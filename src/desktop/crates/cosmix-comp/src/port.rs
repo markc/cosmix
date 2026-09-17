@@ -25,7 +25,10 @@ use tokio::{
 
 use crate::{
     decoration::DecorationStartup,
-    protocol::{port_observation, port_snapshot, window_control::WindowTargetError},
+    protocol::{
+        port_observation, port_snapshot, presentation_stats::STATS_RING,
+        window_control::WindowTargetError,
+    },
 };
 use port_observation::{
     LossCause, LossInterval, ObservationOutbox, ObservationProducer, ObservationRecord, PropValue,
@@ -75,12 +78,30 @@ pub(crate) struct PortSetRequest {
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
 
+/// What `comp.window.stats` / `.stats.reset` measure: a window, fenced by
+/// its role generation, or a content source, optionally fenced by its
+/// registration number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StatsTarget {
+    Window {
+        id: u64,
+        generation: u64,
+    },
+    Source {
+        id: String,
+        registration: Option<u64>,
+    },
+}
+
 /// A window-addressed verb. `{id, generation}` is always required when a
-/// window is named; only `restore` may name none (most recently minimised).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// window is named; only `restore` and `stats.reset` may name none (most
+/// recently minimised; every window, output and source).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WindowOp {
     Minimize { id: u64, generation: u64 },
     Restore { target: Option<(u64, u64)> },
+    Stats { target: StatsTarget, samples: usize },
+    StatsReset { target: Option<StatsTarget> },
 }
 
 pub(crate) struct PortWindowRequest {
@@ -129,6 +150,12 @@ pub(crate) enum ControlReply {
     NotFound {
         minimized_count: usize,
     },
+    /// A `comp.window.stats*` success body.
+    Stats(Value),
+    SourceTarget {
+        source: String,
+        error: SourceTargetError,
+    },
     /// A verb argument the verb does not define (a typo must not be
     /// silently ignored, or `{"gen": 3}` would act unfenced).
     InvalidArgs {
@@ -137,6 +164,15 @@ pub(crate) enum ControlReply {
     },
     Locked,
     Busy,
+}
+
+/// Why a `{source}` stats request did not resolve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceTargetError {
+    /// No content source has this id now.
+    Unknown,
+    /// The id is registered again since the caller read it.
+    StaleTarget { requested: u64, current: u64 },
 }
 
 impl ControlReply {
@@ -244,6 +280,21 @@ impl ControlReply {
                     json!({"error": "not_found", "minimized_count": minimized_count}).to_string(),
                 ),
             ),
+            Self::Stats(body) => (0, Arc::from(body.to_string())),
+            Self::SourceTarget { source, error } => {
+                let body = match error {
+                    SourceTargetError::Unknown => {
+                        json!({"error": "unknown_source", "source": source})
+                    }
+                    SourceTargetError::StaleTarget { requested, current } => json!({
+                        "error": "stale_target",
+                        "source": source,
+                        "registration": requested,
+                        "current": current,
+                    }),
+                };
+                (10, Arc::from(body.to_string()))
+            }
             Self::InvalidArgs { field, allowed } => (
                 10,
                 Arc::from(
@@ -1148,9 +1199,17 @@ fn handle_incoming(
         );
         return;
     }
-    if command.command == "comp.window.minimize" || command.command == "comp.window.restore" {
+    if matches!(
+        command.command.as_str(),
+        "comp.window.minimize"
+            | "comp.window.restore"
+            | "comp.window.stats"
+            | "comp.window.stats.reset"
+    ) {
         let parsed = if malformed {
             Err(invalid_argument("args", "JSON object", "{id, generation}"))
+        } else if command.command.starts_with("comp.window.stats") {
+            parse_stats_op(&command.command, &command.args)
         } else {
             parse_window_op(&command.command, &command.args)
         };
@@ -1398,6 +1457,117 @@ fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
     } else {
         Ok(WindowOp::Restore { target })
     }
+}
+
+/// `comp.window.stats {id, generation | source, registration?, samples?}`
+/// and `comp.window.stats.reset {id, generation | source, registration? |
+/// nothing}`. `{id, generation}` and `{source}` are mutually exclusive.
+fn parse_stats_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
+    const STATS_ARGS: &[&str] = &["id", "generation", "source", "registration", "samples"];
+    const RESET_ARGS: &[&str] = &["id", "generation", "source", "registration"];
+    let reset = verb == "comp.window.stats.reset";
+    let empty = serde_json::Map::new();
+    let object = match args {
+        Value::Null => &empty,
+        Value::Object(object) => object,
+        _ => {
+            return Err(invalid_argument(
+                "args",
+                "JSON object",
+                "{id, generation} or {source}",
+            ));
+        }
+    };
+    let allowed = if reset { RESET_ARGS } else { STATS_ARGS };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed,
+        });
+    }
+    let id = window_arg(object, "id")?;
+    let generation = window_arg(object, "generation")?;
+    let registration = window_arg(object, "registration")?;
+    let source = match object.get("source") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(source))
+            if crate::content_source::ContentSourceId::new(source.as_str()).is_ok() =>
+        {
+            Some(source.clone())
+        }
+        Some(_) => {
+            return Err(invalid_argument("source", "string", "[a-z0-9_-]{1,64}"));
+        }
+    };
+    let window = match (id, generation) {
+        (Some(id), Some(generation)) => Some((id, generation)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(invalid_argument(
+                "generation",
+                "unsigned integer",
+                "required with id (read windows.s<id>.generation)",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid_argument(
+                "id",
+                "unsigned integer",
+                "required with generation",
+            ));
+        }
+    };
+    let target = match (window, source) {
+        (Some(_), Some(_)) => {
+            return Err(invalid_argument(
+                "source",
+                "absent when id is given",
+                "{id, generation} and {source} are mutually exclusive",
+            ));
+        }
+        (Some((id, generation)), None) => {
+            if registration.is_some() {
+                return Err(invalid_argument(
+                    "registration",
+                    "absent when id is given",
+                    "only with source (read sources.<id>.registration)",
+                ));
+            }
+            Some(StatsTarget::Window { id, generation })
+        }
+        (None, Some(id)) => Some(StatsTarget::Source { id, registration }),
+        (None, None) => {
+            if registration.is_some() {
+                return Err(invalid_argument(
+                    "source",
+                    "string",
+                    "required with registration",
+                ));
+            }
+            None
+        }
+    };
+    if reset {
+        return Ok(WindowOp::StatsReset { target });
+    }
+    let Some(target) = target else {
+        return Err(invalid_argument(
+            "id",
+            "unsigned integer",
+            "required (with generation), or give source",
+        ));
+    };
+    let samples = match window_arg(object, "samples")? {
+        None => STATS_RING,
+        Some(samples) if samples <= STATS_RING as u64 => samples as usize,
+        Some(_) => {
+            return Err(invalid_argument("samples", "unsigned integer", "0..=512"));
+        }
+    };
+    Ok(WindowOp::Stats { target, samples })
 }
 
 fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
@@ -2396,6 +2566,98 @@ mod tests {
             assert_eq!(body["error"], "invalid_value", "{verb} {args}");
             assert_eq!(body["path"], field, "{verb} {args}");
         }
+    }
+
+    #[test]
+    fn stats_verb_arguments_name_a_window_or_a_source() {
+        let window = StatsTarget::Window {
+            id: 7,
+            generation: 3,
+        };
+        assert_eq!(
+            parse_stats_op("comp.window.stats", &json!({"id": 7, "generation": 3})),
+            Ok(WindowOp::Stats {
+                target: window.clone(),
+                samples: STATS_RING,
+            })
+        );
+        assert_eq!(
+            parse_stats_op(
+                "comp.window.stats",
+                &json!({"source": "scene", "registration": 2, "samples": 0})
+            ),
+            Ok(WindowOp::Stats {
+                target: StatsTarget::Source {
+                    id: "scene".into(),
+                    registration: Some(2),
+                },
+                samples: 0,
+            })
+        );
+        assert_eq!(
+            parse_stats_op("comp.window.stats.reset", &Value::Null),
+            Ok(WindowOp::StatsReset { target: None })
+        );
+        assert_eq!(
+            parse_stats_op(
+                "comp.window.stats.reset",
+                &json!({"id": 7, "generation": 3})
+            ),
+            Ok(WindowOp::StatsReset {
+                target: Some(window)
+            })
+        );
+        assert_eq!(
+            parse_stats_op("comp.window.stats.reset", &json!({"source": "scene"})),
+            Ok(WindowOp::StatsReset {
+                target: Some(StatsTarget::Source {
+                    id: "scene".into(),
+                    registration: None,
+                })
+            })
+        );
+        for (verb, args, field) in [
+            (
+                "comp.window.stats",
+                json!({"id": 7, "generation": 3, "source": "scene"}),
+                "source",
+            ),
+            ("comp.window.stats", json!({}), "id"),
+            ("comp.window.stats", json!({"id": 7}), "generation"),
+            ("comp.window.stats", json!({"source": "Bad.Id"}), "source"),
+            ("comp.window.stats", json!({"source": 7}), "source"),
+            (
+                "comp.window.stats",
+                json!({"source": "scene", "samples": 513}),
+                "samples",
+            ),
+            (
+                "comp.window.stats",
+                json!({"id": 7, "generation": 3, "registration": 1}),
+                "registration",
+            ),
+            (
+                "comp.window.stats.reset",
+                json!({"registration": 1}),
+                "source",
+            ),
+            ("comp.window.stats.reset", json!({"generation": 3}), "id"),
+            ("comp.window.stats.reset", json!([1]), "args"),
+        ] {
+            let Err(reply) = parse_stats_op(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let (rc, body) = reply.into_wire();
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(rc, 10, "{verb} {args}");
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}");
+            assert_eq!(body["path"], field, "{verb} {args}");
+        }
+        let reply = parse_stats_op("comp.window.stats.reset", &json!({"samples": 1}))
+            .expect_err("reset takes no samples");
+        let body = serde_json::from_str::<Value>(&reply.into_wire().1).unwrap();
+        assert_eq!(body["error"], "invalid_args");
+        assert_eq!(body["field"], "samples");
     }
 
     #[test]

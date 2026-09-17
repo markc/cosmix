@@ -16,6 +16,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
+use super::presentation_stats::{
+    InputMark, PresentSample, PresentationLeaves, PresentationStats, Ring, StatsRegistry,
+    WindowFrame,
+};
 use super::*;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::wayland::presentation::{
@@ -290,6 +294,11 @@ pub(crate) struct FrameSource {
     pub(crate) upload_bytes: u64,
     pub(crate) damage_px: u64,
     pub(crate) consumed_input: Option<u64>,
+    /// When the newest revision was taken (CLOCK_MONOTONIC µs), if this
+    /// report carries a new one.
+    pub(crate) revised_us: Option<u64>,
+    /// When the oldest revision since the previous report was taken.
+    pub(crate) first_revised_us: Option<u64>,
 }
 
 /// One client surface's state in a renderer report.
@@ -314,14 +323,70 @@ pub(crate) struct FrameContent {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SourceCounters {
     pub(crate) registration: u64,
+    /// The output the plugin asked to be measured on (`None` = any).
+    pub(crate) output: Option<String>,
+    pub(crate) registered_at_us: u64,
     pub(crate) revision: u64,
-    pub(crate) presented: u64,
-    pub(crate) discarded: u64,
     pub(crate) last_presented_revision: u64,
-    pub(crate) last_presented_us: Option<u64>,
+    pub(crate) stats: PresentationStats,
     pub(crate) upload_bytes_total: u64,
     pub(crate) damage_px_total: u64,
+    /// Per reported frame, shown or not: the work was done either way.
+    pub(crate) upload_bytes: Ring,
+    pub(crate) damage_px: Ring,
     pub(crate) frames: u64,
+    /// When the oldest revision not yet presented was written.
+    pending_since_us: Option<u64>,
+}
+
+impl SourceCounters {
+    fn reset(&mut self, now_us: u64) {
+        *self = Self {
+            registration: self.registration,
+            output: self.output.take(),
+            registered_at_us: self.registered_at_us,
+            revision: self.revision,
+            last_presented_revision: self.last_presented_revision,
+            stats: PresentationStats::new(now_us),
+            ..Self::default()
+        };
+    }
+
+    /// The `sources.<id>.presentation.*` leaves.
+    pub(crate) fn leaves(&self) -> SourcePresentationLeaves {
+        SourcePresentationLeaves {
+            common: self.stats.leaves(),
+            upload_bytes_total: self.upload_bytes_total,
+            damage_px_total: self.damage_px_total,
+            upload_bytes_p50: self.upload_bytes.percentile(50),
+            upload_bytes_p99: self.upload_bytes.percentile(99),
+            damage_px_p50: self.damage_px.percentile(50),
+            damage_px_p99: self.damage_px.percentile(99),
+        }
+    }
+
+    /// The `comp.window.stats {source}` rings.
+    #[cfg(feature = "bus")]
+    pub(crate) fn samples(&self, count: usize) -> serde_json::Value {
+        let mut samples = self.stats.samples(count);
+        samples["upload_bytes"] = serde_json::json!(self.upload_bytes.newest(count));
+        samples["damage_px"] = serde_json::json!(self.damage_px.newest(count));
+        samples
+    }
+}
+
+/// `sources.<id>.presentation.*`: the window leaves plus the costs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "bus", derive(serde::Serialize))]
+pub(crate) struct SourcePresentationLeaves {
+    #[cfg_attr(feature = "bus", serde(flatten))]
+    pub(crate) common: PresentationLeaves,
+    pub(crate) upload_bytes_total: u64,
+    pub(crate) damage_px_total: u64,
+    pub(crate) upload_bytes_p50: Option<u64>,
+    pub(crate) upload_bytes_p99: Option<u64>,
+    pub(crate) damage_px_p50: Option<u64>,
+    pub(crate) damage_px_p99: Option<u64>,
 }
 
 /// Content sources have no protocol callbacks; a revision counter stands in
@@ -336,12 +401,15 @@ pub(crate) struct SourceLedger {
 
 impl SourceLedger {
     /// Returns the new registration number.
-    pub(crate) fn register(&mut self, id: &str) -> u64 {
+    pub(crate) fn register(&mut self, id: &str, output: Option<String>, now_us: u64) -> u64 {
         self.registrations += 1;
         self.sources.insert(
             id.to_string(),
             SourceCounters {
                 registration: self.registrations,
+                output,
+                registered_at_us: now_us,
+                stats: PresentationStats::new(now_us),
                 ..SourceCounters::default()
             },
         );
@@ -353,13 +421,23 @@ impl SourceLedger {
     pub(crate) fn unregister(&mut self, id: &str, revision: u64) -> Option<SourceCounters> {
         let mut counters = self.sources.remove(id)?;
         counters.revision = counters.revision.max(revision);
-        counters.discarded += counters
-            .revision
-            .saturating_sub(counters.last_presented_revision);
+        counters.stats.record_discarded(
+            counters
+                .revision
+                .saturating_sub(counters.last_presented_revision),
+        );
         Some(counters)
     }
 
-    pub(crate) fn resolve(&mut self, source: &FrameSource, time: Duration) {
+    /// One reported frame. `input_mark` finds when an injected input was
+    /// delivered, for the update that says it answers it.
+    pub(crate) fn resolve(
+        &mut self,
+        source: &FrameSource,
+        tv_us: u64,
+        refresh_us: Option<u64>,
+        input_mark: impl Fn(u64) -> Option<InputMark>,
+    ) {
         let Some(counters) = self.sources.get_mut(&source.id) else {
             return;
         };
@@ -368,19 +446,54 @@ impl SourceLedger {
             .upload_bytes_total
             .saturating_add(source.upload_bytes);
         counters.damage_px_total = counters.damage_px_total.saturating_add(source.damage_px);
+        counters.upload_bytes.push(source.upload_bytes);
+        counters.damage_px.push(source.damage_px);
         counters.revision = counters.revision.max(source.revision);
-        if source.shown && source.revision > counters.last_presented_revision {
-            counters.discarded += source.revision - counters.last_presented_revision - 1;
-            counters.presented += 1;
+        let unpresented = source.revision > counters.last_presented_revision;
+        if unpresented && let Some(first) = source.first_revised_us {
+            counters.pending_since_us = Some(
+                counters
+                    .pending_since_us
+                    .map_or(first, |since| since.min(first)),
+            );
+        }
+        if source.shown && unpresented {
+            counters.stats.record_present(PresentSample {
+                tv_us,
+                refresh_us,
+                discarded: source.revision - counters.last_presented_revision - 1,
+                committed_us: source.revised_us,
+                pending_since_us: counters.pending_since_us.take(),
+                answered_input_us: source
+                    .consumed_input
+                    .and_then(&input_mark)
+                    .map(|mark| mark.at_us),
+            });
             counters.last_presented_revision = source.revision;
-            counters.last_presented_us = u64::try_from(time.as_micros()).ok();
+        } else if !source.shown {
+            counters.stats.hidden();
         }
     }
 
-    // Read by the stats surface (step 6) and the tests.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get(&self, id: &str) -> Option<&SourceCounters> {
         self.sources.get(id)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &SourceCounters)> {
+        self.sources.iter()
+    }
+
+    pub(crate) fn reset(&mut self, id: &str, now_us: u64) -> bool {
+        self.sources
+            .get_mut(id)
+            .map(|counters| counters.reset(now_us))
+            .is_some()
+    }
+
+    pub(crate) fn reset_all(&mut self, now_us: u64) {
+        for counters in self.sources.values_mut() {
+            counters.reset(now_us);
+        }
     }
 
     // Read by the tests.
@@ -399,6 +512,8 @@ pub(crate) struct PresentationRuntime {
     global: Option<PresentationState>,
     pub(crate) ledger: PresentationLedger<PresentationFeedbackCallback>,
     pub(crate) sources: SourceLedger,
+    /// Window and output statistics (content-driven, feedback or not).
+    pub(crate) stats: StatsRegistry,
     /// Per surface, the newest content sequence the renderer refused. A
     /// bufferless commit that still carries it can never be shown.
     refused: HashMap<SurfaceId, u64>,
@@ -441,6 +556,7 @@ impl WaylandState {
     /// is wired; idempotent.
     pub(crate) fn enable_presentation(&mut self) {
         if self.presentation.global.is_none() {
+            self.presentation.stats.epoch_us = crate::frame_trace::monotonic_us();
             self.presentation.global = Some(PresentationState::new::<WaylandState>(
                 &self.display_handle,
                 libc::CLOCK_MONOTONIC as u32,
@@ -569,6 +685,43 @@ impl WaylandState {
         self.discard_presentation_feedback(id, DiscardReason::Destroy);
         self.presentation.ledger.forget_counters(id);
         self.presentation.refused.remove(&id);
+        self.presentation.stats.forget_surface(id.0);
+    }
+
+    /// `(id, generation)` of the window `surface` belongs to: itself for a
+    /// toplevel, its root for a subsurface, none for popups, layers, locks.
+    fn stats_window(&self, surface: &WlSurface) -> Option<(u64, u64)> {
+        let root = self.toplevel_root_for_surface(surface)?;
+        let record = self.surfaces.get(&root.id())?;
+        Some((record.id.0, record.generation))
+    }
+
+    /// A new buffer became `surface`'s content (its `content_seq` was just
+    /// advanced): start timing it.
+    pub(super) fn note_content_published(&mut self, surface: &WlSurface) {
+        let Some(record) = self.surfaces.get(&surface.id()) else {
+            return;
+        };
+        let (id, seq) = (record.id.0, record.content_seq);
+        let window = self.stats_window(surface);
+        self.presentation
+            .stats
+            .note_published(id, window, seq, crate::frame_trace::monotonic_us());
+    }
+
+    /// Injected input was delivered to `target` as `input_seq`. The first
+    /// update its window commits afterwards records `input_to_present`; a
+    /// content source's update that names `input_seq` does the same.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn note_injected_input(&mut self, target: Option<SurfaceId>, input_seq: u64) {
+        let window = target
+            .and_then(|id| self.surface_objects.get(&id))
+            .and_then(|object| self.surfaces.get(object))
+            .map(|record| record.role.wl_surface().clone())
+            .and_then(|surface| self.stats_window(&surface));
+        self.presentation
+            .stats
+            .mark_input(window, input_seq, crate::frame_trace::monotonic_us());
     }
 
     pub(super) fn commit_refused(&mut self, id: SurfaceId, sampled: Option<u64>, seq: u64) {
@@ -588,19 +741,40 @@ impl WaylandState {
         };
         let lock_active = self.session_lock_active();
         let time_us = u64::try_from(frame.time.as_micros()).unwrap_or(u64::MAX);
+        let refresh_us = match frame.refresh {
+            // A variable rate has no vblank grid to count misses against.
+            Refresh::Fixed(refresh) => u64::try_from(refresh.as_micros()).ok(),
+            Refresh::Unknown | Refresh::Variable(_) => None,
+        };
         let mut reported = HashSet::new();
+        let mut windows = HashMap::<u64, (u64, WindowFrame)>::new();
         for surface in &content.surfaces {
             reported.insert(surface.id);
-            let presentable = self
+            let record = self
                 .surface_objects
                 .get(&surface.id)
-                .and_then(|object| self.surfaces.get(object))
-                .is_some_and(|record| {
-                    record.mapped
-                        && !record.minimized
-                        && (!lock_active || self.surface_is_session_presentable(record))
-                });
+                .and_then(|object| self.surfaces.get(object));
+            let presentable = record.is_some_and(|record| {
+                record.mapped
+                    && !record.minimized
+                    && (!lock_active || self.surface_is_session_presentable(record))
+            });
             let shown = surface.shown && presentable;
+            if let Some((window, generation)) = record
+                .map(|record| record.role.wl_surface().clone())
+                .and_then(|wl_surface| self.stats_window(&wl_surface))
+            {
+                let (_, fold) = windows
+                    .entry(window)
+                    .or_insert_with(|| (generation, WindowFrame::default()));
+                self.presentation.stats.surface_frame(
+                    surface.id.0,
+                    window == surface.id.0,
+                    surface.commit_seq,
+                    shown,
+                    fold,
+                );
+            }
             let resolution =
                 self.presentation
                     .ledger
@@ -633,13 +807,32 @@ impl WaylandState {
                 self.discard_presentation_feedback(id, DiscardReason::NotPresentable);
             }
         }
+        for (window, (generation, fold)) in windows {
+            self.presentation
+                .stats
+                .window_frame(window, generation, fold, time_us, refresh_us);
+        }
+        if let Some(output) = &frame.output {
+            self.presentation.stats.output_frame(
+                &output.name(),
+                time_us,
+                frame.flags.bits(),
+                refresh_us,
+            );
+        }
+        let PresentationRuntime { sources, stats, .. } = &mut self.presentation;
         for source in &content.sources {
-            self.presentation.sources.resolve(source, frame.time);
+            sources.resolve(source, time_us, refresh_us, |input_seq| {
+                stats.input_mark(input_seq)
+            });
         }
     }
 
-    pub(super) fn content_source_registered(&mut self, id: &str) {
-        let registration = self.presentation.sources.register(id);
+    pub(super) fn content_source_registered(&mut self, id: &str, output: Option<String>) {
+        let registration =
+            self.presentation
+                .sources
+                .register(id, output, crate::frame_trace::monotonic_us());
         tracing::debug!(source = id, registration, "content source registered");
     }
 
@@ -647,8 +840,8 @@ impl WaylandState {
         if let Some(counters) = self.presentation.sources.unregister(id, revision) {
             tracing::debug!(
                 source = id,
-                presented = counters.presented,
-                discarded = counters.discarded,
+                presented = counters.stats.presented,
+                discarded = counters.stats.discarded,
                 "content source unregistered"
             );
         }

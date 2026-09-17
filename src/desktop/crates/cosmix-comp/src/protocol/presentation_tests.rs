@@ -251,51 +251,143 @@ fn source(revision: u64, shown: bool, upload: u64) -> FrameSource {
         upload_bytes: upload,
         damage_px: upload / 2,
         consumed_input: None,
+        revised_us: None,
+        first_revised_us: None,
     }
+}
+
+fn no_marks(_: u64) -> Option<InputMark> {
+    None
+}
+
+fn presented_discarded(counters: &SourceCounters) -> (u64, u64) {
+    (counters.stats.presented, counters.stats.discarded)
 }
 
 #[test]
 fn source_revisions_skipped_between_frames_count_as_discarded() {
     let mut ledger = SourceLedger::default();
-    assert_eq!(ledger.register("scene"), 1);
-    ledger.resolve(&source(1, true, 10), Duration::from_micros(1));
-    ledger.resolve(&source(1, true, 0), Duration::from_micros(2));
-    ledger.resolve(&source(4, true, 30), Duration::from_micros(3));
+    assert_eq!(ledger.register("scene", Some("DP-1".into()), 5), 1);
+    ledger.resolve(&source(1, true, 10), 1, None, no_marks);
+    ledger.resolve(&source(1, true, 0), 2, None, no_marks);
+    ledger.resolve(&source(4, true, 30), 3, None, no_marks);
     let counters = ledger.get("scene").unwrap();
     // Revisions 1 -> 4 between two shown frames: 1 presented + 2 discarded.
-    assert_eq!((counters.presented, counters.discarded), (2, 2));
-    assert_eq!(counters.last_presented_us, Some(3));
+    assert_eq!(presented_discarded(counters), (2, 2));
+    assert_eq!(counters.stats.last_presented_us, Some(3));
     assert_eq!(counters.upload_bytes_total, 40);
     assert_eq!(counters.damage_px_total, 20);
     assert_eq!(counters.frames, 3);
+    assert_eq!(counters.upload_bytes.newest(8), [10, 0, 30]);
+    assert_eq!(counters.leaves().upload_bytes_p50, Some(10));
+    assert_eq!(
+        (counters.output.as_deref(), counters.registered_at_us),
+        (Some("DP-1"), 5)
+    );
+    assert_eq!(
+        counters.leaves().common.missed,
+        None,
+        "unknown refresh is unmeasured, not zero"
+    );
 
     // Hidden updates are not presented; a later shown one supersedes them.
-    ledger.resolve(&source(5, false, 1), Duration::from_micros(4));
-    ledger.resolve(&source(7, true, 1), Duration::from_micros(5));
+    ledger.resolve(&source(5, false, 1), 4, None, no_marks);
+    ledger.resolve(&source(7, true, 1), 5, None, no_marks);
     let counters = ledger.get("scene").unwrap();
-    assert_eq!((counters.presented, counters.discarded), (3, 4));
+    assert_eq!(presented_discarded(counters), (3, 4));
+    assert_eq!(
+        counters.stats.intervals_us.newest(8),
+        [2],
+        "the hidden frame broke the run"
+    );
 
     // Revisions never shown before unregistering are discarded, including
     // ones from frames that were never reported (the plugin wrote 11).
-    ledger.resolve(&source(9, false, 0), Duration::from_micros(6));
+    ledger.resolve(&source(9, false, 0), 6, None, no_marks);
     let gone = ledger.unregister("scene", 11).unwrap();
-    assert_eq!((gone.presented, gone.discarded), (3, 8));
+    assert_eq!(presented_discarded(&gone), (3, 8));
     assert!(ledger.get("scene").is_none());
     assert_eq!(ledger.len(), 0, "nothing is kept for a gone source");
     assert_eq!(
-        ledger.register("scene"),
+        ledger.register("scene", None, 6),
         2,
         "registration numbers never repeat"
     );
-    assert_eq!(ledger.register("other"), 3);
-    ledger.resolve(&source(1, true, 0), Duration::from_micros(7));
-    assert_eq!(ledger.get("scene").unwrap().presented, 1);
+    assert_eq!(ledger.register("other", None, 6), 3);
+    ledger.resolve(&source(1, true, 0), 7, None, no_marks);
+    assert_eq!(ledger.get("scene").unwrap().stats.presented, 1);
+}
+
+#[test]
+fn source_timing_input_and_reset() {
+    let mut ledger = SourceLedger::default();
+    ledger.register("scene", None, 0);
+    let stamped = |revision, shown, first, newest, input| FrameSource {
+        revised_us: Some(newest),
+        first_revised_us: Some(first),
+        consumed_input: input,
+        ..source(revision, shown, 8)
+    };
+    let marks = |seq: u64| {
+        (seq == 42).then_some(InputMark {
+            input_seq: 42,
+            at_us: 1_000,
+        })
+    };
+    // 60 Hz: a revision written at 1_000 and shown at 16_000.
+    ledger.resolve(
+        &stamped(1, true, 1_000, 1_000, None),
+        16_000,
+        Some(16_000),
+        marks,
+    );
+    // Revision 2 written at 20_000 but shown two vblanks late (64_000):
+    // the vblanks at 32_000 and 48_000 had it pending.
+    ledger.resolve(
+        &stamped(2, true, 20_000, 20_000, Some(42)),
+        64_000,
+        Some(16_000),
+        marks,
+    );
+    let counters = ledger.get("scene").unwrap();
+    assert_eq!(counters.stats.missed, Some(2));
+    assert_eq!(
+        counters.stats.commit_to_present_us.newest(8),
+        [15_000, 44_000]
+    );
+    assert_eq!(counters.stats.input_to_present_us.newest(8), [63_000]);
+    assert_eq!(counters.leaves().common.refresh_us, Some(16_000));
+    assert_eq!(counters.upload_bytes.newest(1), [8]);
+    assert_eq!(counters.stats.intervals_us.newest(1), [48_000]);
+    #[cfg(feature = "bus")]
+    {
+        let samples = counters.samples(1);
+        assert_eq!(samples["upload_bytes"], serde_json::json!([8]));
+        assert_eq!(samples["intervals_us"], serde_json::json!([48_000]));
+    }
+
+    assert!(ledger.reset("scene", 70_000));
+    let counters = ledger.get("scene").unwrap();
+    assert_eq!(presented_discarded(counters), (0, 0));
+    assert_eq!(
+        (
+            counters.upload_bytes_total,
+            counters.frames,
+            counters.stats.since_us
+        ),
+        (0, 0, 70_000)
+    );
+    assert_eq!(counters.registration, 1, "a reset keeps the registration");
+    // A reset does not re-present the revision already shown.
+    ledger.resolve(&stamped(2, true, 20_000, 20_000, None), 80_000, None, marks);
+    assert_eq!(ledger.get("scene").unwrap().stats.presented, 0);
+    assert!(!ledger.reset("gone", 0));
 }
 
 #[test]
 fn unregistered_sources_are_ignored() {
     let mut ledger = SourceLedger::default();
-    ledger.resolve(&source(1, true, 10), Duration::ZERO);
+    ledger.resolve(&source(1, true, 10), 0, None, no_marks);
     assert!(ledger.get("scene").is_none());
     assert!(ledger.unregister("scene", 1).is_none());
 }

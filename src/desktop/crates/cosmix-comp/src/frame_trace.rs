@@ -32,6 +32,12 @@ struct Record {
 }
 static RECORDER: OnceLock<Option<Recorder>> = OnceLock::new();
 
+/// CLOCK_MONOTONIC in µs, the clock trace records and presentation times
+/// share.
+pub(crate) fn monotonic_us() -> u64 {
+    clock_us(libc::CLOCK_MONOTONIC)
+}
+
 fn clock_us(clock: libc::clockid_t) -> u64 {
     let mut value = libc::timespec {
         tv_sec: 0,

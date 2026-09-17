@@ -29479,6 +29479,221 @@ fn content_seq(harness: &KeybindingHarness, object: &ObjectId) -> u64 {
     harness.server.state.surfaces[object].content_seq
 }
 
+#[cfg(feature = "bus")]
+fn stats_reply(harness: &mut KeybindingHarness, op: crate::port::WindowOp) -> (u8, Value) {
+    let (rc, body) = harness.server.state.service_window_op(&op).into_wire();
+    (rc, serde_json::from_str(&body).expect("stats reply body"))
+}
+
+/// Step 6: presentation stats follow a client's content whether or not it
+/// asks for feedback, are served by reads and the stats verbs, and a
+/// watched client presenting every frame never puts a volatile leaf into
+/// `props.changed` (neither the incremental nor the full-snapshot diff).
+#[cfg(feature = "bus")]
+#[test]
+fn presentation_stats_are_read_and_reset_but_never_diffed() {
+    use crate::port::{StatsTarget, WindowOp};
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.enable_presentation();
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let record = &harness.server.state.surfaces[&object];
+    let (id, generation) = (record.id, record.generation);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("watch reply runtime");
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    assert_eq!(runtime.block_on(watch.receive()).unwrap().into_wire().0, 0);
+    drain_observations(&observations);
+
+    // A client committing every frame, without asking for feedback.
+    let mapped_seq = content_seq(&harness, &object);
+    let mut changed = Vec::new();
+    for frame in 1..=6_u64 {
+        commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+        harness.dispatch_client();
+        let (report, content) =
+            test_frame_report(id, frame * 16_667, content_seq(&harness, &object), true);
+        harness.server.state.frame_presented(report, content);
+        port_observation::service_observations(&mut harness.server.state);
+        changed.extend(drain_observations(&observations));
+    }
+    // Force the full-snapshot diff too.
+    harness.server.state.mark_session_observation_dirty();
+    port_observation::service_observations(&mut harness.server.state);
+    changed.extend(drain_observations(&observations));
+    let volatile = changed
+        .iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, new, .. } => {
+                let row = new.wire_value();
+                (port_snapshot::volatile_path(path) || row.get("presentation").is_some())
+                    .then(|| path.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(volatile.is_empty(), "{volatile:?}");
+
+    let context = harness.server.state.port_context.clone().unwrap();
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let key = format!("s{}", id.0);
+    let leaves = snapshot.windows[&key].presentation.clone().unwrap();
+    // Only buffers published before the first reported frame (the mapping
+    // content) can have been superseded.
+    assert_eq!(leaves.presented, 6);
+    assert!(leaves.discarded <= mapped_seq, "{leaves:?}");
+    assert_eq!(leaves.interval_p50_us, Some(16_667));
+    assert_eq!(leaves.missed, None, "nested refresh is unknown");
+    assert!(leaves.commit_to_present_p50_us.is_some());
+    let tree = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(tree["windows"][&key]["presentation"]["presented"], 6);
+    let output = snapshot
+        .outputs
+        .values()
+        .find(|output| output.default)
+        .expect("default output row");
+    assert_eq!(output.presentation.as_ref().unwrap().frames, 6);
+
+    let window = StatsTarget::Window {
+        id: id.0,
+        generation,
+    };
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: window.clone(),
+            samples: 2,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["presented"], 6);
+    assert_eq!(body["generation"], generation);
+    assert_eq!(body["intervals_us"], json!([16_667, 16_667]));
+    assert_eq!(body["missed"], Value::Null);
+    assert_eq!(body["commit_to_present_us"].as_array().unwrap().len(), 2);
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: StatsTarget::Window {
+                id: id.0,
+                generation: generation + 1,
+            },
+            samples: 0,
+        },
+    );
+    assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
+
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::StatsReset {
+            target: Some(window.clone()),
+        },
+    );
+    assert_eq!((rc, body["reset"].as_str()), (0, Some("window")));
+    let (_, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: window,
+            samples: 512,
+        },
+    );
+    assert_eq!(
+        (body["presented"].as_u64(), body["discarded"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(body["intervals_us"], json!([]));
+    assert!(body["since_us"].as_u64().unwrap() > 0);
+
+    // A content source: registered, measured, read, reset, gone.
+    harness
+        .server
+        .state
+        .content_source_registered("scene", Some("nested".into()));
+    let source = |revision, upload| presentation::FrameSource {
+        id: "scene".into(),
+        revision,
+        shown: true,
+        upload_bytes: upload,
+        damage_px: upload,
+        ..presentation::FrameSource::default()
+    };
+    for (frame, revision, upload) in [(7_u64, 1, 10), (8, 3, 20)] {
+        let (report, mut content) = test_frame_report(id, frame * 16_667, 0, false);
+        content.surfaces.clear();
+        content.sources.push(source(revision, upload));
+        harness.server.state.frame_presented(report, content);
+    }
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let scene = &snapshot.sources["scene"];
+    assert_eq!(
+        (scene.revision, scene.registration, scene.output.as_deref()),
+        (3, 1, Some("nested"))
+    );
+    assert_eq!(
+        (
+            scene.presentation.common.presented,
+            scene.presentation.common.discarded,
+            scene.presentation.upload_bytes_total
+        ),
+        (2, 1, 30)
+    );
+    let scene_target = |registration| StatsTarget::Source {
+        id: "scene".into(),
+        registration,
+    };
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: scene_target(Some(1)),
+            samples: 512,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["upload_bytes"], json!([10, 20]));
+    assert_eq!(body["damage_px_total"], 30);
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: scene_target(Some(9)),
+            samples: 1,
+        },
+    );
+    assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
+    let (rc, _) = stats_reply(&mut harness, WindowOp::StatsReset { target: None });
+    assert_eq!(rc, 0);
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    assert_eq!(snapshot.sources["scene"].presentation.upload_bytes_total, 0);
+    let window_leaves = snapshot.windows[&key].presentation.as_ref().unwrap();
+    assert_eq!(window_leaves.presented, 0);
+    assert_eq!(
+        snapshot
+            .outputs
+            .values()
+            .find(|output| output.default)
+            .and_then(|output| output.presentation.as_ref())
+            .map(|presentation| presentation.frames),
+        Some(0)
+    );
+
+    harness.server.state.content_source_unregistered("scene", 3);
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    assert!(snapshot.sources.is_empty());
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: scene_target(None),
+            samples: 1,
+        },
+    );
+    assert_eq!((rc, body["error"].as_str()), (10, Some("unknown_source")));
+}
+
 /// The global exists only after a reporter asked for it.
 #[test]
 fn presentation_global_waits_for_a_frame_reporter() {

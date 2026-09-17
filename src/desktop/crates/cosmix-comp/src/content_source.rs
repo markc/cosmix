@@ -52,9 +52,10 @@ impl ContentSourceId {
 )]
 pub(crate) struct ContentSource {
     pub(crate) id: ContentSourceId,
-    /// `None` = every output it is visible on. Per-output accounting is
-    /// Step 6; today every source is measured on the one reporting output.
-    #[allow(dead_code)]
+    /// `None` = every output it is visible on. Reported as
+    /// `sources.<id>.output`; the source is measured on the reporting
+    /// output (nested has one). Re-inserting the same id with another
+    /// output keeps the registration and its original output.
     pub(crate) output: Option<String>,
 }
 
@@ -151,6 +152,8 @@ impl ExtractedContentSources {
                     // One slot: only the newest answered input is kept
                     // between reports.
                     consumed_input: source.consumed_input.or(previous.consumed_input),
+                    revised_us: source.revised_us.or(previous.revised_us),
+                    first_revised_us: previous.first_revised_us.or(source.first_revised_us),
                     ..source.clone()
                 },
                 None => source.clone(),
@@ -167,6 +170,8 @@ impl ExtractedContentSources {
             source.upload_bytes = 0;
             source.damage_px = 0;
             source.consumed_input = None;
+            source.revised_us = None;
+            source.first_revised_us = None;
         }
     }
 }
@@ -188,6 +193,9 @@ impl Plugin for ContentSourcePlugin {
 
 fn register(world: &mut DeferredWorld, entity: Entity, id: ContentSourceId) {
     let reporter = world.get_resource::<FramePresentationReporter>().cloned();
+    let output = world
+        .get::<ContentSource>(entity)
+        .and_then(|source| source.output.clone());
     let Some(mut registry) = world.get_resource_mut::<ContentSourceRegistry>() else {
         return;
     };
@@ -195,7 +203,7 @@ fn register(world: &mut DeferredWorld, entity: Entity, id: ContentSourceId) {
     registry.by_entity.insert(entity, id.clone());
     registry.revisions.insert(id.clone(), 0);
     if let Some(reporter) = reporter {
-        reporter.source_registered(id.as_str().to_string());
+        reporter.source_registered(id.as_str().to_string(), output);
     }
 }
 
@@ -307,8 +315,11 @@ fn snapshot_content_sources(
             continue;
         }
         let shown = visibility.is_some_and(|visibility| visibility.get());
+        let known = registry.revisions.get(&source.id).copied().unwrap_or(0);
         let entry = match frame {
             Some(mut frame) => {
+                // A new revision is stamped when comp first sees it.
+                let revised_us = (frame.revision > known).then(crate::frame_trace::monotonic_us);
                 let entry = FrameSource {
                     id: source.id.as_str().to_string(),
                     revision: frame.revision,
@@ -316,6 +327,8 @@ fn snapshot_content_sources(
                     upload_bytes: frame.upload_bytes,
                     damage_px: frame.damage_px,
                     consumed_input: frame.consumed_input,
+                    revised_us,
+                    first_revised_us: revised_us,
                 };
                 // The costs move to the render world's accumulator; they are
                 // not lost if this frame is never reported.
@@ -346,6 +359,97 @@ fn extract_content_sources(
     mut extracted: ResMut<ExtractedContentSources>,
 ) {
     extracted.accumulate(&snapshot.0);
+}
+
+/// Gate G1s (`--features content-source-probe`, nested only): a quad whose
+/// colour changes every frame, registered as content source `probe` with
+/// fake costs. It writes `COSMIX_CONTENT_SOURCE_PROBE_REVISIONS` revisions
+/// (default 300), logs its own totals, holds still for four seconds so the
+/// last revision and the carried costs are reported, then despawns itself.
+#[cfg(feature = "content-source-probe")]
+pub(crate) mod probe {
+    use super::*;
+
+    const DEFAULT_REVISIONS: u64 = 300;
+    const HOLD_SECS: f64 = 4.0;
+    const UPLOAD_BYTES: u64 = 4_096;
+    const DAMAGE_PX: u64 = 96 * 96;
+
+    #[derive(Component)]
+    struct ContentSourceProbe {
+        revisions: u64,
+        written: u64,
+        upload_bytes: u64,
+        damage_px: u64,
+        done_at: Option<f64>,
+    }
+
+    pub(crate) struct ContentSourceProbePlugin;
+
+    impl Plugin for ContentSourceProbePlugin {
+        fn build(&self, app: &mut App) {
+            app.add_systems(Startup, spawn_probe)
+                .add_systems(Update, drive_probe);
+        }
+    }
+
+    fn spawn_probe(mut commands: Commands) {
+        let revisions = std::env::var("COSMIX_CONTENT_SOURCE_PROBE_REVISIONS")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(DEFAULT_REVISIONS);
+        let Ok(id) = ContentSourceId::new("probe") else {
+            return;
+        };
+        commands.spawn((
+            Name::new("content-source probe"),
+            ContentSource { id, output: None },
+            ContentSourceFrame::default(),
+            ContentSourceProbe {
+                revisions,
+                written: 0,
+                upload_bytes: 0,
+                damage_px: 0,
+                done_at: None,
+            },
+            Sprite::from_color(Color::WHITE, Vec2::splat(96.0)),
+            Transform::from_xyz(-200.0, 150.0, 0.5),
+        ));
+        info!(revisions, "COSMIX_CONTENT_SOURCE_PROBE START");
+    }
+
+    fn drive_probe(
+        time: Res<Time>,
+        mut commands: Commands,
+        mut probes: Query<(
+            Entity,
+            &mut ContentSourceProbe,
+            &mut ContentSourceFrame,
+            &mut Sprite,
+        )>,
+    ) {
+        let now = time.elapsed_secs_f64();
+        for (entity, mut probe, mut frame, mut sprite) in &mut probes {
+            if probe.written < probe.revisions {
+                probe.written += 1;
+                let upload = UPLOAD_BYTES + probe.written % 7;
+                frame.record(probe.written, upload, DAMAGE_PX);
+                probe.upload_bytes += upload;
+                probe.damage_px += DAMAGE_PX;
+                sprite.color = Color::hsl((probe.written * 37 % 360) as f32, 0.8, 0.5);
+                if probe.written == probe.revisions {
+                    probe.done_at = Some(now);
+                    info!(
+                        "COSMIX_CONTENT_SOURCE_PROBE DONE revisions={} upload_bytes={} damage_px={}",
+                        probe.written, probe.upload_bytes, probe.damage_px
+                    );
+                }
+            } else if probe.done_at.is_some_and(|done| now - done >= HOLD_SECS) {
+                commands.entity(entity).despawn();
+                info!("COSMIX_CONTENT_SOURCE_PROBE DESPAWNED");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +618,10 @@ mod tests {
             ),
             (2, 150, 15)
         );
+        assert!(
+            snapshot[0].revised_us.is_some(),
+            "a new revision is stamped"
+        );
         // No visibility component in this minimal app: not shown.
         assert!(!snapshot[0].shown);
         let frame = *app.world().get::<ContentSourceFrame>(entity).unwrap();
@@ -540,29 +648,43 @@ mod tests {
             (2, 0, 0),
             "an unchanged source is still listed with zero cost"
         );
+        assert_eq!(
+            snapshot[0].revised_us, None,
+            "an old revision is not restamped"
+        );
     }
 
     #[test]
     fn render_side_costs_carry_until_a_report_consumes_them() {
-        let frame = |upload: u64, input: Option<u64>| FrameSource {
+        let frame = |upload: u64, input: Option<u64>, revised: Option<u64>| FrameSource {
             id: "scene".into(),
             revision: 3,
             shown: true,
             upload_bytes: upload,
             damage_px: upload / 2,
             consumed_input: input,
+            revised_us: revised,
+            first_revised_us: revised,
         };
         let mut extracted = ExtractedContentSources::default();
-        extracted.accumulate(&[frame(10, Some(7))]);
-        // An unreported frame: costs add up, the input mark survives.
-        extracted.accumulate(&[frame(4, None)]);
+        extracted.accumulate(&[frame(10, Some(7), Some(100))]);
+        // An unreported frame: costs add up, the input mark survives, the
+        // oldest and newest revision stamps are both kept.
+        extracted.accumulate(&[frame(4, None, Some(200))]);
         assert_eq!(extracted.0[0].upload_bytes, 14);
         assert_eq!(extracted.0[0].damage_px, 7);
         assert_eq!(extracted.0[0].consumed_input, Some(7));
+        assert_eq!(
+            (extracted.0[0].first_revised_us, extracted.0[0].revised_us),
+            (Some(100), Some(200))
+        );
+        extracted.accumulate(&[frame(0, None, None)]);
+        assert_eq!(extracted.0[0].revised_us, Some(200));
         extracted.consume();
         assert_eq!(extracted.0[0].upload_bytes, 0);
         assert_eq!(extracted.0[0].consumed_input, None);
-        extracted.accumulate(&[frame(2, None)]);
+        assert_eq!(extracted.0[0].first_revised_us, None);
+        extracted.accumulate(&[frame(2, None, None)]);
         assert_eq!(extracted.0[0].upload_bytes, 2);
         // A source that left the scene is dropped.
         extracted.accumulate(&[]);

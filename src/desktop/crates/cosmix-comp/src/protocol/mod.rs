@@ -990,6 +990,7 @@ enum ProtocolCommand {
     },
     ContentSourceRegistered {
         id: String,
+        output: Option<String>,
     },
     ContentSourceUnregistered {
         id: String,
@@ -1574,10 +1575,10 @@ impl FramePresentationReporter {
         }
     }
 
-    pub(crate) fn source_registered(&self, id: String) {
+    pub(crate) fn source_registered(&self, id: String, output: Option<String>) {
         let _ = self
             .commands
-            .send(ProtocolCommand::ContentSourceRegistered { id });
+            .send(ProtocolCommand::ContentSourceRegistered { id, output });
     }
 
     pub(crate) fn source_unregistered(&self, id: String, revision: u64) {
@@ -3479,8 +3480,8 @@ impl ProtocolServer {
                 ChannelEvent::Msg(ProtocolCommand::FramePresented { frame, content }) => {
                     state.frame_presented(frame, content);
                 }
-                ChannelEvent::Msg(ProtocolCommand::ContentSourceRegistered { id }) => {
-                    state.content_source_registered(&id);
+                ChannelEvent::Msg(ProtocolCommand::ContentSourceRegistered { id, output }) => {
+                    state.content_source_registered(&id, output);
                 }
                 ChannelEvent::Msg(ProtocolCommand::ContentSourceUnregistered { id, revision }) => {
                     state.content_source_unregistered(&id, revision);
@@ -4836,8 +4837,9 @@ struct SurfaceRecord {
     window_origin: (f32, f32),
     configured_size: (i32, i32),
     commit_count: u64,
-    /// Advances only when a new buffer is published to the renderer
-    /// (`commit_count` also counts buffers the commit path refused).
+    /// +1 each time a new buffer is published to the renderer (dense, so a
+    /// gap between two shown sequences counts the updates never shown;
+    /// `commit_count` also counts bufferless and refused commits).
     content_seq: u64,
     shm_backing: Option<ShmBacking>,
     dmabuf_backing: Option<DmabufBacking>,
@@ -13425,6 +13427,8 @@ impl WaylandState {
     fn role_change_generation(&mut self, object: &ObjectId) -> u64 {
         if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
             self.discard_presentation_feedback(id, presentation::DiscardReason::Role);
+            // A new role is a new window: its stats start over.
+            self.presentation.stats.forget_surface(id.0);
         }
         self.next_role_generation()
     }
@@ -15206,9 +15210,10 @@ impl WaylandState {
                             .surfaces
                             .get_mut(&surface.id())
                             .expect("mapped surface remains tracked");
-                        record.content_seq = commit_count;
+                        record.content_seq += 1;
                         record.scene_snapshot()
                     };
+                    self.note_content_published(surface);
                     self.push_surface_upsert(
                         surface,
                         ProtocolEvent::SurfaceUpserted {
@@ -15384,9 +15389,10 @@ impl WaylandState {
                         .surfaces
                         .get_mut(&surface.id())
                         .expect("mapped surface remains tracked");
-                    record.content_seq = commit_count;
+                    record.content_seq += 1;
                     record.scene_snapshot()
                 };
+                self.note_content_published(surface);
                 self.push_surface_upsert(
                     surface,
                     ProtocolEvent::SurfaceUpserted {
@@ -15574,6 +15580,7 @@ mod focus;
 mod handlers;
 mod input;
 pub(crate) mod presentation;
+pub(crate) mod presentation_stats;
 mod release_use;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;

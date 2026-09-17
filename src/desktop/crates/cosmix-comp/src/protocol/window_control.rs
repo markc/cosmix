@@ -1,9 +1,47 @@
-//! Window-addressed Bus control: `{id, generation}` target fencing and the
+//! Window-addressed Bus control: `{id, generation}` target fencing, the
 //! minimise/restore operations shared by `windows.s<id>.minimized` and the
-//! `comp.window.*` verbs.
+//! `comp.window.*` verbs, and the presentation stats verbs.
 
+use serde_json::{Value, json};
+
+use super::presentation_stats::PresentationStats;
 use super::*;
-use crate::port::{ControlReply, WindowOp};
+use crate::port::{ControlReply, SourceTargetError, StatsTarget, WindowOp};
+
+/// `comp_window_control` trace op codes (the record's `detail`).
+#[derive(Clone, Copy, Debug)]
+enum TracedOp {
+    Minimize = 1,
+    Restore = 2,
+    Stats = 3,
+    StatsReset = 4,
+}
+
+fn trace_window_control(op: &WindowOp) {
+    let (code, target) = match op {
+        WindowOp::Minimize { id, generation } => (TracedOp::Minimize, Some((*id, *generation))),
+        WindowOp::Restore { target } => (TracedOp::Restore, *target),
+        WindowOp::Stats { target, .. } => (TracedOp::Stats, window_of(Some(target))),
+        WindowOp::StatsReset { target } => (TracedOp::StatsReset, window_of(target.as_ref())),
+    };
+    let (id, generation) = target.unwrap_or_default();
+    crate::frame_trace::event("comp_window_control", || (id, code as u64, generation));
+}
+
+fn window_of(target: Option<&StatsTarget>) -> Option<(u64, u64)> {
+    match target {
+        Some(StatsTarget::Window { id, generation }) => Some((*id, *generation)),
+        _ => None,
+    }
+}
+
+/// Merge `extra`'s fields into the object `body`.
+fn merged(mut body: Value, extra: Value) -> Value {
+    if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+        body.extend(extra);
+    }
+    body
+}
 
 /// Why a window-addressed request did not resolve to a window. These are
 /// correctness refusals (the request is aimed at the wrong thing), never
@@ -118,13 +156,131 @@ impl WaylandState {
         })
     }
 
-    /// `comp.window.minimize` / `comp.window.restore`. A session lock
-    /// refuses both: the lock owns what is on screen until it ends.
+    /// `comp.window.stats`: the window's (or source's) leaves plus the
+    /// newest `samples` of each ring.
+    fn service_stats(&mut self, target: &StatsTarget, samples: usize) -> ControlReply {
+        match target {
+            StatsTarget::Window { id, generation } => {
+                if let Err(error) = self.resolve_window_target(*id, Some(*generation)) {
+                    return ControlReply::WindowTarget { id: *id, error };
+                }
+                let stats = &self.presentation.stats;
+                let empty = PresentationStats::new(stats.epoch_us);
+                let window = stats.window(*id, *generation).unwrap_or(&empty);
+                ControlReply::Stats(merged(
+                    merged(
+                        json!({"id": id, "generation": generation}),
+                        window.leaves().to_json(),
+                    ),
+                    window.samples(samples),
+                ))
+            }
+            StatsTarget::Source { id, registration } => {
+                let counters = match self.source_target(id, *registration) {
+                    Ok(counters) => counters,
+                    Err(reply) => return reply,
+                };
+                ControlReply::Stats(merged(
+                    merged(
+                        json!({
+                            "source": id,
+                            "registration": counters.registration,
+                            "output": counters.output,
+                            "registered_at_us": counters.registered_at_us,
+                            "revision": counters.revision,
+                        }),
+                        serde_json::to_value(counters.leaves()).unwrap_or(Value::Null),
+                    ),
+                    counters.samples(samples),
+                ))
+            }
+        }
+    }
+
+    fn source_target(
+        &self,
+        id: &str,
+        registration: Option<u64>,
+    ) -> Result<&presentation::SourceCounters, ControlReply> {
+        let Some(counters) = self.presentation.sources.get(id) else {
+            return Err(ControlReply::SourceTarget {
+                source: id.to_string(),
+                error: SourceTargetError::Unknown,
+            });
+        };
+        if let Some(requested) = registration
+            && requested != counters.registration
+        {
+            return Err(ControlReply::SourceTarget {
+                source: id.to_string(),
+                error: SourceTargetError::StaleTarget {
+                    requested,
+                    current: counters.registration,
+                },
+            });
+        }
+        Ok(counters)
+    }
+
+    /// `comp.window.stats.reset`: one window, one source, or (no target)
+    /// every window, output and source. Counting restarts now.
+    fn service_stats_reset(&mut self, target: Option<&StatsTarget>) -> ControlReply {
+        let now = crate::frame_trace::monotonic_us();
+        match target {
+            None => {
+                self.presentation.stats.reset_all(now);
+                self.presentation.sources.reset_all(now);
+                ControlReply::Stats(json!({"reset": "all", "since_us": now}))
+            }
+            Some(StatsTarget::Window { id, generation }) => {
+                if let Err(error) = self.resolve_window_target(*id, Some(*generation)) {
+                    return ControlReply::WindowTarget { id: *id, error };
+                }
+                self.presentation.stats.reset_window(*id, *generation, now);
+                ControlReply::Stats(json!({
+                    "reset": "window",
+                    "id": id,
+                    "generation": generation,
+                    "since_us": now,
+                }))
+            }
+            Some(StatsTarget::Source { id, registration }) => {
+                let registration = match self.source_target(id, *registration) {
+                    Ok(counters) => counters.registration,
+                    Err(reply) => return reply,
+                };
+                self.presentation.sources.reset(id, now);
+                ControlReply::Stats(json!({
+                    "reset": "source",
+                    "source": id,
+                    "registration": registration,
+                    "since_us": now,
+                }))
+            }
+        }
+    }
+
+    /// The `comp.window.*` verbs. A session lock refuses every one that
+    /// names or changes a window: the lock owns what is on screen until it
+    /// ends. Source stats and a global reset do not reveal a window.
     pub(crate) fn service_window_op(&mut self, op: &WindowOp) -> ControlReply {
-        if self.session_lock_active() {
+        trace_window_control(op);
+        let names_window = match op {
+            WindowOp::Stats { target, .. } => window_of(Some(target)).is_some(),
+            WindowOp::StatsReset { target } => window_of(target.as_ref()).is_some(),
+            WindowOp::Minimize { .. } | WindowOp::Restore { .. } => true,
+        };
+        if names_window && self.session_lock_active() {
             return ControlReply::Locked;
         }
         let (target, minimized) = match *op {
+            WindowOp::Stats {
+                ref target,
+                samples,
+            } => return self.service_stats(target, samples),
+            WindowOp::StatsReset { ref target } => {
+                return self.service_stats_reset(target.as_ref());
+            }
             WindowOp::Minimize { id, generation } => ((id, generation), true),
             WindowOp::Restore {
                 target: Some(target),

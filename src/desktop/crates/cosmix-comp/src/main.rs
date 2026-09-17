@@ -414,6 +414,8 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         capture_reporter.clone(),
     );
     install_nested_frame_presentation(&mut app, runtime.frame_presentation_reporter());
+    #[cfg(feature = "content-source-probe")]
+    app.add_plugins(content_source::probe::ContentSourceProbePlugin);
     #[cfg(feature = "bus")]
     runtime.start_port().map_err(io::Error::other)?;
 

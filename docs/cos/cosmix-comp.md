@@ -137,7 +137,7 @@ instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid `from`
 with Bus rc 10.
 
-The control plane exposes ten verbs:
+The control plane exposes twelve verbs:
 
 - `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
 - `comp.info` returns service/build/backend provenance plus output and surface
@@ -173,8 +173,11 @@ The control plane exposes ten verbs:
   `{id,generation}` (both required together) it restores that window. If the
   window is minimised, either form un-minimises, raises and focuses it; if it
   is not, nothing happens and the reply says `changed:false`.
+- `comp.window.stats {id,generation | source}` and
+  `comp.window.stats.reset {id,generation | source | nothing}` read and zero
+  presentation statistics (see Presentation statistics below).
 
-Both window verbs reply `{id,generation,title,app_id,minimized,changed}`;
+Minimise and restore reply `{id,generation,title,app_id,minimized,changed}`;
 `changed:false` means the window was already in the requested state.
 `comp.window.restore {}` with nothing to restore replies rc 10
 `{"error":"not_found","minimized_count":N}`. While a session lock is active
@@ -194,7 +197,9 @@ The complete L2 read tree is:
 ```text
 info.{service,version,backend,engine,instance}
 outputs.o_<slug>.{name,default,x,y,width,height,scale,refresh_mhz,
-                  usable.{x,y,width,height}}
+                  usable.{x,y,width,height},
+                  presentation.{clock_id,flags,refresh_us,frames,
+                    interval_p50_us,interval_p99_us,since_us}}  (presentation: volatile)
 surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
                 maximized,fullscreen,minimized,decoration,
@@ -202,7 +207,16 @@ surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 generation}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid}
+               window_x,window_y,visible,pid,
+               presentation.{presented,discarded,last_presented_us,
+                 interval_p50_us,interval_p99_us,interval_max_us,
+                 commit_to_present_p50_us,commit_to_present_p99_us,
+                 input_to_present_p50_us,input_to_present_p99_us,
+                 missed,refresh_us,since_us}}          (presentation: volatile)
+sources.<id>.{output,registered_at_us,revision,registration,
+              presentation.{<the window leaves>,upload_bytes_total,
+                damage_px_total,upload_bytes_p50,upload_bytes_p99,
+                damage_px_p50,damage_px_p99}}          (volatile)
 stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
@@ -610,12 +624,73 @@ update. Revisions shown in a presented frame count as presented, skipped ones
 as discarded, and upload/damage costs are carried until a presented frame
 reports them. Changing the id (re-inserting the component) re-registers the
 source; a refused duplicate takes over the id when its holder goes.
+`ContentSource.output` is reported as `sources.<id>.output`; the source is
+measured on the output that reports the frame (nested has one).
 
-Not in this release yet (planned with the stats surface): the Bus stats
-leaves and `comp.window.stats`, per-window interval rings, percentiles, the
-missed-frame rule and input-to-present marks, per-output source accounting
-(`ContentSource.output` is accepted but not used), and the content-source
-probe gate.
+### Presentation statistics
+
+Every window, output and content source is measured, whether or not the
+client asks for feedback. The statistics follow content, not feedback
+objects: an update is one buffer handed to the renderer (a window) or one
+revision (a content source). A frame that shows a newer update presents it;
+the updates it skipped count as `discarded`.
+
+- **Windows:** `windows.s<id>.presentation.*`. Subsurface updates count for
+  their window; a frame that shows several surfaces of one window counts
+  once. A new role (a new `generation`) starts from zero.
+- **Intervals** are measured only between two presentations while the window
+  stays shown, so a minimised or hidden stretch is not one long interval.
+- **`commit_to_present`** is the time from the buffer's commit to the frame
+  that showed it. For a content source it starts when comp first sees the
+  revision.
+- **`missed`** counts vblanks skipped while an update was waiting: for a
+  fixed refresh `R`, a gap of `round(interval / R)` vblanks counts the skipped
+  ones at or after the moment the oldest waiting update was committed. An
+  idle client that commits late misses nothing. With an unknown or variable
+  refresh (nested) `missed` is null, never 0: unmeasured is not perfect.
+- **`input_to_present`** is the time from an injected input to the first
+  presented update committed after it (a comp-side upper bound). A content
+  source's update records it when it names the input's `input_seq`.
+- **Rings** keep the newest 512 samples; `_p50`/`_p99` are nearest-rank
+  percentiles over them, null without samples.
+- All times are CLOCK_MONOTONIC microseconds; `since_us` is when counting
+  started (the first update, registration, compositor start, or the last
+  reset).
+
+The presentation leaves and the whole `sources` subtree are **volatile**:
+`get`, `list` and `describe` serve them (`describe` says `volatile: true`),
+but `props.changed` never reports them, so a watched client presenting at
+60 Hz does not flood the topic. Row add and remove events carry no
+presentation leaves either.
+
+`comp.window.stats {id, generation, samples?}` returns the window's leaves
+plus the newest `samples` (default and maximum 512) of `intervals_us`,
+`commit_to_present_us` and `input_to_present_us`. `{source, registration?,
+samples?}` does the same for a content source and adds `upload_bytes` and
+`damage_px` (per reported frame). `{id, generation}` and `{source}` are
+mutually exclusive (`invalid_value`). `comp.window.stats.reset` takes the same
+targets without `samples`, or no target to zero every window, output and
+source; it replies `{reset, since_us, ...}`. Errors: the window errors of
+`comp.window.*`, `unknown_source`, and `stale_target` with `registration` and
+`current` when the source id was registered again. A session lock refuses the
+window forms (`locked`); source reads and the global reset still work.
+
+Each `comp.window.*` verb emits a `comp_window_control` trace record
+(subject window id or 0, detail 1 minimise / 2 restore / 3 stats / 4 reset,
+aux generation).
+
+Content-source honesty limits: a source counts as presented when its entity
+was visible in a presented frame; comp cannot tell whether the plugin's own
+texture upload for that revision had finished. Flags and clock are the
+frame's. Re-inserting the same id with another `output` keeps the original
+registration and its output. Only the newest `consumed_input` is kept
+between two reports.
+
+Gate G1s: a build with the test-only `content-source-probe` feature adds a
+nested quad registered as source `probe` that changes every frame for
+`COSMIX_CONTENT_SOURCE_PROBE_REVISIONS` revisions (default 300), logs
+`COSMIX_CONTENT_SOURCE_PROBE DONE revisions=… upload_bytes=… damage_px=…`,
+holds for four seconds and despawns (`… DESPAWNED`).
 
 ## XWayland
 

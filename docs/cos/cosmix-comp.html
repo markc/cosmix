@@ -556,7 +556,7 @@ The seat/KMS compositor registers as <code>comp</code>; <code>--nested</code> re
 instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid <code>from</code>
 with Bus rc 10.</p>
-<p>The control plane exposes ten verbs:</p>
+<p>The control plane exposes twelve verbs:</p>
 <ul>
 <li><code>comp.ping</code> returns <code>{"pong":true}</code> without taking a compositor snapshot.</li>
 <li><code>comp.info</code> returns service/build/backend provenance plus output and surface
@@ -592,8 +592,11 @@ recently minimised window, exactly like the <code>Super+Shift+M</code> binding; 
 <code>{id,generation}</code> (both required together) it restores that window. If the
 window is minimised, either form un-minimises, raises and focuses it; if it
 is not, nothing happens and the reply says <code>changed:false</code>.</li>
+<li><code>comp.window.stats {id,generation | source}</code> and
+<code>comp.window.stats.reset {id,generation | source | nothing}</code> read and zero
+presentation statistics (see Presentation statistics below).</li>
 </ul>
-<p>Both window verbs reply <code>{id,generation,title,app_id,minimized,changed}</code>;
+<p>Minimise and restore reply <code>{id,generation,title,app_id,minimized,changed}</code>;
 <code>changed:false</code> means the window was already in the requested state.
 <code>comp.window.restore {}</code> with nothing to restore replies rc 10
 <code>{"error":"not_found","minimized_count":N}</code>. While a session lock is active
@@ -609,7 +612,9 @@ authorization. What the port still refuses is a malformed or mis-aimed request
 <p>The complete L2 read tree is:</p>
 <pre><code class="language-text">info.{service,version,backend,engine,instance}
 outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
-                  usable.{x,y,width,height}}
+                  usable.{x,y,width,height},
+                  presentation.{clock_id,flags,refresh_us,frames,
+                    interval_p50_us,interval_p99_us,since_us}}  (presentation: volatile)
 surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
                 maximized,fullscreen,minimized,decoration,
@@ -617,7 +622,16 @@ surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 generation}
 windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid}
+               window_x,window_y,visible,pid,
+               presentation.{presented,discarded,last_presented_us,
+                 interval_p50_us,interval_p99_us,interval_max_us,
+                 commit_to_present_p50_us,commit_to_present_p99_us,
+                 input_to_present_p50_us,input_to_present_p99_us,
+                 missed,refresh_us,since_us}}          (presentation: volatile)
+sources.&lt;id&gt;.{output,registered_at_us,revision,registration,
+              presentation.{&lt;the window leaves&gt;,upload_bytes_total,
+                damage_px_total,upload_bytes_p50,upload_bytes_p99,
+                damage_px_p50,damage_px_p99}}          (volatile)
 stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
@@ -986,12 +1000,67 @@ its root entity and bumps <code>ContentSourceFrame.revision</code> for every con
 update. Revisions shown in a presented frame count as presented, skipped ones
 as discarded, and upload/damage costs are carried until a presented frame
 reports them. Changing the id (re-inserting the component) re-registers the
-source; a refused duplicate takes over the id when its holder goes.</p>
-<p>Not in this release yet (planned with the stats surface): the Bus stats
-leaves and <code>comp.window.stats</code>, per-window interval rings, percentiles, the
-missed-frame rule and input-to-present marks, per-output source accounting
-(<code>ContentSource.output</code> is accepted but not used), and the content-source
-probe gate.</p>
+source; a refused duplicate takes over the id when its holder goes.
+<code>ContentSource.output</code> is reported as <code>sources.&lt;id&gt;.output</code>; the source is
+measured on the output that reports the frame (nested has one).</p>
+<h3 id="presentation-statistics">Presentation statistics</h3>
+<p>Every window, output and content source is measured, whether or not the
+client asks for feedback. The statistics follow content, not feedback
+objects: an update is one buffer handed to the renderer (a window) or one
+revision (a content source). A frame that shows a newer update presents it;
+the updates it skipped count as <code>discarded</code>.</p>
+<ul>
+<li><strong>Windows:</strong> <code>windows.s&lt;id&gt;.presentation.*</code>. Subsurface updates count for
+their window; a frame that shows several surfaces of one window counts
+once. A new role (a new <code>generation</code>) starts from zero.</li>
+<li><strong>Intervals</strong> are measured only between two presentations while the window
+stays shown, so a minimised or hidden stretch is not one long interval.</li>
+<li><strong><code>commit_to_present</code></strong> is the time from the buffer's commit to the frame
+that showed it. For a content source it starts when comp first sees the
+revision.</li>
+<li><strong><code>missed</code></strong> counts vblanks skipped while an update was waiting: for a
+fixed refresh <code>R</code>, a gap of <code>round(interval / R)</code> vblanks counts the skipped
+ones at or after the moment the oldest waiting update was committed. An
+idle client that commits late misses nothing. With an unknown or variable
+refresh (nested) <code>missed</code> is null, never 0: unmeasured is not perfect.</li>
+<li><strong><code>input_to_present</code></strong> is the time from an injected input to the first
+presented update committed after it (a comp-side upper bound). A content
+source's update records it when it names the input's <code>input_seq</code>.</li>
+<li><strong>Rings</strong> keep the newest 512 samples; <code>_p50</code>/<code>_p99</code> are nearest-rank
+percentiles over them, null without samples.</li>
+<li>All times are CLOCK_MONOTONIC microseconds; <code>since_us</code> is when counting
+started (the first update, registration, compositor start, or the last
+reset).</li>
+</ul>
+<p>The presentation leaves and the whole <code>sources</code> subtree are <strong>volatile</strong>:
+<code>get</code>, <code>list</code> and <code>describe</code> serve them (<code>describe</code> says <code>volatile: true</code>),
+but <code>props.changed</code> never reports them, so a watched client presenting at
+60 Hz does not flood the topic. Row add and remove events carry no
+presentation leaves either.</p>
+<p><code>comp.window.stats {id, generation, samples?}</code> returns the window's leaves
+plus the newest <code>samples</code> (default and maximum 512) of <code>intervals_us</code>,
+<code>commit_to_present_us</code> and <code>input_to_present_us</code>. <code>{source, registration?, samples?}</code> does the same for a content source and adds <code>upload_bytes</code> and
+<code>damage_px</code> (per reported frame). <code>{id, generation}</code> and <code>{source}</code> are
+mutually exclusive (<code>invalid_value</code>). <code>comp.window.stats.reset</code> takes the same
+targets without <code>samples</code>, or no target to zero every window, output and
+source; it replies <code>{reset, since_us, ...}</code>. Errors: the window errors of
+<code>comp.window.*</code>, <code>unknown_source</code>, and <code>stale_target</code> with <code>registration</code> and
+<code>current</code> when the source id was registered again. A session lock refuses the
+window forms (<code>locked</code>); source reads and the global reset still work.</p>
+<p>Each <code>comp.window.*</code> verb emits a <code>comp_window_control</code> trace record
+(subject window id or 0, detail 1 minimise / 2 restore / 3 stats / 4 reset,
+aux generation).</p>
+<p>Content-source honesty limits: a source counts as presented when its entity
+was visible in a presented frame; comp cannot tell whether the plugin's own
+texture upload for that revision had finished. Flags and clock are the
+frame's. Re-inserting the same id with another <code>output</code> keeps the original
+registration and its output. Only the newest <code>consumed_input</code> is kept
+between two reports.</p>
+<p>Gate G1s: a build with the test-only <code>content-source-probe</code> feature adds a
+nested quad registered as source <code>probe</code> that changes every frame for
+<code>COSMIX_CONTENT_SOURCE_PROBE_REVISIONS</code> revisions (default 300), logs
+<code>COSMIX_CONTENT_SOURCE_PROBE DONE revisions=… upload_bytes=… damage_px=…</code>,
+holds for four seconds and despawns (<code>… DESPAWNED</code>).</p>
 <h2 id="xwayland">XWayland</h2>
 <p>The <code>xwayland</code> cargo feature is in the default set: every default build
 supervises one rootless Xwayland instance and acts as its X11 window

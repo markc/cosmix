@@ -226,7 +226,7 @@ fn x11_generation_is_readable_and_fences_window_verbs() {
             target: Some((id, generation)),
         },
     ] {
-        let admission = ingress.request_window(op).expect("verb admitted");
+        let admission = ingress.request_window(op.clone()).expect("verb admitted");
         harness
             .server
             .dispatch_cycle(Some(Duration::ZERO))

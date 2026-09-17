@@ -17,6 +17,8 @@ use smithay::{
     wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer},
 };
 
+use super::presentation::SourcePresentationLeaves;
+use super::presentation_stats::{OutputStats, PresentationLeaves};
 use super::{
     ChromePointerGrabKind, InteractivePointer, LayerOutputBinding, LockLifecycle,
     LogicalOutputRect, SceneDecorationMode, StackBand, SurfaceId, SurfaceRecord, SurfaceRole,
@@ -87,6 +89,7 @@ pub(crate) struct CompSnapshot {
     pub(crate) outputs: BTreeMap<String, OutputSnapshot>,
     pub(crate) surfaces: BTreeMap<String, SurfaceSnapshot>,
     pub(crate) windows: BTreeMap<String, WindowSnapshot>,
+    pub(crate) sources: BTreeMap<String, SourceSnapshot>,
     pub(crate) stack: Vec<u64>,
     pub(crate) focus: FocusSnapshot,
     pub(crate) decoration: DecorationSnapshot,
@@ -127,6 +130,9 @@ pub(crate) struct OutputSnapshot {
     pub(crate) scale: f64,
     pub(crate) refresh_mhz: u32,
     pub(crate) usable: RectSnapshot,
+    /// Volatile; filled only in read snapshots (never in diffed rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) presentation: Option<OutputPresentationSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -205,6 +211,50 @@ pub(crate) struct WindowSnapshot {
     pub(crate) window_y: f32,
     pub(crate) visible: bool,
     pub(crate) pid: Option<u64>,
+    /// Volatile; filled only in read snapshots (never in diffed rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) presentation: Option<PresentationLeaves>,
+}
+
+/// `outputs.o_<slug>.presentation.*` (volatile).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OutputPresentationSnapshot {
+    pub(crate) clock_id: u32,
+    pub(crate) flags: Option<u32>,
+    pub(crate) refresh_us: Option<u64>,
+    pub(crate) frames: u64,
+    pub(crate) interval_p50_us: Option<u64>,
+    pub(crate) interval_p99_us: Option<u64>,
+    pub(crate) since_us: u64,
+}
+
+/// `sources.<id>` (volatile, like everything a source reports).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct SourceSnapshot {
+    pub(crate) output: Option<String>,
+    pub(crate) registered_at_us: u64,
+    pub(crate) revision: u64,
+    pub(crate) registration: u64,
+    pub(crate) presentation: SourcePresentationLeaves,
+}
+
+/// Select inside a small volatile object through its serialised form.
+fn select_serialised<T: Serialize>(value: &T, path: &[&str]) -> Option<Value> {
+    let mut node = serialise_selected(value)?;
+    for segment in path {
+        node = node.as_object_mut()?.remove(*segment)?;
+    }
+    Some(node)
+}
+
+fn serialised_node_kind<T: Serialize>(value: &T, path: &[&str]) -> Option<SnapshotNodeKind> {
+    select_serialised(value, path).map(|node| {
+        if node.is_object() {
+            SnapshotNodeKind::Object
+        } else {
+            SnapshotNodeKind::Leaf
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -315,6 +365,7 @@ impl CompSnapshot {
             "outputs" => select_map(&self.outputs, tail, OutputSnapshot::select),
             "surfaces" => select_map(&self.surfaces, tail, SurfaceSnapshot::select),
             "windows" => select_map(&self.windows, tail, WindowSnapshot::select),
+            "sources" => select_map(&self.sources, tail, select_serialised::<SourceSnapshot>),
             "stack" if tail.is_empty() => serialise_selected(&self.stack),
             "focus" => self.focus.select(tail),
             "decoration" => self.decoration.select(tail),
@@ -336,6 +387,7 @@ impl CompSnapshot {
             "outputs" => map_node_kind(&self.outputs, tail, OutputSnapshot::node_kind),
             "surfaces" => map_node_kind(&self.surfaces, tail, SurfaceSnapshot::node_kind),
             "windows" => map_node_kind(&self.windows, tail, WindowSnapshot::node_kind),
+            "sources" => map_node_kind(&self.sources, tail, serialised_node_kind::<SourceSnapshot>),
             "stack" if tail.is_empty() => Some(SnapshotNodeKind::Leaf),
             "focus" => self.focus.node_kind(tail),
             "decoration" => self.decoration.node_kind(tail),
@@ -372,6 +424,9 @@ impl CompSnapshot {
                 PatternSegment::Literal(segment) => append_segments(&mut paths, [*segment]),
                 PatternSegment::OutputKey => {
                     append_segments(&mut paths, self.outputs.keys().map(String::as_str));
+                }
+                PatternSegment::SourceKey => {
+                    append_segments(&mut paths, self.sources.keys().map(String::as_str));
                 }
                 PatternSegment::SurfaceKey => match pattern.first() {
                     Some(PatternSegment::Literal("surfaces")) => {
@@ -463,27 +518,37 @@ flat_snapshot!(
 );
 #[cfg(feature = "xwayland")]
 flat_snapshot!(XwaylandSnapshot, enabled, persist_path);
-flat_snapshot!(
-    WindowSnapshot,
-    id,
-    foreign_id,
-    title,
-    app_id,
-    x,
-    y,
-    width,
-    height,
-    focused,
-    maximized,
-    fullscreen,
-    minimized,
-    output,
-    band,
-    generation,
-    window_x,
-    window_y,
-    visible,
-    pid,
+macro_rules! window_snapshot {
+    ($($field:ident),+ $(,)?) => {
+        impl WindowSnapshot {
+            fn select(&self, path: &[&str]) -> Option<Value> {
+                match path {
+                    [] => serialise_selected(self),
+                    $([stringify!($field)] => serialise_selected(&self.$field),)+
+                    ["presentation", tail @ ..] => {
+                        select_serialised(self.presentation.as_ref()?, tail)
+                    }
+                    _ => None,
+                }
+            }
+
+            fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+                match path {
+                    [] => Some(SnapshotNodeKind::Object),
+                    $([stringify!($field)] => Some(SnapshotNodeKind::Leaf),)+
+                    ["presentation", tail @ ..] => {
+                        serialised_node_kind(self.presentation.as_ref()?, tail)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+window_snapshot!(
+    id, foreign_id, title, app_id, x, y, width, height, focused, maximized, fullscreen, minimized,
+    output, band, generation, window_x, window_y, visible, pid,
 );
 flat_snapshot!(FocusWindowSnapshot, id, generation);
 
@@ -554,6 +619,7 @@ impl OutputSnapshot {
             ["scale"] => serialise_selected(&self.scale),
             ["refresh_mhz"] => serialise_selected(&self.refresh_mhz),
             ["usable", tail @ ..] => self.usable.select(tail),
+            ["presentation", tail @ ..] => select_serialised(self.presentation.as_ref()?, tail),
             _ => None,
         }
     }
@@ -565,6 +631,7 @@ impl OutputSnapshot {
                 Some(SnapshotNodeKind::Leaf)
             }
             ["usable", tail @ ..] => self.usable.node_kind(tail),
+            ["presentation", tail @ ..] => serialised_node_kind(self.presentation.as_ref()?, tail),
             _ => None,
         }
     }
@@ -676,6 +743,7 @@ pub(super) fn project_outputs(state: &WaylandState) -> Option<OutputProjection> 
                     width: usable.width,
                     height: usable.height,
                 },
+                presentation: None,
             },
         );
     }
@@ -710,6 +778,7 @@ pub(super) fn project_output(
                 width: usable.width,
                 height: usable.height,
             },
+            presentation: None,
         },
     ))
 }
@@ -819,6 +888,7 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         window_y: surface.window.window_y,
         visible: surface.visible,
         pid: surface.window.pid,
+        presentation: None,
     }
 }
 
@@ -890,7 +960,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
     // (`surface_is_session_presentable`). Do not derive it from visibility.
     let session_lock_active = state.session_lock_active();
     let OutputProjection {
-        rows: outputs,
+        rows: mut outputs,
         keys: output_keys,
         slug_collisions,
     } = project_outputs(state)?;
@@ -908,7 +978,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         );
     }
 
-    let windows = if session_lock_active {
+    let mut windows = if session_lock_active {
         BTreeMap::new()
     } else {
         surfaces
@@ -917,6 +987,40 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             .map(|(key, surface)| (key.clone(), project_window_row(surface)))
             .collect()
     };
+
+    let stats = &state.presentation.stats;
+    for window in windows.values_mut() {
+        window.presentation = Some(stats.window(window.id, window.generation).map_or_else(
+            || PresentationLeaves {
+                since_us: stats.epoch_us,
+                ..PresentationLeaves::default()
+            },
+            |window| window.leaves(),
+        ));
+    }
+    for output in outputs.values_mut() {
+        output.presentation = Some(output_presentation(
+            stats.output(&output.name),
+            stats.epoch_us,
+        ));
+    }
+    let sources = state
+        .presentation
+        .sources
+        .iter()
+        .map(|(id, counters)| {
+            (
+                id.clone(),
+                SourceSnapshot {
+                    output: counters.output.clone(),
+                    registered_at_us: counters.registered_at_us,
+                    revision: counters.revision,
+                    registration: counters.registration,
+                    presentation: counters.leaves(),
+                },
+            )
+        })
+        .collect();
 
     let stack = project_stack(state);
 
@@ -934,6 +1038,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         outputs,
         surfaces,
         windows,
+        sources,
         stack,
         focus: project_focus(state),
         decoration: DecorationSnapshot {
@@ -980,6 +1085,20 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         },
         full_tree: tokio::sync::OnceCell::new(),
     })
+}
+
+fn output_presentation(stats: Option<&OutputStats>, epoch_us: u64) -> OutputPresentationSnapshot {
+    OutputPresentationSnapshot {
+        clock_id: libc::CLOCK_MONOTONIC as u32,
+        flags: stats
+            .filter(|stats| stats.frames > 0)
+            .map(|stats| stats.flags),
+        refresh_us: stats.and_then(|stats| stats.refresh_us),
+        frames: stats.map_or(0, |stats| stats.frames),
+        interval_p50_us: stats.and_then(|stats| stats.intervals_us.percentile(50)),
+        interval_p99_us: stats.and_then(|stats| stats.intervals_us.percentile(99)),
+        since_us: stats.map_or(epoch_us, |stats| stats.since_us),
+    }
 }
 
 fn output_slug_collides(
@@ -1140,6 +1259,8 @@ pub(crate) enum PatternSegment {
     Literal(&'static str),
     OutputKey,
     SurfaceKey,
+    /// A content source id (`[a-z0-9_-]{1,64}`).
+    SourceKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1154,6 +1275,8 @@ pub(crate) struct DescribeEntry {
     pub(crate) range: Option<&'static str>,
     pub(crate) persistence: Option<&'static str>,
     pub(crate) owner: &'static str,
+    /// Served by reads but never reported by `props.changed`.
+    pub(crate) volatile: bool,
 }
 
 macro_rules! descriptor {
@@ -1169,6 +1292,7 @@ macro_rules! descriptor {
             range: None,
             persistence: None,
             owner: "comp",
+            volatile: false,
         }
     };
     ($segments:expr, $ty:ident, $description:expr, mutable, range = $range:expr) => {
@@ -1200,7 +1324,16 @@ macro_rules! descriptor {
     };
 }
 
-use PatternSegment::{Literal as L, OutputKey as O, SurfaceKey as S};
+macro_rules! volatile {
+    ([$($segment:expr),+ $(,)?], $ty:ident, $description:expr) => {
+        DescribeEntry {
+            volatile: true,
+            ..descriptor!(&[$($segment),+], $ty, $description)
+        }
+    };
+}
+
+use PatternSegment::{Literal as L, OutputKey as O, SourceKey as C, SurfaceKey as S};
 
 pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
@@ -1632,6 +1765,264 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Resolved per-socket file xwayland.enabled persists to (root- and \
          socket-dependent; read-only so the governing file is visible, not deduced)"
     ),
+    // Presentation statistics are volatile: served by get/list/describe,
+    // never diffed into props.changed (a watched 60 Hz client would flood
+    // the topic). Times are CLOCK_MONOTONIC µs.
+    volatile!(
+        [L("windows"), S, L("presentation"), L("presented")],
+        Number,
+        "Content updates shown since since_us (one per frame, subsurfaces included)"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("discarded")],
+        Number,
+        "Content updates superseded before any frame showed them"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("last_presented_us")],
+        Number,
+        "Time of the newest frame that showed an update, or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("interval_p50_us")],
+        Number,
+        "Median interval between consecutive presentations while shown (newest 512), or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("interval_p99_us")],
+        Number,
+        "99th percentile interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("interval_max_us")],
+        Number,
+        "Largest interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("commit_to_present_p50_us")
+        ],
+        Number,
+        "Median buffer commit to presentation latency (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("commit_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile buffer commit to presentation latency (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("input_to_present_p50_us")
+        ],
+        Number,
+        "Median injected input to first presented update committed after it, or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("input_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile injected input to presentation latency, or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("missed")],
+        Number,
+        "Vblanks skipped while an update was pending; null while the refresh is unknown (nested)"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("refresh_us")],
+        Number,
+        "Fixed refresh of the newest presentation's output, or null (unknown or variable)"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("since_us")],
+        Number,
+        "When counting started (the window's first update or the last reset)"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("clock_id")],
+        Number,
+        "Presentation clock id (1 = CLOCK_MONOTONIC)"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("flags")],
+        Number,
+        "wp_presentation_feedback kind bits of the newest frame, or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("refresh_us")],
+        Number,
+        "Fixed refresh reported with the newest frame, or null (unknown or variable)"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("frames")],
+        Number,
+        "Frames presented on this output since since_us"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("interval_p50_us")],
+        Number,
+        "Median interval between presented frames (newest 512), or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("interval_p99_us")],
+        Number,
+        "99th percentile interval between presented frames (newest 512), or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("since_us")],
+        Number,
+        "When counting started (compositor start or the last reset)"
+    ),
+    volatile!(
+        [L("sources"), C, L("output")],
+        String,
+        "Output the content source asked to be measured on, or null for any"
+    ),
+    volatile!(
+        [L("sources"), C, L("registered_at_us")],
+        Number,
+        "When this registration of the id began"
+    ),
+    volatile!(
+        [L("sources"), C, L("revision")],
+        Number,
+        "Newest content revision reported by the source"
+    ),
+    volatile!(
+        [L("sources"), C, L("registration")],
+        Number,
+        "Registration number; a new one each time the id is registered"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("presented")],
+        Number,
+        "Revisions shown since since_us"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("discarded")],
+        Number,
+        "Revisions superseded before any frame showed them"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("last_presented_us")],
+        Number,
+        "Time of the newest frame that showed a revision, or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("interval_p50_us")],
+        Number,
+        "Median interval between consecutive presentations while shown (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("interval_p99_us")],
+        Number,
+        "99th percentile interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("interval_max_us")],
+        Number,
+        "Largest interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("commit_to_present_p50_us")
+        ],
+        Number,
+        "Median time from comp first seeing a revision to its presentation, or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("commit_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile time from comp first seeing a revision to its presentation, or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("input_to_present_p50_us")
+        ],
+        Number,
+        "Median injected input to presentation of the revision that answered it, or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("input_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile injected input to presentation latency, or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("missed")],
+        Number,
+        "Vblanks skipped while a revision was pending; null while the refresh is unknown (nested)"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("refresh_us")],
+        Number,
+        "Fixed refresh of the newest presentation's output, or null (unknown or variable)"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("since_us")],
+        Number,
+        "When counting started (registration or the last reset)"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("upload_bytes_total")],
+        Number,
+        "GPU upload bytes the source reported since since_us"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("damage_px_total")],
+        Number,
+        "Damaged physical pixels the source reported since since_us"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("upload_bytes_p50")],
+        Number,
+        "Median upload bytes per reported frame (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("upload_bytes_p99")],
+        Number,
+        "99th percentile upload bytes per reported frame (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("damage_px_p50")],
+        Number,
+        "Median damaged pixels per reported frame (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("damage_px_p99")],
+        Number,
+        "99th percentile damaged pixels per reported frame (newest 512), or null"
+    ),
     descriptor!(&[L("port"), L("level")], String, "Implemented property substrate level", enum = &["L2"]),
     descriptor!(
         &[L("port"), L("event_seq")],
@@ -1679,6 +2070,15 @@ impl DescribeEntry {
                     PatternSegment::SurfaceKey => actual.strip_prefix('s').is_some_and(|id| {
                         !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
                     }),
+                    PatternSegment::SourceKey => {
+                        (1..=64).contains(&actual.len())
+                            && actual.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || byte == b'_'
+                                    || byte == b'-'
+                            })
+                    }
                 })
     }
 }
@@ -1702,10 +2102,24 @@ struct DescribeReply<'a> {
     owner: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     children: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "is_false")]
+    volatile: bool,
 }
 
 fn slice_is_empty(values: &&[&str]) -> bool {
     values.is_empty()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Paths `props.changed` never reports: presentation statistics and the
+/// content-source registry change every frame.
+pub(crate) fn volatile_path(path: &str) -> bool {
+    path == "sources"
+        || path.starts_with("sources.")
+        || path.split('.').any(|segment| segment == "presentation")
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -1962,6 +2376,7 @@ fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
             persistence: entry.persistence,
             owner: entry.owner,
             children: None,
+            volatile: entry.volatile,
         })
         .ok();
     }
@@ -1986,6 +2401,7 @@ fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
         persistence: None,
         owner: "comp",
         children: Some(children.into_iter().collect()),
+        volatile: volatile_path(path.as_str()),
     })
     .ok()
 }
@@ -2018,6 +2434,15 @@ mod tests {
                     width: 1920.0,
                     height: 1050.0,
                 },
+                presentation: Some(OutputPresentationSnapshot {
+                    clock_id: 1,
+                    flags: Some(0),
+                    refresh_us: None,
+                    frames: 3,
+                    interval_p50_us: Some(16_000),
+                    interval_p99_us: Some(17_000),
+                    since_us: 5,
+                }),
             },
         );
         let layer = SurfaceSnapshot {
@@ -2144,6 +2569,26 @@ mod tests {
                 window_y: toplevel.window.window_y,
                 visible: toplevel.visible,
                 pid: toplevel.window.pid,
+                presentation: Some(PresentationLeaves {
+                    presented: 3,
+                    interval_p50_us: Some(16_000),
+                    since_us: 5,
+                    ..PresentationLeaves::default()
+                }),
+            },
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "scene".to_string(),
+            SourceSnapshot {
+                output: None,
+                registered_at_us: 7,
+                revision: 4,
+                registration: 1,
+                presentation: SourcePresentationLeaves {
+                    upload_bytes_total: 640,
+                    ..SourcePresentationLeaves::default()
+                },
             },
         );
         CompSnapshot {
@@ -2159,6 +2604,7 @@ mod tests {
             outputs,
             surfaces,
             windows,
+            sources,
             stack: vec![1, 2],
             focus: FocusSnapshot {
                 keyboard: Some(2),
@@ -2269,6 +2715,62 @@ mod tests {
                 descriptor.pattern
             );
         }
+    }
+
+    #[test]
+    fn presentation_and_source_leaves_are_described_as_volatile() {
+        let snapshot = fixture();
+        let describe_json = |path: &str| {
+            let body = describe(&snapshot, &PropPath::new(path).unwrap())
+                .unwrap_or_else(|| panic!("describe {path}"));
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        for path in [
+            "windows.s2.presentation.presented",
+            "windows.s2.presentation.missed",
+            "outputs.o_dp_1.presentation.frames",
+            "sources.scene.revision",
+            "sources.scene.output",
+            "sources.scene.presentation.upload_bytes_p99",
+        ] {
+            let body = describe_json(path);
+            assert_eq!(body["volatile"], true, "{path}");
+            assert_eq!(body["mutable"], false, "{path}");
+            assert!(volatile_path(path), "{path}");
+        }
+        for path in ["windows.s2.presentation", "sources.scene", "sources"] {
+            let body = describe_json(path);
+            assert_eq!(body["type"], "object");
+            assert_eq!(body["volatile"], true, "{path}");
+        }
+        assert!(
+            describe_json("windows.s2.presentation")["children"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("windows.s2.presentation.since_us"))
+        );
+        for path in ["windows.s2.title", "outputs.o_dp_1", "windows"] {
+            assert!(describe_json(path).get("volatile").is_none(), "{path}");
+            assert!(!volatile_path(path), "{path}");
+        }
+        assert_eq!(
+            snapshot.select(&["sources", "scene", "presentation", "upload_bytes_total"]),
+            Some(json!(640))
+        );
+        assert_eq!(
+            snapshot.select(&["windows", "s2", "presentation", "missed"]),
+            Some(Value::Null),
+            "unmeasured missed is null"
+        );
+        assert_eq!(
+            snapshot.select(&["outputs", "o_dp_1", "presentation", "clock_id"]),
+            Some(json!(1))
+        );
+        assert_eq!(snapshot.select(&["sources", "scene", "nope"]), None);
+        assert_eq!(
+            snapshot.select(&["windows", "s2", "presentation", "presented", "x"]),
+            None
+        );
     }
 
     #[tokio::test]

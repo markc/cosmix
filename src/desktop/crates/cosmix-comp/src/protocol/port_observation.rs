@@ -31,7 +31,7 @@ use super::{
     port_snapshot::{
         BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
         SurfaceSnapshot, WindowSnapshot, project_focus, project_output, project_outputs,
-        project_stack, project_surface_by_id, project_window_row, snapshot,
+        project_stack, project_surface_by_id, project_window_row, snapshot, volatile_path,
     },
     window_control::WindowTargetError,
 };
@@ -1600,7 +1600,10 @@ fn diff_output_row(
                 pending,
                 prefix.into(),
                 PropValue::null(),
-                PropValue::OutputRow(Box::new(new.clone())),
+                PropValue::OutputRow(Box::new(OutputSnapshot {
+                    presentation: None,
+                    ..new.clone()
+                })),
                 cause,
             );
         }
@@ -1608,7 +1611,10 @@ fn diff_output_row(
             queue_prop_change(
                 pending,
                 prefix.into(),
-                PropValue::OutputRow(Box::new(old.clone())),
+                PropValue::OutputRow(Box::new(OutputSnapshot {
+                    presentation: None,
+                    ..old.clone()
+                })),
                 PropValue::null(),
                 cause,
             );
@@ -1844,7 +1850,10 @@ fn diff_window_row(
                 pending,
                 prefix.into(),
                 PropValue::null(),
-                PropValue::WindowRow(Box::new(new.clone())),
+                PropValue::WindowRow(Box::new(WindowSnapshot {
+                    presentation: None,
+                    ..new.clone()
+                })),
                 cause,
             );
             return;
@@ -1853,7 +1862,10 @@ fn diff_window_row(
             queue_prop_change(
                 pending,
                 prefix.into(),
-                PropValue::WindowRow(Box::new(old.clone())),
+                PropValue::WindowRow(Box::new(WindowSnapshot {
+                    presentation: None,
+                    ..old.clone()
+                })),
                 PropValue::null(),
                 cause,
             );
@@ -2013,7 +2025,7 @@ fn queue_prop_change(
     new: PropValue,
     cause: &'static str,
 ) {
-    if old == new || path.starts_with("port.") {
+    if old == new || path.starts_with("port.") || volatile_path(&path) {
         return;
     }
     match pending.entry(path) {
@@ -2042,7 +2054,7 @@ fn emit_prop_change(
     new: PropValue,
     cause: &'static str,
 ) {
-    if old == new || path.starts_with("port.") {
+    if old == new || path.starts_with("port.") || volatile_path(&path) {
         return;
     }
     let unix_ms = unix_millis();
@@ -2852,12 +2864,27 @@ mod tests {
                 width: 640.0,
                 height: 480.0,
             },
+            presentation: None,
+        };
+        // A read snapshot's row carries volatile presentation leaves; a row
+        // event never does.
+        let read_row = OutputSnapshot {
+            presentation: Some(crate::protocol::port_snapshot::OutputPresentationSnapshot {
+                clock_id: 1,
+                flags: None,
+                refresh_us: None,
+                frames: 9,
+                interval_p50_us: None,
+                interval_p99_us: None,
+                since_us: 0,
+            }),
+            ..row.clone()
         };
         let mut changes = PendingPropChanges::new();
         diff_output_row(
             "outputs.o_nested",
             None,
-            Some(&row),
+            Some(&read_row),
             "output.geometry",
             &mut changes,
         );
@@ -2912,6 +2939,10 @@ mod tests {
             window: Default::default(),
         };
         let window = project_window_row(&surface);
+        let read_window = WindowSnapshot {
+            presentation: Some(Default::default()),
+            ..window.clone()
+        };
         let mut keyed = PendingPropChanges::new();
         diff_surface_row(
             "surfaces.s7",
@@ -2920,11 +2951,39 @@ mod tests {
             "wayland.map",
             &mut keyed,
         );
-        diff_window_row("windows.s7", None, Some(&window), "wayland.map", &mut keyed);
+        diff_window_row(
+            "windows.s7",
+            None,
+            Some(&read_window),
+            "wayland.map",
+            &mut keyed,
+        );
         assert_eq!(
             keyed.keys().cloned().collect::<Vec<_>>(),
             ["surfaces.s7", "windows.s7"]
         );
+        assert_eq!(
+            keyed["windows.s7"].1,
+            PropValue::WindowRow(Box::new(window.clone())),
+            "the added row has no presentation leaves"
+        );
+        // Rows that differ only in presentation produce no change.
+        let mut quiet = PendingPropChanges::new();
+        diff_window_row(
+            "windows.s7",
+            Some(&window),
+            Some(&read_window),
+            "wayland.commit",
+            &mut quiet,
+        );
+        diff_output_row(
+            "outputs.o_nested",
+            Some(&row),
+            Some(&read_row),
+            "output.geometry",
+            &mut quiet,
+        );
+        assert!(quiet.is_empty(), "{quiet:?}");
         let mut removed = PendingPropChanges::new();
         diff_surface_row(
             "surfaces.s7",
@@ -2967,6 +3026,20 @@ mod tests {
             PropValue::U64(2),
             "wayland.map",
         );
+        for volatile in [
+            "windows.s2.presentation.presented",
+            "outputs.o_dp_1.presentation.frames",
+            "sources.scene.revision",
+            "sources.scene.presentation.presented",
+        ] {
+            queue_prop_change(
+                &mut pending,
+                volatile.into(),
+                PropValue::U64(1),
+                PropValue::U64(2),
+                "frame",
+            );
+        }
         assert_eq!(
             pending.remove("surfaces.s2.title"),
             Some((prop_str("old"), prop_str("new"), "wayland.map"))
@@ -3119,6 +3192,7 @@ mod tests {
                         width: 1.0,
                         height: 1.0,
                     },
+                    presentation: None,
                 },
                 event_seq: 5,
             },
