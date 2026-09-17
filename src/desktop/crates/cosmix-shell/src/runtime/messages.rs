@@ -63,7 +63,13 @@ pub struct ShellResizeResult {
     pub edge: Edge,
     pub requested: f32,
     pub max: f32,
-    pub result: Result<(), String>,
+    pub result: Result<(), ShellResizeError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShellResizeError {
+    OutputChanged,
+    Configuration(crate::core::PanelConfigError),
 }
 
 /// One edge-attributed semantic transition from the current model update.

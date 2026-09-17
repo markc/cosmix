@@ -161,7 +161,7 @@ fn update_model(
                     edge,
                     requested: thickness_px,
                     max: runtime.model.max_thickness(edge),
-                    result: Err("output changed before resize application".into()),
+                    result: Err(super::ShellResizeError::OutputChanged),
                 });
             }
             continue;
@@ -199,7 +199,7 @@ fn update_model(
                         edge: *edge,
                         requested: *thickness_px,
                         max: runtime.model.max_thickness(*edge),
-                        result: result.map_err(|error| error.to_string()),
+                        result: result.map_err(super::ShellResizeError::Configuration),
                     });
                 }
                 if result.is_ok()

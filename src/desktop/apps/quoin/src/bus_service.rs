@@ -21,6 +21,7 @@ use crate::power::{PowerAction, PowerSync};
 /// answers beats an unbounded one, and both beat silently losing every reply
 /// the moment the channel blinks.
 const MAX_PENDING_REPLIES: usize = 32;
+const RESIZE_RECEIPT_FRAMES: u64 = 120;
 
 #[derive(Component)]
 pub(crate) struct QuoinPowerText;
@@ -48,7 +49,8 @@ struct ShellBusState {
     /// work. Losing a reply outright would leave the peer hanging until its
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
-    pending_resizes: BTreeMap<u64, InboundRequest>,
+    pending_resizes: BTreeMap<u64, (InboundRequest, u64)>,
+    frame: u64,
 }
 
 impl Default for ShellBusState {
@@ -62,6 +64,7 @@ impl Default for ShellBusState {
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
+            frame: 0,
         }
     }
 }
@@ -114,12 +117,22 @@ fn reply_resizes(
     mut results: MessageReader<cosmix_shell::runtime::ShellResizeResult>,
 ) {
     for result in results.read() {
-        if let Some(request) = state.pending_resizes.remove(&result.request_id) {
+        if let Some((request, _)) = state.pending_resizes.remove(&result.request_id) {
             let (rc, body) = match &result.result {
                 Ok(()) => (0, json!({"accepted":true})),
+                Err(cosmix_shell::runtime::ShellResizeError::Configuration(
+                    cosmix_shell::core::PanelConfigError::ThicknessBudget {
+                        edge,
+                        requested,
+                        max,
+                    },
+                )) => (
+                    10,
+                    json!({"error_code":"PANEL_THICKNESS_BUDGET", "edge":format!("{edge:?}").to_lowercase(), "requested":requested, "max":max}),
+                ),
                 Err(error) => (
                     10,
-                    json!({"error_code":"PANEL_RESIZE_REJECTED", "error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
+                    json!({"error_code":"PANEL_RESIZE_REJECTED", "error":format!("{error:?}"), "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
                 ),
             };
             stash_or_respond(
@@ -151,6 +164,27 @@ fn service_bus(
     // This system is the app's single inbound drain + reply owner (see
     // `BusBridge::claim_inbound`); Quoin installs no `AppPortPlugin`.
     bridge.claim_inbound("quoin shell service");
+    state.frame = state.frame.saturating_add(1);
+    let frame_number = state.frame;
+    let expired: Vec<_> = state
+        .pending_resizes
+        .iter()
+        .filter_map(|(id, (_, deadline))| (frame_number >= *deadline).then_some(*id))
+        .collect();
+    for id in expired {
+        if let Some((request, _)) = state.pending_resizes.remove(&id) {
+            stash_or_respond(
+                &bridge,
+                &mut state,
+                request,
+                10,
+                json!({"error_code":"PANEL_RESIZE_TIMEOUT", "error":"model receipt expired"})
+                    .to_string(),
+                None,
+                &mut |_| {},
+            );
+        }
+    }
 
     if let Some(generation) = state.snapshot_retry.take() {
         request_power_snapshot(&bridge, &mut state, generation);
@@ -175,6 +209,8 @@ fn service_bus(
                 power_changed = true;
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
+                state.pending_resizes.clear();
+                state.pending_replies.clear();
                 state.power.invalidate();
                 state.snapshot_retry = None;
                 state.live_generation = None;
@@ -299,7 +335,10 @@ fn service_bus(
             if state.pending_resizes.len() < MAX_PENDING_REPLIES {
                 state.next_request_id = state.next_request_id.saturating_add(1);
                 let request_id = state.next_request_id;
-                state.pending_resizes.insert(request_id, request);
+                let deadline = state.frame.saturating_add(RESIZE_RECEIPT_FRAMES);
+                state
+                    .pending_resizes
+                    .insert(request_id, (request, deadline));
                 dispatch(ShellCommand {
                     output: output.clone(),
                     at: *at,
@@ -1166,6 +1205,7 @@ mod tests {
             let body: Value = serde_json::from_str(&replies[0].body).unwrap();
             if shrink {
                 assert_eq!(replies[0].rc, 10);
+                assert_eq!(body["error_code"], "PANEL_THICKNESS_BUDGET");
                 assert_eq!(body["edge"], "left");
                 assert_eq!(body["requested"], 240.0);
                 assert!(body["max"].as_f64().unwrap() < 240.0);
@@ -1185,6 +1225,56 @@ mod tests {
     }
 
     /// A `power.props.changed` delivery-gap notice on `generation`.
+    #[test]
+    fn missing_resize_receipts_expire_and_disconnect_clears_pending() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        let mut req = local("shell.panel.resize");
+        req.body = r#"{"edge":"left","thickness_px":240}"#.into();
+        peer.send(req.clone());
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_resizes
+                .len(),
+            1
+        );
+        for _ in 0..RESIZE_RECEIPT_FRAMES {
+            app.update();
+        }
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replies[0].body).unwrap()["error_code"],
+            "PANEL_RESIZE_TIMEOUT"
+        );
+        assert!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_resizes
+                .is_empty()
+        );
+        peer.send(req);
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_resizes
+                .len(),
+            1
+        );
+        peer.deliver_event(BusBridgeEvent::Fatal("test disconnect".into()));
+        app.update();
+        assert!(
+            app.world()
+                .resource::<ShellBusState>()
+                .pending_resizes
+                .is_empty()
+        );
+    }
+
     fn gap_change(generation: u64) -> BusMessage {
         let mut headers = BTreeMap::new();
         headers.insert("topic".to_owned(), "power.props.changed".to_owned());

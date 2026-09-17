@@ -11,49 +11,9 @@ use std::{
 
 const MAX_BYTES: u64 = 16_384;
 
-// Reversible wallpaper choices are controllable by registered local services
-// and admitted mesh services. Remote identity must come from the recipient's
-// noded, which strips client broker headers and stamps proven direct bridges.
+/// Mesh membership admits writes by default; the shared opt-in lock applies.
 fn authorize_preference_write(request: &ctk::bus::InboundRequest) -> Result<(), &'static str> {
-    if ctk::app_control::authorize_local_caller(request).is_ok() {
-        return Ok(());
-    }
-    let header = |name: &str| {
-        let mut values = request
-            .headers
-            .iter()
-            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str());
-        let value = values.next();
-        if values.next().is_some() { None } else { value }
-    };
-    let service_name = |name: &str| {
-        let bytes = name.as_bytes();
-        (2..=31).contains(&bytes.len())
-            && bytes[0].is_ascii_lowercase()
-            && bytes[1..]
-                .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
-    };
-    if request.headers.keys().any(|key| {
-        ["source_peer", "permissions", "signed_ident"]
-            .iter()
-            .any(|name| key.eq_ignore_ascii_case(name))
-    }) || header("broker_origin") != Some("mesh")
-    {
-        return Err("unproven_caller");
-    }
-    match (header("broker_peer"), header("broker_service")) {
-        (Some(peer), Some(service))
-            if !peer.is_empty()
-                && request.from == format!("bridge-{peer}")
-                && service_name(&request.from)
-                && service_name(service) =>
-        {
-            Ok(())
-        }
-        _ => Err("unproven_caller"),
-    }
+    ctk::app_control::authorize_local_caller(request).map_err(|_| "unproven_caller")
 }
 
 pub const CHANGED_TOPIC: &str = "wallpaper.props.changed";
@@ -398,7 +358,7 @@ fn save(path: &Path, preferences: &Preferences) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn unproven_mesh_writes_leave_memory_disk_and_revision_unchanged() {
+    fn mesh_writes_need_only_unique_broker_origin_and_persist() {
         use std::collections::BTreeMap;
         let valid = ctk::bus::InboundRequest {
             connection_generation: 1,
@@ -413,35 +373,18 @@ mod tests {
             reply_id: Some("write-test".into()),
         };
         let mut cases = Vec::new();
-        for name in ["broker_origin", "broker_peer", "broker_service"] {
-            let mut missing = valid.clone();
-            missing.headers.remove(name);
-            cases.push(missing);
-            let mut duplicate = valid.clone();
-            duplicate
-                .headers
-                .insert(name.to_uppercase(), valid.headers[name].clone());
-            cases.push(duplicate);
-        }
-        for (name, value) in [
-            ("broker_origin", "local-unregistered"),
-            ("broker_peer", "beta"),
-            ("broker_peer", ""),
-            ("broker_service", ""),
-            ("broker_service", "Invalid.service"),
-            ("Source_Peer", "alpha"),
-            ("PERMISSIONS", "all"),
-            ("signed_ident", "assertion"),
-        ] {
-            let mut request = valid.clone();
-            request.headers.insert(name.into(), value.into());
-            cases.push(request);
-        }
-        for from in ["", "mix-test", "bridge-beta"] {
-            let mut request = valid.clone();
-            request.from = from.into();
-            cases.push(request);
-        }
+        let mut missing = valid.clone();
+        missing.headers.remove("broker_origin");
+        cases.push(missing);
+        let mut duplicate = valid.clone();
+        duplicate
+            .headers
+            .insert("BROKER_ORIGIN".into(), "mesh".into());
+        cases.push(duplicate);
+        let mut valid = valid;
+        valid.from.clear();
+        valid.headers.remove("broker_peer");
+        valid.headers.remove("broker_service");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wallpaper.json");
         let mut store = PreferenceStore::load(Some(path.clone()));

@@ -5,13 +5,9 @@
 //! verbs are addressed to the app's exact process-scoped service name; there is
 //! no global app alias or implicit instance selection.
 //!
-//! Authority follows noded's current trust boundary. A registered local
-//! connection gets a canonical, broker-rewritten `from` identity and is inside
-//! the local trust domain. Mesh ingress has `from` stripped and is rejected.
-//! Wire-supplied `source_peer`, `permissions`, or `signed_ident` claims are also
-//! rejected. Remote invocation remains closed until noded supplies
-//! authenticated provenance suitable for resolving the
-//! [`cosmix_mesh_trust::ctk_caps::CTK_ACTIONS`] grant.
+//! Broker-stamped mesh deliveries reach every action without attestation.
+//! COSMIX_MESH_OPEN=0 opts into registered-local-only admission, shared with
+//! app control. Duplicate or missing broker origin remains invalid.
 //!
 //! Apps with same-frame action producers schedule [`crate::app_control::AppPortSystems`]
 //! after those producers and before their action routers. The invoke handler
@@ -25,7 +21,6 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{In, Res, ResMut};
 use cosmix_actions::{ActionArgs, ActionMeta, ActionRegistry, ActionSource, RegistryError};
-use cosmix_mesh_trust::ctk_caps::CTK_ACTIONS;
 use serde_json::{json, Map, Value};
 
 use crate::app_control::{
@@ -342,9 +337,7 @@ fn authorize_local_caller(request: &InboundRequest) -> Result<(), ActionPortErro
     crate::app_control::authorize_local_caller(request).map_err(|error| match error {
         LocalCallerError::RemoteIdentityUnavailable => ActionPortError::new(
             ACTION_ERROR_REMOTE_IDENTITY_UNAVAILABLE,
-            format!(
-                "remote ingress is closed until authenticated provenance can resolve {CTK_ACTIONS}"
-            ),
+            "remote ingress requires broker mesh origin and COSMIX_MESH_OPEN != 0",
         ),
         LocalCallerError::UnregisteredCaller => ActionPortError::new(
             ACTION_ERROR_UNREGISTERED_CALLER,
@@ -660,7 +653,10 @@ mod tests {
         assert_eq!(rc, 0);
         let verbs = describe["verbs"].as_array().unwrap();
         for verb in [ACTION_INVOKE_VERB, ACTIONS_LIST_VERB, ACTIONS_DESCRIBE_VERB] {
-            assert!(verbs.iter().any(|value| value["name"] == verb), "missing {verb}");
+            assert!(
+                verbs.iter().any(|value| value["name"] == verb),
+                "missing {verb}"
+            );
         }
     }
 

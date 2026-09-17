@@ -93,12 +93,22 @@ pub enum LocalCallerError {
 /// overwrites it from connection state on delivery. Absence fails closed, so
 /// CTK mutation requires the matching broker release.
 pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
+    authorize_with_mesh_policy(
+        request,
+        std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0"),
+    )
+}
+
+fn authorize_with_mesh_policy(
+    request: &InboundRequest,
+    mesh_open: bool,
+) -> Result<(), LocalCallerError> {
     let mut origins = request
         .headers
         .iter()
         .filter(|(key, _)| key.eq_ignore_ascii_case("broker_origin"))
         .map(|(_, value)| value.as_str());
-    if origins.next() == Some("mesh") && origins.next().is_none() {
+    if mesh_open && origins.next() == Some("mesh") && origins.next().is_none() {
         return Ok(());
     }
     let asserted = request.headers.keys().any(|name| {
@@ -130,11 +140,6 @@ fn is_bus_service_name(value: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-}
-
-/// Accept broker-stamped mesh membership or a registered local caller.
-pub fn authorize_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
-    authorize_local_caller(request)
 }
 
 // `ControlMeta` is attached by feature-independent spawners (the mixer board
@@ -625,14 +630,14 @@ pub(crate) fn dispatch_app_request(
 ) -> AppPortReply {
     let command = request.command.clone();
     if !dispatch_gate_skips(&command) {
-        let decision = authorize_caller(&request);
+        let decision = authorize_local_caller(&request);
         if let Err(error) = decision {
             return error_reply(match error {
                 LocalCallerError::UnregisteredCaller => {
                     "app verbs require a registered same-node caller"
                 }
                 LocalCallerError::RemoteIdentityUnavailable => {
-                    "remote ingress is closed until authenticated provenance is available"
+                    "remote ingress requires broker mesh origin and COSMIX_MESH_OPEN != 0"
                 }
             });
         }
@@ -1082,6 +1087,27 @@ mod tests {
             .headers
             .insert("broker_service".into(), service.into());
         request
+    }
+
+    #[test]
+    fn mesh_policy_defaults_open_and_opt_in_lock_keeps_local_admission() {
+        let local = request("app.test", &[]);
+        let mut mesh = local.clone();
+        mesh.from.clear();
+        mesh.headers.insert("broker_origin".into(), "mesh".into());
+        assert_eq!(authorize_with_mesh_policy(&mesh, true), Ok(()));
+        assert_eq!(
+            authorize_with_mesh_policy(&mesh, false),
+            Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
+        for open in [false, true] {
+            assert_eq!(authorize_with_mesh_policy(&local, open), Ok(()));
+            let mut duplicate = mesh.clone();
+            duplicate
+                .headers
+                .insert("BROKER_ORIGIN".into(), "mesh".into());
+            assert!(authorize_with_mesh_policy(&duplicate, open).is_err());
+        }
     }
 
     #[test]
