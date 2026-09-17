@@ -77,7 +77,7 @@ impl Plugin for SceneIcedPlugin {
                     // A texture added after this frame's asset events is not
                     // extracted until the next update, which an idle host
                     // may never run (bevy_ui's text_system does the same).
-                    .before(bevy::asset::AssetEventSystems),
+
             )
             .add_systems(Last, bridge::count_asset_events);
     }

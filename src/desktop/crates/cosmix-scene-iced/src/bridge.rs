@@ -489,7 +489,6 @@ pub(crate) fn route_pointer(
             match input.action {
                 PointerAction::Move { .. } | PointerAction::Scroll { .. } => {
                     if surfaces.get(entity).is_ok_and(|(_, state)| state.hovered) {
-                        route.over.remove(&pointer);
                         push(
                             &mut surfaces,
                             entity,
@@ -589,7 +588,6 @@ pub(crate) fn route_pointer(
                     if hovered != Some(entity) {
                         // Released outside: this is the leave, so the next
                         // motion must not produce another one.
-                        route.over.remove(&pointer);
                         push(
                             &mut surfaces,
                             entity,
@@ -598,7 +596,7 @@ pub(crate) fn route_pointer(
                         );
                     }
                 }
-                route.capture.remove(&pointer);
+                route.capture.clear();
             }
             PointerAction::Scroll { unit, x, y, .. } => {
                 if let Some(entity) = target {
