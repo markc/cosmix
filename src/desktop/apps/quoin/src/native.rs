@@ -68,10 +68,9 @@ fn shell_service(configured: Option<&str>, environment: Option<&str>) -> String 
         if crate::valid_service_name(name) {
             return name.to_owned();
         }
-        tracing::warn!(
+        warn!(
             source,
-            name,
-            "not a canonical Bus service name; using {DEFAULT_SHELL_SERVICE}"
+            name, "not a canonical Bus service name; using {DEFAULT_SHELL_SERVICE}"
         );
     }
     DEFAULT_SHELL_SERVICE.to_owned()
@@ -160,7 +159,7 @@ fn build_native(app: &mut App, service: Option<&str>) {
         .add_observer(grip_move)
         .add_observer(grip_end)
         .add_observer(grip_cancel);
-    tracing_notice();
+    tracing_notice(&service);
 }
 
 fn command(frame: &ShellFrameState, time: &Time<Real>, kind: ShellCommandKind) -> ShellCommand {
@@ -270,8 +269,8 @@ fn grip_cancel(
     }
 }
 
-fn tracing_notice() {
-    eprintln!("QUOIN_NATIVE_ENABLED renderer=comp panels=4 bus=shell");
+fn tracing_notice(service: &str) {
+    eprintln!("QUOIN_NATIVE_ENABLED renderer=comp panels=4 bus={service}");
 }
 
 fn model(name: &str, size: Vec2, registry: &cosmix_shell::chrome::QuoinPageRegistry) -> ShellModel {
