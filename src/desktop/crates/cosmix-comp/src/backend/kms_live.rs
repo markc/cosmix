@@ -12267,6 +12267,7 @@ mod tests {
                 id: crate::protocol::SurfaceId(id),
                 commit_seq: id,
                 shown: true,
+                waiting: false,
             }],
             ..Default::default()
         }

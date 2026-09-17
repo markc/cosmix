@@ -30052,6 +30052,7 @@ fn kms_frame_reports_name_their_own_output() {
             id,
             commit_seq: content_seq(&harness, &object),
             shown: true,
+            waiting: false,
         }],
         sources: Vec::new(),
     };
