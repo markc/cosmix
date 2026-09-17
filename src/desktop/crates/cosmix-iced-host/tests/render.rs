@@ -8,6 +8,7 @@ use cosmix_iced_host::{
     Settings, Surface,
 };
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 static FONT: &[u8] = include_bytes!("../../cosmix-comp/assets/fonts/DejaVuSans.ttf");
 const OPTIONS: &[&str] = &["alpha", "beta"];
@@ -94,6 +95,19 @@ impl Target {
             height,
             format,
         }
+    }
+
+    fn draw_at(&mut self, now: Instant) -> Frame {
+        self.surface
+            .draw_at(
+                &mut self.buffer,
+                self.width,
+                self.height,
+                self.width * 4,
+                self.format,
+                now,
+            )
+            .expect("draw")
     }
 
     fn draw(&mut self) -> Frame {
@@ -454,21 +468,21 @@ fn process_surfaces_the_caret_deadline_only_while_a_field_is_focused() {
     assert_eq!(target.surface.process().redraw, Redraw::Wait);
 
     target.click(input.center());
-    target.draw();
+    let t0 = Instant::now();
+    target.draw_at(t0);
     // Motion inside the focused field leaves its status unchanged.
     target
         .surface
         .cursor_moved(input.center() + cosmix_iced_host::core::Vector::new(5.0, 0.0));
-    let before = std::time::Instant::now();
-    let update = target.surface.process();
+    let update = target.surface.process_at(t0 + Duration::from_millis(10));
     assert!(!update.needs_redraw, "{update:?}");
     let Redraw::At(deadline) = update.redraw else {
         panic!("no caret deadline from process: {update:?}");
     };
-    assert!(deadline > before);
-    assert!(deadline <= before + std::time::Duration::from_millis(510));
+    assert!(deadline > t0);
+    assert!(deadline <= t0 + Duration::from_millis(500));
     // Idle: no work, same deadline.
-    let idle = target.surface.process();
+    let idle = target.surface.process_at(t0 + Duration::from_millis(20));
     assert!(!idle.needs_redraw);
     assert_eq!(idle.redraw, Redraw::At(deadline));
 
@@ -478,7 +492,17 @@ fn process_surfaces_the_caret_deadline_only_while_a_field_is_focused() {
         .queue_event(Event::Keyboard(keyboard::Event::ModifiersChanged(
             Modifiers::SHIFT,
         )));
-    assert!(matches!(target.surface.process().redraw, Redraw::At(_)));
+    assert!(matches!(
+        target
+            .surface
+            .process_at(t0 + Duration::from_millis(30))
+            .redraw,
+        Redraw::At(_)
+    ));
+    // Once the deadline passes, idle or not, a draw is due.
+    let late = target.surface.process_at(deadline);
+    assert!(late.needs_redraw);
+    assert_eq!(late.redraw, Redraw::NextFrame);
 
     // Blur: the pending draw recomputes, and afterwards nothing is scheduled.
     let update = target.click(empty);
@@ -568,4 +592,144 @@ fn independent_surfaces_share_one_process() {
         assert!(!target.surface.process().needs_redraw);
         assert!(target.draw().damage.is_empty());
     }
+}
+
+#[test]
+fn padded_rows_match_tight_rows_and_padding_is_untouched() {
+    const TEXTURE_WIDTH: u32 = 256;
+    for format in [PixelFormat::Rgba8, PixelFormat::Argb8888] {
+        let mut tight = Target::new(1.0, format);
+        let mut padded = Target::new(1.0, format);
+        let stride = TEXTURE_WIDTH * 4;
+        padded.buffer = vec![0xab; stride as usize * padded.height as usize];
+        let draw_padded = |target: &mut Target| {
+            target
+                .surface
+                .draw(
+                    &mut target.buffer,
+                    target.width,
+                    target.height,
+                    stride,
+                    target.format,
+                )
+                .expect("padded draw")
+        };
+        tight.draw();
+        assert!(draw_padded(&mut padded).full);
+        let button = tight.bounds("button");
+        for target in [&mut tight, &mut padded] {
+            target.surface.cursor_moved(button.center());
+            target.surface.process();
+        }
+        tight.draw();
+        let frame = draw_padded(&mut padded);
+        assert!(!frame.full && !frame.damage.is_empty());
+        for y in 0..tight.height as usize {
+            let row = &padded.buffer[y * stride as usize..(y + 1) * stride as usize];
+            let visible = tight.width as usize * 4;
+            assert_eq!(
+                &row[..visible],
+                &tight.buffer[y * visible..(y + 1) * visible],
+                "{format:?} row {y}"
+            );
+            assert!(
+                row[visible..].iter().all(|b| *b == 0xab),
+                "{format:?} padding row {y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn narrow_or_ragged_strides_are_refused() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    let mut buffer = vec![0; 200 * 120 * 8];
+    for stride in [796, 802] {
+        assert_eq!(
+            target
+                .surface
+                .draw(&mut buffer, 200, 120, stride, PixelFormat::Rgba8),
+            Err(cosmix_iced_host::DrawError::UnsupportedStride { stride, width: 200 })
+        );
+    }
+}
+
+#[test]
+fn caret_deadlines_are_drawn_while_the_pointer_moves() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    let input = target.bounds("input");
+    target.draw();
+    target.click(input.center());
+    let start = Instant::now();
+    let Redraw::At(mut deadline) = target.draw_at(start).requests.redraw else {
+        panic!("no caret deadline");
+    };
+    let mut crossed = 0;
+    // 1.6 s of 60 Hz motion inside the field: three or more blink boundaries.
+    for step in 1..=100u64 {
+        let now = start + Duration::from_millis(16 * step);
+        let offset = if step % 2 == 0 { 4.0 } else { 6.0 };
+        target
+            .surface
+            .cursor_moved(input.center() + cosmix_iced_host::core::Vector::new(offset, 0.0));
+        let update = target.surface.process_at(now);
+        let due = now >= deadline;
+        assert_eq!(update.needs_redraw, due, "step {step}: {update:?}");
+        if due {
+            crossed += 1;
+            let frame = target.draw_at(now);
+            assert!(!frame.damage.is_empty(), "blink not painted at step {step}");
+            let Redraw::At(next) = frame.requests.redraw else {
+                panic!("deadline lost at step {step}");
+            };
+            assert!(next > now);
+            deadline = next;
+        }
+    }
+    assert!(crossed >= 3, "only {crossed} blink boundaries");
+}
+
+#[test]
+fn idle_process_reports_pending_work() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    assert!(target.surface.process().needs_redraw, "never drawn");
+    target.draw();
+    assert!(!target.surface.needs_redraw());
+    assert!(!target.surface.process().needs_redraw);
+    target.surface.program_mut().clicks += 1;
+    let update = target.surface.process();
+    assert!(update.needs_redraw);
+    assert_eq!(update.redraw, Redraw::NextFrame);
+    assert!(target.surface.needs_redraw());
+    target.draw();
+    assert!(!target.surface.process().needs_redraw);
+    target.surface.invalidate();
+    assert!(target.surface.process().needs_redraw);
+    assert!(target.draw().full);
+    target.surface.set_background(Some(Color::BLACK));
+    assert!(target.surface.process().needs_redraw);
+}
+
+#[test]
+fn invalid_scales_fall_back_instead_of_panicking() {
+    for scale in [0.0, -1.5, f32::NAN, f32::INFINITY] {
+        let surface = Surface::new(
+            App::default(),
+            Settings {
+                physical_size: (200, 120).into(),
+                scale_factor: scale,
+                ..Settings::default()
+            },
+        );
+        assert_eq!(surface.scale_factor(), 1.0, "{scale}");
+    }
+    let mut target = Target::new(2.0, PixelFormat::Rgba8);
+    target.draw();
+    for scale in [0.0, -1.0, f32::NAN] {
+        target
+            .surface
+            .resize((target.width, target.height).into(), scale);
+        assert_eq!(target.surface.scale_factor(), 2.0);
+    }
+    assert!(target.draw().damage.is_empty());
 }

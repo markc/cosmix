@@ -1,5 +1,6 @@
 use crate::clipboard::{Adapter, Clipboard, NullClipboard};
 use crate::damage::{DamageRect, PixelFormat, swap_red_blue};
+use crate::diff::{self, union};
 use crate::ime::{ImeRequest, PreeditOverlay};
 use crate::{Program, Renderer, Theme};
 use iced_core::event::Status;
@@ -12,7 +13,6 @@ use iced_core::widget::operation::Outcome;
 use iced_core::{Color, Event, Font, InputMethod, Pixels, Point, Rectangle, Size, window};
 use iced_graphics::Viewport;
 use iced_runtime::user_interface::{self, UserInterface};
-use iced_tiny_skia::Layer;
 
 /// Initial state of a [`Surface`].
 #[derive(Debug, Clone)]
@@ -108,7 +108,7 @@ pub struct Frame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawError {
     ZeroSize,
-    /// Only tight buffers (`stride == width * 4`) are supported.
+    /// `stride` must be a whole number of pixels and at least `width * 4`.
     UnsupportedStride {
         stride: u32,
         width: u32,
@@ -124,7 +124,10 @@ impl std::fmt::Display for DrawError {
         match self {
             Self::ZeroSize => write!(f, "zero-sized buffer"),
             Self::UnsupportedStride { stride, width } => {
-                write!(f, "stride {stride} is not 4 x width {width}")
+                write!(
+                    f,
+                    "stride {stride} is not whole pixels of at least 4 x width {width}"
+                )
             }
             Self::BufferTooSmall { needed, got } => {
                 write!(f, "buffer holds {got} bytes, {needed} needed")
@@ -136,6 +139,10 @@ impl std::fmt::Display for DrawError {
 impl std::error::Error for DrawError {}
 
 /// One iced program bound to one caller-owned buffer.
+///
+/// Not `Send`: the clipboard is a `Box<dyn Clipboard>` and iced's text
+/// paragraphs are reference-counted without atomics. Keep a surface on the
+/// thread that created it (a Bevy host holds it as a non-send resource).
 pub struct Surface<P: Program> {
     program: P,
     renderer: Renderer,
@@ -147,8 +154,9 @@ pub struct Surface<P: Program> {
     events: Vec<Event>,
     cursor: Cursor,
     drawn_cursor: Cursor,
+    drawn_at: Option<Instant>,
     clip_mask: tiny_skia::Mask,
-    last_layers: Option<Vec<Layer>>,
+    last_layers: Option<diff::Snapshot>,
     last_background: Color,
     invalid: bool,
     dirty: bool,
@@ -158,19 +166,26 @@ pub struct Surface<P: Program> {
 }
 
 impl<P: Program> Surface<P> {
+    /// A scale that is not finite and positive is replaced by 1.0.
     pub fn new(program: P, settings: Settings) -> Self {
         let size = non_zero(settings.physical_size);
+        let scale = if valid_scale(settings.scale_factor) {
+            settings.scale_factor
+        } else {
+            1.0
+        };
         Self {
             program,
             renderer: Renderer::new(settings.default_font, settings.default_text_size),
             cache: user_interface::Cache::new(),
-            viewport: Viewport::with_physical_size(size, settings.scale_factor),
+            viewport: Viewport::with_physical_size(size, scale),
             theme: settings.theme,
             background: settings.background,
             clipboard: Box::new(NullClipboard),
             events: Vec::new(),
             cursor: Cursor::Unavailable,
             drawn_cursor: Cursor::Unavailable,
+            drawn_at: None,
             clip_mask: tiny_skia::Mask::new(size.width, size.height).expect("clip mask"),
             last_layers: None,
             last_background: Color::TRANSPARENT,
@@ -209,9 +224,15 @@ impl<P: Program> Surface<P> {
         self.viewport.scale_factor()
     }
 
-    /// Changes the buffer size or scale. Any change forces full damage.
+    /// Changes the buffer size or scale. Any change forces full damage. A
+    /// scale that is not finite and positive keeps the current one.
     pub fn resize(&mut self, physical_size: Size<u32>, scale_factor: f32) {
         let physical_size = non_zero(physical_size);
+        let scale_factor = if valid_scale(scale_factor) {
+            scale_factor
+        } else {
+            self.viewport.scale_factor()
+        };
         if physical_size == self.viewport.physical_size()
             && scale_factor == self.viewport.scale_factor()
         {
@@ -282,56 +303,75 @@ impl<P: Program> Surface<P> {
 
     /// Runs queued events through the widget tree and delivers the produced
     /// messages. All queued events go through one `UserInterface::update`.
-    /// With nothing queued it does no work and repeats the last known
-    /// deadline.
+    /// With nothing queued it builds nothing, but still reports pending work
+    /// (a passed deadline, `program_mut`, `operate`, `invalidate`).
     pub fn process(&mut self) -> Update {
+        self.process_at(Instant::now())
+    }
+
+    /// [`Surface::process`] at `now`.
+    pub fn process_at(&mut self, now: Instant) -> Update {
+        // A deadline that has passed is a pending draw. It must be read before
+        // the tree is touched: the redraw pass below would report the next one.
+        if matches!(self.requests.redraw, Redraw::At(at) if at <= now) {
+            self.dirty = true;
+        }
         if self.events.is_empty() {
             return Update {
-                needs_redraw: false,
+                needs_redraw: self.dirty,
                 messages: 0,
                 interaction: self.requests.interaction,
                 interaction_changed: false,
-                redraw: self.requests.redraw,
+                redraw: self.pending_redraw(),
                 statuses: Vec::new(),
             };
         }
         let events = std::mem::take(&mut self.events);
         let size = self.viewport.logical_size();
-        let now = Instant::now();
         let mut messages = Vec::new();
-        let mut clipboard = Adapter(self.clipboard.as_mut());
+        let mut count = 0;
 
-        let mut ui = UserInterface::build(
-            self.program.view(),
-            size,
-            std::mem::take(&mut self.cache),
-            &mut self.renderer,
-        );
-        // A rebuilt tree has no remembered widget status. Replaying the
-        // redraw pass with the cursor that was last drawn restores it, so
-        // hover and press changes in `events` request a redraw as they do
-        // under iced_winit's long-lived interface.
-        // Its redraw request carries the caret-blink deadline.
+        // A rebuilt tree has no remembered widget status. Replaying the redraw
+        // pass restores it, so hover and press changes in `events` request a
+        // redraw as under iced_winit's long-lived interface. It replays the
+        // last drawn frame (its time and cursor), so time-based widgets see no
+        // elapsed time; a widget that counts redraw passes sees one more.
+        let replay = Event::Window(window::Event::RedrawRequested(self.drawn_at.unwrap_or(now)));
+        let mut cache = std::mem::take(&mut self.cache);
+        let mut ui = UserInterface::build(self.program.view(), size, cache, &mut self.renderer);
         let (primed, _) = ui.update(
-            &[Event::Window(window::Event::RedrawRequested(now))],
+            std::slice::from_ref(&replay),
             self.drawn_cursor,
             &mut self.renderer,
-            &mut clipboard,
+            &mut Adapter(self.clipboard.as_mut()),
             &mut messages,
         );
+        let mut request = match &primed {
+            user_interface::State::Updated { redraw_request, .. } => *redraw_request,
+            user_interface::State::Outdated => window::RedrawRequest::NextFrame,
+        };
+        if primed.has_layout_changed() || !messages.is_empty() {
+            self.dirty = true;
+        }
+        if !messages.is_empty() {
+            // As iced_winit: messages from the redraw pass are applied and the
+            // tree rebuilt before input is handled.
+            cache = ui.into_cache();
+            count += messages.len();
+            for message in messages.drain(..) {
+                self.program.update(message);
+            }
+            ui = UserInterface::build(self.program.view(), size, cache, &mut self.renderer);
+        }
         let (state, statuses) = ui.update(
             &events,
             self.cursor,
             &mut self.renderer,
-            &mut clipboard,
+            &mut Adapter(self.clipboard.as_mut()),
             &mut messages,
         );
         self.cache = ui.into_cache();
 
-        let mut request = match primed {
-            user_interface::State::Updated { redraw_request, .. } => redraw_request,
-            user_interface::State::Outdated => window::RedrawRequest::Wait,
-        };
         let mut interaction = self.requests.interaction;
         match state {
             user_interface::State::Outdated => self.dirty = true,
@@ -343,10 +383,7 @@ impl<P: Program> Surface<P> {
             } => {
                 interaction = mouse_interaction;
                 request = request.min(redraw_request);
-                if has_layout_changed
-                    || redraw_request == window::RedrawRequest::NextFrame
-                    || matches!(redraw_request, window::RedrawRequest::At(at) if at <= now)
-                {
+                if has_layout_changed || redraw_request == window::RedrawRequest::NextFrame {
                     self.dirty = true;
                 }
             }
@@ -354,9 +391,9 @@ impl<P: Program> Surface<P> {
         if matches!(request, window::RedrawRequest::At(at) if at <= now) {
             self.dirty = true;
         }
-        let count = messages.len();
-        if count > 0 {
+        if !messages.is_empty() {
             self.dirty = true;
+            count += messages.len();
             for message in messages {
                 self.program.update(message);
             }
@@ -365,21 +402,30 @@ impl<P: Program> Surface<P> {
         self.requests.interaction = interaction;
         // A pending draw computes the deadline afresh (the change may have
         // blurred the field), so only an unchanged tree reports it here.
-        let redraw = if self.dirty {
-            Redraw::NextFrame
-        } else {
-            let redraw = Redraw::from(request);
-            self.requests.redraw = redraw;
-            redraw
-        };
+        if !self.dirty {
+            self.requests.redraw = Redraw::from(request);
+        }
 
         Update {
             needs_redraw: self.dirty,
             messages: count,
             interaction,
             interaction_changed,
-            redraw,
+            redraw: self.pending_redraw(),
             statuses,
+        }
+    }
+
+    /// Whether state changed since the last draw.
+    pub fn needs_redraw(&self) -> bool {
+        self.dirty
+    }
+
+    fn pending_redraw(&self) -> Redraw {
+        if self.dirty {
+            Redraw::NextFrame
+        } else {
+            self.requests.redraw
         }
     }
 
@@ -434,10 +480,13 @@ impl<P: Program> Surface<P> {
         if width == 0 || height == 0 {
             return Err(DrawError::ZeroSize);
         }
-        if u64::from(stride) != u64::from(width) * 4 {
+        if !stride.is_multiple_of(4) || u64::from(stride) < u64::from(width) * 4 {
             return Err(DrawError::UnsupportedStride { stride, width });
         }
-        let needed = width as usize * height as usize * 4;
+        // Rows may be padded (a texture wider than the surface); the padding
+        // is never touched. Every row, the last included, is `stride` long.
+        let row_pixels = stride / 4;
+        let needed = stride as usize * height as usize;
         if buffer.len() < needed {
             return Err(DrawError::BufferTooSmall {
                 needed,
@@ -531,42 +580,42 @@ impl<P: Program> Surface<P> {
 
         let background = self.background.unwrap_or(base.background_color);
         let full = self.invalid || self.last_layers.is_none() || self.last_background != background;
-        let layers = self.renderer.layers();
-        let damage = if full {
-            vec![DamageRect {
-                x: 0,
-                y: 0,
-                width,
-                height,
-            }]
-        } else {
-            let logical = iced_graphics::damage::diff(
-                self.last_layers.as_deref().unwrap_or_default(),
-                layers,
-                |layer| vec![layer.bounds],
-                Layer::damage,
-            );
-            let grouped = iced_graphics::damage::group(logical, Rectangle::with_size(size));
-            disjoint(
-                grouped
-                    .into_iter()
-                    .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
-                    .collect(),
-            )
+        let current = diff::Snapshot::new(self.renderer.layers());
+        let damage = match self.last_layers.as_ref().filter(|_| !full) {
+            None => {
+                vec![DamageRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }]
+            }
+            Some(previous) => {
+                let viewport = Rectangle::with_size(size);
+                disjoint(diff::coalesce(
+                    diff::damage(previous, &current)
+                        .into_iter()
+                        .filter_map(|rect| rect.intersection(&viewport))
+                        .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
+                        .collect(),
+                ))
+            }
         };
-        let current = layers.to_vec();
 
         if !damage.is_empty() {
             let pixels = &mut buffer[..needed];
             if format == PixelFormat::Rgba8 {
                 for rect in &damage {
-                    swap_red_blue(pixels, width, *rect);
+                    swap_red_blue(pixels, row_pixels, *rect);
                 }
+            }
+            if self.clip_mask.width() != row_pixels || self.clip_mask.height() != height {
+                self.clip_mask = tiny_skia::Mask::new(row_pixels, height).expect("clip mask");
             }
             let logical: Vec<Rectangle> =
                 damage.iter().map(|rect| rect.to_logical(scale)).collect();
             {
-                let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixels, width, height)
+                let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixels, row_pixels, height)
                     .expect("pixmap over checked buffer");
                 self.renderer.draw(
                     &mut pixmap,
@@ -578,7 +627,7 @@ impl<P: Program> Surface<P> {
             }
             if format == PixelFormat::Rgba8 {
                 for rect in &damage {
-                    swap_red_blue(pixels, width, *rect);
+                    swap_red_blue(pixels, row_pixels, *rect);
                 }
             }
         }
@@ -588,6 +637,7 @@ impl<P: Program> Surface<P> {
         self.invalid = false;
         self.dirty = still_dirty;
         self.drawn_cursor = self.cursor;
+        self.drawn_at = Some(now);
 
         let ime_changed = next.ime != previous.ime;
         let interaction_changed = next.interaction != previous.interaction;
@@ -619,6 +669,10 @@ impl<P: Program> Surface<P> {
     }
 }
 
+fn valid_scale(scale: f32) -> bool {
+    scale.is_finite() && scale > 0.0
+}
+
 fn non_zero(size: Size<u32>) -> Size<u32> {
     Size::new(size.width.max(1), size.height.max(1))
 }
@@ -645,17 +699,6 @@ fn disjoint(mut rects: Vec<DamageRect>) -> Vec<DamageRect> {
 
 fn overlaps(a: &DamageRect, b: &DamageRect) -> bool {
     a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
-}
-
-fn union(a: &DamageRect, b: &DamageRect) -> DamageRect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    DamageRect {
-        x,
-        y,
-        width: (a.x + a.width).max(b.x + b.width) - x,
-        height: (a.y + a.height).max(b.y + b.height) - y,
-    }
 }
 
 #[cfg(test)]
