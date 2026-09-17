@@ -3534,7 +3534,10 @@ mod tests {
         );
         let reply = replies.recv().await.expect("malformed read reply queued");
         assert_eq!(reply.rc, 10);
-        assert_eq!(reply.body.as_ref(), "{\"error\":\"unknown_path\"}");
+        assert_eq!(
+            reply.body.as_ref(),
+            "{\"error\":\"unknown_path\",\"error_code\":\"unknown_path\"}"
+        );
         assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
@@ -4572,7 +4575,10 @@ mod tests {
             local_set_command(3, "input.corners.dwell_ms", json!(250)),
         );
         let reply = replies.recv().await.expect("busy reply");
-        assert_eq!(reply.body.as_ref(), "{\"error\":\"busy\"}");
+        assert_eq!(
+            reply.body.as_ref(),
+            "{\"error\":\"busy\",\"error_code\":\"busy\"}"
+        );
         for _ in 0..PORT_QUEUE_CAPACITY {
             assert!(matches!(source.try_recv(), Ok(PortCommand::Snapshot(_))));
         }

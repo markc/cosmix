@@ -214,6 +214,7 @@ fn place_resize_sends_a_clamped_configure_and_refuses_maximized_windows() {
         &runtime,
         WindowOp::Place(PlaceSpec {
             width: Some(expected.0),
+            height: Some(expected.1),
             ..place(id, generation)
         }),
     );
@@ -723,7 +724,7 @@ fn force_close_kills_a_window_that_only_unmapped() {
         },
         |harness| {
             unmap_alpha(harness);
-            assert!(!test_toplevel_record(harness).mapped);
+            assert!(!harness.server.state.surfaces[&alpha].mapped);
             harness
                 .server
                 .dispatch_cycle(Some(Duration::ZERO))
@@ -810,7 +811,7 @@ fn force_close_does_nothing_for_a_caller_that_left() {
     }
     harness.dispatch_client();
     harness.assert_client_connected("nobody was waiting, so nothing was killed");
-    assert!(test_toplevel_record(&harness).mapped);
+    assert!(harness.server.state.surfaces[&alpha].mapped);
 }
 
 /// `presented` means a frame of the current mapping: a window presented
@@ -835,7 +836,7 @@ fn presented_waits_for_a_frame_of_the_current_mapping() {
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
     traffic.extend(harness.sync());
     ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
-    assert!(test_toplevel_record(&harness).mapped);
+    assert!(harness.server.state.surfaces[&alpha].mapped);
     assert_eq!(
         window_id_and_generation(&harness, &alpha),
         (id, generation),

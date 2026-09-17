@@ -12,7 +12,11 @@
 //! PROBE presented <count>          PROBE close
 //! ```
 //!
-//! Runs until `--seconds` elapse or the compositor closes it.
+//! Runs until `--seconds` elapse or the compositor closes it. With
+//! `--hide-on-close` a close request unmaps the window (a null buffer)
+//! instead, like a tray app, and prints `PROBE hidden`; with
+//! `--remap-once-ms N` the first such hide is undone after N ms
+//! (`PROBE remapped`).
 
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::{
     wp_presentation, wp_presentation_feedback,
@@ -70,6 +74,8 @@ struct Options {
     width: i32,
     height: i32,
     duration: Duration,
+    hide_on_close: bool,
+    remap_once: Option<Duration>,
 }
 
 fn options() -> Result<Options, String> {
@@ -79,6 +85,8 @@ fn options() -> Result<Options, String> {
         width: 320,
         height: 240,
         duration: Duration::from_secs(30),
+        hide_on_close: false,
+        remap_once: None,
     };
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -104,6 +112,14 @@ fn options() -> Result<Options, String> {
                         .parse()
                         .map_err(|error| format!("--seconds: {error}"))?,
                 );
+            }
+            "--hide-on-close" => options.hide_on_close = true,
+            "--remap-once-ms" => {
+                options.remap_once = Some(Duration::from_millis(
+                    value()?
+                        .parse()
+                        .map_err(|error| format!("--remap-once-ms: {error}"))?,
+                ));
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -218,7 +234,35 @@ fn run() -> Result<(), String> {
     let mut current: Option<Canvas> = None;
     let mut frame = 0_u32;
     probe.frame_done = true;
-    while Instant::now() < deadline && !probe.closed {
+    let mut hidden = false;
+    let mut remap_at: Option<Instant> = None;
+    let mut remap_left = options.remap_once;
+    while Instant::now() < deadline && !(probe.closed && !options.hide_on_close) {
+        if probe.closed && !hidden {
+            probe.closed = false;
+            hidden = true;
+            surface.attach(None, 0, 0);
+            surface.commit();
+            say("hidden");
+            if let Some(after) = remap_left.take() {
+                remap_at = Some(Instant::now() + after);
+            }
+        }
+        if hidden && remap_at.is_some_and(|at| Instant::now() >= at) {
+            remap_at = None;
+            hidden = false;
+            // A fresh initial commit; the configure it earns re-attaches.
+            surface.commit();
+            say("remapped");
+        }
+        if hidden {
+            probe.pending_configure = None;
+            wait_readable(&mut queue, Duration::from_millis(20))?;
+            queue
+                .dispatch_pending(&mut probe)
+                .map_err(|error| format!("dispatch failed: {error}"))?;
+            continue;
+        }
         queue
             .dispatch_pending(&mut probe)
             .map_err(|error| format!("dispatch failed: {error}"))?;
