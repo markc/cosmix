@@ -22,6 +22,7 @@ struct Harness {
     surface: Entity,
     _peer: ctk::bus::TestBusPeer,
     bridge: ctk::bus::BusBridge,
+    window: Option<Entity>,
 }
 
 impl Harness {
@@ -39,6 +40,7 @@ impl Harness {
             surface: Entity::PLACEHOLDER,
             _peer: peer,
             bridge,
+            window: None,
         };
         harness.request(SceneVerb::Load, SCENE, json!({"adapter": ADAPTER}));
         harness.app.update();
@@ -69,6 +71,7 @@ impl Harness {
                 size: UVec2::new(width, height),
                 scale,
                 origin: Vec2::new(10.0, 20.0),
+                window: self.window,
             });
     }
 
@@ -83,6 +86,16 @@ impl Harness {
     }
 
     fn pointer(&mut self, over: bool, position: Vec2, action: PointerAction) {
+        self.pointer_in(None, over, position, action);
+    }
+
+    fn pointer_in(
+        &mut self,
+        window: Option<Entity>,
+        over: bool,
+        position: Vec2,
+        action: PointerAction,
+    ) {
         let camera = Entity::PLACEHOLDER;
         let mut hover = HoverMap::default();
         let mut hits = bevy::ecs::entity::EntityHashMap::default();
@@ -95,9 +108,16 @@ impl Harness {
         world.write_message(PointerInput::new(
             PointerId::Mouse,
             Location {
-                target: NormalizedRenderTarget::None {
-                    width: 800,
-                    height: 600,
+                target: match window {
+                    Some(window) => NormalizedRenderTarget::Window(
+                        bevy::window::WindowRef::Entity(window)
+                            .normalize(None)
+                            .unwrap(),
+                    ),
+                    None => NormalizedRenderTarget::None {
+                        width: 800,
+                        height: 600,
+                    },
                 },
                 position,
             },
@@ -120,10 +140,12 @@ fn texture_is_allocated_once_and_again_on_resize() {
     h.geometry(300, 100, 1.5);
     h.run(3);
     assert_eq!(h.totals().allocations, 2);
+    // A scale change at the same physical size keeps the texture.
     h.geometry(300, 100, 2.0);
     h.run(3);
-    assert_eq!(h.totals().allocations, 3);
-    assert_eq!(h.totals().own_added, 3);
+    assert_eq!(h.totals().allocations, 2);
+    assert_eq!(h.totals().resizes, 1);
+    assert_eq!(h.totals().own_added, 2);
     assert_eq!(h.totals().own_modified, 0);
     // A full repaint follows every allocation.
     assert_eq!(
@@ -381,4 +403,192 @@ fn adapter_hand_over_attaches_the_new_page_in_both_directions() {
     assert!(app.world().get_entity(surface).is_err());
     let ctk_page = app.world().resource::<FakeCtkPage>().0.unwrap();
     assert!(wrapper_of(app.world(), ctk_page).is_some());
+}
+
+#[test]
+fn texture_buckets_absorb_a_resize_animation() {
+    use crate::bridge::{BUCKET, texture_size};
+    assert_eq!(
+        texture_size(UVec2::new(1, 1), None),
+        Some(UVec2::splat(BUCKET))
+    );
+    assert_eq!(
+        texture_size(UVec2::new(129, 64), None),
+        Some(UVec2::new(256, 128))
+    );
+    let tex = Some(UVec2::new(256, 128));
+    assert_eq!(texture_size(UVec2::new(200, 100), tex), None);
+    // Growing past the texture reallocates.
+    assert_eq!(
+        texture_size(UVec2::new(257, 100), tex),
+        Some(UVec2::new(384, 128))
+    );
+    // Wobbling across a bucket edge keeps the larger texture ...
+    assert_eq!(texture_size(UVec2::new(127, 100), tex), None);
+    // ... but a much smaller need gives memory back.
+    assert_eq!(
+        texture_size(UVec2::new(60, 60), Some(UVec2::new(1024, 128))),
+        Some(UVec2::new(128, 128))
+    );
+
+    // A reveal/resize animation through 20 widths inside one bucket.
+    let mut h = Harness::new();
+    h.run(3);
+    assert_eq!(h.totals().allocations, 1);
+    for width in 131..=150 {
+        h.geometry(width, 100, 1.5);
+        h.run(1);
+    }
+    h.run(1);
+    let totals = h.totals();
+    assert_eq!(totals.allocations, 1);
+    assert_eq!(totals.resizes, 20);
+    assert_eq!(totals.own_modified, 0);
+    // Each size repaints only its visible part.
+    assert_eq!(
+        h.app.world().resource::<SceneIcedCounters>().last_rects,
+        vec![Rect::new(0, 0, 150, 100)]
+    );
+    let mut views = h.app.world_mut().query::<&ImageNode>();
+    let rects: Vec<_> = views.iter(h.app.world()).map(|node| node.rect).collect();
+    assert_eq!(
+        rects,
+        vec![Some(bevy::math::Rect::new(0.0, 0.0, 150.0, 100.0))]
+    );
+}
+
+#[test]
+fn focused_surface_publishes_its_ime_target_and_receives_ime_input() {
+    use cosmix_shell::runtime::{ExternalImeEvent, ExternalImeKind, ExternalImeTarget};
+    let mut h = Harness::new();
+    h.run(3);
+    let target = |h: &Harness| {
+        h.app
+            .world()
+            .get::<ExternalImeTarget>(h.surface)
+            .unwrap()
+            .clone()
+    };
+    assert!(!target(&h).enabled);
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(2);
+    let enabled = target(&h);
+    assert!(enabled.enabled);
+    // Caret at physical (12, 12) + origin (10, 20), 3 x 24 px, at 1.5x.
+    let min = Vec2::new(22.0, 32.0) / 1.5;
+    assert_eq!(
+        enabled.cursor,
+        Some(bevy::math::Rect::from_corners(
+            min,
+            min + Vec2::new(3.0, 24.0) / 1.5
+        ))
+    );
+
+    // A commit moves the caret: the target follows, and pixels change.
+    let before = h.totals();
+    let other = h.app.world_mut().spawn_empty().id();
+    for event in [
+        ExternalImeEvent {
+            target: other,
+            kind: ExternalImeKind::Commit("ignored".into()),
+        },
+        ExternalImeEvent {
+            target: h.surface,
+            kind: ExternalImeKind::DeleteSurrounding {
+                before: 1,
+                after: 0,
+            },
+        },
+        ExternalImeEvent {
+            target: h.surface,
+            kind: ExternalImeKind::Commit("日本".into()),
+        },
+    ] {
+        h.app.world_mut().write_message(event);
+    }
+    h.run(2);
+    assert!(h.totals().bytes_queued > before.bytes_queued);
+    // Two characters at 12 px each; a stray target's seven would be 84.
+    let moved = target(&h).cursor.unwrap();
+    assert_eq!(moved.min.x, (10.0 + 12.0 + 24.0) / 1.5);
+
+    h.app.world_mut().resource_mut::<InputFocus>().clear();
+    h.run(2);
+    assert_eq!(target(&h), ExternalImeTarget::default());
+}
+
+#[test]
+fn hovered_surface_drives_the_cursor_shape_and_leaving_resets_it() {
+    use cosmix_shell::runtime::{CursorShape, CursorShapeRequest};
+    let mut h = Harness::new();
+    h.run(3);
+    let shape = |h: &Harness| h.app.world().resource::<CursorShapeRequest>().0;
+    assert_eq!(shape(&h), CursorShape::Default);
+    h.pointer(
+        true,
+        Vec2::new(40.0, 60.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    assert_eq!(shape(&h), CursorShape::Text);
+    h.pointer(
+        false,
+        Vec2::new(500.0, 500.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    assert_eq!(shape(&h), CursorShape::Default);
+    // Another owner's request is not overwritten while no surface is hovered.
+    h.app.world_mut().resource_mut::<CursorShapeRequest>().0 = CursorShape::Pointer;
+    h.run(5);
+    assert_eq!(shape(&h), CursorShape::Pointer);
+}
+
+#[test]
+fn captured_pointer_ignores_positions_from_another_window() {
+    let mut h = Harness::new();
+    let home = h.app.world_mut().spawn_empty().id();
+    let away = h.app.world_mut().spawn_empty().id();
+    h.window = Some(home);
+    h.geometry(200, 100, 1.5);
+    h.run(3);
+    h.pointer_in(
+        Some(home),
+        true,
+        Vec2::new(40.0, 60.0),
+        PointerAction::Press(PointerButton::Primary),
+    );
+    h.run(2);
+    let before = h.totals();
+    // Same logical position, other window: routed, this would redraw the
+    // hover square elsewhere; instead the surface only loses hover.
+    h.pointer_in(
+        Some(away),
+        false,
+        Vec2::new(60.0, 30.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    assert_eq!(h.totals().bytes_queued - before.bytes_queued, 36 * 36 * 4);
+    assert_eq!(h.focus().cursor, None);
+    // The release still ends the capture; later home-window input routes normally.
+    h.pointer_in(
+        Some(away),
+        false,
+        Vec2::new(60.0, 30.0),
+        PointerAction::Release(PointerButton::Primary),
+    );
+    h.run(1);
+    let before = h.totals();
+    h.pointer_in(
+        Some(home),
+        true,
+        Vec2::new(40.0, 60.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    assert_eq!(h.totals().bytes_queued - before.bytes_queued, 36 * 36 * 4);
 }

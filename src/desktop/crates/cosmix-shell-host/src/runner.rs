@@ -43,7 +43,7 @@ use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent, KeyboardHandler, Keymap, Modifiers, RepeatInfo,
 };
-use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerHandler};
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
 use smithay_client_toolkit::seat::touch::TouchHandler;
 use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
@@ -1329,6 +1329,8 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
     app.insert_resource(LayerHostWake(external_wake))
         .init_resource::<LayerHostUpdateWake>()
         .init_resource::<LayerHostDeadline>()
+        .init_resource::<cosmix_shell::runtime::CursorShapeRequest>()
+        .add_message::<cosmix_shell::runtime::ExternalImeEvent>()
         .add_systems(Last, capture_layer_host_redraw);
     app.set_runner(move |app| {
         run_layer_host(
@@ -1344,8 +1346,12 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
 #[path = "ime.rs"]
 mod ime;
 
+#[path = "cursor_shape.rs"]
+mod cursor_shape;
+
 struct RunnerState {
     text_input: ime::TextInputBridge,
+    cursor_shape: cursor_shape::CursorShapeBridge,
     app: App,
     connection: Connection,
     registry_state: RegistryState,
@@ -1528,6 +1534,7 @@ impl<'loop_handle>
             self.needs_update = true;
         }
         self.sync_text_input();
+        self.sync_cursor_shape();
     }
 
     fn app_exit(&mut self) -> Option<AppExit> {
@@ -1622,6 +1629,7 @@ fn run_layer_host(
     let viewporter = globals.bind(&qh, 1..=1, GlobalData).ok();
     let mut state = RunnerState {
         text_input: ime::TextInputBridge::new(&globals, &qh),
+        cursor_shape: cursor_shape::CursorShapeBridge::new(&globals, &qh),
         app,
         connection: connection.clone(),
         registry_state,
@@ -1884,6 +1892,7 @@ fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
     }
     state.keyboard_bridge.cleanup(&mut state.app, None);
     state.touch_bridge.cancel(&mut state.app);
+    state.cursor_shape.detach();
     if let Some(pointer) = state.active_pointer.take() {
         release_pointer(pointer);
     }
@@ -2722,6 +2731,13 @@ impl PointerHandler for RunnerState {
             return;
         }
         self.needs_update = true;
+        for event in events {
+            match event.kind {
+                PointerEventKind::Enter { serial } => self.cursor_shape.entered(Some(serial)),
+                PointerEventKind::Leave { .. } => self.cursor_shape.entered(None),
+                _ => {}
+            }
+        }
         let targets = self.surface_targets();
         let Some(output) = self.selected_key.as_ref() else {
             return;
@@ -3022,6 +3038,7 @@ impl RunnerState {
         }
         for seat in self.pointer_seats.clone() {
             if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
+                self.cursor_shape.attach(&pointer, qh);
                 self.active_pointer_seat = Some(seat);
                 self.active_pointer = Some(pointer);
                 break;
@@ -3039,6 +3056,7 @@ impl RunnerState {
         {
             self.needs_update = true;
         }
+        self.cursor_shape.detach();
         if let Some(pointer) = self.active_pointer.take() {
             release_pointer(pointer);
         }
