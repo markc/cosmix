@@ -103,6 +103,8 @@ pub struct IcedDemo {
     tab_texts: Vec<String>,
     shown_tab: usize,
     cursor: Option<CursorShape>,
+    /// The first committed frame has been written to `WL_DEMO_DUMP`.
+    dumped: bool,
 }
 
 impl IcedDemo {
@@ -130,6 +132,7 @@ impl IcedDemo {
             tab_texts: vec![first, String::new(), String::new()],
             shown_tab: 0,
             cursor: None,
+            dumped: false,
         }
     }
 
@@ -431,6 +434,16 @@ impl IcedDemo {
             Commit::Rects(rects) => frame.commit_with_damage(&rects),
         }
         let committed = grid_full || !grid.is_empty() || !chrome_rects.is_empty();
+        if committed && !self.dumped {
+            self.dumped = true;
+            if let Some(path) = std::env::var_os("WL_DEMO_DUMP") {
+                let (pixels, width, height, _) = frame.buffer_mut();
+                match crate::paint::dump_ppm(path.as_ref(), pixels, width, height) {
+                    Ok(()) => eprintln!("wl-iced-demo: dumped {width}x{height} to {path:?}"),
+                    Err(e) => eprintln!("wl-iced-demo: dump: {e}"),
+                }
+            }
+        }
         if !committed {
             // Neither the grid nor iced wrote a pixel.
             frame.keep_contents();

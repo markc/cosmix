@@ -93,3 +93,22 @@ mod tests {
         assert!(buf[..2 * 16 + 12].iter().all(|b| *b == 0));
     }
 }
+
+/// Writes an ARGB8888 buffer as a binary PPM, for a measurement that needs
+/// the pixels the client actually committed (a screen capture of a scaled
+/// output would show the compositor's resampling instead). `WL_DEMO_DUMP`
+/// names the file; the demo writes its first committed frame and stops.
+pub fn dump_ppm(
+    path: &std::path::Path,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut out = Vec::with_capacity(pixels.len() / 4 * 3 + 32);
+    out.extend_from_slice(format!("P6\n{width} {height}\n255\n").as_bytes());
+    for pixel in pixels.chunks_exact(4) {
+        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+    }
+    std::fs::File::create(path)?.write_all(&out)
+}
