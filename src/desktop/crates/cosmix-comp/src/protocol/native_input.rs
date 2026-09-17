@@ -1,11 +1,14 @@
 //! The protocol half of keyboard and IME for in-process content.
 //!
 //! Keys reach content the compositor draws itself only after the same seat
-//! path a client's keys take: the binding filter first, then this. Focus is
-//! decided in `arbitrate_keyboard_focus` — in-process content is one more
-//! requester, below the structural gates (session lock, exclusive layer,
-//! override-redirect) — so a scene can never take the keyboard from the
-//! lock screen.
+//! path a client's keys take: the input-method keyboard grab first, then the
+//! binding filter, then this. Focus is decided in
+//! `arbitrate_keyboard_focus` — in-process content is the LAST requester,
+//! below the session lock, the exclusive layers, the override-redirect gate,
+//! non-interactive layers and any explicitly requested client surface
+//! (`comp.window.focus`, xdg-activation, a click) — so a scene can never
+//! take the keyboard from the lock screen, and a client asked for by name
+//! takes it back from the scene.
 
 use smithay::input::keyboard::{KeysymHandle, ModifiersState, xkb};
 use smithay::reexports::calloop::{
@@ -19,8 +22,7 @@ use smithay::wayland::input_method::{InputMethodSeat, InputMethodSinkEvent};
 
 use super::*;
 use crate::native_input::{
-    NativeImeBridge, NativeImeEvent, NativeImeRequest, NativeKeyEvent, NativeKeyboardBridge,
-    NativeModifiers,
+    NativeImeEvent, NativeImeRequest, NativeInputBridge, NativeKeyEvent, NativeModifiers,
 };
 
 /// The seat's own repeat settings (`seat.add_keyboard`): a client gets these
@@ -38,26 +40,50 @@ pub(crate) struct NativeKeyRepeat {
 
 #[derive(Default)]
 pub(crate) struct NativeInputState {
-    pub(crate) keyboard: Option<NativeKeyboardBridge>,
-    pub(crate) ime: Option<NativeImeBridge>,
+    pub(crate) bridge: Option<NativeInputBridge>,
     repeat: Option<NativeKeyRepeat>,
+    /// The input-method instance this field is already activated for, so
+    /// `enable(true)` on every edit does not re-activate (which resets the
+    /// instance serial and mismatches a batch in flight), while an input
+    /// method that connects LATER — or reconnects — still gets its activate.
+    activated_for: Option<u64>,
+    /// An activation owed to the field once arbitration has actually moved
+    /// the seat focus. Set inside `set_native_keyboard_focus`, which runs
+    /// BEFORE `keyboard.set_focus`, when a client's text input still reads
+    /// as active and the activation would refuse itself.
+    refresh_pending: bool,
 }
 
 impl WaylandState {
-    /// The render thread registered its bridges: keys and IME can flow.
-    pub(crate) fn install_native_input(
-        &mut self,
-        keyboard: NativeKeyboardBridge,
-        ime: NativeImeBridge,
-    ) {
-        self.native_input.keyboard = Some(keyboard);
-        self.native_input.ime = Some(ime.clone());
+    /// The render thread registered its bridge: keys and IME can flow.
+    ///
+    /// SINGLE OWNER. One seat has one keyboard and one input method, so a
+    /// second install is refused rather than silently replacing the first
+    /// (whose bridge would then be fed by nothing while its consumer still
+    /// believed it held the keyboard). An owner that is going away calls
+    /// [`Self::uninstall_native_input`] first.
+    pub(crate) fn install_native_input(&mut self, bridge: NativeInputBridge) {
+        if self.native_input.bridge.is_some() {
+            tracing::error!(
+                "native input already has an owner; refusing the second install \
+                 (the previous owner must uninstall first)"
+            );
+            return;
+        }
+        bridge.set_installed(true);
+        self.native_input.bridge = Some(bridge.clone());
         // The vendored sink: input-method output goes to in-process content
-        // only while no focused client has an active text input.
+        // only while no focused client has an active text input AND the
+        // content itself has the input method enabled. Without the second
+        // half a scene that never enabled would still swallow what the
+        // input method produced for nobody.
         self.seat
             .input_method()
             .set_sink(Some(std::sync::Arc::new(move |event| {
-                ime.push(match event {
+                if !bridge.enabled() {
+                    return;
+                }
+                bridge.push_ime(match event {
                     InputMethodSinkEvent::CommitString(text) => NativeImeEvent::Commit(text),
                     InputMethodSinkEvent::PreeditString {
                         text,
@@ -82,35 +108,136 @@ impl WaylandState {
             })));
     }
 
+    /// The owner is going away: stop feeding it, unregister the sink, and
+    /// give the keyboard back to whichever client should have it.
+    pub(crate) fn uninstall_native_input(&mut self) {
+        let Some(bridge) = self.native_input.bridge.take() else {
+            return;
+        };
+        self.cancel_native_key_repeat();
+        let input_method = self.seat.input_method().clone();
+        if self.native_input.activated_for.take().is_some() {
+            input_method.deactivate_input_method(self);
+        }
+        // A popup the input method created before any field activated has
+        // no parent and belongs to nobody; unregistering the sink below
+        // would leave it on screen with nothing able to dismiss it.
+        input_method.dismiss_parentless_popup::<WaylandState>(self);
+        // Unregister the sink, or input-method output would keep being
+        // swallowed by a bridge nobody drains.
+        input_method.set_sink(None);
+        // The departing owner hears the edge (it may already have emitted
+        // it itself, synchronously, in `NativeKeyboard::uninstall`), and
+        // the bridge's field state is cleared so a re-install cannot start
+        // with a stale standing request or caret. Clearing does not bump
+        // the generation, so the edge survives to the next drain.
+        bridge.set_focused(false);
+        bridge.set_installed(false);
+        self.arbitrate_keyboard_focus(None, true, false);
+    }
+
     /// Whether in-process content is asking for the keyboard. Read inside
-    /// arbitration, after the structural gates.
+    /// arbitration, after every client-side gate.
     pub(crate) fn native_keyboard_wants_focus(&self) -> bool {
         self.native_input
-            .keyboard
+            .bridge
             .as_ref()
-            .is_some_and(NativeKeyboardBridge::wants_focus)
+            .is_some_and(NativeInputBridge::wants_focus)
     }
 
     /// Record what arbitration decided; losing focus also ends a repeat.
     pub(crate) fn set_native_keyboard_focus(&mut self, focused: bool) {
+        // The edge is the keyboard changing hands, INCLUDING between two
+        // in-process owners while the compositor keeps it: the new owner is
+        // a different field and must inherit neither the IME session nor
+        // the caret of the one before it.
         let changed = self
             .native_input
-            .keyboard
+            .bridge
             .as_ref()
-            .is_some_and(|bridge| bridge.focused() != focused);
-        if let Some(bridge) = self.native_input.keyboard.as_ref() {
-            bridge.set_focused(focused);
+            .is_some_and(|bridge| bridge.set_focused(focused));
+        if !changed {
+            return;
         }
-        if changed && !focused {
+        if !focused {
             self.cancel_native_key_repeat();
+        }
+        // The content cannot end its own IME session once it has lost the
+        // keyboard — its requests stop at the gate in
+        // `service_native_ime_request` — so the compositor ends it here, on
+        // every edge. The candidate window belongs to a field nobody is
+        // typing into, and it would otherwise sit over whoever has the
+        // keyboard now.
+        self.end_native_ime_session();
+        if focused {
+            // And re-arm for whoever holds it now, if THEY claimed an input
+            // method (a handover clears that claim; a plain regain keeps
+            // it, so the field that was preempted gets its IME back).
+            //
+            // DEFERRED: this runs inside arbitration, before
+            // `keyboard.set_focus` has taken the keyboard off the client, so
+            // that client's text input still reads active and the activation
+            // would refuse itself. `service_native_ime_refresh` runs it once
+            // the focus change is in effect.
+            self.native_input.refresh_pending = true;
+        }
+    }
+
+    /// Run the activation arbitration owed the field, now that the seat
+    /// focus change it waited for has actually happened.
+    pub(crate) fn service_native_ime_refresh(&mut self) {
+        if !std::mem::take(&mut self.native_input.refresh_pending) {
+            return;
+        }
+        self.refresh_native_ime_activation();
+    }
+
+    /// End the input-method session this field had, if any.
+    fn end_native_ime_session(&mut self) {
+        if self.native_input.activated_for.take().is_none() {
+            return;
+        }
+        let input_method = self.seat.input_method().clone();
+        input_method.deactivate_input_method(self);
+        if let Some(bridge) = self.native_input.bridge.as_ref() {
+            bridge.set_ime_active(false);
+        }
+    }
+
+    /// Activate the input method for in-process content when it claims one,
+    /// holds the keyboard, no client owns a text input, and the instance is
+    /// not the one already activated for. Idempotent by that last test: an
+    /// `activate` resets the instance serial, so doing it twice would
+    /// mismatch a batch in flight.
+    fn refresh_native_ime_activation(&mut self) {
+        let enabled = self
+            .native_input
+            .bridge
+            .as_ref()
+            .is_some_and(NativeInputBridge::enabled);
+        if !enabled
+            || !self.native_keyboard_focused()
+            || self.seat.text_input().has_active_text_input()
+        {
+            return;
+        }
+        let input_method = self.seat.input_method().clone();
+        let instance = input_method.instance_epoch();
+        if instance.is_none() || instance == self.native_input.activated_for {
+            return;
+        }
+        input_method.activate_for_sink(self);
+        self.native_input.activated_for = instance;
+        if let Some(bridge) = self.native_input.bridge.as_ref() {
+            bridge.set_ime_active(true);
         }
     }
 
     pub(crate) fn native_keyboard_focused(&self) -> bool {
         self.native_input
-            .keyboard
+            .bridge
             .as_ref()
-            .is_some_and(NativeKeyboardBridge::focused)
+            .is_some_and(NativeInputBridge::focused)
     }
 
     /// The content's focus request changed: arbitrate again, with the
@@ -132,6 +259,13 @@ impl WaylandState {
         if !self.native_keyboard_focused() {
             return false;
         }
+        // An input method holding the keyboard grab is the one consumer
+        // that outranks the content itself: its keys come BACK through the
+        // sink as composition. Taking them here would starve the grab and
+        // make every IME dead while a scene has focus.
+        if self.seat.input_method().keyboard_grabbed() {
+            return false;
+        }
         let event = NativeKeyEvent {
             evdev: keycode.raw().saturating_sub(8),
             keysym: handle.modified_sym().raw(),
@@ -140,24 +274,44 @@ impl WaylandState {
             repeat: false,
             modifiers: NativeModifiers::from(modifiers),
         };
-        let repeats = pressed && key_repeats(handle, keycode);
-        if let Some(bridge) = self.native_input.keyboard.as_ref() {
-            bridge.push(event.clone());
+        if let Some(bridge) = self.native_input.bridge.as_ref() {
+            bridge.push_key(event.clone());
         }
         // One key repeats at a time, exactly as a client would do it from
-        // `repeat_info`: a new press replaces the old, a release of the
-        // repeating key ends it.
+        // `repeat_info`: a new repeating press replaces the old, a release
+        // of the repeating key ends it. A MODIFIER press does neither —
+        // holding a key and then pressing Shift must not stop the repeat,
+        // it only changes what the repeat produces.
         let repeating = self
             .native_input
             .repeat
             .as_ref()
             .is_some_and(|repeat| repeat.keycode == keycode);
-        if !pressed && !repeating {
+        if !pressed {
+            if repeating {
+                self.cancel_native_key_repeat();
+            }
             return true;
         }
-        self.cancel_native_key_repeat();
-        if repeats {
+        if key_repeats(handle, keycode) {
+            self.cancel_native_key_repeat();
             self.arm_native_key_repeat(keycode, event, REPEAT_DELAY);
+        } else if is_modifier(handle) {
+            // Keep the repeat, and re-resolve what the HELD key produces
+            // under the new modifiers: pressing Shift while `a` repeats
+            // must start delivering `A`, not keep replaying the `a` the
+            // original press resolved to.
+            let repeating_code = self.native_input.repeat.as_ref().map(|repeat| repeat.keycode);
+            if let Some(code) = repeating_code {
+                let (text, keysym) = key_text_and_sym(handle, code);
+                if let Some(repeat) = self.native_input.repeat.as_mut() {
+                    repeat.event.modifiers = NativeModifiers::from(modifiers);
+                    repeat.event.text = text;
+                    repeat.event.keysym = keysym;
+                }
+            }
+        } else {
+            self.cancel_native_key_repeat();
         }
         true
     }
@@ -196,8 +350,8 @@ impl WaylandState {
             return;
         }
         let event = repeat.event.clone();
-        if let Some(bridge) = self.native_input.keyboard.as_ref() {
-            bridge.push(event);
+        if let Some(bridge) = self.native_input.bridge.as_ref() {
+            bridge.push_key(event);
         }
     }
 
@@ -209,13 +363,48 @@ impl WaylandState {
 
     /// The content's own text-input state, on its way to the input method.
     pub(crate) fn service_native_ime_request(&mut self, request: NativeImeRequest) {
-        if let Some(bridge) = self.native_input.ime.as_ref() {
+        // The content's own state is tracked whatever the input method is
+        // doing: the caret feeds the popup anchor and `enabled` gates the
+        // sink, and both must be right the moment the content DOES own it.
+        if let Some(bridge) = self.native_input.bridge.as_ref() {
             bridge.note_request(&request);
         }
+        // Drive the input method only while in-process content actually
+        // holds the keyboard and no client holds a text input. Otherwise
+        // these calls would activate, deactivate or re-anchor the input
+        // method under a client's feet — `deactivate_input_method` in
+        // particular ends the client's composition.
+        //
+        // Dropped, not queued: an IME request is a snapshot of a field's
+        // state, and the content re-sends the whole set (enable,
+        // surrounding text, content type, caret, done) after every edit, so
+        // the first request once it owns the field again carries the truth.
+        // A queue would instead replay a stale caret over the live one.
+        if !self.native_keyboard_focused() || self.seat.text_input().has_active_text_input() {
+            tracing::debug!(
+                native_focused = self.native_keyboard_focused(),
+                "native IME request dropped: the input method belongs to a client"
+            );
+            return;
+        }
+        // Activate on the false->true edge, and again only when a DIFFERENT
+        // input-method instance has appeared (one that connected after the
+        // field did, or replaced the one that was here). Activating on every
+        // `enable(true)` would reset the instance serial and make the IM's
+        // next commit arrive mismatched — which is exactly what a field
+        // re-reporting its state after each edit does.
+        self.refresh_native_ime_activation();
         let input_method = self.seat.input_method().clone();
         match request {
-            NativeImeRequest::Enable(true) => input_method.activate_for_sink(self),
-            NativeImeRequest::Enable(false) => input_method.deactivate_input_method(self),
+            // The activation above is the whole of `enable(true)`.
+            NativeImeRequest::Enable(true) => {}
+            NativeImeRequest::Enable(false) => {
+                self.native_input.activated_for = None;
+                if let Some(bridge) = self.native_input.bridge.as_ref() {
+                    bridge.set_ime_active(false);
+                }
+                input_method.deactivate_input_method(self);
+            }
             NativeImeRequest::Caret {
                 x,
                 y,
@@ -244,10 +433,11 @@ impl WaylandState {
         }
     }
 
-    /// The caret rectangle in-process content last reported, in
-    /// output-space logical pixels.
+    /// The caret rectangle in-process content last reported, in comp's
+    /// global logical coordinates (the space surface layouts and
+    /// `comp.windows.list` use).
     pub(crate) fn native_ime_caret(&self) -> Option<Rectangle<i32, Logical>> {
-        let (x, y, width, height) = self.native_input.ime.as_ref()?.caret()?;
+        let (x, y, width, height) = self.native_input.bridge.as_ref()?.caret()?;
         Some(Rectangle::new((x, y).into(), (width, height).into()))
     }
 }
@@ -259,6 +449,20 @@ fn key_text(handle: &KeysymHandle<'_>) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// What a key produces under the CURRENT modifier state, for a keycode
+/// other than the one that was just pressed.
+fn key_text_and_sym(handle: &KeysymHandle<'_>, keycode: Keycode) -> (Option<String>, u32) {
+    let xkb = handle
+        .xkb()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: the state reference does not outlive this lock guard.
+    let keysym = unsafe { xkb.state() }.key_get_one_sym(keycode);
+    let text = xkb::keysym_to_utf8(keysym);
+    let text = text.trim_end_matches('\0').to_string();
+    ((!text.is_empty()).then_some(text), keysym.raw())
+}
+
 /// Whether the keymap says this key repeats (a modifier does not).
 fn key_repeats(handle: &KeysymHandle<'_>, keycode: Keycode) -> bool {
     let xkb = handle
@@ -267,4 +471,32 @@ fn key_repeats(handle: &KeysymHandle<'_>, keycode: Keycode) -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: the keymap reference does not outlive this lock guard.
     unsafe { xkb.keymap() }.key_repeats(keycode)
+}
+
+/// Whether this key is a modifier, which changes a live repeat rather than
+/// ending it.
+fn is_modifier(handle: &KeysymHandle<'_>) -> bool {
+    use xkb::keysyms as sym;
+    handle.raw_syms().iter().any(|keysym| {
+        matches!(
+            keysym.raw(),
+            sym::KEY_Shift_L
+                | sym::KEY_Shift_R
+                | sym::KEY_Control_L
+                | sym::KEY_Control_R
+                | sym::KEY_Alt_L
+                | sym::KEY_Alt_R
+                | sym::KEY_Meta_L
+                | sym::KEY_Meta_R
+                | sym::KEY_Super_L
+                | sym::KEY_Super_R
+                | sym::KEY_Hyper_L
+                | sym::KEY_Hyper_R
+                | sym::KEY_ISO_Level3_Shift
+                | sym::KEY_ISO_Level5_Shift
+                | sym::KEY_Caps_Lock
+                | sym::KEY_Num_Lock
+                | sym::KEY_Shift_Lock
+        )
+    })
 }

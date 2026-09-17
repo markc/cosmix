@@ -371,56 +371,144 @@ A scene mounted in comp's own Bevy app has no Wayland client, so the two
 input paths a client relies on end at the compositor. The `native-input`
 feature (off by default, implied by `native-quoin`) closes them.
 
-**Registration** is on the Bevy side: add `NativeInputPlugin`, then use the
-`NativeKeyboard` and `NativeIme` resources it inserts.
+**One owner**: the compositor takes ONE bridge. A second
+`install_native_input` is refused (and logged) rather than silently
+replacing the first, and `NativeKeyboard::uninstall()` is how an owner that
+is going away releases the keyboard, unregisters the input-method sink and
+ends the IME session.
+
+**Who installs what**: the feature installs `NativeInputPlugin` itself, in
+both app builders — the bridges exist and the pump runs whenever comp is
+built with `native-input`, and nothing flows until some content asks for
+focus. Only the probe below is behind an environment variable. An in-crate
+consumer just takes the resources; `native_input::install(app)` is there for
+one that builds its own `App`.
+
+**Registration** is on the Bevy side: the `NativeKeyboard` and `NativeIme`
+resources.
 
 | Call | Meaning |
 | --- | --- |
-| `NativeKeyboard::request_focus(bool)` | Ask for, or give up, the keyboard. |
+| `NativeKeyboard::claim()` | A `NativeOwner` for this consumer. |
+| `NativeKeyboard::request_focus(owner, bool)` | Ask for, or give up, the keyboard. |
 | `NativeKeyboard::focused()` | What arbitration decided. |
+| `NativeKeyboard::focus_owner()` | Which owner holds it. |
+| `NativeKeyboard::uninstall()` | Give the input back when the content unmounts. |
+| `NativeKeyboard::installed()` | Whether the compositor took THIS consumer (a second one is refused). |
+| `NativeIme::enabled()` / `active()` | What the field asked for / whether comp actually has an IM activated for it. |
 | `NativeIme::enable(bool)` | Take or give up the input method (a client's `text_input.enable`). |
-| `NativeIme::set_caret(x, y, w, h)` | The caret rectangle in output-space logical pixels. |
+| `NativeIme::set_caret(x, y, w, h)` | The caret rectangle in comp's global logical coordinates. |
 | `NativeIme::set_surrounding_text(text, cursor, anchor)` | As `text_input.set_surrounding_text`. |
 | `NativeIme::set_content_type(hint, purpose)` | As `text_input.set_content_type`. |
 | `NativeIme::done()` | End the batch (a client's `text_input.commit`). |
 
-Keys arrive as ordinary Bevy `KeyboardInput` messages, IME output as
-`NativeImeEvent` messages (`Commit`, `Preedit`, `DeleteSurrounding`,
-`Done`).
+A mounted scene reads `NativeInput` and NOTHING else: comp does not write
+Bevy's `KeyboardInput` and does not feed `ButtonInput<KeyCode>` for these
+keys, so a consumer that reads those sees nothing (in-crate, only
+`cosmix-shell`'s chrome reads `ButtonInput`, which comp never fed on kms
+either — no regression, but no keys from content either).
+
+Everything arrives on ONE message, `NativeInput { generation, seq, event }`,
+where `event` is `Key {input: KeyboardInput, modifiers}`,
+`Ime(NativeImeEvent)`, `Focus {owner, focused}` or `Dropped {events}`. The
+modifiers ride the key because comp does not write Bevy's own
+`KeyboardInput`, so `ButtonInput<KeyCode>` cannot answer "was Ctrl held?". One stream, because keys and IME
+are ordered against each other: `seq` is a single monotonic counter across
+both, so the arrival order is recoverable, and comp does NOT write Bevy's
+own `KeyboardInput` (on the nested backend the host window writes that, and
+a scene reading both would see every key twice).
+
+`generation` is the fence. It is bumped on every focus edge and every IME
+enable/disable transition, and anything queued for an older generation is
+discarded rather than delivered: a composition begun in one field never
+half-lands in the next. An IME batch is stamped with the generation it
+STARTED in, so a focus edge between a preedit and its `done` discards both.
+Content that keeps its own state can fence on the same numbers.
+
+The queue is bounded (256 events). On overflow the NEWEST is dropped, whole
+IME batches at a time — never a preedit without its `done` — and the loss is
+reported as a `Dropped` event, not just a log line. Events discarded by the
+generation fence are counted there too, so losing a whole generation is
+visible rather than a quiet frame. `seq` is strictly increasing but NOT
+contiguous: a gap means a stale generation or a retracted batch, never an
+overflow (that is what `Dropped` reports, and it carries `seq: 0`).
+
+`Focus {focused: false}` is the signal to release whatever the content
+thinks is held: the seat's own key releases went to whoever has the keyboard
+now.
 
 **Focus** is decided in one place, `arbitrate_keyboard_focus`, where
-in-process content is one more requester:
+in-process content is the LAST requester:
 
-- A session lock, an exclusive layer surface and an override-redirect X11
-  window all still win; while content holds the keyboard, no client does,
-  which is what comp already meant by focusing `None`.
+- A session lock, an exclusive layer surface, an override-redirect X11
+  window, a non-interactive layer surface, and any client asked for BY NAME
+  (a click, `comp.window.focus`, xdg-activation) all win. While content
+  holds the keyboard, no client does, which is what comp already meant by
+  focusing `None`.
 - Giving the keyboard back focuses the highest visible toplevel again.
-- The content's request survives being outranked: when the lock ends, it is
-  arbitrated again.
+- The content's request survives being outranked: when the lock ends, or the
+  window that took the keyboard goes away, it is arbitrated again.
+- One owner at a time: the last `request_focus(owner, true)` wins, a release
+  from a displaced owner is ignored, and every `Focus` event names the owner
+  it belongs to. A handover between two in-process owners is an edge like any
+  other — the displaced owner gets `Focus{focused:false}` before the new one
+  gets `Focus{focused:true}`, in that order — even though the compositor
+  never gave the keyboard back to a client. `comp.window.focus` answering
+  `reason: native_content` means in-process content still holds the keyboard.
+- The request STANDS. Being outranked does not clear it, and only a CHANGE
+  reaches the compositor: asking every frame is free and never re-arbitrates
+  (the compositor arbitrates again by itself when the preempting client goes
+  or the lock ends), so there is no per-frame loop on the protocol thread.
 
 **Keys** take the client path up to the last step: the compositor's
 bindings are dispatched first (an injected or typed `Super+Shift+M` still
 restores a window and the content never sees the M), and only what a client
-would have received goes to the content. Injected `comp.input.key` is the
-same path, so a script types into in-process content exactly as it types
-into a client. The compositor also generates key repeats for content,
-because `wl_keyboard.repeat_info` — which a client repeats from — has no
-in-process equivalent; the rate is the seat's own (500 ms, 30/s), one key at
-a time.
+would have received goes to the content. An input method holding the
+keyboard grab outranks both: while one is held the content gets nothing, and
+the keys come back as composition through the sink instead. Injected
+`comp.input.key` is the same path, so a script types into in-process content
+exactly as it types into a client. The compositor also generates key repeats
+for content, because `wl_keyboard.repeat_info` — which a client repeats
+from — has no in-process equivalent; the rate is the seat's own (500 ms,
+30/s), one key at a time. A modifier pressed during a repeat changes what
+the repeat produces rather than ending it; any other press, or the release
+of the repeating key, ends it.
 
 **IME** works in both directions through a small vendored patch (see
 `src/desktop/vendor/README.md`). A focused client's active text input still
 takes priority: the compositor sink receives `commit_string`,
 `set_preedit_string`, `delete_surrounding_text` and `commit` only when no
-client would. The reverse direction — enable, caret rectangle, surrounding
-text, content type, done — drives the input method as a client's text input
-does. A candidate popup created for in-process content has no parent
-surface, so comp anchors it under the caret rectangle the content reported.
+client would AND the content has the input method enabled. The destination
+is latched at the first request of a batch and released by `commit`, so a
+client that activates mid-composition never inherits the tail of somebody
+else's batch.
+
+Coordinates: the caret is in comp's GLOBAL logical space — the one
+`comp.windows.list` reports `x`/`y` in, spanning every output — so a caret
+on the second output anchors its candidate window there. Comp hands the same
+rectangle to the input method as the text-input rectangle, and the caret is
+the source of truth when a dropped request means the two could differ.
+
+The reverse direction — enable, caret rectangle, surrounding text, content
+type, done — drives the input method as a client's text input does, but only
+while the content actually holds the keyboard and no client holds a text
+input. Otherwise the request is DROPPED, not queued: it is a snapshot of a
+field's state, the content re-sends the whole set after every edit, and
+replaying a stale caret over a live one is worse than losing it. (A queued
+`enable(false)` would end a client's composition outright.)
+
+A candidate popup created for in-process content has no parent surface, so
+comp anchors it under the caret rectangle the content reported; it is
+dismissed when the field disables, and a popup that still carries a client
+parent is re-created parentless when the sink takes over. Losing the
+keyboard also ends the session: the content cannot do it itself once its
+requests stop at the gate above, so comp deactivates the input method on the
+falling focus edge and the content re-enables when it reads that edge.
 
 `COSMIX_COMP_NATIVE_INPUT_PROBE=1` installs a test-only text field drawn by
 the compositor: it takes the keyboard, enables the input method and logs a
-`NATIVE_INPUT_PROBE` line (focus, text, preedit, commit count) whenever its
-state changes. It is the gate client for this surface, because no Wayland
+`NATIVE_INPUT_PROBE` line (focus, text, preedit, commit count, dropped)
+whenever its state changes. It is the gate client for this surface, because no Wayland
 client can stand in for content that has no client.
 
 ### Input injection

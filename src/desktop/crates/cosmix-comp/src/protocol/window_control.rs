@@ -331,8 +331,16 @@ impl WaylandState {
             .surfaces
             .get(&object)
             .is_some_and(|record| record.focused);
+        // A named window outranks in-process content, so this is a belt-and-
+        // braces arm: if the scene somehow still holds the keyboard, say so
+        // rather than answering a bare "refused" the caller cannot act on.
+        let refused = if self.native_keyboard_focused() {
+            "native_content"
+        } else {
+            "refused"
+        };
         let mut body = json!({"id": id, "generation": generation, "focused": focused});
-        if let Some(reason) = reason.or((!focused).then_some("refused")) {
+        if let Some(reason) = reason.or((!focused).then_some(refused)) {
             body["reason"] = json!(reason);
         }
         ControlReply::Body(body)

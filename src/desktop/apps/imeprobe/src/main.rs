@@ -39,6 +39,7 @@ use wayland_protocols::xdg::shell::client::{
     xdg_wm_base::{self, XdgWmBase},
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_keyboard_grab_v2::{self, ZwpInputMethodKeyboardGrabV2},
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
     zwp_input_method_v2::{self, ZwpInputMethodV2},
     zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
@@ -67,6 +68,7 @@ struct App {
     manager: Option<ZwpInputMethodManagerV2>,
     input_method: Option<ZwpInputMethodV2>,
     popup: Option<ZwpInputPopupSurfaceV2>,
+    grab: Option<ZwpInputMethodKeyboardGrabV2>,
     popup_surface: Option<WlSurface>,
     /// Serial of the last `done`, which every commit must echo.
     serial: u32,
@@ -151,6 +153,29 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
                 println!("IMEPROBE unavailable — another input method already holds this seat");
             }
             _ => {}
+        }
+    }
+}
+
+/// The keyboard grab a real IME takes so it can compose from raw keys.
+/// Every key the compositor would otherwise deliver to whoever has focus —
+/// a client OR content the compositor draws itself — must arrive here
+/// instead while this is held.
+impl Dispatch<ZwpInputMethodKeyboardGrabV2, ()> for App {
+    fn event(
+        _: &mut Self,
+        _: &ZwpInputMethodKeyboardGrabV2,
+        event: zwp_input_method_keyboard_grab_v2::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwp_input_method_keyboard_grab_v2::Event::Key { key, state, .. } = event {
+            let pressed = matches!(
+                state,
+                wayland_client::WEnum::Value(wayland_client::protocol::wl_keyboard::KeyState::Pressed)
+            );
+            println!("IMEPROBE grab key {key} pressed={pressed}");
         }
     }
 }
@@ -366,6 +391,16 @@ fn main() {
 
     // Exercise an existing client field without mapping the probe's own field.
     if std::env::args().any(|arg| arg == "--external-field") {
+        // A real IME grabs the keyboard to compose from raw keys; the
+        // compositor must route keys here even when in-process content has
+        // focus, or every IME is dead in front of such content.
+        if std::env::args().any(|arg| arg == "--grab") {
+            if let Some(input_method) = app.input_method.clone() {
+                app.grab = Some(input_method.grab_keyboard(&qh, ()));
+                let _ = queue.roundtrip(&mut app);
+                println!("IMEPROBE grabbed the keyboard");
+            }
+        }
         println!("IMEPROBE waiting for an external text field");
         loop {
             if let Err(error) = queue.blocking_dispatch(&mut app) {

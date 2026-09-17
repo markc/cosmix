@@ -17,6 +17,14 @@ The patch adds an optional sink on `InputMethodHandle`
 `DeleteSurroundingText` and `Commit` go to it ONLY when
 `TextInputHandle::has_active_text_input()` is false, so a focused client keeps
 priority and unpatched behaviour is unchanged when no sink is registered.
+The destination is decided ONCE per batch (`batch_to_sink`, latched at the
+first request and released by `commit`), so a client that activates
+mid-composition cannot inherit the tail of a batch the sink began — or the
+other way round. `deactivate_input_method` also dismisses a popup that has
+no parent when a sink is registered (upstream dismisses only parented ones,
+which would leave the compositor's own candidate window on screen for ever),
+and `activate_for_sink` re-creates a popup that still carries a client
+parent rather than repositioning it under that client's geometry.
 The reverse direction is four thin `pub` entry points — `activate_for_sink`,
 the now-`pub` `deactivate_input_method` and `set_text_input_rectangle`, plus
 `with_active_instance` / `send_done` — so the compositor's own field can

@@ -784,51 +784,130 @@ windows and is empty while a session lock is active.</li>
 <p>A scene mounted in comp's own Bevy app has no Wayland client, so the two
 input paths a client relies on end at the compositor. The <code>native-input</code>
 feature (off by default, implied by <code>native-quoin</code>) closes them.</p>
-<p><strong>Registration</strong> is on the Bevy side: add <code>NativeInputPlugin</code>, then use the
-<code>NativeKeyboard</code> and <code>NativeIme</code> resources it inserts.</p>
+<p><strong>One owner</strong>: the compositor takes ONE bridge. A second
+<code>install_native_input</code> is refused (and logged) rather than silently
+replacing the first, and <code>NativeKeyboard::uninstall()</code> is how an owner that
+is going away releases the keyboard, unregisters the input-method sink and
+ends the IME session.</p>
+<p><strong>Who installs what</strong>: the feature installs <code>NativeInputPlugin</code> itself, in
+both app builders — the bridges exist and the pump runs whenever comp is
+built with <code>native-input</code>, and nothing flows until some content asks for
+focus. Only the probe below is behind an environment variable. An in-crate
+consumer just takes the resources; <code>native_input::install(app)</code> is there for
+one that builds its own <code>App</code>.</p>
+<p><strong>Registration</strong> is on the Bevy side: the <code>NativeKeyboard</code> and <code>NativeIme</code>
+resources.</p>
 <table><thead><tr><th>Call</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>NativeKeyboard::request_focus(bool)</code></td><td>Ask for, or give up, the keyboard.</td></tr>
+<tr><td><code>NativeKeyboard::claim()</code></td><td>A <code>NativeOwner</code> for this consumer.</td></tr>
+<tr><td><code>NativeKeyboard::request_focus(owner, bool)</code></td><td>Ask for, or give up, the keyboard.</td></tr>
 <tr><td><code>NativeKeyboard::focused()</code></td><td>What arbitration decided.</td></tr>
+<tr><td><code>NativeKeyboard::focus_owner()</code></td><td>Which owner holds it.</td></tr>
+<tr><td><code>NativeKeyboard::uninstall()</code></td><td>Give the input back when the content unmounts.</td></tr>
+<tr><td><code>NativeKeyboard::installed()</code></td><td>Whether the compositor took THIS consumer (a second one is refused).</td></tr>
+<tr><td><code>NativeIme::enabled()</code> / <code>active()</code></td><td>What the field asked for / whether comp actually has an IM activated for it.</td></tr>
 <tr><td><code>NativeIme::enable(bool)</code></td><td>Take or give up the input method (a client's <code>text_input.enable</code>).</td></tr>
-<tr><td><code>NativeIme::set_caret(x, y, w, h)</code></td><td>The caret rectangle in output-space logical pixels.</td></tr>
+<tr><td><code>NativeIme::set_caret(x, y, w, h)</code></td><td>The caret rectangle in comp's global logical coordinates.</td></tr>
 <tr><td><code>NativeIme::set_surrounding_text(text, cursor, anchor)</code></td><td>As <code>text_input.set_surrounding_text</code>.</td></tr>
 <tr><td><code>NativeIme::set_content_type(hint, purpose)</code></td><td>As <code>text_input.set_content_type</code>.</td></tr>
 <tr><td><code>NativeIme::done()</code></td><td>End the batch (a client's <code>text_input.commit</code>).</td></tr>
 </tbody></table>
-<p>Keys arrive as ordinary Bevy <code>KeyboardInput</code> messages, IME output as
-<code>NativeImeEvent</code> messages (<code>Commit</code>, <code>Preedit</code>, <code>DeleteSurrounding</code>,
-<code>Done</code>).</p>
+<p>A mounted scene reads <code>NativeInput</code> and NOTHING else: comp does not write
+Bevy's <code>KeyboardInput</code> and does not feed <code>ButtonInput&lt;KeyCode&gt;</code> for these
+keys, so a consumer that reads those sees nothing (in-crate, only
+<code>cosmix-shell</code>'s chrome reads <code>ButtonInput</code>, which comp never fed on kms
+either — no regression, but no keys from content either).</p>
+<p>Everything arrives on ONE message, <code>NativeInput { generation, seq, event }</code>,
+where <code>event</code> is <code>Key {input: KeyboardInput, modifiers}</code>,
+<code>Ime(NativeImeEvent)</code>, <code>Focus {owner, focused}</code> or <code>Dropped {events}</code>. The
+modifiers ride the key because comp does not write Bevy's own
+<code>KeyboardInput</code>, so <code>ButtonInput&lt;KeyCode&gt;</code> cannot answer "was Ctrl held?". One stream, because keys and IME
+are ordered against each other: <code>seq</code> is a single monotonic counter across
+both, so the arrival order is recoverable, and comp does NOT write Bevy's
+own <code>KeyboardInput</code> (on the nested backend the host window writes that, and
+a scene reading both would see every key twice).</p>
+<p><code>generation</code> is the fence. It is bumped on every focus edge and every IME
+enable/disable transition, and anything queued for an older generation is
+discarded rather than delivered: a composition begun in one field never
+half-lands in the next. An IME batch is stamped with the generation it
+STARTED in, so a focus edge between a preedit and its <code>done</code> discards both.
+Content that keeps its own state can fence on the same numbers.</p>
+<p>The queue is bounded (256 events). On overflow the NEWEST is dropped, whole
+IME batches at a time — never a preedit without its <code>done</code> — and the loss is
+reported as a <code>Dropped</code> event, not just a log line. Events discarded by the
+generation fence are counted there too, so losing a whole generation is
+visible rather than a quiet frame. <code>seq</code> is strictly increasing but NOT
+contiguous: a gap means a stale generation or a retracted batch, never an
+overflow (that is what <code>Dropped</code> reports, and it carries <code>seq: 0</code>).</p>
+<p><code>Focus {focused: false}</code> is the signal to release whatever the content
+thinks is held: the seat's own key releases went to whoever has the keyboard
+now.</p>
 <p><strong>Focus</strong> is decided in one place, <code>arbitrate_keyboard_focus</code>, where
-in-process content is one more requester:</p>
+in-process content is the LAST requester:</p>
 <ul>
-<li>A session lock, an exclusive layer surface and an override-redirect X11
-window all still win; while content holds the keyboard, no client does,
-which is what comp already meant by focusing <code>None</code>.</li>
+<li>A session lock, an exclusive layer surface, an override-redirect X11
+window, a non-interactive layer surface, and any client asked for BY NAME
+(a click, <code>comp.window.focus</code>, xdg-activation) all win. While content
+holds the keyboard, no client does, which is what comp already meant by
+focusing <code>None</code>.</li>
 <li>Giving the keyboard back focuses the highest visible toplevel again.</li>
-<li>The content's request survives being outranked: when the lock ends, it is
-arbitrated again.</li>
+<li>The content's request survives being outranked: when the lock ends, or the
+window that took the keyboard goes away, it is arbitrated again.</li>
+<li>One owner at a time: the last <code>request_focus(owner, true)</code> wins, a release
+from a displaced owner is ignored, and every <code>Focus</code> event names the owner
+it belongs to. A handover between two in-process owners is an edge like any
+other — the displaced owner gets <code>Focus{focused:false}</code> before the new one
+gets <code>Focus{focused:true}</code>, in that order — even though the compositor
+never gave the keyboard back to a client. <code>comp.window.focus</code> answering
+<code>reason: native_content</code> means in-process content still holds the keyboard.</li>
+<li>The request STANDS. Being outranked does not clear it, and only a CHANGE
+reaches the compositor: asking every frame is free and never re-arbitrates
+(the compositor arbitrates again by itself when the preempting client goes
+or the lock ends), so there is no per-frame loop on the protocol thread.</li>
 </ul>
 <p><strong>Keys</strong> take the client path up to the last step: the compositor's
 bindings are dispatched first (an injected or typed <code>Super+Shift+M</code> still
 restores a window and the content never sees the M), and only what a client
-would have received goes to the content. Injected <code>comp.input.key</code> is the
-same path, so a script types into in-process content exactly as it types
-into a client. The compositor also generates key repeats for content,
-because <code>wl_keyboard.repeat_info</code> — which a client repeats from — has no
-in-process equivalent; the rate is the seat's own (500 ms, 30/s), one key at
-a time.</p>
+would have received goes to the content. An input method holding the
+keyboard grab outranks both: while one is held the content gets nothing, and
+the keys come back as composition through the sink instead. Injected
+<code>comp.input.key</code> is the same path, so a script types into in-process content
+exactly as it types into a client. The compositor also generates key repeats
+for content, because <code>wl_keyboard.repeat_info</code> — which a client repeats
+from — has no in-process equivalent; the rate is the seat's own (500 ms,
+30/s), one key at a time. A modifier pressed during a repeat changes what
+the repeat produces rather than ending it; any other press, or the release
+of the repeating key, ends it.</p>
 <p><strong>IME</strong> works in both directions through a small vendored patch (see
 <code>src/desktop/vendor/README.md</code>). A focused client's active text input still
 takes priority: the compositor sink receives <code>commit_string</code>,
 <code>set_preedit_string</code>, <code>delete_surrounding_text</code> and <code>commit</code> only when no
-client would. The reverse direction — enable, caret rectangle, surrounding
-text, content type, done — drives the input method as a client's text input
-does. A candidate popup created for in-process content has no parent
-surface, so comp anchors it under the caret rectangle the content reported.</p>
+client would AND the content has the input method enabled. The destination
+is latched at the first request of a batch and released by <code>commit</code>, so a
+client that activates mid-composition never inherits the tail of somebody
+else's batch.</p>
+<p>Coordinates: the caret is in comp's GLOBAL logical space — the one
+<code>comp.windows.list</code> reports <code>x</code>/<code>y</code> in, spanning every output — so a caret
+on the second output anchors its candidate window there. Comp hands the same
+rectangle to the input method as the text-input rectangle, and the caret is
+the source of truth when a dropped request means the two could differ.</p>
+<p>The reverse direction — enable, caret rectangle, surrounding text, content
+type, done — drives the input method as a client's text input does, but only
+while the content actually holds the keyboard and no client holds a text
+input. Otherwise the request is DROPPED, not queued: it is a snapshot of a
+field's state, the content re-sends the whole set after every edit, and
+replaying a stale caret over a live one is worse than losing it. (A queued
+<code>enable(false)</code> would end a client's composition outright.)</p>
+<p>A candidate popup created for in-process content has no parent surface, so
+comp anchors it under the caret rectangle the content reported; it is
+dismissed when the field disables, and a popup that still carries a client
+parent is re-created parentless when the sink takes over. Losing the
+keyboard also ends the session: the content cannot do it itself once its
+requests stop at the gate above, so comp deactivates the input method on the
+falling focus edge and the content re-enables when it reads that edge.</p>
 <p><code>COSMIX_COMP_NATIVE_INPUT_PROBE=1</code> installs a test-only text field drawn by
 the compositor: it takes the keyboard, enables the input method and logs a
-<code>NATIVE_INPUT_PROBE</code> line (focus, text, preedit, commit count) whenever its
-state changes. It is the gate client for this surface, because no Wayland
+<code>NATIVE_INPUT_PROBE</code> line (focus, text, preedit, commit count, dropped)
+whenever its state changes. It is the gate client for this surface, because no Wayland
 client can stand in for content that has no client.</p>
 <h3 id="input-injection">Input injection</h3>
 <p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event

@@ -971,10 +971,9 @@ impl HostInput {
 
 enum ProtocolCommand {
     #[cfg(feature = "native-input")]
-    NativeInput(
-        crate::native_input::NativeKeyboardBridge,
-        crate::native_input::NativeImeBridge,
-    ),
+    NativeInput(crate::native_input::NativeInputBridge),
+    #[cfg(feature = "native-input")]
+    NativeInputUninstall,
     #[cfg(feature = "native-input")]
     NativeFocusChanged,
     #[cfg(feature = "native-input")]
@@ -1313,19 +1312,19 @@ impl ClientSceneFeedHandle {
     pub(crate) fn native_ime_request(&self, request: crate::native_input::NativeImeRequest) {
         let _ = self.commands.send(ProtocolCommand::NativeImeRequest(request));
     }
+
+    /// The owner is going away: the compositor stops feeding the bridge and
+    /// unregisters the sink.
+    pub(crate) fn native_input_uninstall(&self) {
+        let _ = self.commands.send(ProtocolCommand::NativeInputUninstall);
+    }
 }
 
 impl ClientSceneFeed {
-    /// Register the bridges in-process content reads (keys, IME).
+    /// Register the bridge in-process content reads (keys, IME, focus).
     #[cfg(feature = "native-input")]
-    pub(crate) fn install_native_input(
-        &self,
-        keyboard: crate::native_input::NativeKeyboardBridge,
-        ime: crate::native_input::NativeImeBridge,
-    ) {
-        let _ = self
-            .commands
-            .send(ProtocolCommand::NativeInput(keyboard, ime));
+    pub(crate) fn install_native_input(&self, bridge: crate::native_input::NativeInputBridge) {
+        let _ = self.commands.send(ProtocolCommand::NativeInput(bridge));
     }
 
     #[cfg(feature = "native-input")]
@@ -3446,8 +3445,12 @@ impl ProtocolServer {
             .handle()
             .insert_source(command_source, |event, (), state| match event {
                 #[cfg(feature = "native-input")]
-                ChannelEvent::Msg(ProtocolCommand::NativeInput(keyboard, ime)) => {
-                    state.install_native_input(keyboard, ime);
+                ChannelEvent::Msg(ProtocolCommand::NativeInput(bridge)) => {
+                    state.install_native_input(bridge);
+                }
+                #[cfg(feature = "native-input")]
+                ChannelEvent::Msg(ProtocolCommand::NativeInputUninstall) => {
+                    state.uninstall_native_input();
                 }
                 #[cfg(feature = "native-input")]
                 ChannelEvent::Msg(ProtocolCommand::NativeFocusChanged) => {
@@ -11980,7 +11983,9 @@ impl WaylandState {
                     };
                     // A binding still comes first; what it leaves goes to
                     // in-process content when that owns the keyboard, and to
-                    // the focused client otherwise.
+                    // the focused client otherwise. An input-method keyboard
+                    // grab outranks both, and `deliver_native_key` declines
+                    // while one is held.
                     #[cfg(feature = "native-input")]
                     if matches!(disposition, KeyDisposition::Forward)
                         && state.deliver_native_key(keycode, &key_handle, modifiers, pressed)
@@ -13003,8 +13008,18 @@ impl WaylandState {
             .and_then(|parent| self.surfaces.get(&parent.surface.id()))
             .map(|record| (record.layout.x as i32, record.layout.y as i32));
         // No parent surface means the caret belongs to content the
-        // compositor draws itself, whose rectangle is already in output
-        // space.
+        // compositor draws itself. Its rectangle is already in comp's GLOBAL
+        // logical coordinates — the space this function answers in, and the
+        // space surface layouts use — so it needs no parent origin added and
+        // it spans outputs: a caret at x=2400 anchors on the second output,
+        // not off the edge of the first.
+        //
+        // `popup.text_input_rectangle()` holds the same rectangle whenever
+        // the compositor was able to forward it (`set_text_input_rectangle`
+        // in `service_native_ime_request`). The caret is the one that is
+        // always current — a request made while a client held the input
+        // method is dropped rather than forwarded — so it is the source of
+        // truth here and the two cannot drift apart in the delivered popup.
         #[cfg(feature = "native-input")]
         if parent.is_none()
             && let Some(caret) = self.native_ime_caret()
@@ -13271,6 +13286,11 @@ impl WaylandState {
     #[cfg(not(feature = "native-input"))]
     fn set_native_keyboard_focus(&mut self, _focused: bool) {}
 
+    #[cfg(not(feature = "native-input"))]
+    fn native_keyboard_focused(&self) -> bool {
+        false
+    }
+
     fn arbitrate_keyboard_focus(
         &mut self,
         requested: Option<WlSurface>,
@@ -13302,16 +13322,7 @@ impl WaylandState {
                 self.set_native_keyboard_focus(false);
                 self.exclusive_keyboard_focus = Some(object);
                 Some(surface)
-            } else if self.native_keyboard_wants_focus() {
-                // Content the compositor draws itself is one more requester,
-                // and no client owns the keyboard while it has it — which is
-                // exactly what `set_focus(None)` already means. The gates
-                // above still win: a lock screen or an exclusive layer
-                // surface takes the keyboard back without asking.
-                self.set_native_keyboard_focus(true);
-                None
             } else {
-                self.set_native_keyboard_focus(false);
                 let requested = match requested {
                     Some(surface)
                         if self.layer_keyboard_interactivity_for_surface(&surface)
@@ -13346,10 +13357,26 @@ impl WaylandState {
                     None => None,
                 };
                 if requested.is_some() {
+                    // A client asked for by name — a click, `comp.window.focus`,
+                    // xdg-activation — outranks in-process content, which has
+                    // only a standing request. The request stays standing: the
+                    // content gets the keyboard back when that client goes.
+                    self.set_native_keyboard_focus(false);
                     requested
+                } else if self.native_keyboard_wants_focus() {
+                    // Content the compositor draws itself is the LAST
+                    // requester, and no client owns the keyboard while it has
+                    // it — which is exactly what `set_focus(None)` already
+                    // means. Everything above wins without asking: the lock
+                    // screen, an exclusive layer, the override-redirect gate,
+                    // a non-interactive layer, and any named client.
+                    self.set_native_keyboard_focus(true);
+                    None
                 } else if fallback || current_layer_became_none || previous_exclusive.is_some() {
+                    self.set_native_keyboard_focus(false);
                     self.highest_visible_toplevel_surface()
                 } else if clear_if_unrequested {
+                    self.set_native_keyboard_focus(false);
                     None
                 } else {
                     break 'focus_policy;
@@ -13388,6 +13415,12 @@ impl WaylandState {
             let keyboard = self.keyboard.clone();
             keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
+        // In-process content that just took the keyboard may be owed an
+        // input-method activation. It waits until here: only now has the
+        // client that had the keyboard lost its text input, which until
+        // this point would have outranked the field's own claim.
+        #[cfg(feature = "native-input")]
+        self.service_native_ime_refresh();
     }
 
     fn keyboard_focus_is_related_grabbing_popup(&self, target: Option<&WlSurface>) -> bool {
@@ -15716,10 +15749,10 @@ mod explicit_sync;
 mod focus;
 mod handlers;
 mod input;
-pub(crate) mod presentation;
-mod release_use;
 #[cfg(feature = "native-input")]
 mod native_input;
+pub(crate) mod presentation;
+mod release_use;
 #[cfg(feature = "bus")]
 mod input_injection;
 #[cfg(feature = "bus")]
