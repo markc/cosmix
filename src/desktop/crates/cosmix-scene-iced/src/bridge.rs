@@ -74,6 +74,9 @@ pub(crate) struct SurfaceState {
     /// Times the render world gave up on this surface's texture without the
     /// geometry changing. Repaint cycles do not clear it.
     giveups: u32,
+    /// The geometry the give-up count belongs to. A repaint cycle zeroes
+    /// `size`, so the count cannot be keyed on that.
+    last_geometry: (UVec2, f32),
     last: Processed,
 }
 
@@ -450,6 +453,7 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
             hovered: false,
             repaint: false,
             giveups: 0,
+            last_geometry: (UVec2::ZERO, 0.0),
             last: Processed::default(),
         },
     ));
@@ -967,8 +971,9 @@ pub(crate) fn frame(
             }
         }
         let size = geometry.size;
-        if state.size != UVec2::ZERO && (state.size != size || state.scale != geometry.scale) {
+        if state.last_geometry != (size, geometry.scale) {
             // Real geometry movement, not a repaint cycle: start counting again.
+            state.last_geometry = (size, geometry.scale);
             state.giveups = 0;
         }
         let renderer = renderers.0.get_mut(&entity);

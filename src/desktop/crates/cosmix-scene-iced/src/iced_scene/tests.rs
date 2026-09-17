@@ -704,7 +704,7 @@ fn buttons_follow_the_design_tokens_not_iceds_palette() {
     let x = (button.x + button.width / 2.0) as usize;
     let y = (button.y + button.height / 2.0) as usize;
     let pixel = &buffer[(y * 300 + x) * 4..][..4];
-    let want = [0x2f, 0x81, 0xf7];
+    let want: [u8; 3] = [0x2f, 0x81, 0xf7];
     for (channel, expected) in pixel.iter().zip(want) {
         assert!(
             (*channel as i32 - expected as i32).abs() <= 2,
@@ -759,10 +759,12 @@ fn pointer_positions_use_the_pointer_scale() {
     rig.settle();
     assert_eq!(rig.actions(), vec![action("click", "go", "button", None)]);
 
-    // The render scale alone would have hit nothing there.
+    // The same logical point, now arriving unscaled, still hits: the divisor
+    // is the pointer scale, not the render scale.
+    rig.renderer.set_pointer_scale(1.0);
     rig.renderer.queue(SurfaceEvent::PointerMoved {
-        x: button.x * 3.75,
-        y: button.y * 3.75,
+        x: button.x,
+        y: button.y,
     });
     for pressed in [true, false] {
         rig.renderer.queue(SurfaceEvent::PointerButton {
@@ -771,7 +773,7 @@ fn pointer_positions_use_the_pointer_scale() {
         });
     }
     rig.settle();
-    assert!(rig.actions().is_empty());
+    assert_eq!(rig.actions(), vec![action("click", "go", "button", None)]);
 }
 
 #[test]
