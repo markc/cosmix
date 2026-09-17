@@ -16,7 +16,7 @@ pub mod waveform;
 pub use audio_style::AudioStyle;
 pub use fader::Fader;
 pub use knob::Knob;
-pub use menu::{Item, Menu, MenuStyle};
+pub use menu::{Item, Menu, MenuState, MenuStyle, NavOutcome, Navigator, Panel};
 pub use meter::LevelMeter;
 pub use piano_roll::{Note, PianoRoll, RollNotes, RollView};
 pub use text_field::TextField;
