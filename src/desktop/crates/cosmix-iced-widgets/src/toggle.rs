@@ -1,9 +1,9 @@
 //! Latching mute/solo-style button.
-use iced::advanced::{
+use iced_core::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer, text,
     widget::{Tree, tree},
 };
-use iced::{Element, Event, Length, Point, Rectangle, Size};
+use iced_core::{Element, Event, Length, Point, Rectangle, Size};
 
 use crate::AudioStyle;
 use crate::audio_style::quad;
@@ -60,7 +60,7 @@ impl<'a, Message> Toggle<'a, Message> {
         self
     }
 
-    fn colours(&self) -> (iced::Color, iced::Color) {
+    fn colours(&self) -> (iced_core::Color, iced_core::Color) {
         let style = self.style;
         match (self.on, self.alert) {
             (false, _) => (style.track, style.muted_text),
@@ -140,7 +140,7 @@ impl<Message, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
                 line_height: text::LineHeight::default(),
                 font: renderer.default_font(),
                 align_x: text::Alignment::Center,
-                align_y: iced::alignment::Vertical::Center,
+                align_y: iced_core::alignment::Vertical::Center,
                 shaping: text::Shaping::Basic,
                 wrapping: text::Wrapping::None,
             },
@@ -183,14 +183,14 @@ mod tests {
         let node = layout::Node::new(Size::new(24.0, 20.0));
         let mut messages = Vec::new();
         let mut shell = Shell::new(&mut messages);
-        Widget::<bool, iced::Theme, ()>::update(
+        Widget::<bool, iced_core::Theme, ()>::update(
             toggle,
             &mut tree,
             &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
             Layout::new(&node),
             mouse::Cursor::Available(at),
             &(),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut shell,
             &Rectangle::with_size(Size::INFINITE),
         );

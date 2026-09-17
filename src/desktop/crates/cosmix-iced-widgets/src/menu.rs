@@ -4,11 +4,11 @@
 //! Shift+F10 after clicking the target. Arrows, Home/End, Enter/Space and
 //! Escape navigate. Accelerator strings are labels; the app owns shortcuts.
 
-use iced::advanced::{
+use iced_core::{Border, Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard};
+use iced_core::{
     Clipboard, Layout, Shell, Widget, input_method, layout, mouse, overlay, renderer, text,
     widget::{Operation, Tree, tree},
 };
-use iced::{Border, Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard};
 
 /// An action, submenu, or separator. Disabled entries cannot be selected.
 #[derive(Debug, Clone)]
@@ -184,9 +184,9 @@ struct ChildFocus {
 impl Operation for ChildFocus {
     fn focusable(
         &mut self,
-        _id: Option<&iced::advanced::widget::Id>,
+        _id: Option<&iced_core::widget::Id>,
         _bounds: Rectangle,
-        state: &mut dyn iced::advanced::widget::operation::Focusable,
+        state: &mut dyn iced_core::widget::operation::Focusable,
     ) {
         self.present = true;
         self.focused |= state.is_focused();
@@ -369,7 +369,7 @@ fn text_width<Renderer: text::Renderer>(renderer: &Renderer, value: &str, style:
         line_height: text::LineHeight::default(),
         font: renderer.default_font(),
         align_x: text::Alignment::Left,
-        align_y: iced::alignment::Vertical::Top,
+        align_y: iced_core::alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,
         wrapping: text::Wrapping::None,
     })
@@ -439,7 +439,7 @@ fn label<Renderer: text::Renderer>(
             } else {
                 text::Alignment::Left
             },
-            align_y: iced::alignment::Vertical::Center,
+            align_y: iced_core::alignment::Vertical::Center,
             shaping: text::Shaping::Advanced,
             wrapping: text::Wrapping::None,
         },
@@ -651,12 +651,12 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             return;
         }
         let bar = self.content.is_none();
-        if let Event::Touch(iced::touch::Event::FingerPressed { position, .. }) = event {
+        if let Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) = event {
             state.focused =
                 !previously_captured && layout.bounds().contains(*position - state.translation);
         } else if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
             state.focused = !previously_captured && cursor.is_over(layout.bounds());
-        } else if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+        } else if matches!(event, Event::Window(iced_core::window::Event::Unfocused)) {
             state.focused = false;
             if state.open {
                 state.close();
@@ -701,7 +701,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         }
         let touch_event;
         let (event, cursor) =
-            if let Event::Touch(iced::touch::Event::FingerPressed { position, .. }) = event {
+            if let Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) = event {
                 touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
                 (
                     &touch_event,
@@ -1014,19 +1014,19 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         }
         let touch_event;
         let (event, cursor) = match event {
-            Event::Touch(iced::touch::Event::FingerPressed { position, .. }) => {
+            Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) => {
                 touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
                 (&touch_event, mouse::Cursor::Available(*position))
             }
-            Event::Touch(iced::touch::Event::FingerMoved { position, .. }) => {
+            Event::Touch(iced_core::touch::Event::FingerMoved { position, .. }) => {
                 touch_event = Event::Mouse(mouse::Event::CursorMoved {
                     position: *position,
                 });
                 (&touch_event, mouse::Cursor::Available(*position))
             }
             Event::Touch(
-                iced::touch::Event::FingerLifted { position, .. }
-                | iced::touch::Event::FingerLost { position, .. },
+                iced_core::touch::Event::FingerLifted { position, .. }
+                | iced_core::touch::Event::FingerLost { position, .. },
             ) => {
                 touch_event = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
                 (&touch_event, mouse::Cursor::Available(*position))
@@ -1101,7 +1101,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
                 shell.capture_event();
             }
             Event::Mouse(_) => shell.capture_event(),
-            Event::Window(iced::window::Event::Unfocused) => self.state.close(),
+            Event::Window(iced_core::window::Event::Unfocused) => self.state.close(),
             _ => {}
         }
         if *self.state != before {
@@ -1145,9 +1145,9 @@ mod tests {
     impl renderer::Renderer for Recorder {
         fn start_layer(&mut self, _: Rectangle) {}
         fn end_layer(&mut self) {}
-        fn start_transformation(&mut self, _: iced::Transformation) {}
+        fn start_transformation(&mut self, _: iced_core::Transformation) {}
         fn end_transformation(&mut self) {}
-        fn fill_quad(&mut self, quad: renderer::Quad, _: impl Into<iced::Background>) {
+        fn fill_quad(&mut self, quad: renderer::Quad, _: impl Into<iced_core::Background>) {
             self.quads.push(quad.bounds);
         }
         fn reset(&mut self, _: Rectangle) {
@@ -1155,10 +1155,9 @@ mod tests {
         }
         fn allocate_image(
             &mut self,
-            handle: &iced::advanced::image::Handle,
-            callback: impl FnOnce(
-                Result<iced::advanced::image::Allocation, iced::advanced::image::Error>,
-            ) + Send
+            handle: &iced_core::image::Handle,
+            callback: impl FnOnce(Result<iced_core::image::Allocation, iced_core::image::Error>)
+            + Send
             + 'static,
         ) {
             renderer::Renderer::allocate_image(&mut (), handle, callback);
@@ -1167,10 +1166,10 @@ mod tests {
 
     #[cfg(debug_assertions)]
     impl text::Renderer for Recorder {
-        type Font = iced::Font;
+        type Font = iced_core::Font;
         type Paragraph = ();
         type Editor = ();
-        const ICON_FONT: iced::Font = iced::Font::DEFAULT;
+        const ICON_FONT: iced_core::Font = iced_core::Font::DEFAULT;
         const CHECKMARK_ICON: char = 'x';
         const ARROW_DOWN_ICON: char = 'v';
         const SCROLL_UP_ICON: char = '^';
@@ -1178,11 +1177,11 @@ mod tests {
         const SCROLL_LEFT_ICON: char = '<';
         const SCROLL_RIGHT_ICON: char = '>';
         const ICED_LOGO: char = 'i';
-        fn default_font(&self) -> iced::Font {
-            iced::Font::DEFAULT
+        fn default_font(&self) -> iced_core::Font {
+            iced_core::Font::DEFAULT
         }
-        fn default_size(&self) -> iced::Pixels {
-            iced::Pixels(14.0)
+        fn default_size(&self) -> iced_core::Pixels {
+            iced_core::Pixels(14.0)
         }
         fn fill_paragraph(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
         fn fill_editor(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
@@ -1193,7 +1192,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn runtime_open_and_release_batch_keeps_drawn_overlay_and_close_keeps_tail() {
         let mut renderer = Recorder::default();
-        let menu: Menu<'_, u8, iced::Theme, Recorder> =
+        let menu: Menu<'_, u8, iced_core::Theme, Recorder> =
             Menu::bar(vec![Item::submenu("file", items())]);
         let mut ui = iced_runtime::UserInterface::build(
             menu,
@@ -1215,13 +1214,13 @@ mod tests {
             &[key_event(Named::F10, keyboard::Modifiers::empty()), release],
             mouse::Cursor::Unavailable,
             &mut renderer,
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(statuses.len(), 2);
         ui.draw(
             &mut renderer,
-            &iced::Theme::Dark,
+            &iced_core::Theme::Dark,
             &renderer::Style::default(),
             mouse::Cursor::Unavailable,
         );
@@ -1238,11 +1237,11 @@ mod tests {
                 Event::Keyboard(keyboard::Event::ModifiersChanged(
                     keyboard::Modifiers::empty(),
                 )),
-                Event::Window(iced::window::Event::Unfocused),
+                Event::Window(iced_core::window::Event::Unfocused),
             ],
             mouse::Cursor::Unavailable,
             &mut renderer,
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
@@ -1250,10 +1249,10 @@ mod tests {
             3,
             "iced must not drop events following menu dismissal"
         );
-        assert_eq!(statuses[1], iced::event::Status::Ignored);
+        assert_eq!(statuses[1], iced_core::event::Status::Ignored);
         ui.draw(
             &mut renderer,
-            &iced::Theme::Dark,
+            &iced_core::Theme::Dark,
             &renderer::Style::default(),
             mouse::Cursor::Unavailable,
         );
@@ -1283,11 +1282,11 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_focused_child_opens_context_and_receives_modifiers_and_ime() {
-        let id = iced::advanced::widget::Id::new("field");
-        let field = iced::widget::text_input("", "")
+        let id = iced_core::widget::Id::new("field");
+        let field = iced_widget::text_input("", "")
             .id(id.clone())
             .on_input(|value| value);
-        let menu: Menu<'_, String, iced::Theme, ()> =
+        let menu: Menu<'_, String, iced_core::Theme, ()> =
             Menu::context(field, vec![Item::action("action", "action".to_owned())]);
         let mut ui = iced_runtime::UserInterface::build(
             menu,
@@ -1297,7 +1296,7 @@ mod tests {
         );
         ui.operate(
             &(),
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+            &mut iced_core::widget::operation::focusable::focus::<()>(id),
         );
         let mut messages = vec![];
         let (_, statuses) = ui.update(
@@ -1307,61 +1306,62 @@ mod tests {
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses[1],
-            iced::event::Status::Captured,
+            iced_core::event::Status::Captured,
             "keyboard-focused child enables context shortcut without click"
         );
         let (_, statuses) = ui.update(
             &[
                 character("q"),
-                Event::InputMethod(iced::advanced::input_method::Event::Preedit(
+                Event::InputMethod(iced_core::input_method::Event::Preedit(
                     "界".into(),
                     Some(0..3),
                 )),
-                Event::InputMethod(iced::advanced::input_method::Event::Commit("界".into())),
+                Event::InputMethod(iced_core::input_method::Event::Commit("界".into())),
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses,
-            [iced::event::Status::Captured; 3],
+            [iced_core::event::Status::Captured; 3],
             "an open menu blocks key presses and IME text from the app behind it"
         );
         assert!(messages.is_empty());
         // A clearing preedit is state, not input: it reaches the field.
         let (_, statuses) = ui.update(
-            &[Event::InputMethod(
-                iced::advanced::input_method::Event::Preedit(String::new(), None),
-            )],
+            &[Event::InputMethod(iced_core::input_method::Event::Preedit(
+                String::new(),
+                None,
+            ))],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
-        assert_eq!(statuses, [iced::event::Status::Ignored]);
+        assert_eq!(statuses, [iced_core::event::Status::Ignored]);
         let (_, statuses) = ui.update(
             &[
                 Event::Keyboard(keyboard::Event::ModifiersChanged(
                     keyboard::Modifiers::empty(),
                 )),
-                Event::InputMethod(iced::advanced::input_method::Event::Closed),
+                Event::InputMethod(iced_core::input_method::Event::Closed),
                 key_event(Named::Escape, keyboard::Modifiers::empty()),
                 character("c"),
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(statuses.len(), 4);
-        assert_eq!(statuses[0], iced::event::Status::Ignored);
+        assert_eq!(statuses[0], iced_core::event::Status::Ignored);
         assert_eq!(
             messages,
             ["c"],
@@ -1372,15 +1372,15 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_captured_sibling_click_unfocuses_context_child() {
-        let id = iced::advanced::widget::Id::new("field");
-        let menu: Menu<'_, String, iced::Theme, ()> = Menu::context(
-            iced::widget::text_input("", "")
+        let id = iced_core::widget::Id::new("field");
+        let menu: Menu<'_, String, iced_core::Theme, ()> = Menu::context(
+            iced_widget::text_input("", "")
                 .id(id.clone())
                 .on_input(|value| value),
             vec![Item::action("action", "action".to_owned())],
         );
-        let root = iced::widget::column![
-            iced::widget::button("button").on_press("button".to_owned()),
+        let root = iced_widget::column![
+            iced_widget::button("button").on_press("button".to_owned()),
             menu
         ];
         let mut ui = iced_runtime::UserInterface::build(
@@ -1391,7 +1391,7 @@ mod tests {
         );
         ui.operate(
             &(),
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+            &mut iced_core::widget::operation::focusable::focus::<()>(id),
         );
         let mut messages = vec![];
         ui.update(
@@ -1401,7 +1401,7 @@ mod tests {
             ],
             mouse::Cursor::Available(Point::new(5.0, 5.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         let (_, statuses) = ui.update(
@@ -1411,12 +1411,15 @@ mod tests {
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses,
-            [iced::event::Status::Ignored, iced::event::Status::Ignored]
+            [
+                iced_core::event::Status::Ignored,
+                iced_core::event::Status::Ignored
+            ]
         );
         assert_eq!(messages, ["button"]);
     }
@@ -1425,10 +1428,10 @@ mod tests {
     #[cfg(debug_assertions)]
     fn runtime_nested_context_prefers_inner_and_touch_can_activate_it() {
         let inner = Menu::context(
-            iced::widget::Space::new().width(200).height(100),
+            iced_widget::Space::new().width(200).height(100),
             vec![Item::action("inner", 1)],
         );
-        let outer: Menu<'_, u8, iced::Theme, ()> =
+        let outer: Menu<'_, u8, iced_core::Theme, ()> =
             Menu::context(inner, vec![Item::action("outer", 2)]);
         let mut ui = iced_runtime::UserInterface::build(
             outer,
@@ -1443,17 +1446,17 @@ mod tests {
             ))],
             mouse::Cursor::Available(Point::new(20.0, 20.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         ui.update(
-            &[Event::Touch(iced::touch::Event::FingerPressed {
-                id: iced::touch::Finger(0),
+            &[Event::Touch(iced_core::touch::Event::FingerPressed {
+                id: iced_core::touch::Finger(0),
                 position: Point::new(25.0, 25.0),
             })],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(messages, [1]);
@@ -1462,13 +1465,13 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_same_batch_popup_hit_testing_uses_scrolled_window_coordinates() {
-        let id = iced::advanced::widget::Id::new("scroll");
-        let menu: Menu<'_, u8, iced::Theme, ()> =
+        let id = iced_core::widget::Id::new("scroll");
+        let menu: Menu<'_, u8, iced_core::Theme, ()> =
             Menu::bar(vec![Item::submenu("file", vec![Item::action("run", 9)])]);
-        let root = iced::widget::scrollable(iced::widget::column![
-            iced::widget::Space::new().height(100),
+        let root = iced_widget::scrollable(iced_widget::column![
+            iced_widget::Space::new().height(100),
             menu,
-            iced::widget::Space::new().height(400)
+            iced_widget::Space::new().height(400)
         ])
         .id(id.clone())
         .width(200)
@@ -1481,9 +1484,9 @@ mod tests {
         );
         ui.operate(
             &(),
-            &mut iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+            &mut iced_core::widget::operation::scrollable::scroll_to::<()>(
                 id,
-                iced::advanced::widget::operation::scrollable::AbsoluteOffset {
+                iced_core::widget::operation::scrollable::AbsoluteOffset {
                     x: None,
                     y: Some(80.0),
                 },
@@ -1497,7 +1500,7 @@ mod tests {
             ],
             mouse::Cursor::Available(Point::new(10.0, 50.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(statuses.len(), 2);
@@ -1511,7 +1514,8 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_touch_opens_bar_and_dismisses_outside_without_hover_leak() {
-        let menu: Menu<'_, u8, iced::Theme, ()> = Menu::bar(vec![Item::submenu("file", items())]);
+        let menu: Menu<'_, u8, iced_core::Theme, ()> =
+            Menu::bar(vec![Item::submenu("file", items())]);
         let mut ui = iced_runtime::UserInterface::build(
             menu,
             Size::new(400.0, 300.0),
@@ -1520,20 +1524,20 @@ mod tests {
         );
         let mut messages = vec![];
         ui.update(
-            &[Event::Touch(iced::touch::Event::FingerPressed {
-                id: iced::touch::Finger(0),
+            &[Event::Touch(iced_core::touch::Event::FingerPressed {
+                id: iced_core::touch::Finger(0),
                 position: Point::new(5.0, 5.0),
             })],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         let (state, _) = ui.update(
             &[],
             mouse::Cursor::Available(Point::new(5.0, 35.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert!(
@@ -1548,35 +1552,38 @@ mod tests {
         );
         let (_, statuses) = ui.update(
             &[
-                Event::Touch(iced::touch::Event::FingerPressed {
-                    id: iced::touch::Finger(1),
+                Event::Touch(iced_core::touch::Event::FingerPressed {
+                    id: iced_core::touch::Finger(1),
                     position: Point::new(390.0, 290.0),
                 }),
                 character("x"),
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses,
-            [iced::event::Status::Captured, iced::event::Status::Ignored]
+            [
+                iced_core::event::Status::Captured,
+                iced_core::event::Status::Ignored
+            ]
         );
         assert!(messages.is_empty());
     }
 
     #[cfg(debug_assertions)]
     struct Harness {
-        menu: Menu<'static, u8, iced::Theme, ()>,
+        menu: Menu<'static, u8, iced_core::Theme, ()>,
         tree: Tree,
         node: layout::Node,
     }
 
     #[cfg(debug_assertions)]
     impl Harness {
-        fn new(mut menu: Menu<'static, u8, iced::Theme, ()>) -> Self {
-            let mut tree = Tree::new(&menu as &dyn Widget<u8, iced::Theme, ()>);
+        fn new(mut menu: Menu<'static, u8, iced_core::Theme, ()>) -> Self {
+            let mut tree = Tree::new(&menu as &dyn Widget<u8, iced_core::Theme, ()>);
             let node = menu.layout(
                 &mut tree,
                 &(),
@@ -1590,7 +1597,7 @@ mod tests {
             event: Event,
             cursor: mouse::Cursor,
             popup: bool,
-        ) -> (Vec<u8>, bool, iced::window::RedrawRequest) {
+        ) -> (Vec<u8>, bool, iced_core::window::RedrawRequest) {
             let mut messages = Vec::new();
             let mut shell = Shell::new(&mut messages);
             let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
@@ -1611,7 +1618,7 @@ mod tests {
                     Layout::new(&node),
                     cursor,
                     &(),
-                    &mut iced::advanced::clipboard::Null,
+                    &mut iced_core::clipboard::Null,
                     &mut shell,
                 );
             } else {
@@ -1621,7 +1628,7 @@ mod tests {
                     Layout::new(&self.node),
                     cursor,
                     &(),
-                    &mut iced::advanced::clipboard::Null,
+                    &mut iced_core::clipboard::Null,
                     &mut shell,
                     &viewport,
                 );
@@ -1656,11 +1663,11 @@ mod tests {
         let cursor = mouse::Cursor::Available(position);
         assert_eq!(
             harness.event(event.clone(), cursor, false).2,
-            iced::window::RedrawRequest::NextFrame
+            iced_core::window::RedrawRequest::NextFrame
         );
         assert_eq!(
             harness.event(event, cursor, false).2,
-            iced::window::RedrawRequest::Wait
+            iced_core::window::RedrawRequest::Wait
         );
         assert_eq!(
             harness
@@ -1670,7 +1677,7 @@ mod tests {
                     false
                 )
                 .2,
-            iced::window::RedrawRequest::NextFrame
+            iced_core::window::RedrawRequest::NextFrame
         );
         assert_eq!(harness.tree.state.downcast_ref::<State>().hovered, None);
     }
@@ -1746,7 +1753,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn context_overlay_skips_disabled_and_captures_outside_dismissal() {
         let mut harness = Harness::new(Menu::context(
-            iced::widget::Space::new().width(200).height(100),
+            iced_widget::Space::new().width(200).height(100),
             items(),
         ));
         let cursor = mouse::Cursor::Available(Point::new(20.0, 20.0));

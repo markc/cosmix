@@ -7,12 +7,12 @@
 //! separate layers, so moving the playhead never touches note geometry.
 use std::cell::RefCell;
 
-use iced::advanced::graphics::geometry::{self, Cache, Path};
-use iced::advanced::{
+use iced_core::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
 };
-use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard};
+use iced_core::{Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard};
+use iced_graphics::geometry::{self, Cache, Path};
 
 use crate::AudioStyle;
 use crate::audio_style::quad;

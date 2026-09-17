@@ -1,11 +1,11 @@
 //! Peak meter with a decaying peak-hold line.
 use std::time::{Duration, Instant};
 
-use iced::advanced::{
+use iced_core::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
 };
-use iced::{Element, Event, Length, Rectangle, Size, window};
+use iced_core::{Element, Event, Length, Rectangle, Size, window};
 
 use crate::AudioStyle;
 use crate::audio_style::quad;
