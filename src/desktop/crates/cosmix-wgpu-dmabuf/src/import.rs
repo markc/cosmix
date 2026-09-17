@@ -193,6 +193,8 @@ impl Default for ImportInstrumentation {
 struct ImportedUse<T> {
     backing: Arc<T>,
     acquire_trace: Option<crate::diagnostics::AcquireState>,
+    /// The `import`/`replace` request this use answers (0 = unknown).
+    request: u64,
     _physical_release: Option<ReleaseOnDrop>,
     _logical_release: Option<ReleaseOnDrop>,
 }
@@ -203,6 +205,7 @@ impl<T> ImportedUse<T> {
         Self {
             backing,
             acquire_trace: None,
+            request: 0,
             _physical_release: physical_release,
             _logical_release: logical_release,
         }
@@ -373,6 +376,11 @@ impl<T> ImportCache<T> {
 #[derive(Default)]
 struct ImportRegistry {
     active: HashMap<AssetId<Image>, ImportState>,
+    /// Request serials: the newest per image, and the one its Pending state
+    /// answers (moved onto the use when the import succeeds).
+    next_request: u64,
+    latest_requests: HashMap<AssetId<Image>, u64>,
+    pending_requests: HashMap<AssetId<Image>, u64>,
     retired: HashMap<AssetId<Image>, Vec<ImportedTexture>>,
     cache: ImportCache<CachedTexture>,
     ever_imported: bool,
@@ -415,6 +423,52 @@ fn evict_cache_backings<T>(cache: &mut ImportCache<T>, backings: &[Arc<T>]) {
         .map(|backing| Arc::as_ptr(backing) as usize)
         .collect::<HashSet<_>>();
     cache.retain(|backing| !evicted.contains(&(Arc::as_ptr(backing) as usize)));
+}
+
+impl ImportRegistry {
+    fn allocate_request(&mut self, id: AssetId<Image>) -> u64 {
+        self.next_request = self.next_request.saturating_add(1);
+        self.latest_requests.insert(id, self.next_request);
+        self.pending_requests.insert(id, self.next_request);
+        self.next_request
+    }
+}
+
+/// Where one image's most recent `import`/`replace` request stands, so a
+/// consumer can tell which client buffer the image actually samples.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImportProgress {
+    /// The newest request made for this image.
+    pub latest: u64,
+    /// The request whose texture is installed as the image's GpuImage, if any.
+    pub installed: Option<u64>,
+    /// A request is still waiting to be imported or installed. When this is
+    /// false and `installed != Some(latest)`, the latest request failed.
+    pub pending: bool,
+}
+
+fn import_progress<T>(state: &ImportState<ImportedUse<T>>, latest: u64) -> ImportProgress {
+    let known = |request: u64| (request != 0).then_some(request);
+    let (installed, pending) = match state {
+        ImportState::Idle => (None, false),
+        ImportState::Pending(pending) => (
+            pending
+                .previous
+                .as_ref()
+                .and_then(|used| known(used.request)),
+            true,
+        ),
+        ImportState::Imported(ready) => (
+            ready.previous.as_ref().and_then(|used| known(used.request)),
+            true,
+        ),
+        ImportState::Applied(used) => (known(used.request), false),
+    };
+    ImportProgress {
+        latest,
+        installed,
+        pending,
+    }
 }
 
 /// Main/render-world shared import registry keyed by Bevy image asset ID.
@@ -606,6 +660,7 @@ impl ImportedDmabufImages {
                 cacheable,
             }),
         );
+        imports.allocate_request(handle.id());
         drop(imports);
         Ok(handle)
     }
@@ -644,7 +699,19 @@ impl ImportedDmabufImages {
                 cacheable,
             }),
         );
+        imports.allocate_request(handle.id());
         Ok(())
+    }
+
+    /// Request/installation state of one image (see [`ImportProgress`]).
+    /// `None` for an image this registry does not track.
+    pub fn progress(&self, id: AssetId<Image>) -> Option<ImportProgress> {
+        let imports = self
+            .0
+            .lock()
+            .expect("DMA-BUF import registry mutex poisoned");
+        let latest = *imports.latest_requests.get(&id)?;
+        Some(import_progress(imports.active.get(&id)?, latest))
     }
 
     /// Evict one destroyed `wl_buffer` from the strong import cache.
@@ -696,6 +763,8 @@ impl ImportedDmabufImages {
             .0
             .lock()
             .expect("DMA-BUF import registry mutex poisoned");
+        imports.latest_requests.remove(&handle.id());
+        imports.pending_requests.remove(&handle.id());
         let Some(current) = imports.active.remove(&handle.id()) else {
             return;
         };
@@ -1041,13 +1110,15 @@ fn apply_imports(
                 no_cache,
                 instrumentation,
             ) {
-                Ok(ready) => {
+                Ok(mut ready) => {
                     if ready.newly_imported {
                         record_successful_import(&mut imports.debug, fourcc, instrumentation);
                     }
+                    ready.current.request = imports.pending_requests.remove(&id).unwrap_or(0);
                     imports.active.insert(id, ImportState::Imported(ready));
                 }
                 Err((import_error, previous)) => {
+                    imports.pending_requests.remove(&id);
                     error!(%import_error, ?id, "failed to import DMA-BUF texture");
                     // The failed request drops its release callback. Keep the
                     // previous applied texture live, ownership-tracked and
@@ -2901,6 +2972,123 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 1);
         assert!(images.is_empty());
         assert!(imports.0.lock().expect("registry mutex").active.is_empty());
+    }
+
+    #[test]
+    fn import_progress_names_the_installed_request_and_exposes_failure() {
+        let lease = || ReleaseLease::new(DmabufRelease::Implicit(Box::new(|| {})));
+        let used = |request: u64| {
+            let mut used = ImportedUse::new(Arc::new("texture"), lease());
+            used.request = request;
+            used
+        };
+        // First import still pending: nothing installed.
+        let pending = ImportState::Pending(PendingImport {
+            buffer_id: DmabufBufferId(1),
+            descriptor: dummy_descriptor(),
+            release: lease(),
+            previous: None::<ImportedUse<&str>>,
+            cacheable: true,
+        });
+        assert_eq!(
+            import_progress(&pending, 1),
+            ImportProgress {
+                latest: 1,
+                installed: None,
+                pending: true
+            }
+        );
+        // A replacement pending behind an installed request: the old one shows.
+        let replacing = ImportState::Pending(PendingImport {
+            buffer_id: DmabufBufferId(2),
+            descriptor: dummy_descriptor(),
+            release: lease(),
+            previous: Some(used(1)),
+            cacheable: true,
+        });
+        assert_eq!(import_progress(&replacing, 2).installed, Some(1));
+        assert!(import_progress(&replacing, 2).pending);
+        let imported = ImportState::Imported(ReadyImport {
+            current: used(2),
+            previous: Some(used(1)),
+            newly_imported: true,
+            probe_after_acquire: false,
+        });
+        assert_eq!(import_progress(&imported, 2).installed, Some(1));
+        // Installed.
+        let applied = ImportState::Applied(used(2));
+        assert_eq!(
+            import_progress(&applied, 2),
+            ImportProgress {
+                latest: 2,
+                installed: Some(2),
+                pending: false
+            }
+        );
+        // A failed replacement falls back to the previous use: not pending,
+        // installed is older than latest, so the latest request failed.
+        let failed = failed_import_fallback(Some(used(1)));
+        let progress = import_progress(&failed, 2);
+        assert!(!progress.pending && progress.installed != Some(progress.latest));
+        // A failed first import (or a failed acquire) leaves nothing installed.
+        let idle = failed_import_fallback(None::<ImportedUse<&str>>);
+        assert_eq!(import_progress(&idle, 1).installed, None);
+        assert!(!import_progress(&idle, 1).pending);
+    }
+
+    #[test]
+    fn import_and_replace_allocate_request_serials_per_image() {
+        let imports = ImportedDmabufImages::default();
+        let mut images = Assets::<Image>::default();
+        let release = || DmabufRelease::Implicit(Box::new(|| {}));
+        let first = imports
+            .import(
+                &mut images,
+                DmabufBufferId(1),
+                true,
+                dummy_descriptor(),
+                release(),
+            )
+            .expect("first import");
+        let second = imports
+            .import(
+                &mut images,
+                DmabufBufferId(2),
+                true,
+                dummy_descriptor(),
+                release(),
+            )
+            .expect("second import");
+        imports
+            .replace(
+                &first,
+                DmabufBufferId(3),
+                true,
+                dummy_descriptor(),
+                release(),
+            )
+            .expect("replace");
+        assert_eq!(
+            imports.progress(first.id()),
+            Some(ImportProgress {
+                latest: 3,
+                installed: None,
+                pending: true
+            })
+        );
+        assert_eq!(
+            imports
+                .progress(second.id())
+                .map(|progress| progress.latest),
+            Some(2)
+        );
+        {
+            let registry = imports.0.lock().expect("registry mutex");
+            assert_eq!(registry.pending_requests.get(&first.id()), Some(&3));
+        }
+        imports.unregister(&first);
+        assert_eq!(imports.progress(first.id()), None);
+        assert!(imports.progress(AssetId::<Image>::default()).is_none());
     }
 
     #[test]

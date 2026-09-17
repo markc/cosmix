@@ -3320,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wgpu-dmabuf"
-version = "0.16.1"
+version = "0.16.2"
 dependencies = [
  "ash",
  "bevy",
