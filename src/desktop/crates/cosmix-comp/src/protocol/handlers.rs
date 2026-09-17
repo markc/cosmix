@@ -80,7 +80,7 @@ impl CompositorHandler for WaylandState {
         compositor::add_pre_commit_hook::<WaylandState, _>(surface, |state, _, surface| {
             state.prepare_scene_commit(surface);
             state.prepare_acquire_gate(surface);
-            state.stage_presentation_feedback(surface);
+            let _ = &state;
         });
         self.surface_count = self.surface_count.saturating_add(1);
         let _ = Self::with_client_state(surface, |client_state| {
