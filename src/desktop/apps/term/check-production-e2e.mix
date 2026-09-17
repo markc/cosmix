@@ -20,7 +20,7 @@ if not is_file($bin) then
   exit(1)
 end
 $test = run_argv(["cargo", "test", "--manifest-path", "desktop/Cargo.toml",
-  "-p", "cosmix-term",
+  "-p", "cosmix-term-core",
   "p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes",
   "--", "--ignored", "--test-threads=1"],
   {timeout: 900, env: {"COSMIX_E2E_MIX_BIN": $bin, "RUSTC_WRAPPER": ""}})

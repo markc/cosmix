@@ -323,7 +323,7 @@ foreground generation is `STALE_GENERATION`. Transport failure and caller-side
 timeout remain client transport outcomes, separate from an application reply.
 
 The S4 fixture inventory and explicit gate prerequisites are in
-`src/desktop/apps/term/tests/README.md`. Test/clippy acceptance is supplied by the
+`src/desktop/crates/cosmix-term-core/tests/README.md`. Test/clippy acceptance is supplied by the
 orchestrator; this page describes implementation, not a claim of passing gates.
 
 The enforcement fixtures are `#[ignore]`d because each spawns a real broker and a
@@ -346,7 +346,7 @@ them. Run it explicitly:
 
 ```sh
 cd src/desktop
-BIN=$(ls -t target/debug/deps/term-* | grep -v \.d | head -1)
+BIN=$(ls -t target/debug/deps/cosmix_term_core-* | grep -v \.d | head -1)
 sudo env COSMIX_SESSION_TEST_UID=<a non-root uid> \
      COSMIX_E2E_MIX_BIN=<abs path to src/target/release/mix> HOME=/root \
      ./$BIN --exact \

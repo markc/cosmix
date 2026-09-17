@@ -5,7 +5,7 @@ pub use mouse::MouseModifiers;
 use rio_vt::{
     ansi::CursorShape,
     corcovado::{Poll, PollOpt, Ready, Token, channel},
-    crosswords::{Crosswords, CrosswordsSize, pos::Column, style::StyleFlags},
+    crosswords::{Crosswords, CrosswordsSize, TermDamage, pos::Column, style::StyleFlags},
     event::{EventListener, Msg, RioEvent, WindowId, WindowSize, sync::FairMutex},
     performer::Machine,
     teletypewriter::{self, ChildEvent, EventedPty, ProcessReadWrite, WinsizeBuilder},
@@ -31,6 +31,29 @@ type Grid = Arc<FairMutex<Crosswords<Listener>>>;
 fn rearm_damage(term: &mut Crosswords<Listener>) {
     term.reset_damage();
     term.damage_event_in_flight = false;
+}
+
+/// Rows changed since the last `rearm_damage`, plus the cursor's row (rio's
+/// damage covers where the cursor was, not where it is). Scrolled-back views
+/// are repainted whole: rio reports their damage in scrollback coordinates.
+fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
+    let mut dirty = vec![false; term.screen_lines()];
+    let cursor = term.grid.cursor.pos.row.0.max(0) as usize;
+    let scrolled = term.display_offset() != 0;
+    match term.damage() {
+        TermDamage::Partial(lines) if !scrolled => {
+            for line in lines {
+                if let Some(row) = dirty.get_mut(line.line) {
+                    *row = true;
+                }
+            }
+        }
+        _ => dirty.fill(true),
+    }
+    if let Some(row) = dirty.get_mut(cursor) {
+        *row = true;
+    }
+    dirty
 }
 
 struct Pending {
@@ -435,6 +458,14 @@ pub struct Screen {
     pub cells: Vec<Cell>,
     pub updated: Instant,
 }
+/// A consuming read for a frontend that repaints by row.
+pub struct GridSnapshot {
+    pub screen: Screen,
+    /// One flag per visible row: true when that row may differ from the
+    /// previous consuming read. All true after a resize, a scroll-back, a
+    /// full-screen mode change or on the first read.
+    pub dirty_rows: Vec<bool>,
+}
 pub struct Terminal {
     #[cfg(test)]
     pub before_pty_cleanup: Option<Box<dyn FnMut() + Send>>,
@@ -709,6 +740,16 @@ impl Terminal {
         self.damage.lock().unwrap().try_recv().is_ok()
     }
     pub fn screen(&self, consume: bool) -> Screen {
+        self.capture(consume, None)
+    }
+    /// Like `screen(true)`, and also reports which rows changed since the
+    /// previous consuming read (by either method).
+    pub fn grid_snapshot(&self) -> GridSnapshot {
+        let mut dirty_rows = Vec::new();
+        let screen = self.capture(true, Some(&mut dirty_rows));
+        GridSnapshot { screen, dirty_rows }
+    }
+    fn capture(&self, consume: bool, dirty: Option<&mut Vec<bool>>) -> Screen {
         use rio_vt::config::{
             Colors,
             colors::{AnsiColor, term::List},
@@ -755,6 +796,9 @@ impl Terminal {
         let pos = term.grid.cursor.pos;
         let cursor = (pos.col.0, pos.row.0.max(0) as usize);
         let cursor_visible = term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
+        if let Some(dirty) = dirty {
+            *dirty = dirty_rows(&mut term);
+        }
         if consume {
             // Both operations must remain under this same grid lock. reset_damage
             // alone does not re-arm Machine's damage notification latch.
@@ -1025,6 +1069,90 @@ mod tests {
         }
         assert!(thread.is_finished(), "Machine shutdown must finish");
         drop(thread.join().unwrap());
+    }
+    #[test]
+    fn dirty_rows_track_changed_rows_and_the_cursor() {
+        let (stream, mut child) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let (damage, rx) = mpsc::sync_channel(1);
+        let listener = Listener {
+            damage,
+            wake: Arc::new(OnceLock::new()),
+            writes: Arc::new(Mutex::new(Writes::default())),
+            stats: Arc::new(Mutex::new(Metrics::default())),
+            quit: Arc::new(AtomicBool::new(false)),
+        };
+        let grid = Arc::new(FairMutex::new(Crosswords::new(
+            CrosswordsSize::new(80, 24),
+            CursorShape::Block,
+            listener.clone(),
+            WindowId::from(0),
+            0,
+            0,
+        )));
+        let machine = Machine::new(
+            grid.clone(),
+            FixturePty {
+                stream,
+                token: Token(1),
+            },
+            listener.clone(),
+            WindowId::from(0),
+            0,
+        )
+        .unwrap();
+        let channel = machine.channel();
+        listener.writes.lock().unwrap().sender = Some(channel.clone());
+        let thread = machine.spawn();
+        let settle = |row: usize, c: char| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while grid.lock().visible_rows()[row][Column(0)].c() != c {
+                assert!(Instant::now() < deadline, "PTY bytes never reached row {row}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        child.write_all(b"A").unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).expect("first damage wake");
+        settle(0, 'A');
+        {
+            let mut term = grid.lock();
+            let first = dirty_rows(&mut term);
+            assert_eq!(first.len(), 24);
+            assert!(first.iter().all(|row| *row), "a fresh grid is fully dirty");
+            rearm_damage(&mut term);
+            let idle = dirty_rows(&mut term);
+            assert_eq!(
+                idle.iter().positions(),
+                vec![0],
+                "an idle grid marks only the cursor row"
+            );
+            rearm_damage(&mut term);
+        }
+        child.write_all(b"\r\n\r\nC").unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).expect("second damage wake");
+        settle(2, 'C');
+        {
+            let mut term = grid.lock();
+            assert_eq!(dirty_rows(&mut term).iter().positions(), vec![0, 1, 2]);
+            rearm_damage(&mut term);
+        }
+        channel.send(Msg::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(thread.is_finished(), "Machine shutdown must finish");
+        drop(thread.join().unwrap());
+    }
+    trait Positions {
+        fn positions(self) -> Vec<usize>;
+    }
+    impl<'a, I: Iterator<Item = &'a bool>> Positions for I {
+        fn positions(self) -> Vec<usize> {
+            self.enumerate()
+                .filter_map(|(row, dirty)| dirty.then_some(row))
+                .collect()
+        }
     }
     #[test]
     fn diagnostic_and_keyboard_share_encoding() {

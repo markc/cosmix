@@ -47,7 +47,7 @@ $term_fixtures = [
 $term_expected = length($term_fixtures)
 
 $root = cwd()
-if not exists($root + "/desktop/apps/term/src/control.rs") then
+if not exists($root + "/desktop/crates/cosmix-term-core/src/control.rs") then
   print("GATE BLOCKED: run from the repository src/ directory")
   exit(2)
 end
@@ -101,7 +101,7 @@ end
 -- Half two: the Term forward, which is #[ignore]'d and needs the built binary.
 print("running " + $term_expected + " stage-D Term fixture ...")
 $argv = concat(
-  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term-core", "--lib", "--", "--ignored", "--test-threads=1", "--exact"],
   $term_fixtures
 )
 $term = run_argv($argv, {

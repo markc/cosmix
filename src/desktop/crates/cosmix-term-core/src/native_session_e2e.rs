@@ -83,7 +83,7 @@ pub(super) fn account_name() -> String {
 /// From a clean committed checkout, with COSMIX naming its absolute root:
 /// ```mix
 /// print(run_argv_must(["env", "RUSTC_WRAPPER=", "cargo", "build", "--release", "-p", "cosmix-mix"], {cwd: env("COSMIX") .. "/src"}))
-/// print(run_argv_must(["env", "RUSTC_WRAPPER=", "COSMIX_E2E_MIX_BIN=" .. env("COSMIX") .. "/src/target/release/mix", "cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "native_session::production_e2e::p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes", "--", "--exact", "--ignored", "--nocapture"], {cwd: env("COSMIX") .. "/src"}))
+/// print(run_argv_must(["env", "RUSTC_WRAPPER=", "COSMIX_E2E_MIX_BIN=" .. env("COSMIX") .. "/src/target/release/mix", "cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term-core", "native_session::production_e2e::p0i_01_production_term_spawn_enrols_real_mix_and_exit_revokes", "--", "--exact", "--ignored", "--nocapture"], {cwd: env("COSMIX") .. "/src"}))
 /// ```
 /// If CARGO_TARGET_DIR is overridden, supply its release/mix path instead.
 #[test]

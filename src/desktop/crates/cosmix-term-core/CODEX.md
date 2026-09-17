@@ -5,7 +5,7 @@ production teletypewriter hop with an explicit current-HEAD Mix release binary.
 See `tests/README.md`; it is ignored by default and must run with `--ignored`.
 An explicit run without the binary variable fails, never passes or skips.
 The test-only `LaunchSettings` injection shares the production spawn body.
-The embedded vendor `patch_guard.rs` also makes Term tests sensitive to the
+The embedded vendor `patch_guard.rs` also makes these tests sensitive to the
 recorded upstream pins and patched source hashes; see the desktop patch README.
 
 `tests/support` embeds noded production modules with `#[path]` rather than a
@@ -16,7 +16,7 @@ the typed client API. Keep the embedding tests-only; it is not a supported
 noded library API, and daemon test-only modules are not included.
 
 Mix's `tests/native_session_pty.rs` also depends on this support crate and
-uses Term's production `src/session_fd.rs` through the support library, without
+uses this crate's production `src/session_fd.rs` through the support library, without
 compiling its desktop-only teletypewriter tests. Mix uses libc `openpty`, as its
 job-control fixtures do. Handoff or support changes therefore require
 the Mix native-session tests as well as Term's gates; do not duplicate the

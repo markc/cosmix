@@ -143,7 +143,7 @@ fn layout_app() -> App {
     .insert_resource(Painter(Mutex::new(
         raster::Raster::new(1.0, settings.config.font_px, settings.config.cursor).unwrap(),
     )))
-    .insert_resource(settings)
+    .insert_resource(TermSettings(settings))
     .init_resource::<InputFocus>()
     .init_resource::<BetweenSchedules>()
     .insert_resource(View {

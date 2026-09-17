@@ -182,7 +182,7 @@ impl TabSet {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_settings(settings: crate::config::Settings) -> Result<Self, String> {
         Self::with_session(settings, None)
     }

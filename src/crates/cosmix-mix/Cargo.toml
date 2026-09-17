@@ -70,7 +70,7 @@ sha2 = "0.10"
 # in the cosmix hub). Test-only; never linked into the shipped binary.
 proptest = "1"
 tempfile = "3"
-term-native-test-broker = { path = "../../desktop/apps/term/tests/support" }
+term-native-test-broker = { path = "../../desktop/crates/cosmix-term-core/tests/support" }
 # The S3 fixture uses Term's actual sealed-fd implementation and pinned PTY hook.
 
 [build-dependencies]
