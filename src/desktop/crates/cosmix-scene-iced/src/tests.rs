@@ -969,10 +969,14 @@ fn a_texture_that_never_prepares_stops_the_upload_cycle() {
         "{settled} wakeups is not a bound"
     );
 
-    // Geometry movement is a fresh start: the surface tries again.
+    // Geometry movement is a fresh start: the surface tries again. Counters
+    // are rolled in `First`, so the retry shows up in the totals one update
+    // after the draw that queued it.
     h.geometry(220, 120, 1.5);
-    h.app.update();
-    gpu.frame();
+    for _ in 0..2 {
+        h.app.update();
+        gpu.frame();
+    }
     assert!(h.totals().bytes_queued > queued, "a resize must retry");
 }
 
