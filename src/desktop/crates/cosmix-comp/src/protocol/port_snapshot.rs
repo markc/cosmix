@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use smithay::{
     output::Output,
+    reexports::wayland_server::Resource as _,
     wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer},
 };
 
@@ -161,6 +162,18 @@ pub(crate) struct SurfaceSnapshot {
     pub(crate) decoration: Option<&'static str>,
     pub(crate) layer: Option<LayerSnapshot>,
     pub(crate) foreign_id: Option<String>,
+    /// Window-only values carried to `project_window_row`; not part of the
+    /// `surfaces.*` tree.
+    #[serde(skip)]
+    pub(crate) window: WindowExtras,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct WindowExtras {
+    pub(crate) generation: u64,
+    pub(crate) window_x: f32,
+    pub(crate) window_y: f32,
+    pub(crate) pid: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -187,6 +200,11 @@ pub(crate) struct WindowSnapshot {
     pub(crate) minimized: bool,
     pub(crate) output: Option<String>,
     pub(crate) band: &'static str,
+    pub(crate) generation: u64,
+    pub(crate) window_x: f32,
+    pub(crate) window_y: f32,
+    pub(crate) visible: bool,
+    pub(crate) pid: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -196,6 +214,15 @@ pub(crate) struct FocusSnapshot {
     pub(crate) pointer: Option<u64>,
     pub(crate) pointer_grab: &'static str,
     pub(crate) session_lock: &'static str,
+    pub(crate) window: FocusWindowSnapshot,
+}
+
+/// `{id, generation}` of the focused window row, both null when no window
+/// has keyboard focus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct FocusWindowSnapshot {
+    pub(crate) id: Option<u64>,
+    pub(crate) generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -452,15 +479,39 @@ flat_snapshot!(
     minimized,
     output,
     band,
+    generation,
+    window_x,
+    window_y,
+    visible,
+    pid,
 );
-flat_snapshot!(
-    FocusSnapshot,
-    keyboard,
-    exclusive_latch,
-    pointer,
-    pointer_grab,
-    session_lock,
-);
+flat_snapshot!(FocusWindowSnapshot, id, generation);
+
+impl FocusSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        match path {
+            [] => serialise_selected(self),
+            ["keyboard"] => serialise_selected(&self.keyboard),
+            ["exclusive_latch"] => serialise_selected(&self.exclusive_latch),
+            ["pointer"] => serialise_selected(&self.pointer),
+            ["pointer_grab"] => serialise_selected(&self.pointer_grab),
+            ["session_lock"] => serialise_selected(&self.session_lock),
+            ["window", tail @ ..] => self.window.select(tail),
+            _ => None,
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        match path {
+            [] | ["window"] => Some(SnapshotNodeKind::Object),
+            ["keyboard" | "exclusive_latch" | "pointer" | "pointer_grab" | "session_lock"] => {
+                Some(SnapshotNodeKind::Leaf)
+            }
+            ["window", tail @ ..] => self.window.node_kind(tail),
+            _ => None,
+        }
+    }
+}
 flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
 flat_snapshot!(
@@ -727,6 +778,22 @@ fn project_surface_row(
         foreign_id: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
             .then(|| state.foreign_toplevel_identifiers.get(&record.id).cloned())
             .flatten(),
+        window: WindowExtras {
+            generation: record.generation,
+            window_x: record.window_origin.0,
+            window_y: record.window_origin.1,
+            // Only rows that become windows pay for the credentials lookup.
+            pid: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
+                .then(|| {
+                    record
+                        .role
+                        .wl_surface()
+                        .client()
+                        .and_then(|client| client.get_credentials(&state.display_handle).ok())
+                        .map(|credentials| u64::try_from(credentials.pid).unwrap_or(0))
+                })
+                .flatten(),
+        },
     }
 }
 
@@ -746,6 +813,11 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         minimized: surface.minimized,
         output: surface.output.clone(),
         band: surface.band,
+        generation: surface.window.generation,
+        window_x: surface.window.window_x,
+        window_y: surface.window.window_y,
+        visible: surface.visible,
+        pid: surface.window.pid,
     }
 }
 
@@ -770,6 +842,23 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
             .and_then(|object| state.surfaces.get(&object))
             .map(|record| record.id.0),
         pointer_grab: pointer_grab_name(state),
+        window: if session_lock_active {
+            FocusWindowSnapshot::default()
+        } else {
+            state
+                .surfaces
+                .values()
+                .filter(|record| {
+                    record.focused
+                        && record.mapped
+                        && matches!(record.role, SurfaceRole::Toplevel(_))
+                })
+                .min_by_key(|record| record.id.0)
+                .map_or_else(FocusWindowSnapshot::default, |record| FocusWindowSnapshot {
+                    id: Some(record.id.0),
+                    generation: Some(record.generation),
+                })
+        },
         session_lock: if !session_lock_active {
             "none"
         } else {
@@ -1395,7 +1484,8 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("minimized")],
         Bool,
-        "Compositor minimized state"
+        "Compositor minimized state; write false to restore and focus this window, true to minimise it",
+        mutable
     ),
     descriptor!(
         &[L("windows"), S, L("output")],
@@ -1409,6 +1499,33 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         persistence: Some("none"),
         ..descriptor!(&[L("windows"), S, L("band")], String, "Compositor stack band; writable as bottom|normal to demote a window behind all normal windows or restore it", enum = &["background", "bottom", "normal", "top", "overlay", "lock"])
     },
+    descriptor!(
+        &[L("windows"), S, L("generation")],
+        Number,
+        "Role generation; changes whenever this surface takes a new role, so {id, generation} names one window"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("window_x")],
+        Number,
+        "Window-geometry x origin (x/y are the buffer origin, CSD shadow included)",
+        format = "logical_px"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("window_y")],
+        Number,
+        "Window-geometry y origin",
+        format = "logical_px"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("visible")],
+        Bool,
+        "Whether the window is effectively on screen (false while minimised)"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("pid")],
+        Number,
+        "Client process id or null"
+    ),
     descriptor!(
         &[L("stack")],
         List,
@@ -1434,6 +1551,17 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         format = "surface_id"
     ),
     descriptor!(&[L("focus"), L("pointer_grab")], String, "Active pointer grab kind", enum = &["none", "chrome", "move", "resize", "popup"]),
+    descriptor!(
+        &[L("focus"), L("window"), L("id")],
+        Number,
+        "Keyboard-focused window id or null",
+        format = "surface_id"
+    ),
+    descriptor!(
+        &[L("focus"), L("window"), L("generation")],
+        Number,
+        "Role generation of the keyboard-focused window or null"
+    ),
     descriptor!(&[L("focus"), L("session_lock")], String, "Session-lock observation state", enum = &["none", "locking", "locked", "orphaned", "unlocking"]),
     descriptor!(
         &[L("decoration"), L("enabled")],
@@ -1919,6 +2047,7 @@ mod tests {
                 binding: "explicit",
             }),
             foreign_id: None,
+            window: WindowExtras::default(),
         };
         let toplevel = SurfaceSnapshot {
             id: 2,
@@ -1944,6 +2073,12 @@ mod tests {
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("foreign-2".into()),
+            window: WindowExtras {
+                generation: 4,
+                window_x: 52.0,
+                window_y: 72.0,
+                pid: Some(4242),
+            },
         };
         let mut surfaces = BTreeMap::new();
         surfaces.insert("s1".into(), layer);
@@ -2001,6 +2136,11 @@ mod tests {
                 minimized: toplevel.minimized,
                 output: toplevel.output.clone(),
                 band: toplevel.band,
+                generation: toplevel.window.generation,
+                window_x: toplevel.window.window_x,
+                window_y: toplevel.window.window_y,
+                visible: toplevel.visible,
+                pid: toplevel.window.pid,
             },
         );
         CompSnapshot {
@@ -2023,6 +2163,10 @@ mod tests {
                 pointer: Some(2),
                 pointer_grab: "none",
                 session_lock: "none",
+                window: FocusWindowSnapshot {
+                    id: Some(2),
+                    generation: Some(4),
+                },
             },
             decoration: DecorationSnapshot {
                 enabled: true,
@@ -2071,15 +2215,16 @@ mod tests {
         // non-persisted startup switch would be unreachable from its own
         // surface).
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 6);
+        assert_eq!(mutable.len(), 7);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 5);
+        assert_eq!(mutable.len(), 6);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
             "input.corners.velocity_max_px_s",
             "windows.s2.band",
+            "windows.s2.minimized",
         ] {
             let path = PropPath::new(path).unwrap();
             let body = describe(&snapshot, &path).expect("mutable descriptor");

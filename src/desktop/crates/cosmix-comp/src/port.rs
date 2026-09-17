@@ -25,7 +25,7 @@ use tokio::{
 
 use crate::{
     decoration::DecorationStartup,
-    protocol::{port_observation, port_snapshot},
+    protocol::{port_observation, port_snapshot, window_control::WindowTargetError},
 };
 use port_observation::{
     LossCause, LossInterval, ObservationOutbox, ObservationProducer, ObservationRecord, PropValue,
@@ -53,6 +53,7 @@ pub(crate) enum PortCommand {
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
+    Window(PortWindowRequest),
     WatchState { active: bool, order: u64 },
 }
 
@@ -69,6 +70,22 @@ pub(crate) struct PortSetRequest {
     pub(crate) order: u64,
     pub(crate) path: String,
     pub(crate) value: Value,
+    /// Optional role-generation fence for `windows.s<id>.*` writes.
+    pub(crate) generation: Option<u64>,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+/// A window-addressed verb. `{id, generation}` is always required when a
+/// window is named; only `restore` may name none (most recently minimised).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowOp {
+    Minimize { id: u64, generation: u64 },
+    Restore { target: Option<(u64, u64)> },
+}
+
+pub(crate) struct PortWindowRequest {
+    pub(crate) order: u64,
+    pub(crate) op: WindowOp,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
 
@@ -96,6 +113,23 @@ pub(crate) enum ControlReply {
         persisted: Option<bool>,
     },
     Validation(SetValidationError),
+    /// A `comp.window.*` success.
+    Window {
+        id: u64,
+        generation: u64,
+        title: Option<Arc<str>>,
+        app_id: Option<Arc<str>>,
+        minimized: bool,
+        changed: bool,
+    },
+    WindowTarget {
+        id: u64,
+        error: WindowTargetError,
+    },
+    NotFound {
+        minimized_count: usize,
+    },
+    Locked,
     Busy,
 }
 
@@ -161,6 +195,50 @@ impl ControlReply {
                     .to_string(),
                 ),
             ),
+            Self::Window {
+                id,
+                generation,
+                title,
+                app_id,
+                minimized,
+                changed,
+            } => (
+                0,
+                Arc::from(
+                    json!({
+                        "id": id,
+                        "generation": generation,
+                        "title": title.as_deref(),
+                        "app_id": app_id.as_deref(),
+                        "minimized": minimized,
+                        "changed": changed,
+                    })
+                    .to_string(),
+                ),
+            ),
+            Self::WindowTarget { id, error } => {
+                let body = match error {
+                    WindowTargetError::UnknownWindow => {
+                        json!({"error": "unknown_window", "id": id})
+                    }
+                    WindowTargetError::StaleTarget { requested, current } => json!({
+                        "error": "stale_target",
+                        "id": id,
+                        "generation": requested,
+                        "current": current,
+                    }),
+                    WindowTargetError::NotManaged => json!({"error": "not_managed", "id": id}),
+                    WindowTargetError::NotMapped => json!({"error": "not_mapped", "id": id}),
+                };
+                (10, Arc::from(body.to_string()))
+            }
+            Self::NotFound { minimized_count } => (
+                10,
+                Arc::from(
+                    json!({"error": "not_found", "minimized_count": minimized_count}).to_string(),
+                ),
+            ),
+            Self::Locked => error("locked"),
             Self::Busy => error("busy"),
         }
     }
@@ -170,6 +248,7 @@ pub(crate) enum PortControl {
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
+    Window(PortWindowRequest),
     WatchState { active: bool, order: u64 },
 }
 
@@ -179,6 +258,7 @@ impl PortControl {
             Self::Watch(request) => request.order,
             Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
+            Self::Window(request) => request.order,
             Self::WatchState { order, .. } => *order,
         }
     }
@@ -214,13 +294,36 @@ impl PortIngress {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn request_set(&self, path: String, value: Value) -> Result<ControlAdmission, ()> {
+        self.request_set_fenced(path, value, None)
+    }
+
+    pub(crate) fn request_set_fenced(
+        &self,
+        path: String,
+        value: Value,
+        generation: Option<u64>,
+    ) -> Result<ControlAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.admit(
             PortCommand::Set(PortSetRequest {
                 order: self.next_control_order(),
                 path,
                 value,
+                generation,
+                reply: Some(reply),
+            }),
+            receive,
+        )
+    }
+
+    pub(crate) fn request_window(&self, op: WindowOp) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(
+            PortCommand::Window(PortWindowRequest {
+                order: self.next_control_order(),
+                op,
                 reply: Some(reply),
             }),
             receive,
@@ -981,7 +1084,7 @@ fn handle_incoming(
         } else {
             parse_set(&command.args)
         };
-        let (path, value) = match parsed {
+        let (path, value, generation) = match parsed {
             Ok(parsed) => parsed,
             Err(reply) => {
                 queue_reply(
@@ -1011,7 +1114,56 @@ fn handle_incoming(
                 return;
             }
         };
-        let admission = match ingress.request_set(path, value) {
+        let admission = match ingress.request_set_fenced(path, value, generation) {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        spawn_control_responder(
+            responders,
+            reply_sender,
+            reply_timeouts,
+            command,
+            admission,
+            permit,
+        );
+        return;
+    }
+    if command.command == "comp.window.minimize" || command.command == "comp.window.restore" {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "{id, generation}"))
+        } else {
+            parse_window_op(&command.command, &command.args)
+        };
+        let op = match parsed {
+            Ok(op) => op,
+            Err(reply) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()),
+                );
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_window(op) {
             Ok(admission) => admission,
             Err(()) => {
                 queue_reply(
@@ -1131,7 +1283,9 @@ pub(crate) fn inject_topic_lifecycle_notice_for_test(
     debug_assert!(responders.is_empty());
 }
 
-fn parse_set(args: &Value) -> Result<(String, Value), (u8, Arc<str>)> {
+type ParsedSet = (String, Value, Option<u64>);
+
+fn parse_set(args: &Value) -> Result<ParsedSet, (u8, Arc<str>)> {
     let object = args.as_object().ok_or_else(|| invalid_set_shape(None))?;
     let path = object
         .get("path")
@@ -1141,7 +1295,86 @@ fn parse_set(args: &Value) -> Result<(String, Value), (u8, Arc<str>)> {
         .get("value")
         .cloned()
         .ok_or_else(|| invalid_set_shape(Some(path)))?;
-    Ok((path.to_string(), value))
+    let generation = match object.get("generation") {
+        None | Some(Value::Null) => None,
+        Some(generation) => Some(generation.as_u64().ok_or_else(|| {
+            invalid_argument("generation", "unsigned integer", "windows.s<id>.generation")
+                .into_wire()
+        })?),
+    };
+    // The fence names a window, so it only means something on a window
+    // leaf; anywhere else it is a mis-aimed request, not something to drop.
+    if generation.is_some() && port_observation::parse_window_leaf_path(path).is_none() {
+        return Err(invalid_argument(
+            "generation",
+            "absent",
+            "generation applies to windows.s<id>.* paths only",
+        )
+        .into_wire());
+    }
+    Ok((path.to_string(), value, generation))
+}
+
+fn invalid_argument(path: &str, expected: &'static str, range: &'static str) -> ControlReply {
+    ControlReply::Validation(SetValidationError::InvalidValue {
+        path: path.to_string(),
+        expected,
+        range,
+    })
+}
+
+fn window_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<u64>, ControlReply> {
+    match object.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| invalid_argument(name, "unsigned integer", "0..=u64::MAX")),
+    }
+}
+
+/// `comp.window.minimize {id, generation}` and
+/// `comp.window.restore {id?, generation?}` (both or neither).
+fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    let object = match args {
+        Value::Null => &empty,
+        Value::Object(object) => object,
+        _ => {
+            return Err(invalid_argument("args", "JSON object", "{id, generation}"));
+        }
+    };
+    let id = window_arg(object, "id")?;
+    let generation = window_arg(object, "generation")?;
+    let target = match (id, generation) {
+        (Some(id), Some(generation)) => Some((id, generation)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(invalid_argument(
+                "generation",
+                "unsigned integer",
+                "required with id (read windows.s<id>.generation)",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid_argument(
+                "id",
+                "unsigned integer",
+                "required with generation",
+            ));
+        }
+    };
+    if verb == "comp.window.minimize" {
+        let Some((id, generation)) = target else {
+            return Err(invalid_argument("id", "unsigned integer", "required"));
+        };
+        Ok(WindowOp::Minimize { id, generation })
+    } else {
+        Ok(WindowOp::Restore { target })
+    }
 }
 
 fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
@@ -2089,6 +2322,134 @@ mod tests {
             );
             responders.abort_all();
         }
+    }
+
+    #[test]
+    fn window_verb_arguments_parse_with_both_or_neither_target_fields() {
+        assert_eq!(
+            parse_window_op("comp.window.restore", &Value::Null),
+            Ok(WindowOp::Restore { target: None })
+        );
+        assert_eq!(
+            parse_window_op("comp.window.restore", &json!({})),
+            Ok(WindowOp::Restore { target: None })
+        );
+        assert_eq!(
+            parse_window_op("comp.window.restore", &json!({"id": 7, "generation": 3})),
+            Ok(WindowOp::Restore {
+                target: Some((7, 3))
+            })
+        );
+        assert_eq!(
+            parse_window_op("comp.window.minimize", &json!({"id": 7, "generation": 3})),
+            Ok(WindowOp::Minimize {
+                id: 7,
+                generation: 3
+            })
+        );
+        for (verb, args, field) in [
+            ("comp.window.restore", json!({"id": 7}), "generation"),
+            ("comp.window.restore", json!({"generation": 3}), "id"),
+            (
+                "comp.window.restore",
+                json!({"id": "7", "generation": 3}),
+                "id",
+            ),
+            (
+                "comp.window.restore",
+                json!({"id": 7, "generation": -1}),
+                "generation",
+            ),
+            ("comp.window.restore", json!([7, 3]), "args"),
+            ("comp.window.minimize", json!({}), "id"),
+            ("comp.window.minimize", json!({"id": 7}), "generation"),
+        ] {
+            let Err(reply) = parse_window_op(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let (rc, body) = reply.into_wire();
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(rc, 10, "{verb} {args}");
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}");
+            assert_eq!(body["path"], field, "{verb} {args}");
+        }
+    }
+
+    #[test]
+    fn set_generation_is_accepted_only_on_window_leaves() {
+        let (path, value, generation) =
+            parse_set(&json!({"path": "windows.s7.minimized", "value": true, "generation": 3}))
+                .expect("fenced window write parses");
+        assert_eq!(
+            (path.as_str(), value, generation),
+            ("windows.s7.minimized", json!(true), Some(3))
+        );
+        let (_, _, generation) =
+            parse_set(&json!({"path": "windows.s7.band", "value": "bottom"})).unwrap();
+        assert_eq!(generation, None, "the fence is optional");
+        for args in [
+            json!({"path": "input.corners.enabled", "value": true, "generation": 3}),
+            json!({"path": "windows.s7.minimized", "value": true, "generation": "3"}),
+        ] {
+            let Err((rc, body)) = parse_set(&args) else {
+                panic!("{args} must be refused");
+            };
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(rc, 10);
+            assert_eq!(body["error"], "invalid_value");
+            assert_eq!(body["path"], "generation");
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_window_verbs_cross_ingress_in_order() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(4);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let mut minimize = command("comp.window.minimize", 1);
+        minimize.args = json!({"id": 7, "generation": 3});
+        minimize.body = minimize.args.to_string();
+        minimize
+            .headers
+            .insert("broker_origin".into(), "mesh".into());
+        let mut restore = command("comp.window.restore", 2);
+        restore.args = json!({});
+        restore.body = restore.args.to_string();
+        let mut malformed = command("comp.window.restore", 3);
+        malformed.body = "{".into();
+        for command in [minimize, restore, malformed] {
+            handle_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                command,
+            );
+        }
+        let PortCommand::Window(first) = source.try_recv().expect("minimize admitted") else {
+            panic!("window command expected");
+        };
+        let PortCommand::Window(second) = source.try_recv().expect("restore admitted") else {
+            panic!("window command expected");
+        };
+        assert_eq!(
+            first.op,
+            WindowOp::Minimize {
+                id: 7,
+                generation: 3
+            }
+        );
+        assert_eq!(second.op, WindowOp::Restore { target: None });
+        assert!(first.order < second.order, "arrival order is kept");
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let refused = replies.recv().await.expect("malformed body refused");
+        assert_eq!(refused.id.as_deref(), Some("3"));
+        assert_eq!(refused.rc, 10);
+        responders.abort_all();
     }
 
     #[tokio::test]

@@ -136,8 +136,10 @@ impl CompositorHandler for WaylandState {
             .is_some_and(|record| record.mapped);
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface);
+        let role_generation = self.next_role_generation();
         let id = if let Some(record) = self.surfaces.get_mut(&surface.id()) {
             let id = record.id;
+            record.generation = role_generation;
             record.role = SurfaceRole::Subsurface {
                 surface: surface.clone(),
                 parent: parent.clone(),
@@ -199,6 +201,7 @@ impl CompositorHandler for WaylandState {
                 surface.id(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role: SurfaceRole::Subsurface {
                         surface: surface.clone(),
                         parent: parent.clone(),
@@ -782,8 +785,10 @@ impl WlrLayerShellHandler for WaylandState {
         };
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
+        let role_generation = self.next_role_generation();
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
+            record.generation = role_generation;
             record.role = SurfaceRole::Layer(role);
             record.mapped = false;
             record.layout = layout;
@@ -818,6 +823,7 @@ impl WlrLayerShellHandler for WaylandState {
                 surface_object.clone(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role: SurfaceRole::Layer(role),
                     mapped: false,
                     layout,
@@ -988,8 +994,10 @@ impl XdgShellHandler for WaylandState {
         set_toplevel_configuration(&surface, configured_size);
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
+        let role_generation = self.next_role_generation();
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
+            record.generation = role_generation;
             record.role = SurfaceRole::Toplevel(surface);
             record.mapped = false;
             record.layout = layout;
@@ -1024,6 +1032,7 @@ impl XdgShellHandler for WaylandState {
                 surface_object.clone(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role: SurfaceRole::Toplevel(surface),
                     mapped: false,
                     layout,
@@ -1208,8 +1217,10 @@ impl XdgShellHandler for WaylandState {
 
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
+        let role_generation = self.next_role_generation();
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
+            record.generation = role_generation;
             record.role = SurfaceRole::Popup(surface);
             record.mapped = false;
             record.layout = layout;
@@ -1244,6 +1255,7 @@ impl XdgShellHandler for WaylandState {
                 surface_object.clone(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role: SurfaceRole::Popup(surface),
                     mapped: false,
                     layout,
@@ -1717,8 +1729,10 @@ impl SessionLockHandler for WaylandState {
         let surface_object = surface.wl_surface().id();
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(surface.wl_surface());
+        let role_generation = self.next_role_generation();
         let id = if let Some(record) = self.surfaces.get_mut(&surface_object) {
             let id = record.id;
+            record.generation = role_generation;
             record.role = SurfaceRole::LockSurface(role);
             record.mapped = false;
             record.layout = layout;
@@ -1753,6 +1767,7 @@ impl SessionLockHandler for WaylandState {
                 surface_object.clone(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role: SurfaceRole::LockSurface(role),
                     mapped: false,
                     layout,
@@ -2219,6 +2234,7 @@ impl InputMethodHandler for WaylandState {
         }
         let anchor = self.ime_popup_anchor(&surface);
         surface.set_location(anchor);
+        let role_generation = self.next_role_generation();
         let id = SurfaceId(self.next_surface_id);
         self.next_surface_id = self.next_surface_id.saturating_add(1);
         // Top band: a candidate window belongs above ordinary windows, the way
@@ -2245,6 +2261,7 @@ impl InputMethodHandler for WaylandState {
             object,
             SurfaceRecord {
                 id,
+                generation: role_generation,
                 role: SurfaceRole::ImePopup(Box::new(surface)),
                 mapped: false,
                 layout,

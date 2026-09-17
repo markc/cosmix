@@ -1882,7 +1882,9 @@ impl KeybindingHarness {
             .state
             .surfaces
             .values_mut()
-            .find(|record| record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
+            .find(|record| {
+                record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID
+            })
             .expect("real toplevel exists");
         toplevel.layout.x = 0.0;
         toplevel.layout.y = 0.0;
@@ -28846,6 +28848,355 @@ fn window_band_prop_demotes_and_restores_toplevels() {
         .into_wire();
     assert_eq!(rc, 10);
     assert!(body.contains("a live toplevel window"), "{body}");
+}
+
+#[cfg(feature = "bus")]
+fn control_reply_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime")
+}
+
+/// Service one control admission and decode its wire reply.
+#[cfg(feature = "bus")]
+fn serviced_control_reply(
+    harness: &mut KeybindingHarness,
+    runtime: &tokio::runtime::Runtime,
+    admission: crate::port::ControlAdmission,
+) -> (u8, Value) {
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("control service cycle");
+    let (rc, body) = runtime
+        .block_on(admission.receive())
+        .expect("control reply")
+        .into_wire();
+    (rc, serde_json::from_str(&body).expect("control reply JSON"))
+}
+
+#[cfg(feature = "bus")]
+fn window_id_and_generation(harness: &KeybindingHarness, object: &ObjectId) -> (u64, u64) {
+    let record = &harness.server.state.surfaces[object];
+    (record.id.0, record.generation)
+}
+
+/// C0.3 fencing: the `wl_surface` keeps its id across a role re-take, but
+/// every role assignment (including going dormant) takes a new generation,
+/// and a write fenced with an old generation is refused before it can reach
+/// whatever now owns the id.
+#[cfg(feature = "bus")]
+#[test]
+fn role_retake_bumps_generation_and_stale_writes_are_refused() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, first) = window_id_and_generation(&harness, &object);
+    assert!(first > 0, "generations start at 1");
+    assert_eq!(
+        harness.server.state.resolve_window_target(id, Some(first)),
+        Ok(object.clone())
+    );
+
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the xdg_toplevel role");
+    let (dormant_id, dormant) = window_id_and_generation(&harness, &object);
+    assert_eq!(dormant_id, id, "the id survives the role");
+    assert!(dormant > first, "going dormant is a role change");
+    assert_eq!(
+        harness.server.state.resolve_window_target(id, None),
+        Err(window_control::WindowTargetError::UnknownWindow)
+    );
+
+    let replacement = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        1,
+        &words(&[replacement]),
+    );
+    harness.dispatch_client();
+    harness.assert_client_connected("after re-taking the toplevel role");
+    let record = &harness.server.state.surfaces[&object];
+    assert!(matches!(record.role, SurfaceRole::Toplevel(_)));
+    let (retaken_id, retaken) = window_id_and_generation(&harness, &object);
+    assert_eq!(retaken_id, id, "a re-taken role keeps the surface id");
+    assert!(retaken > dormant, "a re-taken role takes a new generation");
+    assert_eq!(
+        harness.server.state.resolve_window_target(id, Some(first)),
+        Err(window_control::WindowTargetError::StaleTarget {
+            requested: first,
+            current: retaken,
+        })
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .resolve_window_target(id, Some(retaken)),
+        Err(window_control::WindowTargetError::NotMapped),
+        "the replacement has no content yet"
+    );
+
+    let runtime = control_reply_runtime();
+    for leaf in ["minimized", "band"] {
+        let value = if leaf == "band" {
+            json!("bottom")
+        } else {
+            json!(true)
+        };
+        let admission = ingress
+            .request_set_fenced(format!("windows.s{id}.{leaf}"), value, Some(first))
+            .expect("fenced set admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 10, "{leaf}");
+        assert_eq!(
+            body,
+            json!({"error": "stale_target", "id": id, "generation": first, "current": retaken}),
+            "{leaf}"
+        );
+    }
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.minimized);
+    assert_eq!(record.layout.z.band, StackBand::Normal);
+}
+
+/// `windows.s<id>.minimized` is writable: true minimises, false restores
+/// THAT window (not the LIFO top), drops it from the LIFO, focuses and
+/// raises it, and both directions reach props.changed as `props.set`.
+#[cfg(feature = "bus")]
+#[test]
+fn minimized_prop_round_trips_and_restores_that_window() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let (_, _, _, beta) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    runtime.block_on(watch.receive()).expect("watch reply");
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let alpha_path = format!("windows.s{alpha_id}.minimized");
+    let admission = ingress
+        .request_set_fenced(alpha_path.clone(), json!(true), Some(alpha_generation))
+        .expect("minimise admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"path": alpha_path, "old": false, "new": true}));
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    for leaf in ["minimized", "visible"] {
+        let expected = format!("windows.s{alpha_id}.{leaf}");
+        assert!(
+            changed.iter().any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::PropsChanged {
+                    path,
+                    cause: "props.set",
+                    ..
+                } if *path == expected
+            )),
+            "{expected} reaches props.changed: {changed:?}"
+        );
+    }
+
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Minimize {
+            id: beta_id,
+            generation: beta_generation,
+        })
+        .expect("minimize verb admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["id"], beta_id);
+    assert_eq!(body["generation"], beta_generation);
+    assert_eq!(body["title"], "Beta");
+    assert_eq!(body["minimized"], true);
+    assert_eq!(body["changed"], true);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        [alpha.clone(), beta.clone()]
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    // Restore Alpha, which is NOT the LIFO top, by id only (unfenced).
+    let admission = ingress
+        .request_set(alpha_path.clone(), json!(false))
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"path": alpha_path, "old": true, "new": false}));
+    let state = &harness.server.state;
+    assert!(!state.surfaces[&alpha].minimized);
+    assert!(state.surfaces[&beta].minimized, "the LIFO top stays hidden");
+    assert_eq!(state.minimized_toplevels, [beta.clone()]);
+    assert!(state.surfaces[&alpha].focused);
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(alpha.clone())
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if *path == alpha_path && new.wire_value() == json!(false)
+        )),
+        "restore reaches props.changed: {changed:?}"
+    );
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if path == "focus.window.id" && new.wire_value() == json!(alpha_id)
+        )),
+        "focus.window follows the restored window: {changed:?}"
+    );
+
+    // A no-op write replies normally and publishes nothing.
+    let admission = ingress
+        .request_set(alpha_path.clone(), json!(false))
+        .expect("no-op admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0);
+    assert_eq!(body["old"], false);
+    assert_eq!(body["new"], false);
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+
+    // Refusals: wrong type, unknown window.
+    let admission = ingress
+        .request_set(alpha_path, json!("yes"))
+        .expect("bad value reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "invalid_value");
+    let admission = ingress
+        .request_set("windows.s999999.minimized".into(), json!(true))
+        .expect("missing window reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["range"], "a live toplevel window");
+
+    // The new read-only row leaves are served from the snapshot.
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    let row = &snapshot.windows[&format!("s{alpha_id}")];
+    assert_eq!(row.generation, alpha_generation);
+    assert!(row.visible);
+    assert_eq!(row.pid, Some(u64::from(std::process::id())));
+    let record = &harness.server.state.surfaces[&alpha];
+    assert_eq!((row.window_x, row.window_y), record.window_origin);
+    assert!(!snapshot.windows[&format!("s{beta_id}")].visible);
+    assert_eq!(snapshot.focus.window.id, Some(alpha_id));
+    assert_eq!(snapshot.focus.window.generation, Some(alpha_generation));
+}
+
+/// `comp.window.restore` without an id is exactly the Super+Shift+M
+/// binding (LIFO pop); with nothing left it answers not_found, and every
+/// named form is fenced.
+#[cfg(feature = "bus")]
+#[test]
+fn window_restore_verb_pops_lifo_then_reports_not_found() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let beta = map_test_undecorated_toplevel(&mut harness);
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let runtime = control_reply_runtime();
+    for object in [&alpha, &beta] {
+        let surface = harness.server.state.surfaces[object]
+            .role
+            .wl_surface()
+            .clone();
+        harness.server.state.minimize_toplevel(&surface);
+    }
+    let restore_any = crate::port::WindowOp::Restore { target: None };
+
+    for (expected_id, expected_generation, object) in [
+        (beta_id, beta_generation, &beta),
+        (alpha_id, alpha_generation, &alpha),
+    ] {
+        let admission = ingress
+            .request_window(restore_any)
+            .expect("restore admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["id"], expected_id);
+        assert_eq!(body["generation"], expected_generation);
+        assert_eq!(body["minimized"], false);
+        assert_eq!(body["changed"], true);
+        assert!(body.get("title").is_some() && body.get("app_id").is_some());
+        assert!(!harness.server.state.surfaces[object].minimized);
+        assert_eq!(
+            focused_surface(harness.server.state.keyboard.current_focus())
+                .map(|surface| surface.id()),
+            Some(object.clone())
+        );
+    }
+
+    let admission = ingress
+        .request_window(restore_any)
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body, json!({"error": "not_found", "minimized_count": 0}));
+
+    // Named forms: stale, unknown, then minimise + restore by id, and a
+    // restore of a window that is not minimised is a successful no-op.
+    let stale = crate::port::WindowOp::Restore {
+        target: Some((alpha_id, alpha_generation + 100)),
+    };
+    let admission = ingress.request_window(stale).expect("admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "stale_target");
+    assert_eq!(body["current"], alpha_generation);
+
+    let unknown = crate::port::WindowOp::Minimize {
+        id: 999_999,
+        generation: 1,
+    };
+    let admission = ingress.request_window(unknown).expect("admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body, json!({"error": "unknown_window", "id": 999_999}));
+
+    let minimise = crate::port::WindowOp::Minimize {
+        id: alpha_id,
+        generation: alpha_generation,
+    };
+    let admission = ingress.request_window(minimise).expect("admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!((rc, body["changed"].clone()), (0, json!(true)));
+    let restore_alpha = crate::port::WindowOp::Restore {
+        target: Some((alpha_id, alpha_generation)),
+    };
+    for expected_change in [true, false] {
+        let admission = ingress.request_window(restore_alpha).expect("admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["changed"], expected_change);
+        assert_eq!(body["minimized"], false);
+    }
+    assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 
 /// The XWayland runtime switch as a props leaf: set round-trip, changed

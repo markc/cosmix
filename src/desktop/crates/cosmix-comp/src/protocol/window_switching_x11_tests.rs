@@ -156,3 +156,38 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
         Some(native)
     );
 }
+
+/// The minimised prop drives X11 windows through the same funnel: EWMH
+/// hidden state is set on minimise and cleared on restore.
+#[cfg(feature = "bus")]
+#[test]
+fn minimized_prop_suspends_and_resumes_x11_windows() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let (surface_id, _, window, object) = associate_normal_window(&mut harness, 905);
+    commit_dmabuf(&mut harness, surface_id, 32, 24);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.mapped && record.role.managed_toplevel());
+    let path = format!("windows.s{}.minimized", record.id.0);
+    let generation = record.generation;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime");
+    for minimized in [true, false] {
+        let admission = ingress
+            .request_set_fenced(path.clone(), json!(minimized), Some(generation))
+            .expect("set admitted");
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::ZERO))
+            .expect("set service cycle");
+        let (rc, body) = runtime
+            .block_on(admission.receive())
+            .expect("set reply")
+            .into_wire();
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(harness.server.state.surfaces[&object].minimized, minimized);
+        assert_eq!(window.is_minimized(), minimized, "EWMH hidden state");
+    }
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+}

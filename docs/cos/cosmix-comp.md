@@ -137,7 +137,7 @@ instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid `from`
 with Bus rc 10.
 
-The control plane exposes eight verbs:
+The control plane exposes ten verbs:
 
 - `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
 - `comp.info` returns service/build/backend provenance plus output and surface
@@ -154,16 +154,31 @@ The control plane exposes eight verbs:
   the name this compositor instance actually registered. The reply is truthful
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
-- `comp.props.set {path,value}` mutates the four corner properties,
-  `windows.s<id>.band`, or `xwayland.enabled` and returns
-  `{path,old,new}`; for the file-persisted `xwayland.enabled` the reply also
-  carries `persisted` — `false` means the in-memory change and the changed
-  event stand but the write to disk failed and the value will not survive
-  restart.
+- `comp.props.set {path,value,generation?}` mutates the four corner
+  properties, `windows.s<id>.band`, `windows.s<id>.minimized`, or
+  `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
+  `xwayland.enabled` the reply also carries `persisted` — `false` means the
+  in-memory change and the changed event stand but the write to disk failed
+  and the value will not survive restart. The optional `generation` fences a
+  `windows.s<id>.*` write (see Window identity below); it is refused on any
+  other path.
 - `comp.pointer.watch` renews a three-second local pointer observation lease
   and returns `{version:1,topic:"<service>.pointer.changed",lease_ms:3000}`.
   Subscribe before calling; renew about once per second while observation is
   wanted. The acknowledgement contains no pointer coordinates.
+- `comp.window.minimize {id,generation}` minimises one window, like its
+  title-bar button. Both fields are required.
+- `comp.window.restore {id?,generation?}` with no arguments restores the most
+  recently minimised window, exactly like the `Super+Shift+M` binding; with
+  `{id,generation}` (both required together) it restores that window. Either
+  form un-minimises, raises and focuses the window.
+
+Both window verbs reply `{id,generation,title,app_id,minimized,changed}`;
+`changed:false` means the window was already in the requested state.
+`comp.window.restore {}` with nothing to restore replies rc 10
+`{"error":"not_found","minimized_count":N}`. While a session lock is active
+both verbs, and writes to `windows.s<id>.minimized`, reply
+`{"error":"locked"}`.
 
 No verb checks who the caller is. Any caller that noded delivers, local or from
 the WireGuard mesh, can read, write and watch; being on the mesh is the whole
@@ -181,9 +196,11 @@ surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 maximized,fullscreen,minimized,decoration,
                 layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
-               maximized,fullscreen,minimized,output,band}
+               maximized,fullscreen,minimized,output,band,generation,
+               window_x,window_y,visible,pid}
 stack
-focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
+focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
+       window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
@@ -204,6 +221,32 @@ sequence watermark across every topic, and `port.lost_count` is cumulative.
 `port.broker` is driven by connection-state edges and is `connected` or
 `retrying`. `port.reply_timeouts` and `port.publish_timeouts` count their
 separate bounded lanes; both abandon a sink wait after two seconds.
+
+Window rows add five read-only leaves. `generation` is the window's role
+generation (below). `window_x`/`window_y` are the window-geometry origin; `x`/`y`
+stay the buffer origin, which includes any client-side shadow. `visible` is
+effective on-screen visibility: use it to ask "is this on screen", and
+`minimized` for the user's minimise state. `pid` is the client's process id,
+or null when the compositor cannot read it. `focus.window.{id,generation}`
+names the window row that holds keyboard focus, both null when none does.
+
+**Window identity.** A `wl_surface` keeps its `s<id>` when a client gives it a
+new role, so an id alone can name a different window than the one a script
+read. Every role assignment (including the role ending) takes a new,
+never-reused `generation`. Treat `{id, generation}` as the window's identity:
+the window verbs require both, and `comp.props.set` accepts `generation` on
+any `windows.s<id>.*` path. A mismatch replies rc 10
+`{"error":"stale_target","id","generation","current"}` and changes nothing.
+The window verbs also reply `unknown_window`, `not_managed` or `not_mapped`
+(each with `id`) when the target is not a mapped managed window. Moving or
+resizing a window never changes its generation.
+
+`windows.s<id>.minimized` accepts `true` or `false`. `true` minimises the
+window; `false` restores that window (not the most recently minimised one),
+takes it out of the restore order, and raises and focuses it. X11 windows are
+accepted too and get the EWMH hidden state cleared. A write to a window that
+does not exist or is not a mapped managed window replies `invalid_value`, like
+the band leaf.
 
 Window band writes accept `bottom` or `normal`. They move the complete window
 tree, including popups, behind normal windows or back into their normal band.
@@ -406,8 +449,9 @@ ranges are:
 | `input.corners.dwell_ms` | `200` | `0..=5000` ms |
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
-The mutable leaves are the four corner leaves, `windows.s<id>.band` and
-`xwayland.enabled`. The corner and band descriptors say `mutable:true` and
+The mutable leaves are the four corner leaves, `windows.s<id>.band`,
+`windows.s<id>.minimized` and `xwayland.enabled`. The corner and window
+descriptors say `mutable:true` and
 `persistence:"none"` (numeric leaves also carry the range above) and those
 values live for the compositor process only. `xwayland.enabled` is the one
 exception: its descriptor says

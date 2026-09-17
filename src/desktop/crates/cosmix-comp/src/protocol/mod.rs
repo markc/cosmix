@@ -3112,6 +3112,7 @@ impl ProtocolServer {
             pending_full_upserts: HashSet::new(),
             pending_cursor_update: false,
             next_surface_id: 1,
+            next_role_generation: 1,
             next_layout_index: 0,
             next_stack_sequences: [0; StackBand::COUNT],
             next_buffer_token: 1,
@@ -3254,6 +3255,13 @@ impl ProtocolServer {
                     ChannelEvent::Msg(PortCommand::Set(request)) => {
                         if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_controls.push(PortControl::Set(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Window(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state
+                                .pending_port_controls
+                                .push(PortControl::Window(request));
                         }
                     }
                     ChannelEvent::Msg(PortCommand::WatchState { active, order }) => {
@@ -4680,6 +4688,11 @@ fn sync_toplevel_scene_state(record: &mut SurfaceRecord) {
 struct SurfaceRecord {
     id: SurfaceId,
     role: SurfaceRole,
+    /// Bumped every time this `wl_surface` takes a role (including going
+    /// dormant). The id survives a role re-take; the generation does not, so
+    /// a Bus caller holding `{id, generation}` cannot act on a different
+    /// window that inherited the id.
+    generation: u64,
     mapped: bool,
     layout: SurfaceLayout,
     title: Option<Arc<str>>,
@@ -5895,6 +5908,9 @@ struct WaylandState {
     /// path can retain the current DMA-BUF once pressure clears.
     pending_cursor_update: bool,
     next_surface_id: u64,
+    /// Source of `SurfaceRecord::generation`. Never reused, so a
+    /// `{id, generation}` pair names one role assignment for the session.
+    next_role_generation: u64,
     next_layout_index: u32,
     next_stack_sequences: [u64; StackBand::COUNT],
     next_buffer_token: u64,
@@ -10457,18 +10473,24 @@ impl WaylandState {
         {
             self.dismiss_popup_descendants(surface);
         }
+        if self
+            .surfaces
+            .get(&surface.id())
+            .is_none_or(|record| matches!(record.role, SurfaceRole::Dormant(_)))
+        {
+            return;
+        }
+        let role_generation = self.next_role_generation();
         let Some(record) = self.surfaces.get_mut(&surface.id()) else {
             return;
         };
-        if matches!(record.role, SurfaceRole::Dormant(_)) {
-            return;
-        }
         // Whether the renderer can be holding an entity for this surface. A
         // surface the compositor called mapped is one it may have published a
         // complete upsert for, so going dormant has to be *said*, below.
         let was_mapped = was_mapped_before;
         let id = record.id;
         record.role = SurfaceRole::Dormant(surface.clone());
+        record.generation = role_generation;
         record.required_configure = None;
         record.last_acked_configure = None;
         record.last_acked_size = None;
@@ -13205,34 +13227,55 @@ impl WaylandState {
         self.retarget_pointer_after_visibility_change();
     }
 
-    fn restore_most_recently_minimized(&mut self) {
+    /// Pops the minimise LIFO until one entry restores; returns the
+    /// restored object, or `None` when nothing restorable was left.
+    fn restore_most_recently_minimized(&mut self) -> Option<ObjectId> {
         while let Some(object) = self.minimized_toplevels.pop() {
-            let restored = self.surfaces.get_mut(&object).and_then(|record| {
-                if !record.mapped || !record.minimized || !record.role.managed_toplevel() {
-                    return None;
-                }
-                record.minimized = false;
-                Some((record.role.wl_surface().clone(), record.id))
-            });
-            let Some((surface, _id)) = restored else {
-                continue;
-            };
-            #[cfg(feature = "xwayland")]
-            if let Some(role) = self
-                .surfaces
-                .get(&object)
-                .and_then(|record| record.role.x11())
-            {
-                let _ = role.surface.set_suspended(false);
+            if self.restore_window(&object) {
+                return Some(object);
             }
-            #[cfg(feature = "bus")]
-            self.mark_surface_dirty(_id, "wayland.focus");
-            self.recompute_effective_visibility();
-            self.raise_surface(&surface);
-            self.arbitrate_keyboard_focus(Some(surface), false, false);
-            self.retarget_pointer_after_visibility_change();
-            return;
         }
+        None
+    }
+
+    /// The per-window half of a restore: un-minimise one mapped managed
+    /// toplevel, drop it from the LIFO, then raise, focus and retarget the
+    /// pointer. Returns `false` (and changes nothing but the LIFO entry) when
+    /// the object is not a mapped, minimised, managed toplevel.
+    fn restore_window(&mut self, object: &ObjectId) -> bool {
+        self.minimized_toplevels.retain(|entry| entry != object);
+        let restored = self.surfaces.get_mut(object).and_then(|record| {
+            if !record.mapped || !record.minimized || !record.role.managed_toplevel() {
+                return None;
+            }
+            record.minimized = false;
+            Some((record.role.wl_surface().clone(), record.id))
+        });
+        let Some((surface, _id)) = restored else {
+            return false;
+        };
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = self
+            .surfaces
+            .get(object)
+            .and_then(|record| record.role.x11())
+        {
+            let _ = role.surface.set_suspended(false);
+        }
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(_id, "wayland.focus");
+        self.recompute_effective_visibility();
+        self.raise_surface(&surface);
+        self.arbitrate_keyboard_focus(Some(surface), false, false);
+        self.retarget_pointer_after_visibility_change();
+        true
+    }
+
+    /// Hands out the next role generation (see `SurfaceRecord::generation`).
+    fn next_role_generation(&mut self) -> u64 {
+        let generation = self.next_role_generation;
+        self.next_role_generation = generation.saturating_add(1);
+        generation
     }
 
     fn logical_output_rect(&self) -> LogicalOutputRect {
@@ -15367,6 +15410,8 @@ mod focus;
 mod handlers;
 mod input;
 mod release_use;
+#[cfg(feature = "bus")]
+pub(crate) mod window_control;
 mod window_switching;
 #[cfg(feature = "xwayland")]
 mod xwayland;
