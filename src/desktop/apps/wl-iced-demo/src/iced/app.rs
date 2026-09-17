@@ -421,11 +421,16 @@ impl IcedDemo {
             self.raw.note_frame();
             if self.raw.trace() {
                 self.raw.log(format_args!(
-                    "frame {} window grid_full={grid_full} grid_rects={} chrome_rects={} chrome_full={}",
+                    "frame {} window grid_full={grid_full} grid={:?} chrome_full={} chrome={:?}",
                     self.raw.frames(),
-                    grid.len(),
-                    chrome_rects.len(),
-                    drawn.full
+                    grid.iter()
+                        .map(|r| (r.x, r.y, r.width, r.height))
+                        .collect::<Vec<_>>(),
+                    drawn.full,
+                    chrome_rects
+                        .iter()
+                        .map(|r| (r.x, r.y, r.width, r.height))
+                        .collect::<Vec<_>>()
                 ));
             }
         }
