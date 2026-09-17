@@ -165,7 +165,6 @@ fn register(world: &mut DeferredWorld, entity: Entity, id: ContentSourceId) {
     registry.by_id.insert(id.clone(), entity);
     registry.by_entity.insert(entity, id.clone());
     registry.revisions.insert(id.clone(), 0);
-    drop(registry);
     if let Some(reporter) = reporter {
         reporter.source_registered(id.as_str().to_string());
     }
@@ -236,7 +235,6 @@ fn content_source_discarded(mut world: DeferredWorld, context: HookContext) {
     {
         registry.waiting.remove(&source.id);
     }
-    drop(registry);
     if let Some(reporter) = &reporter {
         reporter.source_unregistered(source.id.as_str().to_string(), revision);
     }

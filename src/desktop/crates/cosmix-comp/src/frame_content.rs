@@ -159,7 +159,7 @@ fn resolve_frame_content(
             let progress = surface
                 .dmabuf_requests
                 .as_ref()
-                .and_then(|_| imports.as_ref())
+                .and(imports.as_ref())
                 .and_then(|imports| imports.progress(surface.image));
             (surface.clone(), gpu_ready, progress)
         })
