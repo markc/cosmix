@@ -247,3 +247,31 @@ fn x11_generation_is_readable_and_fences_window_verbs() {
     assert_eq!(snapshot.focus.window.id, Some(id));
     assert_eq!(snapshot.focus.window.generation, Some(generation));
 }
+
+/// Destroying a mapped surface (Xwayland destroys the wl_surface of an X11
+/// window without a role object to tear down first) discards its pending
+/// presentation feedback.
+#[test]
+fn x11_surface_destroy_discards_pending_presentation_feedback() {
+    let mut harness = KeybindingHarness::new(true);
+    let (surface_id, _, _window, object) = associate_normal_window(&mut harness, 907);
+    commit_dmabuf(&mut harness, surface_id, 32, 24);
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let callback = request_surface_feedback(&mut harness, presentation, surface_id);
+    send_request(&mut harness.client, surface_id, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    send_request(&mut harness.client, surface_id, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the X11 surface");
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, callback), [2], "{events:?}");
+}

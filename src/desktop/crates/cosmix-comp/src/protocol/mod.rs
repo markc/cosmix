@@ -426,9 +426,10 @@ pub(crate) struct SurfaceSceneSnapshot {
     pub(crate) layout: SurfaceLayout,
     pub(crate) kind: SceneSurfaceKind,
     pub(crate) title: Option<Arc<str>>,
-    /// The surface's content sequence (`SurfaceRecord::commit_count`) when
-    /// the snapshot was taken. Only an upsert's value names the content it
-    /// carries; a relayout's is informational.
+    /// The surface's content sequence (`SurfaceRecord::content_seq`) when
+    /// the snapshot was taken: the sequence of the newest buffer published
+    /// to the renderer, so a rebuilt upsert (relayout or dirty recovery)
+    /// names the content it carries.
     pub(crate) commit_seq: u64,
 }
 
@@ -992,7 +993,14 @@ enum ProtocolCommand {
     },
     ContentSourceUnregistered {
         id: String,
+        revision: u64,
     },
+    CommitRefused {
+        id: SurfaceId,
+        commit_seq: u64,
+    },
+    /// A backend wired its frame reporter: advertise `wp_presentation`.
+    EnablePresentation,
     CapturePixels(CapturePixels),
     CaptureDmabufComplete(CaptureDmabufComplete),
     CaptureDmabufFailed(CaptureDmabufFailed),
@@ -1330,6 +1338,21 @@ impl ClientSceneFeed {
         }
     }
 
+    /// The renderer refused a committed buffer (DMA-BUF import rejected), so
+    /// that commit will never be shown.
+    pub(crate) fn commit_refused(&self, id: SurfaceId, commit_seq: u64) {
+        if self
+            .commands
+            .send(ProtocolCommand::CommitRefused { id, commit_seq })
+            .is_err()
+        {
+            tracing::debug!(
+                surface_id = id.0,
+                "protocol thread gone before a refused commit"
+            );
+        }
+    }
+
     pub(crate) fn dmabuf_release_callback(&self, token: u64) -> ReleaseCallback {
         let commands = self.commands.clone();
         Box::new(move || {
@@ -1530,10 +1553,10 @@ impl FramePresentationReporter {
             .send(ProtocolCommand::ContentSourceRegistered { id });
     }
 
-    pub(crate) fn source_unregistered(&self, id: String) {
+    pub(crate) fn source_unregistered(&self, id: String, revision: u64) {
         let _ = self
             .commands
-            .send(ProtocolCommand::ContentSourceUnregistered { id });
+            .send(ProtocolCommand::ContentSourceUnregistered { id, revision });
     }
 }
 
@@ -2205,7 +2228,16 @@ impl WaylandRuntime {
         }
     }
 
+    /// The backend's frame reporter. Asking for it is what advertises
+    /// `wp_presentation`: the global never exists without a reporter.
     pub(crate) fn frame_presentation_reporter(&self) -> FramePresentationReporter {
+        if self
+            .commands
+            .send(ProtocolCommand::EnablePresentation)
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before enabling presentation");
+        }
         FramePresentationReporter {
             commands: self.commands.clone(),
         }
@@ -2864,14 +2896,6 @@ impl ProtocolServer {
         let fractional_scale_state =
             FractionalScaleManagerState::new::<WaylandState>(&display_handle);
         let viewporter_state = ViewporterState::new::<WaylandState>(&display_handle);
-        // Only a backend that reports presented frames advertises
-        // wp_presentation (kms-live joins with its flip report).
-        let presentation_global = matches!(backend_kind, BackendKind::Winit).then(|| {
-            smithay::wayland::presentation::PresentationState::new::<WaylandState>(
-                &display_handle,
-                libc::CLOCK_MONOTONIC as u32,
-            )
-        });
         let shm_state = ShmState::new::<WaylandState>(&display_handle, Vec::new());
         let supported_dmabuf_formats = dmabuf_capabilities
             .formats
@@ -3076,12 +3100,7 @@ impl ProtocolServer {
             xdg_decoration_state,
             fractional_scale_state,
             viewporter_state,
-            presentation: presentation::PresentationRuntime {
-                _global: presentation_global,
-                ledger: presentation::PresentationLedger::default(),
-                sources: presentation::SourceLedger::default(),
-                applied_commits: Vec::new(),
-            },
+            presentation: presentation::PresentationRuntime::default(),
             #[cfg(feature = "xwayland")]
             xwayland_shell_state,
             #[cfg(feature = "xwayland")]
@@ -3436,8 +3455,14 @@ impl ProtocolServer {
                 ChannelEvent::Msg(ProtocolCommand::ContentSourceRegistered { id }) => {
                     state.content_source_registered(&id);
                 }
-                ChannelEvent::Msg(ProtocolCommand::ContentSourceUnregistered { id }) => {
-                    state.content_source_unregistered(&id);
+                ChannelEvent::Msg(ProtocolCommand::ContentSourceUnregistered { id, revision }) => {
+                    state.content_source_unregistered(&id, revision);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CommitRefused { id, commit_seq }) => {
+                    state.commit_refused(id, commit_seq);
+                }
+                ChannelEvent::Msg(ProtocolCommand::EnablePresentation) => {
+                    state.enable_presentation();
                 }
                 ChannelEvent::Msg(ProtocolCommand::CapturePixels(pixels)) => {
                     state.capture_pixels_ready(pixels);
@@ -4780,6 +4805,9 @@ struct SurfaceRecord {
     window_origin: (f32, f32),
     configured_size: (i32, i32),
     commit_count: u64,
+    /// Advances only when a new buffer is published to the renderer
+    /// (`commit_count` also counts buffers the commit path refused).
+    content_seq: u64,
     shm_backing: Option<ShmBacking>,
     dmabuf_backing: Option<DmabufBacking>,
     buffer_dimensions: Option<(u32, u32)>,
@@ -4825,7 +4853,7 @@ impl SurfaceRecord {
             layout: self.layout,
             kind: self.role.scene_kind(),
             title: self.title.clone(),
-            commit_seq: self.commit_count,
+            commit_seq: self.content_seq,
         }
     }
 }
@@ -13288,7 +13316,7 @@ impl WaylandState {
         }) else {
             return;
         };
-        self.discard_presentation_feedback(_id, "minimize");
+        self.discard_presentation_feedback(_id, presentation::DiscardReason::Minimize);
         // A client-started move/resize must not keep steering a hidden
         // window (a Bus minimise can land mid-drag). Unlike unmap, the
         // window stays alive, so a resize ends properly: Resizing is unset
@@ -13365,7 +13393,7 @@ impl WaylandState {
     /// under the old role will never be shown as that role's content.
     fn role_change_generation(&mut self, object: &ObjectId) -> u64 {
         if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
-            self.discard_presentation_feedback(id, "role");
+            self.discard_presentation_feedback(id, presentation::DiscardReason::Role);
         }
         self.next_role_generation()
     }
@@ -15142,11 +15170,14 @@ impl WaylandState {
                         self.release_shm_bytes(surface, released_shm_bytes);
                     }
                     self.recompute_effective_visibility();
-                    let scene = self
-                        .surfaces
-                        .get(&surface.id())
-                        .expect("mapped surface remains tracked")
-                        .scene_snapshot();
+                    let scene = {
+                        let record = self
+                            .surfaces
+                            .get_mut(&surface.id())
+                            .expect("mapped surface remains tracked");
+                        record.content_seq = commit_count;
+                        record.scene_snapshot()
+                    };
                     self.push_surface_upsert(
                         surface,
                         ProtocolEvent::SurfaceUpserted {
@@ -15317,11 +15348,14 @@ impl WaylandState {
                     self.release_buffer_token(released_dmabuf_token);
                 }
                 self.recompute_effective_visibility();
-                let scene = self
-                    .surfaces
-                    .get(&surface.id())
-                    .expect("mapped surface remains tracked")
-                    .scene_snapshot();
+                let scene = {
+                    let record = self
+                        .surfaces
+                        .get_mut(&surface.id())
+                        .expect("mapped surface remains tracked");
+                    record.content_seq = commit_count;
+                    record.scene_snapshot()
+                };
                 self.push_surface_upsert(
                     surface,
                     ProtocolEvent::SurfaceUpserted {

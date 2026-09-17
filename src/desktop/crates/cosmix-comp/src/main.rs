@@ -1313,12 +1313,29 @@ struct NestedPresentCandidate {
 /// swapchain image was handed to the host (the same proof capture and the
 /// security barrier use). The host gives no timing signal, so the report is
 /// honest about it: CLOCK_MONOTONIC at hand-off, no flags, no sequence,
-/// unknown refresh.
+/// unknown refresh. The nested backend has one output and renders every
+/// frame, so every presented frame reports every surface.
 fn install_nested_frame_presentation(app: &mut App, reporter: FramePresentationReporter) {
     app.insert_resource(reporter.clone());
     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
         render_app.insert_resource(reporter);
     }
+}
+
+/// A frame is reported only when its swapchain image was consumed (and a
+/// hand-off time could be read).
+fn nested_frame_report(
+    content: Option<protocol::presentation::FrameContent>,
+    acquisition_consumed: bool,
+    timestamp: Option<(u64, u32)>,
+) -> Option<(
+    protocol::presentation::PresentedFrame,
+    protocol::presentation::FrameContent,
+)> {
+    if !acquisition_consumed {
+        return None;
+    }
+    Some((nested_presented_frame(timestamp?), content?))
 }
 
 fn nested_presented_frame(timestamp: (u64, u32)) -> protocol::presentation::PresentedFrame {
@@ -1435,6 +1452,7 @@ fn complete_nested_security_presentation(
     render_device: Res<RenderDevice>,
     windows: Res<ExtractedWindows>,
     frames: Option<Res<FramePresentationReporter>>,
+    sources: Option<ResMut<content_source::ExtractedContentSources>>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     let Some(acquisition) = candidate.acquisition.take() else {
@@ -1454,8 +1472,15 @@ fn complete_nested_security_presentation(
         acquisition_consumed,
         timestamp,
     );
-    if let (Some(frames), Some(content), Some(timestamp)) = (frames, content, timestamp) {
-        frames.presented(nested_presented_frame(timestamp), content);
+    if let (Some(frames), Some((frame, content))) = (
+        frames,
+        nested_frame_report(content, acquisition_consumed, timestamp),
+    ) {
+        frames.presented(frame, content);
+        // The report carried the content sources' accumulated costs.
+        if let Some(mut sources) = sources {
+            sources.consume();
+        }
     }
     if !acquisition_consumed {
         return;
@@ -1699,6 +1724,22 @@ mod tests {
             deadline: std::time::Instant::now() + Duration::from_secs(30),
             nested_acquisition: Some(acquisition),
         }
+    }
+
+    #[test]
+    fn nested_frames_are_reported_only_after_the_acquisition_was_consumed() {
+        let content = || Some(protocol::presentation::FrameContent::default());
+        assert!(nested_frame_report(content(), false, Some((1, 2))).is_none());
+        assert!(nested_frame_report(content(), true, None).is_none());
+        assert!(nested_frame_report(None, true, Some((1, 2))).is_none());
+        let (frame, _) = nested_frame_report(content(), true, Some((1, 2))).expect("reported");
+        assert_eq!(frame.time, Duration::new(1, 2));
+        assert_eq!((frame.seq, frame.flags.bits()), (0, 0));
+        assert_eq!(
+            frame.refresh,
+            smithay::wayland::presentation::Refresh::Unknown
+        );
+        assert!(frame.output.is_none());
     }
 
     #[test]

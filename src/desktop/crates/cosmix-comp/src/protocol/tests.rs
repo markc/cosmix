@@ -29382,14 +29382,54 @@ fn mesh_minimise_ends_a_client_resize_in_progress() {
 }
 
 fn request_presentation_feedback(harness: &mut KeybindingHarness, presentation: u32) -> u32 {
+    request_surface_feedback(harness, presentation, TEST_TOPLEVEL_SURFACE_ID)
+}
+
+fn request_surface_feedback(
+    harness: &mut KeybindingHarness,
+    presentation: u32,
+    surface: u32,
+) -> u32 {
     let callback = harness.allocate_object_id();
     send_request(
         &mut harness.client,
         presentation,
         1,
-        &words(&[TEST_TOPLEVEL_SURFACE_ID, callback]),
+        &words(&[surface, callback]),
     );
     callback
+}
+
+/// Enable the global (as a backend's reporter does), bind it through a
+/// fresh registry, and return the object id plus the bind traffic.
+fn bind_test_presentation(harness: &mut KeybindingHarness) -> (u32, Vec<(u32, u16, Vec<u8>)>) {
+    harness.server.state.enable_presentation();
+    let registry = harness.allocate_object_id();
+    let sync = harness.allocate_object_id();
+    send_display_request(&mut harness.client, 1, registry);
+    send_display_request(&mut harness.client, 0, sync);
+    harness.dispatch_client();
+    let globals = registry_globals_for(&mut harness.client, registry, sync);
+    let (name, version) = globals["wp_presentation"];
+    let presentation = harness.allocate_object_id();
+    let interface = "wp_presentation";
+    let string_len = interface.len() + 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&name.to_ne_bytes());
+    body.extend_from_slice(&(string_len as u32).to_ne_bytes());
+    body.extend_from_slice(interface.as_bytes());
+    body.resize(8 + string_len.div_ceil(4) * 4, 0);
+    body.extend_from_slice(&version.min(2).to_ne_bytes());
+    body.extend_from_slice(&presentation.to_ne_bytes());
+    send_request(&mut harness.client, registry, 0, &body);
+    let bound = harness.sync();
+    (presentation, bound)
+}
+
+fn commit_test_buffer(harness: &mut KeybindingHarness, surface: u32) {
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
 }
 
 fn test_frame_report(
@@ -29414,6 +29454,7 @@ fn test_frame_report(
                 shown,
             }],
             sources: Vec::new(),
+            refused: Vec::new(),
         },
     )
 }
@@ -29427,10 +29468,40 @@ fn feedback_outcome(events: &[(u32, u16, Vec<u8>)], callback: u32) -> Vec<(u16, 
         .collect()
 }
 
+/// Just the opcodes: 1 = presented, 2 = discarded.
+fn feedback_opcodes(events: &[(u32, u16, Vec<u8>)], callback: u32) -> Vec<u16> {
+    feedback_outcome(events, callback)
+        .into_iter()
+        .map(|(opcode, _)| opcode)
+        .collect()
+}
+
+fn content_seq(harness: &KeybindingHarness, object: &ObjectId) -> u64 {
+    harness.server.state.surfaces[object].content_seq
+}
+
+/// The global exists only after a reporter asked for it.
+#[test]
+fn presentation_global_waits_for_a_frame_reporter() {
+    let mut harness = KeybindingHarness::new(true);
+    let registry = harness.allocate_object_id();
+    let sync = harness.allocate_object_id();
+    send_display_request(&mut harness.client, 1, registry);
+    send_display_request(&mut harness.client, 0, sync);
+    harness.dispatch_client();
+    let globals = registry_globals_for(&mut harness.client, registry, sync);
+    assert!(!globals.contains_key("wp_presentation"));
+    harness.server.state.enable_presentation();
+    harness.server.state.enable_presentation();
+    let (_, bound) = bind_test_presentation(&mut harness);
+    harness.assert_client_connected("after binding wp_presentation");
+    assert!(!bound.is_empty());
+}
+
 /// `wp_presentation` end to end on the protocol thread: feedback is taken at
 /// commit (so a later commit cannot discard it), a frame report presents
-/// the commits it contained and leaves newer ones waiting, a commit without
-/// a new buffer resolves with the content it left on screen, and minimising
+/// the commit it sampled and leaves newer ones waiting, a commit without a
+/// new buffer resolves with the content it left on screen, and minimising
 /// discards what is still pending.
 #[test]
 fn presentation_feedback_is_taken_at_commit_and_resolved_by_frame_reports() {
@@ -29438,26 +29509,7 @@ fn presentation_feedback_is_taken_at_commit_and_resolved_by_frame_reports() {
     map_initial_test_toplevel(&mut harness);
     let object = test_toplevel_record(&harness).role.wl_surface().id();
     let id = harness.server.state.surfaces[&object].id;
-
-    let registry = harness.allocate_object_id();
-    let sync = harness.allocate_object_id();
-    send_display_request(&mut harness.client, 1, registry);
-    send_display_request(&mut harness.client, 0, sync);
-    harness.dispatch_client();
-    let globals = registry_globals_for(&mut harness.client, registry, sync);
-    let (name, version) = globals["wp_presentation"];
-    let presentation = harness.allocate_object_id();
-    let interface = "wp_presentation";
-    let string_len = interface.len() + 1;
-    let mut body = Vec::new();
-    body.extend_from_slice(&name.to_ne_bytes());
-    body.extend_from_slice(&(string_len as u32).to_ne_bytes());
-    body.extend_from_slice(interface.as_bytes());
-    body.resize(8 + string_len.div_ceil(4) * 4, 0);
-    body.extend_from_slice(&version.min(2).to_ne_bytes());
-    body.extend_from_slice(&presentation.to_ne_bytes());
-    send_request(&mut harness.client, registry, 0, &body);
-    let bound = harness.sync();
+    let (presentation, bound) = bind_test_presentation(&mut harness);
     assert!(
         bound
             .iter()
@@ -29468,29 +29520,15 @@ fn presentation_feedback_is_taken_at_commit_and_resolved_by_frame_reports() {
     );
 
     let first = request_presentation_feedback(&mut harness, presentation);
-    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
-    send_request(
-        &mut harness.client,
-        TEST_TOPLEVEL_SURFACE_ID,
-        1,
-        &words(&[buffer, 0, 0]),
-    );
-    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     let second = request_presentation_feedback(&mut harness, presentation);
-    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
-    send_request(
-        &mut harness.client,
-        TEST_TOPLEVEL_SURFACE_ID,
-        1,
-        &words(&[buffer, 0, 0]),
-    );
-    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     let third = request_presentation_feedback(&mut harness, presentation);
     // No new buffer: this commit shows whatever the second one left.
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
     harness.dispatch_client();
     harness.assert_client_connected("after committing with presentation feedback");
-    let seq = harness.server.state.surfaces[&object].commit_count;
+    let seq = content_seq(&harness, &object);
     assert_eq!(
         harness.server.state.presentation.ledger.pending_count(id),
         3,
@@ -29558,52 +29596,49 @@ fn presentation_feedback_is_taken_at_commit_and_resolved_by_frame_reports() {
         0
     );
     let events = harness.sync();
-    assert_eq!(
-        feedback_outcome(&events, fourth)
-            .into_iter()
-            .map(|(opcode, _)| opcode)
-            .collect::<Vec<_>>(),
-        [2],
-        "discarded"
-    );
+    assert_eq!(feedback_opcodes(&events, fourth), [2], "discarded");
 }
 
-/// A frame that does not show the surface (hidden, or its texture not
-/// prepared) discards what it covered; a surface the renderer can no longer
-/// present loses its pending feedback at the next report even if unlisted.
+/// A commit superseded by a newer buffer before any frame sampled it is
+/// discarded, not reported as presented by the later frame.
+#[test]
+fn presentation_feedback_of_a_superseded_commit_is_discarded() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let older = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let newer = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    let (frame, content) = test_frame_report(id, 3_000, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, older), [2], "{events:?}");
+    assert_eq!(feedback_opcodes(&events, newer), [1], "{events:?}");
+}
+
+/// A frame that does not show the surface discards what it covered, and
+/// unmapping discards what waits.
 #[test]
 fn presentation_feedback_is_discarded_when_not_shown_or_unmapped() {
     let mut harness = KeybindingHarness::new(true);
     map_initial_test_toplevel(&mut harness);
     let object = test_toplevel_record(&harness).role.wl_surface().id();
     let id = harness.server.state.surfaces[&object].id;
-    let registry = harness.allocate_object_id();
-    let sync = harness.allocate_object_id();
-    send_display_request(&mut harness.client, 1, registry);
-    send_display_request(&mut harness.client, 0, sync);
-    harness.dispatch_client();
-    let globals = registry_globals_for(&mut harness.client, registry, sync);
-    let (name, _) = globals["wp_presentation"];
-    let presentation = harness.allocate_object_id();
-    let interface = "wp_presentation";
-    let mut body = Vec::new();
-    body.extend_from_slice(&name.to_ne_bytes());
-    body.extend_from_slice(&((interface.len() + 1) as u32).to_ne_bytes());
-    body.extend_from_slice(interface.as_bytes());
-    body.resize(8 + (interface.len() + 1).div_ceil(4) * 4, 0);
-    body.extend_from_slice(&1_u32.to_ne_bytes());
-    body.extend_from_slice(&presentation.to_ne_bytes());
-    send_request(&mut harness.client, registry, 0, &body);
-    harness.sync();
+    let (presentation, _) = bind_test_presentation(&mut harness);
 
     let hidden = request_presentation_feedback(&mut harness, presentation);
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
     harness.dispatch_client();
-    let seq = harness.server.state.surfaces[&object].commit_count;
+    let seq = content_seq(&harness, &object);
     let (frame, content) = test_frame_report(id, 5_000, seq, false);
     harness.server.state.frame_presented(frame, content);
     let events = harness.sync();
-    assert_eq!(feedback_outcome(&events, hidden)[0].0, 2, "{events:?}");
+    assert_eq!(feedback_opcodes(&events, hidden), [2], "{events:?}");
 
     let unmapped = request_presentation_feedback(&mut harness, presentation);
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
@@ -29627,7 +29662,206 @@ fn presentation_feedback_is_discarded_when_not_shown_or_unmapped() {
         0
     );
     let events = harness.sync();
-    assert_eq!(feedback_outcome(&events, unmapped)[0].0, 2, "{events:?}");
+    assert_eq!(feedback_opcodes(&events, unmapped), [2], "{events:?}");
+}
+
+/// A pending commit whose surface the renderer can no longer present, and
+/// did not list, is discarded by the next report's sweep.
+#[test]
+fn presentation_sweep_discards_unlisted_surfaces_that_cannot_be_presented() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let pending = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // Still presentable and unlisted: in flight, kept.
+    let (frame, _) = test_frame_report(id, 1, 0, true);
+    harness
+        .server
+        .state
+        .frame_presented(frame.clone(), presentation::FrameContent::default());
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // No longer presentable (flip the record the way a protocol path would
+    // without passing a discard edge): the sweep resolves it.
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&object)
+        .unwrap()
+        .mapped = false;
+    harness
+        .server
+        .state
+        .frame_presented(frame, presentation::FrameContent::default());
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, pending), [2], "{events:?}");
+}
+
+/// A buffer the commit path counted but never published (here: the client
+/// vanished mid-import, a test hook) is not content: its feedback is
+/// discarded at once and the content sequence does not move. A buffer the
+/// renderer refuses later is discarded when it says so.
+#[test]
+fn presentation_feedback_of_refused_buffers_is_discarded() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let before = content_seq(&harness, &object);
+    let count_before = harness.server.state.surfaces[&object].commit_count;
+
+    harness.server.state.release_use_force_client_missing = true;
+    let refused = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    assert!(harness.server.state.surfaces[&object].commit_count > count_before);
+    assert_eq!(content_seq(&harness, &object), before);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, refused), [2], "{events:?}");
+
+    // Render-side refusal, directly and through a frame report.
+    let direct = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    assert!(seq > before);
+    let kept = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    harness.server.state.commit_refused(id, seq);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, direct), [2], "{events:?}");
+    assert!(
+        feedback_opcodes(&events, kept).is_empty(),
+        "a later commit keeps waiting"
+    );
+
+    let reported = content_seq(&harness, &object);
+    let (frame, mut content) = test_frame_report(id, 9, 0, false);
+    content.surfaces.clear();
+    content.refused.push((id, reported));
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, kept), [2], "{events:?}");
+}
+
+/// A role change (the xdg_toplevel is destroyed) discards what waits.
+#[test]
+fn presentation_feedback_is_discarded_on_role_change() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let pending = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the role");
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, pending), [2], "{events:?}");
+}
+
+/// A rebuilt upsert (relayout or dirty recovery) carries the sequence of the
+/// content it rebuilds from, not of a refused commit.
+#[test]
+fn rebuilt_upserts_carry_the_published_content_sequence() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let published = content_seq(&harness, &object);
+    harness.server.state.release_use_force_client_missing = true;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    assert!(harness.server.state.surfaces[&object].commit_count > published);
+    let LatestSurfaceUpsert::Ready(event) = harness.server.state.latest_surface_upsert(id) else {
+        panic!("a mapped surface rebuilds an upsert");
+    };
+    let ProtocolEvent::SurfaceUpserted { scene, frame, .. } = *event else {
+        panic!("an upsert");
+    };
+    assert_eq!(scene.commit_seq, published);
+    if let SurfaceFrame::Dmabuf(frame) = frame {
+        harness.server.state.release_buffer_token(frame.token);
+    }
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+}
+
+/// A synchronised subsurface's commit is applied (and its feedback taken)
+/// only when the parent commits.
+#[test]
+fn synchronised_subsurface_feedback_is_taken_when_the_parent_applies() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let callback = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    harness.dispatch_client();
+    harness.assert_client_connected("after the cached child commit");
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        0,
+        "a synchronised child's commit is cached until its parent commits"
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        1
+    );
+    let seq = content_seq(&harness, &child.id());
+    let (frame, content) = test_frame_report(child_id, 42, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, callback), [1], "{events:?}");
 }
 
 /// The XWayland runtime switch as a props leaf: set round-trip, changed

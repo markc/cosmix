@@ -6,6 +6,12 @@
 //! resolution rules are tested without a Wayland client. `WaylandState`
 //! glue (take at commit, report handling, lifecycle discards) lives at the
 //! bottom of this file.
+//!
+//! Sequencing: a surface's `content_seq` advances only when the protocol
+//! thread publishes a new buffer to the renderer, and the renderer reports
+//! the `content_seq` each frame actually sampled. A commit's feedback is
+//! presented only by a frame that sampled exactly that commit's content;
+//! older commits it superseded are discarded.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -13,7 +19,7 @@ use std::time::Duration;
 use super::*;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::wayland::presentation::{
-    PresentationFeedbackCachedState, PresentationFeedbackCallback, Refresh,
+    PresentationFeedbackCachedState, PresentationFeedbackCallback, PresentationState, Refresh,
 };
 
 /// At most this many commits per surface wait for a presented frame. A
@@ -25,7 +31,9 @@ pub(crate) const MAX_PENDING_COMMITS: usize = 8;
 /// without resolving it would leave a client waiting forever, so every
 /// path out of the ledger calls exactly one of `presented`/`discarded`.
 pub(crate) trait Feedback {
-    fn presented(self, frame: &PresentedFrame);
+    /// Returns whether the feedback was actually sent as presented (a frame
+    /// without a nameable output can only be sent as discarded).
+    fn presented(self, frame: &PresentedFrame) -> bool;
     fn discarded(self);
 }
 
@@ -41,19 +49,25 @@ pub(crate) struct PresentedFrame {
 }
 
 impl Feedback for PresentationFeedbackCallback {
-    fn presented(self, frame: &PresentedFrame) {
+    fn presented(self, frame: &PresentedFrame) -> bool {
         match &frame.output {
-            Some(output) => PresentationFeedbackCallback::presented(
-                self,
-                output,
-                frame.time,
-                frame.refresh,
-                frame.seq,
-                frame.flags,
-            ),
+            Some(output) => {
+                PresentationFeedbackCallback::presented(
+                    self,
+                    output,
+                    frame.time,
+                    frame.refresh,
+                    frame.seq,
+                    frame.flags,
+                );
+                true
+            }
             // `presented` must name an output; without one the honest
             // answer is that the update was not shown anywhere we can name.
-            None => PresentationFeedbackCallback::discarded(self),
+            None => {
+                PresentationFeedbackCallback::discarded(self);
+                false
+            }
         }
     }
 
@@ -68,6 +82,13 @@ pub(crate) struct PresentationCounters {
     pub(crate) presented: u64,
     pub(crate) discarded: u64,
     pub(crate) last_presented_us: Option<u64>,
+}
+
+/// What one ledger operation resolved: `(commit seq, callbacks)`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Resolution {
+    pub(crate) presented: Option<(u64, usize)>,
+    pub(crate) discarded: Vec<(u64, usize)>,
 }
 
 struct PendingCommit<F> {
@@ -90,98 +111,140 @@ impl<F: Feedback> Default for PresentationLedger<F> {
     }
 }
 
+fn discard_entry<F: Feedback>(
+    entry: PendingCommit<F>,
+    counters: &mut PresentationCounters,
+    resolution: &mut Resolution,
+) {
+    let count = entry.callbacks.len();
+    for callback in entry.callbacks {
+        callback.discarded();
+    }
+    counters.discarded += count as u64;
+    if count > 0 {
+        resolution.discarded.push((entry.seq, count));
+    }
+}
+
 impl<F: Feedback> PresentationLedger<F> {
     /// Record the callbacks of one applied commit. `seq` is the surface's
     /// content sequence after the commit (a commit without a new buffer
-    /// carries the sequence of the content it leaves on screen).
-    pub(crate) fn take_on_commit(&mut self, id: SurfaceId, seq: u64, callbacks: Vec<F>) {
+    /// carries the sequence of the content it leaves on screen). Returns
+    /// what the per-surface cap pushed out.
+    pub(crate) fn take_on_commit(
+        &mut self,
+        id: SurfaceId,
+        seq: u64,
+        callbacks: Vec<F>,
+    ) -> Resolution {
+        let mut resolution = Resolution::default();
         if callbacks.is_empty() {
-            return;
+            return resolution;
         }
         let queue = self.pending.entry(id).or_default();
         match queue.back_mut() {
             Some(last) if last.seq == seq => last.callbacks.extend(callbacks),
             _ => queue.push_back(PendingCommit { seq, callbacks }),
         }
+        let counters = self.counters.entry(id).or_default();
         while queue.len() > MAX_PENDING_COMMITS {
             if let Some(oldest) = queue.pop_front() {
-                let counters = self.counters.entry(id).or_default();
-                for callback in oldest.callbacks {
-                    counters.discarded += 1;
-                    callback.discarded();
-                }
+                discard_entry(oldest, counters, &mut resolution);
             }
         }
+        resolution
     }
 
-    /// Apply one renderer report for one surface. With `shown`, the newest
-    /// commit at or below `commit_seq` is presented and older ones were
-    /// superseded; without it, everything at or below `commit_seq` was not
-    /// seen. Commits above `commit_seq` keep waiting.
+    /// Apply one renderer report for one surface. With `shown`, commits
+    /// below `commit_seq` were superseded before any frame showed them and
+    /// are discarded, and the commit at exactly `commit_seq` is presented.
+    /// Without it, everything at or below `commit_seq` was not seen.
+    /// Commits above `commit_seq` keep waiting.
     pub(crate) fn resolve(
         &mut self,
         id: SurfaceId,
         commit_seq: u64,
         shown: bool,
         frame: &PresentedFrame,
-    ) -> usize {
+    ) -> Resolution {
+        let mut resolution = Resolution::default();
         let Some(queue) = self.pending.get_mut(&id) else {
-            return 0;
+            return resolution;
         };
         let ready = queue
             .iter()
             .take_while(|entry| entry.seq <= commit_seq)
             .count();
         if ready == 0 {
-            return 0;
+            return resolution;
         }
         let resolved = queue.drain(..ready).collect::<Vec<_>>();
         if queue.is_empty() {
             self.pending.remove(&id);
         }
         let counters = self.counters.entry(id).or_default();
-        let mut presented = 0;
-        let last = resolved.len() - 1;
-        for (index, entry) in resolved.into_iter().enumerate() {
-            let present = shown && index == last;
+        for entry in resolved {
+            if !(shown && entry.seq == commit_seq) {
+                discard_entry(entry, counters, &mut resolution);
+                continue;
+            }
+            let count = entry.callbacks.len();
+            let mut sent = 0;
             for callback in entry.callbacks {
-                if present {
-                    counters.presented += 1;
-                    presented += 1;
-                    callback.presented(frame);
-                } else {
-                    counters.discarded += 1;
-                    callback.discarded();
+                if callback.presented(frame) {
+                    sent += 1;
                 }
             }
-            if present {
+            counters.presented += sent as u64;
+            counters.discarded += (count - sent) as u64;
+            if sent > 0 {
                 counters.last_presented_us = u64::try_from(frame.time.as_micros()).ok();
+                resolution.presented = Some((entry.seq, sent));
+            }
+            if sent < count {
+                resolution.discarded.push((entry.seq, count - sent));
             }
         }
-        presented
+        resolution
     }
 
-    /// Unmap, minimise, destroy, role change or lock: nothing pending for
-    /// this surface can be shown as the content it was committed as.
-    pub(crate) fn discard_surface(&mut self, id: SurfaceId) -> usize {
-        let Some(queue) = self.pending.remove(&id) else {
-            return 0;
+    /// The renderer refused this commit's buffer: its feedback (and that of
+    /// bufferless commits that inherited its sequence) is never shown.
+    pub(crate) fn discard_commit(&mut self, id: SurfaceId, seq: u64) -> Resolution {
+        let mut resolution = Resolution::default();
+        let Some(queue) = self.pending.get_mut(&id) else {
+            return resolution;
         };
         let counters = self.counters.entry(id).or_default();
-        let mut discarded = 0;
-        for entry in queue {
-            for callback in entry.callbacks {
-                counters.discarded += 1;
-                discarded += 1;
-                callback.discarded();
-            }
+        let (refused, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(queue)
+            .into_iter()
+            .partition(|entry| entry.seq == seq);
+        *queue = kept;
+        for entry in refused {
+            discard_entry(entry, counters, &mut resolution);
         }
-        discarded
+        if queue.is_empty() {
+            self.pending.remove(&id);
+        }
+        resolution
+    }
+
+    /// Unmap, minimise, destroy, role change: nothing pending for this
+    /// surface can be shown as the content it was committed as.
+    pub(crate) fn discard_surface(&mut self, id: SurfaceId) -> Resolution {
+        let mut resolution = Resolution::default();
+        let Some(queue) = self.pending.remove(&id) else {
+            return resolution;
+        };
+        let counters = self.counters.entry(id).or_default();
+        for entry in queue {
+            discard_entry(entry, counters, &mut resolution);
+        }
+        resolution
     }
 
     /// The surface is gone for good: drop its counters too.
-    pub(crate) fn forget_surface(&mut self, id: SurfaceId) {
-        self.discard_surface(id);
+    pub(crate) fn forget_counters(&mut self, id: SurfaceId) {
         self.counters.remove(&id);
     }
 
@@ -232,9 +295,10 @@ pub(crate) struct FrameSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameSurface {
     pub(crate) id: SurfaceId,
-    /// The newest commit whose content the frame could have shown.
+    /// With `shown`: the content sequence this frame sampled. Without it:
+    /// everything at or below this sequence was not seen.
     pub(crate) commit_seq: u64,
-    /// Visible on this output with its texture prepared.
+    /// Visible, on the output, and sampling that commit's content.
     pub(crate) shown: bool,
 }
 
@@ -243,6 +307,9 @@ pub(crate) struct FrameSurface {
 pub(crate) struct FrameContent {
     pub(crate) surfaces: Vec<FrameSurface>,
     pub(crate) sources: Vec<FrameSource>,
+    /// Commits whose buffer the renderer failed to import after accepting
+    /// them: `(surface, content sequence)`.
+    pub(crate) refused: Vec<(SurfaceId, u64)>,
 }
 
 /// Accounting for one registered content source.
@@ -264,28 +331,30 @@ pub(crate) struct SourceCounters {
 #[derive(Default)]
 pub(crate) struct SourceLedger {
     sources: HashMap<String, SourceCounters>,
-    registrations: HashMap<String, u64>,
+    /// One counter for every registration of any id: a registration number
+    /// never repeats, so it fences a stale request without per-id history.
+    registrations: u64,
 }
 
 impl SourceLedger {
-    /// Returns the new registration counter for this id.
+    /// Returns the new registration number.
     pub(crate) fn register(&mut self, id: &str) -> u64 {
-        let registration = self.registrations.entry(id.to_string()).or_default();
-        *registration += 1;
-        let registration = *registration;
+        self.registrations += 1;
         self.sources.insert(
             id.to_string(),
             SourceCounters {
-                registration,
+                registration: self.registrations,
                 ..SourceCounters::default()
             },
         );
-        registration
+        self.registrations
     }
 
-    /// Revisions never shown before unregistering count as discarded.
-    pub(crate) fn unregister(&mut self, id: &str) -> Option<SourceCounters> {
+    /// `revision` is the newest revision the plugin wrote, reported or not;
+    /// every revision after the last presented one counts as discarded.
+    pub(crate) fn unregister(&mut self, id: &str, revision: u64) -> Option<SourceCounters> {
         let mut counters = self.sources.remove(id)?;
+        counters.revision = counters.revision.max(revision);
         counters.discarded += counters
             .revision
             .saturating_sub(counters.last_presented_revision);
@@ -315,27 +384,69 @@ impl SourceLedger {
     pub(crate) fn get(&self, id: &str) -> Option<&SourceCounters> {
         self.sources.get(id)
     }
+
+    // Read by the tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn len(&self) -> usize {
+        self.sources.len()
+    }
 }
 
 /// Protocol-thread state for `wp_presentation`.
+#[derive(Default)]
 pub(crate) struct PresentationRuntime {
-    /// `None` on a backend that cannot report presented frames yet: the
-    /// global is not advertised there, so no client waits on it.
-    pub(crate) _global: Option<smithay::wayland::presentation::PresentationState>,
+    /// Created only once a backend has wired a frame reporter
+    /// ([`WaylandState::enable_presentation`]), so no client can wait on
+    /// feedback nothing will ever resolve.
+    global: Option<PresentationState>,
     pub(crate) ledger: PresentationLedger<PresentationFeedbackCallback>,
     pub(crate) sources: SourceLedger,
     /// Surfaces committed in the transaction being applied, with what the
     /// commit path needs to judge whether the commit became content.
-    pub(crate) applied_commits: Vec<AppliedCommit>,
+    applied_commits: Vec<AppliedCommit>,
 }
 
-pub(crate) struct AppliedCommit {
+struct AppliedCommit {
     surface: WlSurface,
     buffer_attached: bool,
-    commit_count_before: Option<u64>,
+    content_seq_before: Option<u64>,
+}
+
+/// `frame_trace` reason codes (the `aux` field of
+/// `comp_presentation_discarded`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DiscardReason {
+    Unmap = 1,
+    Minimize = 2,
+    Destroy = 3,
+    Role = 4,
+    Superseded = 5,
+    NotPresentable = 6,
+    Refused = 7,
+    Overflow = 8,
+    NoFrame = 9,
+}
+
+fn trace_discards(id: SurfaceId, resolution: &Resolution, reason: DiscardReason) {
+    for (seq, _) in &resolution.discarded {
+        crate::frame_trace::event("comp_presentation_discarded", || {
+            (id.0, *seq, reason as u64)
+        });
+    }
 }
 
 impl WaylandState {
+    /// Advertise `wp_presentation`. Called when a backend's frame reporter
+    /// is wired; idempotent.
+    pub(crate) fn enable_presentation(&mut self) {
+        if self.presentation.global.is_none() {
+            self.presentation.global = Some(PresentationState::new::<WaylandState>(
+                &self.display_handle,
+                libc::CLOCK_MONOTONIC as u32,
+            ));
+        }
+    }
+
     /// First thing in the commit hook, before the commit path consumes the
     /// buffer: remember what this commit tried to do.
     pub(super) fn note_presentation_commit(&mut self, surface: &WlSurface) {
@@ -349,26 +460,27 @@ impl WaylandState {
                 Some(BufferAssignment::NewBuffer(_))
             )
         });
-        let commit_count_before = self
+        let content_seq_before = self
             .surfaces
             .get(&surface.id())
-            .map(|record| record.commit_count);
+            .map(|record| record.content_seq);
         self.presentation.applied_commits.push(AppliedCommit {
             surface: surface.clone(),
             buffer_attached,
-            commit_count_before,
+            content_seq_before,
         });
     }
 
-    /// After every surface in a transaction has applied (synchronised
-    /// subsurfaces included): take each commit's feedback into the ledger.
+    /// After every surface in a transaction has applied (Smithay runs every
+    /// surface's commit hook, synchronised subsurfaces included, before
+    /// `transaction_applied`): take each commit's feedback into the ledger.
     pub(super) fn take_presentation_commits(&mut self) {
         for commit in mem::take(&mut self.presentation.applied_commits) {
             if commit.surface.is_alive() {
                 self.take_presentation_feedback(
                     &commit.surface,
                     commit.buffer_attached,
-                    commit.commit_count_before,
+                    commit.content_seq_before,
                 );
             }
         }
@@ -381,7 +493,7 @@ impl WaylandState {
         &mut self,
         surface: &WlSurface,
         buffer_attached: bool,
-        commit_count_before: Option<u64>,
+        content_seq_before: Option<u64>,
     ) {
         let callbacks = compositor::with_states(surface, |states| {
             mem::take(
@@ -399,39 +511,55 @@ impl WaylandState {
             .surfaces
             .get(&surface.id())
             .filter(|record| !matches!(record.role, SurfaceRole::Dormant(_)));
+        // A commit becomes content only when it is mapped and, if it
+        // attached a buffer, that buffer was published to the renderer
+        // (`content_seq` advanced). Everything else (no scene record, a
+        // cursor, a buffer retired before its configure ack or refused by
+        // the commit path, an X11 surface before its map) is discarded now.
         let accepted = record.filter(|record| {
-            // A new buffer the commit path refused (retired before a configure
-            // ack, rejected import) never became content.
-            !buffer_attached
-                || commit_count_before.is_some_and(|before| record.commit_count > before)
+            record.mapped
+                && (!buffer_attached
+                    || content_seq_before.is_some_and(|before| record.content_seq > before))
         });
         let Some(record) = accepted else {
+            let (id, seq) =
+                record.map_or((SurfaceId(0), 0), |record| (record.id, record.content_seq));
+            let count = callbacks.len();
             for callback in callbacks {
                 callback.discarded();
+            }
+            if count > 0 {
+                crate::frame_trace::event("comp_presentation_discarded", || {
+                    (id.0, seq, DiscardReason::Refused as u64)
+                });
             }
             return;
         };
-        let (id, seq) = (record.id, record.commit_count);
-        if record.mapped {
-            self.presentation.ledger.take_on_commit(id, seq, callbacks);
-        } else {
-            for callback in callbacks {
-                callback.discarded();
-            }
-        }
+        let (id, seq) = (record.id, record.content_seq);
+        let overflow = self.presentation.ledger.take_on_commit(id, seq, callbacks);
+        trace_discards(id, &overflow, DiscardReason::Overflow);
     }
 
     /// A lifecycle edge after which nothing pending can be shown as
     /// committed.
-    pub(super) fn discard_presentation_feedback(&mut self, id: SurfaceId, reason: &'static str) {
-        let discarded = self.presentation.ledger.discard_surface(id);
-        if discarded > 0 {
-            crate::frame_trace::event("comp_presentation_discarded", || {
-                (id.0, 0, discard_reason_code(reason))
-            });
-        }
+    pub(super) fn discard_presentation_feedback(&mut self, id: SurfaceId, reason: DiscardReason) {
+        let resolution = self.presentation.ledger.discard_surface(id);
+        trace_discards(id, &resolution, reason);
     }
 
+    /// The surface is destroyed: discard what waits, then drop its counters.
+    pub(super) fn forget_presentation_surface(&mut self, id: SurfaceId) {
+        self.discard_presentation_feedback(id, DiscardReason::Destroy);
+        self.presentation.ledger.forget_counters(id);
+    }
+
+    pub(super) fn commit_refused(&mut self, id: SurfaceId, seq: u64) {
+        let resolution = self.presentation.ledger.discard_commit(id, seq);
+        trace_discards(id, &resolution, DiscardReason::Refused);
+    }
+
+    /// Session lock needs no discard of its own: a report during the lock
+    /// treats every surface the lock hides as not shown.
     pub(super) fn frame_presented(&mut self, frame: PresentedFrame, content: FrameContent) {
         let frame = PresentedFrame {
             output: frame.output.or_else(|| self.backend.default_output()),
@@ -439,6 +567,9 @@ impl WaylandState {
         };
         let lock_active = self.session_lock_active();
         let time_us = u64::try_from(frame.time.as_micros()).unwrap_or(u64::MAX);
+        for (id, seq) in &content.refused {
+            self.commit_refused(*id, *seq);
+        }
         let mut reported = HashSet::new();
         for surface in &content.surfaces {
             reported.insert(surface.id);
@@ -451,17 +582,23 @@ impl WaylandState {
                         && !record.minimized
                         && (!lock_active || self.surface_is_session_presentable(record))
                 });
-            let presented = self.presentation.ledger.resolve(
-                surface.id,
-                surface.commit_seq,
-                surface.shown && presentable,
-                &frame,
-            );
-            if presented > 0 {
-                crate::frame_trace::event("comp_presented", || {
-                    (surface.id.0, surface.commit_seq, time_us)
-                });
+            let shown = surface.shown && presentable;
+            let resolution =
+                self.presentation
+                    .ledger
+                    .resolve(surface.id, surface.commit_seq, shown, &frame);
+            if let Some((seq, _)) = resolution.presented {
+                crate::frame_trace::event("comp_presented", || (surface.id.0, seq, time_us));
             }
+            trace_discards(
+                surface.id,
+                &resolution,
+                if shown {
+                    DiscardReason::Superseded
+                } else {
+                    DiscardReason::NoFrame
+                },
+            );
         }
         // A surface the renderer did not list and can never present will not
         // be listed later either; one it can present is still in flight.
@@ -475,7 +612,7 @@ impl WaylandState {
                 .and_then(|object| self.surfaces.get(object))
                 .is_some_and(|record| self.surface_is_renderer_presentable(record));
             if !presentable {
-                self.discard_presentation_feedback(id, "not_presentable");
+                self.discard_presentation_feedback(id, DiscardReason::NotPresentable);
             }
         }
         for source in &content.sources {
@@ -488,8 +625,8 @@ impl WaylandState {
         tracing::debug!(source = id, registration, "content source registered");
     }
 
-    pub(super) fn content_source_unregistered(&mut self, id: &str) {
-        if let Some(counters) = self.presentation.sources.unregister(id) {
+    pub(super) fn content_source_unregistered(&mut self, id: &str, revision: u64) {
+        if let Some(counters) = self.presentation.sources.unregister(id, revision) {
             tracing::debug!(
                 source = id,
                 presented = counters.presented,
@@ -497,18 +634,6 @@ impl WaylandState {
                 "content source unregistered"
             );
         }
-    }
-}
-
-fn discard_reason_code(reason: &'static str) -> u64 {
-    match reason {
-        "unmap" => 1,
-        "minimize" => 2,
-        "destroy" => 3,
-        "role" => 4,
-        "lock" => 5,
-        "not_presentable" => 6,
-        _ => 0,
     }
 }
 

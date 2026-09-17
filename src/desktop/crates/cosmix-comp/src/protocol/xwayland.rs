@@ -1908,6 +1908,7 @@ impl WaylandState {
                     window_origin: origin,
                     configured_size,
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,

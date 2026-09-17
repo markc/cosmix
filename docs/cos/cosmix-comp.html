@@ -940,35 +940,58 @@ clients.</p>
 <tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode only for now (see Presentation feedback below); the KMS backend does not advertise it until it reports page flips.</td></tr>
 </tbody></table>
 <h3 id="presentation-feedback">Presentation feedback</h3>
-<p><code>wp_presentation</code> reports when a client's commit was actually shown.</p>
+<p><code>wp_presentation</code> reports when a client's commit was actually shown. The
+global is advertised only once a backend has wired a frame reporter, so no
+client waits on feedback nothing will resolve.</p>
 <ul>
 <li><strong>Clock:</strong> CLOCK_MONOTONIC (<code>clock_id</code> 1), the same clock <code>frame_trace</code>
 uses.</li>
 <li><strong>Which commit a frame showed:</strong> feedback is taken when the commit is
 applied, so a later commit cannot discard it while the earlier one is still
-on its way to the screen. A presented frame reports, per surface, the newest
-commit whose texture was ready and whether the surface was visible. The
-newest waiting commit at or below that is <code>presented</code>, older ones are
-<code>discarded</code> (superseded), newer ones keep waiting. A commit without a new
-buffer is presented with the content it left on screen.</li>
-<li><strong>Discarded without a frame:</strong> unmap, minimise, destroy, a new role, or a
-surface that can no longer be drawn. At most 8 commits per surface wait; a
-faster client loses the oldest as <code>discarded</code>.</li>
+on its way to the screen. Every new buffer the compositor hands to the
+renderer gets a content sequence number, and a presented frame reports, per
+surface, the sequence it actually sampled. Feedback for exactly that commit
+is <code>presented</code>. Commits older than it were replaced before any frame showed
+them, so they are <code>discarded</code>. Newer commits keep waiting. A commit without
+a new buffer carries the sequence of the content it leaves on screen, so it
+is presented with the next frame that shows that content.</li>
+<li><strong>What "shown" means:</strong> the surface is mapped and visible, lies at least
+partly on the output, and the frame samples that commit's texture.
+Occlusion by other windows is not checked, so a fully covered window still
+counts as shown.</li>
+<li><strong>Discarded without a frame:</strong> unmap, minimise, destroy, a new role, a
+buffer the compositor or renderer refused, a surface that can no longer be
+drawn, and commits made before the surface was mapped (including an X11
+window's commits before its map). A session lock needs no extra step: while
+locked, every frame treats the surfaces the lock hides as not shown. At most
+8 commits per surface wait; a faster client loses the oldest as <code>discarded</code>.</li>
 <li><strong>Nested backend:</strong> the host compositor gives no presentation timing, so
 <code>tv</code> is CLOCK_MONOTONIC when the frame was handed to the host (not first
 photon), <code>flags</code> is 0, <code>seq</code> is 0 and <code>refresh</code> is 0 (unknown). It is
 reported only after the swapchain image was actually presented.</li>
 <li><strong>KMS backend:</strong> not advertised yet. It will report the page-flip time,
 vblank sequence and the flags the kernel proves.</li>
-<li><strong>DMA-BUF clients:</strong> a frame counts a surface as shown when its GPU image
-is prepared; comp does not yet prove that an asynchronously imported
-DMA-BUF replacement had landed in that frame.</li>
+<li><strong>SHM clients:</strong> a surface counts as sampling its newest buffer once the
+GPU image is prepared. Bevy drops the old GPU image while a replacement is
+pending, so a pending upload is reported as not shown rather than stale.</li>
+<li><strong>DMA-BUF clients:</strong> the import bridge replaces images in place and keeps
+the previous texture while a replacement is pending or after it failed.
+A frame therefore counts a commit as shown only when the bridge reports
+that commit's import as the installed one. A failed import is <code>discarded</code>,
+never presented.</li>
 </ul>
 <p>In-process scene content (a Bevy plugin inside comp, not a Wayland client)
 can be measured the same way: the plugin puts a <code>ContentSource</code> component on
 its root entity and bumps <code>ContentSourceFrame.revision</code> for every content
 update. Revisions shown in a presented frame count as presented, skipped ones
-as discarded. The Bus stats surface for these counters is not published yet.</p>
+as discarded, and upload/damage costs are carried until a presented frame
+reports them. Changing the id (re-inserting the component) re-registers the
+source; a refused duplicate takes over the id when its holder goes.</p>
+<p>Not in this release yet (planned with the stats surface): the Bus stats
+leaves and <code>comp.window.stats</code>, per-window interval rings, percentiles, the
+missed-frame rule and input-to-present marks, per-output source accounting
+(<code>ContentSource.output</code> is accepted but not used), and the content-source
+probe gate.</p>
 <h2 id="xwayland">XWayland</h2>
 <p>The <code>xwayland</code> cargo feature is in the default set: every default build
 supervises one rootless Xwayland instance and acts as its X11 window

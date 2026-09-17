@@ -213,6 +213,7 @@ impl CompositorHandler for WaylandState {
                     window_origin: (x, y),
                     configured_size: (1, 1),
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,
@@ -554,7 +555,7 @@ impl CompositorHandler for WaylandState {
                     self.release_buffer_token(released_dmabuf_token);
                 }
                 if let Some(id) = unmapped_id {
-                    self.discard_presentation_feedback(id, "unmap");
+                    self.discard_presentation_feedback(id, presentation::DiscardReason::Unmap);
                     self.close_foreign_toplevel(surface);
                     self.cancel_chrome_pointer_grab_for_surface(surface, false);
                     self.reset_chrome_pointer_tracking(&surface.id());
@@ -716,7 +717,7 @@ impl CompositorHandler for WaylandState {
         self.remove_subsurface_topology(surface);
         self.destroy_cursor_surface(surface);
         if let Some(id) = self.surfaces.get(&surface.id()).map(|record| record.id) {
-            self.presentation.ledger.forget_surface(id);
+            self.forget_presentation_surface(id);
         }
         self.destroy_surface_record(surface);
         if let Some(former_root) = former_root {
@@ -838,6 +839,7 @@ impl WlrLayerShellHandler for WaylandState {
                     window_origin: (layout.x, layout.y),
                     configured_size: (1, 1),
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,
@@ -1047,6 +1049,7 @@ impl XdgShellHandler for WaylandState {
                     window_origin: (layout.x, layout.y),
                     configured_size,
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,
@@ -1270,6 +1273,7 @@ impl XdgShellHandler for WaylandState {
                     window_origin,
                     configured_size: (geometry.size.w, geometry.size.h),
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,
@@ -1782,6 +1786,7 @@ impl SessionLockHandler for WaylandState {
                     window_origin: (layout.x, layout.y),
                     configured_size: (width as i32, height as i32),
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,
@@ -2276,6 +2281,7 @@ impl InputMethodHandler for WaylandState {
                 window_origin: (layout.x, layout.y),
                 configured_size: (1, 1),
                 commit_count: 0,
+                content_seq: 0,
                 shm_backing: None,
                 dmabuf_backing: None,
                 buffer_dimensions: None,

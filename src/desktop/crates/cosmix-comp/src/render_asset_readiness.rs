@@ -339,6 +339,40 @@ mod tests {
         );
     }
 
+    /// Pins the Bevy 0.19 behaviour `frame_content` relies on: extracting a
+    /// new value for a prepared asset removes the old GPU value before the
+    /// new one is ready, so a deferred replacement is not drawn stale.
+    #[test]
+    fn bevy_removes_the_previous_gpu_value_before_a_deferred_replacement() {
+        let mut world = world();
+        let id = AssetId::default();
+        extract(&mut world, id, 0, 1);
+        prepare(&mut world);
+        assert_eq!(
+            world
+                .resource::<RenderAssets<Prepared>>()
+                .get(id)
+                .unwrap()
+                .0,
+            1
+        );
+        extract(&mut world, id, 1, 2);
+        prepare(&mut world);
+        assert!(
+            world.resource::<RenderAssets<Prepared>>().get(id).is_none(),
+            "the stale value must not stay drawable while the new one is pending"
+        );
+        prepare(&mut world);
+        assert_eq!(
+            world
+                .resource::<RenderAssets<Prepared>>()
+                .get(id)
+                .unwrap()
+                .0,
+            2
+        );
+    }
+
     #[test]
     fn observation_does_not_drain_extraction_and_removal_cancels_retry() {
         let mut world = world();

@@ -1,7 +1,7 @@
 //! Shared protocol-event to Bevy scene projection.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex},
 };
 
@@ -513,13 +513,25 @@ pub(crate) struct SurfaceEntity {
     pub(crate) material: Handle<ClientSurfaceMaterial>,
     pub(crate) renderer_z: f32,
     pub(crate) decoration: Option<DecorationEntities>,
-    /// The protocol commit whose buffer this entity's image now holds.
+    /// The newest protocol commit whose buffer was handed to this entity's
+    /// image (for DMA-BUF: requested, not necessarily installed yet).
     pub(crate) applied_commit: u64,
+    /// DMA-BUF only: `(import request, commit)` for recent replacements, so
+    /// the render world can name the commit the installed texture carries.
+    dmabuf_requests: VecDeque<(u64, u64)>,
 }
+
+/// Enough history to name any texture the bridge can still be sampling
+/// (it keeps at most the previous one while a replacement is pending).
+const DMABUF_REQUEST_HISTORY: usize = 8;
 
 impl SurfaceEntity {
     pub(crate) fn image_id(&self) -> bevy::asset::AssetId<Image> {
         self.image.id()
+    }
+
+    pub(crate) fn dmabuf_requests(&self) -> Option<&VecDeque<(u64, u64)>> {
+        (self.buffer_kind == SurfaceBufferKind::Dmabuf).then_some(&self.dmabuf_requests)
     }
 }
 
@@ -1517,6 +1529,9 @@ fn upsert_client_cursor(
                 };
                 match imported {
                     Ok(image) => {
+                        dmabuf_request = importer
+                            .progress(image.id())
+                            .map(|progress| progress.latest);
                         set_client_image_linear(world, &image);
                         (
                             ClientSurfaceImage::encoded_premultiplied_unorm(image),
@@ -2398,14 +2413,17 @@ fn upsert_surface_snapshot(
 ) -> bool {
     let layout = scene.layout;
     let kind = scene.kind;
+    let scene_commit = scene.commit_seq;
     let existing = world
         .resource::<SurfaceEntities>()
         .surfaces
         .get(&id)
         .map(|surface| (surface.entity, surface.image.clone(), surface.buffer_kind));
     // Only an applied buffer advances the content commit; a rejected
-    // DMA-BUF leaves the previous content (and its commit) on screen.
+    // DMA-BUF leaves the previous content (and its commit) on screen, and
+    // the protocol thread is told so the commit's feedback is discarded.
     let mut applied = true;
+    let mut dmabuf_request = None;
 
     let z_changed = match frame {
         SurfaceFrame::Shm(frame) => {
@@ -2450,6 +2468,9 @@ fn upsert_surface_snapshot(
                     release,
                 ) {
                     Ok(()) => {
+                        dmabuf_request = importer
+                            .progress(image.handle().id())
+                            .map(|progress| progress.latest);
                         set_client_image_linear(world, image.handle());
                         update_surface_entity(world, id, entity, image, opaque, layout, kind)
                     }
@@ -2472,6 +2493,9 @@ fn upsert_surface_snapshot(
                 };
                 match imported {
                     Ok(image) => {
+                        dmabuf_request = importer
+                            .progress(image.id())
+                            .map(|progress| progress.latest);
                         set_client_image_linear(world, &image);
                         replace_surface_image(
                             world,
@@ -2501,7 +2525,21 @@ fn upsert_surface_snapshot(
         surface.kind = kind;
         if applied {
             surface.applied_commit = surface.applied_commit.max(scene.commit_seq);
+            match dmabuf_request {
+                Some(request) => {
+                    surface
+                        .dmabuf_requests
+                        .push_back((request, scene.commit_seq));
+                    while surface.dmabuf_requests.len() > DMABUF_REQUEST_HISTORY {
+                        surface.dmabuf_requests.pop_front();
+                    }
+                }
+                None => surface.dmabuf_requests.clear(),
+            }
         }
+    }
+    if !applied && let Some(feed) = world.get_resource::<ClientSceneFeed>() {
+        feed.commit_refused(id, scene_commit);
     }
     z_changed
 }
@@ -2594,6 +2632,7 @@ fn replace_surface_image(
             renderer_z: CLIENT_CONTENT_Z_MIN,
             decoration: None,
             applied_commit: 0,
+            dmabuf_requests: VecDeque::new(),
         },
     );
     world
@@ -3934,6 +3973,62 @@ mod tests {
             .send(events)
             .expect("shared scene protocol channel remains connected");
         app.update();
+    }
+
+    /// Through the real extract system: a minimised (hidden) surface and a
+    /// surface entirely off the output are not shown; the commit carried by
+    /// the upsert is the one extracted.
+    #[test]
+    fn frame_content_extract_hides_minimised_and_off_output_surfaces() {
+        let (mut app, sender) = scene_app();
+        app.update();
+        let upsert =
+            |id: u64, layout: SurfaceLayout, commit_seq: u64| ProtocolEvent::SurfaceUpserted {
+                id: SurfaceId(id),
+                scene: SurfaceSceneSnapshot {
+                    commit_seq,
+                    ..scene(layout)
+                },
+                frame: frame(id as u8),
+            };
+        let mut hidden = layout(2);
+        hidden.visible = false;
+        let mut off = layout(3);
+        off.x = 5000.0;
+        publish(
+            &mut app,
+            &sender,
+            vec![
+                upsert(1, layout(1), 3),
+                upsert(2, hidden, 4),
+                upsert(3, off, 5),
+            ],
+        );
+        // This app runs no visibility pass: stand in for it.
+        let entities = app
+            .world()
+            .resource::<SurfaceEntities>()
+            .surfaces
+            .values()
+            .map(|surface| surface.entity)
+            .collect::<Vec<_>>();
+        for entity in entities {
+            *app.world_mut().get_mut::<ViewVisibility>(entity).unwrap() = ViewVisibility::VISIBLE;
+        }
+        assert_eq!(
+            crate::frame_content::extract_for_test(app.world_mut()),
+            [
+                (SurfaceId(1), true, 3),
+                (SurfaceId(2), false, 4),
+                (SurfaceId(3), false, 5)
+            ]
+        );
+        // A later upsert of the same surface advances the extracted commit.
+        publish(&mut app, &sender, vec![upsert(1, layout(1), 7)]);
+        assert_eq!(
+            crate::frame_content::extract_for_test(app.world_mut())[0],
+            (SurfaceId(1), true, 7)
+        );
     }
 
     fn world_position(world: &World, entity: Entity) -> Vec3 {

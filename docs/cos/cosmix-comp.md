@@ -563,35 +563,59 @@ clients.
 
 ### Presentation feedback
 
-`wp_presentation` reports when a client's commit was actually shown.
+`wp_presentation` reports when a client's commit was actually shown. The
+global is advertised only once a backend has wired a frame reporter, so no
+client waits on feedback nothing will resolve.
 
 - **Clock:** CLOCK_MONOTONIC (`clock_id` 1), the same clock `frame_trace`
   uses.
 - **Which commit a frame showed:** feedback is taken when the commit is
   applied, so a later commit cannot discard it while the earlier one is still
-  on its way to the screen. A presented frame reports, per surface, the newest
-  commit whose texture was ready and whether the surface was visible. The
-  newest waiting commit at or below that is `presented`, older ones are
-  `discarded` (superseded), newer ones keep waiting. A commit without a new
-  buffer is presented with the content it left on screen.
-- **Discarded without a frame:** unmap, minimise, destroy, a new role, or a
-  surface that can no longer be drawn. At most 8 commits per surface wait; a
-  faster client loses the oldest as `discarded`.
+  on its way to the screen. Every new buffer the compositor hands to the
+  renderer gets a content sequence number, and a presented frame reports, per
+  surface, the sequence it actually sampled. Feedback for exactly that commit
+  is `presented`. Commits older than it were replaced before any frame showed
+  them, so they are `discarded`. Newer commits keep waiting. A commit without
+  a new buffer carries the sequence of the content it leaves on screen, so it
+  is presented with the next frame that shows that content.
+- **What "shown" means:** the surface is mapped and visible, lies at least
+  partly on the output, and the frame samples that commit's texture.
+  Occlusion by other windows is not checked, so a fully covered window still
+  counts as shown.
+- **Discarded without a frame:** unmap, minimise, destroy, a new role, a
+  buffer the compositor or renderer refused, a surface that can no longer be
+  drawn, and commits made before the surface was mapped (including an X11
+  window's commits before its map). A session lock needs no extra step: while
+  locked, every frame treats the surfaces the lock hides as not shown. At most
+  8 commits per surface wait; a faster client loses the oldest as `discarded`.
 - **Nested backend:** the host compositor gives no presentation timing, so
   `tv` is CLOCK_MONOTONIC when the frame was handed to the host (not first
   photon), `flags` is 0, `seq` is 0 and `refresh` is 0 (unknown). It is
   reported only after the swapchain image was actually presented.
 - **KMS backend:** not advertised yet. It will report the page-flip time,
   vblank sequence and the flags the kernel proves.
-- **DMA-BUF clients:** a frame counts a surface as shown when its GPU image
-  is prepared; comp does not yet prove that an asynchronously imported
-  DMA-BUF replacement had landed in that frame.
+- **SHM clients:** a surface counts as sampling its newest buffer once the
+  GPU image is prepared. Bevy drops the old GPU image while a replacement is
+  pending, so a pending upload is reported as not shown rather than stale.
+- **DMA-BUF clients:** the import bridge replaces images in place and keeps
+  the previous texture while a replacement is pending or after it failed.
+  A frame therefore counts a commit as shown only when the bridge reports
+  that commit's import as the installed one. A failed import is `discarded`,
+  never presented.
 
 In-process scene content (a Bevy plugin inside comp, not a Wayland client)
 can be measured the same way: the plugin puts a `ContentSource` component on
 its root entity and bumps `ContentSourceFrame.revision` for every content
 update. Revisions shown in a presented frame count as presented, skipped ones
-as discarded. The Bus stats surface for these counters is not published yet.
+as discarded, and upload/damage costs are carried until a presented frame
+reports them. Changing the id (re-inserting the component) re-registers the
+source; a refused duplicate takes over the id when its holder goes.
+
+Not in this release yet (planned with the stats surface): the Bus stats
+leaves and `comp.window.stats`, per-window interval rings, percentiles, the
+missed-frame rule and input-to-present marks, per-output source accounting
+(`ContentSource.output` is accepted but not used), and the content-source
+probe gate.
 
 ## XWayland
 
