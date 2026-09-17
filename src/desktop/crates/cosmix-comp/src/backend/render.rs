@@ -9688,7 +9688,7 @@ pub(crate) mod tests {
 
     /// An already-acquired frame whose present ends in `outcome`. Like the
     /// production presenter, only a completed flip leaves a kernel stamp.
-    fn flip_source(handle: u64, outcome: PresentOutcome) -> OutputFrameSource {
+    fn flip_source(handle: u32, outcome: PresentOutcome) -> OutputFrameSource {
         let stamp = Arc::new(Mutex::new(None));
         let flipped = Arc::clone(&stamp);
         let displayed = matches!(outcome, PresentOutcome::Displayed);
@@ -9725,7 +9725,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn written_view(key: &OutputKey, handle: u64) -> ExtractedOutputView {
+    fn written_view(key: &OutputKey, handle: u32) -> ExtractedOutputView {
         ExtractedOutputView {
             key: key.clone(),
             generation: 5,
