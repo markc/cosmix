@@ -113,11 +113,14 @@ pub fn named_font(family: &str) -> Font {
     }
 }
 
+/// CTK design revision, font family and body size bits.
+type LookKey = (Option<u64>, Option<String>, u32);
+
 fn sync_look(
     design: Res<IcedDesign>,
     ctk_design: Option<Res<CtkDesign>>,
     typography: Option<Res<CtkTypography>>,
-    mut last: Local<Option<(Option<u64>, Option<String>, u32)>>,
+    mut last: Local<Option<LookKey>>,
 ) {
     let revision = ctk_design
         .as_ref()
