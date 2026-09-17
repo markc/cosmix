@@ -1,5 +1,6 @@
 //! Check both standalone renderer arms and feature unification with the shipping
-//! shell selection. Run on a worker with the committed lock and cached crates.
+//! shell selection. Uses the committed lock; may fetch crate sources for an arm
+//! the worker has not built yet (forcing offline made the result order-dependent).
 use std::path::Path;
 use std::process::Command;
 
@@ -12,10 +13,9 @@ fn graph(features: Option<&str>, with_shell: bool) -> String {
             command.env_remove(key);
         }
     }
-    command.env("CARGO_NET_OFFLINE", "true").args([
+    command.args([
         "tree",
         "--locked",
-        "--offline",
         "-e",
         "features",
         "--prefix",
