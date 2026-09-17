@@ -825,12 +825,14 @@ fn presented_waits_for_a_frame_of_the_current_mapping() {
     let _feedback = request_presentation_feedback(&mut harness, presentation);
     commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     harness.dispatch_client();
-    let (frame, content) = test_frame_report(surface_id, 1_000_000, content_seq(&harness, &alpha), true);
+    let (frame, content) =
+        test_frame_report(surface_id, monotonic_micros(), content_seq(&harness, &alpha), true);
     harness.server.state.frame_presented(frame, content);
     let presented = wait_for(by_id(id, generation), WaitUntil::Presented, 30);
     let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented.clone(), |_| {});
     assert_eq!(rc, 0, "presented before the remap: {body}");
 
+    let before_remap = monotonic_micros();
     unmap_alpha(&mut harness);
     let mut traffic = harness.sync();
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
@@ -846,6 +848,23 @@ fn presented_waits_for_a_frame_of_the_current_mapping() {
     assert_eq!(rc, 10, "the old frame does not count: {body}");
     assert_eq!(body["error"], "timeout");
 
+    // A late report of a frame shown before this mapping raises the count
+    // but is older than the map: still not presented.
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) =
+        test_frame_report(surface_id, before_remap, content_seq(&harness, &alpha), true);
+    harness.server.state.frame_presented(frame, content);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "a frame older than the map does not count: {body}");
+
     let _feedback = request_presentation_feedback(&mut harness, presentation);
     commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
     harness.dispatch_client();
@@ -856,7 +875,7 @@ fn presented_waits_for_a_frame_of_the_current_mapping() {
         wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
         |harness| {
             let (frame, content) =
-                test_frame_report(surface_id, 2_000_000, content_seq(harness, &alpha), true);
+                test_frame_report(surface_id, monotonic_micros(), content_seq(harness, &alpha), true);
             harness.server.state.frame_presented(frame, content);
         },
     );

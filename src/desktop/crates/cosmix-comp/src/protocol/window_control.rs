@@ -234,13 +234,22 @@ impl WaylandState {
 pub(crate) struct WindowWaiters {
     next: u64,
     pub(super) waiters: BTreeMap<u64, WindowWaiter>,
-    /// `(generation, presented count)` when each window last mapped, so
-    /// `until: presented` means a frame of THIS mapping, not an earlier one
-    /// (the counters live as long as the `wl_surface`).
-    presented_base: HashMap<SurfaceId, (u64, u64)>,
+    /// When each window last mapped: its generation, presented count and
+    /// CLOCK_MONOTONIC time. `until: presented` needs a newer frame that was
+    /// shown at or after that time, so neither an earlier mapping's count
+    /// (the counters live as long as the `wl_surface`) nor a late report of a
+    /// pre-hide frame satisfies it.
+    presented_base: HashMap<SurfaceId, MappingBase>,
 }
 
 const MAX_PRESENTED_BASES: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct MappingBase {
+    generation: u64,
+    presented: u64,
+    mapped_at_us: u64,
+}
 
 pub(super) struct WindowWaiter {
     kind: WaiterKind,
@@ -486,18 +495,28 @@ impl WaylandState {
         if bases.len() >= MAX_PRESENTED_BASES {
             bases.retain(|id, _| objects.contains_key(id));
         }
-        bases.insert(id, (generation, count));
+        bases.insert(
+            id,
+            MappingBase {
+                generation,
+                presented: count,
+                mapped_at_us: monotonic_micros(),
+            },
+        );
     }
 
     fn presented_since_map(&self, record: &SurfaceRecord) -> bool {
-        let count = self.presentation.ledger.counters(record.id).presented;
-        let base = self
+        let counters = self.presentation.ledger.counters(record.id);
+        let (base, mapped_at_us) = self
             .window_waiters
             .presented_base
             .get(&record.id)
-            .filter(|(generation, _)| *generation == record.generation)
-            .map_or(0, |(_, base)| *base);
-        count > base
+            .filter(|base| base.generation == record.generation)
+            .map_or((0, 0), |base| (base.presented, base.mapped_at_us));
+        counters.presented > base
+            && counters
+                .last_presented_us
+                .is_some_and(|presented_us| presented_us >= mapped_at_us)
     }
 
     /// The target's role ended or was replaced (as opposed to a live window

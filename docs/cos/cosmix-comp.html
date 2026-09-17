@@ -732,7 +732,8 @@ keeps the window's offset within its output.</li>
 <li><code>width</code>/<code>height</code> request a window-geometry size, clamped to the client's
 minimum and maximum. An absent one keeps the window's current
 window-geometry size (what the client committed, not what comp last
-asked for). For an xdg window this is a configure, so the size
+asked for), so a width-only or height-only place re-sends the current
+size for the other axis in the configure. For an xdg window this is a configure, so the size
 changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
 <li>The reply is
 <code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
@@ -750,15 +751,17 @@ window reaches a state.
 are at most 4096 bytes. With <code>id</code>, the wait is about that window; an id
 comp never handed out is refused with <code>unknown_window</code>. Without it, the
 wait is about the lowest-id mapped window whose names match.</li>
-<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (at least one frame of the
-current mapping presented), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
+<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (a frame presented at or
+after the current mapping began; a late report of an earlier frame does
+not count), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
 window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
 without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.</li>
 <li><code>timeout_ms</code> defaults to 10000 and is at most 60000, counted from when
 the port admitted the request.</li>
 <li>While a session lock is active a wait learns nothing it could not read
 from the (redacted) tree: only <code>gone</code> and <code>unmapped</code> for a named <code>id</code> can
-resolve; everything else waits for the unlock or the deadline.</li>
+resolve; everything else waits for the unlock or the deadline, so a
+name-based wait that spans the whole lock ends with <code>timeout</code>.</li>
 <li>A condition that already holds is answered at once. Otherwise comp
 checks after each dispatch cycle and sets one timer for the deadline;
 nothing polls.</li>
@@ -815,11 +818,14 @@ key or a compose sequence are refused as unmappable. If any character cannot
 be typed, nothing is sent and the reply is
 <code>{"error":"unmappable","char","index"}</code>. While an input method holds the
 keyboard, <code>text</code> is refused with <code>{"error":"ime_active"}</code>, because the IME
-would turn the keys into something other than the text sent. An unknown key
+would turn the keys into something other than the text sent. Some input
+methods hold that grab whenever a text field has focus; with one of those,
+every <code>text</code> call is refused, so type with <code>comp.input.key</code> instead. An unknown key
 name replies <code>{"error":"unknown_key","key"}</code>.</p>
 <p>An absolute or window-relative move is real pointer motion, so moving into an
 output corner arms the hot corner exactly as a mouse would; pass
-<code>corners:false</code> to move without that.</p>
+<code>corners:false</code> to move without arming one. Such a move still leaves an
+engaged corner and cancels a pending dwell.</p>
 <p>One verb injects at most 4096 seat events (a whole sequence included; a text
 character counts four, a key with modifiers two per key). A larger request is
 refused before anything is sent with <code>invalid_value</code> naming the limit.</p>
@@ -828,6 +834,7 @@ refused before anything is sent with <code>invalid_value</code> naming the limit
 <li><code>stale_target</code>, or another window-target error, for the <code>window</code> form;</li>
 <li><code>occluded</code> when <code>require_hit</code> is true and the point is not on that window or
 its frame. <code>under</code> names the window actually at that point, or is null;</li>
+<li><code>off_output</code> when <code>require_hit</code> is true and no output shows the point;</li>
 <li><code>unknown_output</code>;</li>
 <li><code>out_of_bounds</code>, with the output size, for a point outside the output.</li>
 </ul>
@@ -845,9 +852,13 @@ seconds.</li>
 <li>A drag is a <code>press</code>, some moves, and a <code>release</code>.</li>
 <li>The reply is <code>{steps:[&lt;each step's reply&gt;],elapsed_ms}</code>.</li>
 <li>A run yields to the event loop after every 256 injected events, so a long
-zero-delay stretch cannot fill a client's socket in one pass.</li>
-<li>If a step is refused, the run stops and releases the keys and buttons this
-run pressed and still holds; holds of other callers and other runs stay.
+zero-delay stretch cannot fill a client's socket in one pass. A run is
+therefore not atomic even without delays: other runs and single verbs can
+interleave at those yields (and at every delay).</li>
+<li>If a step is refused, the run stops and gives up the keys and buttons it
+pressed. A hold is released only when no other owner (another run, or a
+single verb that pressed the same key) still holds it; an explicit release
+by anyone lets the key go for every owner.
 The reply is rc 10
 <code>{"error":"step_failed",index,verb,step:&lt;the refusal&gt;,completed:[...],released:true}</code>.</li>
 <li>If the caller stops waiting, the run also stops and releases its own holds.</li>

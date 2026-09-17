@@ -3081,7 +3081,8 @@ fn reply_wire_bytes(service: &str, reply: &PendingReply) -> usize {
 
 fn enforce_reply_wire_limit(service: &str, mut reply: PendingReply) -> Option<PendingReply> {
     if reply_wire_bytes(service, &reply) > MAX_REPLY_WIRE_BYTES {
-        (reply.rc, reply.body) = too_large(MAX_REPLY_BODY_BYTES);
+        let (rc, body) = too_large(MAX_REPLY_BODY_BYTES);
+        (reply.rc, reply.body) = with_error_code(rc, body);
     }
     (reply_wire_bytes(service, &reply) <= MAX_REPLY_WIRE_BYTES).then_some(reply)
 }
@@ -3491,6 +3492,7 @@ mod tests {
             serde_json::from_str::<Value>(&checked.body).expect("too_large JSON"),
             serde_json::json!({
                 "error": "too_large",
+                "error_code": "too_large",
                 "limit_bytes": MAX_REPLY_BODY_BYTES,
                 "hint": "read a subtree",
             })

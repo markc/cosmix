@@ -320,7 +320,8 @@ frame trace as `comp_window_control` (subject the id; detail 1 minimize,
   - `width`/`height` request a window-geometry size, clamped to the client's
     minimum and maximum. An absent one keeps the window's current
     window-geometry size (what the client committed, not what comp last
-    asked for). For an xdg window this is a configure, so the size
+    asked for), so a width-only or height-only place re-sends the current
+    size for the other axis in the configure. For an xdg window this is a configure, so the size
     changes when the client answers: wait with `comp.window.wait
     {until:"size"}`.
   - The reply is
@@ -336,15 +337,17 @@ frame trace as `comp_window_control` (subject the id; detail 1 minimize,
     are at most 4096 bytes. With `id`, the wait is about that window; an id
     comp never handed out is refused with `unknown_window`. Without it, the
     wait is about the lowest-id mapped window whose names match.
-  - `until` is `mapped`, `visible`, `presented` (at least one frame of the
-    current mapping presented), `size` (needs `width` and `height`, compared with the
+  - `until` is `mapped`, `visible`, `presented` (a frame presented at or
+    after the current mapping began; a late report of an earlier frame does
+    not count), `size` (needs `width` and `height`, compared with the
     window-geometry size), `focused`, `unmapped` or `gone`. For a match
     without `id`, `unmapped` and `gone` mean no mapped window matches.
   - `timeout_ms` defaults to 10000 and is at most 60000, counted from when
     the port admitted the request.
   - While a session lock is active a wait learns nothing it could not read
     from the (redacted) tree: only `gone` and `unmapped` for a named `id` can
-    resolve; everything else waits for the unlock or the deadline.
+    resolve; everything else waits for the unlock or the deadline, so a
+    name-based wait that spans the whole lock ends with `timeout`.
   - A condition that already holds is answered at once. Otherwise comp
     checks after each dispatch cycle and sets one timer for the deadline;
     nothing polls.
@@ -406,12 +409,15 @@ key or a compose sequence are refused as unmappable. If any character cannot
 be typed, nothing is sent and the reply is
 `{"error":"unmappable","char","index"}`. While an input method holds the
 keyboard, `text` is refused with `{"error":"ime_active"}`, because the IME
-would turn the keys into something other than the text sent. An unknown key
+would turn the keys into something other than the text sent. Some input
+methods hold that grab whenever a text field has focus; with one of those,
+every `text` call is refused, so type with `comp.input.key` instead. An unknown key
 name replies `{"error":"unknown_key","key"}`.
 
 An absolute or window-relative move is real pointer motion, so moving into an
 output corner arms the hot corner exactly as a mouse would; pass
-`corners:false` to move without that.
+`corners:false` to move without arming one. Such a move still leaves an
+engaged corner and cancels a pending dwell.
 
 One verb injects at most 4096 seat events (a whole sequence included; a text
 character counts four, a key with modifiers two per key). A larger request is
@@ -421,6 +427,7 @@ Every refusal is decided before anything is sent:
 - `stale_target`, or another window-target error, for the `window` form;
 - `occluded` when `require_hit` is true and the point is not on that window or
   its frame. `under` names the window actually at that point, or is null;
+- `off_output` when `require_hit` is true and no output shows the point;
 - `unknown_output`;
 - `out_of_bounds`, with the output size, for a point outside the output.
 
@@ -439,9 +446,13 @@ never leave a key or button down; only `action: press` holds one.
 - A drag is a `press`, some moves, and a `release`.
 - The reply is `{steps:[<each step's reply>],elapsed_ms}`.
 - A run yields to the event loop after every 256 injected events, so a long
-  zero-delay stretch cannot fill a client's socket in one pass.
-- If a step is refused, the run stops and releases the keys and buttons this
-  run pressed and still holds; holds of other callers and other runs stay.
+  zero-delay stretch cannot fill a client's socket in one pass. A run is
+  therefore not atomic even without delays: other runs and single verbs can
+  interleave at those yields (and at every delay).
+- If a step is refused, the run stops and gives up the keys and buttons it
+  pressed. A hold is released only when no other owner (another run, or a
+  single verb that pressed the same key) still holds it; an explicit release
+  by anyone lets the key go for every owner.
   The reply is rc 10
   `{"error":"step_failed",index,verb,step:<the refusal>,completed:[...],released:true}`.
 - If the caller stops waiting, the run also stops and releases its own holds.

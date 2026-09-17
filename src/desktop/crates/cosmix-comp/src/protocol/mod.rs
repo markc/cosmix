@@ -11308,7 +11308,11 @@ impl WaylandState {
         let clamped = clamp_point_to_seat((x, y), &self.backend.seat_regions());
         let (x, y) = clamped.position;
         #[cfg(feature = "bus")]
-        if !self.injection.suppress_corners {
+        if self.injection.suppress_corners {
+            // `corners: false` suppresses arming only: an engaged or
+            // dwelling corner is still left (and its dwell timer dropped).
+            self.reset_corner_detector();
+        } else {
             self.sample_corner_motion(
                 clamped.position,
                 clamped.region_index,

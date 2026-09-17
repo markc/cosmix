@@ -298,7 +298,7 @@ fn injected_binding_chord_is_consumed_by_the_binding() {
         "the binding swallowed M: {keys:?}"
     );
     assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.injection.held.keys.is_empty());
+    assert!(harness.server.state.injection.held.is_empty());
 
     // An unknown key name is refused and sends nothing.
     let (rc, body) = inject(
@@ -1041,4 +1041,199 @@ fn corners_false_skips_hot_corner_sampling() {
     let (rc, _) = inject(&mut harness, &ingress, &runtime, corner_move(true));
     assert_eq!(rc, 0);
     assert!(entered(&mut harness), "a default move arms the corner");
+}
+
+fn key_op(key: u32, action: PressAction) -> InputOp {
+    InputOp::Key {
+        key: KeySpec::Evdev(key),
+        action,
+        modifiers: Vec::new(),
+    }
+}
+
+fn pressed_evdev(harness: &KeybindingHarness) -> Vec<u32> {
+    let mut keys = harness
+        .server
+        .state
+        .keyboard
+        .pressed_keys()
+        .into_iter()
+        .map(|key| key.raw() - 8)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys
+}
+
+fn failing_move(alpha_id: u64, stale_generation: u64, delay_ms: u64) -> crate::port::SequenceStep {
+    step(
+        "comp.input.pointer.move",
+        move_op(PointerMoveTarget::Window {
+            id: alpha_id,
+            generation: stale_generation,
+            x: 0.0,
+            y: 0.0,
+            require_hit: false,
+        }),
+        delay_ms,
+    )
+}
+
+/// Holds are counted by owner: two runs pressing the same key, or a run
+/// and a single verb, never release each other's hold on abort.
+#[test]
+fn shared_holds_are_released_by_their_last_owner() {
+    let (mut harness, ingress, runtime, _pointer, alpha, _beta) = two_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let key_a = input_injection::Hold::Key(KEY_A + 8);
+
+    // Two runs, one key.
+    let keeper = ingress
+        .request_long(crate::port::LongOp::Sequence(vec![
+            step("comp.input.key", key_op(KEY_A, PressAction::Press), 0),
+            step("comp.input.key", key_op(KEY_A, PressAction::Release), 80),
+        ]))
+        .expect("keeper admitted");
+    let failing = ingress
+        .request_long(crate::port::LongOp::Sequence(vec![
+            step("comp.input.key", key_op(KEY_A, PressAction::Press), 0),
+            failing_move(alpha_id, alpha_generation + 1, 20),
+        ]))
+        .expect("failing admitted");
+    let (rc, _) = long_reply(&mut harness, &runtime, failing, |state| {
+        state.injection.sequences.len() == 1
+    });
+    assert_eq!(rc, 10);
+    assert_eq!(pressed_evdev(&harness), [KEY_A], "the keeper still holds A");
+    assert_eq!(harness.server.state.injection.held.owners_of(key_a), 1);
+    let (rc, _) = long_reply(&mut harness, &runtime, keeper, |state| {
+        state.injection.sequences.is_empty()
+    });
+    assert_eq!(rc, 0);
+    assert!(pressed_evdev(&harness).is_empty());
+    assert!(harness.server.state.injection.held.is_empty());
+
+    // A single verb re-presses what a run held after releasing it: the run's
+    // abort leaves the single verb's hold down.
+    let run = ingress
+        .request_long(crate::port::LongOp::Sequence(vec![
+            step("comp.input.key", key_op(KEY_A, PressAction::Press), 0),
+            failing_move(alpha_id, alpha_generation + 1, 60),
+        ]))
+        .expect("run admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("run starts");
+    assert_eq!(pressed_evdev(&harness), [KEY_A]);
+    for action in [PressAction::Release, PressAction::Press] {
+        let (rc, _) = inject(&mut harness, &ingress, &runtime, key_op(KEY_A, action));
+        assert_eq!(rc, 0);
+    }
+    assert_eq!(
+        harness.server.state.injection.held.owners_of(key_a),
+        1,
+        "the release cleared the run's claim; the press is the verb's"
+    );
+    let (rc, _) = long_reply(&mut harness, &runtime, run, |state| {
+        state.injection.sequences.is_empty()
+    });
+    assert_eq!(rc, 10);
+    assert_eq!(pressed_evdev(&harness), [KEY_A], "the verb's hold survives");
+
+    // And the plain case: a verb's hold survives a run that shared it.
+    let (rc, body) = run_sequence(
+        &mut harness,
+        &ingress,
+        &runtime,
+        vec![
+            step("comp.input.key", key_op(KEY_A, PressAction::Press), 0),
+            failing_move(alpha_id, alpha_generation + 1, 0),
+        ],
+    );
+    assert_eq!((rc, body["error"].clone()), (10, json!("step_failed")));
+    assert_eq!(pressed_evdev(&harness), [KEY_A]);
+    let (rc, _) = inject(&mut harness, &ingress, &runtime, InputOp::ReleaseAll);
+    assert_eq!(rc, 0);
+    assert!(pressed_evdev(&harness).is_empty());
+}
+
+/// `corners: false` suppresses arming only: it still disarms a pending
+/// dwell and leaves an engaged corner.
+#[test]
+fn corners_false_still_leaves_and_disarms() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let runtime = control_reply_runtime();
+    port_observation::service_observations(&mut harness.server.state);
+    harness.server.state.refresh_corner_regions();
+    drain_observations(&observations);
+    let to = |x, y, corners| InputOp::PointerMove {
+        target: PointerMoveTarget::Output {
+            output: None,
+            x,
+            y,
+        },
+        corners,
+    };
+    let settle = |harness: &mut KeybindingHarness| {
+        harness
+            .server
+            .event_loop
+            .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+            .expect("corner deadline dispatch");
+        port_observation::service_observations(&mut harness.server.state);
+        drain_observations(&observations)
+    };
+    harness.server.state.cursor_position = (100.0, 100.0);
+
+    // Arm (default move), then move away with corners:false before the
+    // dwell: nothing enters.
+    assert_eq!(inject(&mut harness, &ingress, &runtime, to(5.0, 5.0, true)).0, 0);
+    assert_eq!(inject(&mut harness, &ingress, &runtime, to(100.0, 100.0, false)).0, 0);
+    let records = settle(&mut harness);
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::CornerEntered { .. }
+        )),
+        "the pending dwell was disarmed: {records:?}"
+    );
+
+    // Engage, then leave with corners:false: the corner is left.
+    assert_eq!(inject(&mut harness, &ingress, &runtime, to(5.0, 5.0, true)).0, 0);
+    let records = settle(&mut harness);
+    assert!(records.iter().any(|record| matches!(
+        record,
+        port_observation::ObservationRecord::CornerEntered { .. }
+    )));
+    assert_eq!(inject(&mut harness, &ingress, &runtime, to(100.0, 100.0, false)).0, 0);
+    let records = settle(&mut harness);
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::CornerLeft { .. }
+        )),
+        "a suppressed move still leaves the corner: {records:?}"
+    );
+}
+
+/// `require_hit` on a point no output shows is `off_output`, not an
+/// occlusion by nothing.
+#[test]
+fn require_hit_off_every_output_is_off_output() {
+    let (mut harness, ingress, runtime, _pointer, alpha, _beta) = two_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        move_op(PointerMoveTarget::Window {
+            id,
+            generation,
+            x: -10.0,
+            y: 5.0,
+            require_hit: true,
+        }),
+    );
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "off_output", "{body}");
 }

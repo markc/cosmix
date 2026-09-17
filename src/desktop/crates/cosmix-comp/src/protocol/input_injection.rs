@@ -46,41 +46,68 @@ pub(crate) struct InputMark {
 const SEQUENCE_YIELD_EVENTS: u64 = 256;
 const SEQUENCE_YIELD: Duration = Duration::from_millis(1);
 
-/// Keys (raw XKB codes) and buttons pressed by injection and not released.
+/// A key (raw XKB code) or button that injection pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Hold {
+    Key(u32),
+    Button(u32),
+}
+
+/// Who pressed a hold: a sequence run, or `None` for single verbs.
+type HoldOwner = Option<u64>;
+
+/// Every injected hold and the owners that pressed it. A hold is released
+/// on an owner's abort only when no other owner still holds it; an
+/// explicit release (any caller) really lets the key go, so it clears
+/// every owner.
 #[derive(Default)]
 pub(super) struct Holds {
-    pub(super) keys: BTreeSet<u32>,
-    pub(super) buttons: BTreeSet<u32>,
+    owners: BTreeMap<Hold, BTreeSet<HoldOwner>>,
 }
 
 impl Holds {
-    fn note(&mut self, input: &HostInput) {
-        match *input {
-            HostInput::Key { keycode, state, .. } => {
-                if state == HostButtonState::Pressed {
-                    self.keys.insert(keycode.raw());
-                } else {
-                    self.keys.remove(&keycode.raw());
-                }
-            }
-            HostInput::PointerButton { button, state, .. } => {
-                if state == HostButtonState::Pressed {
-                    self.buttons.insert(button);
-                } else {
-                    self.buttons.remove(&button);
-                }
-            }
-            _ => {}
+    fn note(&mut self, owner: HoldOwner, input: &HostInput) {
+        let (hold, state) = match *input {
+            HostInput::Key { keycode, state, .. } => (Hold::Key(keycode.raw()), state),
+            HostInput::PointerButton { button, state, .. } => (Hold::Button(button), state),
+            _ => return,
+        };
+        if state == HostButtonState::Pressed {
+            self.owners.entry(hold).or_default().insert(owner);
+        } else {
+            self.owners.remove(&hold);
         }
+    }
+
+    /// Drop one owner; returns the holds nobody holds any more.
+    fn drop_owner(&mut self, owner: HoldOwner) -> Vec<Hold> {
+        let mut orphaned = Vec::new();
+        self.owners.retain(|hold, owners| {
+            if owners.remove(&owner) && owners.is_empty() {
+                orphaned.push(*hold);
+                return false;
+            }
+            !owners.is_empty()
+        });
+        orphaned
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn owners_of(&self, hold: Hold) -> usize {
+        self.owners.get(&hold).map_or(0, BTreeSet::len)
     }
 }
 
 pub(crate) struct InjectionState {
     next_seq: u64,
-    /// Everything injection holds; `release_all` releases all of it.
+    /// Everything injection holds, by owner; `release_all` releases all.
     pub(super) held: Holds,
-    /// The sequence whose step is running, so its holds are also recorded
-    /// on the run: an aborted run releases only its own.
+    /// The sequence whose step is running (the owner of what it presses).
     current_run: Option<u64>,
     /// Injected events so far (for the sequence yield).
     pub(super) events: u64,
@@ -121,7 +148,6 @@ pub(super) struct SequenceRun {
     delay_elapsed: bool,
     replies: Vec<Value>,
     started: Instant,
-    pub(super) holds: Holds,
     reply: tokio::sync::oneshot::Sender<ControlReply>,
 }
 
@@ -217,14 +243,8 @@ impl WaylandState {
     }
 
     fn inject(&mut self, input: HostInput) {
-        self.injection.held.note(&input);
-        if let Some(run) = self
-            .injection
-            .current_run
-            .and_then(|run| self.injection.sequences.get_mut(&run))
-        {
-            run.holds.note(&input);
-        }
+        let owner = self.injection.current_run;
+        self.injection.held.note(owner, &input);
         self.injection.events = self.injection.events.wrapping_add(1);
         self.handle_host_input(input);
     }
@@ -405,26 +425,24 @@ impl WaylandState {
     /// `release_all`: release everything injection holds, and only that.
     fn release_injected(&mut self, time: u32) {
         let holds = std::mem::take(&mut self.injection.held);
-        self.release_holds(holds, time, false);
+        self.release_holds(holds.owners.into_keys().collect(), time);
     }
 
-    /// Release the given holds the seat still has pressed: keys, then
-    /// buttons. With `still_held`, only those injection still holds (a run
-    /// never releases what `release_all` or another caller already let go
-    /// of, nor anything a device holds).
-    fn release_holds(&mut self, holds: Holds, time: u32, still_held: bool) {
+    /// Release the given holds the seat still has pressed: keys (newest
+    /// code first), then buttons.
+    fn release_holds(&mut self, holds: Vec<Hold>, time: u32) {
         let pressed = self.keyboard.pressed_keys();
-        for raw in holds.keys.into_iter().rev() {
+        for hold in holds.iter().rev() {
+            let Hold::Key(raw) = *hold else { continue };
             let keycode = Keycode::new(raw);
-            let ours = !still_held || self.injection.held.keys.contains(&raw);
-            if pressed.contains(&keycode) && ours {
+            if pressed.contains(&keycode) {
                 self.inject_key(keycode, HostButtonState::Released, time);
             }
         }
         let pressed = self.pointer.current_pressed();
-        for button in holds.buttons {
-            let ours = !still_held || self.injection.held.buttons.contains(&button);
-            if pressed.contains(&button) && ours {
+        for hold in holds {
+            let Hold::Button(button) = hold else { continue };
+            if pressed.contains(&button) {
                 self.inject(HostInput::PointerButton {
                     button,
                     state: HostButtonState::Released,
@@ -493,6 +511,20 @@ impl WaylandState {
                 let origin = self.surfaces[&object].window_origin;
                 let (global_x, global_y) = (f64::from(origin.0) + x, f64::from(origin.1) + y);
                 if *require_hit {
+                    let on_output = project_outputs(self).is_some_and(|projection| {
+                        projection.rows.values().any(|row| {
+                            (f64::from(row.x)..f64::from(row.x) + f64::from(row.width))
+                                .contains(&global_x)
+                                && (f64::from(row.y)..f64::from(row.y) + f64::from(row.height))
+                                    .contains(&global_y)
+                        })
+                    });
+                    if !on_output {
+                        return Err(ControlReply::refused(
+                            "off_output",
+                            json!({"id": id, "x": x, "y": y}),
+                        ));
+                    }
                     let under = self.root_record_at(global_x, global_y);
                     if under.as_ref().map(|(under, _, _)| under) != Some(&object) {
                         return Err(ControlReply::refused(
@@ -676,7 +708,6 @@ impl WaylandState {
                         delay_elapsed: false,
                         replies: Vec::new(),
                         started: admitted,
-                        holds: Holds::default(),
                         reply,
                     },
                 );
@@ -691,11 +722,12 @@ impl WaylandState {
         }
     }
 
-    /// End a run early: release only the holds this run still owns.
+    /// End a run early: give up its holds, and release the ones no other
+    /// owner (another run, a single verb) still holds.
     fn abort_sequence(&mut self, id: u64) -> Option<SequenceRun> {
-        let mut run = self.injection.sequences.remove(&id)?;
-        let holds = std::mem::take(&mut run.holds);
-        self.release_holds(holds, monotonic_millis(), true);
+        let run = self.injection.sequences.remove(&id)?;
+        let orphaned = self.injection.held.drop_owner(Some(id));
+        self.release_holds(orphaned, monotonic_millis());
         Some(run)
     }
 
