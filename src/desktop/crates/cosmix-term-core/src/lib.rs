@@ -6,8 +6,9 @@
 //! and the verified native-session control lane (`native_session`, `control`).
 //!
 //! A frontend installs a [`wake::WakeFd`] waker with `TabSet::set_wake`, polls
-//! its descriptor, and on readiness calls `Terminal::grid_snapshot` for each
-//! visible pane, repainting the rows the snapshot marks dirty.
+//! its descriptor, and on readiness calls `WakeFd::drain` and then
+//! `Terminal::grid_snapshot` for each visible pane, repainting the rows the
+//! snapshot marks dirty.
 pub mod bus;
 pub mod config;
 pub mod control;

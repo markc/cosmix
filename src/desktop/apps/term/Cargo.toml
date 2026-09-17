@@ -35,5 +35,4 @@ cosmix-app-identity = { path = "../../../crates/cosmix-app-identity" }
 
 [dev-dependencies]
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config" }
-cosmix-term-core = { path = "../../crates/cosmix-term-core", features = ["test-support"] }
 term-native-test-broker = { path = "../../crates/cosmix-term-core/tests/support" }

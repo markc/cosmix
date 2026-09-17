@@ -1,5 +1,10 @@
 //! Tests-only embedding of the real noded, with no broker source refactor.
 //! Keep module paths pointed at production sources: no simulated session RPCs.
+// This crate has no tests of its own ([lib] test = false), but
+// `cargo build --all-targets` still builds its lib-test target. Under cfg(test)
+// the embedded noded and session_fd sources compile their own test modules,
+// which need noded's dev-dependencies. Build that target as an empty crate.
+#![cfg(not(test))]
 #![allow(dead_code)]
 
 // Compile the real handoff as library code, without pulling Term's desktop

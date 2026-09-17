@@ -137,7 +137,7 @@ fn layout_app() -> App {
         term: "xterm-256color",
     };
     app.insert_resource(Core(
-        Arc::new(Mutex::new(TabSet::with_settings(settings).unwrap())),
+        Arc::new(Mutex::new(TabSet::with_session(settings, None).unwrap())),
         cleanup,
     ))
     .insert_resource(Painter(Mutex::new(

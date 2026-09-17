@@ -33,18 +33,27 @@ impl WakeFd {
     }
 
     /// Consume every pending wake. True when at least one arrived since the
-    /// last drain; false when there was nothing to read.
+    /// last drain; false when nothing was pending (or the read failed).
+    ///
+    /// Drain BEFORE taking snapshots, never after: a change that lands while
+    /// the frontend is reading the grid then leaves the descriptor readable
+    /// for the next loop turn instead of being swallowed.
     pub fn drain(&self) -> bool {
         let mut count = 0u64;
-        // SAFETY: reads exactly eight bytes into a live u64 from an owned fd.
-        let read = unsafe {
-            libc::read(
-                self.0.as_raw_fd(),
-                (&raw mut count).cast(),
-                std::mem::size_of::<u64>(),
-            )
-        };
-        read == std::mem::size_of::<u64>() as isize && count > 0
+        loop {
+            // SAFETY: reads exactly eight bytes into a live u64 from an owned fd.
+            let read = unsafe {
+                libc::read(
+                    self.0.as_raw_fd(),
+                    (&raw mut count).cast(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return read == std::mem::size_of::<u64>() as isize && count > 0;
+        }
     }
 }
 
@@ -62,9 +71,15 @@ impl AsRawFd for WakeFd {
 
 fn signal(fd: RawFd) {
     let one = 1u64;
-    // SAFETY: writes eight bytes from a live u64. EAGAIN means the counter is
-    // saturated, which already reads as "woken", so the result is ignored.
-    let _ = unsafe { libc::write(fd, (&raw const one).cast(), std::mem::size_of::<u64>()) };
+    loop {
+        // SAFETY: writes eight bytes from a live u64. EAGAIN means the counter
+        // is saturated, which already reads as "woken", so it is not retried.
+        let written =
+            unsafe { libc::write(fd, (&raw const one).cast(), std::mem::size_of::<u64>()) };
+        if written >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]

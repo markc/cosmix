@@ -182,7 +182,7 @@ impl TabSet {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     pub fn with_settings(settings: crate::config::Settings) -> Result<Self, String> {
         Self::with_session(settings, None)
     }
@@ -624,6 +624,8 @@ impl TabSet {
         self.invalidate_control_focus();
         self.notify();
     }
+    /// Install the change callback on every pane, current and future. Call it
+    /// once: `Terminal::set_wake` keeps the first waker it is given.
     pub fn set_wake(&mut self, wake: Wake) {
         for tab in &self.tabs {
             for (pane, _) in tab.tree.leaves(Geometry::default()) {

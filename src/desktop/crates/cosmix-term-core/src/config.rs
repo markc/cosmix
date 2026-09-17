@@ -164,6 +164,8 @@ mod tests {
         assert_eq!(parse("{}").unwrap(), Config::default());
         assert_eq!(
             // The example ships with the term app; the parser it must satisfy lives here.
+            // Reaching into a sibling package only works because this crate is
+            // publish = false: a packaged crate would not contain that file.
             parse(include_str!("../../../apps/term/term.example.conf.mix")).unwrap(),
             Config::default()
         );

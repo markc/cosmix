@@ -36,12 +36,22 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
 /// Rows changed since the last `rearm_damage`, plus the cursor's row (rio's
 /// damage covers where the cursor was, not where it is). Scrolled-back views
 /// are repainted whole: rio reports their damage in scrollback coordinates.
+///
+/// rio's `damage()` is not read-only. In insert mode (IRM) it calls
+/// `mark_fully_damaged`, which after a rearm emits `RenderRoute`, which
+/// `Listener` turns into a fresh damage token and wake: every snapshot would
+/// schedule the next. Insert mode repaints whole anyway, so skip the call.
 fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
     let mut dirty = vec![false; term.screen_lines()];
     let cursor = term.grid.cursor.pos.row.0.max(0) as usize;
-    let scrolled = term.display_offset() != 0;
+    if term.display_offset() != 0
+        || term.mode().contains(rio_vt::crosswords::Mode::INSERT)
+    {
+        dirty.fill(true);
+        return dirty;
+    }
     match term.damage() {
-        TermDamage::Partial(lines) if !scrolled => {
+        TermDamage::Partial(lines) => {
             for line in lines {
                 if let Some(row) = dirty.get_mut(line.line) {
                     *row = true;
@@ -732,8 +742,11 @@ impl Terminal {
             thread: Some(thread),
         })
     }
+    /// Install the change callback. Once only: a second call is ignored
+    /// (debug builds assert), so wrap a changing target inside one callback.
     pub fn set_wake(&self, wake: Wake) {
-        let _ = self.listener.wake.set(wake);
+        let installed = self.listener.wake.set(wake).is_ok();
+        debug_assert!(installed, "Terminal::set_wake called twice; the second waker is ignored");
         self.listener.wake();
     }
     pub fn take_damage(&self) -> bool {
@@ -915,7 +928,9 @@ impl Drop for Terminal {
 mod tests {
     use super::*;
     use rio_vt::corcovado;
+    use rio_vt::crosswords::{Mode, grid::Scroll};
     use std::os::{fd::AsRawFd, unix::net::UnixStream};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     #[test]
     fn launch_directory_selects_valid_cwd_or_home() {
@@ -1070,80 +1085,221 @@ mod tests {
         assert!(thread.is_finished(), "Machine shutdown must finish");
         drop(thread.join().unwrap());
     }
-    #[test]
-    fn dirty_rows_track_changed_rows_and_the_cursor() {
-        let (stream, mut child) = UnixStream::pair().unwrap();
-        stream.set_nonblocking(true).unwrap();
-        let (damage, rx) = mpsc::sync_channel(1);
-        let listener = Listener {
-            damage,
-            wake: Arc::new(OnceLock::new()),
-            writes: Arc::new(Mutex::new(Writes::default())),
-            stats: Arc::new(Mutex::new(Metrics::default())),
-            quit: Arc::new(AtomicBool::new(false)),
-        };
-        let grid = Arc::new(FairMutex::new(Crosswords::new(
-            CrosswordsSize::new(80, 24),
-            CursorShape::Block,
-            listener.clone(),
-            WindowId::from(0),
-            0,
-            0,
-        )));
-        let machine = Machine::new(
-            grid.clone(),
-            FixturePty {
-                stream,
-                token: Token(1),
-            },
-            listener.clone(),
-            WindowId::from(0),
-            0,
-        )
-        .unwrap();
-        let channel = machine.channel();
-        listener.writes.lock().unwrap().sender = Some(channel.clone());
-        let thread = machine.spawn();
-        let settle = |row: usize, c: char| {
+    type FixtureThread = JoinHandle<(Machine<FixturePty, Listener>, rio_vt::performer::State)>;
+
+    /// A real Terminal whose PTY is a socketpair: grid, Machine, Listener and
+    /// damage channel are the production ones, and no child process exists
+    /// (`thread: None` makes `shutdown` a no-op; Drop stops the Machine).
+    struct GridFixture {
+        terminal: Terminal,
+        child: UnixStream,
+        channel: channel::Sender<Msg>,
+        thread: Option<FixtureThread>,
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl GridFixture {
+        fn new() -> Self {
+            let (stream, child) = UnixStream::pair().unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let stats = Arc::new(Mutex::new(Metrics::default()));
+            let (damage, rx) = mpsc::sync_channel(1);
+            let listener = Listener {
+                damage,
+                wake: Arc::new(OnceLock::new()),
+                writes: Arc::new(Mutex::new(Writes::default())),
+                stats: stats.clone(),
+                quit: Arc::new(AtomicBool::new(false)),
+            };
+            let grid = Arc::new(FairMutex::new(Crosswords::new(
+                CrosswordsSize::new(80, 24),
+                CursorShape::Block,
+                listener.clone(),
+                WindowId::from(0),
+                0,
+                100,
+            )));
+            let machine = Machine::new(
+                grid.clone(),
+                FixturePty {
+                    stream,
+                    token: Token(1),
+                },
+                listener.clone(),
+                WindowId::from(0),
+                0,
+            )
+            .unwrap();
+            let channel = machine.channel();
+            listener.writes.lock().unwrap().sender = Some(channel.clone());
+            let thread = machine.spawn();
+            let terminal = Terminal {
+                before_pty_cleanup: None,
+                session: None,
+                listener,
+                stats,
+                grid,
+                damage: Mutex::new(rx),
+                pid: 0,
+                thread: None,
+            };
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let counter = wakes.clone();
+            terminal.set_wake(Arc::new(move || {
+                counter.fetch_add(1, AtomicOrdering::SeqCst);
+            }));
+            Self {
+                terminal,
+                child,
+                channel,
+                thread: Some(thread),
+                wakes,
+            }
+        }
+
+        /// Write, then wait until `parsed` holds. Machine reports damage under
+        /// the grid lock, so once the last byte is visible its event is sent.
+        fn feed(&mut self, bytes: &[u8], parsed: impl Fn(&Crosswords<Listener>) -> bool) {
+            self.child.write_all(bytes).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
-            while grid.lock().visible_rows()[row][Column(0)].c() != c {
-                assert!(Instant::now() < deadline, "PTY bytes never reached row {row}");
+            while !parsed(&*self.terminal.grid.lock()) {
+                assert!(Instant::now() < deadline, "PTY bytes were never parsed");
                 std::thread::sleep(Duration::from_millis(5));
             }
-        };
-        child.write_all(b"A").unwrap();
-        rx.recv_timeout(Duration::from_secs(2)).expect("first damage wake");
-        settle(0, 'A');
-        {
-            let mut term = grid.lock();
-            let first = dirty_rows(&mut term);
-            assert_eq!(first.len(), 24);
-            assert!(first.iter().all(|row| *row), "a fresh grid is fully dirty");
-            rearm_damage(&mut term);
-            let idle = dirty_rows(&mut term);
-            assert_eq!(
-                idle.iter().positions(),
-                vec![0],
-                "an idle grid marks only the cursor row"
+        }
+
+        /// Consume the pending change, as a frontend does before it reads.
+        fn settled_snapshot(&self) -> GridSnapshot {
+            let _ = self.terminal.take_damage();
+            self.terminal.grid_snapshot()
+        }
+
+        /// A snapshot with nothing pending must not schedule another one.
+        fn quiet_snapshot(&self) -> GridSnapshot {
+            assert!(!self.terminal.take_damage(), "no change was pending");
+            let before = self.wakes.load(AtomicOrdering::SeqCst);
+            let snapshot = self.terminal.grid_snapshot();
+            assert!(
+                !self.terminal.take_damage(),
+                "a snapshot left a damage token behind"
             );
-            rearm_damage(&mut term);
+            assert_eq!(
+                self.wakes.load(AtomicOrdering::SeqCst),
+                before,
+                "a snapshot woke the frontend"
+            );
+            snapshot
         }
-        child.write_all(b"\r\n\r\nC").unwrap();
-        rx.recv_timeout(Duration::from_secs(2)).expect("second damage wake");
-        settle(2, 'C');
-        {
-            let mut term = grid.lock();
-            assert_eq!(dirty_rows(&mut term).iter().positions(), vec![0, 1, 2]);
-            rearm_damage(&mut term);
-        }
-        channel.send(Msg::Shutdown).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !thread.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(thread.is_finished(), "Machine shutdown must finish");
-        drop(thread.join().unwrap());
     }
+
+    impl Drop for GridFixture {
+        fn drop(&mut self) {
+            let _ = self.channel.send(Msg::Shutdown);
+            if let Some(thread) = self.thread.take() {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !thread.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if thread.is_finished() {
+                    drop(thread.join());
+                }
+            }
+        }
+    }
+
+    fn cell(term: &Crosswords<Listener>, row: usize, col: usize) -> char {
+        term.visible_rows()[row][Column(col)].c()
+    }
+
+    fn all(rows: &[bool]) -> bool {
+        rows.iter().all(|row| *row)
+    }
+
+    #[test]
+    fn grid_snapshot_reports_changed_rows_and_the_cursor() {
+        let mut f = GridFixture::new();
+        f.feed(b"A", |t| cell(t, 0, 0) == 'A');
+        let first = f.settled_snapshot();
+        assert_eq!(first.dirty_rows.len(), 24);
+        assert!(all(&first.dirty_rows), "a fresh grid is fully dirty");
+        assert_eq!(first.screen.cells[0].c, 'A');
+        assert_eq!(
+            f.quiet_snapshot().dirty_rows.iter().positions(),
+            vec![0],
+            "an idle grid marks only the cursor row"
+        );
+        f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
+        assert_eq!(
+            f.settled_snapshot().dirty_rows.iter().positions(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn grid_snapshot_is_fully_dirty_after_resize_alt_screen_palette_and_scrollback() {
+        let mut f = GridFixture::new();
+        f.feed(b"A", |t| cell(t, 0, 0) == 'A');
+        f.settled_snapshot();
+
+        f.terminal.resize(100, 30, 800, 600);
+        let resized = f.settled_snapshot();
+        assert_eq!(resized.dirty_rows.len(), 30);
+        assert_eq!(resized.screen.cols, 100);
+        assert!(all(&resized.dirty_rows), "resize");
+        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+
+        f.feed(b"\x1b[?1049hB", |t| {
+            t.mode().contains(Mode::ALT_SCREEN) && cell(t, 0, 1) == 'B'
+        });
+        assert!(all(&f.settled_snapshot().dirty_rows), "alt-screen entry");
+        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        f.feed(b"\x1b[?1049l", |t| !t.mode().contains(Mode::ALT_SCREEN));
+        assert!(all(&f.settled_snapshot().dirty_rows), "alt-screen exit");
+
+        f.feed(b"\x1b]4;1;rgb:ff/00/00\x07", |t| {
+            t.colors()[1].is_some_and(|c| c[0] == 1.0 && c[1] == 0.0 && c[2] == 0.0)
+        });
+        assert!(all(&f.settled_snapshot().dirty_rows), "palette change");
+        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+
+        let mut lines = b"\r\n".repeat(40);
+        lines.push(b'Z');
+        f.feed(&lines, |t| cell(t, 29, 0) == 'Z');
+        f.settled_snapshot();
+        {
+            let mut term = f.terminal.grid.lock();
+            term.scroll_display(Scroll::Delta(5));
+            assert_ne!(term.display_offset(), 0);
+        }
+        assert!(all(&f.settled_snapshot().dirty_rows), "scroll-back");
+        // Still scrolled back: repainted whole, and still no self-wake.
+        assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");
+    }
+
+    #[test]
+    fn insert_mode_snapshot_neither_wakes_nor_leaves_a_token() {
+        let mut f = GridFixture::new();
+        f.feed(b"\x1b[4hX", |t| {
+            t.mode().contains(Mode::INSERT) && cell(t, 0, 0) == 'X'
+        });
+        assert!(all(&f.settled_snapshot().dirty_rows));
+        for _ in 0..3 {
+            assert!(all(&f.quiet_snapshot().dirty_rows), "insert mode");
+        }
+    }
+
+    #[test]
+    fn screen_consume_is_seen_by_the_next_snapshot() {
+        let mut f = GridFixture::new();
+        f.feed(b"A", |t| cell(t, 0, 0) == 'A');
+        f.settled_snapshot();
+        f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
+        assert!(f.terminal.take_damage());
+        let _ = f.terminal.screen(true);
+        // screen(true) consumed the row damage; only the cursor row remains.
+        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![2]);
+    }
+
     trait Positions {
         fn positions(self) -> Vec<usize>;
     }
