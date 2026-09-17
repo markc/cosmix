@@ -30,12 +30,24 @@ pub struct SurfaceUpload {
     pub ops: Vec<UploadOp>,
 }
 
+/// Why a texture must be repainted in full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepaintReason {
+    /// Bevy re-created the texture under a live surface. Normal and
+    /// recoverable: the next draw repaints it.
+    Replaced,
+    /// The upload waited `MAX_WAIT_FRAMES` and no texture appeared.
+    GaveUp,
+}
+
 /// Main world to render world hand-off, plus what the render world did.
 #[derive(Default)]
 pub struct Shared {
     pending: Mutex<Vec<SurfaceUpload>>,
-    /// Images whose texture must be repainted in full (lost or replaced).
-    repaint: Mutex<HashSet<AssetId<Image>>>,
+    /// Images whose texture must be repainted in full, and why.
+    repaint: Mutex<HashMap<AssetId<Image>, RepaintReason>>,
+    /// Images the render world wrote to since the main world last looked.
+    wrote: Mutex<HashSet<AssetId<Image>>>,
     /// Uploads are staged for a texture that does not exist yet: the main
     /// world must keep updating until they land or are given up.
     pub waiting: AtomicBool,
@@ -47,11 +59,24 @@ impl Shared {
     pub fn push(&self, upload: SurfaceUpload) {
         self.pending.lock().unwrap().push(upload);
     }
-    pub fn take_repaints(&self) -> HashSet<AssetId<Image>> {
+    pub fn take_repaints(&self) -> HashMap<AssetId<Image>, RepaintReason> {
         std::mem::take(&mut *self.repaint.lock().unwrap())
     }
-    pub(crate) fn request_repaint(&self, image: AssetId<Image>) {
-        self.repaint.lock().unwrap().insert(image);
+    /// Images written since the last call.
+    pub fn take_written(&self) -> HashSet<AssetId<Image>> {
+        std::mem::take(&mut *self.wrote.lock().unwrap())
+    }
+    pub(crate) fn request_repaint(&self, image: AssetId<Image>, reason: RepaintReason) {
+        // A give-up is the stronger statement: it must not be overwritten by
+        // a replacement in the same batch.
+        let mut repaint = self.repaint.lock().unwrap();
+        let entry = repaint.entry(image).or_insert(reason);
+        if reason == RepaintReason::GaveUp {
+            *entry = reason;
+        }
+    }
+    pub(crate) fn note_written(&self, image: AssetId<Image>) {
+        self.wrote.lock().unwrap().insert(image);
     }
 }
 
@@ -104,7 +129,9 @@ pub(crate) fn write(
             if waited < MAX_WAIT_FRAMES {
                 waiting.push((upload, waited + 1));
             } else {
-                channel.0.request_repaint(upload.image);
+                channel
+                    .0
+                    .request_repaint(upload.image, RepaintReason::GaveUp);
             }
             continue;
         };
@@ -124,7 +151,9 @@ pub(crate) fn write(
             .is_some_and(|old| old != id)
             && !full
         {
-            channel.0.request_repaint(upload.image);
+            channel
+                .0
+                .request_repaint(upload.image, RepaintReason::Replaced);
         }
         for op in &upload.ops {
             queue.write_texture(
@@ -156,6 +185,7 @@ pub(crate) fn write(
                 .fetch_add(op.bytes.len() as u64, Ordering::Relaxed);
             channel.0.rects_written.fetch_add(1, Ordering::Relaxed);
         }
+        channel.0.note_written(upload.image);
     }
     channel
         .0
@@ -321,7 +351,10 @@ mod tests {
         }
         assert_eq!(gpu.written(), (0, 0));
         assert!(!gpu.shared.waiting.load(Ordering::Relaxed));
-        assert_eq!(gpu.shared.take_repaints(), HashSet::from([b]));
+        assert_eq!(
+            gpu.shared.take_repaints(),
+            HashMap::from([(b, RepaintReason::GaveUp)])
+        );
     }
 
     #[test]
@@ -346,7 +379,10 @@ mod tests {
         assert_ne!(first, second);
         gpu.shared.push(upload(a, tex, UVec2::splat(100), &partial));
         gpu.frame();
-        assert_eq!(gpu.shared.take_repaints(), HashSet::from([a]));
+        assert_eq!(
+            gpu.shared.take_repaints(),
+            HashMap::from([(a, RepaintReason::Replaced)])
+        );
         // A full repaint of the visible part does not.
         gpu.texture(a, tex);
         let full = [Rect::new(0, 0, 100, 100)];

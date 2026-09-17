@@ -717,7 +717,9 @@ fn a_surface_that_cannot_draw_drops_its_ime_target_and_keeps_its_repaint() {
     let mut views = h.app.world_mut().query::<&ImageNode>();
     let image = views.single(h.app.world()).unwrap().image.id();
     h.geometry(0, 0, 1.5);
-    channel.0.request_repaint(image);
+    channel
+        .0
+        .request_repaint(image, crate::gpu::RepaintReason::Replaced);
     let before = h.totals();
     h.run(3);
     assert_eq!(target(&h), ExternalImeTarget::default());
@@ -1106,4 +1108,59 @@ fn the_ime_caret_is_published_in_both_spaces() {
     );
     // Exactly the UiScale factor apart, which is the double-count this field exists to avoid.
     assert!(close(output_logical.min, ime.cursor.min * ui_scale));
+}
+
+/// A texture Bevy re-creates is a normal event; only a texture that never
+/// prepares may stop a surface, and a successful write clears the count.
+#[test]
+fn only_a_real_give_up_counts_against_a_surface() {
+    use crate::gpu::RepaintReason;
+    let mut h = Harness::new();
+    let channel = crate::gpu::GpuChannel::default();
+    h.app.insert_resource(channel.clone());
+    h.run(2);
+    let image = h
+        .app
+        .world_mut()
+        .query::<&ImageNode>()
+        .single(h.app.world())
+        .unwrap()
+        .image
+        .id();
+
+    // Three replacements at one geometry: the surface keeps uploading.
+    for _ in 0..(crate::bridge::MAX_GIVEUPS + 1) {
+        channel.0.request_repaint(image, RepaintReason::Replaced);
+        h.run(2);
+    }
+    let after_replacements = h.totals().bytes_queued;
+    channel.0.request_repaint(image, RepaintReason::Replaced);
+    h.run(3);
+    assert!(
+        h.totals().bytes_queued > after_replacements,
+        "a replaced texture must still be uploaded"
+    );
+
+    // Three give-ups at one geometry: it stops.
+    for _ in 0..crate::bridge::MAX_GIVEUPS {
+        channel.0.request_repaint(image, RepaintReason::GaveUp);
+        h.run(2);
+    }
+    let stopped = h.totals().bytes_queued;
+    channel.0.request_repaint(image, RepaintReason::GaveUp);
+    h.run(3);
+    assert_eq!(
+        h.totals().bytes_queued,
+        stopped,
+        "an abandoned texture must stop being uploaded"
+    );
+
+    // A write proves the texture works: the count clears and uploads resume.
+    channel.0.note_written(image);
+    channel.0.request_repaint(image, RepaintReason::Replaced);
+    h.run(3);
+    assert!(
+        h.totals().bytes_queued > stopped,
+        "a written texture must be trusted again"
+    );
 }

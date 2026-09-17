@@ -28,7 +28,7 @@ use cosmix_shell::runtime::{
 };
 use serde_json::{Value, json};
 
-use crate::gpu::{GpuChannel, SurfaceUpload};
+use crate::gpu::{GpuChannel, RepaintReason, SurfaceUpload};
 use crate::surface::{
     CursorIcon, ImeEvent, ImeRequest, Key, Modifiers, NamedKey, PointerButton, Processed, Rect,
     ScrollUnit, SurfaceEvent, SurfaceRenderer,
@@ -949,25 +949,35 @@ pub(crate) fn frame(
         .as_ref()
         .map(|channel| channel.0.take_repaints())
         .unwrap_or_default();
+    // A texture that was written to is working, whatever it did before.
+    let written = channel
+        .as_ref()
+        .map(|channel| channel.0.take_written())
+        .unwrap_or_default();
     let mut next_wake: Option<Duration> = None;
     let mut cursor = None;
     counters.surfaces = surfaces.iter().count();
     for (entity, geometry, mut state, mut ime_target) in &mut surfaces {
-        if state
-            .image
-            .as_ref()
-            .is_some_and(|image| repaints.contains(&image.id()))
-        {
-            // Consumed from the channel now; kept here until the surface
-            // next draws.
-            state.size = UVec2::ZERO;
-            state.giveups += 1;
-            if state.giveups == MAX_GIVEUPS {
-                warn!(
-                    "scene-iced: a surface texture was abandoned {} times; it stays blank until \
-                     its geometry changes",
-                    state.giveups
-                );
+        if let Some(image) = state.image.as_ref().map(|image| image.id()) {
+            if written.contains(&image) {
+                state.giveups = 0;
+            }
+            if let Some(reason) = repaints.get(&image) {
+                // Consumed from the channel now; kept here until the surface
+                // next draws.
+                state.size = UVec2::ZERO;
+                // A replacement is normal and recoverable; only a texture that
+                // never prepared counts against the surface.
+                if *reason == RepaintReason::GaveUp {
+                    state.giveups += 1;
+                    if state.giveups == MAX_GIVEUPS {
+                        warn!(
+                            "scene-iced: a surface texture was abandoned {} times; it stays blank \
+                             until it is written or its geometry changes",
+                            state.giveups
+                        );
+                    }
+                }
             }
         }
         let size = geometry.size;
