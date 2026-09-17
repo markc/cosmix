@@ -94,7 +94,8 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<crate::demos::DemoState>()
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
-            .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input));
+            .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input))
+            .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation));
     }
 }
 
@@ -103,7 +104,35 @@ struct SceneBus<'w, 's> {
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
-    resize_results: MessageReader<'w, 's, cosmix_shell::runtime::ShellResizeResult>,
+}
+
+// Reply after model application in the same update: a refusal need not
+// schedule another frame, and must not wait for an unrelated wake.
+fn reply_resizes(
+    bridge: Res<BusBridge>,
+    mut state: ResMut<ShellBusState>,
+    mut results: MessageReader<cosmix_shell::runtime::ShellResizeResult>,
+) {
+    for result in results.read() {
+        if let Some(request) = state.pending_resizes.remove(&result.request_id) {
+            let (rc, body) = match &result.result {
+                Ok(()) => (0, json!({"accepted":true})),
+                Err(error) => (
+                    10,
+                    json!({"error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
+                ),
+            };
+            stash_or_respond(
+                &bridge,
+                &mut state,
+                request,
+                rc,
+                body.to_string(),
+                None,
+                &mut |_| {},
+            );
+        }
+    }
 }
 
 fn service_bus(
@@ -220,27 +249,6 @@ fn service_bus(
             command,
             &mut dispatch,
         );
-    }
-
-    for result in content.resize_results.read() {
-        if let Some(request) = state.pending_resizes.remove(&result.request_id) {
-            let (rc, body) = match &result.result {
-                Ok(()) => (0, json!({"accepted":true})),
-                Err(error) => (
-                    10,
-                    json!({"error":error, "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
-                ),
-            };
-            stash_or_respond(
-                &bridge,
-                &mut state,
-                request,
-                rc,
-                body.to_string(),
-                None,
-                &mut dispatch,
-            );
-        }
     }
 
     for request in bridge.drain_inbound() {
@@ -1148,7 +1156,6 @@ mod tests {
             let mut req = local("shell.panel.resize");
             req.body = r#"{"edge":"left","thickness_px":240}"#.into();
             peer.send(req);
-            app.update();
             assert!(
                 peer.drain_responses().is_empty(),
                 "no speculative acceptance"
