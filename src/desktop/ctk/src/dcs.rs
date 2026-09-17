@@ -12,7 +12,7 @@ use bevy::app::PostUpdate;
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 use bevy::ecs::hierarchy::Children;
 use bevy::ecs::observer::On;
 #[cfg(debug_assertions)]
@@ -1294,7 +1294,9 @@ mod tests {
     use bevy::ecs::world::CommandQueue;
     use bevy::image::{ImagePlugin, TextureAtlasPlugin};
     use bevy::input::InputPlugin;
-    use bevy::math::{UVec2, Vec2};
+    use bevy::math::UVec2;
+    #[cfg(debug_assertions)]
+    use bevy::math::Vec2;
     use bevy::mesh::MeshPlugin;
     use bevy::picking::PickingPlugin;
     use bevy::prelude::MinimalPlugins;

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/cosmix-scene</title>
+    <title>CosMix — cos/ctk-text-fields</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,36 +441,15 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/cosmix-scene.md"><div class="prose"><h1 id="cosmix-scene">cosmix-scene</h1>
-<p>For the retained CTK renderer and shell verbs, see <a href="scenes">Mix Scenes in Quoin</a>.</p>
-<p><code>cosmix-scene</code> parses a bounded Mix Scenes v0 document into a renderer-neutral
-tree. A document is a Bus envelope with required <code>scene: 1</code>, <code>name</code> and
-<code>citizen</code> headers. <code>window</code>, <code>subscribe</code>, <code>targets</code> and <code>model</code> are optional
-single-line JSON headers. <code>window.kind</code> is <code>edge</code> in v0; the envelope is the
-mount request and a window-family node is optional. If both exist, their kinds
-must agree.</p>
-<p>The body contains exactly one fenced <code>mix</code> strict-data map. Nodes have the
-shape <code>id: { widget: family, ...ports }</code>. The ten families are <code>window</code>,
-<code>column</code>, <code>row</code>, <code>text</code>, <code>field</code>, <code>button</code>, <code>toggle</code>, <code>list</code>, <code>image</code> and
-<code>spacer</code>. Their required and optional ports, defaults and handler ports are
-described by <code>describe()</code>. Enum ports (<code>window.kind</code>, <code>window.edge</code>,
-<code>row.align</code>, and <code>button.tone</code>) are validated during lint. Numeric ports are
-always JSON floating-point values: <code>13</code> resolves and travels as <code>13.0</code>.</p>
-<p>Lists require rows of <code>{id: string, cells: [string]}</code>, a sibling <code>row</code>
-template and a positive <code>row_height</code>. Template subtrees may contain only row,
-column, text, spacer and image. <code>{cells[i]}</code> is allowed only in <code>text.text</code>,
-and must be within the minimum cell count across all rows. Template nodes are
-marked in <code>ResolvedScene</code>; their ids are not rendered. <code>@</code> is reserved for
-future <code>&lt;template&gt;@&lt;row&gt;</code> instance ids and is rejected in source node ids.</p>
-<p>Lint reports bounded-document, schema, graph, template, row and header
-diagnostics. <code>orphan-node</code> is a warning; other violations are errors. The
-resolver returns diagnostics for unknown families rather than panicking.</p>
-<p><code>diff(old, new)</code> emits <code>Remove</code>, <code>Insert { parent, index }</code>, <code>SetPort</code>,
-<code>Reparent</code>, and scene-level <code>SetScene</code> operations for name, citizen, window
-and subscribe changes. A dropped port emits <code>SetPort</code> with JSON <code>null</code> to
-clear it. Consumers apply operations in this order: Remove, Insert, SetPort,
-Reparent. Scene operations should update the mount metadata as part of the
-same reload.</p></div></div>
+        <div id="content-doc" data-prerendered="cos/ctk-text-fields.md"><div class="prose"><h1 id="ctk-text-fields">CTK text fields</h1>
+<p><code>CtkTextFieldProps::placeholder(text)</code> displays ghost text while a plain
+single-line field is empty. The hint is a separate, non-interactive text
+entity: it never becomes the field value, selection, clipboard content or
+submitted text. An active IME composition hides the hint until composition
+ends. Updating a field does not require replacing its editable entity.</p>
+<p><code>CtkTextFieldPlaceholder</code> identifies the hint and its input entity for hosts
+that need to update the hint after construction. Its <code>Text</code> component holds
+the displayed placeholder.</p></div></div>
     </div>
 
 </main>

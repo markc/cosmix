@@ -35,11 +35,10 @@
 //! `{"error": "..."}` (the worker answers RC 11 busy before requests reach
 //! this module). Read-only discovery (`app.describe`, `app.controls.list`/
 //! `.get`, `actions.list`/`.describe`) retains its established open contract.
-//! **Every other app-port verb** — named app verbs included — applies the same
-//! fail-closed local caller gate as `action.invoke` and `app.controls.set`:
-//! the recipient noded must stamp `broker_origin: local`, and the caller must
-//! also have a canonical registered service identity. Named verbs can mutate
-//! app state (quit, transport, loads), so they are never anonymous.
+//! **Every app-port verb** admits broker-stamped `broker_origin: mesh`
+//! deliveries without principal attestation. For local deliveries, the caller
+//! must have a canonical registered service identity. Operation validation is
+//! independent of admission and applies to both paths.
 //!
 //! [`WidgetControlPlugin`] supplies the three `app.controls.*` verbs. The
 //! compatibility [`AppControlPlugin`] composes the base port + widget-control
@@ -55,8 +54,8 @@ use std::collections::HashMap;
 
 use bevy::app::{App, AppExit, Plugin, Update};
 use bevy::ecs::entity::Entity;
-use bevy::ecs::message::MessageWriter;
 use bevy::ecs::lifecycle::RemovedComponents;
+use bevy::ecs::message::MessageWriter;
 use bevy::ecs::query::{Added, Has};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
@@ -79,19 +78,39 @@ use crate::widgets::{
 /// eventual spec; consumers should expect `v0` to move.
 pub const APP_CONTROL_CONTRACT: &str = "ctk-app-control.v0";
 
-/// Why an Bus caller failed the current same-node provenance gate.
+/// Why a Bus caller lacked mesh provenance or a registered local identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalCallerError {
     UnregisteredCaller,
     RemoteIdentityUnavailable,
 }
 
-/// Accept only deliveries stamped local by the recipient's noded.
+/// Accept broker-stamped mesh deliveries and registered local callers.
+/// Mesh membership is sufficient for every verb; no principal attestation is required.
+/// The historical function name remains for compatibility with app callers.
 ///
 /// `broker_origin` is broker-owned: noded strips every client spelling and
 /// overwrites it from connection state on delivery. Absence fails closed, so
 /// CTK mutation requires the matching broker release.
 pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
+    authorize_with_mesh_policy(
+        request,
+        std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0"),
+    )
+}
+
+fn authorize_with_mesh_policy(
+    request: &InboundRequest,
+    mesh_open: bool,
+) -> Result<(), LocalCallerError> {
+    let mut origins = request
+        .headers
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case("broker_origin"))
+        .map(|(_, value)| value.as_str());
+    if mesh_open && origins.next() == Some("mesh") && origins.next().is_none() {
+        return Ok(());
+    }
     let asserted = request.headers.keys().any(|name| {
         name.eq_ignore_ascii_case("source_peer")
             || name.eq_ignore_ascii_case("permissions")
@@ -121,69 +140,6 @@ fn is_bus_service_name(value: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-}
-
-/// Authorize a caller for a **mesh-reachable** app verb: a local caller (per
-/// [`authorize_local_caller`]) OR an admitted, broker-attested mesh peer. This
-/// is the network-ARexx path — any app on any mesh node driving this one — with
-/// the guard rail kept: attestation, never anonymity.
-///
-/// The mesh branch mirrors the shipping boids `wallpaper.props.set` gate. It
-/// refuses wire-asserted identity (`source_peer`/`permissions`/`signed_ident` —
-/// a client cannot vouch for itself), requires the broker-stamped
-/// `broker_origin: mesh`, and demands the recipient noded's own attestation:
-/// `broker_peer` + `broker_service`, with the canonical `from == "bridge-<peer>"`.
-/// noded stamps that pair only for a Verified, admission-passed, non-revoked
-/// direct bridge, so "authorized" means "an admitted mesh peer", never "anyone
-/// who reached the socket".
-pub fn authorize_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
-    if authorize_local_caller(request).is_ok() {
-        return Ok(());
-    }
-    // A wire-asserted identity is never trusted on the mesh branch either.
-    if request.headers.keys().any(|key| {
-        ["source_peer", "permissions", "signed_ident"]
-            .iter()
-            .any(|name| key.eq_ignore_ascii_case(name))
-    }) {
-        return Err(LocalCallerError::RemoteIdentityUnavailable);
-    }
-    let header = |name: &str| {
-        let mut values = request
-            .headers
-            .iter()
-            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.as_str());
-        let value = values.next();
-        // A duplicated broker header is ambiguous — refuse rather than guess.
-        if values.next().is_some() { None } else { value }
-    };
-    if header("broker_origin") != Some("mesh") {
-        return Err(LocalCallerError::RemoteIdentityUnavailable);
-    }
-    // AGENTIC-FIRST open posture (Mark, 2026-09-14): trust any admitted WG mesh
-    // peer on membership alone. `broker_origin` is set by noded from the source
-    // IP and is not forgeable, and wire-asserted identity headers were rejected
-    // above, so `broker_origin=="mesh"` already proves an admitted WG peer — the
-    // WG /24 + signed inventory is the trust boundary. The strict per-peer bridge
-    // attestation below is retained and re-armed by setting COSMIX_MESH_OPEN=0.
-    // (Interim: MUST-IMPLEMENT the shared cosmix-authd authorizer —
-    // _plan/2026-09-14-cosmix-authd-mesh-authorization.md — so this posture
-    // lives in ONE place instead of every app's gate.)
-    if std::env::var("COSMIX_MESH_OPEN").map_or(true, |v| v != "0") {
-        return Ok(());
-    }
-    match (header("broker_peer"), header("broker_service")) {
-        (Some(peer), Some(service))
-            if !peer.is_empty()
-                && request.from == format!("bridge-{peer}")
-                && is_bus_service_name(&request.from)
-                && is_bus_service_name(service) =>
-        {
-            Ok(())
-        }
-        _ => Err(LocalCallerError::UnregisteredCaller),
-    }
 }
 
 // `ControlMeta` is attached by feature-independent spawners (the mixer board
@@ -400,10 +356,8 @@ impl Plugin for AppPortPlugin {
             .insert("app.describe".into(), describe);
         assert!(replaced.is_none(), "app.describe registered twice");
         // Generic, cross-app lifecycle verb: every app that installs the port
-        // is quittable over the Bus by the same name. Gated but mesh-reachable
-        // (see `mesh_accepting_verb`): a local caller OR an admitted,
-        // broker-attested mesh peer may drive it — the network-ARexx default of
-        // any node driving any app, never a human gate, never anonymous.
+        // is quittable over the Bus by the same name. Mesh membership admits
+        // every verb, including lifecycle and app-specific commands.
         let quit = app.world_mut().register_system(quit_app);
         let replaced = app
             .world_mut()
@@ -669,15 +623,6 @@ fn dispatch_gate_skips(command: &str) -> bool {
     )
 }
 
-/// Verbs an admitted mesh peer may drive, not only a local caller. The generic
-/// app-lifecycle surface: quitting an app is a legitimate network-ARexx
-/// operation across the mesh, gated by broker attestation
-/// ([`authorize_caller`]), not confined to the owning node. App-specific named
-/// verbs are NOT listed here — they stay local-only unless deliberately added.
-fn mesh_accepting_verb(command: &str) -> bool {
-    command == "app.quit"
-}
-
 pub(crate) fn dispatch_app_request(
     world: &mut World,
     app_name: &str,
@@ -685,21 +630,14 @@ pub(crate) fn dispatch_app_request(
 ) -> AppPortReply {
     let command = request.command.clone();
     if !dispatch_gate_skips(&command) {
-        // Mesh-reachable verbs (the generic app-lifecycle surface, e.g.
-        // app.quit) admit an attested mesh peer as well as a local caller; every
-        // other named verb stays local-only. See [`authorize_caller`].
-        let decision = if mesh_accepting_verb(&command) {
-            authorize_caller(&request)
-        } else {
-            authorize_local_caller(&request)
-        };
+        let decision = authorize_local_caller(&request);
         if let Err(error) = decision {
             return error_reply(match error {
                 LocalCallerError::UnregisteredCaller => {
                     "app verbs require a registered same-node caller"
                 }
                 LocalCallerError::RemoteIdentityUnavailable => {
-                    "remote ingress is closed until authenticated provenance is available"
+                    "remote ingress requires broker mesh origin and COSMIX_MESH_OPEN != 0"
                 }
             });
         }
@@ -1135,9 +1073,10 @@ mod tests {
         app
     }
 
-    /// Build a request that looks like an attested, admitted mesh peer: the
-    /// broker-stamped `broker_origin: mesh`, the recipient noded's attestation
-    /// (`broker_peer` + `broker_service`), and the canonical bridge `from`.
+    /// Build a request shaped like a real bridged mesh delivery: the
+    /// broker-stamped `broker_origin: mesh`, the `broker_peer` +
+    /// `broker_service` headers noded adds (informational only; admission
+    /// ignores them), and the canonical bridge `from`.
     fn attested_mesh(command: &str, peer: &str, service: &str) -> InboundRequest {
         let mut request = request(command, &[]);
         request.from = format!("bridge-{peer}");
@@ -1149,6 +1088,27 @@ mod tests {
             .headers
             .insert("broker_service".into(), service.into());
         request
+    }
+
+    #[test]
+    fn mesh_policy_defaults_open_and_opt_in_lock_keeps_local_admission() {
+        let local = request("app.test", &[]);
+        let mut mesh = local.clone();
+        mesh.from.clear();
+        mesh.headers.insert("broker_origin".into(), "mesh".into());
+        assert_eq!(authorize_with_mesh_policy(&mesh, true), Ok(()));
+        assert_eq!(
+            authorize_with_mesh_policy(&mesh, false),
+            Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
+        for open in [false, true] {
+            assert_eq!(authorize_with_mesh_policy(&local, open), Ok(()));
+            let mut duplicate = mesh.clone();
+            duplicate
+                .headers
+                .insert("BROKER_ORIGIN".into(), "mesh".into());
+            assert!(authorize_with_mesh_policy(&duplicate, open).is_err());
+        }
     }
 
     #[test]
@@ -1196,43 +1156,20 @@ mod tests {
     }
 
     #[test]
-    fn app_quit_is_mesh_reachable_only_when_attested() {
-        // The generic lifecycle verb is network-ARexx: an admitted mesh peer may
-        // quit the app, but only with the recipient noded's attestation — never
-        // an anonymous or self-asserted remote caller, and only for app.quit
-        // (app-specific named verbs stay local-only).
+    fn every_app_verb_is_mesh_reachable_without_attestation() {
         let mut app = gated_test_app();
-
-        // Local caller: allowed, as before.
-        let (rc, _) = call(&mut app, &request("app.quit", &[]));
-        assert_eq!(rc, 0, "a local caller may quit");
-
-        // Attested, admitted mesh peer: allowed — this is the cross-node path.
-        let (rc, _) = call(&mut app, &attested_mesh("app.quit", "alpha", "agent"));
-        assert_eq!(rc, 0, "an attested mesh peer may quit the app");
-
-        // Mesh origin WITHOUT the broker's attestation: refused.
-        let mut bare = request("app.quit", &[]);
-        bare.headers.insert("broker_origin".into(), "mesh".into());
-        let (rc, _) = call(&mut app, &bare);
-        assert_eq!(rc, 10, "mesh origin without attestation is refused");
-
-        // Attestation present but `from` is not the canonical bridge: refused
-        // (a registered mesh service cannot borrow another peer's identity).
-        let mut wrong_from = attested_mesh("app.quit", "alpha", "agent");
-        wrong_from.from = "bridge-beta".into();
-        let (rc, _) = call(&mut app, &wrong_from);
-        assert_eq!(rc, 10, "broker_peer must match the bridge from");
-
-        // Wire-asserted identity on the mesh branch: never trusted.
-        let mut spoof = attested_mesh("app.quit", "alpha", "agent");
-        spoof.headers.insert("signed_ident".into(), "mesh:evil".into());
-        let (rc, _) = call(&mut app, &spoof);
-        assert_eq!(rc, 10, "a self-asserted identity is refused");
-
-        // An app-specific named verb is NOT mesh-reachable even when attested.
-        let (rc, _) = call(&mut app, &attested_mesh("app.test", "alpha", "agent"));
-        assert_eq!(rc, 10, "only app.quit opts into the mesh, not every verb");
+        for command in ["app.quit", "app.test"] {
+            let mut mesh = request(command, &[]);
+            mesh.from.clear();
+            mesh.headers.insert("broker_origin".into(), "mesh".into());
+            let (rc, _) = call(&mut app, &mesh);
+            assert_eq!(
+                rc, 0,
+                "mesh membership admits {command} without a principal"
+            );
+            let (rc, _) = call(&mut app, &attested_mesh(command, "alpha", "agent"));
+            assert_eq!(rc, 0);
+        }
     }
 
     #[test]
@@ -1546,8 +1483,8 @@ mod tests {
         let mut mesh = request("app.controls.set", &[("target", "trim"), ("value", "2")]);
         mesh.headers.insert("broker_origin".into(), "mesh".into());
         let (rc, _) = call(&mut app, &mesh);
-        assert_eq!(rc, 10);
-        assert_eq!(app.world().get::<ControlValue>(knob).unwrap().0, -6.0);
+        assert_eq!(rc, 0);
+        assert_eq!(app.world().get::<ControlValue>(knob).unwrap().0, 2.0);
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub struct ShellCommand {
 /// Semantic shell actions; no transport is implied.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ShellCommandKind {
+    Scene(super::SceneVerb),
     Quit,
     Geometry(LogicalSize),
     Resize {
@@ -38,6 +39,12 @@ pub enum ShellCommandKind {
         edge: Edge,
         thickness_px: f32,
     },
+    /// Resize with an application receipt, for request/reply transports.
+    ResizeChecked {
+        edge: Edge,
+        thickness_px: f32,
+        request_id: u64,
+    },
     Corner(CornerEvent),
     Panel {
         edge: Edge,
@@ -47,6 +54,22 @@ pub enum ShellCommandKind {
         edge: Edge,
         input: CarouselInput,
     },
+}
+
+#[cfg_attr(feature = "chrome-core", derive(bevy::prelude::Message))]
+#[derive(Clone, Debug)]
+pub struct ShellResizeResult {
+    pub request_id: u64,
+    pub edge: Edge,
+    pub requested: f32,
+    pub max: f32,
+    pub result: Result<(), ShellResizeError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ShellResizeError {
+    OutputChanged,
+    Configuration(crate::core::PanelConfigError),
 }
 
 /// One edge-attributed semantic transition from the current model update.
@@ -75,6 +98,7 @@ pub enum KeyboardInteractivity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelPresentation {
     pub edge: Edge,
+    pub max_thickness_px: f32,
     pub mode: PanelMode,
     pub mapped: bool,
     pub visible_fraction: f32,
@@ -112,6 +136,7 @@ impl ShellFrame {
             let panel = model.panel(edge);
             PanelPresentation {
                 edge,
+                max_thickness_px: model.max_thickness(edge),
                 mode: panel.mode,
                 mapped: panel.mapped,
                 visible_fraction: panel.visible_fraction,

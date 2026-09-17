@@ -6,8 +6,34 @@ use crate::core::{Edge, OutputKey, PanelInput};
 
 use super::{CarouselInput, ShellCommand, ShellCommandKind};
 
+/// Scene requests are handled by the host's scene adapter, not panel motion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SceneVerb {
+    Load,
+    Patch,
+    Get,
+    Describe,
+    Unload,
+    Watch,
+}
+
+impl SceneVerb {
+    pub fn parse(command: &str) -> Option<Self> {
+        Some(match command {
+            "shell.scene.load" => Self::Load,
+            "shell.scene.patch" => Self::Patch,
+            "shell.scene.get" => Self::Get,
+            "shell.scene.describe" => Self::Describe,
+            "shell.scene.unload" => Self::Unload,
+            "shell.scene.watch" => Self::Watch,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ShellSemanticVerb {
+    Scene(SceneVerb),
     PanelShow,
     PanelHide,
     PanelToggle,
@@ -30,6 +56,7 @@ pub fn semantic_shell_command(
     verb: ShellSemanticVerb,
 ) -> ShellCommand {
     let kind = match verb {
+        ShellSemanticVerb::Scene(verb) => ShellCommandKind::Scene(verb),
         ShellSemanticVerb::PanelShow => ShellCommandKind::Panel {
             edge,
             input: PanelInput::Reveal,

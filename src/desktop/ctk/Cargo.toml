@@ -3,7 +3,7 @@
 # consumed by apps over a `../../ctk` path dependency. See desktop/APPS.md.
 [package]
 name = "ctk"
-version = "0.54.4"
+version = "0.56.0"
 description = "Cosmix Tool Kit — reusable, Bus-citizen Bevy widgets for dense desktop surfaces"
 edition = "2021"
 rust-version = "1.95"
@@ -87,7 +87,6 @@ body-view = [
     "dep:cssparser",
     "dep:html5ever",
     "dep:markup5ever_rcdom",
-    "dep:parley",
 ]
 # Native OS clipboard access for editable text. Default-off because it binds a
 # host clipboard backend; without it Bevy retains its in-process text clipboard.
@@ -126,6 +125,7 @@ accesskit = "0.24"
 # system fonts instead of an app that cannot start. Cargo unifies features
 # across the graph, so declaring it here applies to Parley's copy.
 fontique = { version = "0.9", default-features = false, features = [
+    "std",
     "fontconfig-dlopen",
 ] }
 
@@ -151,7 +151,7 @@ notify = { version = "8.2", optional = true }
 # Bevy exposes its shaped `ComputedTextBlock` layout publicly but does not
 # re-export Parley. Keep this exact so cursor hit-testing and selection geometry
 # name the same Parley types as bevy_text 0.19.
-parley = { version = "=0.9.0", optional = true }
+parley = "=0.9.0"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"], optional = true }
@@ -163,6 +163,7 @@ zeroize = "1"
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../crates/cosmix-lib-buildinfo" }
 
 [dev-dependencies]
+parley = "=0.9.0"
 futures-util = "0.3"
 tempfile = "3"
 tokio-tungstenite = "0.26"

@@ -63,9 +63,10 @@ impl ShellModel {
         self.last_update
     }
 
-    /// Update current host geometry without changing stored panel thicknesses.
+    /// Update current host geometry and fit panels within its exclusive budget.
     pub fn set_geometry(&mut self, geometry: LogicalSize) {
         self.geometry = geometry;
+        self.fit_output_budget();
     }
 
     pub fn panel(&self, edge: Edge) -> PanelSnapshot {
@@ -90,10 +91,60 @@ impl ShellModel {
         edge: Edge,
         thickness: f32,
     ) -> Result<(), PanelConfigError> {
+        let thickness = if thickness.is_finite() && thickness > 0.0 {
+            thickness.min(self.max_thickness(edge))
+        } else {
+            thickness
+        };
         self.panels[edge.index()].restore_thickness(thickness)
     }
 
+    /// Maximum thickness that leaves space for the opposite panel and work area.
+    pub fn max_thickness(&self, edge: Edge) -> f32 {
+        let (opposite, extent) = match edge {
+            Edge::Left => (Edge::Right, self.geometry.width()),
+            Edge::Right => (Edge::Left, self.geometry.width()),
+            Edge::Top => (Edge::Bottom, self.geometry.height()),
+            Edge::Bottom => (Edge::Top, self.geometry.height()),
+        };
+        // Leave a positive extent for the opposing surface and the work area.
+        // A zero-sized layer configure means "client chooses", not a valid
+        // empty viewport, and can otherwise disconnect opposing panels.
+        let minimum = 1.0_f32.min(extent / 4.0);
+        (extent - self.panel(opposite).exclusive_zone_px.max(minimum) - minimum).max(minimum)
+    }
+
+    fn fit_output_budget(&mut self) {
+        for (a, b, extent) in [
+            (Edge::Left, Edge::Right, self.geometry.width()),
+            (Edge::Top, Edge::Bottom, self.geometry.height()),
+        ] {
+            let total = self.panel(a).exclusive_zone_px + self.panel(b).exclusive_zone_px;
+            if total > (extent - 1.0).max(2.0) {
+                let ratio = (extent - 1.0).max(2.0) / total;
+                for edge in [a, b] {
+                    let size = (self.panel(edge).thickness_px * ratio).max(1.0);
+                    let _ = self.panels[edge.index()].restore_thickness(size);
+                }
+            }
+            for edge in [a, b] {
+                let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+            }
+        }
+    }
+
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
+        let max = self.max_thickness(edge);
+        if thickness > max {
+            return Err(PanelConfigError::ThicknessBudget {
+                edge,
+                requested: thickness,
+                max,
+            });
+        }
+        if max < *super::RESIZE_THICKNESS_RANGE.start() && thickness == max {
+            return self.panels[edge.index()].restore_thickness(thickness);
+        }
         self.panels[edge.index()].resize_thickness(thickness)
     }
 
@@ -112,6 +163,7 @@ impl ShellModel {
         }
         self.carousels = outgoing.carousels.clone();
         self.last_update = outgoing.last_update;
+        self.fit_output_budget();
     }
 
     pub fn panel_input(
@@ -121,6 +173,9 @@ impl ShellModel {
         input: PanelInput,
     ) -> Result<PanelUpdate, PanelTimeError> {
         self.ensure_monotonic(at)?;
+        if matches!(input, PanelInput::Pin | PanelInput::PinToggle) {
+            let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+        }
         let update = self.panels[edge.index()].apply(at, input)?;
         self.last_update = at;
         Ok(update)

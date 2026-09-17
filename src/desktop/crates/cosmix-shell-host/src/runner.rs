@@ -1341,7 +1341,11 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
     })
 }
 
+#[path = "ime.rs"]
+mod ime;
+
 struct RunnerState {
+    text_input: ime::TextInputBridge,
     app: App,
     connection: Connection,
     registry_state: RegistryState,
@@ -1523,6 +1527,7 @@ impl<'loop_handle>
         if run_layer_host_app_update_at(&mut self.app, sample) {
             self.needs_update = true;
         }
+        self.sync_text_input();
     }
 
     fn app_exit(&mut self) -> Option<AppExit> {
@@ -1616,6 +1621,7 @@ fn run_layer_host(
     let fractional_manager = globals.bind(&qh, 1..=1, GlobalData).ok();
     let viewporter = globals.bind(&qh, 1..=1, GlobalData).ok();
     let mut state = RunnerState {
+        text_input: ime::TextInputBridge::new(&globals, &qh),
         app,
         connection: connection.clone(),
         registry_state,
@@ -3046,6 +3052,7 @@ impl RunnerState {
         }
         for seat in self.keyboard_seats.clone() {
             if let Ok(keyboard) = self.seat_state.get_keyboard(qh, &seat, None) {
+                self.text_input.attach(&seat, qh);
                 self.active_keyboard_seat = Some(seat);
                 self.active_keyboard = Some(keyboard);
                 break;
@@ -3064,6 +3071,7 @@ impl RunnerState {
         if let Some(keyboard) = self.active_keyboard.take() {
             release_keyboard(keyboard);
         }
+        self.text_input.detach();
         self.active_keyboard_seat = None;
         self.promote_keyboard(qh);
     }

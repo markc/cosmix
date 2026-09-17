@@ -9,12 +9,13 @@ mod bevy_runtime;
 
 pub use messages::{
     CarouselInput, HostGeometry, KeyboardInteractivity, PanelPresentation, ShellCommand,
-    ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, WakePolicy,
+    ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, ShellResizeError,
+    ShellResizeResult, WakePolicy,
 };
-pub use semantic::{ShellSemanticVerb, semantic_shell_command};
+pub use semantic::{SceneVerb, ShellSemanticVerb, semantic_shell_command};
 
 #[cfg(feature = "chrome-core")]
 pub use bevy_runtime::{
     ShellEffects, ShellFrameState, ShellQuitHandler, ShellRuntimePlugin, ShellRuntimeSet,
-    replace_shell_model,
+    replace_shell_model, set_page_thickness, set_shell_pages,
 };

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/cosmix-scene</title>
+    <title>CosMix — cos/scenes</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,36 +441,63 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/cosmix-scene.md"><div class="prose"><h1 id="cosmix-scene">cosmix-scene</h1>
-<p>For the retained CTK renderer and shell verbs, see <a href="scenes">Mix Scenes in Quoin</a>.</p>
-<p><code>cosmix-scene</code> parses a bounded Mix Scenes v0 document into a renderer-neutral
-tree. A document is a Bus envelope with required <code>scene: 1</code>, <code>name</code> and
-<code>citizen</code> headers. <code>window</code>, <code>subscribe</code>, <code>targets</code> and <code>model</code> are optional
-single-line JSON headers. <code>window.kind</code> is <code>edge</code> in v0; the envelope is the
-mount request and a window-family node is optional. If both exist, their kinds
-must agree.</p>
-<p>The body contains exactly one fenced <code>mix</code> strict-data map. Nodes have the
-shape <code>id: { widget: family, ...ports }</code>. The ten families are <code>window</code>,
-<code>column</code>, <code>row</code>, <code>text</code>, <code>field</code>, <code>button</code>, <code>toggle</code>, <code>list</code>, <code>image</code> and
-<code>spacer</code>. Their required and optional ports, defaults and handler ports are
-described by <code>describe()</code>. Enum ports (<code>window.kind</code>, <code>window.edge</code>,
-<code>row.align</code>, and <code>button.tone</code>) are validated during lint. Numeric ports are
-always JSON floating-point values: <code>13</code> resolves and travels as <code>13.0</code>.</p>
-<p>Lists require rows of <code>{id: string, cells: [string]}</code>, a sibling <code>row</code>
-template and a positive <code>row_height</code>. Template subtrees may contain only row,
-column, text, spacer and image. <code>{cells[i]}</code> is allowed only in <code>text.text</code>,
-and must be within the minimum cell count across all rows. Template nodes are
-marked in <code>ResolvedScene</code>; their ids are not rendered. <code>@</code> is reserved for
-future <code>&lt;template&gt;@&lt;row&gt;</code> instance ids and is rejected in source node ids.</p>
-<p>Lint reports bounded-document, schema, graph, template, row and header
-diagnostics. <code>orphan-node</code> is a warning; other violations are errors. The
-resolver returns diagnostics for unknown families rather than panicking.</p>
-<p><code>diff(old, new)</code> emits <code>Remove</code>, <code>Insert { parent, index }</code>, <code>SetPort</code>,
-<code>Reparent</code>, and scene-level <code>SetScene</code> operations for name, citizen, window
-and subscribe changes. A dropped port emits <code>SetPort</code> with JSON <code>null</code> to
-clear it. Consumers apply operations in this order: Remove, Insert, SetPort,
-Reparent. Scene operations should update the mount metadata as part of the
-same reload.</p></div></div>
+        <div id="content-doc" data-prerendered="cos/scenes.md"><div class="prose"><h1 id="mix-scenes-in-quoin">Mix Scenes in Quoin</h1>
+<p>Quoin accepts renderer-neutral scene documents through <code>shell.scene.load</code>.
+The request body is the complete AMP document with one <code>mix</code> fence. The
+<code>cosmix-scene</code> parser and registry validate it before any live state changes.
+Invalid loads and patches return diagnostics and retain the last good tree.</p>
+<p>Scenes mount as pages in an edge panel. Floating windows are outside v0.
+The envelope's <code>window</code> header is the mount request; when absent, the window
+node supplies edge, title and extent. Patching that node reapplies the mount.
+An absent or cleared extent uses the shell's output-derived default thickness.
+Authored extents fit the output space left by opposing exclusive zones;
+pinning and output changes recheck that budget. Pointer resizes exceeding the
+remaining budget are rejected without changing panel thickness. Clearing ports resets their
+derived layout constraints. A spacer without a size flexes into free space.
+For a nested development host, select its compositor with <code>--comp-service</code>
+and a distinct registration with <code>--bus-service</code>; the default registration
+remains <code>shell</code>. Scene verb names retain the <code>shell.scene.</code> prefix.
+<code>shell.scene.get {scene}</code> returns the P1 resolved tree, including defaults,
+template metadata and numeric ports as floating-point values. An optional
+<code>path</code> selects <code>node.port</code>. <code>shell.scene.patch {scene,path,value}</code> validates
+a candidate before committing it; null clears an optional authored port.
+The complete serialised patch candidate must fit the same 256 KiB bound as
+loads. Rejected patches retain both the tree and its revision.
+<code>shell.scene.describe {family?}</code> reports the shared P1 registry.
+<code>shell.scene.unload {scene}</code> removes the page.</p>
+<p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
+<code>shell.scene.changed</code> for summaries <code>{scene,revision,ops,diagnostics}</code>;
+fetch the complete tree with <code>get</code>. Revisions increase on accepted loads and
+patches. Digests are SHA-256 of the serialised resolved tree.</p>
+<p>UI handlers are directed Bus requests to the document's citizen with
+<code>{scene,node,kind,value?,item?}</code>. Kinds are <code>click</code>, <code>change</code> and <code>submit</code>.
+Requests time out after two seconds; unavailable citizens are logged at most
+once per minute. Hover, focus and pointer motion stay local.</p>
+<p>Stable node IDs retain CTK field entities, selection, focus, composition and
+undo state. Plain fields use CTK's single-line editing transactions. Active
+edits take precedence over incoming value replacements while focused.
+Changing a field's family or password mode replaces that widget.</p>
+<p>List rows use CTK VirtualList. Row templates are instantiated with
+<code>template-node@row-id</code> identities and substitute only <code>{cells[i]}</code> in text.
+Text elision uses CTK's middle-elision policy.</p>
+<p>CTK shares the font source cache through weak references. Fonts still used by
+retained layouts keep the same atlas identity after idle cache pruning, so
+periodically updated labels do not accumulate duplicate font-atlas textures.</p>
+<p>The standalone shell host bridges Wayland text-input-v3 preedit and commit
+events to Bevy's editable text pipeline. Candidate positions come from the
+focused field's layout in its panel surface, without a primary Winit window.
+Focus generations and text-input <code>done</code> serials discard delayed batches for
+previously focused fields. Cursor-rectangle commits extend the current focus
+generation's serial range; input already in flight for that field still applies.
+The synthetic <code>cosmix-imeprobe --external-field</code> mode exercises an existing
+client field without opening the probe's own text window.</p>
+<p>Development builds may enable Quoin's <code>scene-gates</code> feature and set
+<code>COSMIX_SCENE_EDIT_GATE=clippanel</code>. The opt-in probe types, selects and starts
+composition through CTK, logs <code>SCENE_RETAINED_GATE READY</code>, then waits for a
+Bus reload. It checks entity identity, focus, selection, history and preedit,
+then performs undo and logs <code>SCENE_RETAINED_GATE PASS</code>. This is an in-process
+editing probe, not a physical keyboard or pointer injection test. It is absent
+from production builds.</p></div></div>
     </div>
 
 </main>

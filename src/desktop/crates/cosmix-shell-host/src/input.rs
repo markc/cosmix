@@ -654,8 +654,10 @@ pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
 fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
     match kind {
         ShellCommandKind::Quit => "quit",
+        ShellCommandKind::Scene(_) => "scene",
         ShellCommandKind::Resize { .. } => "resize",
         ShellCommandKind::ResizeCommit { .. } => "resize-commit",
+        ShellCommandKind::ResizeChecked { .. } => "resize-checked",
         ShellCommandKind::Geometry(_) => "geometry",
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",
@@ -991,12 +993,18 @@ impl PointerBridge {
         if let Some(resize) = self.resize
             && let Some(extent) = configured_extent(app, window, resize.edge)
         {
+            let max = app
+                .world()
+                .resource::<cosmix_shell::runtime::ShellFrameState>()
+                .0
+                .panel(resize.edge)
+                .max_thickness_px;
             stage_shell_command(
                 app,
                 output.clone(),
                 ShellCommandKind::Resize {
                     edge: resize.edge,
-                    thickness_px: resize.thickness(raw, extent),
+                    thickness_px: resize.thickness(raw, extent).min(max),
                 },
             );
         }
@@ -1341,6 +1349,38 @@ mod tests {
         assert_eq!(raw_position((-40.0, 600.0)), Some(Vec2::new(-40.0, 600.0)));
         assert_eq!(raw_position((f64::MAX, 0.0)), None);
         assert_eq!(raw_position((f64::NAN, 0.0)), None);
+    }
+
+    #[test]
+    fn fast_pointer_drag_stages_the_effective_budget_limit() {
+        let (mut app, window, output) = pointer_app();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(600.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model.restore_thickness(Edge::Right, 350.0).unwrap();
+        model
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .unwrap();
+        app.insert_resource(ShellFrameState(
+            cosmix_shell::runtime::ShellFrame::from_model(&model),
+        ));
+        let bridge = PointerBridge {
+            resize: Some(resize_session(Edge::Left)),
+            ..Default::default()
+        };
+        bridge.resize_motion(&mut app, &output, window, Vec2::splat(1000.0));
+        assert_eq!(
+            app.world().resource::<StagedShellCommands>().0[0].1,
+            ShellCommandKind::Resize {
+                edge: Edge::Left,
+                thickness_px: 249.0
+            }
+        );
     }
 
     #[test]

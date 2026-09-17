@@ -138,7 +138,9 @@ pub fn configure_named(app: &mut App, service: &str) {
         .init_resource::<SceneBus>()
         .init_resource::<ScenePointer>();
     let Some(url) = configured_noded_url() else {
-        eprintln!("bg-showcase: no node.conf.mix — running standalone; Bus app-control port disabled");
+        eprintln!(
+            "bg-showcase: no node.conf.mix — running standalone; Bus app-control port disabled"
+        );
         return;
     };
     let mut config = BusBridgeConfig::new(service, url);
@@ -717,8 +719,8 @@ mod tests {
             .insert("broker_origin".into(), "mesh".into());
         peer.send(request);
         app.update();
-        assert_eq!(peer.drain_responses()[0].rc, 10);
-        assert!(app.world().resource::<SceneControl>().paused);
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        assert!(!app.world().resource::<SceneControl>().paused);
     }
 
     #[test]

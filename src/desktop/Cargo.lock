@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bg-showcase"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bevy",
  "cosmix-bg-boing",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-busviewer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bevy",
  "cosmix-lib-client",
@@ -2904,7 +2904,7 @@ version = "0.1.0"
 
 [[package]]
 name = "cosmix-imeprobe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rustix 1.1.4",
  "wayland-client",
@@ -3130,12 +3130,14 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.11.0"
+version = "0.12.3"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
  "cosmix-lib-config",
  "cosmix-lib-props-core",
+ "cosmix-scene",
+ "cosmix-scene-bevy",
  "cosmix-shell",
  "cosmix-shell-host",
  "ctk",
@@ -3144,8 +3146,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-scene"
+version = "0.1.1"
+dependencies = [
+ "cosmix-lib-bus",
+ "cosmix-lib-mix",
+ "indexmap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cosmix-scene-bevy"
+version = "0.1.3"
+dependencies = [
+ "bevy",
+ "cosmix-scene",
+ "cosmix-shell",
+ "ctk",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "cosmix-shell"
-version = "0.8.6"
+version = "0.11.0"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3155,7 +3180,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.6.6"
+version = "0.6.10"
 dependencies = [
  "bevy",
  "bevy_winit",
@@ -3507,7 +3532,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.54.4"
+version = "0.56.0"
 dependencies = [
  "accesskit",
  "ammonia",

@@ -115,6 +115,8 @@ impl CtkTextField {
 #[derive(Clone, Debug)]
 pub struct CtkTextFieldProps {
     pub initial: String,
+    /// Visual hint only; never inserted into the editable value.
+    pub placeholder: String,
     pub accessible_label: String,
     pub max_length: usize,
     pub select_all: bool,
@@ -125,6 +127,7 @@ impl CtkTextFieldProps {
     pub fn new(initial: impl Into<String>, accessible_label: impl Into<String>) -> Self {
         Self {
             initial: initial.into(),
+            placeholder: String::new(),
             accessible_label: accessible_label.into(),
             max_length: 4_096,
             select_all: false,
@@ -134,6 +137,11 @@ impl CtkTextFieldProps {
 
     pub fn max_length(mut self, max_length: usize) -> Self {
         self.max_length = max_length;
+        self
+    }
+
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
         self
     }
 
@@ -187,6 +195,22 @@ pub fn spawn_text_field(commands: &mut Commands, props: CtkTextFieldProps) -> Ct
         input.insert(SelectAllOnFocus);
     }
     let input = input.id();
+    let hint = commands
+        .spawn((
+            Text::new(props.placeholder),
+            TextFont::from_font_size(13.0),
+            ThemeTextColor(tokens::TEXT_DIM),
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(7),
+                top: px(4),
+                ..default()
+            },
+            Pickable::IGNORE,
+            CtkTextFieldPlaceholder { input },
+        ))
+        .id();
+    commands.entity(input).add_child(hint);
     commands
         .entity(input)
         .insert(CtkTextInputFocusBorder::new(tokens::CONTROL));
@@ -413,6 +437,31 @@ fn text_accessibility(label: &str, secret: bool) -> AccessibilityNode {
 /// Installs the secret-field edit guard and mask synchronisation.
 pub struct CtkTextFieldPlugin;
 
+/// Non-interactive ghost text associated with an editable field.
+#[derive(Component)]
+pub struct CtkTextFieldPlaceholder {
+    pub input: Entity,
+}
+
+fn sync_placeholders(
+    fields: Query<&EditableText>,
+    mut hints: Query<(&CtkTextFieldPlaceholder, &mut Visibility)>,
+) {
+    for (hint, mut visibility) in &mut hints {
+        let show = fields.get(hint.input).is_ok_and(|editable| {
+            !editable.is_composing() && editable.value().to_string().is_empty()
+        });
+        let next = if show {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != next {
+            *visibility = next;
+        }
+    }
+}
+
 impl Plugin for CtkTextFieldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<InputFocus>()
@@ -439,7 +488,13 @@ impl Plugin for CtkTextFieldPlugin {
                 PostUpdate,
                 strip_secret_clipboard_edits.before(EditableTextSystems),
             )
-            .add_systems(PostUpdate, sync_secret_fields.after(EditableTextSystems));
+            .add_systems(PostUpdate, sync_secret_fields.after(EditableTextSystems))
+            .add_systems(
+                PostUpdate,
+                sync_placeholders
+                    .after(EditableTextSystems)
+                    .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate),
+            );
     }
 }
 
@@ -470,7 +525,9 @@ fn paint_text_input_focus_borders(
     }
 }
 
-fn strip_secret_clipboard_edits(mut fields: Query<&mut EditableText, With<CtkSecretField>>) {
+pub(crate) fn strip_secret_clipboard_edits(
+    mut fields: Query<&mut EditableText, With<CtkSecretField>>,
+) {
     for mut editable in &mut fields {
         remove_secret_clipboard_edits(&mut editable);
     }

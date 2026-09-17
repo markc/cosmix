@@ -68,6 +68,7 @@ impl Plugin for ShellRuntimePlugin {
             })
             .insert_resource(ShellFrameState(ShellFrame::from_model(&self.model)))
             .init_resource::<ShellEffects>()
+            .add_message::<super::ShellResizeResult>()
             .configure_sets(
                 Update,
                 (
@@ -101,13 +102,47 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     }
 }
 
+/// Apply an authored page extent without persisting a pointer resize preference.
+pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    // Authored page sizes are not pointer-grip gestures (which have a 500px cap).
+    if runtime.model.restore_thickness(edge, thickness).is_ok() {
+        let frame = ShellFrame::from_model(&runtime.model);
+        world.resource_mut::<ShellFrameState>().0 = frame;
+    }
+}
+
+/// Update a dynamic carousel while retaining its active page when possible.
+pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: Option<&str>) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    let selected = select
+        .map(str::to_owned)
+        .or_else(|| runtime.model.carousel(edge).active_id().map(str::to_owned));
+    let Ok(mut carousel) = crate::core::Carousel::new(ids) else {
+        return;
+    };
+    if let Some(selected) = selected {
+        carousel.select_id(&selected);
+    }
+    runtime.model.set_carousel(edge, carousel);
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
+}
+
 fn update_model(
     time: Res<Time<Real>>,
     mut commands: MessageReader<ShellCommand>,
     mut runtime: ResMut<ShellRuntime>,
     mut frame: ResMut<ShellFrameState>,
     mut effects: ResMut<ShellEffects>,
-    mut exit: MessageWriter<AppExit>,
+    mut replies: (
+        MessageWriter<AppExit>,
+        MessageWriter<super::ShellResizeResult>,
+    ),
     quit_handler: Option<Res<ShellQuitHandler>>,
 ) {
     let now = time.elapsed();
@@ -115,14 +150,40 @@ fn update_model(
     effects.1.clear();
     for command in commands.read() {
         if command.output != *runtime.model.output() {
+            if let ShellCommandKind::ResizeChecked {
+                edge,
+                thickness_px,
+                request_id,
+            } = command.kind
+            {
+                replies.1.write(super::ShellResizeResult {
+                    request_id,
+                    edge,
+                    requested: thickness_px,
+                    max: runtime.model.max_thickness(edge),
+                    result: Err(super::ShellResizeError::OutputChanged),
+                });
+            }
             continue;
         }
         let at = command.at.clamp(runtime.model.last_update(), now);
         match &command.kind {
+            // Scene content is owned by the host adapter; it has no motion effect.
+            ShellCommandKind::Scene(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
-                let _ = runtime.model.resize_thickness(*edge, *thickness_px);
+                let thickness_px = if thickness_px.is_finite() {
+                    thickness_px.min(runtime.model.max_thickness(*edge))
+                } else {
+                    *thickness_px
+                };
+                if let Err(error) = runtime.model.resize_thickness(*edge, thickness_px) {
+                    bevy::log::warn!("panel drag rejected: {error}");
+                }
             }
-            ShellCommandKind::ResizeCommit { edge, thickness_px } => {
+            ShellCommandKind::ResizeCommit { edge, thickness_px }
+            | ShellCommandKind::ResizeChecked {
+                edge, thickness_px, ..
+            } => {
                 // Atomic scripted resize: start records the pre-resize
                 // thickness (so settled_thickness_px is correct if the apply
                 // is rejected), apply, then complete — which settles the new
@@ -131,7 +192,17 @@ fn update_model(
                 let _ = runtime
                     .model
                     .panel_input(*edge, at, PanelInput::ResizeStarted);
-                if runtime.model.resize_thickness(*edge, *thickness_px).is_ok()
+                let result = runtime.model.resize_thickness(*edge, *thickness_px);
+                if let ShellCommandKind::ResizeChecked { request_id, .. } = command.kind {
+                    replies.1.write(super::ShellResizeResult {
+                        request_id,
+                        edge: *edge,
+                        requested: *thickness_px,
+                        max: runtime.model.max_thickness(*edge),
+                        result: result.map_err(super::ShellResizeError::Configuration),
+                    });
+                }
+                if result.is_ok()
                     && let Ok(update) =
                         runtime
                             .model
@@ -154,7 +225,7 @@ fn update_model(
                 if let Some(handler) = &quit_handler {
                     (handler.0)();
                 } else {
-                    exit.write(AppExit::Success);
+                    replies.0.write(AppExit::Success);
                 }
             }
             ShellCommandKind::Geometry(size) => runtime.model.set_geometry(*size),
@@ -247,6 +318,118 @@ fn merge_wake(current: WakePolicy, deadline: Duration) -> WakePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fast_drag_lands_at_budget_and_checked_resize_reports_refusal() {
+        let mut app = app();
+        let output = {
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            let model = &mut runtime.model;
+            model.set_geometry(LogicalSize::new(600.0, 600.0).unwrap());
+            model.restore_thickness(Edge::Right, 350.0).unwrap();
+            model
+                .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+                .unwrap();
+            assert_eq!(model.max_thickness(Edge::Left), 249.0);
+            model.output().clone()
+        };
+        app.world_mut().write_message(ShellCommand {
+            output: output.clone(),
+            at: Duration::ZERO,
+            kind: ShellCommandKind::Resize {
+                edge: Edge::Left,
+                thickness_px: 500.0,
+            },
+        });
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .thickness_px,
+            249.0
+        );
+        app.world_mut().write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::ResizeChecked {
+                edge: Edge::Left,
+                thickness_px: 300.0,
+                request_id: 42,
+            },
+        });
+        app.update();
+        let mut results = app
+            .world_mut()
+            .resource_mut::<bevy::ecs::message::Messages<super::super::ShellResizeResult>>();
+        let result = results.drain().next().unwrap();
+        assert_eq!(result.request_id, 42);
+        assert!(result.result.is_err());
+        assert_eq!(result.max, 249.0);
+    }
+    #[test]
+    fn resizing_pinned_panel_cannot_exceed_output_budget() {
+        let mut app = app();
+        let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+        let model = &mut runtime.model;
+        model.set_geometry(LogicalSize::new(800.0, 600.0).unwrap());
+        for (edge, thickness) in [(Edge::Left, 798.0), (Edge::Right, 1.0)] {
+            model.restore_thickness(edge, thickness).unwrap();
+            model
+                .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                .unwrap();
+        }
+        assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 798.0);
+        assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
+        assert_eq!(
+            model.resize_thickness(Edge::Right, 120.0),
+            Err(crate::core::PanelConfigError::ThicknessBudget {
+                edge: Edge::Right,
+                requested: 120.0,
+                max: 1.0
+            })
+        );
+        assert_eq!(model.panel(Edge::Right).thickness_px, 1.0);
+        assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
+    }
+
+    #[test]
+    fn unmounting_last_dynamic_page_clears_carousel() {
+        let mut app = app();
+        set_shell_pages(app.world_mut(), Edge::Top, vec!["scene-only".into()], None);
+        set_shell_pages(app.world_mut(), Edge::Top, vec![], None);
+        let runtime = app.world().resource::<ShellRuntime>();
+        assert!(runtime.model.carousel(Edge::Top).page_ids().is_empty());
+        assert_eq!(runtime.model.carousel(Edge::Top).active_id(), None);
+    }
+
+    #[test]
+    fn authored_opposing_panels_fit_on_pin_and_output_change() {
+        let mut app = app();
+        for edge in [Edge::Left, Edge::Right] {
+            set_page_thickness(app.world_mut(), edge, 100_000.0);
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            runtime
+                .model
+                .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                .unwrap();
+            assert!(
+                runtime.model.panel(Edge::Left).exclusive_zone_px
+                    + runtime.model.panel(Edge::Right).exclusive_zone_px
+                    < runtime.model.geometry().width()
+            );
+        }
+        let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+        for width in [800.0, 320.0, 100.0] {
+            runtime
+                .model
+                .set_geometry(LogicalSize::new(width, 600.0).unwrap());
+            let left = runtime.model.panel(Edge::Left);
+            let right = runtime.model.panel(Edge::Right);
+            assert!(left.exclusive_zone_px + right.exclusive_zone_px < width);
+            assert!(left.thickness_px > 0.0 && right.thickness_px > 0.0);
+        }
+    }
     #[test]
     fn local_clock_timezone_probe() {
         let Ok(expected) = std::env::var("QUOIN_CLOCK_TEST_EXPECTED") else {

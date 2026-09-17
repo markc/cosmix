@@ -9,7 +9,7 @@
 
 #[cfg(feature = "theme")]
 use bevy::app::{AppExit, PreStartup};
-use bevy::app::{PostUpdate, PropagateSet};
+use bevy::app::{Last, PostUpdate, PropagateSet};
 use bevy::color::Color;
 use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
@@ -1162,6 +1162,9 @@ fn configure_typography(
     typography: &mut CtkTypography,
     font_cx: &mut FontCx,
 ) -> bool {
+    // The shared cache locates the strong handles retained by CTK even after
+    // Bevy prunes its local entries and Parley clears the sole text layout.
+    font_cx.source_cache.make_shared();
     // An unresolved family is retried on every pass, not once per theme
     // revision: the font collection is built from the system at `FontCx`
     // construction, but families can still be registered into it afterwards,
@@ -1277,6 +1280,55 @@ fn configure_typography(
         typography.revision = typography.revision.saturating_add(1);
     }
     changed
+}
+
+/// Bevy keeps font atlases for its lifetime. Keep only blobs observed in shaped
+/// layouts for the same lifetime, including named and fallback-selected faces.
+/// Releasing them on unmap would allow a later layout to create a second atlas.
+#[derive(Resource, Default)]
+struct UsedFontSources {
+    blobs: std::collections::HashMap<u64, fontique::Blob<u8>>,
+    #[cfg(test)]
+    reconciliations: usize,
+    #[cfg(test)]
+    editor_visits: usize,
+}
+
+impl UsedFontSources {
+    fn retain_layout<B: parley::Brush>(&mut self, layout: &parley::Layout<B>) {
+        #[cfg(test)]
+        {
+            self.reconciliations += 1;
+        }
+        for line in layout.lines() {
+            for run in line.runs() {
+                let blob = &run.font().data;
+                self.blobs.entry(blob.id()).or_insert_with(|| blob.clone());
+            }
+        }
+    }
+}
+
+fn retain_used_font_sources(
+    mut sources: ResMut<UsedFontSources>,
+    blocks: Query<&bevy::text::ComputedTextBlock, Changed<bevy::text::ComputedTextBlock>>,
+    // bevy_ui borrows every `EditableText` mutably each frame, so its change
+    // tick is always fresh; the generation is only written when the layout
+    // actually changed.
+    editors: Query<&bevy::text::EditableText, Changed<bevy::text::EditableTextGeneration>>,
+) {
+    for block in &blocks {
+        sources.retain_layout(block.buffer());
+    }
+    for editor in &editors {
+        #[cfg(test)]
+        {
+            sources.editor_visits += 1;
+        }
+        if let Some(layout) = editor.editor.try_layout() {
+            sources.retain_layout(layout);
+        }
+    }
 }
 
 fn apply_ctk_typography(
@@ -1468,6 +1520,10 @@ impl Plugin for CtkThemePlugin {
         app.init_resource::<UiTheme>()
             .init_resource::<CtkThemeMetrics>()
             .init_resource::<CtkTypography>()
+            .init_resource::<UsedFontSources>()
+            // PostUpdate shaping has completed; Last cache pruning cannot drop
+            // layout-owned blobs before this system retains them.
+            .add_systems(Last, retain_used_font_sources)
             .init_resource::<ThemeState>()
             .add_message::<ApplyTheme>()
             .add_systems(Update, apply_theme_requests)
@@ -4014,6 +4070,198 @@ mod tests {
             second,
             scale_authored_font_size(first, 20.0),
             "the second live apply must use the authored size, not the first result"
+        );
+    }
+
+    #[test]
+    fn font_identity_survives_idle_source_cache_pruning() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-font.ttf");
+        std::fs::write(&path, bevy::text::DEFAULT_FONT_DATA).unwrap();
+        let source = fontique::SourceInfo::new(
+            fontique::SourceId::new(),
+            fontique::SourceKind::Path(path.into()),
+        );
+        let mut app = App::new();
+        app.init_resource::<FontCx>()
+            .add_plugins(CtkThemePlugin::default());
+        app.update();
+        let mut fonts = app.world_mut().resource_mut::<FontCx>();
+        // A retained layout owns this blob while another label (e.g. a clock)
+        // is reshaped after Bevy has evicted its local source-cache entry.
+        let retained = fonts.source_cache.get(&source).unwrap();
+        for _ in 0..120 {
+            fonts.source_cache.prune(0, false);
+            let reloaded = fonts.source_cache.get(&source).unwrap();
+            assert_eq!(reloaded.id(), retained.id(), "font atlas identity drifted");
+        }
+    }
+
+    #[test]
+    fn sole_layout_named_identity_survives_pruning() {
+        assert_sole_layout_identity(false);
+    }
+
+    #[test]
+    fn sole_layout_fallback_identity_survives_pruning() {
+        assert_sole_layout_identity(true);
+    }
+
+    fn assert_sole_layout_identity(fallback: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-font.ttf");
+        std::fs::write(&path, bevy::text::DEFAULT_FONT_DATA).unwrap();
+        let mut fonts = FontCx::default();
+        fonts.collection = fontique::Collection::new(fontique::CollectionOptions {
+            system_fonts: false,
+            ..Default::default()
+        });
+        fonts.collection.load_fonts_from_paths([&path]);
+        let family = fonts.collection.family_names().next().unwrap().to_string();
+        let id = fonts.collection.family_id(&family).unwrap();
+        fonts.collection.set_fallbacks(
+            fontique::FallbackKey::new(fontique::Script::from_bytes(*b"Latn"), None),
+            [id].into_iter(),
+        );
+        fonts.source_cache.make_shared();
+        let mut sources = UsedFontSources::default();
+        let mut layouts = parley::LayoutContext::<()>::new();
+        let mut layout = parley::Layout::<()>::new();
+        let mut identity = None;
+        for _ in 0..120 {
+            fonts.source_cache.prune(0, false);
+            let mut builder = layouts.ranged_builder(&mut fonts.context, "sole label", 1.0, false);
+            builder.push_default(parley::StyleProperty::FontFamily(
+                parley::FontFamily::Single(parley::FontFamilyName::Named(
+                    if fallback {
+                        "Nonexistent fixture family"
+                    } else {
+                        &family
+                    }
+                    .into(),
+                )),
+            ));
+            builder.build_into(&mut layout, "sole label");
+            layout.break_all_lines(None);
+            let id = layout
+                .lines()
+                .next()
+                .unwrap()
+                .runs()
+                .next()
+                .unwrap()
+                .font()
+                .data
+                .id();
+            assert_eq!(
+                *identity.get_or_insert(id),
+                id,
+                "sole layout font atlas identity drifted (fallback={fallback})"
+            );
+            sources.retain_layout(&layout);
+        }
+        assert_eq!(sources.blobs.len(), 1);
+    }
+
+    #[test]
+    fn system_font_catalogue_is_not_retained_and_idle_frames_do_no_work() {
+        use bevy::prelude::{Assets, Vec2};
+        use bevy::text::{ComputedTextBlock, LayoutCx, TextBounds};
+        let mut app = App::new();
+        app.init_resource::<FontCx>()
+            .add_plugins(CtkThemePlugin::default());
+        let entity = app.world_mut().spawn(ComputedTextBlock::default()).id();
+        app.update();
+        assert!(app.world().resource::<UsedFontSources>().blobs.is_empty());
+        // Shape through Bevy with the host's entire system collection present.
+        let mut computed = app
+            .world_mut()
+            .entity_mut(entity)
+            .take::<ComputedTextBlock>()
+            .unwrap();
+        let font = TextFont {
+            font: FontSource::SansSerif,
+            ..Default::default()
+        };
+        TextPipeline::default()
+            .update_buffer(
+                &Assets::default(),
+                std::iter::once((
+                    entity,
+                    0,
+                    "used face",
+                    &font,
+                    Color::WHITE,
+                    Default::default(),
+                    Default::default(),
+                )),
+                Default::default(),
+                Default::default(),
+                TextBounds::UNBOUNDED,
+                1.0,
+                &mut computed,
+                &mut app.world_mut().resource_mut::<FontCx>(),
+                &mut LayoutCx::default(),
+                Vec2::new(800.0, 600.0),
+                16.0,
+            )
+            .unwrap();
+        let mut used = HashSet::new();
+        for line in computed.buffer().lines() {
+            for run in line.runs() {
+                used.insert(run.font().data.id());
+            }
+        }
+        assert!(!used.is_empty());
+        app.world_mut().entity_mut(entity).insert(computed);
+        app.update();
+        assert_eq!(
+            app.world().resource::<UsedFontSources>().blobs.len(),
+            used.len()
+        );
+        let count = app.world().resource::<UsedFontSources>().reconciliations;
+        for _ in 0..5 {
+            app.update();
+        }
+        let sources = app.world().resource::<UsedFontSources>();
+        assert_eq!(sources.reconciliations, count);
+        assert_eq!(sources.blobs.len(), used.len());
+    }
+
+    #[test]
+    fn idle_text_fields_do_no_retention_work() {
+        use bevy::text::{EditableText, EditableTextGeneration};
+        // bevy_ui takes every EditableText mutably each frame; mimic that.
+        fn touch_editors(mut editors: Query<&mut EditableText>) {
+            for mut editor in &mut editors {
+                editor.set_changed();
+            }
+        }
+        let mut app = App::new();
+        app.init_resource::<FontCx>()
+            .add_plugins(CtkThemePlugin::default())
+            .add_systems(Update, touch_editors);
+        let entity = app.world_mut().spawn(EditableText::default()).id();
+        app.update();
+        let visits = app.world().resource::<UsedFontSources>().editor_visits;
+        assert_eq!(visits, 1, "a new field is examined once");
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<UsedFontSources>().editor_visits,
+            visits,
+            "an idle field must not be re-examined every frame"
+        );
+        app.world_mut()
+            .get_mut::<EditableTextGeneration>(entity)
+            .unwrap()
+            .set_changed();
+        app.update();
+        assert_eq!(
+            app.world().resource::<UsedFontSources>().editor_visits,
+            visits + 1,
+            "a layout change is examined"
         );
     }
 
