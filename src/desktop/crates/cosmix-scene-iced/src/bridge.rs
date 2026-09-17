@@ -840,7 +840,8 @@ pub(crate) fn route_keyboard(
         };
         state.events.push(SurfaceEvent::Ime(event));
     }
-    drop(state);
+    // `state`'s borrow of the query ends here; the host queue may name any
+    // surface, not only the owner.
     for (target, ingress) in std::mem::take(&mut host.queued) {
         let Some(target) = target.or(owner) else {
             continue;
