@@ -26,10 +26,13 @@ configured, the app asked for a redraw (or a configure or scale change did),
 and no frame callback is pending. `Frame::buffer_mut()` returns
 `(pixels, width, height, stride)` at physical size, ARGB8888 in B, G, R, A
 byte order. `Frame::commit_with_damage(&[Rect])` records physical damage;
-the runtime then clips and merges it, sends `damage_buffer`, requests one
-frame callback and commits. A draw that commits nothing leaves the surface
-untouched. There are no timers, so an idle app has no wakeups. The only
-timer is key repeat, and it is armed only while a key is held.
+the runtime then clips and merges it, sends `damage_buffer` and commits. It
+requests a frame callback only if the app asked for another redraw during
+the draw (an animation), so a one-off change costs no callback wakeup; the
+flip side is that redraws requested between frames are not throttled to the
+display rate. A draw that commits nothing leaves the surface untouched.
+The runtime arms no timers of its own except key repeat, which is armed only
+while a key is held.
 
 Each surface has up to three `wl_shm` slots. The runtime reuses the newest
 committed slot once the compositor releases it, so a steady-state frame

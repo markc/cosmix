@@ -677,9 +677,14 @@ impl State {
                 wl.damage(0, 0, i32::MAX, i32::MAX);
             }
         }
-        wl.frame(&rt.qh, wl.clone());
+        // A frame callback only when the app already wants another frame
+        // (animation, caret); otherwise the next change draws at once and an
+        // idle surface gets no callback wakeup.
+        if surface.dirty {
+            wl.frame(&rt.qh, wl.clone());
+            surface.frame_pending = true;
+        }
         wl.commit();
-        surface.frame_pending = true;
         chain.committed(index, damage.rects());
         surface.chain = Some(chain);
         rt.stats.frames_committed += 1;

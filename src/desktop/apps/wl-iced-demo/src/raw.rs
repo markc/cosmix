@@ -575,7 +575,9 @@ impl App for RawDemo {
                     state.maximized,
                     state.server_decorations
                 ));
-                self.relayout(info);
+                if first || self.info != Some(info) {
+                    self.relayout(info);
+                }
             }
             Event::ScaleChanged { surface, info } => {
                 self.log(format_args!(
