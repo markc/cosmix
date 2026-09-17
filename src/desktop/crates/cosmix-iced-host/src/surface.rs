@@ -259,6 +259,8 @@ impl<P: Program> Surface<P> {
         if physical_size != self.viewport.physical_size() {
             self.clip_mask = None;
         }
+        // Recorded damage describes pixels of the old geometry.
+        self.history.clear();
         self.viewport = Viewport::with_physical_size(physical_size, scale_factor);
         self.invalidate();
     }
@@ -282,8 +284,6 @@ impl<P: Program> Surface<P> {
     pub fn invalidate(&mut self) {
         self.invalid = true;
         self.dirty = true;
-        // Older frames' damage describes contents that no longer exist.
-        self.history.clear();
     }
 
     pub fn queue_event(&mut self, event: Event) {
