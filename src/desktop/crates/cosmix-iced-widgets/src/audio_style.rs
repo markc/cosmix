@@ -1,6 +1,6 @@
 //! Shared colours for the pro-audio controls and canvases.
-use iced::advanced::renderer;
-use iced::{Border, Color, Rectangle};
+use iced_core::renderer;
+use iced_core::{Border, Color, Rectangle};
 
 /// Colours and corner radius for `Fader`, `Knob`, `LevelMeter`, `Toggle`,
 /// `Waveform` and `PianoRoll`. Build it with `Tokens::audio_style`.

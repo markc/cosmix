@@ -1,12 +1,12 @@
 //! Waveform overview with a cached body and an uncached playhead layer.
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use iced::advanced::graphics::geometry::{self, Cache, Path};
-use iced::advanced::{
+use iced_core::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
 };
-use iced::{Element, Event, Length, Point, Rectangle, Size, Vector};
+use iced_core::{Element, Event, Length, Point, Rectangle, Size, Vector};
+use iced_graphics::geometry::{self, Cache, Path};
 
 use crate::AudioStyle;
 use crate::audio_style::quad;

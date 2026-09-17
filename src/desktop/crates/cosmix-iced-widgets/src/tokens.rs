@@ -3,7 +3,8 @@
 //! to the design compiler's closed family registry.
 
 use cosmix_design::{LinearRgba, ResolvedColours, ResolvedDictionary, ResolvedMetricKind};
-use iced::{Border, Color, widget::text_input};
+use iced_core::{Border, Color};
+use iced_widget::text_input;
 
 use crate::{AudioStyle, MenuStyle};
 

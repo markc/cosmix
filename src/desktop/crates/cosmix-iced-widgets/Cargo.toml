@@ -6,17 +6,24 @@ edition = "2024"
 rust-version = "1.95"
 license = "MIT"
 
+# The library uses iced's component crates only. The `iced` umbrella always
+# links iced_winit and winit, so it is reachable solely through the gallery
+# features, for the example.
 [features]
 default = []
-wgpu = ["iced/wgpu"]
-tiny-skia = ["iced/tiny-skia"]
-gallery = ["iced/fira-sans"]
-gallery-wgpu = ["gallery", "wgpu"]
-gallery-tiny-skia = ["gallery", "tiny-skia"]
+wgpu = ["iced_renderer/wgpu", "iced_renderer/geometry"]
+tiny-skia = ["iced_renderer/tiny-skia", "iced_renderer/geometry"]
+gallery = ["dep:iced"]
+gallery-wgpu = ["gallery", "wgpu", "iced/wgpu"]
+gallery-tiny-skia = ["gallery", "tiny-skia", "iced/tiny-skia"]
 
 [dependencies]
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "canvas", "wayland", "thread-pool"] }
+iced_core = { version = "=0.14.0", default-features = false, features = ["advanced"] }
+iced_widget = { version = "=0.14.2", default-features = false, features = ["advanced"] }
+iced_graphics = { version = "=0.14.0", default-features = false, features = ["geometry"] }
+iced_renderer = { version = "=0.14.0", default-features = false }
 cosmix-design = { path = "../cosmix-design", default-features = false }
+iced = { version = "=0.14.0", default-features = false, optional = true, features = ["advanced", "canvas", "wayland", "thread-pool", "fira-sans"] }
 
 [dev-dependencies]
 iced_runtime = { version = "=0.14.0", default-features = false }

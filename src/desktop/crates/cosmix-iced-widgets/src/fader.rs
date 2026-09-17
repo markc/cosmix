@@ -1,9 +1,9 @@
 //! Vertical gain fader on the shared dB scale.
-use iced::advanced::{
+use iced_core::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
     widget::{Tree, tree},
 };
-use iced::{Element, Event, Length, Point, Rectangle, Size, keyboard};
+use iced_core::{Element, Event, Length, Point, Rectangle, Size, keyboard};
 
 use crate::AudioStyle;
 use crate::audio_style::quad;
@@ -230,7 +230,7 @@ impl<Message: Clone, Theme, Renderer: renderer::Renderer> Widget<Message, Theme,
                 }
                 shell.capture_event();
             }
-            Event::Window(iced::window::Event::Unfocused) => {
+            Event::Window(iced_core::window::Event::Unfocused) => {
                 if state.drag.take().is_some()
                     && let Some(message) = &self.on_release
                 {

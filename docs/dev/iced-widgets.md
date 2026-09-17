@@ -2,19 +2,26 @@
 
 `cosmix-iced-widgets` 0.1.0 provides a single-line `TextField`, a menu bar,
 context menus, pro-audio controls (fader, pan knob, level meter, toggle), a
-waveform and a piano roll, and a `cosmix-design` colour/metric adapter. It uses upstream
-iced exactly 0.14.0, with defaults disabled and Wayland enabled. Neither
-renderer is selected by the library's defaults. Hosts select `wgpu` or
-`tiny-skia`; renderer-generic widgets can also be embedded in a host's UI.
-Upstream iced requires a renderer feature for release builds.
+waveform and a piano roll, and a `cosmix-design` colour/metric adapter. It
+uses upstream iced 0.14 component crates, pinned exactly, with defaults
+disabled and no window shell: the library links no winit, so raw Wayland and
+compositor hosts can embed it. Neither renderer is selected by default. Hosts
+select `wgpu` or `tiny-skia`. Upstream iced_renderer requires a renderer
+feature for release builds. Only the gallery example uses iced's winit shell
+(Wayland-only).
 
 ## Public API (0.1.0)
 
 This is the whole surface other crates may rely on. Everything else is private.
 
 ```rust
-// Cargo features: `wgpu`, `tiny-skia` (pick one in the host; default neither),
-// `gallery-wgpu`, `gallery-tiny-skia` (example only).
+// Dependencies: iced_core, iced_widget (feature `advanced`), iced_graphics
+// (`geometry`) and iced_renderer, pinned exactly. Never the `iced` umbrella,
+// which always links iced_winit/winit: `cargo tree -p cosmix-iced-widgets
+// -e normal` shows no winit, and tests/feature_graph.rs enforces it.
+// Cargo features: `wgpu`, `tiny-skia` (enable that backend's geometry
+// support; pick one in the host; default neither), `gallery-wgpu`,
+// `gallery-tiny-skia` (example only; these pull in the umbrella).
 
 // Text field. Theme is iced::Theme; Renderer is generic over text::Renderer.
 TextField::new(placeholder: &str, value: &str) -> TextField<'a, Message, Renderer>
