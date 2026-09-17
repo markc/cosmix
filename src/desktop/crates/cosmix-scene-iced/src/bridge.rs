@@ -137,7 +137,14 @@ pub(crate) fn apply_wake(world: &mut World) {
     world.insert_resource(waker);
 }
 
-/// What the input method should do for the focused surface.
+/// What the focused surface ASKS of the input method.
+///
+/// It is a request, never a report: whether an input method actually
+/// activated is the host's to say, and no host can say it yet (comp's
+/// `NativeIme::enabled()` is its own last request; an `active()` is coming).
+/// The bridge therefore infers nothing about activation — when that arrives,
+/// it belongs here as a separate field the host writes, not as a meaning
+/// quietly attached to this one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImeOutput {
     pub window_scale: f32,
@@ -393,6 +400,7 @@ pub(crate) fn reconcile(world: &mut World) {
         for name in gone {
             let mount = mounts.0.remove(&name).unwrap();
             unmount(world, &mount);
+            release_held(world, mount.page);
             world.non_send_mut::<Renderers>().0.remove(&mount.page);
             if world.get_entity(mount.page).is_ok() {
                 world.despawn(mount.page);
@@ -442,6 +450,45 @@ pub(crate) fn register(world: &mut World) {
             mount.registered = register_scene_page(world, &mount.tree, mount.page);
         }
     });
+}
+
+/// Hand a surface its own key releases before it goes.
+///
+/// A host can be late with the focus edge — comp's `uninstall()` queues
+/// `Focus{false}` a frame or more after the fact — so a surface that
+/// unmounts first would otherwise take its held keys to the grave, and a
+/// renderer that survives the mount (an iced host keeping widget state)
+/// would keep believing they are down. Clearing `held` makes it idempotent:
+/// a `Focus(false)` arriving afterwards finds nothing to release.
+fn release_held(world: &mut World, page: Entity) {
+    let Some(mut state) = world.get_mut::<SurfaceState>(page) else {
+        return;
+    };
+    let held = std::mem::take(&mut state.held);
+    if held.is_empty() {
+        return;
+    }
+    let mut events = Vec::with_capacity(held.len() + 1);
+    for key in held {
+        events.push(SurfaceEvent::Key {
+            key,
+            latin: None,
+            text: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        });
+    }
+    events.push(SurfaceEvent::Focus(false));
+    let mut renderers = world.non_send_mut::<Renderers>();
+    let Some(renderer) = renderers.0.get_mut(&page) else {
+        return;
+    };
+    // The renderer is dropped with the mount, so these go straight to it
+    // rather than through the surface's queue.
+    for event in events {
+        renderer.queue(event);
+    }
 }
 
 fn unmount(world: &mut World, mount: &Mount) {

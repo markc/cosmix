@@ -1149,3 +1149,52 @@ fn a_dropped_batch_clears_the_composition_and_repaints() {
         vec![Rect::new(0, 0, 200, 100)]
     );
 }
+
+#[test]
+fn an_unmounting_surface_releases_its_held_keys_in_either_order() {
+    use crate::surface::SurfaceEvent as E;
+    // Unmount first: the host's focus edge may be a frame or more late, so
+    // the surface must not take its held keys with it.
+    let (mut h, log) = recording();
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(1);
+    h.app.world_mut().write_message(press("a"));
+    h.app.world_mut().write_message(press("b"));
+    h.run(1);
+    take(&log);
+    h.request(SceneVerb::Unload, "", json!({"scene": "probe"}));
+    h.run(1);
+    assert_eq!(
+        take(&log),
+        vec![host_key("a", false), host_key("b", false), E::Focus(false)]
+    );
+    h.run(2);
+    assert!(take(&log).is_empty(), "a late focus edge adds nothing");
+
+    // Focus first: the unmount then finds nothing held and stays silent.
+    let (mut h, log) = recording();
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(1);
+    h.app.world_mut().write_message(press("a"));
+    h.app.world_mut().write_message(press("b"));
+    h.run(1);
+    take(&log);
+    h.app.world_mut().resource_mut::<InputFocus>().clear();
+    h.run(1);
+    assert_eq!(
+        take(&log),
+        vec![host_key("a", false), host_key("b", false), E::Focus(false)]
+    );
+    h.request(SceneVerb::Unload, "", json!({"scene": "probe"}));
+    h.run(1);
+    assert!(
+        take(&log).is_empty(),
+        "the keys were released once, not twice"
+    );
+}
