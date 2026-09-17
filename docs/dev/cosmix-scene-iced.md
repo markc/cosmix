@@ -82,8 +82,11 @@ under Quoin and differ in comp, whose native shell already multiplies
 `UiScale` into pointer positions. The capture window check needs the UI
 camera to target `WindowRef::Entity`, as Quoin's panels do.
 A press on a surface sets `InputFocus`; a press on no surface clears it if a
-surface held it. `SceneIcedFocus` records the owning surface, its IME request
-(caret in window-logical coordinates) and the hovered cursor shape. Keys and
+surface held it. `SceneIcedFocus` records the owning surface, its IME request (the caret in
+both window-logical and window-physical coordinates, so a host can divide by
+the scale its input method wants: `window_scale` for a layer surface,
+`pointer_scale` for comp's output-space native IME) and the hovered cursor
+shape. Keys and
 IME input (`ExternalImeEvent`) go to the owner only. Keyboard input is
 copied to the owner, not consumed: `ButtonInput<KeyCode>`, Quoin's and the
 layer host's handlers and global shortcut systems still see every key; CTK
