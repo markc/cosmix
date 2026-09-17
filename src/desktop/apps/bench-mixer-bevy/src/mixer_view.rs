@@ -1,20 +1,17 @@
 //! The mixer view: every channel strip plus the master, built from CTK's
-//! stock controls and wrapped into rows (see `cosmix_bench_feed::layout`).
+//! stock controls and placed at the rectangles `cosmix_bench_feed::layout`
+//! resolves, so the iced arm and the bake-off driver read the same geometry.
 //!
 //! CTK's own `spawn_channel_strip_styled` cannot be used: it asserts the
 //! 32-channel musicd cap and binds every control to the musicd mixer store.
-//! The strips here follow its compact skeleton with the same widgets, minus
-//! the trim knob and the value readouts the bake-off surface does not have.
+//! The strips here carry the same widgets, minus the trim knob and the value
+//! readouts the bake-off surface does not have.
 
 use bevy::feathers::theme::{ThemeBackgroundColor, ThemeTextColor, ThemeToken};
 use bevy::prelude::*;
-use bevy::text::{Justify, TextLayout};
+use bevy::text::{Justify, LineBreak, TextLayout};
 use bevy::ui::{Checked, Overflow};
-use cosmix_bench_feed::layout::{
-    BUTTON_FONT, BUTTON_GAP, BUTTON_HEIGHT, BUTTON_MIN_WIDTH, FADER_METER_GAP, FADER_WIDTH,
-    KNOB_SIZE, METER_WIDTH, NAME_BOX_HEIGHT, NAME_FONT, NUMBER_FONT, ROW_GAP, STRIP_GAP,
-    STRIP_PADDING, STRIP_SECTION_GAP, STRIP_WIDTH, strip_rows,
-};
+use cosmix_bench_feed::layout::{BUTTON_FONT, Layout, NAME_FONT, Rect, StripLayout};
 use cosmix_bench_feed::{FADER_MAX_DB, FADER_MIN_DB, MeterFrame, MixerFeed};
 use ctk::prelude::{
     ControlRange, MeterLane as CtkMeterLane, MeterValue, NumericControlProps, SetControlValue,
@@ -50,6 +47,7 @@ pub struct MixerEntities {
 fn spawn_mixer(mut commands: Commands, bench: Res<Bench>) {
     let config = &bench.config;
     let feed = MixerFeed::new(config.seed, config.strips, config.mode);
+    let layout = Layout::new((config.size.0 as f32, config.size.1 as f32), config.strips);
     let mut entities = MixerEntities {
         feed,
         faders: Vec::new(),
@@ -59,38 +57,57 @@ fn spawn_mixer(mut commands: Commands, bench: Res<Bench>) {
         solos: Vec::new(),
         last_tick: None,
     };
-    let mut rows = Vec::new();
-    for slots in strip_rows(config.strips) {
-        let strips: Vec<Entity> = slots
-            .map(|slot| spawn_strip(&mut commands, &feed, slot, &mut entities))
-            .collect();
-        let row = commands
-            .spawn(Node {
-                flex_direction: FlexDirection::Row,
-                column_gap: px(STRIP_GAP),
-                align_items: AlignItems::Stretch,
-                flex_grow: 1.0,
-                flex_basis: px(0),
-                min_height: px(0),
-                ..default()
-            })
-            .add_children(&strips)
-            .id();
-        rows.push(row);
-    }
+    let strips: Vec<Entity> = layout
+        .slots
+        .iter()
+        .map(|strip| spawn_strip(&mut commands, &feed, strip, &mut entities))
+        .collect();
     commands
         .spawn((
             Node {
+                position_type: PositionType::Relative,
                 width: percent(100),
                 height: percent(100),
-                flex_direction: FlexDirection::Column,
-                row_gap: px(ROW_GAP),
                 ..default()
             },
             ThemeBackgroundColor(tokens::SURFACE),
         ))
-        .add_children(&rows);
+        .add_children(&strips);
+    commands.insert_resource(MixerLayout(layout));
     commands.insert_resource(entities);
+}
+
+/// The resolved board, kept so tests and any later input wiring read the same
+/// rectangles the widgets were placed at.
+#[derive(Resource)]
+pub struct MixerLayout(pub Layout);
+
+/// An absolutely-placed node at `rect`, in the coordinates of a parent that
+/// spans the same space (the board root, or a strip panel for its children).
+fn placed(rect: Rect, origin: (f32, f32)) -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: px(rect.x - origin.0),
+        top: px(rect.y - origin.1),
+        width: px(rect.w),
+        height: px(rect.h),
+        ..default()
+    }
+}
+
+/// Place an already-spawned widget (a CTK bundle brings its own size) at
+/// `rect` inside a parent whose origin is `origin`.
+fn place(commands: &mut Commands, entity: Entity, rect: Rect, origin: (f32, f32)) {
+    commands
+        .entity(entity)
+        .entry::<Node>()
+        .and_modify(move |mut node| {
+            node.position_type = PositionType::Absolute;
+            node.left = px(rect.x - origin.0);
+            node.top = px(rect.y - origin.1);
+            node.width = px(rect.w);
+            node.height = px(rect.h);
+        });
 }
 
 fn text(content: impl Into<String>, size: f32, token: ThemeToken) -> impl Bundle {
@@ -100,24 +117,6 @@ fn text(content: impl Into<String>, size: f32, token: ThemeToken) -> impl Bundle
         ThemeTextColor(token),
         Pickable::IGNORE,
     )
-}
-
-/// An empty box that holds a missing control's place on the master strip.
-fn spacer(width: f32, height: f32) -> Node {
-    Node {
-        width: px(width),
-        height: px(height),
-        ..default()
-    }
-}
-
-/// Let a widget follow its row's height instead of its spawn-time height
-/// (CTK's fader and meter internals are percent-based).
-fn stretch_to_row_height(commands: &mut Commands, entity: Entity) {
-    commands
-        .entity(entity)
-        .entry::<Node>()
-        .and_modify(|mut node| node.height = percent(100));
 }
 
 fn fader_props(id: String, db: f32) -> NumericControlProps {
@@ -148,110 +147,103 @@ fn pan_props(id: String, pan: f32) -> NumericControlProps {
     )
 }
 
-fn toggle(commands: &mut Commands, id: String, label: &str, on: bool) -> Entity {
-    let mut entity = commands.spawn(toggle_button_sized(id, BUTTON_MIN_WIDTH, BUTTON_HEIGHT));
+fn toggle(
+    commands: &mut Commands,
+    id: String,
+    label: &str,
+    on: bool,
+    rect: Rect,
+    origin: (f32, f32),
+) -> Entity {
+    let mut entity = commands.spawn(toggle_button_sized(id, rect.w, rect.h));
     entity.with_child(text(label, BUTTON_FONT, tokens::TEXT));
     if on {
         entity.insert(Checked);
     }
-    entity.id()
+    let entity = entity.id();
+    place(commands, entity, rect, origin);
+    entity
 }
 
+/// Spawn one strip's panel and widgets at the rectangles `strip` gives.
 fn spawn_strip(
     commands: &mut Commands,
     feed: &MixerFeed,
-    slot: usize,
+    strip: &StripLayout,
     out: &mut MixerEntities,
 ) -> Entity {
+    let slot = strip.slot;
     let state = feed.strip(slot);
-    let master = feed.is_master(slot);
-    let inner_width = STRIP_WIDTH - 2.0 * STRIP_PADDING;
+    let origin = (strip.rect.x, strip.rect.y);
 
-    let number = commands
-        .spawn(text(
-            state
-                .number
-                .map_or_else(|| " ".to_owned(), |n| n.to_string()),
-            NUMBER_FONT,
-            tokens::TEXT_DIM,
-        ))
-        .id();
-    // One word per line, centred, clipped to the fixed two-line box.
+    // One line, centred, clipped to the strip.
     let name = commands
         .spawn((
-            text(state.name.replace(' ', "\n"), NAME_FONT, tokens::TEXT),
+            Node {
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                overflow: Overflow::clip(),
+                ..placed(strip.name, origin)
+            },
+            Pickable::IGNORE,
+        ))
+        .with_child((
+            text(state.name.clone(), NAME_FONT, tokens::TEXT),
             TextLayout {
                 justify: Justify::Center,
+                linebreak: LineBreak::NoWrap,
                 ..default()
             },
         ))
         .id();
-    let name_box = commands
-        .spawn(Node {
-            width: px(inner_width),
-            height: px(NAME_BOX_HEIGHT),
-            flex_direction: FlexDirection::Column,
-            align_items: AlignItems::Center,
-            justify_content: JustifyContent::Center,
-            overflow: Overflow::clip(),
-            ..default()
-        })
-        .add_child(name)
-        .id();
 
-    let pan = (!master).then(|| {
-        commands
+    let pan = strip.knob.map(|rect| {
+        let entity = commands
             .spawn(knob_sized(
                 pan_props(format!("strip-{slot}-pan"), state.pan),
-                KNOB_SIZE,
+                rect.w,
             ))
-            .id()
+            .id();
+        place(commands, entity, rect, origin);
+        entity
     });
-    let pan_slot = pan.unwrap_or_else(|| commands.spawn(spacer(KNOB_SIZE, KNOB_SIZE)).id());
 
     let fader = commands
         .spawn(fader_sized(
             fader_props(format!("strip-{slot}-fader"), feed.fader_db(slot, 0)),
-            FADER_WIDTH,
-            100.0,
+            strip.fader.w,
+            strip.fader.h,
         ))
         .id();
+    place(commands, fader, strip.fader, origin);
     let meter = commands
         .spawn(level_meter_sized(
             format!("strip-{slot}-meter"),
             meter_value(&MeterFrame::default()),
-            METER_WIDTH,
-            100.0,
+            strip.meter.w,
+            strip.meter.h,
         ))
         .id();
-    stretch_to_row_height(commands, fader);
-    stretch_to_row_height(commands, meter);
-    let fader_row = commands
-        .spawn(Node {
-            flex_direction: FlexDirection::Row,
-            column_gap: px(FADER_METER_GAP),
-            align_items: AlignItems::End,
-            justify_content: JustifyContent::Center,
-            flex_grow: 1.0,
-            min_height: px(0),
-            ..default()
-        })
-        .add_children(&[meter, fader])
-        .id();
+    place(commands, meter, strip.meter, origin);
 
-    let mute = toggle(commands, format!("strip-{slot}-mute"), "M", state.mute);
-    let solo = (!master).then(|| toggle(commands, format!("strip-{slot}-solo"), "S", state.solo));
-    let solo_slot =
-        solo.unwrap_or_else(|| commands.spawn(spacer(BUTTON_MIN_WIDTH, BUTTON_HEIGHT)).id());
-    let buttons = commands
-        .spawn(Node {
-            flex_direction: FlexDirection::Column,
-            row_gap: px(BUTTON_GAP),
-            align_items: AlignItems::Center,
-            ..default()
-        })
-        .add_children(&[mute, solo_slot])
-        .id();
+    let mute = toggle(
+        commands,
+        format!("strip-{slot}-mute"),
+        "M",
+        state.mute,
+        strip.mute,
+        origin,
+    );
+    let solo = strip.solo.map(|rect| {
+        toggle(
+            commands,
+            format!("strip-{slot}-solo"),
+            "S",
+            state.solo,
+            rect,
+            origin,
+        )
+    });
 
     out.faders.push(fader);
     out.meters.push(meter);
@@ -259,23 +251,19 @@ fn spawn_strip(
     out.mutes.push(mute);
     out.solos.push(solo);
 
+    let mut children = vec![name, fader, meter, mute];
+    children.extend(pan);
+    children.extend(solo);
     commands
         .spawn((
-            Node {
-                width: px(STRIP_WIDTH),
-                flex_direction: FlexDirection::Column,
-                align_items: AlignItems::Center,
-                row_gap: px(STRIP_SECTION_GAP),
-                padding: UiRect::all(px(STRIP_PADDING)),
-                ..default()
-            },
-            ThemeBackgroundColor(if master {
+            placed(strip.rect, (0.0, 0.0)),
+            ThemeBackgroundColor(if strip.is_master {
                 tokens::MASTER_PANEL
             } else {
                 tokens::PANEL
             }),
         ))
-        .add_children(&[number, name_box, pan_slot, fader_row, buttons])
+        .add_children(&children)
         .id()
 }
 
@@ -352,6 +340,7 @@ mod tests {
                 strips,
                 seed: DEFAULT_SEED,
                 song: None,
+                size: (1024, 576),
                 scripted_drag: true,
             },
             None,
@@ -416,6 +405,42 @@ mod tests {
             }
             assert_eq!(world.get::<Checked>(mutes[slot]).is_some(), state.mute);
         }
+    }
+
+    #[test]
+    fn widgets_sit_at_the_shared_layout_rects() {
+        let mut app = app(Mode::Idle, 64);
+        set_tick(&mut app, 0);
+        app.update();
+        let layout = &app.world().resource::<MixerLayout>().0;
+        assert_eq!(layout.rows, 3);
+        let mixer = app.world().resource::<MixerEntities>();
+        let (faders, meters, mutes) = (
+            mixer.faders.clone(),
+            mixer.meters.clone(),
+            mixer.mutes.clone(),
+        );
+        // Widgets are strip-relative; the strip panel is at the board origin.
+        for slot in [0usize, 21, 22, 64] {
+            let strip = layout.slot(slot);
+            let origin = (strip.rect.x, strip.rect.y);
+            for (entity, rect) in [
+                (faders[slot], strip.fader),
+                (meters[slot], strip.meter),
+                (mutes[slot], strip.mute),
+            ] {
+                let node = app.world().get::<Node>(entity).unwrap();
+                assert_eq!(node.left, px(rect.x - origin.0), "slot {slot}");
+                assert_eq!(node.top, px(rect.y - origin.1), "slot {slot}");
+                assert_eq!(node.width, px(rect.w), "slot {slot}");
+                assert_eq!(node.height, px(rect.h), "slot {slot}");
+            }
+        }
+        // The drag point the driver aims at is inside the dragged fader.
+        let point = layout.fader_point(32, 0.75);
+        let fader = layout.slot(32).fader;
+        assert!(point.0 > fader.x && point.0 < fader.right());
+        assert!(point.1 > fader.y && point.1 < fader.bottom());
     }
 
     #[test]

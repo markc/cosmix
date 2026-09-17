@@ -447,6 +447,7 @@ mod tests {
                 strips: 64,
                 seed: DEFAULT_SEED,
                 song: None,
+                size: (1024, 576),
                 scripted_drag: true,
             },
             Some(song.clone()),
