@@ -207,7 +207,7 @@ fn options() -> Result<Options, String> {
 /// Which commits ask for feedback: all of them without bursts; otherwise
 /// the first (superseded) and last (shown) commit of each burst.
 fn asks_feedback(commit: usize, burst: usize) -> bool {
-    burst == 1 || commit % burst == 0 || commit % burst == burst - 1
+    burst == 1 || commit.is_multiple_of(burst) || commit % burst == burst - 1
 }
 
 fn is_last_of_burst(commit: usize, burst: usize) -> bool {

@@ -1529,9 +1529,6 @@ fn upsert_client_cursor(
                 };
                 match imported {
                     Ok(image) => {
-                        dmabuf_request = importer
-                            .progress(image.id())
-                            .map(|progress| progress.latest);
                         set_client_image_linear(world, &image);
                         (
                             ClientSurfaceImage::encoded_premultiplied_unorm(image),
