@@ -11,6 +11,11 @@ pub const PEAK_TICKS: u64 = 6;
 pub const HOLD_TICKS: u64 = 45;
 /// A lane is marked clipped while its hold window contains a level above this.
 pub const CLIP_DB: f32 = 0.0;
+/// Initial fader values closer than this to 0 dB are generated as 0 dB.
+/// CTK snaps a constructed fader within (range / 200) = 0.63 dB of its 0 dB
+/// detent; generating on the far side of that band keeps every arm showing the
+/// same value.
+pub const FADER_DETENT_BAND_DB: f32 = 0.7;
 /// One full down-and-up cycle of the scripted drag.
 pub const DRAG_PERIOD_TICKS: u64 = 90;
 /// Fader travel range the scripted drag sweeps.
@@ -123,6 +128,11 @@ impl MixerFeed {
         let name = format!("{} {}", NAMES[(h % NAMES.len() as u64) as usize], slot + 1);
         // -24..=+3 dB in 0.1 dB steps.
         let fader_db = ((h >> 8) % 271) as f32 / 10.0 - 24.0;
+        let fader_db = if fader_db.abs() < FADER_DETENT_BAND_DB {
+            0.0
+        } else {
+            fader_db
+        };
         // -1..=1 in 1/64 steps (every such value is on CTK's 1/512 grid).
         let pan = ((h >> 20) % 129) as f32 / 64.0 - 1.0;
         StripState {
@@ -272,6 +282,7 @@ mod tests {
             assert!(names.insert(strip.name.clone()), "names are unique");
             assert!(strip.name.len() <= 9, "{} fits the compact name box", strip.name);
             assert!((-24.0..=3.0).contains(&strip.fader_db));
+            assert!(strip.fader_db == 0.0 || strip.fader_db.abs() >= FADER_DETENT_BAND_DB);
             let tenths = strip.fader_db * 10.0;
             assert!((tenths - tenths.round()).abs() < 1e-3);
             assert!((-1.0..=1.0).contains(&strip.pan));
