@@ -40911,3 +40911,9 @@ mod x11 {
         include!("x11_placement_tests.rs");
     }
 }
+
+#[cfg(feature = "bus")]
+mod injection_tests {
+    use super::*;
+    include!("input_injection_tests.rs");
+}

@@ -3190,6 +3190,8 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             #[cfg(feature = "bus")]
+            injection: input_injection::InjectionState::default(),
+            #[cfg(feature = "bus")]
             observations: port_observation::ObservationState::new(
                 observation_producer,
                 observation_event_seq,
@@ -3350,6 +3352,16 @@ impl ProtocolServer {
                             state
                                 .pending_port_controls
                                 .push(PortControl::Window(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Input(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Input(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Long(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Long(request));
                         }
                     }
                     ChannelEvent::Msg(PortCommand::WatchState { active, order }) => {
@@ -5993,6 +6005,9 @@ struct WaylandState {
     pending_port_requests: Vec<PortRequest>,
     #[cfg(feature = "bus")]
     pending_port_controls: Vec<PortControl>,
+    /// Bus-injected input: held keys/buttons, sequences, host passthrough.
+    #[cfg(feature = "bus")]
+    injection: input_injection::InjectionState,
     #[cfg(feature = "bus")]
     observations: port_observation::ObservationState,
     events: Vec<ProtocolEvent>,
@@ -8444,6 +8459,8 @@ impl WaylandState {
     }
 
     fn handle_frame(&mut self, inputs: Vec<HostInput>) {
+        #[cfg(feature = "bus")]
+        let inputs = self.filter_host_passthrough(inputs);
         for input in inputs {
             self.handle_host_input(input);
         }
@@ -15545,6 +15562,8 @@ mod input;
 pub(crate) mod presentation;
 mod release_use;
 #[cfg(feature = "bus")]
+mod input_injection;
+#[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;
 #[cfg(feature = "xwayland")]
@@ -15774,10 +15793,28 @@ fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> ClampRes
     }
 }
 
+/// Event time in milliseconds on CLOCK_MONOTONIC, wrapping at `u32`.
+///
+/// The Wayland base is unspecified, but CLOCK_MONOTONIC is the clock
+/// `wp_presentation` reports, so a client can subtract an input event time
+/// from a presentation time without a second clock.
 pub(crate) fn monotonic_millis() -> u32 {
-    // Wayland timestamps have an unspecified monotonic base and wrap naturally.
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u32
+    (monotonic_micros() / 1_000) as u32
+}
+
+/// CLOCK_MONOTONIC in microseconds.
+pub(crate) fn monotonic_micros() -> u64 {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value points to a valid, writable timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return 0;
+    }
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(value.tv_nsec as u64 / 1_000)
 }
 
 fn root_compositor_surface(surface: &WlSurface) -> WlSurface {

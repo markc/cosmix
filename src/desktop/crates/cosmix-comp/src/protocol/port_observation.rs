@@ -1056,7 +1056,15 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     service_focus_edge(state);
     service_output_edges(state);
     service_property_diffs(state);
-    service_controls(state);
+    if service_controls(state) {
+        // A mutation (window op, injected input) moved state after the
+        // edge passes above ran; report it in this cycle rather than on
+        // whatever event wakes the loop next.
+        service_surface_edges(state);
+        service_focus_edge(state);
+        service_output_edges(state);
+        service_property_diffs(state);
+    }
     service_pointer(state);
 }
 
@@ -1558,6 +1566,7 @@ fn diff_corners(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
+    let (old_host, new_host) = (old.input.host, new.input.host);
     let old = old.input.corners;
     let new = new.input.corners;
     for (leaf, old, new) in [
@@ -1583,6 +1592,15 @@ fn diff_corners(
         ),
     ] {
         queue_prop_change(pending, format!("input.corners.{leaf}"), old, new, cause);
+    }
+    if let (Some(old), Some(new)) = (old_host, new_host) {
+        queue_prop_change(
+            pending,
+            HOST_PASSTHROUGH_PATH.into(),
+            PropValue::Bool(old.passthrough),
+            PropValue::Bool(new.passthrough),
+            cause,
+        );
     }
 }
 
@@ -2066,7 +2084,8 @@ fn unix_millis() -> i64 {
         })
 }
 
-fn service_controls(state: &mut WaylandState) {
+/// Returns whether any control mutated compositor state.
+fn service_controls(state: &mut WaylandState) -> bool {
     let mut controls = std::mem::take(&mut state.pending_port_controls);
     if let Some(context) = state.port_context.as_ref() {
         for (active, order) in [
@@ -2080,15 +2099,36 @@ fn service_controls(state: &mut WaylandState) {
     }
     controls.sort_by_key(PortControl::order);
     let mut changes = PendingPropChanges::new();
+    let mut mutated = false;
     // Mutations run in arrival order, so a script's set -> minimise ->
-    // restore lands in the order it was sent.
+    // restore -> click lands in the order it was sent.
     for control in &mut controls {
         match control {
-            PortControl::Set(request) => service_set(state, request, &mut changes),
+            PortControl::Set(request) => {
+                mutated = true;
+                service_set(state, request, &mut changes);
+            }
             PortControl::Window(request) => {
+                mutated = true;
                 let reply = state.service_window_op(&request.op);
                 if let Some(sender) = request.reply.take() {
                     let _ = sender.send(reply);
+                }
+            }
+            PortControl::Input(request) => {
+                mutated = true;
+                let reply = state.service_input_op(&request.op);
+                if let Some(sender) = request.reply.take() {
+                    let _ = sender.send(reply);
+                }
+            }
+            PortControl::Long(request) => {
+                mutated = true;
+                // The ingress slot is released here: the verb now waits on
+                // its own permit and deadline, not on the bounded queue.
+                request.slot.take();
+                if let (Some(op), Some(reply)) = (request.op.take(), request.reply.take()) {
+                    state.start_long_op(op, reply);
                 }
             }
             PortControl::Watch(_)
@@ -2118,7 +2158,10 @@ fn service_controls(state: &mut WaylandState) {
                 watches.push(request);
             }
             PortControl::WatchState { active, .. } => desired_active = active,
-            PortControl::Set(_) | PortControl::Window(_) => {}
+            PortControl::Set(_)
+            | PortControl::Window(_)
+            | PortControl::Input(_)
+            | PortControl::Long(_) => {}
         }
     }
 
@@ -2149,6 +2192,7 @@ fn service_controls(state: &mut WaylandState) {
             });
         let _ = request.reply.send(reply);
     }
+    mutated
 }
 
 fn service_set(
@@ -2195,6 +2239,10 @@ fn service_set(
         }
         return;
     }
+    if path == HOST_PASSTHROUGH_PATH {
+        service_set_host_passthrough(state, request, changes);
+        return;
+    }
     let old_config = state.observations.corner_config;
     let mut new_config = old_config;
     let validated = match validate_corner_value(&path, &request.value) {
@@ -2218,6 +2266,45 @@ fn service_set(
             new,
             persisted: None,
         });
+    }
+}
+
+pub(crate) const HOST_PASSTHROUGH_PATH: &str = "input.host.passthrough";
+
+/// `input.host.passthrough` (nested only): `false` stops host pointer and
+/// key input reaching the seat, so the host cursor cannot overwrite an
+/// injected position. Process-lifetime; the leaf does not exist on kms.
+fn service_set_host_passthrough(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    changes: &mut PendingPropChanges,
+) {
+    let path = request.path.clone();
+    let reply = if !state.host_passthrough_available() {
+        ControlReply::Validation(SetValidationError::UnknownPath)
+    } else if let Some(value) = request.value.as_bool() {
+        let old = state.host_passthrough();
+        if old != value {
+            state.set_host_passthrough(value);
+            queue_prop_change(
+                changes,
+                path.clone(),
+                PropValue::Bool(old),
+                PropValue::Bool(value),
+                "props.set",
+            );
+        }
+        ControlReply::Set {
+            path,
+            old: PropValue::Bool(old),
+            new: PropValue::Bool(value),
+            persisted: None,
+        }
+    } else {
+        ControlReply::Validation(invalid_value(&path, "bool", "true|false"))
+    };
+    if let Some(sender) = request.reply.take() {
+        let _ = sender.send(reply);
     }
 }
 
@@ -2386,8 +2473,10 @@ fn missing_window(path: &str) -> ControlReply {
 
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     flush_prop_changes(state, changes);
+    let host = state.host_input_snapshot();
     if let Some(baseline) = state.observations.watched_baseline.as_mut() {
         baseline.input.corners = state.observations.corner_config.into();
+        baseline.input.host = host;
         #[cfg(feature = "xwayland")]
         {
             baseline.xwayland.enabled = state.xwayland.enabled;
@@ -2462,6 +2551,15 @@ pub(crate) fn validate_set_request(path: &str, value: &Value) -> Result<(), SetV
     }
     if parse_window_band_path(path).is_some() {
         return validate_window_band_value(path, value).map(|_| ());
+    }
+    if path == HOST_PASSTHROUGH_PATH {
+        // Backend presence is the service's call (the leaf exists only on
+        // the nested backend).
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(invalid_value(path, "bool", "true|false"))
+        };
     }
     if parse_window_leaf_path(path).is_some_and(|(_, leaf)| leaf == "minimized") {
         return if value.is_boolean() {
@@ -2578,6 +2676,7 @@ fn known_read_only_path(path: &str) -> bool {
     }
     path == "input"
         || path == "input.corners"
+        || path == "input.host"
         || ROOTS
             .iter()
             .any(|root| path == *root || path.starts_with(&format!("{root}.")))

@@ -39,6 +39,17 @@ use port_snapshot::{
 pub(crate) const PORT_QUEUE_CAPACITY: usize = 16;
 const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Verbs that reply after a wait (`comp.input.sequence`, and in step 8
+/// `comp.window.wait` / `close {force}`) hold their own permits, so a few
+/// long waits can never starve ordinary reads and controls.
+const LONG_VERB_PERMITS: usize = 8;
+/// The longest a long verb may run before its reply is due.
+pub(crate) const LONG_VERB_MAX: Duration = Duration::from_secs(60);
+/// Admission slack on top of a long verb's own deadline: the protocol
+/// thread answers at the deadline, and the worker must still be listening.
+const LONG_VERB_SLACK: Duration = Duration::from_secs(1);
+const SEQUENCE_MAX_STEPS: usize = 256;
+const TEXT_MAX_CHARS: usize = 4096;
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
 const GAP_RETRY_INITIAL: Duration = Duration::from_secs(1);
@@ -54,6 +65,8 @@ pub(crate) enum PortCommand {
     PointerWatch(PortReply),
     Set(PortSetRequest),
     Window(PortWindowRequest),
+    Input(PortInputRequest),
+    Long(PortLongRequest),
     WatchState { active: bool, order: u64 },
 }
 
@@ -87,6 +100,114 @@ pub(crate) struct PortWindowRequest {
     pub(crate) order: u64,
     pub(crate) op: WindowOp,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+/// Press, release, or both in one verb (`click` for buttons, `tap` for
+/// keys).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PressAction {
+    Press,
+    Release,
+    Both,
+}
+
+/// Where `comp.input.pointer.move` puts the pointer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PointerMoveTarget {
+    /// Output-local logical coordinates; `None` is the default output.
+    Output {
+        output: Option<String>,
+        x: f64,
+        y: f64,
+    },
+    /// A relative device delta (accelerated == unaccelerated).
+    Relative { dx: f64, dy: f64 },
+    /// Window-local coordinates, relative to the window-geometry origin.
+    Window {
+        id: u64,
+        generation: u64,
+        x: f64,
+        y: f64,
+        require_hit: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+}
+
+/// A key named by XKB keysym (`"Return"`, `"a"`, `"Super_L"`) or by raw
+/// evdev code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeySpec {
+    Name(String),
+    Evdev(u32),
+}
+
+/// One `comp.input.*` operation, parsed and bounded on the worker.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum InputOp {
+    PointerMove(PointerMoveTarget),
+    PointerButton {
+        button: u32,
+        action: PressAction,
+    },
+    PointerScroll {
+        dx: Option<f64>,
+        dy: Option<f64>,
+        source: ScrollSource,
+        v120: (Option<i32>, Option<i32>),
+    },
+    Key {
+        key: KeySpec,
+        action: PressAction,
+        /// Keysym names of modifiers held around the key.
+        modifiers: Vec<KeySpec>,
+    },
+    Text(String),
+    ReleaseAll,
+}
+
+pub(crate) struct PortInputRequest {
+    pub(crate) order: u64,
+    pub(crate) op: InputOp,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+/// One step of `comp.input.sequence`: the delay runs before the step.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SequenceStep {
+    pub(crate) verb: &'static str,
+    pub(crate) op: InputOp,
+    pub(crate) delay: Duration,
+}
+
+/// A verb whose reply waits on a timer or an edge.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LongOp {
+    Sequence(Vec<SequenceStep>),
+}
+
+impl LongOp {
+    /// When the protocol thread must have answered by.
+    fn budget(&self) -> Duration {
+        match self {
+            Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
+        }
+    }
+}
+
+pub(crate) struct PortLongRequest {
+    pub(crate) order: u64,
+    pub(crate) op: Option<LongOp>,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+    /// The queue slot this request holds until the protocol thread has
+    /// taken it: dropping it there frees the slot while the verb waits, so
+    /// long waits never fill the bounded ingress.
+    pub(crate) slot: Option<QueueSlot>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,9 +258,21 @@ pub(crate) enum ControlReply {
     },
     Locked,
     Busy,
+    /// A verb's success body (rc 0).
+    Body(Value),
+    /// A refusal: `{"error": error, ...detail}` (rc 10). `detail` is an
+    /// object or null.
+    Refused {
+        error: &'static str,
+        detail: Value,
+    },
 }
 
 impl ControlReply {
+    pub(crate) fn refused(error: &'static str, detail: Value) -> Self {
+        Self::Refused { error, detail }
+    }
+
     pub(crate) fn into_wire(self) -> (u8, Arc<str>) {
         match self {
             Self::PointerWatch { topic, lease_ms } => (
@@ -253,6 +386,22 @@ impl ControlReply {
             ),
             Self::Locked => error("locked"),
             Self::Busy => error("busy"),
+            Self::Body(body) => (0, Arc::from(body.to_string())),
+            Self::Refused {
+                error: code,
+                detail,
+            } => {
+                let mut body = serde_json::Map::new();
+                body.insert("error".into(), json!(code));
+                if let Value::Object(fields) = detail {
+                    for (name, value) in fields {
+                        if name != "error" {
+                            body.insert(name, value);
+                        }
+                    }
+                }
+                (10, Arc::from(Value::Object(body).to_string()))
+            }
         }
     }
 }
@@ -262,6 +411,8 @@ pub(crate) enum PortControl {
     PointerWatch(PortReply),
     Set(PortSetRequest),
     Window(PortWindowRequest),
+    Input(PortInputRequest),
+    Long(PortLongRequest),
     WatchState { active: bool, order: u64 },
 }
 
@@ -272,6 +423,8 @@ impl PortControl {
             Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
             Self::Window(request) => request.order,
+            Self::Input(request) => request.order,
+            Self::Long(request) => request.order,
             Self::WatchState { order, .. } => *order,
         }
     }
@@ -343,6 +496,36 @@ impl PortIngress {
         )
     }
 
+    pub(crate) fn request_input(&self, op: InputOp) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(
+            PortCommand::Input(PortInputRequest {
+                order: self.next_control_order(),
+                op,
+                reply: Some(reply),
+            }),
+            receive,
+        )
+    }
+
+    /// Admit a long verb. The queue slot rides inside the command and is
+    /// released when the protocol thread takes it, not when the reply
+    /// arrives; the reply wait is bounded by the verb's own budget.
+    pub(crate) fn request_long(&self, op: LongOp) -> Result<LongAdmission, ()> {
+        let timeout = op.budget().min(LONG_VERB_MAX) + LONG_VERB_SLACK;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let slot = self.reserve_slot()?;
+        let command = PortCommand::Long(PortLongRequest {
+            order: self.next_control_order(),
+            op: Some(op),
+            reply: Some(reply),
+            slot: Some(slot),
+        });
+        // A refused send drops the command, and with it the slot.
+        self.sender.try_send(command).map_err(|_| ())?;
+        Ok(LongAdmission { receive, timeout })
+    }
+
     pub(crate) fn set_watch_state(&self, active: bool) {
         let order = self.next_control_order();
         if let Err(TrySendError::Full(_)) = self
@@ -371,6 +554,14 @@ impl PortIngress {
         command: PortCommand,
         receive: tokio::sync::oneshot::Receiver<T>,
     ) -> Result<Admission<T>, ()> {
+        let depth = self.reserve_slot()?;
+        match self.sender.try_send(command) {
+            Ok(()) => Ok(Admission { receive, depth }),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+
+    fn reserve_slot(&self) -> Result<QueueSlot, ()> {
         let mut depth = self.queue_depth.load(Ordering::Acquire);
         loop {
             if depth >= PORT_QUEUE_CAPACITY {
@@ -382,18 +573,8 @@ impl PortIngress {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return Ok(QueueSlot(Arc::clone(&self.queue_depth))),
                 Err(observed) => depth = observed,
-            }
-        }
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(Admission {
-                receive,
-                depth: QueueDepthGuard(Arc::clone(&self.queue_depth)),
-            }),
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.queue_depth.fetch_sub(1, Ordering::AcqRel);
-                Err(())
             }
         }
     }
@@ -406,7 +587,26 @@ impl PortIngress {
 
 pub(crate) struct Admission<T> {
     receive: tokio::sync::oneshot::Receiver<T>,
-    depth: QueueDepthGuard,
+    depth: QueueSlot,
+}
+
+pub(crate) struct LongAdmission {
+    receive: tokio::sync::oneshot::Receiver<ControlReply>,
+    timeout: Duration,
+}
+
+impl LongAdmission {
+    pub(crate) async fn receive(self) -> Result<ControlReply, ()> {
+        match tokio::time::timeout(self.timeout, self.receive).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) | Err(_) => Err(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeout_for_test(&self) -> Duration {
+        self.timeout
+    }
 }
 
 impl<T> Admission<T> {
@@ -672,9 +872,10 @@ impl Drop for CompletionOnDrop {
     }
 }
 
-struct QueueDepthGuard(Arc<AtomicUsize>);
+/// One admitted ingress entry; dropping it frees the slot.
+pub(crate) struct QueueSlot(Arc<AtomicUsize>);
 
-impl Drop for QueueDepthGuard {
+impl Drop for QueueSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -889,6 +1090,7 @@ async fn worker_loop<F, Fut, C>(
     apply_connection_state(&broker, *states.borrow());
     let mut responders = JoinSet::new();
     let responder_permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+    let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
     let (reply_sender, reply_receiver) = tokio_mpsc::channel(PORT_REPLY_CAPACITY);
     let reply_task = tokio::spawn(reply_loop(
         Arc::clone(&client),
@@ -934,10 +1136,11 @@ async fn worker_loop<F, Fut, C>(
                     }
                     break;
                 };
-                handle_incoming(
+                dispatch_incoming(
                     &ingress,
                     &mut responders,
                     &responder_permits,
+                    &long_permits,
                     &reply_sender,
                     &reply_timeouts,
                     &service,
@@ -1010,10 +1213,36 @@ fn apply_connection_state(broker: &AtomicU8, state: ConnState) {
     );
 }
 
+/// The pre-long-verb entry the existing tests drive: a fresh long pool per
+/// call, so only the tests that exercise long verbs see pool pressure.
+#[cfg(test)]
 fn handle_incoming(
     ingress: &PortIngress,
     responders: &mut JoinSet<()>,
     responder_permits: &Arc<Semaphore>,
+    reply_sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &Arc<AtomicU64>,
+    service: &str,
+    command: cosmix_client::IncomingCommand,
+) {
+    dispatch_incoming(
+        ingress,
+        responders,
+        responder_permits,
+        &Arc::new(Semaphore::new(LONG_VERB_PERMITS)),
+        reply_sender,
+        reply_timeouts,
+        service,
+        command,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_incoming(
+    ingress: &PortIngress,
+    responders: &mut JoinSet<()>,
+    responder_permits: &Arc<Semaphore>,
+    long_permits: &Arc<Semaphore>,
     reply_sender: &tokio_mpsc::Sender<PendingReply>,
     reply_timeouts: &Arc<AtomicU64>,
     service: &str,
@@ -1177,6 +1406,111 @@ fn handle_incoming(
             }
         };
         let admission = match ingress.request_window(op) {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        spawn_control_responder(
+            responders,
+            reply_sender,
+            reply_timeouts,
+            command,
+            admission,
+            permit,
+        );
+        return;
+    }
+    if command.command == "comp.input.sequence" {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "{steps, interval_ms?}"))
+        } else {
+            parse_sequence(&command.args)
+        };
+        let op = match parsed {
+            Ok(op) => op,
+            Err(reply) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()),
+                );
+                return;
+            }
+        };
+        let permit = match Arc::clone(long_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_long(op) {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let reply_sender = reply_sender.clone();
+        let reply_timeouts = Arc::clone(reply_timeouts);
+        responders.spawn(async move {
+            let _permit = permit;
+            let reply = admission
+                .receive()
+                .await
+                .unwrap_or(ControlReply::Busy)
+                .into_wire();
+            queue_reply(
+                &reply_sender,
+                &reply_timeouts,
+                PendingReply::new(command, reply),
+            );
+        });
+        return;
+    }
+    if let Some(verb) = input_verb(&command.command) {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "verb arguments"))
+        } else {
+            parse_input_op(verb, &command.args)
+        };
+        let op = match parsed {
+            Ok(op) => op,
+            Err(reply) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()),
+                );
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_input(op) {
             Ok(admission) => admission,
             Err(()) => {
                 queue_reply(
@@ -1398,6 +1732,465 @@ fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
     } else {
         Ok(WindowOp::Restore { target })
     }
+}
+
+const INPUT_VERBS: &[&str] = &[
+    "comp.input.pointer.move",
+    "comp.input.pointer.button",
+    "comp.input.pointer.scroll",
+    "comp.input.key",
+    "comp.input.release_all",
+];
+
+/// The canonical `&'static` name of a single-step input verb.
+fn input_verb(verb: &str) -> Option<&'static str> {
+    INPUT_VERBS.iter().copied().find(|known| *known == verb)
+}
+
+/// evdev `BTN_LEFT` / `BTN_RIGHT` / `BTN_MIDDLE`.
+pub(crate) const BTN_LEFT: u32 = 0x110;
+pub(crate) const BTN_RIGHT: u32 = 0x111;
+pub(crate) const BTN_MIDDLE: u32 = 0x112;
+/// evdev `KEY_MAX`: every key and button code is at most this.
+const EVDEV_CODE_MAX: u64 = 0x2ff;
+
+fn args_object<'a>(
+    args: &'a Value,
+    empty: &'a serde_json::Map<String, Value>,
+    allowed: &'static [&'static str],
+) -> Result<&'a serde_json::Map<String, Value>, ControlReply> {
+    let object = match args {
+        Value::Null => empty,
+        Value::Object(object) => object,
+        _ => return Err(invalid_argument("args", "JSON object", "verb arguments")),
+    };
+    if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+        return Err(ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed,
+        });
+    }
+    Ok(object)
+}
+
+fn present<'a>(object: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a Value> {
+    object.get(name).filter(|value| !value.is_null())
+}
+
+fn finite_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<f64>, ControlReply> {
+    match present(object, name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite() && value.abs() <= 1.0e6)
+            .map(Some)
+            .ok_or_else(|| invalid_argument(name, "finite number", "-1e6..=1e6")),
+    }
+}
+
+fn required_finite(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<f64, ControlReply> {
+    finite_arg(object, name)?.ok_or_else(|| invalid_argument(name, "finite number", "required"))
+}
+
+fn press_action(
+    object: &serde_json::Map<String, Value>,
+    both: &'static str,
+) -> Result<PressAction, ControlReply> {
+    match present(object, "action") {
+        None => Ok(PressAction::Both),
+        Some(Value::String(action)) if action == "press" => Ok(PressAction::Press),
+        Some(Value::String(action)) if action == "release" => Ok(PressAction::Release),
+        Some(Value::String(action)) if action == both => Ok(PressAction::Both),
+        Some(_) => Err(invalid_argument(
+            "action",
+            "string",
+            if both == "click" {
+                "press|release|click"
+            } else {
+                "press|release|tap"
+            },
+        )),
+    }
+}
+
+fn evdev_code(value: &Value, name: &'static str, minimum: u64) -> Result<u32, ControlReply> {
+    value
+        .as_u64()
+        .filter(|code| (minimum..=EVDEV_CODE_MAX).contains(code))
+        .map(|code| code as u32)
+        .ok_or_else(|| invalid_argument(name, "evdev code", "an evdev code up to 0x2ff"))
+}
+
+fn key_spec(value: &Value, name: &'static str) -> Result<KeySpec, ControlReply> {
+    match value {
+        Value::String(key) if !key.is_empty() && key.len() <= 64 => Ok(KeySpec::Name(key.clone())),
+        Value::Number(_) => evdev_code(value, name, 1).map(KeySpec::Evdev),
+        _ => Err(invalid_argument(
+            name,
+            "keysym name or evdev code",
+            "XKB keysym name (\"Return\", \"a\") or 1..=0x2ff",
+        )),
+    }
+}
+
+fn modifier_spec(value: &Value) -> Result<KeySpec, ControlReply> {
+    let name = match value.as_str() {
+        Some("shift") => "Shift_L",
+        Some("ctrl" | "control") => "Control_L",
+        Some("alt") => "Alt_L",
+        Some("super" | "logo") => "Super_L",
+        Some("altgr") => "ISO_Level3_Shift",
+        _ => {
+            return Err(invalid_argument(
+                "modifiers",
+                "list of modifier names",
+                "shift|ctrl|alt|super|altgr",
+            ));
+        }
+    };
+    Ok(KeySpec::Name(name.into()))
+}
+
+/// Parse one `comp.input.*` verb's arguments. Shared by the direct verbs
+/// and `comp.input.sequence` steps, so a step is exactly the verb.
+pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    match verb {
+        "comp.input.pointer.move" => {
+            const ALLOWED: &[&str] = &["output", "x", "y", "dx", "dy", "window", "require_hit"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let require_hit = match present(object, "require_hit") {
+                None => None,
+                Some(Value::Bool(value)) => Some(*value),
+                Some(_) => return Err(invalid_argument("require_hit", "bool", "true|false")),
+            };
+            let relative = present(object, "dx").is_some() || present(object, "dy").is_some();
+            if let Some(window) = present(object, "window") {
+                const WINDOW: &[&str] = &["id", "generation"];
+                let window = match window {
+                    Value::Object(window) => window,
+                    _ => return Err(invalid_argument("window", "object", "{id, generation}")),
+                };
+                if let Some(field) = window.keys().find(|field| !WINDOW.contains(&field.as_str()))
+                {
+                    return Err(ControlReply::InvalidArgs {
+                        field: format!("window.{field}"),
+                        allowed: WINDOW,
+                    });
+                }
+                if relative || present(object, "output").is_some() {
+                    return Err(invalid_argument(
+                        "window",
+                        "exclusive form",
+                        "{window, x, y} takes no output, dx or dy",
+                    ));
+                }
+                let id = window_arg(window, "id")?
+                    .ok_or_else(|| invalid_argument("window.id", "unsigned integer", "required"))?;
+                let generation = window_arg(window, "generation")?.ok_or_else(|| {
+                    invalid_argument(
+                        "window.generation",
+                        "unsigned integer",
+                        "required (read windows.s<id>.generation)",
+                    )
+                })?;
+                return Ok(InputOp::PointerMove(PointerMoveTarget::Window {
+                    id,
+                    generation,
+                    x: required_finite(object, "x")?,
+                    y: required_finite(object, "y")?,
+                    require_hit: require_hit.unwrap_or(false),
+                }));
+            }
+            if require_hit.is_some() {
+                return Err(invalid_argument(
+                    "require_hit",
+                    "absent",
+                    "require_hit applies to the {window, x, y} form only",
+                ));
+            }
+            if relative {
+                if present(object, "x").is_some()
+                    || present(object, "y").is_some()
+                    || present(object, "output").is_some()
+                {
+                    return Err(invalid_argument(
+                        "dx",
+                        "exclusive form",
+                        "{dx, dy} takes no output, x or y",
+                    ));
+                }
+                return Ok(InputOp::PointerMove(PointerMoveTarget::Relative {
+                    dx: finite_arg(object, "dx")?.unwrap_or(0.0),
+                    dy: finite_arg(object, "dy")?.unwrap_or(0.0),
+                }));
+            }
+            let output = match present(object, "output") {
+                None => None,
+                Some(Value::String(output)) if !output.is_empty() => Some(output.clone()),
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "output",
+                        "string",
+                        "outputs.<key> key or output name",
+                    ));
+                }
+            };
+            Ok(InputOp::PointerMove(PointerMoveTarget::Output {
+                output,
+                x: required_finite(object, "x")?,
+                y: required_finite(object, "y")?,
+            }))
+        }
+        "comp.input.pointer.button" => {
+            const ALLOWED: &[&str] = &["button", "action"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let button = match present(object, "button") {
+                None => BTN_LEFT,
+                Some(Value::String(name)) if name == "left" => BTN_LEFT,
+                Some(Value::String(name)) if name == "right" => BTN_RIGHT,
+                Some(Value::String(name)) if name == "middle" => BTN_MIDDLE,
+                Some(value @ Value::Number(_)) => evdev_code(value, "button", 0x100)?,
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "button",
+                        "button name or evdev code",
+                        "left|right|middle|0x100..=0x2ff",
+                    ));
+                }
+            };
+            Ok(InputOp::PointerButton {
+                button,
+                action: press_action(object, "click")?,
+            })
+        }
+        "comp.input.pointer.scroll" => {
+            const ALLOWED: &[&str] = &["dx", "dy", "source", "v120"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let dx = finite_arg(object, "dx")?;
+            let dy = finite_arg(object, "dy")?;
+            if dx.is_none() && dy.is_none() {
+                return Err(invalid_argument("dy", "finite number", "dx or dy is required"));
+            }
+            let source = match present(object, "source") {
+                None => ScrollSource::Wheel,
+                Some(Value::String(source)) if source == "wheel" => ScrollSource::Wheel,
+                Some(Value::String(source)) if source == "finger" => ScrollSource::Finger,
+                Some(Value::String(source)) if source == "continuous" => ScrollSource::Continuous,
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "source",
+                        "string",
+                        "wheel|finger|continuous",
+                    ));
+                }
+            };
+            let detent = |name: &'static str,
+                          value: Option<&Value>,
+                          amount: Option<f64>|
+             -> Result<Option<i32>, ControlReply> {
+                match value {
+                    Some(value) => {
+                        if amount.is_none() {
+                            return Err(invalid_argument(
+                                name,
+                                "absent",
+                                "a detent count needs the matching axis",
+                            ));
+                        }
+                        value
+                            .as_i64()
+                            .and_then(|value| i32::try_from(value).ok())
+                            .filter(|value| value.unsigned_abs() <= 120 * 1000)
+                            .map(Some)
+                            .ok_or_else(|| {
+                                invalid_argument(name, "integer", "-120000..=120000")
+                            })
+                    }
+                    // A wheel reports detents: 15 logical units to one
+                    // detent (120) is libinput's convention. Other sources
+                    // have none, and an absent count stays absent.
+                    None if source == ScrollSource::Wheel => {
+                        Ok(amount.map(|amount| (amount * 8.0).round() as i32))
+                    }
+                    None => Ok(None),
+                }
+            };
+            let v120 = match present(object, "v120") {
+                None => (detent("v120.dx", None, dx)?, detent("v120.dy", None, dy)?),
+                Some(Value::Object(v120)) => {
+                    const V120: &[&str] = &["dx", "dy"];
+                    if let Some(field) = v120.keys().find(|field| !V120.contains(&field.as_str()))
+                    {
+                        return Err(ControlReply::InvalidArgs {
+                            field: format!("v120.{field}"),
+                            allowed: V120,
+                        });
+                    }
+                    if source != ScrollSource::Wheel {
+                        return Err(invalid_argument(
+                            "v120",
+                            "absent",
+                            "detent counts belong to source wheel",
+                        ));
+                    }
+                    (
+                        detent("v120.dx", present(v120, "dx"), dx)?,
+                        detent("v120.dy", present(v120, "dy"), dy)?,
+                    )
+                }
+                Some(_) => return Err(invalid_argument("v120", "object", "{dx?, dy?}")),
+            };
+            Ok(InputOp::PointerScroll {
+                dx,
+                dy,
+                source,
+                v120,
+            })
+        }
+        "comp.input.key" => {
+            const ALLOWED: &[&str] = &["key", "action", "modifiers", "text"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            if let Some(text) = present(object, "text") {
+                if ["key", "action", "modifiers"]
+                    .iter()
+                    .any(|name| present(object, name).is_some())
+                {
+                    return Err(invalid_argument(
+                        "text",
+                        "exclusive form",
+                        "{text} takes no key, action or modifiers",
+                    ));
+                }
+                return match text {
+                    Value::String(text)
+                        if !text.is_empty() && text.chars().count() <= TEXT_MAX_CHARS =>
+                    {
+                        Ok(InputOp::Text(text.clone()))
+                    }
+                    _ => Err(invalid_argument("text", "string", "1..=4096 characters")),
+                };
+            }
+            let key = present(object, "key")
+                .ok_or_else(|| invalid_argument("key", "keysym name or evdev code", "required"))
+                .and_then(|key| key_spec(key, "key"))?;
+            let modifiers = match present(object, "modifiers") {
+                None => Vec::new(),
+                Some(Value::Array(modifiers)) if modifiers.len() <= 5 => modifiers
+                    .iter()
+                    .map(modifier_spec)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "modifiers",
+                        "list of modifier names",
+                        "shift|ctrl|alt|super|altgr",
+                    ));
+                }
+            };
+            Ok(InputOp::Key {
+                key,
+                action: press_action(object, "tap")?,
+                modifiers,
+            })
+        }
+        "comp.input.release_all" => {
+            args_object(args, &empty, &[])?;
+            Ok(InputOp::ReleaseAll)
+        }
+        _ => Err(invalid_argument(
+            "verb",
+            "input verb",
+            "comp.input.pointer.move|pointer.button|pointer.scroll|key|release_all",
+        )),
+    }
+}
+
+fn delay_arg(value: Option<&Value>, name: &'static str) -> Result<Option<Duration>, ControlReply> {
+    match value {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| *ms <= LONG_VERB_MAX.as_millis() as u64)
+            .map(|ms| Some(Duration::from_millis(ms)))
+            .ok_or_else(|| invalid_argument(name, "unsigned integer", "0..=60000")),
+    }
+}
+
+/// `comp.input.sequence {steps:[{verb, args?, delay_ms?}], interval_ms?}`.
+/// `delay_ms` (default `interval_ms`, default 0) runs before its step; the
+/// delays together are capped at 60 s.
+fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    const ALLOWED: &[&str] = &["steps", "interval_ms"];
+    let object = args_object(args, &empty, ALLOWED)?;
+    let interval = delay_arg(present(object, "interval_ms"), "interval_ms")?.unwrap_or_default();
+    let steps = match present(object, "steps") {
+        Some(Value::Array(steps)) if !steps.is_empty() && steps.len() <= SEQUENCE_MAX_STEPS => {
+            steps
+        }
+        _ => return Err(invalid_argument("steps", "list", "1..=256 steps")),
+    };
+    let mut parsed = Vec::with_capacity(steps.len());
+    let mut total = Duration::ZERO;
+    for (index, step) in steps.iter().enumerate() {
+        const STEP: &[&str] = &["verb", "args", "delay_ms"];
+        let step = match step {
+            Value::Object(step) => step,
+            _ => return Err(invalid_argument("steps", "list of objects", "{verb, args?, delay_ms?}")),
+        };
+        if let Some(field) = step.keys().find(|field| !STEP.contains(&field.as_str())) {
+            return Err(ControlReply::InvalidArgs {
+                field: format!("steps[{index}].{field}"),
+                allowed: STEP,
+            });
+        }
+        let verb = present(step, "verb")
+            .and_then(Value::as_str)
+            .and_then(input_verb)
+            .ok_or_else(|| {
+                invalid_argument(
+                    "steps.verb",
+                    "input verb",
+                    "comp.input.pointer.move|pointer.button|pointer.scroll|key|release_all",
+                )
+            })?;
+        let op = parse_input_op(verb, step.get("args").unwrap_or(&Value::Null)).map_err(
+            |reply| match reply {
+                ControlReply::Validation(SetValidationError::InvalidValue {
+                    path,
+                    expected,
+                    range,
+                }) => ControlReply::Validation(SetValidationError::InvalidValue {
+                    path: format!("steps[{index}].args.{path}"),
+                    expected,
+                    range,
+                }),
+                ControlReply::InvalidArgs { field, allowed } => ControlReply::InvalidArgs {
+                    field: format!("steps[{index}].args.{field}"),
+                    allowed,
+                },
+                other => other,
+            },
+        )?;
+        let delay = delay_arg(present(step, "delay_ms"), "steps.delay_ms")?.unwrap_or(interval);
+        total += delay;
+        if total > LONG_VERB_MAX {
+            return Err(invalid_argument(
+                "steps",
+                "total delay",
+                "the delays together are at most 60000 ms",
+            ));
+        }
+        parsed.push(SequenceStep { verb, op, delay });
+    }
+    Ok(LongOp::Sequence(parsed))
 }
 
 fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
@@ -2488,6 +3281,391 @@ mod tests {
         assert_eq!(refused.id.as_deref(), Some("3"));
         assert_eq!(refused.rc, 10);
         responders.abort_all();
+    }
+
+    fn refusal(reply: ControlReply) -> Value {
+        let (rc, body) = reply.into_wire();
+        assert_eq!(rc, 10, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn input_verbs_parse_every_documented_form() {
+        assert_eq!(
+            parse_input_op("comp.input.pointer.move", &json!({"x": 40, "y": 30.5})),
+            Ok(InputOp::PointerMove(PointerMoveTarget::Output {
+                output: None,
+                x: 40.0,
+                y: 30.5
+            }))
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.move",
+                &json!({"output": "o_nested", "x": 1, "y": 2})
+            ),
+            Ok(InputOp::PointerMove(PointerMoveTarget::Output {
+                output: Some("o_nested".into()),
+                x: 1.0,
+                y: 2.0
+            }))
+        );
+        assert_eq!(
+            parse_input_op("comp.input.pointer.move", &json!({"dx": -3})),
+            Ok(InputOp::PointerMove(PointerMoveTarget::Relative {
+                dx: -3.0,
+                dy: 0.0
+            }))
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.move",
+                &json!({"window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
+            ),
+            Ok(InputOp::PointerMove(PointerMoveTarget::Window {
+                id: 7,
+                generation: 3,
+                x: 4.0,
+                y: 5.0,
+                require_hit: true
+            }))
+        );
+        assert_eq!(
+            parse_input_op("comp.input.pointer.button", &Value::Null),
+            Ok(InputOp::PointerButton {
+                button: BTN_LEFT,
+                action: PressAction::Both
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.button",
+                &json!({"button": "right", "action": "press"})
+            ),
+            Ok(InputOp::PointerButton {
+                button: BTN_RIGHT,
+                action: PressAction::Press
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.button",
+                &json!({"button": 0x113, "action": "release"})
+            ),
+            Ok(InputOp::PointerButton {
+                button: 0x113,
+                action: PressAction::Release
+            })
+        );
+        // A wheel derives detents (15 units = 120); a finger has none and a
+        // missing axis stays missing.
+        assert_eq!(
+            parse_input_op("comp.input.pointer.scroll", &json!({"dy": 15})),
+            Ok(InputOp::PointerScroll {
+                dx: None,
+                dy: Some(15.0),
+                source: ScrollSource::Wheel,
+                v120: (None, Some(120))
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.scroll",
+                &json!({"dx": 0, "source": "finger"})
+            ),
+            Ok(InputOp::PointerScroll {
+                dx: Some(0.0),
+                dy: None,
+                source: ScrollSource::Finger,
+                v120: (None, None)
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.scroll",
+                &json!({"dy": 10, "v120": {"dy": -240}})
+            ),
+            Ok(InputOp::PointerScroll {
+                dx: None,
+                dy: Some(10.0),
+                source: ScrollSource::Wheel,
+                v120: (None, Some(-240))
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.key",
+                &json!({"key": "q", "modifiers": ["super", "shift"]})
+            ),
+            Ok(InputOp::Key {
+                key: KeySpec::Name("q".into()),
+                action: PressAction::Both,
+                modifiers: vec![
+                    KeySpec::Name("Super_L".into()),
+                    KeySpec::Name("Shift_L".into())
+                ],
+            })
+        );
+        assert_eq!(
+            parse_input_op("comp.input.key", &json!({"key": 28, "action": "press"})),
+            Ok(InputOp::Key {
+                key: KeySpec::Evdev(28),
+                action: PressAction::Press,
+                modifiers: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_input_op("comp.input.key", &json!({"text": "ok\n"})),
+            Ok(InputOp::Text("ok\n".into()))
+        );
+        assert_eq!(
+            parse_input_op("comp.input.release_all", &json!({})),
+            Ok(InputOp::ReleaseAll)
+        );
+    }
+
+    #[test]
+    fn input_verbs_refuse_ambiguous_and_out_of_range_arguments() {
+        for (verb, args, path) in [
+            ("comp.input.pointer.move", json!({"x": 1}), "y"),
+            ("comp.input.pointer.move", json!({"x": 1, "y": 2, "dx": 1}), "dx"),
+            (
+                "comp.input.pointer.move",
+                json!({"x": 1, "y": 2, "require_hit": true}),
+                "require_hit",
+            ),
+            (
+                "comp.input.pointer.move",
+                json!({"window": {"id": 7}, "x": 1, "y": 2}),
+                "window.generation",
+            ),
+            (
+                "comp.input.pointer.move",
+                json!({"window": {"id": 7, "generation": 1}, "dx": 1, "x": 1, "y": 2}),
+                "window",
+            ),
+            ("comp.input.pointer.move", json!({"x": "1", "y": 2}), "x"),
+            ("comp.input.pointer.move", json!({"x": 1e9, "y": 2}), "x"),
+            ("comp.input.pointer.button", json!({"button": "back"}), "button"),
+            ("comp.input.pointer.button", json!({"button": 30}), "button"),
+            ("comp.input.pointer.button", json!({"action": "tap"}), "action"),
+            ("comp.input.pointer.scroll", json!({}), "dy"),
+            (
+                "comp.input.pointer.scroll",
+                json!({"dy": 1, "source": "finger", "v120": {"dy": 120}}),
+                "v120",
+            ),
+            (
+                "comp.input.pointer.scroll",
+                json!({"dy": 1, "v120": {"dx": 120}}),
+                "v120.dx",
+            ),
+            ("comp.input.key", json!({}), "key"),
+            ("comp.input.key", json!({"key": ""}), "key"),
+            ("comp.input.key", json!({"key": 0}), "key"),
+            ("comp.input.key", json!({"key": "a", "action": "click"}), "action"),
+            ("comp.input.key", json!({"key": "a", "modifiers": ["hyper"]}), "modifiers"),
+            ("comp.input.key", json!({"text": "a", "key": "b"}), "text"),
+            ("comp.input.key", json!({"text": ""}), "text"),
+            ("comp.input.key", json!({"text": "x".repeat(4097)}), "text"),
+            ("comp.input.release_all", json!([1]), "args"),
+        ] {
+            let Err(reply) = parse_input_op(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let body = refusal(reply);
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}: {body}");
+            assert_eq!(body["path"], path, "{verb} {args}: {body}");
+        }
+        for (verb, args, field) in [
+            ("comp.input.pointer.move", json!({"x": 1, "y": 2, "screen": 0}), "screen"),
+            (
+                "comp.input.pointer.move",
+                json!({"window": {"id": 7, "generation": 1, "gen": 1}, "x": 1, "y": 2}),
+                "window.gen",
+            ),
+            ("comp.input.pointer.button", json!({"btn": "left"}), "btn"),
+            ("comp.input.pointer.scroll", json!({"dy": 1, "discrete": 1}), "discrete"),
+            ("comp.input.key", json!({"key": "a", "mods": []}), "mods"),
+            ("comp.input.release_all", json!({"all": true}), "all"),
+        ] {
+            let body = refusal(parse_input_op(verb, &args).expect_err("typo refused"));
+            assert_eq!(body["error"], "invalid_args", "{verb}");
+            assert_eq!(body["field"], field, "{verb}");
+        }
+    }
+
+    #[test]
+    fn sequence_parses_delays_and_names_the_failing_step() {
+        let Ok(LongOp::Sequence(steps)) = parse_sequence(&json!({
+            "interval_ms": 10,
+            "steps": [
+                {"verb": "comp.input.pointer.button", "args": {"action": "press"}, "delay_ms": 0},
+                {"verb": "comp.input.pointer.move", "args": {"dx": 5}},
+                {"verb": "comp.input.release_all"},
+            ],
+        })) else {
+            panic!("sequence parses");
+        };
+        assert_eq!(
+            steps.iter().map(|step| (step.verb, step.delay)).collect::<Vec<_>>(),
+            [
+                ("comp.input.pointer.button", Duration::ZERO),
+                ("comp.input.pointer.move", Duration::from_millis(10)),
+                ("comp.input.release_all", Duration::from_millis(10)),
+            ]
+        );
+        assert_eq!(LongOp::Sequence(steps).budget(), Duration::from_millis(20));
+
+        let body = refusal(
+            parse_sequence(&json!({"steps": [
+                {"verb": "comp.input.key", "args": {"key": "a"}},
+                {"verb": "comp.input.key", "args": {"key": "a", "action": "hold"}},
+            ]}))
+            .expect_err("bad step refused"),
+        );
+        assert_eq!(body["path"], "steps[1].args.action");
+        let body = refusal(
+            parse_sequence(&json!({"steps": [{"verb": "comp.input.key", "args": {"k": 1}}]}))
+                .expect_err("bad step field refused"),
+        );
+        assert_eq!(body["field"], "steps[0].args.k");
+        for (args, path) in [
+            (json!({"steps": []}), "steps"),
+            (json!({"steps": [{"verb": "comp.window.focus"}]}), "steps.verb"),
+            (json!({"steps": [{"verb": "comp.input.sequence"}]}), "steps.verb"),
+            (
+                json!({"steps": [
+                    {"verb": "comp.input.release_all", "delay_ms": 40_000},
+                    {"verb": "comp.input.release_all", "delay_ms": 30_000},
+                ]}),
+                "steps",
+            ),
+            (json!({"steps": [{"verb": "comp.input.release_all"}], "interval_ms": -1}), "interval_ms"),
+        ] {
+            let body = refusal(parse_sequence(&args).expect_err("refused"));
+            assert_eq!(body["path"], path, "{args}");
+        }
+        let too_many = vec![json!({"verb": "comp.input.release_all"}); SEQUENCE_MAX_STEPS + 1];
+        let body = refusal(parse_sequence(&json!({"steps": too_many})).expect_err("capped"));
+        assert_eq!(body["path"], "steps");
+        let body = refusal(
+            parse_sequence(&json!({"steps": [{"verb": "comp.input.release_all", "wait": 1}]}))
+                .expect_err("unknown step field"),
+        );
+        assert_eq!(body["field"], "steps[0].wait");
+    }
+
+    #[tokio::test]
+    async fn input_verbs_cross_ingress_in_order_and_long_verbs_release_their_slot() {
+        let (ingress, source, depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(1));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let mut dispatch = |verb: &str, id: usize, args: Value| {
+            let mut incoming = command(verb, id);
+            incoming.body = args.to_string();
+            incoming.args = args;
+            incoming
+                .headers
+                .insert("broker_origin".into(), "mesh".into());
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                incoming,
+            );
+        };
+        dispatch("comp.input.pointer.move", 1, json!({"x": 1, "y": 2}));
+        dispatch(
+            "comp.input.sequence",
+            2,
+            json!({"steps": [{"verb": "comp.input.release_all", "delay_ms": 50}]}),
+        );
+        // The long pool has one permit and it is held.
+        dispatch(
+            "comp.input.sequence",
+            3,
+            json!({"steps": [{"verb": "comp.input.release_all"}]}),
+        );
+        dispatch("comp.input.key", 4, json!({"text": "ok"}));
+        dispatch("comp.input.teleport", 5, json!({}));
+        dispatch("comp.input.key", 6, json!({"key": "a", "hold": true}));
+
+        let Ok(PortCommand::Input(first)) = source.try_recv() else {
+            panic!("move admitted");
+        };
+        let Ok(PortCommand::Long(mut second)) = source.try_recv() else {
+            panic!("sequence admitted");
+        };
+        let Ok(PortCommand::Input(third)) = source.try_recv() else {
+            panic!("text admitted");
+        };
+        assert!(first.order < second.order && second.order < third.order);
+        assert_eq!(third.op, InputOp::Text("ok".into()));
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(depth.load(Ordering::Acquire), 3);
+        // Taking the long request off the queue frees its slot while the
+        // verb itself keeps waiting.
+        assert!(second.slot.take().is_some());
+        assert_eq!(depth.load(Ordering::Acquire), 2);
+
+        let mut refusals = BTreeMap::new();
+        for _ in 0..3 {
+            let reply = replies.recv().await.expect("refusal");
+            refusals.insert(
+                reply.id.clone().unwrap(),
+                serde_json::from_str::<Value>(&reply.body).unwrap(),
+            );
+        }
+        assert_eq!(refusals["3"]["error"], "busy");
+        assert_eq!(refusals["5"]["error"], "unknown_verb");
+        assert_eq!(refusals["6"]["error"], "invalid_args");
+
+        // The long reply waits for its own budget, not the 2 s snapshot one.
+        let _ = second
+            .reply
+            .take()
+            .unwrap()
+            .send(ControlReply::Body(json!({"steps": []})));
+        let reply = replies.recv().await.expect("sequence reply");
+        assert_eq!(reply.id.as_deref(), Some("2"));
+        assert_eq!(reply.rc, 0);
+        responders.abort_all();
+    }
+
+    #[test]
+    fn long_admission_budget_is_the_verb_deadline_plus_slack() {
+        let (ingress, _source, _) = test_ingress();
+        let admission = ingress
+            .request_long(LongOp::Sequence(vec![SequenceStep {
+                verb: "comp.input.release_all",
+                op: InputOp::ReleaseAll,
+                delay: Duration::from_millis(1500),
+            }]))
+            .expect("admitted");
+        assert_eq!(
+            admission.timeout_for_test(),
+            Duration::from_millis(1500) + LONG_VERB_SLACK
+        );
+    }
+
+    #[test]
+    fn refused_reply_carries_code_and_detail() {
+        assert_eq!(
+            ControlReply::refused("occluded", json!({"id": 7, "error": "ignored"})).into_wire(),
+            (10, Arc::from(r#"{"error":"occluded","id":7}"#))
+        );
+        assert_eq!(
+            ControlReply::refused("busy", Value::Null).into_wire(),
+            (10, Arc::from(r#"{"error":"busy"}"#))
+        );
     }
 
     #[tokio::test]

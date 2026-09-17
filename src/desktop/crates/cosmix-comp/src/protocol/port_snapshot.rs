@@ -247,6 +247,14 @@ pub(crate) struct BindingRowSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct InputSnapshot {
     pub(crate) corners: CornersSnapshot,
+    /// Nested backend only: whether host pointer/key input reaches the seat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<HostInputSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct HostInputSnapshot {
+    pub(crate) passthrough: bool,
 }
 
 /// The XWayland runtime switch as a props subtree: `xwayland.enabled` is
@@ -575,6 +583,11 @@ impl InputSnapshot {
         match path {
             [] => serialise_selected(self),
             ["corners", tail @ ..] => self.corners.select(tail),
+            ["host"] => self.host.as_ref().and_then(serialise_selected),
+            ["host", "passthrough"] => self
+                .host
+                .as_ref()
+                .and_then(|host| serialise_selected(&host.passthrough)),
             _ => None,
         }
     }
@@ -583,6 +596,8 @@ impl InputSnapshot {
         match path {
             [] | ["corners"] => Some(SnapshotNodeKind::Object),
             ["corners", tail @ ..] => self.corners.node_kind(tail),
+            ["host"] => self.host.map(|_| SnapshotNodeKind::Object),
+            ["host", "passthrough"] => self.host.map(|_| SnapshotNodeKind::Leaf),
             _ => None,
         }
     }
@@ -954,6 +969,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         },
         input: InputSnapshot {
             corners: state.observations.corner_config.into(),
+            host: state.host_input_snapshot(),
         },
         #[cfg(feature = "xwayland")]
         xwayland: XwaylandSnapshot {
@@ -1609,6 +1625,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         mutable,
         range = "1.0..=20000.0"
     ),
+    descriptor!(
+        &[L("input"), L("host"), L("passthrough")],
+        Bool,
+        "Nested backend only: false drops host pointer and key input (resize, \
+         scale and pointer leave still pass) so injected input is not overwritten",
+        mutable
+    ),
     // The one file-persisted leaf on this surface (see the resolver in
     // xwayland.rs for why startup-read + persistence:none would make the
     // leaf decorative). `persistence: "file"` overrides the mutable
@@ -2185,6 +2208,7 @@ mod tests {
             },
             input: InputSnapshot {
                 corners: CornerConfig::default().into(),
+                host: Some(HostInputSnapshot { passthrough: true }),
             },
             #[cfg(feature = "xwayland")]
             xwayland: XwaylandSnapshot {
@@ -2218,14 +2242,15 @@ mod tests {
         // non-persisted startup switch would be unreachable from its own
         // surface).
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 7);
+        assert_eq!(mutable.len(), 8);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 6);
+        assert_eq!(mutable.len(), 7);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
             "input.corners.velocity_max_px_s",
+            "input.host.passthrough",
             "windows.s2.band",
             "windows.s2.minimized",
         ] {

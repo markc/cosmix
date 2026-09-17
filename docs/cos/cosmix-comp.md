@@ -137,7 +137,7 @@ instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid `from`
 with Bus rc 10.
 
-The control plane exposes ten verbs:
+The control plane exposes these verbs:
 
 - `comp.ping` returns `{"pong":true}` without taking a compositor snapshot.
 - `comp.info` returns service/build/backend provenance plus output and surface
@@ -155,8 +155,8 @@ The control plane exposes ten verbs:
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
 - `comp.props.set {path,value,generation?}` mutates the four corner
-  properties, `windows.s<id>.band`, `windows.s<id>.minimized`, or
-  `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
+  properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
+  `input.host.passthrough`, or `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
   `xwayland.enabled` the reply also carries `persisted` — `false` means the
   in-memory change and the changed event stand but the write to disk failed
   and the value will not survive restart. The optional `generation` fences a
@@ -173,6 +173,10 @@ The control plane exposes ten verbs:
   `{id,generation}` (both required together) it restores that window. If the
   window is minimised, either form un-minimises, raises and focuses it; if it
   is not, nothing happens and the reply says `changed:false`.
+- `comp.input.pointer.move`, `comp.input.pointer.button`,
+  `comp.input.pointer.scroll`, `comp.input.key`, `comp.input.release_all` and
+  `comp.input.sequence` inject input through the real seat (see Input
+  injection below).
 
 Both window verbs reply `{id,generation,title,app_id,minimized,changed}`;
 `changed:false` means the window was already in the requested state.
@@ -209,6 +213,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
@@ -268,6 +273,94 @@ Assignments last for the current session. Use the canonical ID returned by
 reserved for layer-shell and session-lock roles. Corner activation takes
 priority over client pointer constraints; reactivation waits for physical
 pointer motion out of the corner.
+
+### Input injection
+
+The `comp.input.*` verbs feed the seat exactly as a device does. Every event
+enters the one seat entry point with user activity on, so these all apply
+unchanged: bindings (an injected `Super+Shift+M` restores a window, and the
+client never sees the M), pointer grabs and constraints, click-to-focus and
+raise, idle notification, and the session lock. Under a session lock,
+injected input reaches only the lock surface.
+
+Event timestamps are CLOCK_MONOTONIC milliseconds, wrapping at 32 bits. That
+is the clock `wp_presentation` reports, so a client can subtract an input
+event time from a presentation time. Real input from the nested host window
+uses the same clock.
+
+| Verb | Arguments |
+| --- | --- |
+| `comp.input.pointer.move` | One of three forms. `{x,y,output?}`: output-local absolute; `output` is an `outputs` key or output name, and defaults to the default output. `{dx,dy}`: relative. `{window:{id,generation},x,y,require_hit?}`: relative to the window-geometry origin. |
+| `comp.input.pointer.button` | `{button?,action?}`. `button`: `left` (default), `right`, `middle`, or an evdev code `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
+| `comp.input.pointer.scroll` | `{dx?,dy?,source?,v120?}`. At least one axis is required; an omitted axis stays absent. Positive `dy` scrolls down. `source`: `wheel` (default), `finger` or `continuous`; a zero on `finger` or `continuous` is an axis stop. `v120:{dx?,dy?}` sets wheel detents; without it, a wheel derives 120 per 15 units. |
+| `comp.input.key` | `{key,action?,modifiers?}`. `key`: an XKB keysym name (`Return`, `a`, `F5`, `Super_L`) or an evdev code. `action`: `press`, `release` or `tap` (default). `modifiers`: any of `shift`, `ctrl`, `alt`, `super`, `altgr`, held around the key. A keysym that needs Shift gets Shift added. **Or** `{text}`, at most 4096 characters. |
+| `comp.input.release_all` | `{}` |
+| `comp.input.sequence` | `{steps:[{verb,args?,delay_ms?}],interval_ms?}` |
+
+Each single verb replies:
+
+```text
+{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null}
+```
+
+- `input_seq` increases by one per verb.
+- `injected_at_us` is CLOCK_MONOTONIC microseconds.
+- `pointer` is the cursor after the verb, in output-local coordinates.
+- `target` is the root surface the seat now delivers to: pointer focus for
+  pointer verbs, keyboard focus for key verbs. It can be a layer or lock
+  surface, not only a window.
+
+`text` maps each character through the live seat keymap, honouring Caps Lock
+and the active layout. Only characters on the first two shift levels map; each
+is typed as press and release, with Shift where needed. A newline types
+Return. Characters that need AltGr or a compose sequence cannot be typed. If
+any character cannot be typed, nothing is sent and the reply is
+`{"error":"unmappable","char","index"}`. An unknown key name replies
+`{"error":"unknown_key","key"}`.
+
+Every refusal is decided before anything is sent:
+- `stale_target`, or another window-target error, for the `window` form;
+- `occluded` when `require_hit` is true and the point is not on that window or
+  its frame. `under` names the window actually at that point, or is null;
+- `unknown_output`;
+- `out_of_bounds`, with the output size, for a point outside the output.
+
+The verbs are not refused while the session is locked; the seat decides where
+the input goes.
+
+`release_all` releases the keys and buttons that injection pressed and has not
+released. It never releases anything a physical device holds. Taps and clicks
+never leave a key or button down; only `action: press` holds one.
+
+`comp.input.sequence` runs up to 256 steps in order:
+- Each step is one of the single input verbs above, with its usual arguments.
+- `delay_ms` is a wait before that step, on a compositor timer. It defaults to
+  `interval_ms`, which defaults to 0. The delays together may total at most 60
+  seconds.
+- A drag is a `press`, some moves, and a `release`.
+- The reply is `{steps:[<each step's reply>],elapsed_ms}`.
+- If a step is refused, the run stops and every injected hold is released. The
+  reply is rc 10
+  `{"error":"step_failed",index,verb,step:<the refusal>,completed:[...],released:true}`.
+- If the caller stops waiting, the run also stops and releases its holds.
+
+Sequences use their own pool of eight permits. Each waits for its own delays
+plus one second, not the two-second budget of other verbs. When all eight
+permits are in use, a new sequence gets `busy`.
+
+`input.host.passthrough` exists only on the nested backend; on KMS the path is
+`unknown_path`. Setting it to `false` stops the host window's pointer motion,
+buttons, scroll and keys reaching the seat, so the host cursor cannot
+overwrite an injected position. Output resize and scale, pointer leave and
+touch still pass. A host key or button pressed before the switch still gets
+its release. A host focus loss releases only those host keys, never an
+injected hold. The value lasts for the compositor process.
+
+The frame trace records each injected verb as `comp_input_injected`:
+- subject: `input_seq`;
+- detail: the verb kind (1 move, 2 button, 3 scroll, 4 key, 5 text,
+  6 release_all);
+- aux: the target id, or 0.
 
 The compositor publishes non-retained messages under the registered service
 namespace. The seat instance therefore uses `comp.*`, the default nested
@@ -463,7 +556,8 @@ ranges are:
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
 The mutable leaves are the four corner leaves, `windows.s<id>.band`,
-`windows.s<id>.minimized` and `xwayland.enabled`. The corner and window
+`windows.s<id>.minimized`, `input.host.passthrough` (nested only) and
+`xwayland.enabled`. The corner and window
 descriptors say `mutable:true` and
 `persistence:"none"` (numeric leaves also carry the range above) and those
 values live for the compositor process only. `xwayland.enabled` is the one
