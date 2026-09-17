@@ -475,15 +475,25 @@ mod tests {
             progress(11, Some(10), false),
         );
         let mut offered = 0;
-        frame_content(&[failed.clone()], Vec::new(), &mut memory, |_| {
-            offered += 1;
-            false
-        });
+        frame_content(
+            std::slice::from_ref(&failed),
+            Vec::new(),
+            &mut memory,
+            |_| {
+                offered += 1;
+                false
+            },
+        );
         let mut sent = Vec::new();
-        frame_content(&[failed.clone()], Vec::new(), &mut memory, |refusal| {
-            sent.push(refusal);
-            true
-        });
+        frame_content(
+            std::slice::from_ref(&failed),
+            Vec::new(),
+            &mut memory,
+            |refusal| {
+                sent.push(refusal);
+                true
+            },
+        );
         assert_eq!(offered, 1);
         assert_eq!(sent, [refusal(1, 1, 2)]);
         frame_content(&[failed], Vec::new(), &mut memory, |_| {
