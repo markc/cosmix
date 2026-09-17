@@ -7,6 +7,7 @@ use cosmix_iced_host::core::{Background, Border, Color, Length, alignment};
 use cosmix_iced_host::widget::{button, column, container, row, space, text};
 use cosmix_iced_host::{Element, Program};
 use cosmix_iced_widgets::{MenuStyle, TextField, Tokens};
+use cosmix_wl_app::SurfaceInfo;
 
 pub const SEARCH_ID: &str = "search";
 pub const TAB_HEIGHT: u32 = 30;
@@ -15,6 +16,16 @@ const TAB_WIDTH: f32 = 120.0;
 /// Logical height of the whole chrome band.
 pub fn band_height(metrics: &Metrics) -> u32 {
     metrics.bar_height as u32 + TAB_HEIGHT
+}
+
+/// The chrome surface for a window: physical width, physical band height
+/// and scale. The band never exceeds the window.
+pub fn chrome_surface(info: &SurfaceInfo, band: u32) -> (u32, u32, f32) {
+    let height = info
+        .scale
+        .to_physical(band)
+        .clamp(1, info.physical.1.max(1));
+    (info.physical.0.max(1), height, info.scale_factor() as f32)
 }
 
 #[derive(Debug, Clone)]
@@ -144,5 +155,30 @@ impl Program for Chrome {
                 ..container::Style::default()
             })
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmix_wl_app::Scale;
+
+    #[test]
+    fn chrome_surface_follows_size_and_scale() {
+        let band = band_height(&Metrics::default());
+        assert_eq!(band, 58);
+        let info = SurfaceInfo::new((795, 447), Scale::Fractional(300));
+        assert_eq!(chrome_surface(&info, band), (1988, 145, 2.5));
+        // A configure that changes neither size nor scale asks for the same
+        // surface, so the chrome is neither resized nor invalidated.
+        let same = SurfaceInfo::new((795, 447), Scale::Fractional(300));
+        assert_eq!(chrome_surface(&same, band), chrome_surface(&info, band));
+        let resized = SurfaceInfo::new((640, 447), Scale::Fractional(300));
+        assert_ne!(chrome_surface(&resized, band), chrome_surface(&info, band));
+        let rescaled = SurfaceInfo::new((795, 447), Scale::Fractional(120));
+        assert_eq!(chrome_surface(&rescaled, band), (795, 58, 1.0));
+        // A window shorter than the band gets a band the size of the window.
+        let short = SurfaceInfo::new((795, 20), Scale::Integer(1));
+        assert_eq!(chrome_surface(&short, band), (795, 20, 1.0));
     }
 }

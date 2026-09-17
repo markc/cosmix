@@ -96,6 +96,8 @@ pub struct IcedDemo {
     clipboard: Shared,
     metrics: Metrics,
     band: u32,
+    /// Physical size and scale the chrome surface was last given.
+    chrome_surface: Option<(u32, u32, f32)>,
     pointer: Option<(f64, f64)>,
     field_ime: bool,
     tab_texts: Vec<String>,
@@ -122,6 +124,7 @@ impl IcedDemo {
             clipboard,
             metrics,
             band,
+            chrome_surface: None,
             pointer: None,
             field_ime: false,
             tab_texts: vec![first, String::new(), String::new()],
@@ -134,12 +137,17 @@ impl IcedDemo {
         self.raw.window().zip(self.raw.info())
     }
 
+    /// Resize the chrome surface for a new window size or scale. A
+    /// configure that changes neither is a no-op: invalidating here would
+    /// repaint the whole band for nothing.
     fn resize_chrome(&mut self, info: &SurfaceInfo) {
-        let band = info.scale.to_physical(self.band).min(info.physical.1);
-        self.chrome.resize(
-            Size::new(info.physical.0, band.max(1)),
-            info.scale_factor() as f32,
-        );
+        let surface = chrome::chrome_surface(info, self.band);
+        if self.chrome_surface == Some(surface) {
+            return;
+        }
+        self.chrome_surface = Some(surface);
+        let (width, height, scale) = surface;
+        self.chrome.resize(Size::new(width, height), scale);
         self.chrome.invalidate();
     }
 
