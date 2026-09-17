@@ -46,6 +46,10 @@ pub struct Bench {
     pub faders: Vec<f32>,
     /// Pan, -1..=1, one per slot.
     pub pans: Vec<f32>,
+    /// Strip names, resolved once. The feed hashes and formats a name on
+    /// every `strip()` call, and a view that did that per frame would be
+    /// measuring the feed instead of the toolkit.
+    pub names: Vec<String>,
     pub mutes: Vec<bool>,
     pub solos: Vec<bool>,
     pub song: Option<BenchSong>,
@@ -76,6 +80,7 @@ impl Bench {
             meters: vec![MeterFrame::default(); slots],
             faders: (0..slots).map(|slot| feed.fader_db(slot, 0)).collect(),
             pans: (0..slots).map(|slot| feed.strip(slot).pan).collect(),
+            names: (0..slots).map(|slot| feed.strip(slot).name).collect(),
             mutes: (0..slots).map(|slot| feed.strip(slot).mute).collect(),
             solos: (0..slots).map(|slot| feed.strip(slot).solo).collect(),
             song,

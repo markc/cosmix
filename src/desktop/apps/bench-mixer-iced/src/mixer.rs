@@ -82,7 +82,7 @@ fn strip<'a>(
     board = board.push(
         place.name,
         container(
-            text(bench.feed.strip(slot).name.clone())
+            text(&bench.names[slot])
                 .size(NAME_FONT)
                 .align_x(Center)
                 .wrapping(text::Wrapping::None)
