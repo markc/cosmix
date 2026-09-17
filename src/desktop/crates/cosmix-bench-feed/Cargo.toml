@@ -10,5 +10,13 @@ rust-version = "1.95"
 license = "MIT"
 publish = false
 
+[[bin]]
+# Prints the resolved mixer layout as JSON, so the Mix bake-off driver aims
+# injected input at the same rectangles the arms draw.
+name = "cosmix-bench-layout"
+path = "src/bin/layout.rs"
+
 [dependencies]
 cosmix-song = { path = "../../../crates/cosmix-song" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

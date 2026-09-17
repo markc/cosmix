@@ -2789,6 +2789,8 @@ name = "cosmix-bench-feed"
 version = "0.1.0"
 dependencies = [
  "cosmix-song",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

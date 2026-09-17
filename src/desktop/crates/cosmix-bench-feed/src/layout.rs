@@ -15,6 +15,8 @@
 
 use std::ops::Range;
 
+use serde::{Deserialize, Serialize};
+
 /// Default window size: the nested harness's logical output (1105x622),
 /// rounded down to a 16:9 size that fits inside it. Both arms take the same
 /// size on the command line, so a run can measure at another size as long as
@@ -68,7 +70,7 @@ pub const FADER_TRAVEL_INSET: f32 = 8.0;
 
 /// A rectangle in logical pixels, origin top left. The mixer's rectangles are
 /// in window coordinates; the roll's are in the roll canvas's own space.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: f32,
     pub y: f32,
@@ -100,7 +102,7 @@ impl Rect {
 }
 
 /// One strip's widgets, in window coordinates.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StripLayout {
     pub slot: usize,
     pub is_master: bool,
@@ -117,7 +119,7 @@ pub struct StripLayout {
 }
 
 /// The whole mixer board resolved for one window size.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub width: f32,
     pub height: f32,
