@@ -162,6 +162,7 @@ pub(crate) struct SurfaceSnapshot {
     pub(crate) decoration: Option<&'static str>,
     pub(crate) layer: Option<LayerSnapshot>,
     pub(crate) foreign_id: Option<String>,
+    pub(crate) generation: u64,
     /// Window-only values carried to `project_window_row`; not part of the
     /// `surfaces.*` tree.
     #[serde(skip)]
@@ -170,7 +171,6 @@ pub(crate) struct SurfaceSnapshot {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct WindowExtras {
-    pub(crate) generation: u64,
     pub(crate) window_x: f32,
     pub(crate) window_y: f32,
     pub(crate) pid: Option<u64>,
@@ -616,6 +616,7 @@ impl SurfaceSnapshot {
             ["layer"] => serialise_selected(&self.layer),
             ["layer", tail @ ..] => self.layer.as_ref()?.select(tail),
             ["foreign_id"] => serialise_selected(&self.foreign_id),
+            ["generation"] => serialise_selected(&self.generation),
             _ => None,
         }
     }
@@ -627,7 +628,7 @@ impl SurfaceSnapshot {
                 "id" | "role" | "mapped" | "visible" | "x" | "y" | "width" | "height" | "band"
                 | "sequence" | "tree_index" | "parent" | "output" | "title" | "app_id" | "focused"
                 | "activated" | "maximized" | "fullscreen" | "minimized" | "decoration"
-                | "foreign_id",
+                | "foreign_id" | "generation",
             ] => Some(SnapshotNodeKind::Leaf),
             ["layer"] => Some(if self.layer.is_some() {
                 SnapshotNodeKind::Object
@@ -778,8 +779,8 @@ fn project_surface_row(
         foreign_id: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
             .then(|| state.foreign_toplevel_identifiers.get(&record.id).cloned())
             .flatten(),
+        generation: record.generation,
         window: WindowExtras {
-            generation: record.generation,
             window_x: record.window_origin.0,
             window_y: record.window_origin.1,
             // Only rows that become windows pay for the credentials lookup.
@@ -790,9 +791,9 @@ fn project_surface_row(
                         .wl_surface()
                         .client()
                         .and_then(|client| client.get_credentials(&state.display_handle).ok())
-                        .map(|credentials| u64::try_from(credentials.pid).unwrap_or(0))
                 })
-                .flatten(),
+                .flatten()
+                .and_then(|credentials| u64::try_from(credentials.pid).ok()),
         },
     }
 }
@@ -813,7 +814,7 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         minimized: surface.minimized,
         output: surface.output.clone(),
         band: surface.band,
-        generation: surface.window.generation,
+        generation: surface.generation,
         window_x: surface.window.window_x,
         window_y: surface.window.window_y,
         visible: surface.visible,
@@ -848,11 +849,7 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
             state
                 .surfaces
                 .values()
-                .filter(|record| {
-                    record.focused
-                        && record.mapped
-                        && matches!(record.role, SurfaceRole::Toplevel(_))
-                })
+                .filter(|record| record.focused && record.mapped && record.role.managed_toplevel())
                 .min_by_key(|record| record.id.0)
                 .map_or_else(FocusWindowSnapshot::default, |record| FocusWindowSnapshot {
                     id: Some(record.id.0),
@@ -1422,6 +1419,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Mapped foreign-toplevel identifier or null"
     ),
     descriptor!(
+        &[L("surfaces"), S, L("generation")],
+        Number,
+        "Role generation; a new role (including the role ending) takes a new value, an unmap/remap of the same role keeps it"
+    ),
+    descriptor!(
         &[L("windows"), S, L("id")],
         Number,
         "Session-local toplevel id",
@@ -1502,7 +1504,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("generation")],
         Number,
-        "Role generation; changes whenever this surface takes a new role, so {id, generation} names one window"
+        "Role generation (same value as surfaces.s<id>.generation); {id, generation} names one window"
     ),
     descriptor!(
         &[L("windows"), S, L("window_x")],
@@ -1524,7 +1526,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("pid")],
         Number,
-        "Client process id or null"
+        "Process id of the client socket peer (a proxy or sandbox may report its own), or null"
     ),
     descriptor!(
         &[L("stack")],
@@ -1554,7 +1556,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("focus"), L("window"), L("id")],
         Number,
-        "Keyboard-focused window id or null",
+        "Keyboard-focused managed window (xdg or X11) id or null",
         format = "surface_id"
     ),
     descriptor!(
@@ -2047,6 +2049,7 @@ mod tests {
                 binding: "explicit",
             }),
             foreign_id: None,
+            generation: 3,
             window: WindowExtras::default(),
         };
         let toplevel = SurfaceSnapshot {
@@ -2073,8 +2076,8 @@ mod tests {
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("foreign-2".into()),
+            generation: 4,
             window: WindowExtras {
-                generation: 4,
                 window_x: 52.0,
                 window_y: 72.0,
                 pid: Some(4242),
@@ -2136,7 +2139,7 @@ mod tests {
                 minimized: toplevel.minimized,
                 output: toplevel.output.clone(),
                 band: toplevel.band,
-                generation: toplevel.window.generation,
+                generation: toplevel.generation,
                 window_x: toplevel.window.window_x,
                 window_y: toplevel.window.window_y,
                 visible: toplevel.visible,
