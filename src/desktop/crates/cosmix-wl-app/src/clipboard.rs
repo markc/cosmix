@@ -143,12 +143,22 @@ impl Runtime {
             Selection::Clipboard => self.seat.data_device.as_ref().and_then(|d| {
                 let offer = d.data().selection_offer()?;
                 let mime = offer.with_mime_types(pick_text_mime)?;
-                Some(offer.receive(mime.clone()).map(|pipe| (pipe, mime)))
+                Some(
+                    offer
+                        .receive(mime.clone())
+                        .map(|pipe| (pipe, mime))
+                        .map_err(|e| e.to_string()),
+                )
             }),
             Selection::Primary => self.seat.primary_device.as_ref().and_then(|d| {
                 let offer = d.data().selection_offer()?;
                 let mime = offer.with_mime_types(pick_text_mime)?;
-                Some(offer.receive(mime.clone()).map(|pipe| (pipe, mime)))
+                Some(
+                    offer
+                        .receive(mime.clone())
+                        .map(|pipe| (pipe, mime))
+                        .map_err(|e| e.to_string()),
+                )
             }),
         };
         match receive {
