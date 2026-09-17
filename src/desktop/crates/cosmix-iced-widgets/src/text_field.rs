@@ -3,9 +3,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer, text, widget};
-use iced::widget::text_input::{self, TextInput};
-use iced::{Element, Event, Length, Padding, Pixels, Rectangle, Size, Theme, keyboard, mouse};
+use iced_core::{Clipboard, Layout, Shell, Widget, layout, renderer, text, widget};
+use iced_core::{Element, Event, Length, Padding, Pixels, Rectangle, Size, Theme, keyboard, mouse};
+use iced_widget::text_input::{self, TextInput};
 
 type Selection = text_input::cursor::State;
 
@@ -325,17 +325,16 @@ impl<Message, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
             && matches!(selection, Selection::Index(_))
             && !history.composing;
         match event {
-            Event::InputMethod(iced::advanced::input_method::Event::Preedit(text, _))
+            Event::InputMethod(iced_core::input_method::Event::Preedit(text, _))
                 if state.is_focused() =>
             {
                 history.composing = !text.is_empty()
             }
             Event::InputMethod(
-                iced::advanced::input_method::Event::Commit(_)
-                | iced::advanced::input_method::Event::Closed,
+                iced_core::input_method::Event::Commit(_) | iced_core::input_method::Event::Closed,
             ) => history.composing = false,
-            Event::Window(iced::window::Event::Unfocused) => history.window_blurred = true,
-            Event::Window(iced::window::Event::Focused) => history.window_blurred = false,
+            Event::Window(iced_core::window::Event::Unfocused) => history.window_blurred = true,
+            Event::Window(iced_core::window::Event::Focused) => history.window_blurred = false,
             _ => {}
         }
         // Redraws and modifier releases must not split an otherwise contiguous group.
@@ -346,7 +345,7 @@ impl<Message, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
                     | Event::Mouse(mouse::Event::ButtonPressed(_))
                     | Event::Touch(_)
                     | Event::InputMethod(_)
-                    | Event::Window(iced::window::Event::Unfocused)
+                    | Event::Window(iced_core::window::Event::Unfocused)
             )
         {
             history.typing_at = None;
@@ -515,7 +514,7 @@ mod tests {
 #[cfg(all(test, debug_assertions))]
 mod widget_tests {
     use super::*;
-    use iced::advanced::{clipboard, input_method};
+    use iced_core::{clipboard, input_method};
 
     type Field = TextField<'static, String, ()>;
 
@@ -686,7 +685,7 @@ mod widget_tests {
         let (_, ime) = send(
             &mut field,
             &mut tree,
-            Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Event::Window(iced_core::window::Event::RedrawRequested(Instant::now())),
         );
         assert!(matches!(
             ime,
@@ -717,7 +716,7 @@ mod widget_tests {
         let (_, ime) = send(
             &mut field,
             &mut tree,
-            Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Event::Window(iced_core::window::Event::RedrawRequested(Instant::now())),
         );
         assert!(
             matches!(ime, input_method::InputMethod::Enabled { preedit: Some(preedit), .. } if preedit.content == "界")
@@ -781,7 +780,7 @@ mod widget_tests {
         let (_, ime) = send(
             &mut replacement,
             &mut tree,
-            Event::Window(iced::window::Event::RedrawRequested(Instant::now())),
+            Event::Window(iced_core::window::Event::RedrawRequested(Instant::now())),
         );
         assert!(
             matches!(ime, input_method::InputMethod::Enabled { preedit: Some(preedit), .. } if preedit.content == "界")
@@ -826,7 +825,7 @@ mod widget_tests {
         send(
             &mut field,
             &mut tree,
-            Event::Window(iced::window::Event::Unfocused),
+            Event::Window(iced_core::window::Event::Unfocused),
         );
         assert!(
             send(&mut field, &mut tree, key("z", keyboard::Modifiers::CTRL))
@@ -836,7 +835,7 @@ mod widget_tests {
         send(
             &mut field,
             &mut tree,
-            Event::Window(iced::window::Event::Focused),
+            Event::Window(iced_core::window::Event::Focused),
         );
         tree.children[0]
             .state

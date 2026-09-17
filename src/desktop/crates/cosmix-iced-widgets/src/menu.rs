@@ -1,14 +1,28 @@
-//! Application menus with modal iced overlays and app-owned action messages.
+//! Application menus with app-owned action messages.
+//!
+//! By default the bar and context menus draw modal in-surface iced overlays.
+//! With `Menu::external_popups` the widget draws no popup and reports a
+//! `MenuState` instead, so a host can show each panel on its own surface
+//! (xdg_popup) with `Panel`, driving it through the same `Navigator`.
 //!
 //! F10 activates the menu bar. A context target opens on right click, or
 //! Shift+F10 after clicking the target. Arrows, Home/End, Enter/Space and
 //! Escape navigate. Accelerator strings are labels; the app owns shortcuts.
 
-use iced::advanced::{
-    Clipboard, Layout, Shell, Widget, input_method, layout, mouse, overlay, renderer, text,
+mod nav;
+mod panel;
+
+pub use nav::{MenuState, NavOutcome, Navigator, PanelSpec};
+pub use panel::{MIN_PANEL_WIDTH, Panel, SEPARATOR_HEIGHT, panel_size, row_at, row_bounds};
+
+use iced_core::{
+    Border, Clipboard, Color, Element, Event, Layout, Length, Point, Rectangle, Shell, Size,
+    Vector, Widget, input_method, keyboard, layout, mouse, overlay, renderer, text,
     widget::{Operation, Tree, tree},
 };
-use iced::{Border, Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard};
+
+use nav::next;
+use panel::{draw_panel, panel_width, row_height};
 
 /// An action, submenu, or separator. Disabled entries cannot be selected.
 #[derive(Debug, Clone)]
@@ -69,15 +83,44 @@ impl<Message> Item<Message> {
         self
     }
 
-    fn selectable(&self) -> bool {
-        self.enabled && !matches!(self.kind, Kind::Separator)
+    /// The label (empty for a separator).
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
-    fn children(&self) -> &[Self] {
+    /// The accelerator label (empty when none).
+    pub fn accelerator_label(&self) -> &str {
+        &self.accelerator
+    }
+
+    /// True if the entry can be selected: enabled and not a separator.
+    pub fn is_enabled(&self) -> bool {
+        self.selectable()
+    }
+
+    /// True for a separator.
+    pub fn is_separator(&self) -> bool {
+        matches!(self.kind, Kind::Separator)
+    }
+
+    /// The submenu's entries; empty for actions and separators.
+    pub fn children(&self) -> &[Self] {
         match &self.kind {
             Kind::Submenu(items) => items,
             _ => &[],
         }
+    }
+
+    /// The action's message; `None` for submenus and separators.
+    pub fn message(&self) -> Option<&Message> {
+        match &self.kind {
+            Kind::Action(message) => Some(message),
+            _ => None,
+        }
+    }
+
+    fn selectable(&self) -> bool {
+        self.enabled && !matches!(self.kind, Kind::Separator)
     }
 }
 
@@ -123,11 +166,15 @@ impl Default for MenuStyle {
     }
 }
 
+type OnState<'a, Message> = Box<dyn Fn(MenuState) -> Message + 'a>;
+
 /// A horizontal menu bar, or a context-menu wrapper around arbitrary content.
 pub struct Menu<'a, Message, Theme, Renderer> {
     items: Vec<Item<Message>>,
     content: Option<Element<'a, Message, Theme, Renderer>>,
     style: MenuStyle,
+    external: Option<OnState<'a, Message>>,
+    host_state: Option<MenuState>,
 }
 
 impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
@@ -138,6 +185,8 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
             items,
             content: None,
             style: MenuStyle::default(),
+            external: None,
+            host_state: None,
         }
     }
 
@@ -151,6 +200,8 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
             items,
             content: Some(content.into()),
             style: MenuStyle::default(),
+            external: None,
+            host_state: None,
         }
     }
 
@@ -159,20 +210,71 @@ impl<'a, Message, Theme, Renderer> Menu<'a, Message, Theme, Renderer> {
         self.style = style;
         self
     }
+
+    /// Draws no popup. Every change to the open state (including its
+    /// anchors) is published as a `MenuState` for the host to show on its
+    /// own surfaces. While open, key presses reaching this widget drive the
+    /// navigator and are captured. Losing window focus does not close the
+    /// menu in this mode: a popup surface takes focus, and the host closes
+    /// the menu when the compositor dismisses the popup.
+    pub fn external_popups(mut self, on_change: impl Fn(MenuState) -> Message + 'a) -> Self {
+        self.external = Some(Box::new(on_change));
+        self
+    }
+
+    /// The host's current state, with `external_popups` (ignored without it).
+    /// A host that changes the state (popup surfaces, compositor dismissal)
+    /// must pass it: store every published value exactly as received, apply
+    /// your own changes to that copy, and pass it here every view. Anchors
+    /// that differ from the widget's are recomputed and republished, so a
+    /// host that drops or edits them makes the widget republish on every
+    /// event.
+    pub fn state(mut self, state: &MenuState) -> Self {
+        self.host_state = Some(state.clone());
+        self
+    }
+
+    // Host state counts only in external mode: an overlay menu never
+    // publishes, so a host copy would keep closing it.
+    fn host_state(&self) -> Option<&MenuState> {
+        self.host_state.as_ref().filter(|_| self.external.is_some())
+    }
+
+    fn navigator(&self) -> Navigator<'_, Message> {
+        Navigator {
+            items: &self.items,
+            bar: self.content.is_none(),
+        }
+    }
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct State {
-    open: bool,
+    nav: MenuState,
     focused: bool,
+    // Bar entry under the pointer while closed.
     hovered: Option<usize>,
-    root: usize,
-    // One selected row per visible panel. None means pointer-opened, unselected.
-    path: Vec<Option<usize>>,
+    // Context menu origin, in widget coordinates.
     position: Point,
     // Set even by the inert closed overlay, before iced dispatches a batch.
     overlay_bounds: Option<Size>,
     translation: Vector,
+    // External mode: the state last published, compared before publishing.
+    reported: MenuState,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            nav: MenuState::default(),
+            focused: false,
+            hovered: None,
+            position: Point::ORIGIN,
+            overlay_bounds: None,
+            translation: Vector::ZERO,
+            reported: MenuState::default(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -184,9 +286,9 @@ struct ChildFocus {
 impl Operation for ChildFocus {
     fn focusable(
         &mut self,
-        _id: Option<&iced::advanced::widget::Id>,
+        _id: Option<&iced_core::widget::Id>,
         _bounds: Rectangle,
-        state: &mut dyn iced::advanced::widget::operation::Focusable,
+        state: &mut dyn iced_core::widget::operation::Focusable,
     ) {
         self.present = true;
         self.focused |= state.is_focused();
@@ -198,163 +300,27 @@ impl Operation for ChildFocus {
 }
 
 // State-only events that content must see even while a menu is open. IME
-// preedit and commit are input, so the open menu blocks them like key presses.
+// preedit text and commits are input, so the open menu blocks them like key
+// presses; an empty preedit only clears a composition in flight, so it passes.
 fn housekeeping(event: &Event) -> bool {
-    matches!(
-        event,
+    match event {
         Event::Window(_)
-            | Event::InputMethod(input_method::Event::Opened | input_method::Event::Closed)
-            | Event::Keyboard(keyboard::Event::ModifiersChanged(_))
-    )
-}
-
-fn next<Message>(items: &[Item<Message>], selected: Option<usize>, forward: bool) -> Option<usize> {
-    let len = items.len();
-    (0..len)
-        .map(|step| match selected {
-            Some(index) if forward => (index + step + 1) % len,
-            Some(index) => (index + len - (step + 1) % len) % len,
-            None if forward => step,
-            None => len - step - 1,
-        })
-        .find(|index| items[*index].selectable())
-}
-
-impl State {
-    fn close(&mut self) {
-        self.open = false;
-        self.hovered = None;
-        self.path.clear();
-    }
-
-    fn open(&mut self, items: &[Item<impl Clone>], bar: bool, root: usize, keyboard: bool) {
-        self.root = root;
-        self.open = true;
-        let items = if bar {
-            items.get(root).map(Item::children).unwrap_or(&[])
-        } else {
-            items
-        };
-        self.path = vec![if keyboard {
-            next(items, None, true)
-        } else {
-            None
-        }];
-    }
-
-    fn panel<'a, Message>(
-        &self,
-        items: &'a [Item<Message>],
-        bar: bool,
-        depth: usize,
-    ) -> &'a [Item<Message>] {
-        let mut items = if bar {
-            items.get(self.root).map(Item::children).unwrap_or(&[])
-        } else {
-            items
-        };
-        for selected in self.path.iter().take(depth) {
-            items = selected
-                .and_then(|i| items.get(i))
-                .map(Item::children)
-                .unwrap_or(&[]);
-        }
-        items
-    }
-
-    fn activate<Message: Clone>(&mut self, items: &[Item<Message>], bar: bool) -> Option<Message> {
-        let depth = self.path.len().checked_sub(1)?;
-        let index = self.path[depth]?;
-        let item = self.panel(items, bar, depth).get(index)?;
-        if !item.selectable() {
-            return None;
-        }
-        match &item.kind {
-            Kind::Action(message) => {
-                let message = message.clone();
-                self.close();
-                Some(message)
-            }
-            // An empty submenu opens nothing (no zero-height panel).
-            Kind::Submenu(children) if children.is_empty() => None,
-            Kind::Submenu(children) => {
-                self.path.push(next(children, None, true));
-                None
-            }
-            Kind::Separator => None,
-        }
-    }
-
-    fn key<Message: Clone>(
-        &mut self,
-        key: keyboard::key::Named,
-        items: &[Item<Message>],
-        bar: bool,
-    ) -> Option<Message> {
-        use keyboard::key::Named;
-        let depth = self.path.len().checked_sub(1)?;
-        match key {
-            Named::ArrowDown | Named::ArrowUp | Named::Home | Named::End => {
-                let selected = if matches!(key, Named::Home | Named::End) {
-                    None
-                } else {
-                    self.path[depth]
-                };
-                self.path[depth] = next(
-                    self.panel(items, bar, depth),
-                    selected,
-                    matches!(key, Named::ArrowDown | Named::Home),
-                );
-            }
-            Named::Enter | Named::Space => {
-                if bar
-                    && depth == 0
-                    && let Some(Item {
-                        kind: Kind::Action(message),
-                        enabled: true,
-                        ..
-                    }) = items.get(self.root)
-                {
-                    let message = message.clone();
-                    self.close();
-                    return Some(message);
-                }
-                return self.activate(items, bar);
-            }
-            Named::ArrowRight => {
-                let children = self.path[depth]
-                    .and_then(|i| self.panel(items, bar, depth).get(i))
-                    .map(Item::children)
-                    .unwrap_or(&[]);
-                if !children.is_empty() {
-                    self.path.push(next(children, None, true));
-                } else if bar && let Some(root) = next(items, Some(self.root), true) {
-                    self.open(items, true, root, true);
-                }
-            }
-            Named::ArrowLeft if depth > 0 => {
-                self.path.pop();
-            }
-            Named::ArrowLeft if bar => {
-                if let Some(root) = next(items, Some(self.root), false) {
-                    self.open(items, true, root, true);
-                }
-            }
-            Named::Escape if depth > 0 => {
-                self.path.pop();
-            }
-            Named::Escape | Named::Tab => self.close(),
-            _ => {}
-        }
-        None
+        | Event::InputMethod(input_method::Event::Opened | input_method::Event::Closed)
+        | Event::Keyboard(keyboard::Event::ModifiersChanged(_)) => true,
+        Event::InputMethod(input_method::Event::Preedit(content, _)) => content.is_empty(),
+        _ => false,
     }
 }
 
-fn row_height<Message>(item: &Item<Message>, style: MenuStyle) -> f32 {
-    if matches!(item.kind, Kind::Separator) {
-        8.0
-    } else {
-        style.row_height
+// Input an open menu keeps from everything behind it.
+fn modal_input(event: &Event) -> bool {
+    match event {
+        Event::Keyboard(
+            keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. },
+        )
+        | Event::InputMethod(input_method::Event::Commit(_)) => true,
+        Event::InputMethod(input_method::Event::Preedit(..)) => !housekeeping(event),
+        _ => false,
     }
 }
 
@@ -367,7 +333,7 @@ fn text_width<Renderer: text::Renderer>(renderer: &Renderer, value: &str, style:
         line_height: text::LineHeight::default(),
         font: renderer.default_font(),
         align_x: text::Alignment::Left,
-        align_y: iced::alignment::Vertical::Top,
+        align_y: iced_core::alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,
         wrapping: text::Wrapping::None,
     })
@@ -437,7 +403,7 @@ fn label<Renderer: text::Renderer>(
             } else {
                 text::Alignment::Left
             },
-            align_y: iced::alignment::Vertical::Center,
+            align_y: iced_core::alignment::Vertical::Center,
             shaping: text::Shaping::Advanced,
             wrapping: text::Wrapping::None,
         },
@@ -452,6 +418,141 @@ fn label<Renderer: text::Renderer>(
         color,
         bounds,
     );
+}
+
+impl<Message: Clone, Theme, Renderer: text::Renderer> Menu<'_, Message, Theme, Renderer> {
+    /// Anchors for the open panels (see `MenuState::anchors`); `bounds` is
+    /// this widget's layout bounds.
+    fn anchors(&self, renderer: &Renderer, state: &State, bounds: Rectangle) -> Vec<Rectangle> {
+        let nav = self.navigator();
+        let Some(root) = state.nav.root else {
+            return Vec::new();
+        };
+        let mut anchors = Vec::with_capacity(state.nav.path.len());
+        anchors.push(if nav.is_bar() {
+            bar_rects(
+                renderer,
+                &self.items,
+                bounds + state.translation,
+                self.style,
+            )
+            .get(root)
+            .copied()
+            .unwrap_or(bounds + state.translation)
+        } else {
+            Rectangle::new(state.position + state.translation, Size::new(1.0, 1.0))
+        });
+        for level in 1..state.nav.path.len() {
+            let parent = nav.panel(&state.nav, level - 1);
+            let width = panel_width(renderer, parent, self.style);
+            anchors.push(
+                state.nav.path[level - 1]
+                    .and_then(|row| row_bounds(parent, row, width, self.style))
+                    .unwrap_or_default(),
+            );
+        }
+        anchors
+    }
+
+    /// External mode: publishes the state when it differs from what the host
+    /// holds (or was last told).
+    fn report(
+        &self,
+        renderer: &Renderer,
+        state: &mut State,
+        bounds: Rectangle,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let Some(on_change) = &self.external else {
+            return;
+        };
+        state.nav.anchors = self.anchors(renderer, state, bounds);
+        let believed = self.host_state().unwrap_or(&state.reported);
+        if *believed != state.nav {
+            state.reported = state.nav.clone();
+            shell.publish(on_change(state.nav.clone()));
+        }
+    }
+
+    // External mode, menu open: this surface still gets keys (unless a
+    // popup took focus) and presses outside the popups.
+    fn external_open_event(
+        &self,
+        renderer: &Renderer,
+        state: &mut State,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let touch_event;
+        let (event, cursor) =
+            if let Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) = event {
+                touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+                (
+                    &touch_event,
+                    mouse::Cursor::Available(*position - state.translation),
+                )
+            } else {
+                (event, cursor)
+            };
+        let nav = self.navigator();
+        let outcome = match event {
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => {
+                nav.key(&mut state.nav, key)
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if nav.is_bar() => {
+                match self.title_at(renderer, bounds, cursor) {
+                    Some(index) => nav.hover_root(&mut state.nav, index),
+                    None => NavOutcome::None,
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(_)) => {
+                match self.title_at(renderer, bounds, cursor) {
+                    Some(index) if nav.is_bar() => nav.click_root(&mut state.nav, index),
+                    _ => nav.close(&mut state.nav),
+                }
+            }
+            _ => NavOutcome::None,
+        };
+        let pressed = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)));
+        if !state.nav.is_open() {
+            state.hovered = None;
+        }
+        self.finish(outcome, shell);
+        if pressed || modal_input(event) {
+            shell.capture_event();
+        }
+    }
+
+    fn title_at(
+        &self,
+        renderer: &Renderer,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<usize> {
+        if !self.navigator().is_bar() {
+            return None;
+        }
+        bar_rects(renderer, &self.items, bounds, self.style)
+            .iter()
+            .position(|rect| cursor.is_over(*rect))
+    }
+
+    fn finish(&self, outcome: NavOutcome<Message>, shell: &mut Shell<'_, Message>) {
+        match outcome {
+            NavOutcome::None => {}
+            NavOutcome::Activated(message) => {
+                shell.publish(message);
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+            NavOutcome::Changed | NavOutcome::Closed => {
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+        }
+    }
 }
 
 impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Renderer>
@@ -470,7 +571,17 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         tree::Tag::of::<State>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(State::default())
+        let mut nav = self.host_state().cloned().unwrap_or_default();
+        self.navigator().validate(&mut nav);
+        tree::State::new(State {
+            // A rebuilt context menu keeps its origin (translation is not
+            // known yet, so this is exact outside scrollables).
+            position: nav
+                .anchor(0)
+                .map_or(Point::ORIGIN, |anchor| anchor.position()),
+            nav,
+            ..State::default()
+        })
     }
     fn children(&self) -> Vec<Tree> {
         self.content.iter().map(Tree::new).collect()
@@ -481,25 +592,18 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         } else {
             tree.children.clear();
         }
-        // Rebuilt/dynamic menu models must never retain an invalid navigation path.
         let state = tree.state.downcast_mut::<State>();
-        let bar = self.content.is_none();
-        if state.open
-            && ((bar
-                && self
-                    .items
-                    .get(state.root)
-                    .is_none_or(|item| !item.selectable()))
-                || state.path.iter().enumerate().any(|(depth, selected)| {
-                    selected.is_some_and(|index| {
-                        state
-                            .panel(&self.items, bar, depth)
-                            .get(index)
-                            .is_none_or(|item| !item.selectable())
-                    })
-                }))
+        let was_open = state.nav.is_open();
+        if let Some(host) = self.host_state()
+            && (host.root != state.nav.root || host.path != state.nav.path)
         {
-            state.close();
+            state.nav = host.clone();
+        }
+        // Rebuilt/dynamic menu models must never retain an invalid navigation
+        // path. External mode republishes the closed state on its next event.
+        self.navigator().validate(&mut state.nav);
+        if was_open && !state.nav.is_open() {
+            state.hovered = None;
         }
     }
     fn layout(
@@ -556,8 +660,11 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             ))
             .enumerate()
         {
-            let selected = (state.open && state.root == index)
-                || (!state.open && state.hovered == Some(index));
+            let selected = if state.nav.is_open() {
+                state.nav.root == Some(index)
+            } else {
+                state.hovered == Some(index)
+            };
             if selected {
                 quad(renderer, rect, self.style.selected, self.style);
             }
@@ -610,9 +717,17 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         viewport: &Rectangle,
     ) {
         let previously_captured = shell.is_event_captured();
+        let external = self.external.is_some();
+        let bar = self.content.is_none();
+        let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<State>();
-        if state.open && !housekeeping(event) {
+        if state.nav.is_open() && !housekeeping(event) {
             if previously_captured {
+                return;
+            }
+            if external {
+                self.external_open_event(renderer, state, event, bounds, cursor, shell);
+                self.report(renderer, state, bounds, shell);
                 return;
             }
             // iced obtains overlays before processing a batch. If this batch
@@ -621,17 +736,16 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             // the overlay. Events captured by an existing overlay never reach
             // the base widget (and the guard above also protects composition).
             let translation = state.translation;
-            let bounds = state.overlay_bounds.unwrap_or(viewport.size());
+            let overlay_bounds = state.overlay_bounds.unwrap_or(viewport.size());
             let mut popup: overlay::Element<'_, Message, Theme, Renderer> =
                 overlay::Element::new(Box::new(Popup {
-                    items: &self.items,
+                    nav: self.navigator(),
                     state,
-                    bar: self.content.is_none(),
-                    anchor: layout.bounds() + translation,
+                    anchor: bounds + translation,
                     translation,
                     style: self.style,
                 }));
-            let node = popup.as_overlay_mut().layout(renderer, bounds);
+            let node = popup.as_overlay_mut().layout(renderer, overlay_bounds);
             popup.as_overlay_mut().update(
                 event,
                 Layout::new(&node),
@@ -641,23 +755,23 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
                 shell,
             );
             drop(popup);
-            if state.open && shell.is_event_captured() {
+            if state.nav.is_open() && shell.is_event_captured() {
                 // A capture in iced's base pass clears its stored overlay,
                 // even for a key release that does not change our state.
                 shell.invalidate_layout();
             }
             return;
         }
-        let bar = self.content.is_none();
-        if let Event::Touch(iced::touch::Event::FingerPressed { position, .. }) = event {
-            state.focused =
-                !previously_captured && layout.bounds().contains(*position - state.translation);
+        if let Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) = event {
+            state.focused = !previously_captured && bounds.contains(*position - state.translation);
         } else if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
-            state.focused = !previously_captured && cursor.is_over(layout.bounds());
-        } else if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
+            state.focused = !previously_captured && cursor.is_over(bounds);
+        } else if matches!(event, Event::Window(iced_core::window::Event::Unfocused)) {
             state.focused = false;
-            if state.open {
-                state.close();
+            // A popup surface taking focus must not close an external menu.
+            if state.nav.is_open() && !external {
+                self.navigator().close(&mut state.nav);
+                state.hovered = None;
                 shell.request_redraw();
             }
         }
@@ -694,12 +808,13 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
                 }
             }
         }
-        if shell.is_event_captured() || state.open {
+        if shell.is_event_captured() || state.nav.is_open() {
+            self.report(renderer, state, bounds, shell);
             return;
         }
         let touch_event;
         let (event, cursor) =
-            if let Event::Touch(iced::touch::Event::FingerPressed { position, .. }) = event {
+            if let Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) = event {
                 touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
                 (
                     &touch_event,
@@ -708,39 +823,26 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             } else {
                 (event, cursor)
             };
-        let mut opened = false;
+        let nav = self.navigator();
+        let mut outcome = NavOutcome::None;
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. } | mouse::Event::CursorLeft) if bar => {
-                let hovered = bar_rects(renderer, &self.items, layout.bounds(), self.style)
-                    .iter()
-                    .enumerate()
-                    .find(|(index, rect)| self.items[*index].selectable() && cursor.is_over(**rect))
-                    .map(|(index, _)| index);
+                let hovered = self
+                    .title_at(renderer, bounds, cursor)
+                    .filter(|index| self.items[*index].selectable());
                 if state.hovered != hovered {
                     state.hovered = hovered;
                     shell.request_redraw();
                 }
             }
-            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
-                state.focused = cursor.is_over(layout.bounds());
-                if state.focused && bar && *button == mouse::Button::Left {
-                    if let Some(index) =
-                        bar_rects(renderer, &self.items, layout.bounds(), self.style)
-                            .iter()
-                            .position(|rect| cursor.is_over(*rect))
-                        && self.items[index].selectable()
-                    {
-                        if let Kind::Action(message) = &self.items[index].kind {
-                            shell.publish(message.clone());
-                        } else {
-                            state.open(&self.items, true, index, false);
-                        }
-                        opened = true;
+            Event::Mouse(mouse::Event::ButtonPressed(button)) if state.focused => {
+                if bar && *button == mouse::Button::Left {
+                    if let Some(index) = self.title_at(renderer, bounds, cursor) {
+                        outcome = nav.click_root(&mut state.nav, index);
                     }
-                } else if state.focused && !bar && *button == mouse::Button::Right {
-                    state.position = cursor.position().unwrap_or(layout.bounds().position());
-                    state.open(&self.items, false, 0, false);
-                    opened = true;
+                } else if !bar && *button == mouse::Button::Right {
+                    state.position = cursor.position().unwrap_or(bounds.position());
+                    outcome = nav.open(&mut state.nav, 0, false);
                 }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -749,18 +851,17 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
                 ..
             }) if (bar && !modifiers.shift()) || (!bar && state.focused && modifiers.shift()) => {
                 if let Some(index) = next(&self.items, None, true) {
-                    state.position = layout.bounds().position();
-                    state.open(&self.items, bar, index, true);
-                    opened = true;
+                    state.position = bounds.position();
+                    outcome = nav.open(&mut state.nav, index, true);
                 }
             }
             _ => {}
         }
-        if opened {
+        if !matches!(outcome, NavOutcome::None) {
             shell.capture_event();
-            shell.invalidate_layout();
-            shell.request_redraw();
         }
+        self.finish(outcome, shell);
+        self.report(renderer, state, bounds, shell);
     }
     fn mouse_interaction(
         &self,
@@ -778,10 +879,9 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
                 viewport,
                 renderer,
             )
-        } else if bar_rects(renderer, &self.items, layout.bounds(), self.style)
-            .iter()
-            .zip(&self.items)
-            .any(|(rect, item)| item.selectable() && cursor.is_over(*rect))
+        } else if self
+            .title_at(renderer, layout.bounds(), cursor)
+            .is_some_and(|index| self.items[index].selectable())
         {
             mouse::Interaction::Pointer
         } else {
@@ -798,12 +898,26 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let state = tree.state.downcast_mut::<State>();
         state.translation = translation;
-        let open = state.open;
-        let bar = self.content.is_none();
-        let popup = overlay::Element::new(Box::new(Popup {
+        let open = state.nav.is_open();
+        if self.external.is_some() {
+            // No popup of our own; child overlays behave as in a container.
+            return self.content.as_mut().and_then(|content| {
+                content.as_widget_mut().overlay(
+                    &mut tree.children[0],
+                    layout.children().next().unwrap(),
+                    renderer,
+                    viewport,
+                    translation,
+                )
+            });
+        }
+        let nav = Navigator {
             items: &self.items,
+            bar: self.content.is_none(),
+        };
+        let popup = overlay::Element::new(Box::new(Popup {
+            nav,
             state,
-            bar,
             anchor: layout.bounds() + translation,
             translation,
             style: self.style,
@@ -811,7 +925,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
         let mut overlays = vec![popup];
         if !open
             && let Some(content) = &mut self.content
-            && let Some(child) = content.as_widget_mut().overlay(
+            && let Some(overlay) = content.as_widget_mut().overlay(
                 &mut tree.children[0],
                 layout.children().next().unwrap(),
                 renderer,
@@ -819,7 +933,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
                 translation,
             )
         {
-            overlays.push(child);
+            overlays.push(overlay);
         }
         // The closed popup is inert. Keeping it present lets iced finish its
         // complete event batch on dismissal and supplies true window bounds
@@ -837,32 +951,23 @@ impl<'a, Message: Clone + 'a, Theme: 'a, Renderer: text::Renderer + 'a>
 }
 
 struct Popup<'a, Message> {
-    items: &'a [Item<Message>],
+    nav: Navigator<'a, Message>,
     state: &'a mut State,
-    bar: bool,
     anchor: Rectangle,
     translation: Vector,
     style: MenuStyle,
 }
 
-impl<Message> Popup<'_, Message> {
-    fn hit(&self, layout: Layout<'_>, cursor: mouse::Cursor) -> Option<(usize, usize)> {
+impl<Message: Clone> Popup<'_, Message> {
+    fn hit(&self, layout: Layout<'_>, cursor: mouse::Cursor) -> Option<(usize, Option<usize>)> {
         let panels: Vec<_> = layout.children().collect();
         for (depth, panel) in panels.iter().enumerate().rev() {
             if let Some(position) = cursor.position_over(panel.bounds()) {
-                let mut y = panel.bounds().y;
-                for (index, item) in self
-                    .state
-                    .panel(self.items, self.bar, depth)
-                    .iter()
-                    .enumerate()
-                {
-                    let height = row_height(item, self.style);
-                    if position.y >= y && position.y < y + height {
-                        return Some((depth, index));
-                    }
-                    y += height;
-                }
+                let items = self.nav.panel(&self.state.nav, depth);
+                return Some((
+                    depth,
+                    row_at(items, position.y - panel.bounds().y, self.style),
+                ));
             }
         }
         None
@@ -874,34 +979,21 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
 {
     fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
         self.state.overlay_bounds = Some(bounds);
-        if !self.state.open {
+        let Some(root) = self.state.nav.root else {
             return layout::Node::new(bounds);
-        }
+        };
         let mut panels = Vec::new();
-        let mut position = if self.bar {
-            bar_rects(renderer, self.items, self.anchor, self.style)
-                .get(self.state.root)
+        let mut position = if self.nav.is_bar() {
+            bar_rects(renderer, self.nav.items, self.anchor, self.style)
+                .get(root)
                 .map(|rect| Point::new(rect.x, rect.y + rect.height))
                 .unwrap_or(self.anchor.position())
         } else {
             self.state.position + self.translation
         };
-        for depth in 0..self.state.path.len() {
-            let items = self.state.panel(self.items, self.bar, depth);
-            let width = items
-                .iter()
-                .map(|item| {
-                    text_width(renderer, &item.label, self.style)
-                        + text_width(renderer, &item.accelerator, self.style)
-                        + if matches!(item.kind, Kind::Submenu(_)) {
-                            text_width(renderer, "  ›", self.style)
-                        } else {
-                            0.0
-                        }
-                        + self.style.padding * 3.0
-                })
-                .fold(160.0, f32::max)
-                .min(bounds.width);
+        for depth in 0..self.state.nav.path.len() {
+            let items = self.nav.panel(&self.state.nav, depth);
+            let width = panel_width(renderer, items, self.style).min(bounds.width);
             let height = items
                 .iter()
                 .map(|item| row_height(item, self.style))
@@ -913,7 +1005,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
             position.x = position.x.clamp(0.0, (bounds.width - width).max(0.0));
             position.y = position.y.clamp(0.0, (bounds.height - height).max(0.0));
             panels.push(layout::Node::new(Size::new(width, height)).move_to(position));
-            let selected = self.state.path[depth].unwrap_or(0);
+            let selected = self.state.nav.path[depth].unwrap_or(0);
             let offset = items
                 .iter()
                 .take(selected)
@@ -932,70 +1024,19 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
     ) {
-        if !self.state.open {
+        if !self.state.nav.is_open() {
             return;
         }
         for (depth, panel) in layout.children().enumerate() {
-            let bounds = panel.bounds();
             // A bar entry without children (an action opened by F10) has an
-            // empty panel; draw nothing for it.
-            if bounds.height <= 0.0 {
-                continue;
-            }
-            quad(renderer, bounds, self.style.background, self.style);
-            let mut y = bounds.y;
-            for (index, item) in self
-                .state
-                .panel(self.items, self.bar, depth)
-                .iter()
-                .enumerate()
-            {
-                let height = row_height(item, self.style);
-                let row = Rectangle {
-                    y,
-                    height,
-                    ..bounds
-                };
-                y += height;
-                if matches!(item.kind, Kind::Separator) {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: Rectangle {
-                                x: row.x + self.style.padding,
-                                y: row.center_y(),
-                                width: (row.width - self.style.padding * 2.0).max(0.0),
-                                height: 1.0,
-                            },
-                            ..Default::default()
-                        },
-                        self.style.border,
-                    );
-                    continue;
-                }
-                let selected = self.state.path[depth] == Some(index);
-                if selected {
-                    quad(renderer, row, self.style.selected, self.style);
-                }
-                let color = if !item.selectable() {
-                    self.style.disabled
-                } else if selected {
-                    self.style.selected_text
-                } else {
-                    self.style.text
-                };
-                let text_bounds = Rectangle {
-                    x: row.x + self.style.padding,
-                    width: (row.width - self.style.padding * 2.0).max(0.0),
-                    ..row
-                };
-                label(renderer, &item.label, text_bounds, color, self.style, false);
-                let trailing = if matches!(item.kind, Kind::Submenu(_)) {
-                    format!("{}  ›", item.accelerator)
-                } else {
-                    item.accelerator.clone()
-                };
-                label(renderer, &trailing, text_bounds, color, self.style, true);
-            }
+            // empty panel; draw_panel draws nothing for it.
+            draw_panel(
+                renderer,
+                panel.bounds(),
+                self.nav.panel(&self.state.nav, depth),
+                self.state.nav.path[depth],
+                self.style,
+            );
         }
     }
     fn update(
@@ -1007,105 +1048,86 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
     ) {
-        if !self.state.open || shell.is_event_captured() {
+        if !self.state.nav.is_open() || shell.is_event_captured() {
             return;
         }
         let touch_event;
         let (event, cursor) = match event {
-            Event::Touch(iced::touch::Event::FingerPressed { position, .. }) => {
+            Event::Touch(iced_core::touch::Event::FingerPressed { position, .. }) => {
                 touch_event = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
                 (&touch_event, mouse::Cursor::Available(*position))
             }
-            Event::Touch(iced::touch::Event::FingerMoved { position, .. }) => {
+            Event::Touch(iced_core::touch::Event::FingerMoved { position, .. }) => {
                 touch_event = Event::Mouse(mouse::Event::CursorMoved {
                     position: *position,
                 });
                 (&touch_event, mouse::Cursor::Available(*position))
             }
             Event::Touch(
-                iced::touch::Event::FingerLifted { position, .. }
-                | iced::touch::Event::FingerLost { position, .. },
+                iced_core::touch::Event::FingerLifted { position, .. }
+                | iced_core::touch::Event::FingerLost { position, .. },
             ) => {
                 touch_event = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
                 (&touch_event, mouse::Cursor::Available(*position))
             }
             _ => (event, cursor),
         };
-        let before = self.state.clone();
-        match event {
-            Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(key),
-                ..
-            }) => {
-                if let Some(message) = self.state.key(*key, self.items, self.bar) {
-                    shell.publish(message);
-                }
-                shell.capture_event();
-            }
-            // The menu is modal: no key press or IME text may reach the app or
-            // `keyboard::listen` subscriptions behind it.
-            Event::Keyboard(
-                keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. },
+        let nav = self.nav;
+        let pointer = matches!(
+            event,
+            Event::Mouse(
+                mouse::Event::CursorMoved { .. } | mouse::Event::ButtonPressed(mouse::Button::Left)
             )
-            | Event::InputMethod(
-                input_method::Event::Preedit(..) | input_method::Event::Commit(_),
-            ) => shell.capture_event(),
-            Event::Mouse(mouse::Event::CursorMoved { .. })
-            | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+        );
+        let (hit, title) = if pointer {
+            let title = if nav.is_bar() {
+                bar_rects(renderer, nav.items, self.anchor, self.style)
+                    .iter()
+                    .position(|rect| cursor.is_over(*rect))
+            } else {
+                None
+            };
+            (self.hit(layout, cursor), title)
+        } else {
+            (None, None)
+        };
+        let state = &mut self.state.nav;
+        let outcome = match event {
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => nav.key(state, key),
+            _ if pointer => {
                 let clicked = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)));
-                if let Some((depth, index)) = self.hit(layout, cursor) {
-                    let item = &self.state.panel(self.items, self.bar, depth)[index];
-                    if item.selectable() {
-                        let changed = self.state.path[depth] != Some(index);
-                        if changed || clicked {
-                            self.state.path.truncate(depth + 1);
-                            self.state.path[depth] = Some(index);
-                            if clicked {
-                                if let Some(message) = self.state.activate(self.items, self.bar) {
-                                    shell.publish(message);
-                                }
-                            } else if !item.children().is_empty() {
-                                self.state.path.push(None);
-                            }
-                        }
-                    } else {
-                        self.state.path.truncate(depth + 1);
-                        self.state.path[depth] = None;
-                    }
-                } else if self.bar
-                    && let Some(index) = bar_rects(renderer, self.items, self.anchor, self.style)
-                        .iter()
-                        .position(|rect| cursor.is_over(*rect))
-                {
-                    if clicked
-                        && self.items[index].selectable()
-                        && let Kind::Action(message) = &self.items[index].kind
-                    {
-                        shell.publish(message.clone());
-                        self.state.close();
-                    } else if self.items[index].selectable() && self.state.root != index {
-                        self.state.open(self.items, true, index, false);
-                    } else if clicked {
-                        self.state.close();
-                    }
-                } else if clicked {
-                    self.state.close();
+                match (hit, title) {
+                    (Some((level, row)), _) if clicked => nav.click(state, level, row),
+                    (Some((level, row)), _) => nav.hover(state, level, row),
+                    (None, Some(index)) if clicked => nav.click_root(state, index),
+                    (None, Some(index)) => nav.hover_root(state, index),
+                    (None, None) if clicked => nav.close(state),
+                    (None, None) => NavOutcome::None,
                 }
-                shell.capture_event();
             }
-            Event::Mouse(mouse::Event::ButtonPressed(_)) => {
-                self.state.close();
-                shell.capture_event();
-            }
-            Event::Mouse(_) => shell.capture_event(),
-            Event::Window(iced::window::Event::Unfocused) => self.state.close(),
-            _ => {}
+            Event::Mouse(mouse::Event::ButtonPressed(_)) => nav.close(state),
+            Event::Window(iced_core::window::Event::Unfocused) => nav.close(state),
+            _ => NavOutcome::None,
+        };
+        if modal_input(event) || matches!(event, Event::Mouse(_)) {
+            shell.capture_event();
         }
-        if *self.state != before {
-            if self.state.open {
-                shell.invalidate_layout();
+        if !self.state.nav.is_open() {
+            // As before the navigator refactor: a closed bar shows no stale
+            // title highlight.
+            self.state.hovered = None;
+        }
+        match outcome {
+            NavOutcome::None => {}
+            NavOutcome::Activated(message) => {
+                shell.publish(message);
+                shell.request_redraw();
             }
-            shell.request_redraw();
+            NavOutcome::Closed => shell.request_redraw(),
+            NavOutcome::Changed => {
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
         }
     }
     fn mouse_interaction(
@@ -1114,12 +1136,14 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         cursor: mouse::Cursor,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if !self.state.open {
+        if !self.state.nav.is_open() {
             return mouse::Interaction::None;
         }
-        if self.hit(layout, cursor).is_some_and(|(depth, index)| {
-            self.state.panel(self.items, self.bar, depth)[index].selectable()
-        }) {
+        let selectable = self.hit(layout, cursor).is_some_and(|(depth, row)| {
+            row.and_then(|row| self.nav.panel(&self.state.nav, depth).get(row))
+                .is_some_and(Item::selectable)
+        });
+        if selectable {
             mouse::Interaction::Pointer
         } else {
             mouse::Interaction::Idle
@@ -1142,9 +1166,9 @@ mod tests {
     impl renderer::Renderer for Recorder {
         fn start_layer(&mut self, _: Rectangle) {}
         fn end_layer(&mut self) {}
-        fn start_transformation(&mut self, _: iced::Transformation) {}
+        fn start_transformation(&mut self, _: iced_core::Transformation) {}
         fn end_transformation(&mut self) {}
-        fn fill_quad(&mut self, quad: renderer::Quad, _: impl Into<iced::Background>) {
+        fn fill_quad(&mut self, quad: renderer::Quad, _: impl Into<iced_core::Background>) {
             self.quads.push(quad.bounds);
         }
         fn reset(&mut self, _: Rectangle) {
@@ -1152,10 +1176,9 @@ mod tests {
         }
         fn allocate_image(
             &mut self,
-            handle: &iced::advanced::image::Handle,
-            callback: impl FnOnce(
-                Result<iced::advanced::image::Allocation, iced::advanced::image::Error>,
-            ) + Send
+            handle: &iced_core::image::Handle,
+            callback: impl FnOnce(Result<iced_core::image::Allocation, iced_core::image::Error>)
+            + Send
             + 'static,
         ) {
             renderer::Renderer::allocate_image(&mut (), handle, callback);
@@ -1164,10 +1187,10 @@ mod tests {
 
     #[cfg(debug_assertions)]
     impl text::Renderer for Recorder {
-        type Font = iced::Font;
+        type Font = iced_core::Font;
         type Paragraph = ();
         type Editor = ();
-        const ICON_FONT: iced::Font = iced::Font::DEFAULT;
+        const ICON_FONT: iced_core::Font = iced_core::Font::DEFAULT;
         const CHECKMARK_ICON: char = 'x';
         const ARROW_DOWN_ICON: char = 'v';
         const SCROLL_UP_ICON: char = '^';
@@ -1175,11 +1198,11 @@ mod tests {
         const SCROLL_LEFT_ICON: char = '<';
         const SCROLL_RIGHT_ICON: char = '>';
         const ICED_LOGO: char = 'i';
-        fn default_font(&self) -> iced::Font {
-            iced::Font::DEFAULT
+        fn default_font(&self) -> iced_core::Font {
+            iced_core::Font::DEFAULT
         }
-        fn default_size(&self) -> iced::Pixels {
-            iced::Pixels(14.0)
+        fn default_size(&self) -> iced_core::Pixels {
+            iced_core::Pixels(14.0)
         }
         fn fill_paragraph(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
         fn fill_editor(&mut self, _: &(), _: Point, _: Color, _: Rectangle) {}
@@ -1190,7 +1213,7 @@ mod tests {
     #[cfg(debug_assertions)]
     fn runtime_open_and_release_batch_keeps_drawn_overlay_and_close_keeps_tail() {
         let mut renderer = Recorder::default();
-        let menu: Menu<'_, u8, iced::Theme, Recorder> =
+        let menu: Menu<'_, u8, iced_core::Theme, Recorder> =
             Menu::bar(vec![Item::submenu("file", items())]);
         let mut ui = iced_runtime::UserInterface::build(
             menu,
@@ -1212,13 +1235,13 @@ mod tests {
             &[key_event(Named::F10, keyboard::Modifiers::empty()), release],
             mouse::Cursor::Unavailable,
             &mut renderer,
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(statuses.len(), 2);
         ui.draw(
             &mut renderer,
-            &iced::Theme::Dark,
+            &iced_core::Theme::Dark,
             &renderer::Style::default(),
             mouse::Cursor::Unavailable,
         );
@@ -1235,11 +1258,11 @@ mod tests {
                 Event::Keyboard(keyboard::Event::ModifiersChanged(
                     keyboard::Modifiers::empty(),
                 )),
-                Event::Window(iced::window::Event::Unfocused),
+                Event::Window(iced_core::window::Event::Unfocused),
             ],
             mouse::Cursor::Unavailable,
             &mut renderer,
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
@@ -1247,10 +1270,10 @@ mod tests {
             3,
             "iced must not drop events following menu dismissal"
         );
-        assert_eq!(statuses[1], iced::event::Status::Ignored);
+        assert_eq!(statuses[1], iced_core::event::Status::Ignored);
         ui.draw(
             &mut renderer,
-            &iced::Theme::Dark,
+            &iced_core::Theme::Dark,
             &renderer::Style::default(),
             mouse::Cursor::Unavailable,
         );
@@ -1280,11 +1303,11 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_focused_child_opens_context_and_receives_modifiers_and_ime() {
-        let id = iced::advanced::widget::Id::new("field");
-        let field = iced::widget::text_input("", "")
+        let id = iced_core::widget::Id::new("field");
+        let field = iced_widget::text_input("", "")
             .id(id.clone())
             .on_input(|value| value);
-        let menu: Menu<'_, String, iced::Theme, ()> =
+        let menu: Menu<'_, String, iced_core::Theme, ()> =
             Menu::context(field, vec![Item::action("action", "action".to_owned())]);
         let mut ui = iced_runtime::UserInterface::build(
             menu,
@@ -1294,7 +1317,7 @@ mod tests {
         );
         ui.operate(
             &(),
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+            &mut iced_core::widget::operation::focusable::focus::<()>(id),
         );
         let mut messages = vec![];
         let (_, statuses) = ui.update(
@@ -1304,50 +1327,62 @@ mod tests {
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses[1],
-            iced::event::Status::Captured,
+            iced_core::event::Status::Captured,
             "keyboard-focused child enables context shortcut without click"
         );
         let (_, statuses) = ui.update(
             &[
                 character("q"),
-                Event::InputMethod(iced::advanced::input_method::Event::Preedit(
+                Event::InputMethod(iced_core::input_method::Event::Preedit(
                     "界".into(),
                     Some(0..3),
                 )),
-                Event::InputMethod(iced::advanced::input_method::Event::Commit("界".into())),
+                Event::InputMethod(iced_core::input_method::Event::Commit("界".into())),
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses,
-            [iced::event::Status::Captured; 3],
+            [iced_core::event::Status::Captured; 3],
             "an open menu blocks key presses and IME text from the app behind it"
         );
         assert!(messages.is_empty());
+        // A clearing preedit is state, not input: it reaches the field.
+        let (_, statuses) = ui.update(
+            &[Event::InputMethod(iced_core::input_method::Event::Preedit(
+                String::new(),
+                None,
+            ))],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced_core::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(statuses, [iced_core::event::Status::Ignored]);
         let (_, statuses) = ui.update(
             &[
                 Event::Keyboard(keyboard::Event::ModifiersChanged(
                     keyboard::Modifiers::empty(),
                 )),
-                Event::InputMethod(iced::advanced::input_method::Event::Closed),
+                Event::InputMethod(iced_core::input_method::Event::Closed),
                 key_event(Named::Escape, keyboard::Modifiers::empty()),
                 character("c"),
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(statuses.len(), 4);
-        assert_eq!(statuses[0], iced::event::Status::Ignored);
+        assert_eq!(statuses[0], iced_core::event::Status::Ignored);
         assert_eq!(
             messages,
             ["c"],
@@ -1358,15 +1393,15 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_captured_sibling_click_unfocuses_context_child() {
-        let id = iced::advanced::widget::Id::new("field");
-        let menu: Menu<'_, String, iced::Theme, ()> = Menu::context(
-            iced::widget::text_input("", "")
+        let id = iced_core::widget::Id::new("field");
+        let menu: Menu<'_, String, iced_core::Theme, ()> = Menu::context(
+            iced_widget::text_input("", "")
                 .id(id.clone())
                 .on_input(|value| value),
             vec![Item::action("action", "action".to_owned())],
         );
-        let root = iced::widget::column![
-            iced::widget::button("button").on_press("button".to_owned()),
+        let root = iced_widget::column![
+            iced_widget::button("button").on_press("button".to_owned()),
             menu
         ];
         let mut ui = iced_runtime::UserInterface::build(
@@ -1377,7 +1412,7 @@ mod tests {
         );
         ui.operate(
             &(),
-            &mut iced::advanced::widget::operation::focusable::focus::<()>(id),
+            &mut iced_core::widget::operation::focusable::focus::<()>(id),
         );
         let mut messages = vec![];
         ui.update(
@@ -1387,7 +1422,7 @@ mod tests {
             ],
             mouse::Cursor::Available(Point::new(5.0, 5.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         let (_, statuses) = ui.update(
@@ -1397,12 +1432,15 @@ mod tests {
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses,
-            [iced::event::Status::Ignored, iced::event::Status::Ignored]
+            [
+                iced_core::event::Status::Ignored,
+                iced_core::event::Status::Ignored
+            ]
         );
         assert_eq!(messages, ["button"]);
     }
@@ -1411,10 +1449,10 @@ mod tests {
     #[cfg(debug_assertions)]
     fn runtime_nested_context_prefers_inner_and_touch_can_activate_it() {
         let inner = Menu::context(
-            iced::widget::Space::new().width(200).height(100),
+            iced_widget::Space::new().width(200).height(100),
             vec![Item::action("inner", 1)],
         );
-        let outer: Menu<'_, u8, iced::Theme, ()> =
+        let outer: Menu<'_, u8, iced_core::Theme, ()> =
             Menu::context(inner, vec![Item::action("outer", 2)]);
         let mut ui = iced_runtime::UserInterface::build(
             outer,
@@ -1429,17 +1467,17 @@ mod tests {
             ))],
             mouse::Cursor::Available(Point::new(20.0, 20.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         ui.update(
-            &[Event::Touch(iced::touch::Event::FingerPressed {
-                id: iced::touch::Finger(0),
+            &[Event::Touch(iced_core::touch::Event::FingerPressed {
+                id: iced_core::touch::Finger(0),
                 position: Point::new(25.0, 25.0),
             })],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(messages, [1]);
@@ -1448,13 +1486,13 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_same_batch_popup_hit_testing_uses_scrolled_window_coordinates() {
-        let id = iced::advanced::widget::Id::new("scroll");
-        let menu: Menu<'_, u8, iced::Theme, ()> =
+        let id = iced_core::widget::Id::new("scroll");
+        let menu: Menu<'_, u8, iced_core::Theme, ()> =
             Menu::bar(vec![Item::submenu("file", vec![Item::action("run", 9)])]);
-        let root = iced::widget::scrollable(iced::widget::column![
-            iced::widget::Space::new().height(100),
+        let root = iced_widget::scrollable(iced_widget::column![
+            iced_widget::Space::new().height(100),
             menu,
-            iced::widget::Space::new().height(400)
+            iced_widget::Space::new().height(400)
         ])
         .id(id.clone())
         .width(200)
@@ -1467,9 +1505,9 @@ mod tests {
         );
         ui.operate(
             &(),
-            &mut iced::advanced::widget::operation::scrollable::scroll_to::<()>(
+            &mut iced_core::widget::operation::scrollable::scroll_to::<()>(
                 id,
-                iced::advanced::widget::operation::scrollable::AbsoluteOffset {
+                iced_core::widget::operation::scrollable::AbsoluteOffset {
                     x: None,
                     y: Some(80.0),
                 },
@@ -1483,7 +1521,7 @@ mod tests {
             ],
             mouse::Cursor::Available(Point::new(10.0, 50.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(statuses.len(), 2);
@@ -1497,7 +1535,8 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn runtime_touch_opens_bar_and_dismisses_outside_without_hover_leak() {
-        let menu: Menu<'_, u8, iced::Theme, ()> = Menu::bar(vec![Item::submenu("file", items())]);
+        let menu: Menu<'_, u8, iced_core::Theme, ()> =
+            Menu::bar(vec![Item::submenu("file", items())]);
         let mut ui = iced_runtime::UserInterface::build(
             menu,
             Size::new(400.0, 300.0),
@@ -1506,20 +1545,20 @@ mod tests {
         );
         let mut messages = vec![];
         ui.update(
-            &[Event::Touch(iced::touch::Event::FingerPressed {
-                id: iced::touch::Finger(0),
+            &[Event::Touch(iced_core::touch::Event::FingerPressed {
+                id: iced_core::touch::Finger(0),
                 position: Point::new(5.0, 5.0),
             })],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         let (state, _) = ui.update(
             &[],
             mouse::Cursor::Available(Point::new(5.0, 35.0)),
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert!(
@@ -1534,35 +1573,38 @@ mod tests {
         );
         let (_, statuses) = ui.update(
             &[
-                Event::Touch(iced::touch::Event::FingerPressed {
-                    id: iced::touch::Finger(1),
+                Event::Touch(iced_core::touch::Event::FingerPressed {
+                    id: iced_core::touch::Finger(1),
                     position: Point::new(390.0, 290.0),
                 }),
                 character("x"),
             ],
             mouse::Cursor::Unavailable,
             &mut (),
-            &mut iced::advanced::clipboard::Null,
+            &mut iced_core::clipboard::Null,
             &mut messages,
         );
         assert_eq!(
             statuses,
-            [iced::event::Status::Captured, iced::event::Status::Ignored]
+            [
+                iced_core::event::Status::Captured,
+                iced_core::event::Status::Ignored
+            ]
         );
         assert!(messages.is_empty());
     }
 
     #[cfg(debug_assertions)]
     struct Harness {
-        menu: Menu<'static, u8, iced::Theme, ()>,
+        menu: Menu<'static, u8, iced_core::Theme, ()>,
         tree: Tree,
         node: layout::Node,
     }
 
     #[cfg(debug_assertions)]
     impl Harness {
-        fn new(mut menu: Menu<'static, u8, iced::Theme, ()>) -> Self {
-            let mut tree = Tree::new(&menu as &dyn Widget<u8, iced::Theme, ()>);
+        fn new(mut menu: Menu<'static, u8, iced_core::Theme, ()>) -> Self {
+            let mut tree = Tree::new(&menu as &dyn Widget<u8, iced_core::Theme, ()>);
             let node = menu.layout(
                 &mut tree,
                 &(),
@@ -1576,7 +1618,7 @@ mod tests {
             event: Event,
             cursor: mouse::Cursor,
             popup: bool,
-        ) -> (Vec<u8>, bool, iced::window::RedrawRequest) {
+        ) -> (Vec<u8>, bool, iced_core::window::RedrawRequest) {
             let mut messages = Vec::new();
             let mut shell = Shell::new(&mut messages);
             let viewport = Rectangle::with_size(Size::new(400.0, 300.0));
@@ -1597,7 +1639,7 @@ mod tests {
                     Layout::new(&node),
                     cursor,
                     &(),
-                    &mut iced::advanced::clipboard::Null,
+                    &mut iced_core::clipboard::Null,
                     &mut shell,
                 );
             } else {
@@ -1607,7 +1649,7 @@ mod tests {
                     Layout::new(&self.node),
                     cursor,
                     &(),
-                    &mut iced::advanced::clipboard::Null,
+                    &mut iced_core::clipboard::Null,
                     &mut shell,
                     &viewport,
                 );
@@ -1642,11 +1684,11 @@ mod tests {
         let cursor = mouse::Cursor::Available(position);
         assert_eq!(
             harness.event(event.clone(), cursor, false).2,
-            iced::window::RedrawRequest::NextFrame
+            iced_core::window::RedrawRequest::NextFrame
         );
         assert_eq!(
             harness.event(event, cursor, false).2,
-            iced::window::RedrawRequest::Wait
+            iced_core::window::RedrawRequest::Wait
         );
         assert_eq!(
             harness
@@ -1656,9 +1698,54 @@ mod tests {
                     false
                 )
                 .2,
-            iced::window::RedrawRequest::NextFrame
+            iced_core::window::RedrawRequest::NextFrame
         );
         assert_eq!(harness.tree.state.downcast_ref::<State>().hovered, None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn closing_clears_the_title_highlight_and_host_state_needs_external_mode() {
+        let mut harness = Harness::new(Menu::bar(vec![Item::submenu("menu", items())]));
+        let at = Point::new(5.0, 5.0);
+        harness.event(
+            Event::Mouse(mouse::Event::CursorMoved { position: at }),
+            mouse::Cursor::Available(at),
+            false,
+        );
+        harness.event(
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            mouse::Cursor::Available(at),
+            false,
+        );
+        let state = harness.tree.state.downcast_ref::<State>();
+        assert!(state.nav.is_open());
+        assert_eq!(state.hovered, Some(0));
+        harness.event(
+            key_event(Named::Escape, keyboard::Modifiers::empty()),
+            mouse::Cursor::Unavailable,
+            true,
+        );
+        let state = harness.tree.state.downcast_ref::<State>();
+        assert!(!state.nav.is_open());
+        assert_eq!(state.hovered, None);
+
+        let open = MenuState {
+            root: Some(0),
+            path: vec![None],
+            anchors: Vec::new(),
+        };
+        let overlay_menu = Harness::new(
+            Menu::context(iced_widget::Space::new().width(200).height(100), items()).state(&open),
+        );
+        assert!(
+            !overlay_menu
+                .tree
+                .state
+                .downcast_ref::<State>()
+                .nav
+                .is_open()
+        );
     }
 
     #[test]
@@ -1671,7 +1758,10 @@ mod tests {
             false,
         );
         assert!(captured);
-        assert_eq!(harness.tree.state.downcast_ref::<State>().path, [Some(2)]);
+        assert_eq!(
+            harness.tree.state.downcast_ref::<State>().nav.path,
+            [Some(2)]
+        );
         // Popup starts below the 28px bar: disabled (28), separator (8), action (28).
         let (messages, captured, _) = harness.event(
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
@@ -1680,7 +1770,7 @@ mod tests {
         );
         assert!(captured);
         assert_eq!(messages, [1]);
-        assert!(!harness.tree.state.downcast_ref::<State>().open);
+        assert!(!harness.tree.state.downcast_ref::<State>().nav.is_open());
     }
 
     #[test]
@@ -1701,7 +1791,7 @@ mod tests {
         );
         assert_eq!(messages, [1]);
         assert!(captured);
-        assert!(!harness.tree.state.downcast_ref::<State>().open);
+        assert!(!harness.tree.state.downcast_ref::<State>().nav.is_open());
 
         harness.event(
             key_event(Named::F10, keyboard::Modifiers::empty()),
@@ -1725,14 +1815,14 @@ mod tests {
         );
         assert_eq!(messages, [2]);
         assert!(captured);
-        assert!(!harness.tree.state.downcast_ref::<State>().open);
+        assert!(!harness.tree.state.downcast_ref::<State>().nav.is_open());
     }
 
     #[test]
     #[cfg(debug_assertions)]
     fn context_overlay_skips_disabled_and_captures_outside_dismissal() {
         let mut harness = Harness::new(Menu::context(
-            iced::widget::Space::new().width(200).height(100),
+            iced_widget::Space::new().width(200).height(100),
             items(),
         ));
         let cursor = mouse::Cursor::Available(Point::new(20.0, 20.0));
@@ -1749,13 +1839,16 @@ mod tests {
         );
         assert!(captured);
         assert!(messages.is_empty());
-        assert!(harness.tree.state.downcast_ref::<State>().open);
+        assert!(harness.tree.state.downcast_ref::<State>().nav.is_open());
         harness.event(
             key_event(Named::ArrowDown, keyboard::Modifiers::empty()),
             cursor,
             true,
         );
-        assert_eq!(harness.tree.state.downcast_ref::<State>().path, [Some(2)]);
+        assert_eq!(
+            harness.tree.state.downcast_ref::<State>().nav.path,
+            [Some(2)]
+        );
         let (messages, captured, _) = harness.event(
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
             mouse::Cursor::Available(Point::new(390.0, 290.0)),
@@ -1763,14 +1856,194 @@ mod tests {
         );
         assert!(messages.is_empty());
         assert!(captured);
-        assert!(!harness.tree.state.downcast_ref::<State>().open);
+        assert!(!harness.tree.state.downcast_ref::<State>().nav.is_open());
         // Context keyboard activation uses the focus retained by its target.
         harness.event(
             key_event(Named::F10, keyboard::Modifiers::SHIFT),
             cursor,
             false,
         );
-        assert!(harness.tree.state.downcast_ref::<State>().open);
+        assert!(harness.tree.state.downcast_ref::<State>().nav.is_open());
+    }
+
+    #[cfg(debug_assertions)]
+    #[derive(Debug, Clone, PartialEq)]
+    enum Host {
+        State(MenuState),
+        Act(u8),
+    }
+
+    #[cfg(debug_assertions)]
+    fn host_items() -> Vec<Item<Host>> {
+        vec![
+            Item::submenu(
+                "file",
+                vec![
+                    Item::action("one", Host::Act(1)),
+                    Item::submenu("more", vec![Item::action("two", Host::Act(2))]),
+                ],
+            ),
+            Item::action("go", Host::Act(9)),
+        ]
+    }
+
+    #[cfg(debug_assertions)]
+    fn host_ui(
+        menu: Menu<'_, Host, iced_core::Theme, ()>,
+    ) -> iced_runtime::UserInterface<'_, Host, iced_core::Theme, ()> {
+        iced_runtime::UserInterface::build(
+            menu,
+            Size::new(400.0, 300.0),
+            iced_runtime::user_interface::Cache::new(),
+            &mut (),
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    fn send(
+        ui: &mut iced_runtime::UserInterface<'_, Host, iced_core::Theme, ()>,
+        events: &[Event],
+    ) -> (Vec<iced_core::event::Status>, Vec<Host>) {
+        let mut messages = Vec::new();
+        let (_, statuses) = ui.update(
+            events,
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced_core::clipboard::Null,
+            &mut messages,
+        );
+        (statuses, messages)
+    }
+
+    // With the null renderer text has no width: bar titles are 20 px
+    // (padding only) and panels take the minimum width.
+    #[cfg(debug_assertions)]
+    fn title(index: usize) -> Rectangle {
+        Rectangle::new(Point::new(20.0 * index as f32, 0.0), Size::new(20.0, 28.0))
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn external_bar_reports_state_with_anchors_and_draws_no_popup() {
+        let mut ui = host_ui(Menu::bar(host_items()).external_popups(Host::State));
+        let (statuses, messages) = send(
+            &mut ui,
+            &[key_event(Named::F10, keyboard::Modifiers::empty())],
+        );
+        assert_eq!(statuses, [iced_core::event::Status::Captured]);
+        assert_eq!(
+            messages,
+            [Host::State(MenuState {
+                root: Some(0),
+                path: vec![Some(0)],
+                anchors: vec![title(0)],
+            })]
+        );
+        let (statuses, messages) = send(
+            &mut ui,
+            &[
+                key_event(Named::ArrowDown, keyboard::Modifiers::empty()),
+                key_event(Named::ArrowRight, keyboard::Modifiers::empty()),
+            ],
+        );
+        assert_eq!(statuses, [iced_core::event::Status::Captured; 2]);
+        let submenu = MenuState {
+            root: Some(0),
+            path: vec![Some(1), Some(0)],
+            anchors: vec![
+                title(0),
+                Rectangle::new(Point::new(0.0, 28.0), Size::new(MIN_PANEL_WIDTH, 28.0)),
+            ],
+        };
+        assert_eq!(messages.last(), Some(&Host::State(submenu)));
+        // Losing window focus (a popup surface took it) keeps the menu open;
+        // other keys are still modal.
+        let (statuses, messages) = send(
+            &mut ui,
+            &[
+                Event::Window(iced_core::window::Event::Unfocused),
+                key_event(Named::Enter, keyboard::Modifiers::empty()),
+            ],
+        );
+        assert_eq!(statuses[1], iced_core::event::Status::Captured);
+        assert_eq!(messages, [Host::Act(2), Host::State(MenuState::default()),]);
+
+        let mut menu: Menu<'_, Host, iced_core::Theme, ()> =
+            Menu::bar(host_items()).external_popups(Host::State);
+        let mut tree = Tree::new(&menu as &dyn Widget<Host, iced_core::Theme, ()>);
+        let node = layout::Node::new(Size::new(400.0, 28.0));
+        assert!(
+            menu.overlay(
+                &mut tree,
+                Layout::new(&node),
+                &(),
+                &Rectangle::with_size(Size::new(400.0, 300.0)),
+                Vector::ZERO,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn external_bar_follows_host_state_and_fills_its_anchors() {
+        let host = MenuState {
+            root: Some(0),
+            path: vec![Some(1), None],
+            anchors: Vec::new(),
+        };
+        let mut ui = host_ui(
+            Menu::bar(host_items())
+                .external_popups(Host::State)
+                .state(&host),
+        );
+        let (_, messages) = send(
+            &mut ui,
+            &[Event::Window(iced_core::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ))],
+        );
+        assert_eq!(
+            messages,
+            [Host::State(MenuState {
+                anchors: vec![
+                    title(0),
+                    Rectangle::new(Point::new(0.0, 28.0), Size::new(MIN_PANEL_WIDTH, 28.0)),
+                ],
+                ..host.clone()
+            })]
+        );
+        // A host state that no longer fits the items is closed and reported.
+        let stale = MenuState {
+            root: Some(0),
+            path: vec![Some(7)],
+            anchors: Vec::new(),
+        };
+        let mut ui = host_ui(
+            Menu::bar(host_items())
+                .external_popups(Host::State)
+                .state(&stale),
+        );
+        let (_, messages) = send(
+            &mut ui,
+            &[Event::Window(iced_core::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            ))],
+        );
+        assert_eq!(messages, [Host::State(MenuState::default())]);
+        // A closed external bar still activates top-level actions.
+        let mut ui = host_ui(Menu::bar(host_items()).external_popups(Host::State));
+        let mut messages = Vec::new();
+        ui.update(
+            &[Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left,
+            ))],
+            mouse::Cursor::Available(Point::new(25.0, 5.0)),
+            &mut (),
+            &mut iced_core::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(messages, [Host::Act(9)]);
     }
 
     fn items() -> Vec<Item<u8>> {
@@ -1780,102 +2053,5 @@ mod tests {
             Item::action("one", 1),
             Item::submenu("more", vec![Item::separator(), Item::action("two", 2)]),
         ]
-    }
-
-    #[test]
-    fn navigation_skips_disabled_and_separators_and_wraps() {
-        let items = items();
-        let mut state = State::default();
-        state.open(&items, false, 0, true);
-        assert_eq!(state.path, [Some(2)]);
-        state.key(Named::ArrowUp, &items, false);
-        assert_eq!(state.path, [Some(3)]);
-        state.key(Named::ArrowDown, &items, false);
-        assert_eq!(state.path, [Some(2)]);
-        state.key(Named::End, &items, false);
-        assert_eq!(state.path, [Some(3)]);
-        state.key(Named::Home, &items, false);
-        assert_eq!(state.path, [Some(2)]);
-    }
-
-    #[test]
-    fn bar_action_roots_activate_from_keyboard() {
-        let items = vec![Item::action("run", 7)];
-        let mut state = State::default();
-        state.open(&items, true, 0, true);
-        assert_eq!(state.key(Named::Enter, &items, true), Some(7));
-        assert!(!state.open);
-    }
-
-    #[test]
-    fn nested_navigation_and_activation_emit_only_action() {
-        let items = items();
-        let mut state = State::default();
-        state.open(&items, false, 0, true);
-        state.key(Named::End, &items, false);
-        assert_eq!(state.key(Named::ArrowRight, &items, false), None);
-        assert_eq!(state.path, [Some(3), Some(1)]);
-        state.key(Named::ArrowLeft, &items, false);
-        assert_eq!(state.path, [Some(3)]);
-        state.key(Named::Enter, &items, false);
-        assert_eq!(state.key(Named::Enter, &items, false), Some(2));
-        assert!(!state.open);
-        assert!(state.path.is_empty());
-    }
-
-    #[test]
-    fn empty_or_fully_disabled_menus_are_safe() {
-        for items in [
-            vec![],
-            vec![
-                Item::action("disabled", 1).enabled(false),
-                Item::separator(),
-            ],
-        ] {
-            let mut state = State::default();
-            state.open(&items, false, 0, true);
-            for key in [
-                Named::Home,
-                Named::End,
-                Named::ArrowDown,
-                Named::ArrowUp,
-                Named::ArrowRight,
-                Named::Enter,
-            ] {
-                assert_eq!(state.key(key, &items, false), None);
-            }
-            assert_eq!(state.path, [None]);
-            state.key(Named::Escape, &items, false);
-            assert!(!state.open);
-        }
-        // An empty submenu is selectable but opens no panel.
-        let items = vec![Item::submenu("empty", vec![]), Item::action("run", 1)];
-        let mut state = State::default();
-        state.open(&items, false, 0, true);
-        assert_eq!(state.path, [Some(0)]);
-        assert_eq!(state.key(Named::Enter, &items, false), None);
-        assert_eq!(state.key(Named::ArrowRight, &items, false), None);
-        assert_eq!(state.path, [Some(0)]);
-    }
-
-    #[test]
-    fn bar_arrows_switch_roots_and_escape_unwinds() {
-        let menus = vec![
-            Item::submenu("first", items()),
-            Item::submenu("disabled", items()).enabled(false),
-            Item::submenu("last", items()),
-        ];
-        let mut state = State::default();
-        state.open(&menus, true, 0, true);
-        state.key(Named::ArrowLeft, &menus, true);
-        assert_eq!(state.root, 2);
-        state.key(Named::End, &menus, true);
-        state.key(Named::ArrowRight, &menus, true);
-        assert_eq!(state.path.len(), 2);
-        state.key(Named::Escape, &menus, true);
-        assert_eq!(state.path.len(), 1);
-        assert!(state.open);
-        state.key(Named::Escape, &menus, true);
-        assert!(!state.open);
     }
 }
