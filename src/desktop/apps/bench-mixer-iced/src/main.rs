@@ -222,6 +222,7 @@ fn main() -> iced::Result {
         }
     );
     let size = iced::Size::new(config.width as f32, config.height as f32);
+    let iced_theme = theme::iced_theme(tokens);
 
     iced::application(
         move || app::Bench::new(config.clone(), song.clone(), tokens),
@@ -230,7 +231,9 @@ fn main() -> iced::Result {
     )
     .title(move |_: &app::Bench| title.clone())
     .subscription(app::Bench::subscription)
-    .theme(move |_: &app::Bench| theme::iced_theme(tokens))
+    // Built once: `Theme::custom` generates a whole extended palette, and
+    // iced asks for the theme on every redraw.
+    .theme(move |_: &app::Bench| iced_theme.clone())
     .window(iced::window::Settings {
         size,
         min_size: Some(size),

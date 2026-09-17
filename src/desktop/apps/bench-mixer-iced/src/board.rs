@@ -110,7 +110,6 @@ impl<Message, Theme, Renderer: renderer::Renderer> Widget<Message, Theme, Render
         });
     }
 
-    #[allow(clippy::too_many_arguments)] // The iced Widget::update signature.
     fn update(
         &mut self,
         tree: &mut Tree,
