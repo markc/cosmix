@@ -13,7 +13,7 @@ struct Runner {
     exit_after: Option<Duration>,
 }
 
-impl cosmix_wl_app::App for Runner {
+impl App for Runner {
     fn init(&mut self, cx: &mut cosmix_wl_app::Ctx<'_>) {
         if let Some(after) = self.exit_after {
             let waker = cx.waker();
