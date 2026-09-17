@@ -1,0 +1,35 @@
+-- Accepted parity deltas between the two bake-off arms (ADR 2026-09-17
+-- test C). The driver's parity guard loads this with load_data() and accepts
+-- exactly these differences; anything else it finds is a parity failure.
+--
+-- Every entry is a limit of `cosmix-iced-widgets` 0.1.0's surface, not a
+-- choice made in the iced arm: each of the four needs a widget-crate change
+-- to remove, and the lead has queued that slice. None of them changes how
+-- many quads or glyphs a frame draws, so none of them moves a measured
+-- number; they change where a few pixels land and what colour they are.
+known_deltas: {
+  schema_version: 1,
+  arms: ["bevy", "iced-wgpu", "iced-tiny-skia"],
+  deltas: [
+    {
+      arm: "iced",
+      item: "fader-meter-taper",
+      reason: "Fader and LevelMeter map dB with cosmix_iced_widgets::scale (0 dB at travel 0.80, floor -60 dB) and take no mapping; the Bevy arm uses the feed's CTK-matching FADER_TAPER (0 dB at 0.75, floor -120 dB), so a given dB sits a few pixels higher or lower"
+    },
+    {
+      arm: "iced",
+      item: "meter-hold-and-clip",
+      reason: "LevelMeter takes only a level and keeps its own time-based peak line; it has no input for the feed's peak, hold or clipped, so the iced arm draws neither the hold marker nor the clip latch CTK draws"
+    },
+    {
+      arm: "iced",
+      item: "roll-note-colour",
+      reason: "PianoRoll colours every note from one AudioStyle.note with velocity as alpha; the Bevy arm colours per track through CTK's channel_color, so the roll is one hue instead of a family per track"
+    },
+    {
+      arm: "iced",
+      item: "roll-playhead",
+      reason: "PianoRoll can draw a playhead on its own layer but the Bevy arm draws none, so the iced arm passes None: the absence is the parity choice, not a missing feature"
+    }
+  ]
+}

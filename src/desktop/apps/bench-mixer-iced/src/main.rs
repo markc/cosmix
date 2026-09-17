@@ -16,6 +16,7 @@ compile_error!(
 );
 
 mod app;
+mod board;
 mod mixer;
 mod roll;
 mod theme;
@@ -30,8 +31,9 @@ use cosmix_bench_feed::{BenchSong, DEFAULT_SEED, DEFAULT_STRIPS, Mode};
 const APP_ID: &str = "dev.cosmix.bench-mixer-iced";
 /// Most channel strips a run accepts (the Bevy arm's limit).
 const MAX_STRIPS: usize = 512;
-/// Widest and tallest window `--size` accepts.
-const MAX_WINDOW: u32 = 8192;
+/// Window size limits `--size` accepts, matching the Bevy arm exactly.
+const MIN_WINDOW: u32 = 200;
+const MAX_WINDOW: u32 = 8000;
 
 /// Which renderer this binary was built with, for the run banner: the two
 /// arms are reported separately and a mislabelled run is worthless.
@@ -48,7 +50,7 @@ usage: cosmix-bench-mixer-iced [options]
   --strips N                     channel strips, plus the master (default 64)
   --seed S                       feed seed, decimal or 0x hex (default 0x5eed1234)
   --song PATH                    roll song (default ~/.cache/cosmix-bench/studio-s0/dense-32-track.mid)
-  --size WxH                     logical window size (default 1600x900)
+  --size WxH                     logical window size (default 1024x576)
   --drag-by script|pointer       drag mode: the feed moves the fader, or an external
                                  pointer does while meters animate (default script)";
 
@@ -80,15 +82,15 @@ fn parse_seed(text: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("--seed: not a number: {text:?}"))
 }
 
-/// `WxH` in logical pixels, both sides 1..=[`MAX_WINDOW`].
+/// `WxH` in logical pixels, both sides [`MIN_WINDOW`]..=[`MAX_WINDOW`].
 fn parse_size(text: &str) -> Result<(u32, u32), String> {
-    let bad = || format!("--size must be WxH in 1..={MAX_WINDOW}, got {text:?}");
+    let bad = || format!("--size must be WxH in {MIN_WINDOW}..={MAX_WINDOW}, got {text:?}");
     let (width, height) = text.split_once(['x', 'X']).ok_or_else(bad)?;
     let side = |value: &str| {
         value
             .parse::<u32>()
             .ok()
-            .filter(|n| (1..=MAX_WINDOW).contains(n))
+            .filter(|n| (MIN_WINDOW..=MAX_WINDOW).contains(n))
             .ok_or_else(bad)
     };
     Ok((side(width)?, side(height)?))
@@ -308,6 +310,7 @@ mod tests {
             &["--size", "0x576"],
             &["--size", "1024x"],
             &["--size", "9000x576"],
+            &["--size", "199x576"],
             &["--size", "-1x5"],
             &["--mode"],
             &["--frobnicate", "1"],

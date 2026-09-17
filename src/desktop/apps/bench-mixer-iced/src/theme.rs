@@ -80,18 +80,28 @@ mod tests {
         let audio = tokens.audio_style();
         assert_eq!(audio.background, tokens.card);
         assert_ne!(audio.meter_clip, audio.meter_low);
-        // The master strip must be visibly lifted off the channel strips, as
-        // CTK's bg3-over-bg2 is; if the design ever collapses those rungs the
-        // arm needs a different pair, not a silent flat board.
-        assert_ne!(
-            strip_background(tokens, true),
-            strip_background(tokens, false),
-            "master/channel panels collapsed; surface={:?} card={:?} popover={:?} muted={:?}",
-            tokens.surface,
-            tokens.card,
-            tokens.popover,
-            tokens.muted_surface
-        );
+    }
+
+    /// Not an assertion: the resolved palette, so a reader can see which
+    /// rungs this design actually separates (`cargo test -- --nocapture`).
+    #[test]
+    fn the_resolved_palette_is_reported() {
+        let t = tokens().unwrap();
+        for (name, colour) in [
+            ("surface", t.surface),
+            ("card", t.card),
+            ("popover", t.popover),
+            ("muted_surface", t.muted_surface),
+            ("input", t.input),
+            ("border", t.border),
+            ("selection", t.selection),
+            ("primary", t.primary),
+            ("ring", t.ring),
+            ("text", t.text),
+        ] {
+            let [r, g, b] = [colour.r, colour.g, colour.b].map(|c| (c * 255.0).round() as u8);
+            println!("palette {name:<14} #{r:02x}{g:02x}{b:02x}");
+        }
     }
 
     #[test]

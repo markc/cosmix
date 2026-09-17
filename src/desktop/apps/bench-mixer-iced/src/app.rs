@@ -6,6 +6,7 @@
 //! the [`crate::ticker`] widget publishes once per feed tick and never when
 //! the run is idle.
 
+use cosmix_bench_feed::layout::Layout;
 use cosmix_bench_feed::{BenchSong, MeterFrame, MixerFeed, Mode, RollViewport, roll_script};
 use cosmix_iced_widgets::{RollNotes, RollView, Tokens};
 use iced::widget::stack;
@@ -50,7 +51,10 @@ pub struct Bench {
     pub song: Option<BenchSong>,
     pub notes: RollNotes,
     pub roll: RollView,
-    /// Logical canvas size the roll view was mapped for.
+    /// The shared board geometry for the current size; the Bevy arm and the
+    /// driver read the same rectangles from the same function.
+    pub layout: Layout,
+    /// Logical window size the layout and roll view were resolved for.
     size: Size,
 }
 
@@ -77,6 +81,7 @@ impl Bench {
             song,
             notes,
             roll,
+            layout: Layout::new((size.width, size.height), config.strips),
             size,
             config,
         }
@@ -136,6 +141,7 @@ impl Bench {
             Message::Resized(size) => {
                 if self.size != size && size.width > 0.0 && size.height > 0.0 {
                     self.size = size;
+                    self.layout = Layout::new((size.width, size.height), self.config.strips);
                     self.remap_roll();
                 }
             }
@@ -144,7 +150,7 @@ impl Bench {
 
     pub fn view(&self) -> Element<'_, Message> {
         let body = match self.config.view {
-            View::Mixer => mixer::view(self, self.tokens),
+            View::Mixer => mixer::view(self, &self.layout, self.tokens),
             View::Roll => roll::view(self, self.tokens),
         };
         // The clock is zero-sized and stacked over the surface, so it costs
