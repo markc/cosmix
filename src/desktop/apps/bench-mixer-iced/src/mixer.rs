@@ -90,7 +90,7 @@ fn strip<'a>(bench: &'a Bench, slot: usize, tokens: Tokens) -> Element<'a, Messa
     .clip(true);
 
     let pan: Element<'a, Message> = if master {
-        Space::new(KNOB_SIZE, KNOB_SIZE).into()
+        Space::new().width(KNOB_SIZE).height(KNOB_SIZE).into()
     } else {
         Knob::new(bench.pans[slot])
             .size(KNOB_SIZE)
@@ -116,7 +116,10 @@ fn strip<'a>(bench: &'a Bench, slot: usize, tokens: Tokens) -> Element<'a, Messa
         .on_toggle(move |on| Message::Mute(slot, on))
         .style(style);
     let solo: Element<'a, Message> = if master {
-        Space::new(BUTTON_MIN_WIDTH, BUTTON_HEIGHT).into()
+        Space::new()
+            .width(BUTTON_MIN_WIDTH)
+            .height(BUTTON_HEIGHT)
+            .into()
     } else {
         Toggle::new("S", bench.solos[slot])
             .size(BUTTON_MIN_WIDTH, BUTTON_HEIGHT)

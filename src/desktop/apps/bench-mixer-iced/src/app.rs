@@ -59,10 +59,9 @@ impl Bench {
         let feed = MixerFeed::new(config.seed, config.strips, config.mode);
         let slots = feed.slot_count();
         let size = Size::new(config.width as f32, config.height as f32);
-        let notes = song.as_ref().map_or_else(
-            || RollNotes::new(Vec::new()),
-            |song| roll::notes(song),
-        );
+        let notes = song
+            .as_ref()
+            .map_or_else(|| RollNotes::new(Vec::new()), roll::notes);
         let roll = song.as_ref().map_or_else(RollView::default, |song| {
             roll::roll_view(RollViewport::initial(song), song, size.width, size.height)
         });

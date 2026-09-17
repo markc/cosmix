@@ -226,7 +226,7 @@ fn main() -> iced::Result {
         app::Bench::update,
         app::Bench::view,
     )
-    .title(title)
+    .title(move |_: &app::Bench| title.clone())
     .subscription(app::Bench::subscription)
     .theme(move |_: &app::Bench| theme::iced_theme(tokens))
     .window(iced::window::Settings {
