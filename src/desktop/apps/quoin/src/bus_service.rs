@@ -525,11 +525,8 @@ fn dispatch_shell_request(
     // The mutation gate. CROSS-COMPONENT TRUST DEPENDENCY: this authorization
     // is only as strong as noded's guarantee to strip client-supplied
     // `broker_origin`/identity headers and restamp them from connection
-    // state. If noded ever forwards a client's own header spelling, every
-    // mesh peer gains unauthenticated mutation of the desktop shell, and no
-    // test in this repository can catch it — the invariant lives in noded and
-    // must be enforced (and tested) there. Failure the other way (noded stops
-    // stamping) fails closed here.
+    // state. Mesh membership admits every verb; local callers must have a
+    // registered service identity. The broker owns the provenance stamp.
     if let Err(error) = authorize_local_caller(request) {
         return (
             10,

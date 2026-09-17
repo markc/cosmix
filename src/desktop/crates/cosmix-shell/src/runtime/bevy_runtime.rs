@@ -139,9 +139,11 @@ fn update_model(
     mut runtime: ResMut<ShellRuntime>,
     mut frame: ResMut<ShellFrameState>,
     mut effects: ResMut<ShellEffects>,
-    mut exit: MessageWriter<AppExit>,
+    mut replies: (
+        MessageWriter<AppExit>,
+        MessageWriter<super::ShellResizeResult>,
+    ),
     quit_handler: Option<Res<ShellQuitHandler>>,
-    mut resize_results: MessageWriter<super::ShellResizeResult>,
 ) {
     let now = time.elapsed();
     effects.0.clear();
@@ -154,7 +156,7 @@ fn update_model(
                 request_id,
             } = command.kind
             {
-                resize_results.write(super::ShellResizeResult {
+                replies.1.write(super::ShellResizeResult {
                     request_id,
                     edge,
                     requested: thickness_px,
@@ -192,7 +194,7 @@ fn update_model(
                     .panel_input(*edge, at, PanelInput::ResizeStarted);
                 let result = runtime.model.resize_thickness(*edge, *thickness_px);
                 if let ShellCommandKind::ResizeChecked { request_id, .. } = command.kind {
-                    resize_results.write(super::ShellResizeResult {
+                    replies.1.write(super::ShellResizeResult {
                         request_id,
                         edge: *edge,
                         requested: *thickness_px,
@@ -223,7 +225,7 @@ fn update_model(
                 if let Some(handler) = &quit_handler {
                     (handler.0)();
                 } else {
-                    exit.write(AppExit::Success);
+                    replies.0.write(AppExit::Success);
                 }
             }
             ShellCommandKind::Geometry(size) => runtime.model.set_geometry(*size),

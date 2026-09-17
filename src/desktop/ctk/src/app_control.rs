@@ -35,11 +35,10 @@
 //! `{"error": "..."}` (the worker answers RC 11 busy before requests reach
 //! this module). Read-only discovery (`app.describe`, `app.controls.list`/
 //! `.get`, `actions.list`/`.describe`) retains its established open contract.
-//! **Every other app-port verb** — named app verbs included — applies the same
-//! fail-closed local caller gate as `action.invoke` and `app.controls.set`:
-//! the recipient noded must stamp `broker_origin: local`, and the caller must
-//! also have a canonical registered service identity. Named verbs can mutate
-//! app state (quit, transport, loads), so they are never anonymous.
+//! **Every app-port verb** admits broker-stamped `broker_origin: mesh`
+//! deliveries without principal attestation. For local deliveries, the caller
+//! must have a canonical registered service identity. Operation validation is
+//! independent of admission and applies to both paths.
 //!
 //! [`WidgetControlPlugin`] supplies the three `app.controls.*` verbs. The
 //! compatibility [`AppControlPlugin`] composes the base port + widget-control
@@ -79,7 +78,7 @@ use crate::widgets::{
 /// eventual spec; consumers should expect `v0` to move.
 pub const APP_CONTROL_CONTRACT: &str = "ctk-app-control.v0";
 
-/// Why an Bus caller failed the current same-node provenance gate.
+/// Why a Bus caller lacked mesh provenance or a registered local identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalCallerError {
     UnregisteredCaller,
@@ -88,6 +87,7 @@ pub enum LocalCallerError {
 
 /// Accept broker-stamped mesh deliveries and registered local callers.
 /// Mesh membership is sufficient for every verb; no principal attestation is required.
+/// The historical function name remains for compatibility with app callers.
 ///
 /// `broker_origin` is broker-owned: noded strips every client spelling and
 /// overwrites it from connection state on delivery. Absence fails closed, so
