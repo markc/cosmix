@@ -652,14 +652,15 @@ fn frame_is_ordered_before_asset_events() {
         app.finish();
         app.cleanup();
         let world = app.world_mut();
-        world.resource_scope(|world, mut schedules: Mut<Schedules>| {
-            schedules
-                .get_mut(PostUpdate)
-                .unwrap()
-                .initialize(world)
-                .map(|_| ())
-                .map_err(|error| format!("{error:?}"))
-        })
+        // Initialising may insert resources, so the schedule leaves `Schedules`.
+        let mut schedule = world
+            .resource_mut::<Schedules>()
+            .remove(PostUpdate)
+            .unwrap();
+        schedule
+            .initialize(world)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
     };
     assert_eq!(build(false), Ok(()));
     let error = build(true).unwrap_err();
