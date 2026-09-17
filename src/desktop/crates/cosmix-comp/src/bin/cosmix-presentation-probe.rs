@@ -1,9 +1,11 @@
 //! Minimal SHM client for the public `wp_presentation` contract.
 //!
-//! Maps one xdg toplevel, commits `--frames` buffers paced by frame
-//! callbacks, asks for presentation feedback on every commit, and checks
-//! what comes back. Prints one `COSMIX_PRESENTATION_PROBE` summary line and
-//! exits non-zero when an assertion fails.
+//! Maps one xdg toplevel and, for each of `--frames` frame callbacks,
+//! commits `--burst` buffers back to back. Every commit of a single-commit
+//! frame asks for presentation feedback; in burst mode the first and the
+//! last commit of each burst ask, so superseded commits are exercised too.
+//! Prints one `COSMIX_PRESENTATION_PROBE` summary line and exits non-zero
+//! when an assertion fails.
 
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::{
     wp_presentation, wp_presentation_feedback,
@@ -23,9 +25,10 @@ use std::{
     time::{Duration, Instant},
 };
 use wayland_client::{
-    Connection, Dispatch, EventQueue, QueueHandle,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
+        wl_surface,
     },
 };
 
@@ -36,8 +39,17 @@ enum Outcome {
         refresh_ns: u32,
         seq: u64,
         flags: u32,
+        /// A `sync_output` naming one of the probe's bound outputs arrived
+        /// before `presented`.
+        synced: bool,
     },
     Discarded,
+}
+
+#[derive(Default)]
+struct FeedbackSlot {
+    synced: bool,
+    outcome: Option<Outcome>,
 }
 
 #[derive(Default)]
@@ -46,11 +58,14 @@ struct Probe {
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     presentation: Option<wp_presentation::WpPresentation>,
+    outputs: Vec<wl_output::WlOutput>,
     clock_id: Option<u32>,
     configured: Option<u32>,
     frame_done: bool,
-    outcomes: Vec<Option<Outcome>>,
+    /// Indexed by commit number; only commits that asked have a slot used.
+    feedback: Vec<FeedbackSlot>,
     closed: bool,
+    failure: Option<String>,
 }
 
 fn monotonic_now() -> Duration {
@@ -74,7 +89,7 @@ fn dispatch_until(
         queue
             .dispatch_pending(probe)
             .map_err(|error| format!("{phase} dispatch failed: {error}"))?;
-        if complete(probe) || probe.closed {
+        if complete(probe) || probe.closed || probe.failure.is_some() {
             break;
         }
         let now = Instant::now();
@@ -120,8 +135,11 @@ fn dispatch_until(
             }
         }
     }
+    if let Some(failure) = &probe.failure {
+        return Err(format!("{failure} (during {phase})"));
+    }
     if probe.closed {
-        return Err(format!("toplevel closed during {phase}"));
+        return Err(format!("toplevel closed by the compositor during {phase}"));
     }
     complete(probe)
         .then_some(())
@@ -130,6 +148,7 @@ fn dispatch_until(
 
 struct Options {
     frames: usize,
+    burst: usize,
     width: u32,
     height: u32,
     timeout: Duration,
@@ -138,6 +157,7 @@ struct Options {
 fn options() -> Result<Options, String> {
     let mut options = Options {
         frames: 300,
+        burst: 1,
         width: 256,
         height: 256,
         timeout: Duration::from_secs(60),
@@ -154,6 +174,11 @@ fn options() -> Result<Options, String> {
                 options.frames = value()?
                     .parse()
                     .map_err(|error| format!("--frames: {error}"))?;
+            }
+            "--burst" => {
+                options.burst = value()?
+                    .parse()
+                    .map_err(|error| format!("--burst: {error}"))?;
             }
             "--size" => {
                 let size = value()?;
@@ -173,10 +198,20 @@ fn options() -> Result<Options, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if options.frames == 0 || options.width == 0 || options.height == 0 {
-        return Err("frames and size must be non-zero".into());
+    if options.frames == 0 || options.burst == 0 || options.width == 0 || options.height == 0 {
+        return Err("frames, burst and size must be non-zero".into());
     }
     Ok(options)
+}
+
+/// Which commits ask for feedback: all of them without bursts; otherwise
+/// the first (superseded) and last (shown) commit of each burst.
+fn asks_feedback(commit: usize, burst: usize) -> bool {
+    burst == 1 || commit % burst == 0 || commit % burst == burst - 1
+}
+
+fn is_last_of_burst(commit: usize, burst: usize) -> bool {
+    commit % burst == burst - 1
 }
 
 fn run() -> Result<bool, String> {
@@ -233,41 +268,57 @@ fn run() -> Result<bool, String> {
     }
     // SAFETY: memfd_create returned a new owned descriptor.
     let backing = unsafe { File::from_raw_fd(raw) };
+    let slots = options.burst + 1;
     backing
-        .set_len((buffer_bytes * 2) as u64)
+        .set_len((buffer_bytes * slots) as u64)
         .map_err(|error| error.to_string())?;
-    let pool = shm.create_pool(backing.as_fd(), (buffer_bytes * 2) as i32, &qh, ());
-    let buffers = [0, 1].map(|index| {
-        pool.create_buffer(
-            (index * buffer_bytes) as i32,
-            width as i32,
-            height as i32,
-            stride as i32,
-            wl_shm::Format::Xrgb8888,
-            &qh,
-            (),
-        )
-    });
+    let pool = shm.create_pool(backing.as_fd(), (buffer_bytes * slots) as i32, &qh, ());
+    let buffers = (0..slots)
+        .map(|index| {
+            pool.create_buffer(
+                (index * buffer_bytes) as i32,
+                width as i32,
+                height as i32,
+                stride as i32,
+                wl_shm::Format::Xrgb8888,
+                &qh,
+                (),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    probe.outcomes = vec![None; options.frames];
+    let commits = options.frames * options.burst;
+    probe.feedback = (0..commits).map(|_| FeedbackSlot::default()).collect();
+    let mut commit_times = vec![Duration::ZERO; commits];
     let deadline = Instant::now() + options.timeout;
     let started = monotonic_now();
     let mut pixels = vec![0_u8; buffer_bytes];
-    for frame in 0..options.frames {
-        let slot = frame % 2;
-        let shade = (frame % 256) as u8;
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[shade, 255 - shade, 0x40, 0xff]);
+    let mut commit = 0;
+    for _ in 0..options.frames {
+        for step in 0..options.burst {
+            // Consecutive commits never share a buffer (there is one more
+            // buffer than commits per burst).
+            let slot = commit % slots;
+            let shade = (commit % 256) as u8;
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[shade, 255 - shade, 0x40, 0xff]);
+            }
+            backing
+                .write_all_at(&pixels, (slot * buffer_bytes) as u64)
+                .map_err(|error| error.to_string())?;
+            surface.attach(Some(&buffers[slot]), 0, 0);
+            surface.damage_buffer(0, 0, width as i32, height as i32);
+            if step + 1 == options.burst {
+                surface.frame(&qh, ());
+            }
+            if asks_feedback(commit, options.burst) {
+                presentation.feedback(&surface, &qh, commit);
+            }
+            commit_times[commit] = monotonic_now();
+            surface.commit();
+            commit += 1;
         }
-        backing
-            .write_all_at(&pixels, (slot * buffer_bytes) as u64)
-            .map_err(|error| error.to_string())?;
-        surface.attach(Some(&buffers[slot]), 0, 0);
-        surface.damage_buffer(0, 0, width as i32, height as i32);
-        surface.frame(&qh, ());
-        presentation.feedback(&surface, &qh, frame);
         probe.frame_done = false;
-        surface.commit();
         dispatch_until(
             &mut queue,
             &mut probe,
@@ -277,29 +328,59 @@ fn run() -> Result<bool, String> {
         )?;
     }
     let committed = monotonic_now();
+    let burst = options.burst;
     dispatch_until(
         &mut queue,
         &mut probe,
         deadline,
-        |probe| probe.outcomes.iter().all(Option::is_some),
+        |probe| {
+            probe
+                .feedback
+                .iter()
+                .enumerate()
+                .all(|(commit, slot)| !asks_feedback(commit, burst) || slot.outcome.is_some())
+        },
         "feedback resolution",
     )?;
     let finished = monotonic_now();
 
-    let outcomes = probe.outcomes.iter().flatten().copied().collect::<Vec<_>>();
-    let presented = outcomes
-        .iter()
-        .filter_map(|outcome| match outcome {
-            Outcome::Presented {
+    // Shown commits: the last of each burst. Superseded: the first of each
+    // burst when bursting.
+    let mut presented = Vec::new();
+    let mut shown_discarded = 0;
+    let mut superseded_discarded = 0;
+    let mut superseded_presented = 0;
+    let mut tv_before_commit = 0;
+    let mut unsynced = 0;
+    for (commit, slot) in probe.feedback.iter().enumerate() {
+        if !asks_feedback(commit, burst) {
+            continue;
+        }
+        let last = is_last_of_burst(commit, burst);
+        match slot.outcome {
+            Some(Outcome::Presented {
                 time,
                 refresh_ns,
                 seq,
                 flags,
-            } => Some((*time, *refresh_ns, *seq, *flags)),
-            Outcome::Discarded => None,
-        })
-        .collect::<Vec<_>>();
-    let discarded = outcomes.len() - presented.len();
+                synced,
+            }) => {
+                if !last {
+                    superseded_presented += 1;
+                }
+                if time < commit_times[commit] {
+                    tv_before_commit += 1;
+                }
+                if !synced {
+                    unsynced += 1;
+                }
+                presented.push((time, refresh_ns, seq, flags));
+            }
+            Some(Outcome::Discarded) if last => shown_discarded += 1,
+            Some(Outcome::Discarded) => superseded_discarded += 1,
+            None => {}
+        }
+    }
     let increasing = presented.windows(2).all(|pair| pair[1].0 > pair[0].0);
     let in_window = presented
         .iter()
@@ -320,10 +401,16 @@ fn run() -> Result<bool, String> {
             sorted[(sorted.len() - 1) * p / 100]
         }
     };
-    let min_presented = options.frames * 9 / 10;
+    // At least 90% of the shown commits, and never zero.
+    let min_presented = options.frames.saturating_mul(9).div_ceil(10).max(1);
     let clock_ok = probe.clock_id == Some(libc::CLOCK_MONOTONIC as u32);
-    let pass = outcomes.len() == options.frames
-        && presented.len() >= min_presented
+    let superseded_expected = if burst > 1 { options.frames } else { 0 };
+    let pass = presented.len() >= min_presented
+        && superseded_presented == 0
+        && superseded_discarded == superseded_expected
+        && tv_before_commit == 0
+        && unsynced == 0
+        && !probe.outputs.is_empty()
         && increasing
         && in_window
         && flags_zero
@@ -331,18 +418,27 @@ fn run() -> Result<bool, String> {
         && refresh_zero
         && clock_ok;
     println!(
-        "COSMIX_PRESENTATION_PROBE {} frames={} presented={} discarded={} min_presented={} \
-         clock_id={} tv_first_us={} tv_last_us={} window_start_us={} commits_done_us={} \
+        "COSMIX_PRESENTATION_PROBE {} frames={} burst={} commits={} presented={} \
+         shown_discarded={} superseded_discarded={} superseded_presented={} \
+         min_presented={} clock_id={} outputs={} unsynced={} tv_before_commit={} \
+         tv_first_us={} tv_last_us={} window_start_us={} commits_done_us={} \
          window_end_us={} increasing={} in_window={} flags_zero={} seq_zero={} \
          refresh_zero={} interval_p50_us={} interval_p99_us={} interval_max_us={}",
         if pass { "PASS" } else { "FAIL" },
         options.frames,
+        burst,
+        commits,
         presented.len(),
-        discarded,
+        shown_discarded,
+        superseded_discarded,
+        superseded_presented,
         min_presented,
         probe
             .clock_id
             .map_or_else(|| "none".to_string(), |clock| clock.to_string()),
+        probe.outputs.len(),
+        unsynced,
+        tv_before_commit,
         presented.first().map_or(0, |entry| entry.0.as_micros()),
         presented.last().map_or(0, |entry| entry.0.as_micros()),
         started.as_micros(),
@@ -394,6 +490,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
                 state.compositor = Some(registry.bind(name, version.min(6), qh, ()));
             }
             "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
+            "wl_output" => state
+                .outputs
+                .push(registry.bind(name, version.min(4), qh, ())),
             "xdg_wm_base" => state.wm_base = Some(registry.bind(name, 1, qh, ())),
             "wp_presentation" => {
                 state.presentation = Some(registry.bind(name, version.min(2), qh, ()));
@@ -423,11 +522,20 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, usize> for Probe
         state: &mut Self,
         _: &wp_presentation_feedback::WpPresentationFeedback,
         event: wp_presentation_feedback::Event,
-        frame: &usize,
+        commit: &usize,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let Some(slot) = state.feedback.get_mut(*commit) else {
+            return;
+        };
         let outcome = match event {
+            wp_presentation_feedback::Event::SyncOutput { output } => {
+                if state.outputs.iter().any(|bound| bound.id() == output.id()) {
+                    slot.synced = true;
+                }
+                return;
+            }
             wp_presentation_feedback::Event::Presented {
                 tv_sec_hi,
                 tv_sec_lo,
@@ -444,17 +552,15 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, usize> for Probe
                     wayland_client::WEnum::Value(flags) => flags.bits(),
                     wayland_client::WEnum::Unknown(bits) => bits,
                 },
+                synced: slot.synced,
             },
             wp_presentation_feedback::Event::Discarded => Outcome::Discarded,
             _ => return,
         };
-        if let Some(slot) = state.outcomes.get_mut(*frame) {
-            if slot.is_some() {
-                eprintln!("COSMIX_PRESENTATION_PROBE feedback {frame} resolved twice");
-                state.closed = true;
-            }
-            *slot = Some(outcome);
+        if slot.outcome.is_some() {
+            state.failure = Some(format!("feedback for commit {commit} resolved twice"));
         }
+        slot.outcome = Some(outcome);
     }
 }
 
@@ -483,7 +589,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for Probe {
         _: &QueueHandle<Self>,
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
-            if state.configured.is_none() && !state.outcomes.is_empty() {
+            if state.configured.is_none() && !state.feedback.is_empty() {
                 // Later configures (focus, size hints) are acked immediately;
                 // the probe keeps its own buffer size.
                 xdg.ack_configure(serial);
@@ -548,4 +654,5 @@ ignore_events!(
     wl_shm_pool::WlShmPool,
     wl_buffer::WlBuffer,
     wl_surface::WlSurface,
+    wl_output::WlOutput,
 );
