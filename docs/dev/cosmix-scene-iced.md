@@ -96,3 +96,47 @@ capture.
 
 `SceneIcedWake` is the earliest renderer wake time; Quoin copies it into
 `LayerHostDeadline` so a caret can blink on an otherwise idle host.
+
+## The iced renderer (feature `iced`)
+
+`iced_scene::IcedRendererPlugin` replaces the stand-in factory with
+`IcedSceneRenderer`: one `cosmix_iced_host::Surface` per mounted scene,
+drawing RGBA8 with tiny-skia. Quoin's `scene-iced` feature selects it;
+`scene-iced-standin` builds the bridge with the stand-in only.
+
+Scene families map as the CTK adapter maps them:
+
+| family | iced | notes |
+|---|---|---|
+| `column` | keyed column (children keyed by node id), stretch across | `gap`, `padding`, `fill` |
+| `row` | row in a styled container, `mouse_area` for `hover`/`on_click` | `height`, `radius`, `background`, `align` |
+| `text` | text, no wrapping, `bold` weight, `mono` family | `elide` clips; iced 0.14 has no middle elision |
+| `field` | `cosmix-iced-widgets` `TextField` (design tokens), Enter wrapper for `on_submit` | `password` uses secure mode |
+| `button` | button; `tone` primary / danger / secondary styles | |
+| `toggle` | toggler | |
+| `list` | scrollable keyed column of template instances, row click with `item` | `{cells[n]}` substitution, `max_rows`, `hidden_if_empty` |
+| `spacer`, `window` | space | as CTK's sizes |
+| `image` | space of `w` x `h` | not drawn: iced's image feature is off |
+
+Handler ports produce `{scene, node, kind, value?, item?}` calls. The
+renderer queues them; `IcedRendererPlugin` sends them with
+`cosmix_scene_bevy::SceneEvents::send_handler`, the same request ids and
+reply bookkeeping as CTK-mounted scenes.
+
+Editing state lives in the iced widget tree and survives reloads and
+patches that keep the node: focus, selection, undo history and an open
+preedit. A changed `value` port replaces a field's text only while it is not
+focused, as CTK does.
+
+The look follows CTK: `CtkDesign`'s resolved dictionary gives the
+`cosmix-iced-widgets` tokens, `CtkTypography` the family (effective, else
+requested) and body size. A new renderer takes the look current at mount;
+the text field keeps the renderer's default font from then on.
+
+There are no font files in `cosmix-design`: both stacks resolve the
+configured family from the system font set (fontique for Bevy, fontdb for
+iced). The font test registers one file in both and compares family names.
+
+`process` returns `wake_at = now` when it asks for a draw, because the next
+deadline (caret blink) is known only after drawing; the following update
+returns the real deadline or none.
