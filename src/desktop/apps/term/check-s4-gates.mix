@@ -35,7 +35,7 @@ $fixtures = [
 $expected = length($fixtures)
 
 $root = cwd()
-if not exists($root + "/desktop/apps/term/src/control.rs") then
+if not exists($root + "/desktop/crates/cosmix-term-core/src/control.rs") then
   print("GATE BLOCKED: run from the repository src/ directory")
   exit(2)
 end
@@ -59,7 +59,7 @@ if not exists($binary) then
 end
 
 $argv = concat(
-  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term", "--bin", "term", "--", "--ignored", "--test-threads=1", "--exact"],
+  ["cargo", "test", "--manifest-path", "desktop/Cargo.toml", "-p", "cosmix-term-core", "--lib", "--", "--ignored", "--test-threads=1", "--exact"],
   $fixtures
 )
 

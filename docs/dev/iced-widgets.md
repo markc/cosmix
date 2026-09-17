@@ -86,19 +86,24 @@ Tokens { surface, text, popover, popover_text, card, card_text, primary,
 
 // Pro-audio controls. All are controlled: store each published value and
 // pass it back. Generic over Theme; Fader and Knob need Message: Clone.
-scale::{db_to_position, position_to_db, format_db, FLOOR_DB, MAX_DB}
-    // shared gain scale: -inf..=+6 dB <-> 0..=1, 0 dB at 0.8, -60 dB floor
+scale::Taper::DEFAULT                       // -inf..=+6 dB <-> 0..=1, 0 dB at 0.8
+scale::Taper::new(&[(position, db), …])     // a host curve; unusable points
+    .position(db) .db(position) .floor_db() .max_db() .points()   // fall back
+scale::{db_to_position, position_to_db, format_db, FLOOR_DB, MAX_DB, DEFAULT_POINTS}
 Fader::new(value_db: f32)                   // vertical, 28 x 160 by default
     .on_change(impl Fn(f32) -> Message)     // dB; NEG_INFINITY at the bottom
     .on_release(Message)                    // once per gesture
     .default_db(f32)                        // double-click value, default 0
     .width(f32) .height(impl Into<Length>) .style(AudioStyle)
+    .taper(Taper)                           // curve for travel + unity tick
 Knob::new(value: f32)                       // pan, -1..=1, 28 px
     .on_change(impl Fn(f32) -> Message) .on_release(Message)
     .size(f32) .style(AudioStyle)
 LevelMeter::new(level_db: f32)              // 8 x 160, same scale as Fader
-    .width(f32) .height(impl Into<Length>) .style(AudioStyle)
-    // meter::{PEAK_HOLD, PEAK_FALL_DB_PER_SEC, PEAK_FRAME}
+    .peak(Option<f32>) .hold(Option<f32>)   // the host's own peak and hold
+    .clipped(bool)                          // the host's clip latch
+    .width(f32) .height(impl Into<Length>) .style(AudioStyle) .taper(Taper)
+    // meter::{PEAK_HOLD, PEAK_FALL_DB_PER_SEC, PEAK_FRAME, HIGH_DB, CLIP_DB}
 Toggle::new(label, on: bool)                // mute/solo, 24 x 20
     .on_toggle(impl Fn(bool) -> Message)
     .alert(bool)                            // alert (mute) vs active (solo) colour
@@ -112,7 +117,7 @@ Waveform::new(&WaveformPeaks)               // fill x 64
     .playhead(Option<f32>)                  // 0..=1
     .on_seek(impl Fn(f32) -> Message)       // 0..=1 under a left press
     .width(..) .height(..) .style(AudioStyle)
-Note { start: f32, length: f32, pitch: u8, velocity: u8 }   // beats
+Note { start: f32, length: f32, pitch: u8, velocity: u8, track: u16 }  // beats
 RollNotes::new(Vec<Note>)                   // sorts; drops invalid notes
     .notes() .len() .is_empty() .end_beat()
     .visible(from, to) -> impl Iterator<Item = (usize, &Note)>
@@ -124,6 +129,8 @@ PianoRoll::new(&RollNotes, RollView)        // fill x fill
     .playhead(Option<f32>)                  // beats
     .on_view(impl Fn(RollView) -> Message)  // wheel, Shift+wheel, Ctrl+wheel zoom
     .on_note(impl Fn(usize) -> Message)     // index into RollNotes::notes()
+    .track_colours(&[Color])                // Note::track picks one, wrapping;
+                                            // empty = AudioStyle::note
     .width(..) .height(..) .style(AudioStyle)
     // piano_roll::{TILE_WIDTH, MAX_TILES, MIN_PIXELS_PER_BEAT, MAX_PIXELS_PER_BEAT}
 AudioStyle { background, track, fill, thumb, text, muted_text, border,
@@ -178,7 +185,16 @@ Contracts a host must honour:
   which is the redraw after your update. Map a panel's `on_hover(row)` to
   `navigator.hover(&mut state, spec.level, row)`, its `on_press(row)` to
   `navigator.click(&mut state, spec.level, Some(row))`, and keys on a popup
-  surface to `navigator.key`. Publish the
+  surface to `navigator.key`. Known limits:
+  - `panel_size` of an empty item list has height 0, so never size a
+    popup from it directly; use `open_panels`.
+  - `Panel` forgets which hover it last reported whenever its item slice
+    moves, which happens on every view that rebuilds the items. The only
+    cost is one extra hover message on the next pointer motion.
+  - A context menu rebuilt from host state reopens at `anchors[0]`, which
+    is off by the scroll offset inside a scrollable.
+  - A finger moving over bar titles does not switch menus in external
+    mode. Publish the
   message of `NavOutcome::Activated`. Map a compositor dismissal
   (`popup_done`) to `navigator.close`. Pass the new state back to the bar,
   which republishes it with fresh anchors. The bar itself still handles
@@ -192,6 +208,16 @@ Contracts a host must honour:
   mid-drag never jumps. A double-click resets (fader: `default_db`, knob: 0).
   Toggles flip on press. Each change is published at once; hosts that record
   automation or undo should group on `on_release`.
+- **Gain taper.** `Fader` and `LevelMeter` share one curve. Give both the
+  same `Taper` and their scales line up: the fader's travel and unity tick,
+  the meter's zone boundaries (-12 dB and -3 dB), its markers, and the floor
+  below which nothing is drawn, all follow it. Points that do not increase in
+  both coordinates fall back to the default curve rather than drawing a
+  nonsense scale.
+- **Meter state.** The widget always keeps its own falling peak line. A host
+  with its own meter feed adds `peak`, `hold` and `clipped`: peak and hold
+  draw as lines (peak colour, text colour), and the clip latch as a block at
+  the top in the clip colour, until the host clears it.
 - **Idle is zero redraws.** No widget subscribes to time. Only `LevelMeter`
   schedules redraws, and only while its peak line is above the level: it
   waits for `PEAK_HOLD`, then redraws every `PEAK_FRAME` until the line

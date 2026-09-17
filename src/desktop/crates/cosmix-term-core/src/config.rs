@@ -38,7 +38,7 @@ impl Default for Config {
     }
 }
 
-#[derive(bevy::prelude::Resource, Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct Settings {
     #[serde(flatten)]
     pub config: Config,
@@ -163,7 +163,10 @@ mod tests {
     fn optional_keys_and_example() {
         assert_eq!(parse("{}").unwrap(), Config::default());
         assert_eq!(
-            parse(include_str!("../term.example.conf.mix")).unwrap(),
+            // The example ships with the term app; the parser it must satisfy lives here.
+            // Reaching into a sibling package only works because this crate is
+            // publish = false: a packaged crate would not contain that file.
+            parse(include_str!("../../../apps/term/term.example.conf.mix")).unwrap(),
             Config::default()
         );
         assert_eq!(parse("font_px: 18.5").unwrap().font_px, 18.5);

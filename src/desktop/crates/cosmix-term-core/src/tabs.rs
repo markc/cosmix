@@ -624,6 +624,8 @@ impl TabSet {
         self.invalidate_control_focus();
         self.notify();
     }
+    /// Install the change callback on every pane, current and future. Call it
+    /// once: `Terminal::set_wake` keeps the first waker it is given.
     pub fn set_wake(&mut self, wake: Wake) {
         for tab in &self.tabs {
             for (pane, _) in tab.tree.leaves(Geometry::default()) {
