@@ -108,7 +108,7 @@ pub struct Frame {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawError {
     ZeroSize,
-    /// Only tight buffers (`stride == width * 4`) are supported.
+    /// `stride` must be a whole number of pixels and at least `width * 4`.
     UnsupportedStride {
         stride: u32,
         width: u32,
@@ -124,7 +124,10 @@ impl std::fmt::Display for DrawError {
         match self {
             Self::ZeroSize => write!(f, "zero-sized buffer"),
             Self::UnsupportedStride { stride, width } => {
-                write!(f, "stride {stride} is not 4 x width {width}")
+                write!(
+                    f,
+                    "stride {stride} is not whole pixels of at least 4 x width {width}"
+                )
             }
             Self::BufferTooSmall { needed, got } => {
                 write!(f, "buffer holds {got} bytes, {needed} needed")
@@ -434,10 +437,13 @@ impl<P: Program> Surface<P> {
         if width == 0 || height == 0 {
             return Err(DrawError::ZeroSize);
         }
-        if u64::from(stride) != u64::from(width) * 4 {
+        if stride % 4 != 0 || u64::from(stride) < u64::from(width) * 4 {
             return Err(DrawError::UnsupportedStride { stride, width });
         }
-        let needed = width as usize * height as usize * 4;
+        // Rows may be padded (a texture wider than the surface); the padding
+        // is never touched. Every row, the last included, is `stride` long.
+        let row_pixels = stride / 4;
+        let needed = stride as usize * height as usize;
         if buffer.len() < needed {
             return Err(DrawError::BufferTooSmall {
                 needed,
@@ -560,13 +566,16 @@ impl<P: Program> Surface<P> {
             let pixels = &mut buffer[..needed];
             if format == PixelFormat::Rgba8 {
                 for rect in &damage {
-                    swap_red_blue(pixels, width, *rect);
+                    swap_red_blue(pixels, row_pixels, *rect);
                 }
+            }
+            if self.clip_mask.width() != row_pixels || self.clip_mask.height() != height {
+                self.clip_mask = tiny_skia::Mask::new(row_pixels, height).expect("clip mask");
             }
             let logical: Vec<Rectangle> =
                 damage.iter().map(|rect| rect.to_logical(scale)).collect();
             {
-                let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixels, width, height)
+                let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixels, row_pixels, height)
                     .expect("pixmap over checked buffer");
                 self.renderer.draw(
                     &mut pixmap,
@@ -578,7 +587,7 @@ impl<P: Program> Surface<P> {
             }
             if format == PixelFormat::Rgba8 {
                 for rect in &damage {
-                    swap_red_blue(pixels, width, *rect);
+                    swap_red_blue(pixels, row_pixels, *rect);
                 }
             }
         }

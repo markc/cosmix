@@ -47,8 +47,9 @@ instance costs its widget state, layer list and tiny-skia glyph cache.
 
 ## Buffers and damage
 
-- One persistent buffer per surface, tight rows (`stride == width * 4`).
-  A new width or height repaints everything. After a lost or swapped
+- One persistent buffer per surface. Rows may be padded (`stride >= width * 4`,
+  whole pixels, every row `stride` long, as in a texture wider than the
+  surface); padding is never written. A new width or height repaints everything. After a lost or swapped
   buffer, call `invalidate()`.
 - `PixelFormat::Argb8888` is wl_shm's little-endian B, G, R, A, which
   tiny-skia draws directly. `PixelFormat::Rgba8` swaps red and blue on the
