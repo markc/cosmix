@@ -19,11 +19,18 @@ libwayland is not linked). This crate never calls softbuffer.
 
 1. `Surface::new(program, Settings)` with the physical size and scale.
 2. Input: `cursor_moved` / `cursor_left` (logical points), `queue_event`
-   for anything else. `input::*` converts evdev buttons, wheel axes and
-   focus; `keys::*` (feature `xkb`) converts xkb keysyms.
-3. `process()` when events are queued. It returns `needs_redraw`, the
-   cursor shape and per-event capture status. With nothing queued it
-   returns at once and asks for nothing.
+   for anything else. Hosts must deliver `Event::InputMethod`
+   (Opened/Preedit/Commit/Closed), `keyboard::Event::ModifiersChanged` and
+   window `Focused`/`Unfocused` (`input::focus_event`); text fields read all
+   three. `input::*` converts evdev buttons and wheel axes; `keys::*`
+   (feature `xkb`) converts xkb keysyms.
+3. `process()` when events are queued. Every event queued since the last
+   call goes through one `UserInterface::update`, on a tree rebuilt from
+   `view()` with the retained cache. It returns `needs_redraw`, the cursor
+   shape, per-event capture status and `redraw`: `NextFrame` when a draw
+   is due, otherwise the pending deadline (a focused field's 500 ms caret
+   blink, `At`) or `Wait`. With nothing queued it does no work and repeats
+   the last known deadline.
 4. `draw(buffer, width, height, stride, format)` on the next frame. The
    result lists the physical rectangles rewritten, whether the draw was a
    full repaint, and the `Requests` to act on: cursor shape, IME state and
@@ -31,7 +38,12 @@ libwayland is not linked). This crate never calls softbuffer.
    An empty damage list means the buffer did not change.
 
 The crate starts no threads and no timers. A caret blink arrives as
-`Redraw::At`; the host arms its own timer and calls `draw` then.
+`Redraw::At`; the host arms one one-shot timer and calls `draw` then.
+
+Overlays (menus, pick lists) take part in both `process` and `draw` and are
+drawn inside the surface. For `xdg_popup`, run one `Surface` per popup:
+instances are independent and share iced's global font system, so an extra
+instance costs its widget state, layer list and tiny-skia glyph cache.
 
 ## Buffers and damage
 

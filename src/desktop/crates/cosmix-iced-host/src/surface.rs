@@ -83,6 +83,8 @@ pub struct Update {
     pub messages: usize,
     pub interaction: Interaction,
     pub interaction_changed: bool,
+    /// `NextFrame` when `needs_redraw`; otherwise the pending deadline (a
+    /// focused field's caret blink) or `Wait`.
     pub redraw: Redraw,
     /// One status per processed event; `Ignored` events may be passed on
     /// (for example to a terminal grid under the chrome).
@@ -279,7 +281,9 @@ impl<P: Program> Surface<P> {
     }
 
     /// Runs queued events through the widget tree and delivers the produced
-    /// messages. Does nothing when no event is queued.
+    /// messages. All queued events go through one `UserInterface::update`.
+    /// With nothing queued it does no work and repeats the last known
+    /// deadline.
     pub fn process(&mut self) -> Update {
         if self.events.is_empty() {
             return Update {
@@ -287,7 +291,7 @@ impl<P: Program> Surface<P> {
                 messages: 0,
                 interaction: self.requests.interaction,
                 interaction_changed: false,
-                redraw: Redraw::Wait,
+                redraw: self.requests.redraw,
                 statuses: Vec::new(),
             };
         }
@@ -307,7 +311,8 @@ impl<P: Program> Surface<P> {
         // redraw pass with the cursor that was last drawn restores it, so
         // hover and press changes in `events` request a redraw as they do
         // under iced_winit's long-lived interface.
-        let _ = ui.update(
+        // Its redraw request carries the caret-blink deadline.
+        let (primed, _) = ui.update(
             &[Event::Window(window::Event::RedrawRequested(now))],
             self.drawn_cursor,
             &mut self.renderer,
@@ -323,7 +328,10 @@ impl<P: Program> Surface<P> {
         );
         self.cache = ui.into_cache();
 
-        let mut redraw = Redraw::Wait;
+        let mut request = match primed {
+            user_interface::State::Updated { redraw_request, .. } => redraw_request,
+            user_interface::State::Outdated => window::RedrawRequest::Wait,
+        };
         let mut interaction = self.requests.interaction;
         match state {
             user_interface::State::Outdated => self.dirty = true,
@@ -334,14 +342,17 @@ impl<P: Program> Surface<P> {
                 ..
             } => {
                 interaction = mouse_interaction;
-                redraw = redraw_request.into();
+                request = request.min(redraw_request);
                 if has_layout_changed
-                    || redraw == Redraw::NextFrame
-                    || matches!(redraw, Redraw::At(at) if at <= now)
+                    || redraw_request == window::RedrawRequest::NextFrame
+                    || matches!(redraw_request, window::RedrawRequest::At(at) if at <= now)
                 {
                     self.dirty = true;
                 }
             }
+        }
+        if matches!(request, window::RedrawRequest::At(at) if at <= now) {
+            self.dirty = true;
         }
         let count = messages.len();
         if count > 0 {
@@ -352,6 +363,15 @@ impl<P: Program> Surface<P> {
         }
         let interaction_changed = interaction != self.requests.interaction;
         self.requests.interaction = interaction;
+        // A pending draw computes the deadline afresh (the change may have
+        // blurred the field), so only an unchanged tree reports it here.
+        let redraw = if self.dirty {
+            Redraw::NextFrame
+        } else {
+            let redraw = Redraw::from(request);
+            self.requests.redraw = redraw;
+            redraw
+        };
 
         Update {
             needs_redraw: self.dirty,

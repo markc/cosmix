@@ -2,7 +2,7 @@ use cosmix_iced_host::core::keyboard::{self, Key, Modifiers, key::Physical};
 use cosmix_iced_host::core::mouse::{self, Button, Interaction};
 use cosmix_iced_host::core::widget::{Id, Operation};
 use cosmix_iced_host::core::{Color, Event, Font, Point, Rectangle, SmolStr, input_method};
-use cosmix_iced_host::widget::{button, column, container, text, text_input};
+use cosmix_iced_host::widget::{button, column, container, pick_list, row, text, text_input};
 use cosmix_iced_host::{
     DamageRect, Element, Frame, ImeRequest, MemoryClipboard, PixelFormat, Program, Redraw,
     Settings, Surface,
@@ -10,18 +10,21 @@ use cosmix_iced_host::{
 use std::sync::{Arc, Mutex};
 
 static FONT: &[u8] = include_bytes!("../../cosmix-comp/assets/fonts/DejaVuSans.ttf");
+const OPTIONS: &[&str] = &["alpha", "beta"];
 const BACKGROUND: Color = Color::from_rgb8(10, 20, 200);
 
 #[derive(Default)]
 struct App {
     clicks: u32,
     value: String,
+    choice: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
 enum Msg {
     Pressed,
     Input(String),
+    Chose(&'static str),
 }
 
 impl Program for App {
@@ -31,18 +34,23 @@ impl Program for App {
         match message {
             Msg::Pressed => self.clicks += 1,
             Msg::Input(value) => self.value = value,
+            Msg::Chose(choice) => self.choice = Some(choice),
         }
     }
 
     fn view(&self) -> Element<'_, Msg> {
         column![
-            container(
-                button(text("Press"))
-                    .on_press(Msg::Pressed)
-                    .width(100.0)
-                    .height(30.0)
-            )
-            .id("button"),
+            row![
+                container(
+                    button(text("Press"))
+                        .on_press(Msg::Pressed)
+                        .width(100.0)
+                        .height(30.0)
+                )
+                .id("button"),
+                container(pick_list(OPTIONS, self.choice, Msg::Chose).width(70.0)).id("pick"),
+            ]
+            .spacing(10.0),
             container(
                 text_input("type here", &self.value)
                     .on_input(Msg::Input)
@@ -429,4 +437,135 @@ fn ink(target: &Target) -> ([u32; 4], usize) {
         }
     }
     (bbox, count)
+}
+
+#[test]
+fn process_surfaces_the_caret_deadline_only_while_a_field_is_focused() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    let input = target.bounds("input");
+    let empty = Point::new(190.0, 110.0);
+    target.draw();
+
+    // Unfocused: pointer motion over empty space changes nothing.
+    target.surface.cursor_moved(empty);
+    let update = target.surface.process();
+    assert!(!update.needs_redraw);
+    assert_eq!(update.redraw, Redraw::Wait);
+    assert_eq!(target.surface.process().redraw, Redraw::Wait);
+
+    target.click(input.center());
+    target.draw();
+    // Motion inside the focused field leaves its status unchanged.
+    target
+        .surface
+        .cursor_moved(input.center() + cosmix_iced_host::core::Vector::new(5.0, 0.0));
+    let before = std::time::Instant::now();
+    let update = target.surface.process();
+    assert!(!update.needs_redraw, "{update:?}");
+    let Redraw::At(deadline) = update.redraw else {
+        panic!("no caret deadline from process: {update:?}");
+    };
+    assert!(deadline > before);
+    assert!(deadline <= before + std::time::Duration::from_millis(510));
+    // Idle: no work, same deadline.
+    let idle = target.surface.process();
+    assert!(!idle.needs_redraw);
+    assert_eq!(idle.redraw, Redraw::At(deadline));
+
+    // A modifier change in the focused field keeps the deadline.
+    target
+        .surface
+        .queue_event(Event::Keyboard(keyboard::Event::ModifiersChanged(
+            Modifiers::SHIFT,
+        )));
+    assert!(matches!(target.surface.process().redraw, Redraw::At(_)));
+
+    // Blur: the pending draw recomputes, and afterwards nothing is scheduled.
+    let update = target.click(empty);
+    assert!(update.needs_redraw);
+    assert_eq!(update.redraw, Redraw::NextFrame);
+    assert_eq!(target.draw().requests.redraw, Redraw::Wait);
+    target.surface.cursor_moved(Point::new(185.0, 110.0));
+    assert_eq!(target.surface.process().redraw, Redraw::Wait);
+}
+
+#[test]
+fn window_focus_events_gate_the_input_method() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    let input = target.bounds("input");
+    target.draw();
+    target.click(input.center());
+    assert!(target.draw().requests.ime.is_enabled());
+
+    target
+        .surface
+        .queue_event(cosmix_iced_host::input::focus_event(false));
+    target.surface.process();
+    let frame = target.draw();
+    assert_eq!(frame.requests.ime, ImeRequest::Disabled);
+    assert_eq!(frame.requests.redraw, Redraw::Wait);
+
+    target
+        .surface
+        .queue_event(cosmix_iced_host::input::focus_event(true));
+    assert!(target.surface.process().needs_redraw);
+    assert!(target.draw().requests.ime.is_enabled());
+}
+
+#[test]
+fn overlay_menus_draw_outside_their_widget_and_take_input() {
+    let mut target = Target::new(1.0, PixelFormat::Rgba8);
+    let pick = target.bounds("pick");
+    target.draw();
+    let probe = Point::new(pick.center_x(), pick.y + pick.height + 8.0);
+    let before = target.pixel(probe.x as u32, probe.y as u32);
+
+    let update = target.click(pick.center());
+    assert!(update.needs_redraw);
+    let frame = target.draw();
+    let bottom = ((pick.y + pick.height) * target.scale()) as u32;
+    assert!(
+        frame
+            .damage
+            .iter()
+            .any(|rect| rect.y + rect.height > bottom + 8),
+        "menu not drawn below the pick list: {:?}",
+        frame.damage
+    );
+    assert_ne!(
+        target.pixel(probe.x as u32, probe.y as u32),
+        before,
+        "menu pixels unchanged"
+    );
+
+    // The first option sits just under the pick list.
+    let update = target.click(probe);
+    assert_eq!(update.messages, 1, "{update:?}");
+    assert_eq!(target.surface.program().choice, Some("alpha"));
+    target.draw();
+    assert_eq!(
+        target.pixel(probe.x as u32, probe.y as u32),
+        before,
+        "menu not closed"
+    );
+}
+
+#[test]
+fn independent_surfaces_share_one_process() {
+    let mut targets: Vec<Target> = (0..4)
+        .map(|i| Target::new(1.0 + i as f32 * 0.5, PixelFormat::Argb8888))
+        .collect();
+    for target in &mut targets {
+        assert!(target.draw().full);
+    }
+    let input = targets[0].bounds("input");
+    targets[0].click(input.center());
+    type_char(&mut targets[0].surface, "z");
+    targets[0].surface.process();
+    assert_eq!(targets[0].surface.program().value, "z");
+    for target in &mut targets[1..] {
+        assert!(target.surface.program().value.is_empty());
+        assert!(!target.surface.process().needs_redraw);
+        assert!(target.draw().damage.is_empty());
+    }
 }
