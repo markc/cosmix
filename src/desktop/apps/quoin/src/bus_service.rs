@@ -130,9 +130,13 @@ fn reply_resizes(
                     10,
                     json!({"error_code":"PANEL_THICKNESS_BUDGET", "edge":format!("{edge:?}").to_lowercase(), "requested":requested, "max":max}),
                 ),
-                Err(error) => (
+                Err(cosmix_shell::runtime::ShellResizeError::OutputChanged) => (
                     10,
-                    json!({"error_code":"PANEL_RESIZE_REJECTED", "error":format!("{error:?}"), "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
+                    json!({"error_code":"PANEL_OUTPUT_CHANGED", "error":"output geometry changed before the resize applied", "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
+                ),
+                Err(cosmix_shell::runtime::ShellResizeError::Configuration(error)) => (
+                    10,
+                    json!({"error_code":"PANEL_RESIZE_REJECTED", "error":error.to_string(), "edge":argument(&request, "edge"), "requested":result.requested, "max":result.max}),
                 ),
             };
             stash_or_respond(

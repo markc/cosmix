@@ -1290,6 +1290,8 @@ struct UsedFontSources {
     blobs: std::collections::HashMap<u64, fontique::Blob<u8>>,
     #[cfg(test)]
     reconciliations: usize,
+    #[cfg(test)]
+    editor_visits: usize,
 }
 
 impl UsedFontSources {
@@ -1310,12 +1312,19 @@ impl UsedFontSources {
 fn retain_used_font_sources(
     mut sources: ResMut<UsedFontSources>,
     blocks: Query<&bevy::text::ComputedTextBlock, Changed<bevy::text::ComputedTextBlock>>,
-    editors: Query<&bevy::text::EditableText, Changed<bevy::text::EditableText>>,
+    // bevy_ui borrows every `EditableText` mutably each frame, so its change
+    // tick is always fresh; the generation is only written when the layout
+    // actually changed.
+    editors: Query<&bevy::text::EditableText, Changed<bevy::text::EditableTextGeneration>>,
 ) {
     for block in &blocks {
         sources.retain_layout(block.buffer());
     }
     for editor in &editors {
+        #[cfg(test)]
+        {
+            sources.editor_visits += 1;
+        }
         if let Some(layout) = editor.editor.try_layout() {
             sources.retain_layout(layout);
         }
@@ -4217,6 +4226,43 @@ mod tests {
         let sources = app.world().resource::<UsedFontSources>();
         assert_eq!(sources.reconciliations, count);
         assert_eq!(sources.blobs.len(), used.len());
+    }
+
+    #[test]
+    fn idle_text_fields_do_no_retention_work() {
+        use bevy::text::{EditableText, EditableTextGeneration};
+        // bevy_ui takes every EditableText mutably each frame; mimic that.
+        fn touch_editors(mut editors: Query<&mut EditableText>) {
+            for mut editor in &mut editors {
+                editor.set_changed();
+            }
+        }
+        let mut app = App::new();
+        app.init_resource::<FontCx>()
+            .add_plugins(CtkThemePlugin::default())
+            .add_systems(Update, touch_editors);
+        let entity = app.world_mut().spawn(EditableText::default()).id();
+        app.update();
+        let visits = app.world().resource::<UsedFontSources>().editor_visits;
+        assert_eq!(visits, 1, "a new field is examined once");
+        for _ in 0..5 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<UsedFontSources>().editor_visits,
+            visits,
+            "an idle field must not be re-examined every frame"
+        );
+        app.world_mut()
+            .get_mut::<EditableTextGeneration>(entity)
+            .unwrap()
+            .set_changed();
+        app.update();
+        assert_eq!(
+            app.world().resource::<UsedFontSources>().editor_visits,
+            visits + 1,
+            "a layout change is examined"
+        );
     }
 
     #[test]
