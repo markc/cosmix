@@ -13,14 +13,15 @@ xkb = ["dep:xkbcommon"]
 # The `iced` umbrella crate depends on iced_winit (and so winit) unconditionally,
 # so the host takes the iced component crates directly. tiny-skia is the only
 # renderer: `iced_renderer/tiny-skia` without `wgpu` makes it the default
-# `iced_widget` renderer, and `iced_tiny_skia` default features (softbuffer
-# X11/Wayland presenters) stay off.
+# `iced_widget` renderer. iced_tiny_skia always compiles softbuffer, which
+# fails to build on Linux with no backend, so its dlopen'd Wayland presenter is
+# enabled; this crate never calls it and nothing links libwayland for it.
 [dependencies]
 iced_core = "=0.14.0"
 iced_graphics = "=0.14.0"
 iced_renderer = { version = "=0.14.0", default-features = false, features = ["tiny-skia"] }
 iced_runtime = "=0.14.0"
-iced_tiny_skia = { version = "=0.14.1", default-features = false }
+iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["wayland"] }
 iced_widget = { version = "=0.14.2", default-features = false }
 tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
 xkbcommon = { version = "=0.7.0", default-features = false, optional = true }
