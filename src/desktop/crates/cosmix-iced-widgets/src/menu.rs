@@ -275,6 +275,8 @@ impl State {
                 self.close();
                 Some(message)
             }
+            // An empty submenu opens nothing (no zero-height panel).
+            Kind::Submenu(children) if children.is_empty() => None,
             Kind::Submenu(children) => {
                 self.path.push(next(children, None, true));
                 None
@@ -935,6 +937,11 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
         }
         for (depth, panel) in layout.children().enumerate() {
             let bounds = panel.bounds();
+            // A bar entry without children (an action opened by F10) has an
+            // empty panel; draw nothing for it.
+            if bounds.height <= 0.0 {
+                continue;
+            }
             quad(renderer, bounds, self.style.background, self.style);
             let mut y = bounds.y;
             for (index, item) in self
@@ -1057,7 +1064,7 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
                                 if let Some(message) = self.state.activate(self.items, self.bar) {
                                     shell.publish(message);
                                 }
-                            } else if matches!(item.kind, Kind::Submenu(_)) {
+                            } else if !item.children().is_empty() {
                                 self.state.path.push(None);
                             }
                         }
@@ -1841,6 +1848,14 @@ mod tests {
             state.key(Named::Escape, &items, false);
             assert!(!state.open);
         }
+        // An empty submenu is selectable but opens no panel.
+        let items = vec![Item::submenu("empty", vec![]), Item::action("run", 1)];
+        let mut state = State::default();
+        state.open(&items, false, 0, true);
+        assert_eq!(state.path, [Some(0)]);
+        assert_eq!(state.key(Named::Enter, &items, false), None);
+        assert_eq!(state.key(Named::ArrowRight, &items, false), None);
+        assert_eq!(state.path, [Some(0)]);
     }
 
     #[test]

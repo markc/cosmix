@@ -83,7 +83,9 @@ The text field wraps iced's `text_input`: selection, clipboard, placeholder,
 password presentation and IME remain in the upstream widget. Focused fields
 handle Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y (resolved like iced's clipboard
 shortcuts, so they work by key position on non-Latin layouts). Undo is off
-while an IME composition is open. Applications own the string and apply
+while an IME composition is open. A focused, editable field always consumes
+these keys, even with nothing to undo, as native entries do; an app-level undo
+binding fires only when no field has focus. Applications own the string and apply
 `on_input` messages as with iced's text input. Undo history belongs to the
 widget tree; keep the widget's identity stable across views. Password mode
 obscures presentation; it does not encrypt the application value or history.
