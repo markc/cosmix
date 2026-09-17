@@ -62,11 +62,18 @@ impl ImeRequest {
 
 /// Preedit text drawn under the caret, as iced_winit does: text widgets do
 /// not paint the composition themselves.
+///
+/// Ported from iced_winit 0.14.1 `src/window.rs` (`Preedit`, lines 337-460),
+/// Copyright 2019 Héctor Ramón, iced contributors, MIT licence.
 pub(crate) struct PreeditOverlay {
     position: Point,
     content: Paragraph,
-    key: Option<(String, Option<std::ops::Range<usize>>)>,
+    key: Option<PreeditKey>,
 }
+
+/// What the shaped paragraph depends on: text, selection, the selection's
+/// background colour and the text size.
+type PreeditKey = (String, Option<std::ops::Range<usize>>, [u8; 4], Option<u32>);
 
 impl PreeditOverlay {
     pub fn new() -> Self {
@@ -87,7 +94,12 @@ impl PreeditOverlay {
         use iced_core::text::Renderer as _;
 
         self.position = cursor.position() + Vector::new(0.0, cursor.height);
-        let key = (preedit.content.clone(), preedit.selection.clone());
+        let key = (
+            preedit.content.clone(),
+            preedit.selection.clone(),
+            background.into_rgba8(),
+            preedit.text_size.map(|size| size.0.to_bits()),
+        );
         if self.key.as_ref() == Some(&key) {
             return;
         }

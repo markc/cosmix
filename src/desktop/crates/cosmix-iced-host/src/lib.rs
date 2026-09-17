@@ -12,6 +12,7 @@
 
 mod clipboard;
 mod damage;
+mod diff;
 mod fonts;
 mod ime;
 pub mod input;

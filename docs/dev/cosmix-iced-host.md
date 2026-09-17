@@ -17,7 +17,9 @@ libwayland is not linked). This crate never calls softbuffer.
 
 ## Driving a surface
 
-1. `Surface::new(program, Settings)` with the physical size and scale.
+1. `Surface::new(program, Settings)` with the physical size and scale (a
+   scale that is not finite and positive becomes 1.0; `resize` keeps the
+   current one instead). A surface is not `Send`: keep it on its thread.
 2. Input: `cursor_moved` / `cursor_left` (logical points), `queue_event`
    for anything else. Hosts must deliver `Event::InputMethod`
    (Opened/Preedit/Commit/Closed), `keyboard::Event::ModifiersChanged` and
@@ -29,8 +31,16 @@ libwayland is not linked). This crate never calls softbuffer.
    `view()` with the retained cache. It returns `needs_redraw`, the cursor
    shape, per-event capture status and `redraw`: `NextFrame` when a draw
    is due, otherwise the pending deadline (a focused field's 500 ms caret
-   blink, `At`) or `Wait`. With nothing queued it does no work and repeats
-   the last known deadline.
+   blink, `At`) or `Wait`. With nothing queued it builds nothing, but still
+   reports pending work: a deadline that has passed, `program_mut`,
+   `operate`, `invalidate`, `set_background`. `process_at(now)` takes the
+   time; `needs_redraw()` asks without processing.
+
+   A rebuilt tree has lost the widgets' remembered status, so `process`
+   first replays the last draw's redraw pass (its time and cursor) before
+   the events. Time-based widgets see no elapsed time in that pass; a
+   widget that counts redraw passes sees one extra. Messages from the
+   replay are applied before the events, as iced_winit does.
 4. `draw(buffer, width, height, stride, format)` on the next frame. The
    result lists the physical rectangles rewritten, whether the draw was a
    full repaint, and the `Requests` to act on: cursor shape, IME state and
@@ -54,10 +64,30 @@ instance costs its widget state, layer list and tiny-skia glyph cache.
 - `PixelFormat::Argb8888` is wl_shm's little-endian B, G, R, A, which
   tiny-skia draws directly. `PixelFormat::Rgba8` swaps red and blue on the
   damaged rectangles only. Both are premultiplied.
-- Damage is the layer diff `iced_tiny_skia`'s own compositor uses
-  (`Layer::damage`, `damage::group`), rounded outward to whole physical
-  pixels and merged until disjoint. Only those rectangles are cleared and
-  redrawn, clipped by the tiny-skia mask.
+- Damage is computed per primitive (`src/diff.rs`), not with
+  `iced_tiny_skia`'s `Layer::damage`. That one pairs primitives by index,
+  so a caret quad blinking off misaligned the rest of its layer, and it
+  treats live primitives as always changed. Here each layer's quads, text
+  items, primitives and images are matched by a longest common subsequence,
+  and only unmatched items' old and new bounds are damaged (text expanded
+  by 2 logical px for ink overhang, quads by 1). Paragraphs are compared
+  through a per-frame snapshot of their lines, attributes, metrics and
+  layout size: the weak references a layer holds are detached whenever a
+  widget re-lays out a paragraph, even if nothing visible changed.
+  Rectangles are rounded outward to physical pixels, merged where the union
+  wastes at most 4096 pixels (collapsed to one box past 24), and made
+  disjoint. Resize, scale, theme, background and `invalidate()` still
+  repaint everything.
+- A caret blink damages about the caret (3×21 px at scale 1.0, 8×51 px at
+  2.5 in the tests); a one-character edit damages the field's text run and
+  any text that echoes it.
+- Partial redraws match a full redraw except for occasional one-level
+  channel differences on antialiased edges. A quad cut by a damage
+  rectangle is drawn through tiny-skia's masked pipeline, which rounds
+  differently from the unmasked path used when the quad lies wholly
+  inside. `tests/damage.rs` checks damage coverage exactly (every pixel
+  whose full redraw changed lies in the damage) and bounds the rest to one
+  level.
 
 ## IME
 
@@ -94,6 +124,8 @@ cargo clippy --manifest-path desktop/Cargo.toml --release -p cosmix-iced-host --
 cargo test   --manifest-path desktop/Cargo.toml --release -p cosmix-iced-host --all-features --locked
 ```
 
-The tests render into buffers and need no compositor. They load
+Run from `src/` (the build workers' working directory); from the repository
+root the manifest is `src/desktop/Cargo.toml`. The tests render into
+buffers and need no compositor. They load
 `DejaVuSans.ttf` from `cosmix-comp`'s assets so text does not depend on
 installed fonts.
