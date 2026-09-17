@@ -427,11 +427,13 @@ impl SourceLedger {
     pub(crate) fn unregister(&mut self, id: &str, revision: u64) -> Option<SourceCounters> {
         let mut counters = self.sources.remove(id)?;
         counters.revision = counters.revision.max(revision);
-        // Revisions are assumed to be +1 per update (not checked).
+        // Revisions are assumed to be +1 per update (not checked). No frame
+        // time: an unregistration is not a frame report.
         counters.stats.record_discarded(
             counters
                 .revision
                 .saturating_sub(counters.last_presented_revision),
+            None,
         );
         Some(counters)
     }
@@ -663,14 +665,18 @@ impl WaylandState {
         });
         // Only the last commit that replaced the buffer (and the bufferless
         // commits after it) can be shown; earlier ones were superseded
-        // inside the transaction.
+        // inside the transaction. A NULL attach replaces the content with
+        // nothing, so a transaction ending in one shows none of its
+        // commits, whatever the record's map state is by the time the
+        // unmap path runs.
         let last_content = commits.iter().rposition(|commit| commit.supersedes);
+        let removed = last_content.is_some_and(|index| !commits[index].new_buffer);
         let buffer_attached = last_content.is_some_and(|index| commits[index].new_buffer);
         let mut callbacks = Vec::new();
         let mut superseded = 0;
         for (index, mut commit) in commits.into_iter().enumerate() {
             let taken = mem::take(&mut commit.callbacks);
-            if last_content.is_some_and(|last| index < last) {
+            if removed || last_content.is_some_and(|last| index < last) {
                 superseded += taken.len();
                 for callback in taken {
                     callback.discarded();

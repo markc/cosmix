@@ -36,6 +36,12 @@ const INPUT_MARKS: usize = 256;
 /// window that did not react within a second did not react to it.
 pub(crate) const INPUT_MARK_TTL_US: u64 = 1_000_000;
 
+/// A frame reported this far before the last reset was in flight across it
+/// and is dropped. Anything older cannot be a reset race: its clock does
+/// not share `monotonic_us`'s base, so it is counted (and logged) instead
+/// of silently freezing the row.
+const PRE_RESET_BOUND_US: u64 = 10_000_000;
+
 /// The newest `STATS_RING` samples of one measurement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Ring(VecDeque<u64>);
@@ -132,6 +138,11 @@ pub(crate) struct PresentationStats {
     pub(crate) refresh_us: Option<u64>,
     /// When counting started (creation or the last reset).
     pub(crate) since_us: u64,
+    /// Frames counted although they predate `since_us` by more than the
+    /// bound: their clock base is not ours.
+    pub(crate) clock_base_mismatches: u64,
+    logged_pre_reset: bool,
+    logged_clock_mismatch: bool,
     /// The previous presentation while continuously shown; an interval is
     /// only measured between two of those.
     interval_anchor_us: Option<u64>,
@@ -146,9 +157,39 @@ impl PresentationStats {
         }
     }
 
+    /// Whether a frame timed `tv_us` counts. A frame from just before the
+    /// last reset was in flight across it; one from far before it is a
+    /// different clock base, which must not freeze the row silently.
+    fn counts(&mut self, tv_us: u64) -> bool {
+        if tv_us >= self.since_us {
+            return true;
+        }
+        if self.since_us - tv_us <= PRE_RESET_BOUND_US {
+            if !self.logged_pre_reset {
+                self.logged_pre_reset = true;
+                tracing::debug!(
+                    tv_us,
+                    since_us = self.since_us,
+                    "presentation stats dropped a frame reported after a reset"
+                );
+            }
+            return false;
+        }
+        self.clock_base_mismatches = self.clock_base_mismatches.saturating_add(1);
+        if !self.logged_clock_mismatch {
+            self.logged_clock_mismatch = true;
+            tracing::warn!(
+                tv_us,
+                since_us = self.since_us,
+                "presented frame is far older than the last reset: counting it, \
+                 its timestamps do not share CLOCK_MONOTONIC with the compositor"
+            );
+        }
+        true
+    }
+
     pub(crate) fn record_present(&mut self, sample: PresentSample) {
-        // A frame shown before the last reset but reported after it.
-        if sample.tv_us < self.since_us {
+        if !self.counts(sample.tv_us) {
             return;
         }
         self.presented = self.presented.saturating_add(1);
@@ -173,15 +214,17 @@ impl PresentationStats {
             self.intervals_us
                 .push(sample.tv_us.saturating_sub(previous));
         }
-        if let Some(mark) = self.input_mark
-            && !mark.live_at(sample.tv_us)
-        {
-            self.input_mark = None;
-        }
         if let Some(committed) = sample.committed_us {
             self.commit_to_present_us
                 .push(sample.tv_us.saturating_sub(committed));
-            // The first update committed after the input answers it.
+            // The first update committed after the input answers it. The
+            // age that matters is the client's: a slow present must not
+            // lose a sample the client answered promptly.
+            if let Some(mark) = self.input_mark
+                && !mark.live_at(committed)
+            {
+                self.input_mark = None;
+            }
             if let Some(mark) = self.input_mark
                 && committed >= mark.injected_at_us
             {
@@ -198,7 +241,13 @@ impl PresentationStats {
         self.last_presented_us = Some(sample.tv_us);
     }
 
-    pub(crate) fn record_discarded(&mut self, count: u64) {
+    /// Updates this frame will never show. `tv_us` is the frame's time when
+    /// there is one, so a frame reported after a reset is dropped whole
+    /// instead of leaving its discards behind.
+    pub(crate) fn record_discarded(&mut self, count: u64, tv_us: Option<u64>) {
+        if tv_us.is_some_and(|tv_us| !self.counts(tv_us)) {
+            return;
+        }
         self.discarded = self.discarded.saturating_add(count);
     }
 
@@ -208,6 +257,14 @@ impl PresentationStats {
     pub(crate) fn hidden(&mut self) {
         self.interval_anchor_us = None;
         self.input_mark = None;
+    }
+
+    /// A frame report that did not list this window at all. The run breaks
+    /// (nothing proves it was on screen), but an injected input keeps
+    /// waiting: a window mapped a frame ago is simply not in the renderer's
+    /// list yet, and the mark's own age still bounds it.
+    pub(crate) fn unlisted(&mut self) {
+        self.interval_anchor_us = None;
     }
 
     /// Injected input was delivered to this window. Only the newest mark
@@ -514,7 +571,7 @@ impl StatsRegistry {
                 answered_input_us: None,
             });
         } else {
-            stats.record_discarded(fold.discarded);
+            stats.record_discarded(fold.discarded, Some(tv_us));
         }
         if fold.hidden {
             stats.hidden();
@@ -526,7 +583,7 @@ impl StatsRegistry {
     pub(crate) fn hide_unlisted(&mut self, listed: impl Fn(u64) -> bool) {
         for (window, entry) in &mut self.windows {
             if !listed(*window) {
-                entry.stats.hidden();
+                entry.stats.unlisted();
             }
         }
     }
@@ -588,6 +645,9 @@ impl StatsRegistry {
             *output = OutputStats::new(now_us);
         }
         self.input_marks.clear();
+        // The injection site's counter keeps running, so the next mark is
+        // newer than anything this registry saw before the reset.
+        self.last_input_seq = 0;
     }
 
     /// Injected input reached `window` (its root, if any). Content sources

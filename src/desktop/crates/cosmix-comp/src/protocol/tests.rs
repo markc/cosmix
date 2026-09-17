@@ -30287,6 +30287,41 @@ fn interior_cached_commits_are_superseded_not_presented_late() {
     assert_eq!(feedback_opcodes(&events, shown), [1], "{events:?}");
 }
 
+/// A-N4: a NULL attach replaces the content with nothing, so a commit
+/// with feedback followed in the same transaction by an unmap attach is
+/// discarded, not admitted at the unchanged content sequence.
+#[test]
+fn a_null_attach_supersedes_the_commits_before_it() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let doomed = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    // The unmap attach lands in the same cached transaction.
+    send_request(&mut harness.client, child_surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    harness.dispatch_client();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let events = harness.sync();
+    assert_eq!(
+        feedback_opcodes(&events, doomed),
+        [2],
+        "content replaced by nothing is never shown: {events:?}"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        0
+    );
+}
+
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
 /// event, no-op dedup, validation, and the startup gate it feeds. The
 /// PERSISTED half (the etc-tree file) is deliberately not driven here —

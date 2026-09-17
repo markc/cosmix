@@ -152,7 +152,7 @@ fn reset_zeroes_and_restarts_the_window() {
     let mut stats = PresentationStats::new(0);
     stats.record_present(present(R, 0, Some(R)));
     stats.record_present(present(3 * R, R, Some(R)));
-    stats.record_discarded(2);
+    stats.record_discarded(2, None);
     stats.reset(99);
     assert_eq!(stats, PresentationStats::new(99));
     assert_eq!(
@@ -171,13 +171,13 @@ fn reset_zeroes_and_restarts_the_window() {
 #[test]
 fn counts_saturate() {
     let mut stats = PresentationStats::new(0);
-    stats.record_discarded(u64::MAX - 1);
+    stats.record_discarded(u64::MAX - 1, None);
     stats.record_present(PresentSample {
         tv_us: 1,
         discarded: 5,
         ..PresentSample::default()
     });
-    stats.record_discarded(5);
+    stats.record_discarded(5, None);
     assert_eq!(stats.discarded, u64::MAX);
 }
 
@@ -298,6 +298,70 @@ fn a_stalled_upload_is_a_miss_not_a_hide() {
     assert_eq!(stats.commit_to_present_us.newest(4), [R, 3 * R - 10]);
 }
 
+/// B-N1: a frame reported after a reset drops its discards too, not just
+/// its presentation; B-N3 bounds that and counts a frame from another
+/// clock base instead of freezing the row.
+#[test]
+fn a_frame_older_than_the_reset_is_dropped_whole_unless_its_clock_differs() {
+    let mut stats = PresentationStats::new(1_000_000);
+    stats.record_discarded(3, Some(999_000));
+    assert_eq!((stats.presented, stats.discarded), (0, 0));
+    stats.record_present(PresentSample {
+        tv_us: 999_000,
+        discarded: 2,
+        ..PresentSample::default()
+    });
+    assert_eq!((stats.presented, stats.discarded), (0, 0));
+    assert_eq!(stats.clock_base_mismatches, 0);
+    // Far older than the reset: a different clock base, counted and flagged.
+    stats.record_present(PresentSample {
+        tv_us: 1_000_000 - PRE_RESET_BOUND_US - 1,
+        discarded: 1,
+        ..PresentSample::default()
+    });
+    assert_eq!((stats.presented, stats.discarded), (1, 1));
+    assert_eq!(stats.clock_base_mismatches, 1);
+    stats.record_discarded(1, Some(0));
+    assert_eq!(stats.clock_base_mismatches, 2);
+}
+
+/// A-N2: a window the report does not list keeps an injected input's mark
+/// (the mark's own age bounds it); a genuine hide drops it.
+#[test]
+fn an_unlisted_frame_keeps_the_input_mark() {
+    let mut registry = StatsRegistry::new(0);
+    registry.mark_input(Some((1, 7)), mark(1, 1_000));
+    registry.hide_unlisted(|_| false);
+    registry.note_published(1, Some((1, 7)), 1, 2_000);
+    frame(&mut registry, &[(1, true, 1, true)], 5_000);
+    assert_eq!(
+        registry.window(1, 7).unwrap().input_to_present_us.newest(4),
+        [4_000],
+        "an unlisted frame is not a hide"
+    );
+    registry.mark_input(Some((1, 7)), mark(2, 6_000));
+    frame(&mut registry, &[(1, true, 1, false)], 7_000);
+    registry.note_published(1, Some((1, 7)), 2, 8_000);
+    frame(&mut registry, &[(1, true, 2, true)], 9_000);
+    assert_eq!(
+        registry.window(1, 7).unwrap().input_to_present_us.newest(4),
+        [4_000],
+        "a hide drops the mark"
+    );
+}
+
+/// A-N3: the mark ages against the client's commit, not a slow present.
+#[test]
+fn a_slow_present_does_not_lose_a_promptly_answered_input() {
+    let mut stats = PresentationStats::new(0);
+    stats.mark_input(mark(1, 1_000));
+    stats.record_present(present(2_000 + INPUT_MARK_TTL_US, 1_500, None));
+    assert_eq!(
+        stats.input_to_present_us.newest(4),
+        [1_000 + INPUT_MARK_TTL_US]
+    );
+}
+
 /// S1: a window the report does not list is not shown by that frame.
 #[test]
 fn unlisted_windows_lose_their_run() {
@@ -305,6 +369,7 @@ fn unlisted_windows_lose_their_run() {
     registry.note_published(1, Some((1, 7)), 1, 0);
     frame(&mut registry, &[(1, true, 1, true)], R);
     registry.hide_unlisted(|_| false);
+    assert_eq!(registry.last_input_seq, 0, "nothing marked yet");
     registry.note_published(1, Some((1, 7)), 2, 5 * R);
     frame(&mut registry, &[(1, true, 2, true)], 6 * R);
     let stats = registry.window(1, 7).unwrap();
@@ -405,4 +470,9 @@ fn input_marks_reach_the_window_and_the_source_lookup() {
     // Marks older than the TTL are pruned as new ones arrive.
     registry.mark_input(None, mark(1_000, 3_000 + INPUT_MARK_TTL_US + 1));
     assert_eq!(registry.input_marks.len(), 1);
+    // A-N1: a reset forgets the sequence watermark; the injection site's
+    // own counter is what keeps sequences unique.
+    registry.reset_all(4_000);
+    assert_eq!(registry.last_input_seq, 0);
+    assert!(registry.mark_input(None, mark(1, 4_100)));
 }
