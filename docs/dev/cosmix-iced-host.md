@@ -41,7 +41,8 @@ libwayland is not linked). This crate never calls softbuffer.
    the events. Time-based widgets see no elapsed time in that pass; a
    widget that counts redraw passes sees one extra. Messages from the
    replay are applied before the events, as iced_winit does.
-4. `draw(buffer, width, height, stride, format)` on the next frame. The
+4. `draw(buffer, width, height, stride, format)` on the next frame, or
+   `draw_aged(.., age)` when the buffer is older than the last frame. The
    result lists the physical rectangles rewritten, whether the draw was a
    full repaint, and the `Requests` to act on: cursor shape, IME state and
    `Redraw` (`Wait`, `NextFrame`, or `At(instant)` for a one-shot timer).
@@ -81,6 +82,24 @@ instance costs its widget state, layer list and tiny-skia glyph cache.
 - A caret blink damages about the caret (3×21 px at scale 1.0, 8×51 px at
   2.5 in the tests); a one-character edit damages the field's text run and
   any text that echoes it.
+- Two things the renderer paints without the clip mask are added to the
+  damage, or they would be drawn outside it (accumulating shadow, and in
+  `Rgba8` bytes left unswapped): a quad's **shadow**, drawn whole whenever
+  the quad body meets the damage, and the **ink of text that lies wholly
+  inside** the damage, which can overhang its measured bounds. Text that
+  crosses a damage edge is clipped, so only fully covered text is expanded.
+  A shadow spanning the surface therefore turns every partial redraw into a
+  full one: keep shadows off large containers, or draw them yourself.
+- `draw_aged(.., age)` draws into a buffer that is `age` frames old: 1 is
+  the buffer of the last frame (what `draw` assumes), `n` one holding the
+  contents of `n` frames ago, and 0 unknown contents. The damage of the
+  frames in between is added from an eight-frame history, so a client
+  cycling `wl_shm` buffers does not repaint everything. An age past the
+  history repaints everything. (`cosmix-wl-app` does not need this: its
+  pool copies damage forward, so every buffer it hands over is one frame
+  old.)
+- A buffer of the same size but a different `stride` or `PixelFormat` is
+  not the previous frame's buffer, and repaints everything.
 - Partial redraws match a full redraw except for occasional one-level
   channel differences on antialiased edges. A quad cut by a damage
   rectangle is drawn through tiny-skia's masked pipeline, which rounds

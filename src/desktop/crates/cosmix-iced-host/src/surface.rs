@@ -14,6 +14,9 @@ use iced_core::{Color, Event, Font, InputMethod, Pixels, Point, Rectangle, Size,
 use iced_graphics::Viewport;
 use iced_runtime::user_interface::{self, UserInterface};
 
+/// Frames of damage kept for buffer ages greater than one.
+const HISTORY: usize = 8;
+
 /// Initial state of a [`Surface`].
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -117,6 +120,11 @@ pub enum DrawError {
         needed: usize,
         got: usize,
     },
+    /// tiny-skia refused a surface of this size (too large for its limits).
+    UnsupportedSize {
+        width: u32,
+        height: u32,
+    },
 }
 
 impl std::fmt::Display for DrawError {
@@ -131,6 +139,9 @@ impl std::fmt::Display for DrawError {
             }
             Self::BufferTooSmall { needed, got } => {
                 write!(f, "buffer holds {got} bytes, {needed} needed")
+            }
+            Self::UnsupportedSize { width, height } => {
+                write!(f, "tiny-skia refused a {width}x{height} surface")
             }
         }
     }
@@ -158,6 +169,10 @@ pub struct Surface<P: Program> {
     clip_mask: tiny_skia::Mask,
     last_layers: Option<diff::Snapshot>,
     last_background: Color,
+    /// Row stride and byte order of the buffer the last frame went into.
+    last_buffer: Option<(u32, PixelFormat)>,
+    /// Damage of recent frames, newest first, for buffer ages > 1.
+    history: std::collections::VecDeque<Vec<DamageRect>>,
     invalid: bool,
     dirty: bool,
     requests: Requests,
@@ -188,6 +203,8 @@ impl<P: Program> Surface<P> {
             drawn_at: None,
             clip_mask: tiny_skia::Mask::new(size.width, size.height).expect("clip mask"),
             last_layers: None,
+            last_buffer: None,
+            history: std::collections::VecDeque::new(),
             last_background: Color::TRANSPARENT,
             invalid: true,
             dirty: true,
@@ -265,6 +282,8 @@ impl<P: Program> Surface<P> {
     pub fn invalidate(&mut self) {
         self.invalid = true;
         self.dirty = true;
+        // Older frames' damage describes contents that no longer exist.
+        self.history.clear();
     }
 
     pub fn queue_event(&mut self, event: Event) {
@@ -462,6 +481,26 @@ impl<P: Program> Surface<P> {
         self.draw_at(buffer, width, height, stride, format, Instant::now())
     }
 
+    /// [`Surface::draw_at`] into a buffer that is `age` frames old: 1 for
+    /// the buffer the last frame was drawn into (the default), `n` for one
+    /// holding the contents of `n` frames ago, 0 when the contents are
+    /// unknown (a fresh buffer), which repaints everything.
+    ///
+    /// A client cycling through `wl_shm` buffers reports the age of the one
+    /// it got; the damage of the frames in between is added, so those
+    /// buffers catch up without a full repaint.
+    pub fn draw_aged(
+        &mut self,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: PixelFormat,
+        age: u32,
+    ) -> Result<Frame, DrawError> {
+        self.draw_inner(buffer, width, height, stride, format, Instant::now(), age)
+    }
+
     /// Lays out and draws the program, diffs the result against the
     /// previous frame and rewrites only the damaged pixels.
     ///
@@ -476,6 +515,20 @@ impl<P: Program> Surface<P> {
         stride: u32,
         format: PixelFormat,
         now: Instant,
+    ) -> Result<Frame, DrawError> {
+        self.draw_inner(buffer, width, height, stride, format, now, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_inner(
+        &mut self,
+        buffer: &mut [u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: PixelFormat,
+        now: Instant,
+        age: u32,
     ) -> Result<Frame, DrawError> {
         if width == 0 || height == 0 {
             return Err(DrawError::ZeroSize);
@@ -497,6 +550,29 @@ impl<P: Program> Surface<P> {
         if physical != self.viewport.physical_size() {
             let scale = self.viewport.scale_factor();
             self.resize(physical, scale);
+        }
+        // Same size, different row padding or byte order: the contents are
+        // not the previous frame's.
+        if self
+            .last_buffer
+            .is_some_and(|last| last != (stride, format))
+        {
+            self.invalidate();
+        }
+        let older = match age {
+            1 => Some(Vec::new()),
+            n if n >= 2 && (n as usize - 1) <= self.history.len() => Some(
+                self.history
+                    .iter()
+                    .take(n as usize - 1)
+                    .flatten()
+                    .copied()
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if older.is_none() {
+            self.invalidate();
         }
 
         let scale = self.viewport.scale_factor();
@@ -548,7 +624,12 @@ impl<P: Program> Surface<P> {
         };
         let mut still_dirty = false;
         match &state {
-            user_interface::State::Outdated => still_dirty = true,
+            user_interface::State::Outdated => {
+                // Nothing was laid out, so nothing reported an input method.
+                // Dropping it here would disable text-input for a frame.
+                next.ime = previous.ime.clone();
+                still_dirty = true;
+            }
             user_interface::State::Updated {
                 mouse_interaction,
                 redraw_request,
@@ -592,13 +673,15 @@ impl<P: Program> Surface<P> {
             }
             Some(previous) => {
                 let viewport = Rectangle::with_size(size);
-                disjoint(diff::coalesce(
-                    diff::damage(previous, &current)
-                        .into_iter()
-                        .filter_map(|rect| rect.intersection(&viewport))
-                        .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
-                        .collect(),
-                ))
+                let mut logical = diff::damage(previous, &current);
+                diff::expand_unclipped(&mut logical, previous, &current);
+                let mut rects: Vec<DamageRect> = logical
+                    .into_iter()
+                    .filter_map(|rect| rect.intersection(&viewport))
+                    .filter_map(|rect| DamageRect::from_logical(rect, scale, width, height))
+                    .collect();
+                rects.extend(older.into_iter().flatten());
+                disjoint(diff::coalesce(rects))
             }
         };
 
@@ -610,13 +693,14 @@ impl<P: Program> Surface<P> {
                 }
             }
             if self.clip_mask.width() != row_pixels || self.clip_mask.height() != height {
-                self.clip_mask = tiny_skia::Mask::new(row_pixels, height).expect("clip mask");
+                self.clip_mask = tiny_skia::Mask::new(row_pixels, height)
+                    .ok_or(DrawError::UnsupportedSize { width, height })?;
             }
             let logical: Vec<Rectangle> =
                 damage.iter().map(|rect| rect.to_logical(scale)).collect();
             {
                 let mut pixmap = tiny_skia::PixmapMut::from_bytes(pixels, row_pixels, height)
-                    .expect("pixmap over checked buffer");
+                    .ok_or(DrawError::UnsupportedSize { width, height })?;
                 self.renderer.draw(
                     &mut pixmap,
                     &mut self.clip_mask,
@@ -634,6 +718,20 @@ impl<P: Program> Surface<P> {
 
         self.last_layers = Some(current);
         self.last_background = background;
+        self.last_buffer = Some((stride, format));
+        if self.history.len() == HISTORY {
+            self.history.pop_back();
+        }
+        self.history.push_front(if full {
+            vec![DamageRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }]
+        } else {
+            damage.clone()
+        });
         self.invalid = false;
         self.dirty = still_dirty;
         self.drawn_cursor = self.cursor;
