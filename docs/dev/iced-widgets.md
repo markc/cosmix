@@ -39,9 +39,35 @@ Item::action(label, message) | Item::submenu(label, Vec<Item>) | Item::separator
 Menu::bar(Vec<Item<Message>>)               // full-width, row_height tall
 Menu::context(content: impl Into<Element>, Vec<Item<Message>>)
     .style(MenuStyle)
+    .external_popups(impl Fn(MenuState) -> Message)  // no overlay; see below
+    .state(&MenuState)                      // host-driven state (external mode)
 MenuStyle { background, text, disabled, selected, selected_text, border,
             radius, text_size, row_height, padding }   // Default impl
 // impl From<Menu> for Element<'a, Message, Theme, Renderer>
+item.label() .accelerator_label() .is_enabled() .is_separator()
+    .children() .message()                  // read-only, for hosts
+
+// Menus on external surfaces (xdg_popup). Message: Clone.
+MenuState { root: Option<usize>, path: Vec<Option<usize>>,
+            anchors: Vec<Rectangle> }       // Default = closed
+    .is_open()
+Navigator::bar(&items) | Navigator::context(&items)   // Copy
+    .panel(&state, level) -> &[Item]        // items shown in panel `level`
+    .open(&mut state, root, keyboard) .close(&mut state)
+    .key(&mut state, &keyboard::Key)        // arrows, Home/End, Enter/Space, Escape, Tab
+    .hover(&mut state, level, Option<row>)  // None: pointer on no row
+    .click(&mut state, level, Option<row>)  // None: press outside every panel
+    .hover_root(&mut state, index) .click_root(&mut state, index)   // bar titles
+    .validate(&mut state)                   // close if the items changed under it
+    // each returns NavOutcome::{None, Changed, Activated(Message), Closed}
+menu::Panel::new(&items, selected: Option<usize>)   // one panel, fills its surface
+    .style(MenuStyle)
+    .on_hover(impl Fn(Option<usize>) -> Message)    // row under the pointer changed
+    .on_press(impl Fn(usize) -> Message)            // left press or touch on a row
+menu::panel_size(&renderer, &items, style) -> Size  // popup surface size
+menu::row_bounds(&items, row, panel_width, style) -> Option<Rectangle>  // panel-local
+menu::row_at(&items, y, style) -> Option<usize>
+menu::{MIN_PANEL_WIDTH, SEPARATOR_HEIGHT}
 
 // Design tokens (cosmix-design stays iced-free).
 Tokens::from_dictionary(&ResolvedDictionary) -> Result<Tokens, TokenError>
@@ -132,6 +158,26 @@ Contracts a host must honour:
   no focusable child remembers a click as focus until the next press, so if
   keyboard focus then moves into another context target's field, Shift+F10
   can open the clicked one instead.
+- **External popups.** `Menu::bar(items).external_popups(Msg::Menu)` draws
+  the bar only. Every change to the open state is published as a
+  `MenuState` whose `anchors` are filled in: `anchors[0]` is the open title
+  in the bar widget's window coordinates (a 1 x 1 rectangle at the pointer
+  for a context menu), `anchors[n]` the parent row inside panel `n - 1`,
+  relative to that panel. Store it and pass it back with `.state(&state)`.
+  For each `n` in `0..state.path.len()`, show a popup of
+  `panel_size(renderer, navigator.panel(&state, n), style)` anchored at
+  `anchors[n]`, containing `Panel::new(navigator.panel(&state, n),
+  state.path[n])`. Map its `on_hover(row)` to `navigator.hover(&mut state,
+  n, row)`, its `on_press(row)` to `navigator.click(&mut state, n,
+  Some(row))`, and keys on a popup surface to `navigator.key`. Publish the
+  message of `NavOutcome::Activated`. Map a compositor dismissal
+  (`popup_done`) to `navigator.close`. Pass the new state back to the bar,
+  which republishes it with fresh anchors. The bar itself still handles
+  F10, title clicks and title hover, keys that reach its surface, and
+  presses outside (which close the menu). It does not close on window
+  unfocus, because a popup taking keyboard focus is expected. The
+  in-surface overlay mode uses the same `Navigator`, so both modes behave
+  the same.
 - **Pro-audio gestures.** Fader and knob drags are relative (a press never
   jumps the value). Shift divides travel by ten and rebases, so toggling it
   mid-drag never jumps. A double-click resets (fader: `default_db`, knob: 0).
