@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::{NormalizedRenderTarget, RenderTarget};
 use bevy::image::ImageSampler;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key as BevyKey, KeyCode, KeyboardInput};
@@ -15,17 +16,22 @@ use bevy::picking::hover::HoverMap;
 use bevy::picking::pointer::{PointerAction, PointerButton as BevyButton, PointerId, PointerInput};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::ui::{ComputedUiRenderTargetInfo, UiGlobalTransform};
-use bevy::window::Ime;
+use bevy::ui::widget::NodeImageMode;
+use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiGlobalTransform};
+use bevy::window::WindowRef;
 use cosmix_scene::ResolvedScene;
 use cosmix_scene_bevy::{SceneStore, register_scene_page, scene_edge, scene_page_id};
 use cosmix_shell::core::Edge;
+use cosmix_shell::runtime::{
+    CursorShape, CursorShapeRequest, ExternalImeEvent, ExternalImeKind, ExternalImeTarget,
+    ImePurpose,
+};
 use serde_json::{Value, json};
 
 use crate::gpu::{GpuChannel, SurfaceUpload};
 use crate::surface::{
-    ImeEvent, ImeRequest, Key, Modifiers, NamedKey, PointerButton, Processed, Rect, ScrollUnit,
-    SurfaceEvent, SurfaceRenderer,
+    CursorIcon, ImeEvent, ImeRequest, Key, Modifiers, NamedKey, PointerButton, Processed, Rect,
+    ScrollUnit, SurfaceEvent, SurfaceRenderer,
 };
 use crate::upload;
 use crate::{ADAPTER, standin::StandIn};
@@ -43,12 +49,17 @@ pub struct IcedSurfaceGeometry {
     pub size: UVec2,
     pub scale: f32,
     pub origin: Vec2,
+    /// The window the surface is shown in; pointer events from other windows
+    /// are in another coordinate space.
+    pub window: Option<Entity>,
 }
 
 #[derive(Component)]
 pub(crate) struct SurfaceState {
     view: Entity,
     image: Option<Handle<Image>>,
+    /// Allocated texture size; the surface uses its top-left `size`.
+    texture: UVec2,
     buffer: Vec<u8>,
     size: UVec2,
     scale: f32,
@@ -111,7 +122,7 @@ pub struct SceneIcedFocus {
     pub ime: Option<ImeOutput>,
     /// The cursor shape asked for by the hovered surface (not applied: the
     /// layer host has no cursor-shape support).
-    pub cursor: Option<crate::surface::CursorIcon>,
+    pub cursor: Option<CursorIcon>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,6 +134,8 @@ pub struct FrameCounters {
     pub own_added: u64,
     pub own_modified: u64,
     pub allocations: u64,
+    /// Surface size changes served by the existing texture.
+    pub resizes: u64,
     pub draws: u64,
     pub rects_queued: u64,
     pub bytes_queued: u64,
@@ -138,6 +151,7 @@ impl FrameCounters {
         self.own_added += other.own_added;
         self.own_modified += other.own_modified;
         self.allocations += other.allocations;
+        self.resizes += other.resizes;
         self.draws += other.draws;
         self.rects_queued += other.rects_queued;
         self.bytes_queued += other.bytes_queued;
@@ -152,6 +166,7 @@ impl FrameCounters {
             "own_added": self.own_added,
             "own_modified": self.own_modified,
             "allocations": self.allocations,
+            "resizes": self.resizes,
             "draws": self.draws,
             "rects_queued": self.rects_queued,
             "bytes_queued": self.bytes_queued,
@@ -359,7 +374,10 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
                 height: percent(100),
                 ..default()
             },
-            ImageNode::default(),
+            ImageNode {
+                image_mode: NodeImageMode::Stretch,
+                ..default()
+            },
             Visibility::Hidden,
             Pickable::IGNORE,
         ))
@@ -376,9 +394,11 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
             scene: scene.to_owned(),
         },
         IcedSurfaceGeometry::default(),
+        ExternalImeTarget::default(),
         SurfaceState {
             view,
             image: None,
+            texture: UVec2::ZERO,
             buffer: Vec::new(),
             size: UVec2::ZERO,
             scale: 0.0,
@@ -398,12 +418,21 @@ pub(crate) fn geometry(
             &ComputedNode,
             &UiGlobalTransform,
             &ComputedUiRenderTargetInfo,
+            &ComputedUiTargetCamera,
             &mut IcedSurfaceGeometry,
         ),
         With<IcedSurface>,
     >,
+    cameras: Query<&RenderTarget>,
 ) {
-    for (node, transform, target, mut geometry) in &mut surfaces {
+    for (node, transform, target, camera, mut geometry) in &mut surfaces {
+        let window = camera
+            .get()
+            .and_then(|camera| cameras.get(camera).ok())
+            .and_then(|target| match target {
+                RenderTarget::Window(WindowRef::Entity(window)) => Some(*window),
+                _ => None,
+            });
         let size = node.size();
         if size.x < 1.0 || size.y < 1.0 {
             // Not laid out (or collapsed): keep the last texture.
@@ -413,6 +442,7 @@ pub(crate) fn geometry(
             size: size.round().as_uvec2(),
             scale: target.scale_factor(),
             origin: transform.affine().translation - size / 2.0,
+            window,
         });
     }
 }
@@ -440,6 +470,57 @@ pub(crate) fn route_pointer(
             .capture
             .filter(|(id, _)| *id == pointer)
             .map(|(_, entity)| entity);
+        let event_window = match &input.location.target {
+            NormalizedRenderTarget::Window(window) => Some(window.entity()),
+            _ => None,
+        };
+        let foreign = captured.filter(|entity| {
+            surfaces.get(*entity).is_ok_and(|(geometry, _)| {
+                geometry
+                    .window
+                    .is_some_and(|window| event_window != Some(window))
+            })
+        });
+        if let Some(entity) = foreign {
+            // A captured pointer now reports positions in another window's
+            // space: leave, and release the button without a position.
+            match input.action {
+                PointerAction::Move { .. } | PointerAction::Scroll { .. } => {
+                    if surfaces.get(entity).is_ok_and(|(_, state)| state.hovered) {
+                        route.over.remove(&pointer);
+                        push(
+                            &mut surfaces,
+                            entity,
+                            SurfaceEvent::PointerLeft,
+                            Some(false),
+                        );
+                    }
+                    continue;
+                }
+                PointerAction::Release(button) => {
+                    if let Some(button) = convert_button(button) {
+                        let event = SurfaceEvent::PointerButton {
+                            button,
+                            pressed: false,
+                        };
+                        push(&mut surfaces, entity, event, None);
+                    }
+                    if surfaces.get(entity).is_ok_and(|(_, state)| state.hovered) {
+                        push(
+                            &mut surfaces,
+                            entity,
+                            SurfaceEvent::PointerLeft,
+                            Some(false),
+                        );
+                    }
+                    route.over.remove(&pointer);
+                    route.capture = None;
+                    continue;
+                }
+                PointerAction::Press(_) | PointerAction::Cancel => {}
+            }
+        }
+        let captured = captured.filter(|entity| Some(*entity) != foreign);
         let target = captured.or(hovered);
         if let Some(previous) = route.over.get(&pointer).copied()
             && Some(previous) != hovered
@@ -568,7 +649,7 @@ fn convert_button(button: BevyButton) -> Option<PointerButton> {
 
 pub(crate) fn route_keyboard(
     mut keys: MessageReader<KeyboardInput>,
-    mut ime: MessageReader<Ime>,
+    mut ime: MessageReader<ExternalImeEvent>,
     input_focus: Option<Res<InputFocus>>,
     buttons: Option<Res<ButtonInput<KeyCode>>>,
     mut surfaces: Query<(&IcedSurface, &mut SurfaceState)>,
@@ -593,8 +674,8 @@ pub(crate) fn route_keyboard(
         focus.owner = current;
         focus.ime = None;
     }
-    let owner = focus.owner.and_then(|owner| surfaces.get_mut(owner).ok());
-    let Some((_, mut state)) = owner else {
+    let owner = focus.owner;
+    let Some((_, mut state)) = owner.and_then(|owner| surfaces.get_mut(owner).ok()) else {
         keys.clear();
         ime.clear();
         return;
@@ -615,15 +696,17 @@ pub(crate) fn route_keyboard(
             modifiers,
         });
     }
-    for event in ime.read() {
-        let event = match event {
-            Ime::Preedit { value, cursor, .. } => ImeEvent::Preedit {
-                text: value.clone(),
+    for event in ime.read().filter(|event| Some(event.target) == owner) {
+        let event = match &event.kind {
+            ExternalImeKind::Preedit { text, cursor } => ImeEvent::Preedit {
+                text: text.clone(),
                 cursor: *cursor,
             },
-            Ime::Commit { value, .. } => ImeEvent::Commit(value.clone()),
-            Ime::Disabled { .. } => ImeEvent::Disabled,
-            Ime::Enabled { .. } => continue,
+            ExternalImeKind::Commit(text) => ImeEvent::Commit(text.clone()),
+            ExternalImeKind::Disabled => ImeEvent::Disabled,
+            // Focus already told the renderer; iced 0.14 has no deletion of
+            // surrounding text, and no surrounding text is ever sent.
+            ExternalImeKind::Enabled | ExternalImeKind::DeleteSurrounding { .. } => continue,
         };
         state.events.push(SurfaceEvent::Ime(event));
     }
@@ -705,15 +788,54 @@ fn latin(code: KeyCode) -> Option<char> {
         .map(|i| (b'0' + i as u8) as char)
 }
 
+/// Texture side lengths grow in steps of this many pixels.
+pub const BUCKET: u32 = 128;
+
+/// The texture size to allocate for a surface of `size`, or `None` when the
+/// current texture (`current`) still serves: it must be at least as large,
+/// and less than four times the bucketed need in each dimension, so a size
+/// wobbling across a bucket edge does not reallocate back and forth.
+pub fn texture_size(size: UVec2, current: Option<UVec2>) -> Option<UVec2> {
+    let bucket = |v: u32| v.div_ceil(BUCKET).max(1) * BUCKET;
+    let want = UVec2::new(bucket(size.x), bucket(size.y));
+    match current {
+        Some(tex)
+            if size.x <= tex.x && size.y <= tex.y && want.x * 4 > tex.x && want.y * 4 > tex.y =>
+        {
+            None
+        }
+        _ => Some(want),
+    }
+}
+
+fn cursor_shape(icon: CursorIcon) -> CursorShape {
+    match icon {
+        CursorIcon::Default => CursorShape::Default,
+        CursorIcon::Pointer => CursorShape::Pointer,
+        CursorIcon::Text => CursorShape::Text,
+        CursorIcon::Grab => CursorShape::Grab,
+        CursorIcon::Grabbing => CursorShape::Grabbing,
+        CursorIcon::NotAllowed => CursorShape::NotAllowed,
+        CursorIcon::ResizeHorizontal => CursorShape::EwResize,
+        CursorIcon::ResizeVertical => CursorShape::NsResize,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn frame(
     mut renderers: NonSendMut<Renderers>,
-    mut surfaces: Query<(Entity, &IcedSurfaceGeometry, &mut SurfaceState)>,
+    mut surfaces: Query<(
+        Entity,
+        &IcedSurfaceGeometry,
+        &mut SurfaceState,
+        &mut ExternalImeTarget,
+    )>,
     mut views: Query<(&mut ImageNode, &mut Visibility)>,
     mut images: ResMut<Assets<Image>>,
     mut counters: ResMut<SceneIcedCounters>,
     mut focus: ResMut<SceneIcedFocus>,
     mut wake: ResMut<SceneIcedWake>,
+    mut cursor_request: ResMut<CursorShapeRequest>,
     channel: Option<Res<GpuChannel>>,
     time: Res<Time<Real>>,
 ) {
@@ -725,7 +847,7 @@ pub(crate) fn frame(
     let mut next_wake: Option<Duration> = None;
     let mut cursor = None;
     counters.surfaces = surfaces.iter().count();
-    for (entity, geometry, mut state) in &mut surfaces {
+    for (entity, geometry, mut state, mut ime_target) in &mut surfaces {
         let Some(renderer) = renderers.0.get_mut(&entity) else {
             continue;
         };
@@ -733,18 +855,19 @@ pub(crate) fn frame(
         if size.x == 0 || size.y == 0 || geometry.scale <= 0.0 {
             continue;
         }
-        if state.image.is_none() || state.size != size || state.scale != geometry.scale {
+        let current = state.image.as_ref().map(|_| state.texture);
+        if let Some(texture) = texture_size(size, current) {
             let mut image = Image::new_uninit(
                 Extent3d {
-                    width: size.x,
-                    height: size.y,
+                    width: texture.x,
+                    height: texture.y,
                     depth_or_array_layers: 1,
                 },
                 TextureDimension::D2,
                 TextureFormat::Rgba8UnormSrgb,
                 RenderAssetUsages::RENDER_WORLD,
             );
-            // The texture maps 1:1 onto physical pixels.
+            // The visible part maps 1:1 onto physical pixels.
             image.sampler = ImageSampler::nearest();
             let handle = images.add(image);
             counters.own.insert(handle.id());
@@ -754,7 +877,22 @@ pub(crate) fn frame(
                 *visibility = Visibility::Inherited;
             }
             state.image = Some(handle);
-            state.buffer = vec![0; size.x as usize * size.y as usize * 4];
+            state.buffer = vec![0; texture.x as usize * texture.y as usize * 4];
+            state.texture = texture;
+            state.size = UVec2::ZERO;
+        }
+        if state.size != size || state.scale != geometry.scale {
+            if let Ok((mut node, _)) = views.get_mut(state.view) {
+                node.rect = Some(bevy::math::Rect::new(
+                    0.0,
+                    0.0,
+                    size.x as f32,
+                    size.y as f32,
+                ));
+            }
+            if state.size != UVec2::ZERO {
+                counters.current.resizes += 1;
+            }
             state.size = size;
             state.scale = geometry.scale;
             state.repaint = true;
@@ -777,19 +915,26 @@ pub(crate) fn frame(
         if state.hovered {
             cursor = Some(processed.cursor);
         }
-        if focus.owner == Some(entity) {
-            focus.ime = match &processed.ime {
-                ImeRequest::Disabled => None,
-                ImeRequest::Enabled { cursor } => {
-                    let min = (geometry.origin + Vec2::new(cursor.x as f32, cursor.y as f32))
-                        / geometry.scale;
-                    let size = Vec2::new(cursor.w as f32, cursor.h as f32) / geometry.scale;
-                    Some(ImeOutput {
-                        window_scale: geometry.scale,
-                        cursor: bevy::math::Rect::from_corners(min, min + size),
-                    })
-                }
-            };
+        let owner = focus.owner == Some(entity);
+        let request = match (&processed.ime, owner) {
+            (ImeRequest::Enabled { cursor }, true) => {
+                let min = (geometry.origin + Vec2::new(cursor.x as f32, cursor.y as f32))
+                    / geometry.scale;
+                let extent = Vec2::new(cursor.w as f32, cursor.h as f32) / geometry.scale;
+                Some(ImeOutput {
+                    window_scale: geometry.scale,
+                    cursor: bevy::math::Rect::from_corners(min, min + extent),
+                })
+            }
+            _ => None,
+        };
+        ime_target.set_if_neq(ExternalImeTarget {
+            enabled: request.is_some(),
+            purpose: ImePurpose::Normal,
+            cursor: request.as_ref().map(|ime| ime.cursor),
+        });
+        if owner {
+            focus.ime = request;
         }
         let redraw = processed.needs_redraw || state.repaint;
         state.last = processed;
@@ -797,7 +942,8 @@ pub(crate) fn frame(
             continue;
         }
         let state = &mut *state;
-        let damage = renderer.draw(&mut state.buffer, size.x, size.y, size.x * 4);
+        let stride = state.texture.x * 4;
+        let damage = renderer.draw(&mut state.buffer, size.x, size.y, stride);
         let damage = if state.repaint {
             vec![Rect::new(0, 0, size.x, size.y)]
         } else {
@@ -813,16 +959,21 @@ pub(crate) fn frame(
         {
             channel.0.push(SurfaceUpload {
                 image: state.image.as_ref().unwrap().id(),
-                width: size.x,
-                height: size.y,
+                texture: state.texture,
+                visible: size,
                 ops: rects
                     .iter()
-                    .map(|rect| upload::extract(&state.buffer, size.x * 4, *rect))
+                    .map(|rect| upload::extract(&state.buffer, stride, *rect))
                     .collect(),
             });
         }
         counters.last_rects = rects;
     }
-    focus.cursor = cursor;
+    if focus.cursor != cursor {
+        // Leaving every surface hands the pointer back to the default shape.
+        let shape = cursor.map_or(CursorShape::Default, cursor_shape);
+        cursor_request.set_if_neq(CursorShapeRequest(shape));
+        focus.cursor = cursor;
+    }
     wake.set_if_neq(SceneIcedWake(next_wake));
 }

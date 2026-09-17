@@ -20,9 +20,9 @@ use bevy::input_focus::InputFocus;
 use bevy::picking::pointer::PointerInput;
 use bevy::prelude::*;
 use bevy::render::RenderApp;
-use bevy::window::Ime;
 use cosmix_scene_bevy::{SceneReconcile, SceneStore};
 use cosmix_shell::runtime::ShellRuntimeSet;
+use cosmix_shell::runtime::{CursorShapeRequest, ExternalImeEvent};
 
 pub use bridge::{
     FrameCounters, IcedSurface, IcedSurfaceGeometry, ImeOutput, RendererFactory, SceneIcedCounters,
@@ -46,7 +46,8 @@ impl Plugin for SceneIcedPlugin {
         app.insert_non_send(bridge::Renderers::default());
         app.add_message::<PointerInput>()
             .add_message::<KeyboardInput>()
-            .add_message::<Ime>()
+            .add_message::<ExternalImeEvent>()
+            .init_resource::<CursorShapeRequest>()
             .add_message::<AssetEvent<Image>>()
             .init_resource::<InputFocus>()
             .init_resource::<bridge::Mounts>()

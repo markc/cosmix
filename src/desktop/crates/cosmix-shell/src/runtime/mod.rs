@@ -6,6 +6,8 @@ mod semantic;
 
 #[cfg(feature = "chrome-core")]
 mod bevy_runtime;
+#[cfg(feature = "chrome-core")]
+mod host_requests;
 
 pub use messages::{
     CarouselInput, HostGeometry, KeyboardInteractivity, PanelPresentation, ShellCommand,
@@ -18,4 +20,9 @@ pub use semantic::{SceneVerb, ShellSemanticVerb, semantic_shell_command};
 pub use bevy_runtime::{
     ShellEffects, ShellFrameState, ShellQuitHandler, ShellRuntimePlugin, ShellRuntimeSet,
     replace_shell_model, set_page_thickness, set_shell_pages,
+};
+#[cfg(feature = "chrome-core")]
+pub use host_requests::{
+    CursorShape, CursorShapeRequest, ExternalImeEvent, ExternalImeKind, ExternalImeTarget,
+    ImePurpose,
 };

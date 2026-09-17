@@ -45,8 +45,12 @@ scene.
 
 Each surface owns one texture: an uninitialised `Image`
 (`RENDER_WORLD`, `Rgba8UnormSrgb`, nearest sampling) added to
-`Assets<Image>` when the surface first gets a size and again only when the
-physical size or scale changes. The handle is never mutably borrowed, so the
+`Assets<Image>` when the surface first gets a size. Textures are sized in
+128 px buckets and the surface shows its top-left part through
+`ImageNode.rect` (`NodeImageMode::Stretch`). A new texture is allocated only
+when the surface outgrows it or needs less than a quarter of it in a
+dimension; other size and scale changes count as `resizes` and repaint the
+visible part. The handle is never mutably borrowed, so the
 only asset events are one `Added` per allocation. Damage is clipped and
 merged (`upload::plan`), copied out with alpha un-premultiplied (Bevy UI
 blends straight alpha), passed to the render world at extract, and written
@@ -73,11 +77,22 @@ surface held it. `SceneIcedFocus` records the owning surface, its IME request
 (caret in window-logical coordinates) and the hovered cursor shape. Keys and
 Bevy `Ime` preedit/commit go to the owner only.
 
-Seams: the layer host enables text-input-v3 only for a focused
-`EditableText` and has no cursor-shape support, so in Quoin the IME request
-and cursor shape are recorded but not applied, and no IME events reach a
-surface yet. Pointer capture does not check that later events come from the
-same window.
+The owning surface carries `cosmix_shell::runtime::ExternalImeTarget`
+(enabled, purpose, caret in window-logical coordinates). The layer host
+enables text-input-v3 for it as for a focused `EditableText`, sends the
+content type and the caret rectangle (origin rounded down, far edges rounded
+up) and delivers `ExternalImeEvent`s (enabled, disabled, delete, commit,
+preedit, in protocol order) under the same focus-generation and serial rules.
+Commit and preedit reach the renderer; surrounding-text deletion is dropped
+because no surrounding text is sent and iced 0.14 has no such event.
+
+The hovered surface's cursor shape goes to `CursorShapeRequest`, which the
+layer host applies with `wp_cursor_shape_v1` on change and after each pointer
+enter. Leaving all surfaces resets it to the default shape.
+
+A captured pointer that reports from another window is not given that
+position: the surface loses hover, and a release there still ends the
+capture.
 
 `SceneIcedWake` is the earliest renderer wake time; Quoin copies it into
 `LayerHostDeadline` so a caret can blink on an otherwise idle host.

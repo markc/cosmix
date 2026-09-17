@@ -14,6 +14,7 @@ use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::GpuImage;
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
 
+use crate::surface::Rect;
 use crate::upload::UploadOp;
 
 /// Frames an upload may wait for its texture before it is dropped and the
@@ -22,8 +23,10 @@ const MAX_WAIT_FRAMES: u32 = 120;
 
 pub struct SurfaceUpload {
     pub image: AssetId<Image>,
-    pub width: u32,
-    pub height: u32,
+    /// The texture this plan was made for.
+    pub texture: UVec2,
+    /// The part of it the surface shows.
+    pub visible: UVec2,
     pub ops: Vec<UploadOp>,
 }
 
@@ -96,7 +99,7 @@ fn write(
             continue;
         };
         let size = gpu.texture_descriptor.size;
-        if (size.width, size.height) != (upload.width, upload.height) {
+        if UVec2::new(size.width, size.height) != upload.texture {
             // A stale plan for a texture that has since been replaced.
             continue;
         }
@@ -104,7 +107,7 @@ fn write(
         let full = upload
             .ops
             .iter()
-            .any(|op| op.rect.w == upload.width && op.rect.h == upload.height);
+            .any(|op| op.rect == Rect::new(0, 0, upload.visible.x, upload.visible.y));
         if staged
             .written
             .insert(upload.image, id)
