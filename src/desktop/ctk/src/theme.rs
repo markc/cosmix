@@ -26,7 +26,7 @@ use bevy::log::warn;
 use bevy::prelude::IntoScheduleConfigs;
 use bevy::prelude::{App, Entity, Plugin, Update};
 use bevy::text::{
-    FontCx, FontSize, FontSource, TextFont, TextPipeline, detect_text_needs_rerender,
+    detect_text_needs_rerender, FontCx, FontSize, FontSource, TextFont, TextPipeline,
 };
 use bevy::ui::UiSystems;
 #[cfg(feature = "theme")]
@@ -2475,8 +2475,8 @@ pub(crate) fn theme_file_watcher(
 
 #[cfg(feature = "theme")]
 fn theme_event_requests_reload(event: &notify::Event, paths: &ThemeWatchPaths) -> bool {
-    use notify::EventKind;
     use notify::event::{AccessKind, AccessMode, ModifyKind, RenameMode};
+    use notify::EventKind;
 
     if theme_event_rechecks_watches(event, paths) {
         return true;
@@ -2516,8 +2516,8 @@ fn theme_event_rechecks_watches(event: &notify::Event, paths: &ThemeWatchPaths) 
 #[cfg(feature = "theme")]
 mod file {
     use super::{
-        Color, CtkThemeMetrics, MAX_BODY_PX, MIN_BODY_PX, Mode, Scheme, ThemeSpec,
-        TypographyProvenance, contrast_checked, dimmed_on, legible_away,
+        contrast_checked, dimmed_on, legible_away, Color, CtkThemeMetrics, Mode, Scheme, ThemeSpec,
+        TypographyProvenance, MAX_BODY_PX, MIN_BODY_PX,
     };
     use std::fs::{File, OpenOptions};
     use std::path::Path;
@@ -2968,9 +2968,8 @@ mod file {
 
 #[cfg(feature = "theme")]
 pub use file::{
-    THEME_FILE, ThemeFile, TypographyFile, load_theme_file, resolve_app_theme,
-    resolve_app_theme_with_selection, resolve_theme, resolve_theme_with_selection,
-    shared_theme_path,
+    load_theme_file, resolve_app_theme, resolve_app_theme_with_selection, resolve_theme,
+    resolve_theme_with_selection, shared_theme_path, ThemeFile, TypographyFile, THEME_FILE,
 };
 
 #[cfg(test)]
@@ -3274,11 +3273,9 @@ mod tests {
         // The capture layer installs lazily on the first `warnings_from`. Without
         // this the worker's warnings reach no subscriber at all and the probe
         // proves nothing — which is exactly how it first passed against `with`.
-        assert!(
-            warnings_from(|| warn!("install the global capture layer"))
-                .iter()
-                .any(|line| line.contains("install the global capture layer"))
-        );
+        assert!(warnings_from(|| warn!("install the global capture layer"))
+            .iter()
+            .any(|line| line.contains("install the global capture layer")));
 
         std::thread::spawn(|| {
             // Initialised BEFORE any warning, so `SINK` — first touched by the
@@ -4151,22 +4148,20 @@ mod tests {
                 );
             }
         }
-        assert!(
-            !app.world()
-                .resource::<CtkTypography>()
-                .retained_faces
-                .is_empty()
-        );
+        assert!(!app
+            .world()
+            .resource::<CtkTypography>()
+            .retained_faces
+            .is_empty());
         // Replacing the mappings releases the old sources; the retention set
         // is bounded by current mappings, never by the number of rebuilds.
         app.world_mut().resource_mut::<FontCx>().collection.clear();
         app.update();
-        assert!(
-            app.world()
-                .resource::<CtkTypography>()
-                .retained_faces
-                .is_empty()
-        );
+        assert!(app
+            .world()
+            .resource::<CtkTypography>()
+            .retained_faces
+            .is_empty());
     }
 
     #[test]
@@ -4706,8 +4701,8 @@ mod tests {
 mod theme_file_tests {
     use super::*;
     use cosmix_design::{
-        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, EMBEDDED_DEFAULT_SOURCE,
-        InteractionState,
+        ButtonCellKey, ButtonSize, ButtonVariant, DesignCompileOutcome, InteractionState,
+        EMBEDDED_DEFAULT_SOURCE,
     };
     use tempfile::TempDir;
 

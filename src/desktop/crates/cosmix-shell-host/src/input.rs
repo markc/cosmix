@@ -993,18 +993,18 @@ impl PointerBridge {
         if let Some(resize) = self.resize
             && let Some(extent) = configured_extent(app, window, resize.edge)
         {
+            let max = app
+                .world()
+                .resource::<cosmix_shell::runtime::ShellFrameState>()
+                .0
+                .panel(resize.edge)
+                .max_thickness_px;
             stage_shell_command(
                 app,
                 output.clone(),
                 ShellCommandKind::Resize {
                     edge: resize.edge,
-                    thickness_px: resize.thickness(raw, extent).min(
-                        app.world()
-                            .resource::<cosmix_shell::runtime::ShellFrameState>()
-                            .0
-                            .panel(resize.edge)
-                            .max_thickness_px,
-                    ),
+                    thickness_px: resize.thickness(raw, extent).min(max),
                 },
             );
         }

@@ -1131,6 +1131,55 @@ mod tests {
         app
     }
 
+    #[test]
+    fn resize_reply_waits_for_model_and_rechecks_queued_geometry() {
+        for shrink in [false, true] {
+            let (bridge, peer) = test_bridge("quoin");
+            let mut app = bus_app(bridge);
+            let model = test_model();
+            let output = model.output().clone();
+            app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(model));
+            if shrink {
+                app.world_mut().write_message(ShellCommand {
+                    output,
+                    at: Default::default(),
+                    kind: ShellCommandKind::Geometry(
+                        cosmix_shell::core::LogicalSize::new(200.0, 200.0).unwrap(),
+                    ),
+                });
+            }
+            let mut req = local("shell.panel.resize");
+            req.body = r#"{"edge":"left","thickness_px":240}"#.into();
+            peer.send(req);
+            app.update();
+            assert!(
+                peer.drain_responses().is_empty(),
+                "no speculative acceptance"
+            );
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies.len(), 1);
+            let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+            if shrink {
+                assert_eq!(replies[0].rc, 10);
+                assert_eq!(body["edge"], "left");
+                assert_eq!(body["requested"], 240.0);
+                assert!(body["max"].as_f64().unwrap() < 240.0);
+            } else {
+                assert_eq!(replies[0].rc, 0);
+                assert_eq!(body["accepted"], true);
+                assert_eq!(
+                    app.world()
+                        .resource::<ShellFrameState>()
+                        .0
+                        .panel(Edge::Left)
+                        .thickness_px,
+                    240.0
+                );
+            }
+        }
+    }
+
     /// A `power.props.changed` delivery-gap notice on `generation`.
     fn gap_change(generation: u64) -> BusMessage {
         let mut headers = BTreeMap::new();

@@ -351,10 +351,8 @@ impl Plugin for AppPortPlugin {
             .insert("app.describe".into(), describe);
         assert!(replaced.is_none(), "app.describe registered twice");
         // Generic, cross-app lifecycle verb: every app that installs the port
-        // is quittable over the Bus by the same name. Gated but mesh-reachable
-        // (see `mesh_accepting_verb`): a local caller OR an admitted,
-        // broker-attested mesh peer may drive it — the network-ARexx default of
-        // any node driving any app, never a human gate, never anonymous.
+        // is quittable over the Bus by the same name. Mesh membership admits
+        // every verb, including lifecycle and app-specific commands.
         let quit = app.world_mut().register_system(quit_app);
         let replaced = app
             .world_mut()
@@ -620,15 +618,6 @@ fn dispatch_gate_skips(command: &str) -> bool {
     )
 }
 
-/// Verbs an admitted mesh peer may drive, not only a local caller. The generic
-/// app-lifecycle surface: quitting an app is a legitimate network-ARexx
-/// operation across the mesh, gated by broker attestation
-/// ([`authorize_caller`]), not confined to the owning node. App-specific named
-/// verbs are NOT listed here — they stay local-only unless deliberately added.
-fn mesh_accepting_verb(command: &str) -> bool {
-    command == "app.quit"
-}
-
 pub(crate) fn dispatch_app_request(
     world: &mut World,
     app_name: &str,
@@ -636,14 +625,7 @@ pub(crate) fn dispatch_app_request(
 ) -> AppPortReply {
     let command = request.command.clone();
     if !dispatch_gate_skips(&command) {
-        // Mesh-reachable verbs (the generic app-lifecycle surface, e.g.
-        // app.quit) admit an attested mesh peer as well as a local caller; every
-        // other named verb stays local-only. See [`authorize_caller`].
-        let decision = if mesh_accepting_verb(&command) {
-            authorize_caller(&request)
-        } else {
-            authorize_local_caller(&request)
-        };
+        let decision = authorize_caller(&request);
         if let Err(error) = decision {
             return error_reply(match error {
                 LocalCallerError::UnregisteredCaller => {
@@ -863,19 +845,17 @@ fn get_control(entity: Entity, id: &str, controls: &Query<ControlQueryData>) -> 
         ControlClass::Bool => json!(checked),
         ControlClass::Action => return error_reply("control is not queryable"),
         ControlClass::Meter => match meter {
-            Some(meter) => json!(
-                meter.lanes[..usize::from(meter.lane_count).min(2)]
-                    .iter()
-                    .map(|lane| {
-                        json!({
-                            "level": lane.level,
-                            "peak": lane.peak,
-                            "hold": lane.hold,
-                            "clipped": lane.clipped,
-                        })
+            Some(meter) => json!(meter.lanes[..usize::from(meter.lane_count).min(2)]
+                .iter()
+                .map(|lane| {
+                    json!({
+                        "level": lane.level,
+                        "peak": lane.peak,
+                        "hold": lane.hold,
+                        "clipped": lane.clipped,
                     })
-                    .collect::<Vec<_>>()
-            ),
+                })
+                .collect::<Vec<_>>()),
             None => return error_reply("control has no value"),
         },
     };
@@ -1003,8 +983,8 @@ mod tests {
 
     use super::*;
     use crate::widgets::{
-        CtkWidgetsPlugin, NumericControlProps, ValueMapping, action_button, fader_sized,
-        knob_sized, level_meter_sized, toggle_button_sized,
+        action_button, fader_sized, knob_sized, level_meter_sized, toggle_button_sized,
+        CtkWidgetsPlugin, NumericControlProps, ValueMapping,
     };
 
     #[derive(Resource, Default)]
@@ -1112,12 +1092,10 @@ mod tests {
         anonymous.from.clear();
         let (rc, body) = call(&mut app, &anonymous);
         assert_eq!(rc, 10);
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap()
-                .contains("registered same-node caller")
-        );
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("registered same-node caller"));
 
         let asserted = request("app.test", &[("signed_ident", "spoof")]);
         let (rc, body) = call(&mut app, &asserted);
