@@ -414,11 +414,15 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         capture_reporter.clone(),
     );
     install_nested_frame_presentation(&mut app, runtime.frame_presentation_reporter());
+    // Opt-in (COSMIX_FRAME_TRACE): render phases and wgpu acquire/present.
+    frame_trace::install_render_phases(&mut app);
     #[cfg(feature = "content-source-probe")]
     app.add_plugins(content_source::probe::ContentSourceProbePlugin);
     #[cfg(feature = "bus")]
     runtime.start_port().map_err(io::Error::other)?;
 
+    app.world_mut()
+        .insert_non_send(NestedUpdateTrace::default());
     // `App::run` reports how the app ended (window close / exit chord →
     // Success; render-error, device-lost, winit-loop, Ctrl-C → Error).
     // Propagate it so the process exit code stays truthful.
@@ -438,6 +442,8 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         .add_systems(Startup, setup_scene)
         .add_systems(Update, (animate_background, collect_host_input))
         .add_systems(Last, finish_wayland_frame)
+        .add_systems(First, begin_nested_update_trace.before(CompositorSceneSet))
+        .add_systems(Last, end_nested_update_trace.after(finish_wayland_frame))
         .run();
     Ok(exit)
 }
@@ -1300,6 +1306,18 @@ fn pump_wayland(world: &mut World) {
     }
 }
 
+/// `comp_update` for one nested main-world update (frame tracing only).
+#[derive(Default)]
+struct NestedUpdateTrace(Option<frame_trace::Span>);
+
+fn begin_nested_update_trace(mut trace: NonSendMut<NestedUpdateTrace>) {
+    trace.0 = Some(frame_trace::span("comp_update", 0));
+}
+
+fn end_nested_update_trace(mut trace: NonSendMut<NestedUpdateTrace>) {
+    trace.0.take();
+}
+
 #[derive(ScheduleLabel, Clone, Debug, Eq, Hash, PartialEq)]
 struct NestedPostPresent;
 
@@ -1467,6 +1485,15 @@ fn complete_nested_security_presentation(
     let timestamp = acquisition_consumed
         .then(monotonic_capture_timestamp)
         .flatten();
+    frame_trace::event("comp_nested_handoff", || {
+        (
+            u64::from(acquisition_consumed),
+            timestamp.map_or(0, |(seconds, nanos)| {
+                seconds * 1_000_000 + u64::from(nanos) / 1_000
+            }),
+            0,
+        )
+    });
     complete_nested_capture_presentations(
         &completion.capture_reporter,
         captures,

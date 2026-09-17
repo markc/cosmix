@@ -8513,6 +8513,7 @@ impl WaylandState {
         if delivered > 0 {
             tracing::trace!(delivered, "completed Wayland frame callbacks");
         }
+        crate::frame_trace::event("comp_frame_callbacks", || (delivered as u64, 0, 0));
     }
 
     fn surface_belongs_to_minimized_toplevel(&self, surface: &WlSurface) -> bool {
