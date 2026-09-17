@@ -178,7 +178,16 @@ Contracts a host must honour:
   which is the redraw after your update. Map a panel's `on_hover(row)` to
   `navigator.hover(&mut state, spec.level, row)`, its `on_press(row)` to
   `navigator.click(&mut state, spec.level, Some(row))`, and keys on a popup
-  surface to `navigator.key`. Publish the
+  surface to `navigator.key`. Known limits:
+  - `panel_size` of an empty item list has height 0, so never size a
+    popup from it directly; use `open_panels`.
+  - `Panel` forgets which hover it last reported whenever its item slice
+    moves, which happens on every view that rebuilds the items. The only
+    cost is one extra hover message on the next pointer motion.
+  - A context menu rebuilt from host state reopens at `anchors[0]`, which
+    is off by the scroll offset inside a scrollable.
+  - A finger moving over bar titles does not switch menus in external
+    mode. Publish the
   message of `NavOutcome::Activated`. Map a compositor dismissal
   (`popup_done`) to `navigator.close`. Pass the new state back to the bar,
   which republishes it with fresh anchors. The bar itself still handles
