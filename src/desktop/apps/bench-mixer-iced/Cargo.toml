@@ -22,11 +22,17 @@ engine = "iced"
 [[bin]]
 name = "cosmix-bench-mixer-iced"
 path = "src/main.rs"
+# A plain `cargo build --workspace` selects no features, and this arm has no
+# renderer to build with then. `required-features` makes cargo skip the binary
+# instead of failing the workspace build on the compile_error below; each
+# renderer feature turns the marker on.
+required-features = ["renderer"]
 
 [features]
 default = []
-wgpu = ["cosmix-iced-widgets/wgpu", "iced/wgpu"]
-tiny-skia = ["cosmix-iced-widgets/tiny-skia", "iced/tiny-skia"]
+renderer = []
+wgpu = ["renderer", "cosmix-iced-widgets/wgpu", "iced/wgpu"]
+tiny-skia = ["renderer", "cosmix-iced-widgets/tiny-skia", "iced/tiny-skia"]
 
 [dependencies]
 cosmix-bench-feed = { path = "../../crates/cosmix-bench-feed" }

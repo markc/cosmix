@@ -17,6 +17,7 @@ compile_error!(
 
 mod app;
 mod board;
+mod channel;
 mod mixer;
 mod roll;
 mod theme;

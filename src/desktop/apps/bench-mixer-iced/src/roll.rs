@@ -9,10 +9,11 @@
 //! key range, onto the widget's view, which is in beats and pixel rows, so
 //! both arms show the same slice of the same song.
 //!
-//! Two parity notes (see the crate report): the widget colours notes from one
-//! `AudioStyle::note` with velocity as alpha, where the Bevy arm colours per
-//! track through CTK's `channel_color`; and the playhead is left off, because
-//! the Bevy arm draws none.
+//! Notes carry their track index and the roll is given a per-track palette
+//! (`cosmix-iced-widgets` slice 4), so the colour families match the Bevy
+//! arm's `channel_color` spread — see [`crate::channel`]. The playhead is
+//! left off on purpose: the Bevy arm draws none, so drawing one here would be
+//! the parity difference.
 
 use cosmix_bench_feed::{BenchSong, RollViewport};
 use cosmix_iced_widgets::piano_roll::{MAX_PIXELS_PER_BEAT, MIN_PIXELS_PER_BEAT};
@@ -34,6 +35,7 @@ pub fn notes(song: &BenchSong) -> RollNotes {
                 length: (note.length.max(1)) as f32 / per_beat,
                 pitch: note.pitch,
                 velocity: note.velocity,
+                track: note.track,
             })
             .collect(),
     )
@@ -62,6 +64,7 @@ pub fn view<'a>(bench: &'a Bench, tokens: Tokens) -> Element<'a, Message> {
     let style = tokens.audio_style();
     container(
         PianoRoll::new(&bench.notes, bench.roll)
+            .track_colours(&bench.track_colours)
             .width(Fill)
             .height(Fill)
             .on_view(Message::Roll)
@@ -98,17 +101,23 @@ mod tests {
     }
 
     #[test]
-    fn ticks_become_beats_and_every_note_survives() {
+    fn ticks_become_beats_and_every_note_keeps_its_track() {
         let song = song();
         let notes = notes(&song);
         assert_eq!(notes.len(), song.notes.len());
         let per_beat = song.ticks_per_beat as f32;
+        let mut tracks = std::collections::HashSet::new();
         for (widget, feed) in notes.notes().iter().zip(&song.notes) {
             // Both lists are start-sorted, so they line up.
             assert!((widget.start - feed.start as f32 / per_beat).abs() < 1e-3);
             assert!((widget.length - feed.length as f32 / per_beat).abs() < 1e-3);
             assert_eq!(widget.pitch, feed.pitch);
+            assert_eq!(widget.velocity, feed.velocity);
+            // The track index is what picks the note's colour family.
+            assert_eq!(widget.track, feed.track);
+            tracks.insert(widget.track);
         }
+        assert_eq!(tracks.len(), song.track_count, "every track is represented");
     }
 
     #[test]

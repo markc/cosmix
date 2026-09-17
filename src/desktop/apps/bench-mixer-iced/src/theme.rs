@@ -69,9 +69,10 @@ pub fn iced_theme(tokens: Tokens) -> Theme {
 /// So the two lifts come from the next two colours this design does separate:
 /// `border` for the channel panels and `selection` for the master's further
 /// lift. The exact values are not CTK's bg2/bg3 — that is an accepted parity
-/// delta (`known-deltas.conf.mix`, `panel-rung-colours`) and it goes away when
-/// `Tokens` exposes the background rungs. [`the_panels_are_three_distinct_rungs`]
-/// fails rather than letting the board go flat if the design ever moves.
+/// delta (`known-deltas.conf.mix`, `colour-role-mapping`) and it goes away
+/// when `Tokens` exposes the design's background rungs.
+/// [`the_panels_are_three_distinct_rungs`] fails rather than letting the board
+/// go flat if the design ever moves.
 pub fn strip_background(tokens: Tokens, master: bool) -> Color {
     if master { tokens.selection } else { tokens.border }
 }

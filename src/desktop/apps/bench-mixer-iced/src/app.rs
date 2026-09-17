@@ -54,6 +54,8 @@ pub struct Bench {
     pub solos: Vec<bool>,
     pub song: Option<BenchSong>,
     pub notes: RollNotes,
+    /// One colour per track, the spread CTK's `channel_color` draws.
+    pub track_colours: Vec<iced::Color>,
     pub roll: RollView,
     /// The shared board geometry for the current size; the Bevy arm and the
     /// driver read the same rectangles from the same function.
@@ -83,6 +85,10 @@ impl Bench {
             names: (0..slots).map(|slot| feed.strip(slot).name).collect(),
             mutes: (0..slots).map(|slot| feed.strip(slot).mute).collect(),
             solos: (0..slots).map(|slot| feed.strip(slot).solo).collect(),
+            track_colours: crate::channel::track_palette(
+                song.as_ref().map_or(1, |song| song.track_count),
+                tokens.ring,
+            ),
             song,
             notes,
             roll,
