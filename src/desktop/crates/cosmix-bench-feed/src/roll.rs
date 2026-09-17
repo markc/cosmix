@@ -9,6 +9,9 @@ use std::f64::consts::TAU;
 use crate::layout::{ROLL_NOTE_INSET, ROLL_NOTE_MIN_WIDTH};
 use crate::song::{BenchNote, BenchSong};
 
+/// The roll draws into the same rectangles the mixer does.
+pub use crate::layout::Rect;
+
 /// Narrowest zoom, in measures.
 pub const ROLL_MIN_SPAN_MEASURES: f64 = 1.0;
 /// Widest zoom, in measures (also capped at the song length).
@@ -47,15 +50,6 @@ pub struct RollViewport {
 pub struct GridLine {
     pub tick: u32,
     pub measure: bool,
-}
-
-/// A rectangle in the roll's own pixel space (origin top left).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
 }
 
 impl RollViewport {

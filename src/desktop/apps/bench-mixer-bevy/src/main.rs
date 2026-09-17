@@ -351,6 +351,8 @@ mod tests {
             "0xdead_beef",
             "--drag-by",
             "pointer",
+            "--size",
+            "1600x900",
         ]))
         .unwrap();
         assert_eq!(config.mode, Mode::Drag);
