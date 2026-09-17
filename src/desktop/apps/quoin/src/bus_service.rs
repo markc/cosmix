@@ -1142,6 +1142,81 @@ mod tests {
         }
     }
 
+    /// The mesh-open law (`~/.ctl/CLAUDE.md`): a caller on the WG mesh
+    /// reaches every verb with no authorization gate, and needs no principal
+    /// attestation — being on the mesh IS the authorization. What survives is
+    /// well-formedness: the broker's own `broker_origin` stamp, singular.
+    ///
+    /// CTK owns the policy (`app_control::authorize_local_caller`) and tests
+    /// it directly; this reads it back through Quoin's panel verbs, which is
+    /// where an operator or an agent actually drives the shell from another
+    /// node.
+    #[test]
+    fn a_mesh_caller_drives_the_panel_verbs_without_attestation() {
+        let frame = paged_frame();
+        let mesh = |command: &str, body: Value| {
+            let mut request = wire(command, body);
+            // Anonymous: no registered service name, no source_peer, no
+            // permissions, no signed_ident. Only the broker's stamp.
+            request.from = "anonymous".to_owned();
+            request
+                .headers
+                .insert("broker_origin".to_owned(), "mesh".to_owned());
+            request
+        };
+        for (command, expected) in [
+            (
+                "shell.panel.pin",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Pin,
+                },
+            ),
+            (
+                "shell.panel.unpin",
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Unpin,
+                },
+            ),
+        ] {
+            let request = mesh(command, json!({"edge": "bottom"}));
+            let (rc, body, enqueued) = dispatch_shell_request(&request, &frame, Default::default());
+            assert_eq!(rc, 0, "{command}: {body}");
+            assert_eq!(
+                enqueued.expect("a mesh caller's verb enqueues it").kind,
+                expected,
+                "{command}"
+            );
+        }
+        // The same for the resize gate, which has its own admission site.
+        let resize = mesh(
+            "shell.panel.resize",
+            json!({"edge": "bottom", "thickness_px": 240}),
+        );
+        let (rc, body, enqueued) = dispatch_shell_request(&resize, &frame, Default::default());
+        assert_eq!(rc, 0, "resize: {body}");
+        assert_eq!(
+            enqueued.expect("resize enqueues").kind,
+            ShellCommandKind::ResizeCommit {
+                edge: Edge::Bottom,
+                thickness_px: 240.0
+            }
+        );
+
+        // Well-formedness survives: two broker_origin spellings are not one
+        // stamp, and the request is refused whatever they say.
+        let mut duplicate = mesh("shell.panel.pin", json!({"edge": "bottom"}));
+        duplicate
+            .headers
+            .insert("Broker_Origin".to_owned(), "mesh".to_owned());
+        assert_eq!(
+            dispatch_shell_request(&duplicate, &frame, Default::default()).0,
+            10,
+            "a duplicated origin stamp is not well-formed"
+        );
+    }
+
     /// The two surfaces the live gate found contradicting each other, read
     /// off ONE frame in one test: whatever `panels.<edge>.pages` advertises,
     /// `page.set` must accept.
