@@ -1637,7 +1637,7 @@ pub(crate) struct PresentationCommandProbe(channel::Channel<ProtocolCommand>);
 impl PresentationCommandProbe {
     /// Hand every queued report to `state` as the protocol loop does, and
     /// return how many there were.
-    pub(crate) fn deliver(&self, state: &mut WaylandState) -> usize {
+    fn deliver(&self, state: &mut WaylandState) -> usize {
         let mut delivered = 0;
         while let Ok(command) = self.0.try_recv() {
             delivered += 1;
