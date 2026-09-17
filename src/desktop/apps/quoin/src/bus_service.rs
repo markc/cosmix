@@ -210,7 +210,6 @@ fn service_bus(
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 state.pending_resizes.clear();
-                state.pending_replies.clear();
                 state.power.invalidate();
                 state.snapshot_retry = None;
                 state.live_generation = None;

@@ -4149,19 +4149,67 @@ mod tests {
 
     #[test]
     fn system_font_catalogue_is_not_retained_and_idle_frames_do_no_work() {
+        use bevy::prelude::{Assets, Vec2};
+        use bevy::text::{ComputedTextBlock, LayoutCx, TextBounds};
         let mut app = App::new();
         app.init_resource::<FontCx>()
             .add_plugins(CtkThemePlugin::default());
-        app.world_mut()
-            .spawn(bevy::text::ComputedTextBlock::default());
+        let entity = app.world_mut().spawn(ComputedTextBlock::default()).id();
         app.update();
+        assert!(app.world().resource::<UsedFontSources>().blobs.is_empty());
+        // Shape through Bevy with the host's entire system collection present.
+        let mut computed = app
+            .world_mut()
+            .entity_mut(entity)
+            .take::<ComputedTextBlock>()
+            .unwrap();
+        let font = TextFont {
+            font: FontSource::SansSerif,
+            ..Default::default()
+        };
+        TextPipeline::default()
+            .update_buffer(
+                &Assets::default(),
+                std::iter::once((
+                    entity,
+                    0,
+                    "used face",
+                    &font,
+                    Color::WHITE,
+                    Default::default(),
+                    Default::default(),
+                )),
+                Default::default(),
+                Default::default(),
+                TextBounds::UNBOUNDED,
+                1.0,
+                &mut computed,
+                &mut app.world_mut().resource_mut::<FontCx>(),
+                &mut LayoutCx::default(),
+                Vec2::new(800.0, 600.0),
+                16.0,
+            )
+            .unwrap();
+        let mut used = HashSet::new();
+        for line in computed.buffer().lines() {
+            for run in line.runs() {
+                used.insert(run.font().data.id());
+            }
+        }
+        assert!(!used.is_empty());
+        app.world_mut().entity_mut(entity).insert(computed);
+        app.update();
+        assert_eq!(
+            app.world().resource::<UsedFontSources>().blobs.len(),
+            used.len()
+        );
         let count = app.world().resource::<UsedFontSources>().reconciliations;
         for _ in 0..5 {
             app.update();
         }
         let sources = app.world().resource::<UsedFontSources>();
         assert_eq!(sources.reconciliations, count);
-        assert!(sources.blobs.is_empty());
+        assert_eq!(sources.blobs.len(), used.len());
     }
 
     #[test]

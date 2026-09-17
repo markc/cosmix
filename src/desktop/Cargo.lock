@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bg-showcase"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "bevy",
  "cosmix-bg-boing",
@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3170,7 +3170,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3532,7 +3532,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.55.2"
+version = "0.56.0"
 dependencies = [
  "accesskit",
  "ammonia",
