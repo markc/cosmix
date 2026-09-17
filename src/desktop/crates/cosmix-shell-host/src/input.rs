@@ -1359,7 +1359,7 @@ mod tests {
             LogicalSize::new(600.0, 600.0).unwrap(),
             Duration::ZERO,
             Duration::ZERO,
-            Duration::ZERO,
+            Duration::from_millis(200),
         )
         .unwrap();
         model.restore_thickness(Edge::Right, 350.0).unwrap();

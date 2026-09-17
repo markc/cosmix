@@ -169,7 +169,11 @@ fn update_model(
             // Scene content is owned by the host adapter; it has no motion effect.
             ShellCommandKind::Scene(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
-                let thickness_px = thickness_px.min(runtime.model.max_thickness(*edge));
+                let thickness_px = if thickness_px.is_finite() {
+                    thickness_px.min(runtime.model.max_thickness(*edge))
+                } else {
+                    *thickness_px
+                };
                 if let Err(error) = runtime.model.resize_thickness(*edge, thickness_px) {
                     bevy::log::warn!("panel drag rejected: {error}");
                 }
