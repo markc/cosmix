@@ -5,7 +5,6 @@
 pub mod font;
 #[cfg(feature = "iced")]
 pub mod iced;
-pub mod menus;
 pub mod paint;
 pub mod raw;
 pub mod startup;

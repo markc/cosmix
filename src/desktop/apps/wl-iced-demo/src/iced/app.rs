@@ -1,13 +1,12 @@
 //! The iced demo: the raw grid under iced chrome, one buffer, one commit.
 //! This file is the event-loop glue: routing, redraw scheduling, cursor.
 
-use super::chrome::{self, Chrome};
+use super::chrome::{self, Chrome, ChromeMsg};
 use super::clipboard::{Fetch, Shared};
 use super::damage::{Commit, merge};
 use super::ime;
 use super::keys::{self, Route};
-use super::popups::{Bar, MenuPopups};
-use crate::menus::{Entry, Metrics, Outcome};
+use super::popups::{MenuPopups, PanelMsg};
 use crate::raw::{IME_GRID, RawDemo};
 use crate::startup::Clock;
 use cosmix_iced_host::core::event::Status;
@@ -15,8 +14,9 @@ use cosmix_iced_host::core::mouse::Interaction;
 use cosmix_iced_host::core::widget::operation::focusable;
 use cosmix_iced_host::core::{Point, Size};
 use cosmix_iced_host::{PixelFormat, Redraw, Settings, Surface, Update, input};
+use cosmix_iced_widgets::menu::{Item, MenuState, NavOutcome, Navigator};
 use cosmix_wl_app::{
-    App, BTN_LEFT, ButtonState, Ctx, CursorShape, Event, Frame, PointerKind, Selection, SurfaceId,
+    App, ButtonState, Ctx, CursorShape, Event, Frame, PointerKind, Selection, SurfaceId,
     SurfaceInfo,
 };
 
@@ -36,36 +36,42 @@ pub enum Action {
     FocusSearch,
 }
 
-pub fn menu_bar() -> Bar<Action> {
+pub fn menu_items() -> Vec<Item<ChromeMsg>> {
+    let action = |label: &str, accelerator: &str, what: Action| {
+        Item::action(label, ChromeMsg::Action(what)).accelerator(accelerator)
+    };
     vec![
-        (
-            "File".into(),
+        Item::submenu(
+            "File",
             vec![
-                Entry::action("Clear tab", Action::ClearTab).accelerator("Ctrl+Shift+L"),
-                Entry::Separator,
-                Entry::action("Quit", Action::Quit).accelerator("Ctrl+Shift+Q"),
+                action("Clear tab", "Ctrl+Shift+L", Action::ClearTab),
+                Item::separator(),
+                action("Quit", "Ctrl+Shift+Q", Action::Quit),
             ],
         ),
-        (
-            "Edit".into(),
+        Item::submenu(
+            "Edit",
             vec![
-                Entry::action("Undo", Action::Undo)
-                    .accelerator("Ctrl+Z")
-                    .disabled(),
-                Entry::action("Copy", Action::Copy).accelerator("Ctrl+Shift+C"),
-                Entry::action("Paste", Action::Paste).accelerator("Ctrl+Shift+V"),
+                action("Undo", "Ctrl+Z", Action::Undo).enabled(false),
+                action("Copy", "Ctrl+Shift+C", Action::Copy),
+                action("Paste", "Ctrl+Shift+V", Action::Paste),
             ],
         ),
-        (
-            "View".into(),
+        Item::submenu(
+            "View",
             vec![
-                Entry::submenu(
+                Item::submenu(
                     "Tabs",
                     (0..3)
-                        .map(|i| Entry::action(&format!("Tab {}", i + 1), Action::SelectTab(i)))
+                        .map(|i| {
+                            Item::action(
+                                format!("Tab {}", i + 1),
+                                ChromeMsg::Action(Action::SelectTab(i)),
+                            )
+                        })
                         .collect(),
                 ),
-                Entry::action("Focus search", Action::FocusSearch).accelerator("Ctrl+F"),
+                action("Focus search", "Ctrl+F", Action::FocusSearch),
             ],
         ),
     ]
@@ -92,9 +98,8 @@ fn cursor_shape(interaction: Interaction) -> CursorShape {
 pub struct IcedDemo {
     raw: RawDemo,
     chrome: Surface<Chrome>,
-    menus: MenuPopups<Action>,
+    menus: MenuPopups,
     clipboard: Shared,
-    metrics: Metrics,
     band: u32,
     /// Physical size and scale the chrome surface was last given.
     chrome_surface: Option<(u32, u32, f32)>,
@@ -109,11 +114,9 @@ pub struct IcedDemo {
 
 impl IcedDemo {
     pub fn new(clock: Clock) -> Self {
-        let metrics = Metrics::default();
-        let band = chrome::band_height(&metrics);
-        let bar = menu_bar();
-        let chrome_program = Chrome::new(bar.iter().map(|(t, _)| t.clone()).collect(), metrics);
+        let chrome_program = Chrome::new(menu_items());
         let style = chrome_program.style;
+        let band = chrome::band_height(&style);
         let clipboard = Shared::default();
         let mut chrome = Surface::new(chrome_program, Settings::default());
         chrome.set_clipboard(Box::new(clipboard.clone()));
@@ -122,9 +125,8 @@ impl IcedDemo {
         Self {
             raw,
             chrome,
-            menus: MenuPopups::new(bar, metrics, style),
+            menus: MenuPopups::new(style),
             clipboard,
-            metrics,
             band,
             chrome_surface: None,
             pointer: None,
@@ -208,23 +210,51 @@ impl IcedDemo {
         }
     }
 
+    /// Reconcile the popups with the menu state the chrome now holds, and
+    /// redraw the bar if the state it draws from changed.
     fn after_menu_change(&mut self, cx: &mut Ctx<'_>) {
-        if let Some((window, info)) = self.window_info() {
-            self.menus.reconcile(cx, window, &info);
-        }
-        let root = self.menus.nav.root();
-        if self.chrome.program().open_root != root {
-            self.chrome.program_mut().open_root = root;
+        let Some((window, info)) = self.window_info() else {
+            return;
+        };
+        let Chrome {
+            items, menu_state, ..
+        } = self.chrome.program_mut();
+        let before = menu_state.clone();
+        let nav = Navigator::bar(items);
+        let mut state = std::mem::take(menu_state);
+        nav.validate(&mut state);
+        self.menus.sync(cx, window, &info, &nav, &mut state);
+        let changed = state != before;
+        self.chrome.program_mut().menu_state = state;
+        if changed {
             self.schedule(cx, Redraw::NextFrame);
         }
     }
 
-    fn outcome(&mut self, cx: &mut Ctx<'_>, outcome: Outcome<Action>) {
-        if let Outcome::Activated(action) = outcome {
+    /// Run the outcome of a navigator step, then reconcile.
+    fn outcome(&mut self, cx: &mut Ctx<'_>, outcome: NavOutcome<ChromeMsg>) {
+        if let NavOutcome::Activated(ChromeMsg::Action(action)) = outcome {
             self.raw.log(format_args!("menu action {action:?}"));
             self.run(cx, action);
         }
         self.after_menu_change(cx);
+    }
+
+    /// Drive the navigator with `step`, which borrows the items and the
+    /// state from the chrome program.
+    fn navigate(
+        &mut self,
+        cx: &mut Ctx<'_>,
+        step: impl FnOnce(&Navigator<'_, ChromeMsg>, &mut MenuState) -> NavOutcome<ChromeMsg>,
+    ) {
+        let Chrome {
+            items, menu_state, ..
+        } = self.chrome.program_mut();
+        let nav = Navigator::bar(items);
+        let mut state = std::mem::take(menu_state);
+        let outcome = step(&nav, &mut state);
+        self.chrome.program_mut().menu_state = state;
+        self.outcome(cx, outcome);
     }
 
     fn run(&mut self, cx: &mut Ctx<'_>, action: Action) {
@@ -265,15 +295,10 @@ impl IcedDemo {
     }
 
     fn key(&mut self, cx: &mut Ctx<'_>, key: cosmix_wl_app::KeyEvent) {
-        match keys::route(&key, self.menus.nav.is_open()) {
-            Route::Menu(nav) => {
-                let outcome = self.menus.nav.key(&self.menus.bar, nav);
-                self.outcome(cx, outcome);
-            }
-            Route::Swallow => {}
-            Route::OpenBar => {
-                self.menus.nav.open(&self.menus.bar, 0, true);
-                self.after_menu_change(cx);
+        match keys::route(&key, self.chrome.program().menu_state.is_open()) {
+            Route::Menu => {
+                let logical = keys::logical_key(&key);
+                self.navigate(cx, |nav, state| nav.key(state, &logical));
             }
             Route::Shortcut(action) => self.run(cx, action),
             Route::Chrome { then_grid } => {
@@ -289,19 +314,12 @@ impl IcedDemo {
     fn window_pointer(&mut self, cx: &mut Ctx<'_>, p: cosmix_wl_app::PointerEvent) {
         let (x, y) = p.position;
         let point = Point::new(x as f32, y as f32);
-        let open = self.menus.nav.is_open();
         match p.kind {
             PointerKind::Enter | PointerKind::Motion => {
                 self.pointer = Some((x, y));
                 self.chrome.cursor_moved(point);
                 if !self.in_band(y) {
                     self.set_cursor(cx, CursorShape::Text);
-                }
-                if open
-                    && let Some(root) = self.metrics.bar_hit(&self.menus.bar, x, y)
-                    && self.menus.nav.hover_root(&self.menus.bar, root)
-                {
-                    self.after_menu_change(cx);
                 }
             }
             PointerKind::Leave => {
@@ -312,21 +330,6 @@ impl IcedDemo {
                 button,
                 state: ButtonState::Pressed,
             } => {
-                if button == BTN_LEFT
-                    && let Some(root) = self.metrics.bar_hit(&self.menus.bar, x, y)
-                {
-                    if self.menus.nav.root() == Some(root) {
-                        self.menus.close_all(cx);
-                    } else {
-                        self.menus.nav.open(&self.menus.bar, root, false);
-                    }
-                    self.after_menu_change(cx);
-                    return;
-                }
-                if open {
-                    self.menus.close_all(cx);
-                    self.after_menu_change(cx);
-                }
                 self.chrome.queue_event(input::button_event(button, true));
             }
             PointerKind::Button { button, .. } => {
@@ -355,27 +358,19 @@ impl IcedDemo {
     }
 
     fn popup_pointer(&mut self, cx: &mut Ctx<'_>, level: usize, p: cosmix_wl_app::PointerEvent) {
-        let Some(entries) = self.menus.entries(level) else {
-            return;
-        };
-        let row = self.metrics.row_hit(entries, p.position.0, p.position.1);
-        match p.kind {
-            PointerKind::Enter | PointerKind::Motion => {
-                self.set_cursor(cx, CursorShape::Default);
-                if self.menus.nav.hover(&self.menus.bar, level, row) {
-                    self.after_menu_change(cx);
+        if matches!(p.kind, PointerKind::Enter | PointerKind::Motion) {
+            self.set_cursor(cx, CursorShape::Default);
+        }
+        // The panel widget hit-tests its own rows and reports them back.
+        for message in self.menus.pointer(cx, level, &p) {
+            match message {
+                PanelMsg::Hover(row) => {
+                    self.navigate(cx, |nav, state| nav.hover(state, level, row));
+                }
+                PanelMsg::Press(row) => {
+                    self.navigate(cx, |nav, state| nav.click(state, level, Some(row)));
                 }
             }
-            PointerKind::Button {
-                button: BTN_LEFT,
-                state: ButtonState::Pressed,
-            } => {
-                if let Some(row) = row {
-                    let outcome = self.menus.nav.click(&self.menus.bar, level, row);
-                    self.outcome(cx, outcome);
-                }
-            }
-            _ => {}
         }
     }
 

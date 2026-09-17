@@ -1,11 +1,13 @@
-//! The iced chrome: menu bar titles, a search field and a tab bar. Menu
-//! panels are not drawn here; they are separate popup surfaces.
+//! The iced chrome: a `cosmix-iced-widgets` menu bar in external-popup mode,
+//! a tab bar and a search field. Menu panels are not drawn here; the host
+//! shows each one on its own `xdg_popup` (see `popups.rs`).
 
-use crate::menus::Metrics;
+use super::app::Action;
 use cosmix_iced_host::core::widget::Id;
 use cosmix_iced_host::core::{Background, Border, Color, Length, alignment};
 use cosmix_iced_host::widget::{button, column, container, row, space, text};
 use cosmix_iced_host::{Element, Program};
+use cosmix_iced_widgets::menu::{Item, Menu, MenuState};
 use cosmix_iced_widgets::{MenuStyle, TextField, Tokens};
 use cosmix_wl_app::SurfaceInfo;
 
@@ -13,9 +15,9 @@ pub const SEARCH_ID: &str = "search";
 pub const TAB_HEIGHT: u32 = 30;
 const TAB_WIDTH: f32 = 120.0;
 
-/// Logical height of the whole chrome band.
-pub fn band_height(metrics: &Metrics) -> u32 {
-    metrics.bar_height as u32 + TAB_HEIGHT
+/// Logical height of the whole chrome band: the menu bar is one row tall.
+pub fn band_height(style: &MenuStyle) -> u32 {
+    style.row_height.ceil() as u32 + TAB_HEIGHT
 }
 
 /// The chrome surface for a window: physical width, physical band height
@@ -32,30 +34,42 @@ pub fn chrome_surface(info: &SurfaceInfo, band: u32) -> (u32, u32, f32) {
 pub enum ChromeMsg {
     Tab(usize),
     Search(String),
+    /// The bar published new menu state (opened, closed, another title).
+    Menu(MenuState),
+    /// A menu item was activated from the bar itself.
+    Action(Action),
+    /// A panel surface reports the row under the pointer (`None` off the
+    /// rows). The panel widget is generic over the item message type, so
+    /// these ride the same enum and only `PanelProgram` acts on them.
+    PanelHover(Option<usize>),
+    /// A panel surface reports a press on a row.
+    PanelPress(usize),
 }
 
 pub struct Chrome {
-    pub titles: Vec<String>,
+    /// The menu tree. The host borrows it for its `Navigator`.
+    pub items: Vec<Item<ChromeMsg>>,
+    /// Open state, owned here because the bar widget needs it every view.
+    pub menu_state: MenuState,
     pub tabs: Vec<String>,
     pub active: usize,
     pub search: String,
-    /// Bar title highlighted because its panel is open.
-    pub open_root: Option<usize>,
-    pub metrics: Metrics,
+    /// An action the bar activated, for the host to run.
+    pub pending: Option<Action>,
     pub tokens: Tokens,
     pub style: MenuStyle,
 }
 
 impl Chrome {
-    pub fn new(titles: Vec<String>, metrics: Metrics) -> Self {
+    pub fn new(items: Vec<Item<ChromeMsg>>) -> Self {
         let tokens = Tokens::default();
         Self {
-            titles,
+            items,
+            menu_state: MenuState::default(),
             tabs: (1..=3).map(|i| format!("Tab {i}")).collect(),
             active: 0,
             search: String::new(),
-            open_root: None,
-            metrics,
+            pending: None,
             tokens,
             style: tokens.menu_style(),
         }
@@ -77,34 +91,20 @@ impl Program for Chrome {
         match message {
             ChromeMsg::Tab(i) => self.active = i.min(self.tabs.len().saturating_sub(1)),
             ChromeMsg::Search(value) => self.search = value,
+            ChromeMsg::Menu(state) => self.menu_state = state,
+            ChromeMsg::Action(action) => self.pending = Some(action),
+            ChromeMsg::PanelHover(_) | ChromeMsg::PanelPress(_) => {}
         }
     }
 
     fn view(&self) -> Element<'_, ChromeMsg> {
-        let m = self.metrics;
         let style = self.style;
         let tokens = self.tokens;
-        let mut bar = row![space().width(m.bar_x as f32)];
-        for (i, title) in self.titles.iter().enumerate() {
-            let open = self.open_root == Some(i);
-            bar = bar.push(
-                container(text(title.as_str()).size(style.text_size))
-                    .width(m.bar_item_width as f32)
-                    .height(Length::Fill)
-                    .center_x(m.bar_item_width as f32)
-                    .align_y(alignment::Vertical::Center)
-                    .style(move |_| container::Style {
-                        text_color: Some(if open {
-                            style.selected_text
-                        } else {
-                            style.text
-                        }),
-                        background: open.then_some(Background::Color(style.selected)),
-                        border: Border::default().rounded(style.radius),
-                        ..container::Style::default()
-                    }),
-            );
-        }
+        let bar = Menu::bar(self.items.clone())
+            .style(style)
+            .external_popups(ChromeMsg::Menu)
+            .state(&self.menu_state);
+
         let search = TextField::new("Search", &self.search)
             .id(Self::search_id())
             .on_input(ChromeMsg::Search)
@@ -112,14 +112,8 @@ impl Program for Chrome {
             .size(style.text_size)
             .padding([2, 8])
             .style(move |_, status| tokens.text_input(status));
-        let bar = bar
-            .push(space().width(Length::Fill))
-            .push(search)
-            .push(space().width(6.0))
-            .height(m.bar_height as f32)
-            .align_y(alignment::Vertical::Center);
 
-        let mut tabs = row![].spacing(2.0).padding([0, m.bar_x as u16]);
+        let mut tabs = row![].spacing(2.0).padding([0, 4]);
         for (i, label) in self.tabs.iter().enumerate() {
             let active = i == self.active;
             tabs = tabs.push(
@@ -143,9 +137,14 @@ impl Program for Chrome {
                     }),
             );
         }
-        let tabs = container(tabs.height(Length::Fill))
-            .height(TAB_HEIGHT as f32)
-            .align_y(alignment::Vertical::Bottom);
+        let tabs = container(
+            tabs.push(space().width(Length::Fill))
+                .push(search)
+                .push(space().width(6.0))
+                .height(Length::Fill)
+                .align_y(alignment::Vertical::Center),
+        )
+        .height(TAB_HEIGHT as f32);
 
         container(column![bar, tabs])
             .width(Length::Fill)
@@ -165,7 +164,7 @@ mod tests {
 
     #[test]
     fn chrome_surface_follows_size_and_scale() {
-        let band = band_height(&Metrics::default());
+        let band = band_height(&MenuStyle::default());
         assert_eq!(band, 58);
         let info = SurfaceInfo::new((795, 447), Scale::Fractional(300));
         assert_eq!(chrome_surface(&info, band), (1988, 145, 2.5));

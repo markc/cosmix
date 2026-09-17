@@ -1,8 +1,8 @@
 //! Glue: cosmix-wl-app keyboard events to iced events and menu keys.
 
 use super::app::Action;
-use crate::menus::NavKey;
 use cosmix_iced_host::core::Event as IcedEvent;
+use cosmix_iced_host::core::keyboard as iced_keyboard;
 use cosmix_iced_host::keys::{self, KeyInput};
 use cosmix_wl_app::{KeyEvent, KeyState, Keysym, Modifiers};
 
@@ -28,23 +28,9 @@ pub fn key_event(key: &KeyEvent) -> IcedEvent {
     )
 }
 
-/// Menu navigation for a key while menus are open.
-pub fn nav_key(sym: Keysym) -> Option<NavKey> {
-    Some(match sym {
-        Keysym::Up => NavKey::Up,
-        Keysym::Down => NavKey::Down,
-        Keysym::Left => NavKey::Left,
-        Keysym::Right => NavKey::Right,
-        Keysym::Home => NavKey::Home,
-        Keysym::End => NavKey::End,
-        Keysym::Return | Keysym::KP_Enter | Keysym::space => NavKey::Enter,
-        Keysym::Escape => NavKey::Escape,
-        _ => return None,
-    })
-}
-
-pub fn is_f10(key: &KeyEvent) -> bool {
-    key.keysym == Keysym::F10 && !key.modifiers.ctrl && !key.modifiers.alt
+/// The logical key, for `Navigator::key`.
+pub fn logical_key(key: &KeyEvent) -> iced_keyboard::Key {
+    keys::key(key.keysym)
 }
 
 /// Ctrl+Shift+<letter>, matched on either case.
@@ -55,12 +41,8 @@ pub fn ctrl_shift(key: &KeyEvent, lower: Keysym, upper: Keysym) -> bool {
 /// Where a key goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
-    /// Menus are open and modal: navigate.
-    Menu(NavKey),
-    /// Menus are open and the key means nothing to them.
-    Swallow,
-    /// F10: open the first menu with its first row selected.
-    OpenBar,
+    /// Menus are open and modal: the navigator decides what the key means.
+    Menu,
     Shortcut(Action),
     /// To the chrome; if it does not capture the key and `then_grid`, to the
     /// grid. Releases only update the chrome's key state.
@@ -74,10 +56,9 @@ pub fn route(key: &KeyEvent, menus_open: bool) -> Route {
         return Route::Chrome { then_grid: false };
     }
     if menus_open {
-        return nav_key(key.keysym).map_or(Route::Swallow, Route::Menu);
-    }
-    if is_f10(key) {
-        return Route::OpenBar;
+        // Modal: the navigator takes every press, and ignores what it does
+        // not use. F10 is the exception the bar widget handles itself.
+        return Route::Menu;
     }
     let shortcuts = [
         (Keysym::c, Keysym::C, Action::Copy),
@@ -145,20 +126,22 @@ mod tests {
     }
 
     #[test]
-    fn routing_between_bar_popups_chrome_and_grid() {
+    fn routing_between_the_menus_the_chrome_and_the_grid() {
         let press = |sym| KeyEvent {
             modifiers: Modifiers::default(),
             ..key(sym, None, KeyState::Pressed)
         };
-        assert_eq!(route(&press(Keysym::F10), false), Route::OpenBar);
-        assert_eq!(route(&press(Keysym::Down), true), Route::Menu(NavKey::Down));
+        // With no menu open, F10 goes to the chrome: the bar widget opens
+        // itself and publishes the state (it owns the title anchors).
         assert_eq!(
-            route(&press(Keysym::Escape), true),
-            Route::Menu(NavKey::Escape)
+            route(&press(Keysym::F10), false),
+            Route::Chrome { then_grid: true }
         );
-        // Menus are modal: typing and F10 are swallowed while open.
-        assert_eq!(route(&press(Keysym::a), true), Route::Swallow);
-        assert_eq!(route(&press(Keysym::F10), true), Route::Swallow);
+        // Open menus are modal: every press goes to the navigator, which
+        // ignores the keys it has no use for.
+        for sym in [Keysym::Down, Keysym::Escape, Keysym::a, Keysym::F10] {
+            assert_eq!(route(&press(sym), true), Route::Menu);
+        }
         assert_eq!(
             route(&press(Keysym::a), false),
             Route::Chrome { then_grid: true }
@@ -175,15 +158,28 @@ mod tests {
         copy.modifiers.ctrl = true;
         copy.modifiers.shift = true;
         assert_eq!(route(&copy, false), Route::Shortcut(Action::Copy));
-        assert_eq!(route(&copy, true), Route::Swallow);
+        assert_eq!(route(&copy, true), Route::Menu, "modal beats a shortcut");
     }
 
     #[test]
-    fn menu_keys() {
-        assert_eq!(nav_key(Keysym::Down), Some(NavKey::Down));
-        assert_eq!(nav_key(Keysym::KP_Enter), Some(NavKey::Enter));
-        assert_eq!(nav_key(Keysym::a), None);
-        assert!(is_f10(&key(Keysym::F10, None, KeyState::Pressed)));
+    fn logical_keys_reach_the_navigator() {
+        use cosmix_iced_host::core::keyboard::key::Named;
+        assert_eq!(
+            logical_key(&key(Keysym::Down, None, KeyState::Pressed)),
+            iced_keyboard::Key::Named(Named::ArrowDown)
+        );
+        assert_eq!(
+            logical_key(&key(Keysym::Escape, None, KeyState::Pressed)),
+            iced_keyboard::Key::Named(Named::Escape)
+        );
+        assert_eq!(
+            logical_key(&key(Keysym::Return, None, KeyState::Pressed)),
+            iced_keyboard::Key::Named(Named::Enter)
+        );
+    }
+
+    #[test]
+    fn shortcut_keys() {
         let mut k = key(Keysym::C, None, KeyState::Pressed);
         assert!(!ctrl_shift(&k, Keysym::c, Keysym::C));
         k.modifiers.ctrl = true;
