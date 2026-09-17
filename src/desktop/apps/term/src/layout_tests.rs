@@ -137,13 +137,13 @@ fn layout_app() -> App {
         term: "xterm-256color",
     };
     app.insert_resource(Core(
-        Arc::new(Mutex::new(TabSet::with_settings(settings).unwrap())),
+        Arc::new(Mutex::new(TabSet::with_session(settings, None).unwrap())),
         cleanup,
     ))
     .insert_resource(Painter(Mutex::new(
         raster::Raster::new(1.0, settings.config.font_px, settings.config.cursor).unwrap(),
     )))
-    .insert_resource(settings)
+    .insert_resource(TermSettings(settings))
     .init_resource::<InputFocus>()
     .init_resource::<BetweenSchedules>()
     .insert_resource(View {

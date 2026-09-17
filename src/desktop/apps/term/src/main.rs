@@ -1,23 +1,12 @@
-mod bus;
-mod config;
 #[cfg(test)]
 mod config_precedence_tests;
-mod control;
 #[cfg(test)]
 mod input_tests;
 #[cfg(test)]
 mod layout_tests;
-mod metrics;
 mod mouse_input;
-mod native_session;
-mod panes;
-mod raster;
-mod session_fd;
-mod tabs;
-#[cfg(test)]
-#[path = "../../../vendor/teletypewriter/patch_guard.rs"]
-mod teletypewriter_patch_guard;
-mod terminal;
+
+use cosmix_term_core::{bus, config, native_session, panes, raster, session_fd, tabs};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -36,8 +25,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tabs::TabSet;
-use terminal::Key as TerminalKey;
+use cosmix_term_core::{tabs::TabSet, terminal::Key as TerminalKey};
 
 /// Event-order state, independent of ButtonInput's end-of-batch snapshot.
 #[derive(Resource, Default)]
@@ -96,6 +84,9 @@ struct Core(Arc<Mutex<TabSet>>, tabs::Cleanup);
 struct NotifyTx(Option<tokio::sync::mpsc::UnboundedSender<tabs::CompletionNote>>);
 #[derive(Resource)]
 struct Painter(Mutex<raster::Raster>);
+/// The core is Bevy-free, so its startup settings ride in this resource.
+#[derive(Resource, Clone, Copy)]
+struct TermSettings(config::Settings);
 #[derive(Component)]
 struct SquareButton;
 
@@ -312,7 +303,7 @@ fn main() {
         ..Default::default()
     };
     let mut app = App::new();
-    app.insert_resource(settings)
+    app.insert_resource(TermSettings(settings))
         .insert_resource(MenuKeymap::new(1, keymap))
         .insert_resource(Core(terminal.clone(), cleanup.clone()))
         .insert_resource(NotifyTx(notify_enabled.then_some(notify_tx)))
@@ -664,6 +655,8 @@ fn tab_action(id: &str, core: &Core) {
         _ => {}
     }
 }
+// Bevy injects these independent resources/queries as observer parameters.
+#[allow(clippy::too_many_arguments)]
 fn keyboard(
     mut event: On<FocusedInput<KeyboardInput>>,
     mut modifiers: ResMut<Modifiers>,
@@ -1088,7 +1081,7 @@ fn refresh(
     core: Res<Core>,
     notify: Res<NotifyTx>,
     painter: Res<Painter>,
-    settings: Res<config::Settings>,
+    settings: Res<TermSettings>,
     mut view: ResMut<View>,
     mut images: ResMut<Assets<Image>>,
     mut nodes: Query<(&ComputedNode, &UiGlobalTransform, &mut Node)>,
@@ -1125,6 +1118,7 @@ fn refresh(
     let origin = centre_transform.affine().translation * inv - centre.size() * inv / 2.0;
     let scale = if inv > 0.0 { 1.0 / inv } else { 1.0 };
     if (scale - view.scale).abs() > 0.01 {
+        let settings = settings.0;
         match raster::Raster::new(scale, settings.config.font_px, settings.config.cursor) {
             Ok(next) => {
                 *painter = next;

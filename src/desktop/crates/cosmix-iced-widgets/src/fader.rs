@@ -7,7 +7,7 @@ use iced_core::{Element, Event, Length, Point, Rectangle, Size, keyboard};
 
 use crate::AudioStyle;
 use crate::audio_style::quad;
-use crate::scale::{db_to_position, position_to_db};
+use crate::scale::Taper;
 
 const THUMB_HEIGHT: f32 = 14.0;
 /// Shift divides pointer travel by this.
@@ -17,7 +17,8 @@ pub(crate) const FINE_DIVISOR: f32 = 10.0;
 ///
 /// Dragging is relative (pressing never jumps the value); holding Shift while
 /// dragging moves ten times slower. A double-click resets to the default
-/// (0 dB unless set). Travel follows `scale::db_to_position`.
+/// (0 dB unless set). Travel follows the taper, `scale::Taper::DEFAULT`
+/// unless the host supplies one.
 pub struct Fader<'a, Message> {
     value_db: f32,
     default_db: f32,
@@ -26,6 +27,7 @@ pub struct Fader<'a, Message> {
     width: f32,
     height: Length,
     style: AudioStyle,
+    taper: Taper<'a>,
 }
 
 impl<'a, Message> Fader<'a, Message> {
@@ -39,6 +41,7 @@ impl<'a, Message> Fader<'a, Message> {
             width: 28.0,
             height: Length::Fixed(160.0),
             style: AudioStyle::default(),
+            taper: Taper::DEFAULT,
         }
     }
 
@@ -75,6 +78,13 @@ impl<'a, Message> Fader<'a, Message> {
     /// Colours; see `Tokens::audio_style`.
     pub fn style(mut self, style: AudioStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    /// The gain taper. The travel, the unity tick and a neighbouring
+    /// `LevelMeter` given the same taper all follow it.
+    pub fn taper(mut self, taper: Taper<'a>) -> Self {
+        self.taper = taper;
         self
     }
 }
@@ -198,7 +208,7 @@ impl<Message: Clone, Theme, Renderer: renderer::Renderer> Widget<Message, Theme,
                 } else {
                     state.drag = Some(Drag::new(
                         position.y,
-                        db_to_position(self.value_db),
+                        self.taper.position(self.value_db),
                         state.modifiers.shift(),
                     ));
                 }
@@ -210,10 +220,10 @@ impl<Message: Clone, Theme, Renderer: renderer::Renderer> Widget<Message, Theme,
                 if let Some(drag) = &mut state.drag
                     && let Some(position) = cursor.position()
                 {
-                    let current = db_to_position(self.value_db);
+                    let current = self.taper.position(self.value_db);
                     let next =
                         drag.value(position.y, current, state.modifiers.shift(), travel(bounds));
-                    let db = position_to_db(next);
+                    let db = self.taper.db(next);
                     if db != self.value_db {
                         self.value_db = db;
                         shell.publish(on_change(db));
@@ -253,7 +263,7 @@ impl<Message: Clone, Theme, Renderer: renderer::Renderer> Widget<Message, Theme,
     ) {
         let bounds = layout.bounds();
         let style = self.style;
-        let position = db_to_position(self.value_db);
+        let position = self.taper.position(self.value_db);
         let thumb = thumb_rect(bounds, position);
         let track = Rectangle {
             x: bounds.center_x() - 2.0,
@@ -274,7 +284,7 @@ impl<Message: Clone, Theme, Renderer: renderer::Renderer> Widget<Message, Theme,
             2.0,
             None,
         );
-        let unity = thumb_rect(bounds, db_to_position(0.0)).center_y();
+        let unity = thumb_rect(bounds, self.taper.position(0.0)).center_y();
         quad(
             renderer,
             Rectangle {

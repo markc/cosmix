@@ -100,34 +100,37 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | crate | version |
 |---|---|
 | `cosmix-bg-boing` | 0.1.0 |
-| `cosmix-bg-showcase` | 0.2.4 |
-| `cosmix-busviewer` | 0.1.0 |
+| `cosmix-bg-showcase` | 0.2.5 |
+| `cosmix-busviewer` | 0.1.1 |
 | `cosmix-capture` | 0.1.2 |
 | `cosmix-comp` | 0.57.0 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
 | `cosmix-flock` | 0.1.0 |
-| `cosmix-imeprobe` | 0.1.0 |
+| `cosmix-iced-widgets` | 0.1.0 |
+| `cosmix-imeprobe` | 0.2.0 |
 | `cosmix-interactgui` | 0.1.2 |
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
-| `cosmix-quoin` | 0.11.0 |
+| `cosmix-quoin` | 0.12.3 |
 | `cosmix-scene` | 0.1.1 |
-| `cosmix-shell` | 0.8.6 |
-| `cosmix-shell-host` | 0.6.6 |
+| `cosmix-scene-bevy` | 0.1.3 |
+| `cosmix-shell` | 0.11.0 |
+| `cosmix-shell-host` | 0.6.10 |
 | `cosmix-studio` | 0.4.7 |
-| `cosmix-term` | 0.8.5 |
+| `cosmix-term` | 0.8.6 |
+| `cosmix-term-core` | 0.1.0 |
 | `cosmix-tower` | 0.5.4 |
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
 | `cosmix-wallpaper` | 0.2.0 |
 | `cosmix-wgpu-dmabuf` | 0.16.1 |
 | `cosmix-wl-dnd` | 0.4.2 |
-| `ctk` | 0.54.4 |
+| `ctk` | 0.56.0 |
 | `spike-wl-dnd` | 0.1.0 |
 | `term-native-test-broker` | 0.0.0 |
 
 ---
 
-52 crates in `$COSMIX/src` and 28 in the separate `$COSMIX/src/desktop` workspace.
+52 crates in `$COSMIX/src` and 31 in the separate `$COSMIX/src/desktop` workspace.

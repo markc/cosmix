@@ -1,4 +1,5 @@
-use crate::{Core, Modifiers, Painter, View, terminal::MouseModifiers};
+use crate::{Core, Modifiers, Painter, View};
+use cosmix_term_core::terminal::MouseModifiers;
 use bevy::{ecs::system::SystemParam, input::mouse::MouseScrollUnit, prelude::*};
 
 #[derive(Component, Default)]

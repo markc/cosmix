@@ -26,6 +26,7 @@ members = [
     "crates/cosmix-comp",
     "crates/cosmix-deco",
     "crates/cosmix-shell",
+    "crates/cosmix-term-core",
     "crates/cosmix-shell-host",
     "crates/cosmix-flock",
     "crates/cosmix-bg-boing",

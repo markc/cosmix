@@ -1,9 +1,9 @@
-//! Compiled by cosmix-term's test target, never by vendored production code.
+//! Compiled by cosmix-term-core's test target, never by vendored production code.
 use sha2::{Digest, Sha256};
 
 const RECORD: &str = include_str!("patch-record.json");
 const SOURCE: &str = include_str!("src/unix/mod.rs");
-const TERM: &str = include_str!("../../apps/term/Cargo.toml");
+const TERM: &str = include_str!("../../crates/cosmix-term-core/Cargo.toml");
 const VENDOR: &str = include_str!("Cargo.toml");
 const WORKSPACE: &str = include_str!("../../Cargo.toml");
 const REV_MOVED: &str = "upstream rev moved: re-diff the patch, update the recorded hash; see README.teletypewriter-patch.md";

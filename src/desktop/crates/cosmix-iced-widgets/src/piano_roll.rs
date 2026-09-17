@@ -36,6 +36,10 @@ pub struct Note {
     pub length: f32,
     pub pitch: u8,
     pub velocity: u8,
+    /// Which track this note belongs to; picks its colour from the roll's
+    /// palette (`PianoRoll::track_colours`), wrapping when there are more
+    /// tracks than colours. Leave it 0 when every note is the same colour.
+    pub track: u16,
 }
 
 /// An immutable, start-sorted note set. Build it once per song edit; the roll
@@ -207,20 +211,24 @@ impl RollView {
     }
 }
 
-/// Tile-local rectangles for tile `index`, grouped by velocity level. Notes
-/// are clipped to the tile. Notes narrower than a pixel collapse onto one
-/// pixel column, and each (column, pitch) is emitted once, so sub-pixel notes
-/// in a zoomed-out dense song cost at most one rectangle per pixel per row.
+/// Tile-local rectangles for tile `index`, grouped by track colour and then
+/// velocity level: group `colour * VELOCITY_LEVELS + level`, with `colours`
+/// track colours (1 when the roll has no palette). Notes are clipped to the
+/// tile. Notes narrower than a pixel collapse onto one pixel column, and each
+/// (column, pitch) is emitted once, so sub-pixel notes in a zoomed-out dense
+/// song cost at most one rectangle per pixel per row.
 pub(crate) fn tile_rects(
     notes: &RollNotes,
     pixels_per_beat: f32,
     row_height: f32,
     index: i64,
-) -> [Vec<Rectangle>; VELOCITY_LEVELS] {
+    colours: usize,
+) -> Vec<Vec<Rectangle>> {
+    let colours = colours.max(1);
     let x0 = index as f32 * TILE_WIDTH;
     let columns = TILE_WIDTH as usize;
     let mut covered = vec![0u64; (columns * PITCHES).div_ceil(64)];
-    let mut out: [Vec<Rectangle>; VELOCITY_LEVELS] = Default::default();
+    let mut out: Vec<Vec<Rectangle>> = vec![Vec::new(); colours * VELOCITY_LEVELS];
     let height = (row_height - 1.0).max(1.0);
     for (_, note) in notes.visible(x0 / pixels_per_beat, (x0 + TILE_WIDTH) / pixels_per_beat) {
         let start = (note.start * pixels_per_beat - x0).max(0.0);
@@ -247,7 +255,7 @@ pub(crate) fn tile_rects(
             };
             Rectangle::new(Point::new(start, y), Size::new(width, height))
         };
-        out[level].push(rect);
+        out[usize::from(note.track) % colours * VELOCITY_LEVELS + level].push(rect);
     }
     out
 }
@@ -320,6 +328,7 @@ struct RollState<Renderer: geometry::Renderer> {
     tiles: RefCell<TileSet<Renderer>>,
     generation: u64,
     style: AudioStyle,
+    colours: Vec<Color>,
     modifiers: keyboard::Modifiers,
 }
 
@@ -337,6 +346,7 @@ pub struct PianoRoll<'a, Message> {
     width: Length,
     height: Length,
     style: AudioStyle,
+    track_colours: &'a [Color],
 }
 
 impl<'a, Message> PianoRoll<'a, Message> {
@@ -348,6 +358,7 @@ impl<'a, Message> PianoRoll<'a, Message> {
             playhead: None,
             on_view: None,
             on_note: None,
+            track_colours: &[],
             width: Length::Fill,
             height: Length::Fill,
             style: AudioStyle::default(),
@@ -389,6 +400,14 @@ impl<'a, Message> PianoRoll<'a, Message> {
         self.style = style;
         self
     }
+
+    /// One colour per track; `Note::track` picks from it, wrapping. Empty
+    /// (the default) draws every note in `AudioStyle::note`. Velocity still
+    /// sets the alpha. Changing the palette redraws the cached tiles.
+    pub fn track_colours(mut self, colours: &'a [Color]) -> Self {
+        self.track_colours = colours;
+        self
+    }
 }
 
 fn is_black_key(pitch: u8) -> bool {
@@ -418,16 +437,21 @@ where
             tiles: RefCell::new(TileSet::new()),
             generation: self.notes.generation,
             style: self.style,
+            colours: self.track_colours.to_vec(),
             modifiers: keyboard::Modifiers::empty(),
         })
     }
 
     fn diff(&self, tree: &mut Tree) {
         let state = tree.state.downcast_mut::<RollState<Renderer>>();
-        if state.generation != self.notes.generation || state.style != self.style {
+        if state.generation != self.notes.generation
+            || state.style != self.style
+            || state.colours != self.track_colours
+        {
             state.tiles.get_mut().clear();
             state.generation = self.notes.generation;
             state.style = self.style;
+            state.colours = self.track_colours.to_vec();
         }
     }
 
@@ -577,18 +601,28 @@ where
             for index in first..=last {
                 let (cache, _) = tiles.get(view.key(), index);
                 let geometry = cache.draw(renderer, tile_size, |frame| {
-                    let levels =
-                        tile_rects(self.notes, view.pixels_per_beat, view.row_height, index);
-                    for (level, rects) in levels.iter().enumerate() {
+                    let groups = tile_rects(
+                        self.notes,
+                        view.pixels_per_beat,
+                        view.row_height,
+                        index,
+                        self.track_colours.len(),
+                    );
+                    for (group, rects) in groups.iter().enumerate() {
                         if rects.is_empty() {
                             continue;
                         }
+                        let base = self
+                            .track_colours
+                            .get(group / VELOCITY_LEVELS)
+                            .copied()
+                            .unwrap_or(style.note);
                         let path = Path::new(|builder| {
                             for rect in rects {
                                 builder.rectangle(rect.position(), rect.size());
                             }
                         });
-                        frame.fill(&path, velocity_colour(style.note, level));
+                        frame.fill(&path, velocity_colour(base, group % VELOCITY_LEVELS));
                     }
                 });
                 let offset = Vector::new(
@@ -661,6 +695,17 @@ mod tests {
             length,
             pitch,
             velocity: 100,
+            track: 0,
+        }
+    }
+
+    fn tracked(start: f32, pitch: u8, track: u16) -> Note {
+        Note {
+            start,
+            length: 1.0,
+            pitch,
+            velocity: 100,
+            track,
         }
     }
 
@@ -680,6 +725,7 @@ mod tests {
                     length: 0.05 + (next() % 4000) as f32 / 1000.0,
                     pitch: (next() % 128) as u8,
                     velocity: (next() % 128) as u8,
+                    track: (next() % 32) as u16,
                 })
                 .collect(),
         )
@@ -784,17 +830,15 @@ mod tests {
     fn tiles_clip_notes_and_collapse_dense_columns() {
         // A note spanning two tiles appears in both, clipped at the seam.
         let notes = RollNotes::new(vec![note(0.0, 20.0, 0)]);
-        let left = tile_rects(&notes, 40.0, 10.0, 0);
-        let right = tile_rects(&notes, 40.0, 10.0, 1);
-        let all = |levels: &[Vec<Rectangle>; VELOCITY_LEVELS]| {
-            levels.iter().flatten().copied().collect::<Vec<_>>()
-        };
+        let left = tile_rects(&notes, 40.0, 10.0, 0, 0);
+        let right = tile_rects(&notes, 40.0, 10.0, 1, 0);
+        let all = |groups: &[Vec<Rectangle>]| groups.iter().flatten().copied().collect::<Vec<_>>();
         assert_eq!(all(&left).len(), 1);
         assert_eq!(all(&left)[0].x, 0.0);
         assert_eq!(all(&left)[0].x + all(&left)[0].width, TILE_WIDTH - 1.0);
         assert_eq!(all(&right)[0].x, 0.0);
         assert_eq!(all(&right)[0].y, 1270.0);
-        assert!(all(&tile_rects(&notes, 40.0, 10.0, 2)).is_empty());
+        assert!(all(&tile_rects(&notes, 40.0, 10.0, 2, 0)).is_empty());
 
         // 1000 short notes on one pitch within one pixel become one rect.
         let dense_column = RollNotes::new(
@@ -802,13 +846,54 @@ mod tests {
                 .map(|i| note(i as f32 * 0.0001, 0.00005, 5))
                 .collect(),
         );
-        assert_eq!(all(&tile_rects(&dense_column, 1.0, 8.0, 0)).len(), 1);
+        assert_eq!(all(&tile_rects(&dense_column, 1.0, 8.0, 0, 0)).len(), 1);
 
         // Zoomed right out, a whole dense song costs at most a pixel per row.
         let song = dense(131_072);
-        let count = all(&tile_rects(&song, MIN_PIXELS_PER_BEAT, 8.0, 0)).len();
+        let count = all(&tile_rects(&song, MIN_PIXELS_PER_BEAT, 8.0, 0, 0)).len();
         assert!(count <= TILE_WIDTH as usize * PITCHES, "{count}");
         assert!(count > 0);
+    }
+
+    #[test]
+    fn tracks_group_by_colour_then_velocity_and_wrap() {
+        let notes = RollNotes::new(vec![
+            tracked(0.0, 60, 0),
+            tracked(2.0, 61, 1),
+            // Track 3 wraps onto colour 1 with three colours.
+            tracked(4.0, 62, 3),
+        ]);
+        let groups = tile_rects(&notes, 8.0, 10.0, 0, 3);
+        assert_eq!(groups.len(), 3 * VELOCITY_LEVELS);
+        let per_colour: Vec<usize> = groups
+            .chunks(VELOCITY_LEVELS)
+            .map(|chunk| chunk.iter().map(Vec::len).sum())
+            .collect();
+        // Tracks 0 and 3 share colour 0; track 1 has colour 1; colour 2 is unused.
+        assert_eq!(per_colour, [2, 1, 0]);
+        // Velocity still splits within a colour.
+        let quiet = RollNotes::new(vec![
+            Note {
+                velocity: 0,
+                ..tracked(0.0, 60, 0)
+            },
+            Note {
+                velocity: 127,
+                ..tracked(2.0, 60, 0)
+            },
+        ]);
+        let groups = tile_rects(&quiet, 8.0, 10.0, 0, 1);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[VELOCITY_LEVELS - 1].len(), 1);
+        // Without a palette every note lands in one colour group.
+        let groups = tile_rects(&notes, 8.0, 10.0, 0, 0);
+        assert_eq!(groups.len(), VELOCITY_LEVELS);
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 3);
+        // Velocity alpha rides on whatever colour the track picked.
+        let base = Color::from_rgb8(10, 20, 30);
+        assert_eq!(velocity_colour(base, VELOCITY_LEVELS - 1).a, base.a);
+        assert!(velocity_colour(base, 0).a < base.a);
+        assert_eq!(velocity_colour(base, 0).r, base.r);
     }
 
     #[test]
