@@ -89,7 +89,8 @@ impl SceneStore {
                 (0, reply.to_string())
             }
             Err(error) => {
-                if changes_scene {
+                // A refused adapter never reached the document: nothing changed.
+                if changes_scene && error["code"] != ADAPTER_NOT_BUILT {
                     let name = error["scene"].as_str().or_else(|| args["scene"].as_str());
                     let revision = name
                         .and_then(|name| self.revisions.get(name))
@@ -127,7 +128,10 @@ impl SceneStore {
                     Some("bevy") => Some(None),
                     Some(name) if self.adapters.contains(name) => Some(Some(name.to_owned())),
                     Some(name) => {
-                        return Err(json!({"error":format!("scene adapter {name} is not built")}));
+                        return Err(json!({
+                            "code": ADAPTER_NOT_BUILT,
+                            "error": format!("scene adapter {name} is not built")
+                        }));
                     }
                 };
                 let document = cosmix_scene::parse(body).map_err(|d| json!({"diagnostics":d}))?;
@@ -273,6 +277,8 @@ impl SceneStore {
     }
 }
 
+const ADAPTER_NOT_BUILT: &str = "adapter-not-built";
+
 fn digest(tree: &ResolvedScene) -> String {
     format!("{:x}", Sha256::digest(serde_json::to_vec(tree).unwrap()))
 }
@@ -378,6 +384,26 @@ mod tests {
             .unwrap();
         assert_eq!(store.adapter_scenes("iced").count(), 0);
         assert_eq!(store.scenes["conformance"].revision, 3);
+    }
+
+    #[test]
+    fn unbuilt_adapter_is_refused_without_a_change_summary() {
+        let (bridge, peer) = ctk::bus::test_bridge("test");
+        let mut store = SceneStore::default();
+        let (rc, reply) = store.dispatch(
+            SceneVerb::Load,
+            FIXTURE,
+            &json!({"adapter": "nope"}),
+            &bridge,
+        );
+        assert_eq!(rc, 10, "{reply}");
+        assert!(peer.drain_publishes().is_empty());
+        // A load that fails validation still reports its diagnostics.
+        let (rc, _) = store.dispatch(SceneVerb::Load, "bad", &Value::Null, &bridge);
+        assert_eq!(rc, 10);
+        let published = peer.drain_publishes();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].command, "shell.scene.changed");
     }
 
     #[test]

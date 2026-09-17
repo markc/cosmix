@@ -27,7 +27,14 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_factory(None)
+    }
+
+    fn with_factory(factory: Option<SceneIcedFactory>) -> Self {
         let mut app = App::new();
+        if let Some(factory) = factory {
+            app.insert_non_send(factory);
+        }
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<Image>()
             .add_plugins(SceneIcedPlugin)
@@ -96,17 +103,28 @@ impl Harness {
         position: Vec2,
         action: PointerAction,
     ) {
+        self.pointer_as(PointerId::Mouse, window, over, position, action);
+    }
+
+    fn pointer_as(
+        &mut self,
+        pointer: PointerId,
+        window: Option<Entity>,
+        over: bool,
+        position: Vec2,
+        action: PointerAction,
+    ) {
         let camera = Entity::PLACEHOLDER;
         let mut hover = HoverMap::default();
         let mut hits = bevy::ecs::entity::EntityHashMap::default();
         if over {
             hits.insert(self.surface, HitData::new(camera, 0.0, None, None));
         }
-        hover.insert(PointerId::Mouse, hits);
+        hover.insert(pointer, hits);
         let world = self.app.world_mut();
         world.insert_resource(hover);
         world.write_message(PointerInput::new(
-            PointerId::Mouse,
+            pointer,
             Location {
                 target: match window {
                     Some(window) => NormalizedRenderTarget::Window(
@@ -525,7 +543,7 @@ fn hovered_surface_drives_the_cursor_shape_and_leaving_resets_it() {
     use cosmix_shell::runtime::{CursorShape, CursorShapeRequest};
     let mut h = Harness::new();
     h.run(3);
-    let shape = |h: &Harness| h.app.world().resource::<CursorShapeRequest>().0;
+    let shape = |h: &Harness| h.app.world().resource::<CursorShapeRequest>().shape;
     assert_eq!(shape(&h), CursorShape::Default);
     h.pointer(
         true,
@@ -542,7 +560,11 @@ fn hovered_surface_drives_the_cursor_shape_and_leaving_resets_it() {
     h.run(2);
     assert_eq!(shape(&h), CursorShape::Default);
     // Another owner's request is not overwritten while no surface is hovered.
-    h.app.world_mut().resource_mut::<CursorShapeRequest>().0 = CursorShape::Pointer;
+    let ctk = h.app.world_mut().spawn_empty().id();
+    h.app
+        .world_mut()
+        .resource_mut::<CursorShapeRequest>()
+        .set(ctk, CursorShape::Pointer);
     h.run(5);
     assert_eq!(shape(&h), CursorShape::Pointer);
 }
@@ -591,4 +613,248 @@ fn captured_pointer_ignores_positions_from_another_window() {
     );
     h.run(2);
     assert_eq!(h.totals().bytes_queued - before.bytes_queued, 36 * 36 * 4);
+}
+
+// ---- review round 1 ----
+
+#[test]
+fn texture_added_event_is_emitted_in_the_allocating_update() {
+    let mut h = Harness::new();
+    // Harness::new sets the geometry after its first update, so this update
+    // allocates. Its Added event must be emitted by this update's
+    // `asset_events` (counted in Last), so render extraction sees the image
+    // in the same frame.
+    h.app.update();
+    let current = h.app.world().resource::<SceneIcedCounters>().current;
+    assert_eq!(current.allocations, 1);
+    assert_eq!(current.own_added, 1);
+}
+
+#[test]
+fn frame_is_ordered_before_asset_events() {
+    use bevy::app::PostUpdate;
+    use bevy::asset::AssetEventSystems;
+    use bevy::ecs::schedule::Schedules;
+    let build = |opposite: bool| {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .add_plugins(SceneIcedPlugin);
+        if opposite {
+            // Contradicts the plugin's constraint: only a cycle if it exists.
+            app.add_systems(
+                PostUpdate,
+                (|| {})
+                    .after(AssetEventSystems)
+                    .before(crate::bridge::frame),
+            );
+        }
+        app.finish();
+        app.cleanup();
+        let world = app.world_mut();
+        world.resource_scope(|world, mut schedules: Mut<Schedules>| {
+            schedules
+                .get_mut(PostUpdate)
+                .unwrap()
+                .initialize(world)
+                .map_err(|error| format!("{error:?}"))
+        })
+    };
+    assert_eq!(build(false), Ok(()));
+    let error = build(true).unwrap_err();
+    assert!(error.contains("Cycle"), "{error}");
+}
+
+#[test]
+fn a_surface_that_cannot_draw_drops_its_ime_target_and_keeps_its_repaint() {
+    use crate::gpu::GpuChannel;
+    use cosmix_shell::runtime::ExternalImeTarget;
+    let mut h = Harness::new();
+    let channel = GpuChannel::default();
+    h.app.insert_resource(channel.clone());
+    h.run(3);
+    h.app
+        .world_mut()
+        .resource_mut::<InputFocus>()
+        .set(h.surface, FocusCause::Navigated);
+    h.run(2);
+    let target = |h: &Harness| {
+        h.app
+            .world()
+            .get::<ExternalImeTarget>(h.surface)
+            .unwrap()
+            .clone()
+    };
+    assert!(target(&h).enabled);
+
+    // The surface loses its size (e.g. not laid out) while a repaint arrives.
+    let mut views = h.app.world_mut().query::<&ImageNode>();
+    let image = views.single(h.app.world()).unwrap().image.id();
+    h.geometry(0, 0, 1.5);
+    channel.0.request_repaint(image);
+    let before = h.totals();
+    h.run(3);
+    assert_eq!(target(&h), ExternalImeTarget::default());
+    assert_eq!(h.focus().ime, None);
+    assert_eq!(h.totals().draws, before.draws);
+    assert!(
+        channel.0.take_repaints().is_empty(),
+        "consumed by the frame"
+    );
+
+    // Same size again: the repaint was kept, so the whole surface is uploaded.
+    h.geometry(200, 100, 1.5);
+    h.run(2);
+    let after = h.totals();
+    assert_eq!(after.allocations, before.allocations);
+    assert!(after.bytes_queued - before.bytes_queued >= 200 * 100 * 4);
+    assert_eq!(
+        h.app.world().resource::<SceneIcedCounters>().last_rects,
+        vec![Rect::new(0, 0, 200, 100)]
+    );
+    assert!(target(&h).enabled);
+}
+
+type Log = std::sync::Arc<std::sync::Mutex<Vec<crate::surface::SurfaceEvent>>>;
+
+struct Recorder(Log);
+
+impl crate::surface::SurfaceRenderer for Recorder {
+    fn resize(&mut self, _: u32, _: u32, _: f32) {}
+    fn queue(&mut self, event: crate::surface::SurfaceEvent) {
+        self.0.lock().unwrap().push(event);
+    }
+    fn process(&mut self, _: Duration) -> crate::surface::Processed {
+        crate::surface::Processed::default()
+    }
+    fn draw(&mut self, _: &mut [u8], _: u32, _: u32, _: u32) -> Vec<Rect> {
+        Vec::new()
+    }
+}
+
+fn recording() -> (Harness, Log) {
+    let log = Log::default();
+    let sink = log.clone();
+    let factory = SceneIcedFactory(Box::new(move |_| Box::new(Recorder(sink.clone()))));
+    let mut h = Harness::with_factory(Some(factory));
+    h.run(2);
+    log.lock().unwrap().clear();
+    (h, log)
+}
+
+fn take(log: &Log) -> Vec<crate::surface::SurfaceEvent> {
+    std::mem::take(&mut *log.lock().unwrap())
+}
+
+#[test]
+fn captures_are_per_pointer() {
+    use crate::surface::SurfaceEvent as E;
+    let (mut h, log) = recording();
+    let at = Vec2::new(40.0, 60.0);
+    h.pointer(true, at, PointerAction::Press(PointerButton::Primary));
+    h.run(1);
+    // A second pointer presses and releases on the same surface.
+    let touch = PointerId::Touch(1);
+    h.pointer_as(
+        touch,
+        None,
+        true,
+        at,
+        PointerAction::Press(PointerButton::Primary),
+    );
+    h.run(1);
+    h.pointer_as(
+        touch,
+        None,
+        true,
+        at,
+        PointerAction::Release(PointerButton::Primary),
+    );
+    h.run(1);
+    take(&log);
+    // The mouse is still captured: motion outside keeps reaching the surface.
+    h.pointer(
+        false,
+        Vec2::new(500.0, 300.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(1);
+    let events = take(&log);
+    assert_eq!(
+        events,
+        vec![E::PointerMoved {
+            x: 500.0 * 1.5 - 10.0,
+            y: 300.0 * 1.5 - 20.0
+        }]
+    );
+}
+
+#[test]
+fn a_release_outside_leaves_once() {
+    use crate::surface::SurfaceEvent as E;
+    let (mut h, log) = recording();
+    h.pointer(
+        true,
+        Vec2::new(40.0, 60.0),
+        PointerAction::Press(PointerButton::Primary),
+    );
+    h.run(1);
+    let outside = Vec2::new(500.0, 300.0);
+    h.pointer(false, outside, PointerAction::Move { delta: Vec2::ZERO });
+    h.run(1);
+    h.pointer(
+        false,
+        outside,
+        PointerAction::Release(PointerButton::Primary),
+    );
+    h.run(1);
+    h.pointer(false, outside, PointerAction::Move { delta: Vec2::ZERO });
+    h.run(1);
+    h.pointer(false, outside, PointerAction::Move { delta: Vec2::ZERO });
+    h.run(1);
+    let leaves = take(&log)
+        .into_iter()
+        .filter(|event| *event == E::PointerLeft)
+        .count();
+    assert_eq!(leaves, 1);
+}
+
+#[test]
+fn leaving_a_surface_does_not_clobber_another_sources_cursor() {
+    use cosmix_shell::runtime::{CursorShape, CursorShapeRequest};
+    let mut h = Harness::new();
+    h.run(3);
+    h.pointer(
+        true,
+        Vec2::new(40.0, 60.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    let request = *h.app.world().resource::<CursorShapeRequest>();
+    assert_eq!(
+        request,
+        CursorShapeRequest {
+            shape: CursorShape::Text,
+            owner: Some(h.surface)
+        }
+    );
+    // In one update: CTK takes the cursor and the pointer leaves the surface.
+    let ctk = h.app.world_mut().spawn_empty().id();
+    h.app
+        .world_mut()
+        .resource_mut::<CursorShapeRequest>()
+        .set(ctk, CursorShape::Pointer);
+    h.pointer(
+        false,
+        Vec2::new(500.0, 500.0),
+        PointerAction::Move { delta: Vec2::ZERO },
+    );
+    h.run(2);
+    assert_eq!(
+        *h.app.world().resource::<CursorShapeRequest>(),
+        CursorShapeRequest {
+            shape: CursorShape::Pointer,
+            owner: Some(ctk)
+        }
+    );
 }

@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-scene-iced"
-version = "0.2.0"
+version = "0.2.1"
 description = "Mix Scenes adapter drawing through a CPU surface renderer into a persistent Bevy texture"
 edition = "2024"
 rust-version = "1.95"
@@ -16,3 +16,4 @@ serde_json = "1"
 
 [dev-dependencies]
 ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }
+wgpu = { version = "=29.0.4", features = ["noop"] }

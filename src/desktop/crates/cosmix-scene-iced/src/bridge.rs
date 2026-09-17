@@ -18,7 +18,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::ui::widget::NodeImageMode;
 use bevy::ui::{ComputedUiRenderTargetInfo, ComputedUiTargetCamera, UiGlobalTransform};
-use bevy::window::WindowRef;
+use bevy::window::{RequestRedraw, WindowRef};
 use cosmix_scene::ResolvedScene;
 use cosmix_scene_bevy::{SceneStore, register_scene_page, scene_edge, scene_page_id};
 use cosmix_shell::core::Edge;
@@ -111,18 +111,18 @@ pub struct ImeOutput {
 /// Keyboard focus and IME state of the iced surfaces.
 ///
 /// `owner` is the surface holding Bevy's `InputFocus`. Keyboard input and
-/// IME preedit/commit are routed to it only. `ime` is its current request;
-/// `None` means disabled. The layer host's text-input-v3 bridge enables the
-/// protocol only for a focused `EditableText`, so nothing consumes `ime` in
-/// Quoin yet and no `Ime` messages arrive for a surface: this is the seam.
+/// `ExternalImeEvent`s are routed to it only. `ime` is its current request
+/// (`None` means disabled); the same request is published on the surface as
+/// `ExternalImeTarget`, which the layer host's text-input-v3 bridge serves.
 #[derive(Resource, Default, Debug)]
 pub struct SceneIcedFocus {
     pub owner: Option<Entity>,
     pub scene: Option<String>,
     pub ime: Option<ImeOutput>,
-    /// The cursor shape asked for by the hovered surface (not applied: the
-    /// layer host has no cursor-shape support).
+    /// The cursor shape asked for by the hovered surface; it is published as
+    /// `CursorShapeRequest` with that surface as owner.
     pub cursor: Option<CursorIcon>,
+    cursor_owner: Option<Entity>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -412,6 +412,11 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
     page.id()
 }
 
+/// Surface placement from UI layout. Assumes `UiScale` is 1: the target's
+/// scale factor is then the window's, which is also what pointer positions
+/// (window-logical) must be multiplied by. The window is resolved only for
+/// cameras targeting `WindowRef::Entity`, as Quoin's panels do; a primary-
+/// window camera leaves `window` unset and disables the capture window check.
 pub(crate) fn geometry(
     mut surfaces: Query<
         (
@@ -449,7 +454,7 @@ pub(crate) fn geometry(
 
 #[derive(Default)]
 pub(crate) struct PointerRoute {
-    capture: Option<(PointerId, Entity)>,
+    capture: HashMap<PointerId, Entity>,
     over: HashMap<PointerId, Entity>,
 }
 
@@ -466,10 +471,7 @@ pub(crate) fn route_pointer(
             .as_ref()
             .and_then(|map| map.get(&pointer))
             .and_then(|hits| hits.keys().copied().find(|e| surfaces.contains(*e)));
-        let captured = route
-            .capture
-            .filter(|(id, _)| *id == pointer)
-            .map(|(_, entity)| entity);
+        let captured = route.capture.get(&pointer).copied();
         let event_window = match &input.location.target {
             NormalizedRenderTarget::Window(window) => Some(window.entity()),
             _ => None,
@@ -514,7 +516,7 @@ pub(crate) fn route_pointer(
                         );
                     }
                     route.over.remove(&pointer);
-                    route.capture = None;
+                    route.capture.remove(&pointer);
                     continue;
                 }
                 PointerAction::Press(_) | PointerAction::Cancel => {}
@@ -553,7 +555,7 @@ pub(crate) fn route_pointer(
             }
             PointerAction::Press(button) => {
                 if let Some(entity) = hovered {
-                    route.capture = Some((pointer, entity));
+                    route.capture.insert(pointer, entity);
                     if let Some(event) = local(&surfaces, entity) {
                         push(&mut surfaces, entity, event, Some(true));
                     }
@@ -585,6 +587,9 @@ pub(crate) fn route_pointer(
                     };
                     push(&mut surfaces, entity, event, None);
                     if hovered != Some(entity) {
+                        // Released outside: this is the leave, so the next
+                        // motion must not produce another one.
+                        route.over.remove(&pointer);
                         push(
                             &mut surfaces,
                             entity,
@@ -593,7 +598,7 @@ pub(crate) fn route_pointer(
                         );
                     }
                 }
-                route.capture = None;
+                route.capture.remove(&pointer);
             }
             PointerAction::Scroll { unit, x, y, .. } => {
                 if let Some(entity) = target {
@@ -618,7 +623,7 @@ pub(crate) fn route_pointer(
                         Some(false),
                     );
                 }
-                route.capture = None;
+                route.capture.remove(&pointer);
                 route.over.remove(&pointer);
             }
         }
@@ -647,6 +652,11 @@ fn convert_button(button: BevyButton) -> Option<PointerButton> {
     }
 }
 
+/// Copies keyboard input to the focused surface; it does not consume it.
+/// Every other `KeyboardInput` reader still sees each key: `ButtonInput<KeyCode>`,
+/// Quoin's and the layer host's own handlers, and any global shortcut system.
+/// CTK text fields act only on keys while they hold `InputFocus`, which they
+/// cannot while a surface does, so text never reaches both.
 pub(crate) fn route_keyboard(
     mut keys: MessageReader<KeyboardInput>,
     mut ime: MessageReader<ExternalImeEvent>,
@@ -836,10 +846,19 @@ pub(crate) fn frame(
     mut focus: ResMut<SceneIcedFocus>,
     mut wake: ResMut<SceneIcedWake>,
     mut cursor_request: ResMut<CursorShapeRequest>,
+    mut redraw: MessageWriter<RequestRedraw>,
     channel: Option<Res<GpuChannel>>,
     time: Res<Time<Real>>,
 ) {
     let now = time.elapsed();
+    if channel
+        .as_ref()
+        .is_some_and(|channel| channel.0.waiting.load(Ordering::Relaxed))
+    {
+        // Uploads are staged for a texture Bevy has not prepared yet; an
+        // idle host would otherwise never render them.
+        redraw.write(RequestRedraw);
+    }
     let repaints = channel
         .as_ref()
         .map(|channel| channel.0.take_repaints())
@@ -848,13 +867,26 @@ pub(crate) fn frame(
     let mut cursor = None;
     counters.surfaces = surfaces.iter().count();
     for (entity, geometry, mut state, mut ime_target) in &mut surfaces {
-        let Some(renderer) = renderers.0.get_mut(&entity) else {
+        if state
+            .image
+            .as_ref()
+            .is_some_and(|image| repaints.contains(&image.id()))
+        {
+            // Consumed from the channel now; kept here until the surface
+            // next draws.
+            state.size = UVec2::ZERO;
+        }
+        let size = geometry.size;
+        let renderer = renderers.0.get_mut(&entity);
+        let Some(renderer) = renderer.filter(|_| size.x > 0 && size.y > 0 && geometry.scale > 0.0)
+        else {
+            // A surface that cannot draw cannot show a caret either.
+            ime_target.set_if_neq(ExternalImeTarget::default());
+            if focus.owner == Some(entity) {
+                focus.ime = None;
+            }
             continue;
         };
-        let size = geometry.size;
-        if size.x == 0 || size.y == 0 || geometry.scale <= 0.0 {
-            continue;
-        }
         let current = state.image.as_ref().map(|_| state.texture);
         if let Some(texture) = texture_size(size, current) {
             let mut image = Image::new_uninit(
@@ -897,13 +929,6 @@ pub(crate) fn frame(
             state.scale = geometry.scale;
             state.repaint = true;
             renderer.resize(size.x, size.y, geometry.scale);
-        } else if state
-            .image
-            .as_ref()
-            .is_some_and(|image| repaints.contains(&image.id()))
-        {
-            state.repaint = true;
-            renderer.resize(size.x, size.y, geometry.scale);
         }
         for event in std::mem::take(&mut state.events) {
             renderer.queue(event);
@@ -913,7 +938,7 @@ pub(crate) fn frame(
             next_wake = Some(next_wake.map_or(at, |next| next.min(at)));
         }
         if state.hovered {
-            cursor = Some(processed.cursor);
+            cursor = Some((entity, processed.cursor));
         }
         let owner = focus.owner == Some(entity);
         let request = match (&processed.ime, owner) {
@@ -969,11 +994,26 @@ pub(crate) fn frame(
         }
         counters.last_rects = rects;
     }
-    if focus.cursor != cursor {
-        // Leaving every surface hands the pointer back to the default shape.
-        let shape = cursor.map_or(CursorShape::Default, cursor_shape);
-        cursor_request.set_if_neq(CursorShapeRequest(shape));
+    let owner = cursor.map(|(entity, _)| entity);
+    let cursor = cursor.map(|(_, icon)| icon);
+    if (focus.cursor, focus.cursor_owner) != (cursor, owner) {
+        match (owner, cursor) {
+            (Some(owner), Some(icon)) => {
+                let mut request = *cursor_request;
+                request.set(owner, cursor_shape(icon));
+                cursor_request.set_if_neq(request);
+            }
+            // Leaving every surface releases only our own request.
+            _ => {
+                if let Some(previous) = focus.cursor_owner {
+                    let mut request = *cursor_request;
+                    request.clear(previous);
+                    cursor_request.set_if_neq(request);
+                }
+            }
+        }
         focus.cursor = cursor;
+        focus.cursor_owner = owner;
     }
     wake.set_if_neq(SceneIcedWake(next_wake));
 }

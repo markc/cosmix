@@ -54,9 +54,13 @@ visible part. The handle is never mutably borrowed, so the
 only asset events are one `Added` per allocation. Damage is clipped and
 merged (`upload::plan`), copied out with alpha un-premultiplied (Bevy UI
 blends straight alpha), passed to the render world at extract, and written
-with `RenderQueue::write_texture` after `PrepareAssets`. An upload waits up
-to 120 frames for its texture; a texture Bevy re-created underneath us
-triggers a full repaint.
+with `RenderQueue::write_texture` after `PrepareAssets`. The texture is
+added before the frame's asset events (`AssetEventSystems`), so it is
+extracted in the same update. An upload waits up to 120 frames for its
+texture, requesting a redraw meanwhile so an idle host keeps updating; a
+texture Bevy re-created underneath us triggers a full repaint. A surface that
+cannot draw (no size yet) disables its IME target and keeps any repaint for
+its next draw.
 
 ## Counters
 
@@ -70,12 +74,17 @@ updates.
 ## Input, focus and IME
 
 Pointer input is read from Bevy's `PointerInput` messages, routed to the
-surface under the pointer (`HoverMap`) and captured from press to release.
-Positions are converted to surface physical pixels using the window scale.
+surface under the pointer (`HoverMap`) and captured from press to release,
+per pointer. Positions are converted to surface physical pixels using the
+window scale; this assumes `UiScale` is 1. The capture window check needs the
+UI camera to target `WindowRef::Entity`, as Quoin's panels do.
 A press on a surface sets `InputFocus`; a press on no surface clears it if a
 surface held it. `SceneIcedFocus` records the owning surface, its IME request
 (caret in window-logical coordinates) and the hovered cursor shape. Keys and
-Bevy `Ime` preedit/commit go to the owner only.
+IME input (`ExternalImeEvent`) go to the owner only. Keyboard input is
+copied to the owner, not consumed: `ButtonInput<KeyCode>`, Quoin's and the
+layer host's handlers and global shortcut systems still see every key; CTK
+fields only act on keys while they hold `InputFocus`.
 
 The owning surface carries `cosmix_shell::runtime::ExternalImeTarget`
 (enabled, purpose, caret in window-logical coordinates). The layer host
@@ -88,7 +97,8 @@ because no surrounding text is sent and iced 0.14 has no such event.
 
 The hovered surface's cursor shape goes to `CursorShapeRequest`, which the
 layer host applies with `wp_cursor_shape_v1` on change and after each pointer
-enter. Leaving all surfaces resets it to the default shape.
+enter. The request names its owner; leaving all surfaces resets it to the
+default shape only if a surface still owns it.
 
 A captured pointer that reports from another window is not given that
 position: the surface loses hover, and a release there still ends the

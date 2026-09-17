@@ -80,7 +80,7 @@ impl RunnerState {
             .app
             .world()
             .get_resource::<CursorShapeRequest>()
-            .map_or(CursorShape::Default, |request| request.0);
+            .map_or(CursorShape::Default, |request| request.shape);
         if self.cursor_shape.device.is_none() {
             return;
         }
