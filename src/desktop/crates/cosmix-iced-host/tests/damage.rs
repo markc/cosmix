@@ -249,13 +249,22 @@ fn damaged_area(frame: &Frame) -> u64 {
     frame.damage.iter().map(DamageRect::area).sum()
 }
 
+/// Antialiasing rounding tolerated INSIDE the damage, in channel levels.
+/// tiny-skia's masked and unmasked pipelines round coverage differently, and
+/// a rounded border cut by a damage rectangle is blended twice over (fill
+/// then stroke), so a redrawn edge or glyph can land a few levels off. It is
+/// only tolerated where the pixel was repainted anyway; outside the damage
+/// any difference at all is a fault.
+const MAX_ROUNDING: u8 = 4;
+
 #[derive(Debug, Default)]
 struct Check {
     /// Pixels whose full-redraw colour changed since the previous frame.
     changed: usize,
-    /// Pixels where the incremental buffer is off by one channel level
-    /// (tiny-skia's masked and unmasked pipelines round antialiased edges
-    /// differently; a quad cut by a damage rectangle is drawn masked).
+    /// Pixels where the incremental buffer is off by at most
+    /// [`MAX_ROUNDING`] channel levels: tiny-skia's masked and unmasked
+    /// pipelines round antialiased coverage differently, and a quad or
+    /// glyph cut by a damage rectangle is drawn masked.
     rounding: usize,
 }
 
@@ -263,8 +272,10 @@ struct Check {
 /// the previous one:
 /// - every pixel whose true colour changed lies inside the damage (too
 ///   little damage is a rendering bug);
-/// - the incremental buffer equals the full redraw everywhere, except for
-///   one-level rounding differences.
+/// - outside the damage the incremental buffer matches the full redraw
+///   exactly, so nothing was painted where the caller was not told (an
+///   unmasked shadow or glyph, or an unswapped `Rgba8` pixel);
+/// - inside it, only antialiasing rounding differs.
 fn check(
     t: &Target,
     frame: &Frame,
@@ -290,13 +301,20 @@ fn check(
             }
         }
         if inc != now {
+            if !frame.full && !frame.damage.iter().any(|r| r.contains(x, y)) {
+                return Err(format!(
+                    "pixel ({x}, {y}) is {inc:?}, full redraw {now:?}, and it is outside \
+                     the damage {:?}",
+                    frame.damage
+                ));
+            }
             let delta = inc
                 .iter()
                 .zip(now)
                 .map(|(a, b)| a.abs_diff(*b))
                 .max()
                 .unwrap_or(0);
-            if delta > 1 {
+            if delta > MAX_ROUNDING {
                 return Err(format!(
                     "pixel ({x}, {y}) is {inc:?}, full redraw {now:?} (damage {:?})",
                     frame.damage
