@@ -449,6 +449,12 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         .add_systems(Startup, setup_scene)
         .add_systems(Update, (animate_background, collect_host_input))
         .add_systems(Last, finish_wayland_frame)
+        // The last drain before extract: a client that drew on the callback
+        // this frame pulsed is shown by the next frame, not the one after.
+        .add_systems(
+            Last,
+            compositor_scene::drain_protocol_events.after(finish_wayland_frame),
+        )
         .add_systems(First, begin_nested_update_trace.before(CompositorSceneSet))
         .add_systems(Last, end_nested_update_trace.after(finish_wayland_frame))
         .run();
