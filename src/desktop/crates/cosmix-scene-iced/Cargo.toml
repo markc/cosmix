@@ -9,7 +9,7 @@ publish = false
 
 [features]
 # The iced renderer (cosmix-iced-host + cosmix-iced-widgets) and `IcedRendererPlugin`.
-iced = ["dep:cosmix-iced-host", "dep:cosmix-iced-widgets", "cosmix-iced-widgets/tiny-skia", "dep:cosmix-design", "dep:ctk"]
+iced = ["dep:cosmix-iced-host", "cosmix-iced-host/image", "dep:cosmix-iced-widgets", "cosmix-iced-widgets/tiny-skia", "dep:cosmix-design", "dep:ctk"]
 
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "bevy_render", "bevy_ui_widgets", "bevy_feathers", "png"] }
@@ -23,6 +23,9 @@ cosmix-iced-widgets = { path = "../cosmix-iced-widgets", optional = true }
 ctk = { path = "../../ctk", default-features = false, features = ["bus"], optional = true }
 
 [dev-dependencies]
+# Writes the PNG the image test renders; the workspace already builds this
+# version with the png codec.
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
 # The font-identity test registers one face in Bevy's fontique and in iced's
 # fontdb. Cargo has no optional dev-dependencies, so this is built for every
 # test run even though only the `iced` tests use it.

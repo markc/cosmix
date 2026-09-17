@@ -4,15 +4,16 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use cosmix_iced_host::core::alignment::Vertical;
 use cosmix_iced_host::core::font::{Family, Weight};
 use cosmix_iced_host::core::text::Wrapping;
 use cosmix_iced_host::core::widget::Id;
-use cosmix_iced_host::core::{Background, Border, Color, Font, Length, mouse};
+use cosmix_iced_host::core::{Background, Border, Color, ContentFit, Font, Length, mouse};
 use cosmix_iced_host::widget::{
-    button, container, keyed_column, mouse_area, row, scrollable, space, text, toggler,
+    button, container, image, keyed_column, mouse_area, row, scrollable, space, text, toggler,
 };
 use cosmix_iced_host::{Element, Program, Theme};
 use cosmix_iced_widgets::{TextField, Tokens};
@@ -71,12 +72,15 @@ pub struct SceneProgram {
     hovered: HashSet<String>,
     look: Look,
     outbox: Outbox,
-    /// Nodes of a family this renderer cannot draw, logged once each.
+    /// Where a relative `image` src is resolved from, as CTK resolves it
+    /// against Bevy's asset root.
+    assets: Arc<Path>,
+    /// Nodes whose file is missing, logged once each.
     undrawn: BTreeSet<String>,
 }
 
 impl SceneProgram {
-    pub fn new(look: Look, outbox: Outbox) -> Self {
+    pub fn new(look: Look, outbox: Outbox, assets: Arc<Path>) -> Self {
         Self {
             tree: ResolvedScene {
                 name: String::new(),
@@ -92,6 +96,7 @@ impl SceneProgram {
             hovered: HashSet::new(),
             look,
             outbox,
+            assets,
             undrawn: BTreeSet::new(),
         }
     }
@@ -100,7 +105,17 @@ impl SceneProgram {
         &self.tree
     }
 
-    /// Nodes this renderer left blank (an `image`, today).
+    /// The file a node's `src` names.
+    fn image_path(&self, src: &str) -> PathBuf {
+        let path = Path::new(src);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.assets.join(path)
+        }
+    }
+
+    /// Nodes this renderer could not draw (a missing image file).
     pub fn undrawn_nodes(&self) -> usize {
         self.undrawn.len()
     }
@@ -153,11 +168,15 @@ impl SceneProgram {
             .retain(|id, _| tree.nodes.get(id).is_some_and(|n| n.family == "toggle"));
         self.templates = template_ids(tree);
         for (id, node) in &tree.nodes {
-            if node.family == "image" && self.undrawn.insert(id.clone()) {
+            if node.family != "image" {
+                continue;
+            }
+            let src = text_port(node, "src");
+            if !self.image_path(src).is_file() && self.undrawn.insert(id.clone()) {
                 bevy::log::warn!(
-                    "scene {}: node {id} is an image; the iced adapter does not draw images (src {:?})",
+                    "scene {}: image node {id} has no file at {:?} (src {src:?})",
                     tree.name,
-                    text_port(node, "src")
+                    self.image_path(src)
                 );
             }
         }
@@ -415,12 +434,21 @@ impl SceneProgram {
                     .into()
             }
             "image" => {
-                // Not drawn: iced's image feature is off (it needs a decoder
-                // dependency outside the spike's pins). The box is kept and the
-                // node counted; `set_scene` logs it once.
-                width = Length::Fixed(number(node, "w").unwrap_or(16.0));
-                height = Length::Fixed(number(node, "h").unwrap_or(16.0));
-                space().into()
+                // As CTK: the node's own box, the image stretched into it.
+                let w = number(node, "w").unwrap_or(16.0);
+                let h = number(node, "h").unwrap_or(16.0);
+                width = Length::Fixed(w);
+                height = Length::Fixed(h);
+                let path = self.image_path(text_port(node, "src"));
+                if path.is_file() {
+                    image(cosmix_iced_host::ImageHandle::from_path(path))
+                        .width(w)
+                        .height(h)
+                        .content_fit(ContentFit::Fill)
+                        .into()
+                } else {
+                    space().into()
+                }
             }
             "spacer" => match number(node, "size") {
                 Some(size) => {
@@ -548,10 +576,9 @@ fn button_style(look: &Look, tone: &str, theme: &Theme, status: button::Status) 
 fn toggler_style(look: &Look, status: toggler::Status) -> toggler::Style {
     let tokens = look.tokens;
     let on = match status {
-        toggler::Status::Active { is_toggled } | toggler::Status::Hovered { is_toggled } => {
-            is_toggled
-        }
-        toggler::Status::Disabled => false,
+        toggler::Status::Active { is_toggled }
+        | toggler::Status::Hovered { is_toggled }
+        | toggler::Status::Disabled { is_toggled } => is_toggled,
     };
     let background = if on {
         tokens.selection

@@ -44,7 +44,7 @@ struct Rig {
 impl Rig {
     fn new(source: &str, width: u32, height: u32, scale: f32) -> Self {
         let outbox = Outbox::default();
-        let mut renderer = IcedSceneRenderer::new(test_design(), outbox.clone());
+        let mut renderer = IcedSceneRenderer::new(test_design(), outbox.clone(), asset_root());
         renderer.resize(width, height, scale);
         renderer.set_scene(&resolve(source));
         Self {
@@ -517,9 +517,23 @@ fn font_faces_resolve_to_the_same_family_in_both_stacks() {
         .map(|f| f.name().to_owned());
     let iced_has = iced_family(&ctk_family);
     println!("FONT_CHECK family={ctk_family:?} bevy={bevy_has:?} iced={iced_has:?}");
+    assert_eq!(
+        bevy_has.is_some(),
+        iced_has.is_some(),
+        "{ctk_family:?} resolves in one stack only: bevy={bevy_has:?} iced={iced_has:?}"
+    );
     if let (Some(bevy), Some(iced)) = (&bevy_has, &iced_has) {
         assert_eq!(bevy, iced);
     }
+    // The face both stacks were given resolves in both, by the same name.
+    assert_eq!(
+        bevy_fonts
+            .collection
+            .family_by_name("DejaVu Sans")
+            .map(|family| family.name().to_owned())
+            .as_deref(),
+        iced_family("DejaVu Sans").as_deref()
+    );
 }
 
 #[test]
@@ -679,7 +693,7 @@ fn buttons_follow_the_design_tokens_not_iceds_palette() {
     }));
     cosmix_iced_host::load_font(FONT);
     let outbox = Outbox::default();
-    let mut renderer = IcedSceneRenderer::new(design, outbox);
+    let mut renderer = IcedSceneRenderer::new(design, outbox, asset_root());
     renderer.resize(300, 200, 1.0);
     let source = "---\nscene: 1\nname: tones\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 10, children: [\"go\"]}\ngo: {widget: \"button\", label: \"Go\", tone: \"primary\", width: 80, on_click: \"go\"}\n```\n";
     renderer.set_scene(&resolve(source));
@@ -722,4 +736,109 @@ fn handler_calls_wait_for_the_bus() {
     app.update();
     assert!(outbox.lock().unwrap().is_empty());
     assert_eq!(peer.drain_calls().len(), 1);
+}
+
+#[test]
+fn pointer_positions_use_the_pointer_scale() {
+    // Bevy's UiScale separates the render scale from the scale pointer
+    // positions arrive in; the bridge passes both.
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 3.75);
+    rig.renderer.set_pointer_scale(2.5);
+    rig.settle();
+    let button = rig.bounds("button").center();
+    rig.renderer.queue(SurfaceEvent::PointerMoved {
+        x: button.x * 2.5,
+        y: button.y * 2.5,
+    });
+    for pressed in [true, false] {
+        rig.renderer.queue(SurfaceEvent::PointerButton {
+            button: PointerButton::Primary,
+            pressed,
+        });
+    }
+    rig.settle();
+    assert_eq!(rig.actions(), vec![action("click", "go", "button", None)]);
+
+    // The render scale alone would have hit nothing there.
+    rig.renderer.queue(SurfaceEvent::PointerMoved {
+        x: button.x * 3.75,
+        y: button.y * 3.75,
+    });
+    for pressed in [true, false] {
+        rig.renderer.queue(SurfaceEvent::PointerButton {
+            button: PointerButton::Primary,
+            pressed,
+        });
+    }
+    rig.settle();
+    assert!(rig.actions().is_empty());
+}
+
+#[test]
+fn the_renderer_plugin_mounts_the_bridge_itself() {
+    use bevy::asset::AssetPlugin;
+    use cosmix_scene_bevy::SceneStore;
+    use cosmix_shell::runtime::SceneVerb;
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+        .init_asset::<Image>()
+        .add_plugins(IcedRendererPlugin);
+    let (bridge, _peer) = ctk::bus::test_bridge("test");
+    let (rc, reply) = app.world_mut().resource_mut::<SceneStore>().dispatch(
+        SceneVerb::Load,
+        CONFORMANCE,
+        &json!({"adapter": crate::ADAPTER}),
+        &bridge,
+    );
+    assert_eq!(rc, 0, "{reply}");
+    app.update();
+    let surface = app
+        .world_mut()
+        .query_filtered::<Entity, With<crate::IcedSurface>>()
+        .single(app.world())
+        .unwrap();
+    app.world_mut()
+        .entity_mut(surface)
+        .insert(crate::IcedSurfaceGeometry {
+            size: UVec2::new(600, 450),
+            scale: 1.0,
+            origin: Vec2::ZERO,
+            window: None,
+            pointer_scale: 1.0,
+        });
+    for _ in 0..3 {
+        app.update();
+    }
+    let counters = app.world().resource::<crate::SceneIcedCounters>();
+    assert!(counters.totals.draws >= 1, "the iced renderer never drew");
+    assert!(counters.totals.bytes_queued >= 600 * 450 * 4);
+}
+
+#[test]
+fn image_nodes_draw_their_file_and_missing_ones_are_reported() {
+    // A file written next to the test, named absolutely: the asset root is
+    // only used for relative sources.
+    let dir = std::env::temp_dir().join(format!("ctl88-scene-iced-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dot.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]))
+        .save(&path)
+        .unwrap();
+    let source = format!(
+        "---\nscene: 1\nname: pictures\ncitizen: test\n---\n```mix\nroot: {{widget: \"column\", padding: 4, children: [\"pic\", \"gone\"]}}\npic: {{widget: \"image\", src: {:?}, w: 32, h: 32}}\ngone: {{widget: \"image\", src: \"/nowhere/missing.png\", w: 8, h: 8}}\n```\n",
+        path.display().to_string()
+    );
+    let mut rig = Rig::new(&source, 200, 200, 1.0);
+    rig.settle();
+    let box_ = rig.physical("pic", 0.0);
+    let pixel = |rig: &Rig, x: u32, y: u32| {
+        let i = (y * rig.width + x) as usize * 4;
+        rig.buffer[i..i + 4].to_vec()
+    };
+    let at = pixel(&rig, box_.x + box_.w / 2, box_.y + box_.h / 2);
+    assert_eq!(at[0], 255, "image not drawn: {at:?}");
+    assert!(at[1] < 32 && at[2] < 32, "image not drawn: {at:?}");
+    // The missing one is counted and logged, never a silent blank.
+    assert_eq!(rig.renderer.program().undrawn_nodes(), 1);
+    std::fs::remove_dir_all(&dir).ok();
 }

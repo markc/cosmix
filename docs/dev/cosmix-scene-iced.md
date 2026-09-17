@@ -31,6 +31,8 @@ before the CTK pass (`SceneReconcile`) and registers pages after it.
 `surface::SurfaceRenderer` has no Bevy types:
 
 - `resize(width, height, scale)`: physical pixels; the next draw repaints all;
+- `set_pointer_scale(scale)`: the scale `queue`s pointer positions arrive in,
+  which differs from the render scale when the host scales its UI separately;
 - `set_scene(&ResolvedScene)`: a new accepted revision;
 - `queue(SurfaceEvent)`: pointer (surface physical pixels), keys, focus, IME;
 - `process(now) -> Processed`: `needs_redraw`, cursor shape, IME request

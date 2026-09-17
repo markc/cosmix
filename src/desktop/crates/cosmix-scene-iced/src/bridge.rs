@@ -1023,6 +1023,7 @@ pub(crate) fn frame(
             state.scale = geometry.scale;
             state.repaint = true;
             renderer.resize(size.x, size.y, geometry.scale);
+            renderer.set_pointer_scale(geometry.pointer_scale);
         }
         for event in std::mem::take(&mut state.events) {
             renderer.queue(event);

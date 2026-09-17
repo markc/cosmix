@@ -221,6 +221,10 @@ pub struct Processed {
 pub trait SurfaceRenderer {
     /// Physical size and scale factor. The next `draw` must repaint everything.
     fn resize(&mut self, width: u32, height: u32, scale: f32);
+    /// The scale `queue`'s pointer positions are expressed in. It equals the
+    /// render scale unless the host scales its UI separately (Bevy's
+    /// `UiScale`); hosts that never do need not call it.
+    fn set_pointer_scale(&mut self, _scale: f32) {}
     /// A new accepted scene revision.
     fn set_scene(&mut self, _scene: &ResolvedScene) {}
     fn queue(&mut self, event: SurfaceEvent);

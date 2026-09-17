@@ -34,16 +34,22 @@ pub struct IcedSceneRenderer {
     design: SharedDesign,
     design_revision: u64,
     scale: f32,
+    /// Pointer positions arrive in this scale, not always the render scale.
+    pointer_scale: f32,
     modifiers: keyboard::Modifiers,
     composing: bool,
     scene_changed: bool,
 }
 
 impl IcedSceneRenderer {
-    pub fn new(design: SharedDesign, outbox: Outbox) -> Self {
+    pub fn new(
+        design: SharedDesign,
+        outbox: Outbox,
+        assets: std::sync::Arc<std::path::Path>,
+    ) -> Self {
         let share = design.read().unwrap().clone();
         let surface = Surface::new(
-            SceneProgram::new(share.look, outbox),
+            SceneProgram::new(share.look, outbox, assets),
             Settings {
                 default_font: share.look.font,
                 default_text_size: share.look.text_px.into(),
@@ -57,6 +63,7 @@ impl IcedSceneRenderer {
             design,
             design_revision: share.revision,
             scale: 1.0,
+            pointer_scale: 1.0,
             modifiers: keyboard::Modifiers::empty(),
             composing: false,
             scene_changed: true,
@@ -113,7 +120,7 @@ impl IcedSceneRenderer {
     }
 
     fn logical(&self, x: f32, y: f32) -> Point {
-        Point::new(x / self.scale, y / self.scale)
+        Point::new(x / self.pointer_scale, y / self.pointer_scale)
     }
 }
 
@@ -150,9 +157,19 @@ impl Operation for Collect {
 
 impl SurfaceRenderer for IcedSceneRenderer {
     fn resize(&mut self, width: u32, height: u32, scale: f32) {
+        if self.pointer_scale == self.scale {
+            // No host has said otherwise: keep them together.
+            self.pointer_scale = scale;
+        }
         self.scale = scale;
         self.surface.resize(Size::new(width, height), scale);
         self.surface.invalidate();
+    }
+
+    fn set_pointer_scale(&mut self, scale: f32) {
+        if scale > 0.0 {
+            self.pointer_scale = scale;
+        }
     }
 
     fn set_scene(&mut self, scene: &ResolvedScene) {
@@ -184,8 +201,8 @@ impl SurfaceRenderer for IcedSceneRenderer {
                 let delta = match unit {
                     ScrollUnit::Line => ScrollDelta::Lines { x, y },
                     ScrollUnit::Pixel => ScrollDelta::Pixels {
-                        x: x / self.scale,
-                        y: y / self.scale,
+                        x: x / self.pointer_scale,
+                        y: y / self.pointer_scale,
                     },
                 };
                 self.surface

@@ -28,6 +28,11 @@ pub use renderer::{DesignShare, IcedSceneRenderer, SharedDesign};
 
 use crate::bridge::SceneIcedFactory;
 
+/// Distinct font families this process will ever name to iced. Each one
+/// costs a leaked string, so the cache is bounded; a later family falls back
+/// to iced's default family with a warning.
+pub const MAX_INTERNED_FAMILIES: usize = 8;
+
 /// CTK's body size (`ctk::theme` default) when no typography resource exists.
 pub const DEFAULT_TEXT_PX: f32 = 15.333;
 
@@ -43,6 +48,14 @@ pub struct IcedRendererPlugin;
 
 impl Plugin for IcedRendererPlugin {
     fn build(&self, app: &mut App) {
+        // Order-independent: the factory this plugin installs is only read
+        // through the bridge, and the bridge only keeps a factory it did not
+        // find. Adding it here means a host cannot mount iced scenes without
+        // the bridge, and adding both in the wrong order fails loudly in
+        // Bevy rather than falling back to the stand-in.
+        if !app.is_plugin_added::<crate::SceneIcedPlugin>() {
+            app.add_plugins(crate::SceneIcedPlugin);
+        }
         let outbox = IcedOutbox::default();
         let design = IcedDesign(Arc::new(RwLock::new(DesignShare {
             revision: 0,
@@ -50,10 +63,12 @@ impl Plugin for IcedRendererPlugin {
         })));
         let factory_outbox = outbox.0.clone();
         let factory_design = design.0.clone();
+        let assets = asset_root();
         app.insert_non_send(SceneIcedFactory(Box::new(move |_| {
             Box::new(IcedSceneRenderer::new(
                 factory_design.clone(),
                 factory_outbox.clone(),
+                assets.clone(),
             ))
         })));
         app.insert_resource(outbox)
@@ -99,6 +114,13 @@ fn default_tokens() -> Option<Tokens> {
     }
 }
 
+/// Bevy's asset directory, which is what CTK resolves an `image` src
+/// against.
+pub fn asset_root() -> std::sync::Arc<std::path::Path> {
+    let base = bevy::asset::io::file::FileAssetReader::get_base_path();
+    std::sync::Arc::from(base.join("assets").as_path())
+}
+
 /// Whether a surface colour reads as dark, by relative luminance.
 pub fn is_dark(surface: cosmix_iced_host::core::Color) -> bool {
     0.2126 * surface.r + 0.7152 * surface.g + 0.0722 * surface.b < 0.5
@@ -109,10 +131,24 @@ pub fn is_dark(surface: cosmix_iced_host::core::Color) -> bool {
 pub fn named_font(family: &str) -> Font {
     static NAMES: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
     let mut names = NAMES.lock().unwrap();
-    let name = *names
-        .get_or_insert_with(HashMap::new)
-        .entry(family.to_owned())
-        .or_insert_with(|| Box::leak(family.to_owned().into_boxed_str()));
+    let names = names.get_or_insert_with(HashMap::new);
+    let name = match names.get(family) {
+        Some(name) => *name,
+        None if names.len() < MAX_INTERNED_FAMILIES => {
+            // iced fonts hold `&'static str`, so a family name must be leaked
+            // to be usable. The cache bounds how many can ever be.
+            let name: &'static str = Box::leak(family.to_owned().into_boxed_str());
+            names.insert(family.to_owned(), name);
+            name
+        }
+        None => {
+            bevy::log::warn!(
+                "scene-iced: more than {MAX_INTERNED_FAMILIES} font families requested; \
+                 {family:?} falls back to the default family"
+            );
+            return Font::DEFAULT;
+        }
+    };
     Font {
         family: Family::Name(name),
         ..Font::DEFAULT
