@@ -23,6 +23,9 @@ cosmix-iced-widgets = { path = "../cosmix-iced-widgets", optional = true }
 ctk = { path = "../../ctk", default-features = false, features = ["bus"], optional = true }
 
 [dev-dependencies]
+# The font-identity test registers one face in Bevy's fontique and in iced's
+# fontdb. Cargo has no optional dev-dependencies, so this is built for every
+# test run even though only the `iced` tests use it.
 parley = { version = "=0.9.0", default-features = false }
 ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }
 wgpu = { version = "=29.0.4", features = ["noop"] }

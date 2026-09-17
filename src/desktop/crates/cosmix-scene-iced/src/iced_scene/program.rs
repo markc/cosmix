@@ -57,6 +57,9 @@ pub struct Look {
     pub tokens: Tokens,
     pub font: Font,
     pub text_px: f32,
+    /// The resolved scheme is dark: picks the iced theme the stock widget
+    /// styles read.
+    pub dark: bool,
 }
 
 pub struct SceneProgram {
@@ -68,6 +71,8 @@ pub struct SceneProgram {
     hovered: HashSet<String>,
     look: Look,
     outbox: Outbox,
+    /// Nodes of a family this renderer cannot draw, logged once each.
+    undrawn: BTreeSet<String>,
 }
 
 impl SceneProgram {
@@ -87,11 +92,24 @@ impl SceneProgram {
             hovered: HashSet::new(),
             look,
             outbox,
+            undrawn: BTreeSet::new(),
         }
     }
 
     pub fn tree(&self) -> &ResolvedScene {
         &self.tree
+    }
+
+    /// Nodes this renderer left blank (an `image`, today).
+    pub fn undrawn_nodes(&self) -> usize {
+        self.undrawn.len()
+    }
+
+    /// Row and node keys the pointer is currently inside.
+    pub fn hovered_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.hovered.iter().cloned().collect();
+        keys.sort();
+        keys
     }
 
     pub fn field_value(&self, id: &str) -> Option<&str> {
@@ -134,6 +152,17 @@ impl SceneProgram {
         self.toggles
             .retain(|id, _| tree.nodes.get(id).is_some_and(|n| n.family == "toggle"));
         self.templates = template_ids(tree);
+        for (id, node) in &tree.nodes {
+            if node.family == "image" && self.undrawn.insert(id.clone()) {
+                bevy::log::warn!(
+                    "scene {}: node {id} is an image; the iced adapter does not draw images (src {:?})",
+                    tree.name,
+                    text_port(node, "src")
+                );
+            }
+        }
+        let live = live_keys(tree);
+        self.hovered.retain(|key| live.contains(key));
         self.tree = tree.clone();
     }
 
@@ -143,7 +172,9 @@ impl SceneProgram {
             "change" => "on_change",
             _ => "on_submit",
         };
-        let Some(handler) = self.tree.nodes.get(node).and_then(|n| string(n, port)) else {
+        // A row instance is `<node>@<row id>`; its ports live on the node.
+        let base = node.split_once('@').map_or(node, |(base, _)| base);
+        let Some(handler) = self.tree.nodes.get(base).and_then(|n| string(n, port)) else {
             return;
         };
         self.outbox.lock().unwrap().push(SceneAction {
@@ -161,6 +192,7 @@ impl SceneProgram {
         &'a self,
         id: &str,
         parent: Axis,
+        stretch: bool,
         item: Option<&'a Value>,
     ) -> Element<'a, Msg> {
         let Some(node) = self.tree.nodes.get(id) else {
@@ -171,11 +203,11 @@ impl SceneProgram {
             Some(item) => format!("{id}@{}", item["id"].as_str().unwrap_or_default()),
             None => id.to_owned(),
         };
+        // CTK hides with `Display::None`, which keeps the entity. iced has no
+        // such flag, so the widget stays in the tree inside a clipped
+        // zero-size box: focus, selection, undo and preedit survive.
         let hidden = flag(node, "hidden")
             || (node.family == "list" && flag(node, "hidden_if_empty") && rows(node).is_empty());
-        if hidden {
-            return space().width(0.0).height(0.0).into();
-        }
         let fill = flag(node, "fill");
         let boxed = matches!(node.family.as_str(), "row" | "column" | "list");
         let mut width = match number(node, "width") {
@@ -185,7 +217,7 @@ impl SceneProgram {
             None if parent == Axis::Column && boxed => Length::Fill,
             None => Length::Shrink,
         };
-        let mut height = if fill && parent == Axis::Column {
+        let mut height = if stretch || (fill && parent == Axis::Column) {
             Length::Fill
         } else {
             Length::Shrink
@@ -193,8 +225,12 @@ impl SceneProgram {
         let look = self.look;
         let content: Element<'a, Msg> = match node.family.as_str() {
             "column" => {
-                let children = children(node)
-                    .map(|child| (hash(child), self.node_view(child, Axis::Column, item)));
+                let children = children(node).map(|child| {
+                    (
+                        hash(child),
+                        self.node_view(child, Axis::Column, false, item),
+                    )
+                });
                 keyed_column(children)
                     .spacing(number(node, "gap").unwrap_or(0.0))
                     .padding(number(node, "padding").unwrap_or(0.0))
@@ -205,17 +241,23 @@ impl SceneProgram {
                 if let Some(h) = number(node, "height") {
                     height = Length::Fixed(h);
                 }
-                let align = match text_port(node, "align") {
+                let authored = text_port(node, "align");
+                let align = match authored {
                     "center" => Vertical::Center,
                     "end" => Vertical::Bottom,
                     _ => Vertical::Top,
                 };
-                let inner = row(children(node).map(|child| self.node_view(child, Axis::Row, item)))
-                    .spacing(number(node, "gap").unwrap_or(0.0))
-                    .padding(number(node, "padding").unwrap_or(0.0))
-                    .align_y(align)
-                    .width(width)
-                    .height(height);
+                // CTK's `stretch` is cross-axis stretch; iced expresses it as a
+                // filled child height. Row children are positional: iced 0.14
+                // has no keyed row, so reordering siblings resets their state.
+                let stretch_children = authored == "stretch";
+                let inner = row(children(node)
+                    .map(|child| self.node_view(child, Axis::Row, stretch_children, item)))
+                .spacing(number(node, "gap").unwrap_or(0.0))
+                .padding(number(node, "padding").unwrap_or(0.0))
+                .align_y(align)
+                .width(width)
+                .height(height);
                 let normal = colour(text_port(node, "background"));
                 let hover = colour(text_port(node, "hover")).or(normal);
                 let background = if self.hovered.contains(&key) {
@@ -243,10 +285,12 @@ impl SceneProgram {
                             key: key.clone(),
                             inside: false,
                         });
-                    if clickable && item.is_none() {
+                    if clickable {
+                        // CTK fires on release, and a template instance reports as
+                        // `<row>@<row id>` with no item.
                         area = area
-                            .on_press(Msg::Click {
-                                node: id.to_owned(),
+                            .on_release(Msg::Click {
+                                node: key.clone(),
                                 item: None,
                             })
                             .interaction(mouse::Interaction::Pointer);
@@ -308,18 +352,13 @@ impl SceneProgram {
                 )
             }
             "button" => {
-                let style: fn(&Theme, button::Status) -> button::Style =
-                    match text_port(node, "tone") {
-                        "primary" => button::primary,
-                        "danger" => button::danger,
-                        _ => button::secondary,
-                    };
+                let tone = text_port(node, "tone").to_owned();
                 let mut b = button(text(text_port(node, "label").to_owned()).size(look.text_px))
                     .on_press(Msg::Click {
                         node: id.to_owned(),
                         item: item.cloned(),
                     })
-                    .style(style);
+                    .style(move |theme: &Theme, status| button_style(&look, &tone, theme, status));
                 if let Some(w) = number(node, "width").filter(|w| *w > 0.0) {
                     b = b.width(w);
                 }
@@ -330,6 +369,7 @@ impl SceneProgram {
                 toggler(self.toggles.get(id).copied().unwrap_or(false))
                     .label(text_port(node, "label").to_owned())
                     .text_size(look.text_px)
+                    .style(move |_theme: &Theme, status| toggler_style(&look, status))
                     .on_toggle(move |value| Msg::Toggle {
                         node: node_id.clone(),
                         value,
@@ -345,18 +385,29 @@ impl SceneProgram {
                     Length::Fixed(list_height(node))
                 };
                 let template = text_port(node, "row");
+                let row_click = self
+                    .tree
+                    .nodes
+                    .get(template)
+                    .is_some_and(|row| row.ports.contains_key("on_click"));
                 let instances = rows(node).iter().map(|row_item| {
-                    let content = container(self.node_view(template, Axis::Column, Some(row_item)))
-                        .width(Length::Fill)
-                        .height(row_height);
-                    let area = mouse_area(content).on_press(Msg::Click {
-                        node: id.to_owned(),
-                        item: Some(row_item.clone()),
-                    });
-                    (
-                        hash(row_item["id"].as_str().unwrap_or_default()),
-                        area.into(),
-                    )
+                    let content =
+                        container(self.node_view(template, Axis::Column, false, Some(row_item)))
+                            .width(Length::Fill)
+                            .height(row_height);
+                    // A template row with its own handler reports itself; only
+                    // then does the list not wrap the instance.
+                    let element: Element<'a, Msg> = if row_click {
+                        content.into()
+                    } else {
+                        mouse_area(content)
+                            .on_release(Msg::Click {
+                                node: id.to_owned(),
+                                item: Some(row_item.clone()),
+                            })
+                            .into()
+                    };
+                    (hash(row_item["id"].as_str().unwrap_or_default()), element)
                 });
                 scrollable(keyed_column(instances).spacing(gap).width(Length::Fill))
                     .width(Length::Fill)
@@ -364,7 +415,9 @@ impl SceneProgram {
                     .into()
             }
             "image" => {
-                // Not rendered: iced_widget's image feature is off. Keeps the box.
+                // Not drawn: iced's image feature is off (it needs a decoder
+                // dependency outside the spike's pins). The box is kept and the
+                // node counted; `set_scene` logs it once.
                 width = Length::Fixed(number(node, "w").unwrap_or(16.0));
                 height = Length::Fixed(number(node, "h").unwrap_or(16.0));
                 space().into()
@@ -390,6 +443,14 @@ impl SceneProgram {
             }
             _ => space().into(),
         };
+        if hidden {
+            return container(content)
+                .id(node_id(&key))
+                .width(0.0)
+                .height(0.0)
+                .clip(true)
+                .into();
+        }
         container(content)
             .id(node_id(&key))
             .width(width)
@@ -434,7 +495,7 @@ impl Program for SceneProgram {
     fn view(&self) -> Element<'_, Msg> {
         let tokens = self.look.tokens;
         let root = if self.tree.nodes.contains_key("root") && !self.templates.contains("root") {
-            self.node_view("root", Axis::Column, None)
+            self.node_view("root", Axis::Column, false, None)
         } else {
             space().into()
         };
@@ -447,6 +508,113 @@ impl Program for SceneProgram {
                 ..container::Style::default()
             })
             .into()
+    }
+}
+
+/// Button colours from the design tokens: `primary` is the accent pair,
+/// `danger` the theme's danger colour (the tokens carry no danger pair),
+/// anything else the muted pair.
+fn button_style(look: &Look, tone: &str, theme: &Theme, status: button::Status) -> button::Style {
+    let tokens = look.tokens;
+    let (surface, text_colour) = match tone {
+        "primary" => (tokens.selection, tokens.selection_text),
+        "danger" => {
+            let palette = theme.extended_palette();
+            (palette.danger.base.color, palette.danger.base.text)
+        }
+        _ => (tokens.muted_surface, tokens.muted_text),
+    };
+    let surface = match status {
+        button::Status::Hovered => lighten(surface, 0.08),
+        button::Status::Pressed => lighten(surface, -0.08),
+        button::Status::Disabled => Color {
+            a: surface.a * 0.5,
+            ..surface
+        },
+        button::Status::Active => surface,
+    };
+    button::Style {
+        background: Some(Background::Color(surface)),
+        text_color: text_colour,
+        border: Border {
+            radius: tokens.radius.into(),
+            width: 1.0,
+            color: tokens.border,
+        },
+        ..button::Style::default()
+    }
+}
+
+fn toggler_style(look: &Look, status: toggler::Status) -> toggler::Style {
+    let tokens = look.tokens;
+    let on = match status {
+        toggler::Status::Active { is_toggled } | toggler::Status::Hovered { is_toggled } => {
+            is_toggled
+        }
+        toggler::Status::Disabled => false,
+    };
+    let background = if on {
+        tokens.selection
+    } else {
+        tokens.muted_surface
+    };
+    toggler::Style {
+        background: Background::Color(match status {
+            toggler::Status::Hovered { .. } => lighten(background, 0.08),
+            _ => background,
+        }),
+        background_border_width: 1.0,
+        background_border_color: tokens.border,
+        foreground: Background::Color(if on {
+            tokens.selection_text
+        } else {
+            tokens.muted_text
+        }),
+        foreground_border_width: 0.0,
+        foreground_border_color: Color::TRANSPARENT,
+        text_color: Some(tokens.text),
+        border_radius: None,
+        padding_ratio: 0.2,
+    }
+}
+
+fn lighten(colour: Color, amount: f32) -> Color {
+    Color {
+        r: (colour.r + amount).clamp(0.0, 1.0),
+        g: (colour.g + amount).clamp(0.0, 1.0),
+        b: (colour.b + amount).clamp(0.0, 1.0),
+        a: colour.a,
+    }
+}
+
+/// Every key `node_view` can hover: node ids plus `<row>@<row id>` instances.
+fn live_keys(tree: &ResolvedScene) -> HashSet<String> {
+    let mut keys: HashSet<String> = tree.nodes.keys().cloned().collect();
+    for node in tree.nodes.values() {
+        if node.family != "list" {
+            continue;
+        }
+        let template = text_port(node, "row");
+        let mut subtree = BTreeSet::new();
+        collect(tree, template, &mut subtree);
+        for row_item in rows(node) {
+            let row_id = row_item["id"].as_str().unwrap_or_default();
+            for id in &subtree {
+                keys.insert(format!("{id}@{row_id}"));
+            }
+        }
+    }
+    keys
+}
+
+fn collect(tree: &ResolvedScene, id: &str, out: &mut BTreeSet<String>) {
+    if !out.insert(id.to_owned()) {
+        return;
+    }
+    if let Some(node) = tree.nodes.get(id) {
+        for child in children(node) {
+            collect(tree, child, out);
+        }
     }
 }
 

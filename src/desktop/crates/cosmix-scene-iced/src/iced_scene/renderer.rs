@@ -47,7 +47,7 @@ impl IcedSceneRenderer {
             Settings {
                 default_font: share.look.font,
                 default_text_size: share.look.text_px.into(),
-                theme: cosmix_iced_host::Theme::Dark,
+                theme: iced_theme(share.look.dark),
                 background: Some(share.look.tokens.surface),
                 ..Settings::default()
             },
@@ -106,6 +106,7 @@ impl IcedSceneRenderer {
         let look = share.look;
         drop(share);
         self.surface.program_mut().set_look(look);
+        self.surface.set_theme(iced_theme(look.dark));
         self.surface.set_background(Some(look.tokens.surface));
         self.surface.invalidate();
         self.scene_changed = true;
@@ -339,6 +340,14 @@ impl SurfaceRenderer for IcedSceneRenderer {
                 Vec::new()
             }
         }
+    }
+}
+
+fn iced_theme(dark: bool) -> cosmix_iced_host::Theme {
+    if dark {
+        cosmix_iced_host::Theme::Dark
+    } else {
+        cosmix_iced_host::Theme::Light
     }
 }
 

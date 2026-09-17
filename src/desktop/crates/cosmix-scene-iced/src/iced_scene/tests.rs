@@ -556,3 +556,170 @@ fn bucketed_texture_stride_is_drawn() {
     );
     assert!(row(10)[(width * 4) as usize..].iter().all(|b| *b == 0));
 }
+
+/// CTK gives a clickable template row its own binding and stops propagation;
+/// the list's row click is only for rows that have none.
+#[test]
+fn a_clickable_template_row_reports_itself() {
+    let source = "---\nscene: 1\nname: rows\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 4, children: [\"list\"]}\nlist: {widget: \"list\", rows: [{id: \"r1\", cells: [\"one\"]}], row: \"entry\", row_height: 30, on_click: \"pick\"}\nentry: {widget: \"row\", height: 30, children: [\"cell\"], on_click: \"open\"}\ncell: {widget: \"text\", text: \"{cells[0]}\"}\n```\n";
+    let mut rig = Rig::new(source, 300, 200, 1.0);
+    rig.settle();
+    rig.click("entry@r1");
+    let actions = rig.actions();
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0].node, "entry@r1");
+    assert_eq!(actions[0].handler, "open");
+    assert_eq!(actions[0].kind, "click");
+    assert_eq!(actions[0].item, None);
+}
+
+#[test]
+fn rows_and_list_rows_fire_on_release() {
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 1.0);
+    rig.settle();
+    let row = rig.bounds("row").center();
+    rig.renderer
+        .queue(SurfaceEvent::PointerMoved { x: row.x, y: row.y });
+    rig.renderer.queue(SurfaceEvent::PointerButton {
+        button: PointerButton::Primary,
+        pressed: true,
+    });
+    rig.settle();
+    assert!(rig.actions().is_empty(), "a press alone must not click");
+    rig.renderer.queue(SurfaceEvent::PointerButton {
+        button: PointerButton::Primary,
+        pressed: false,
+    });
+    rig.settle();
+    assert_eq!(rig.actions(), vec![action("click", "pick", "row", None)]);
+}
+
+#[test]
+fn stretch_rows_fill_their_children() {
+    let source = "---\nscene: 1\nname: stretchy\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 0, children: [\"bar\"]}\nbar: {widget: \"row\", height: 60, align: \"stretch\", children: [\"tall\"]}\ntall: {widget: \"row\", children: [\"label\"], background: \"#345\"}\nlabel: {widget: \"text\", text: \"x\"}\n```\n";
+    let mut rig = Rig::new(source, 300, 200, 1.0);
+    rig.settle();
+    let bar = rig.bounds("bar");
+    let tall = rig.bounds("tall");
+    assert!(
+        (tall.height - bar.height).abs() < 0.5,
+        "stretch: {} vs {}",
+        tall.height,
+        bar.height
+    );
+}
+
+#[test]
+fn hover_state_does_not_outlive_its_rows() {
+    let mut rig = Rig::new(CLIPPANEL, 720, 520, 1.0);
+    rig.settle();
+    rig.point("entry_row@e1");
+    rig.settle();
+    assert_eq!(rig.renderer.program().hovered_keys(), ["entry_row@e1"]);
+    let mut without = resolve(CLIPPANEL);
+    without.nodes["table"]
+        .ports
+        .insert("rows".into(), json!([]));
+    rig.renderer.set_scene(&without);
+    rig.settle();
+    assert!(
+        rig.renderer.program().hovered_keys().is_empty(),
+        "stale hover: {:?}",
+        rig.renderer.program().hovered_keys()
+    );
+}
+
+#[test]
+fn a_hidden_field_keeps_its_text_and_focus() {
+    let source = "---\nscene: 1\nname: hider\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 6, children: [\"pad\", \"field\"]}\npad: {widget: \"text\", text: \"pad\"}\nfield: {widget: \"field\", value: \"\", width: 150, on_change: \"change\"}\n```\n";
+    let mut rig = Rig::new(source, 300, 200, 1.0);
+    rig.settle();
+    rig.click("field");
+    rig.type_text("hi");
+    assert_eq!(rig.renderer.program().field_value("field"), Some("hi"));
+    rig.actions();
+
+    // The scene hides the column that holds it: CTK keeps the entity, so the
+    // iced widget must keep its state too.
+    let mut hidden = resolve(source);
+    hidden.nodes["pad"]
+        .ports
+        .insert("hidden".into(), json!(true));
+    rig.renderer.set_scene(&hidden);
+    rig.settle();
+    assert!(rig.renderer.focused().contains("field"));
+    rig.type_text("!");
+    assert_eq!(rig.renderer.program().field_value("field"), Some("hi!"));
+}
+
+#[test]
+fn images_are_reported_not_silently_blank() {
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 1.0);
+    rig.settle();
+    assert_eq!(rig.renderer.program().undrawn_nodes(), 1);
+}
+
+#[test]
+fn buttons_follow_the_design_tokens_not_iceds_palette() {
+    // A light look: the button must not be painted from iced's dark palette.
+    let light = Tokens {
+        surface: cosmix_iced_host::core::Color::WHITE,
+        selection: cosmix_iced_host::core::Color::from_rgb8(0x2f, 0x81, 0xf7),
+        selection_text: cosmix_iced_host::core::Color::WHITE,
+        ..Tokens::default()
+    };
+    let design = Arc::new(RwLock::new(DesignShare {
+        revision: 0,
+        look: Look {
+            tokens: light,
+            dark: false,
+            font: named_font("DejaVu Sans"),
+            text_px: 15.0,
+        },
+    }));
+    cosmix_iced_host::load_font(FONT);
+    let outbox = Outbox::default();
+    let mut renderer = IcedSceneRenderer::new(design, outbox);
+    renderer.resize(300, 200, 1.0);
+    let source = "---\nscene: 1\nname: tones\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 10, children: [\"go\"]}\ngo: {widget: \"button\", label: \"Go\", tone: \"primary\", width: 80, on_click: \"go\"}\n```\n";
+    renderer.set_scene(&resolve(source));
+    renderer.process(Duration::from_secs(1));
+    let mut buffer = vec![0u8; 300 * 200 * 4];
+    renderer.draw(&mut buffer, 300, 200, 300 * 4);
+    let button = renderer.node_bounds("go").expect("button bounds");
+    let x = (button.x + button.width / 2.0) as usize;
+    let y = (button.y + button.height / 2.0) as usize;
+    let pixel = &buffer[(y * 300 + x) * 4..][..4];
+    let want = [0x2f, 0x81, 0xf7];
+    for (channel, expected) in pixel.iter().zip(want) {
+        assert!(
+            (*channel as i32 - expected as i32).abs() <= 2,
+            "button pixel {pixel:?} is not the accent {want:?}"
+        );
+    }
+}
+
+#[test]
+fn handler_calls_wait_for_the_bus() {
+    use bevy::asset::AssetPlugin;
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+        .init_asset::<Image>()
+        .add_plugins((crate::SceneIcedPlugin, IcedRendererPlugin));
+    let outbox = app.world().resource::<IcedOutbox>().0.clone();
+    outbox
+        .lock()
+        .unwrap()
+        .push(action("click", "go", "button", None));
+    app.update();
+    assert_eq!(
+        outbox.lock().unwrap().len(),
+        1,
+        "a click before the Bus is up must stay queued"
+    );
+    let (bridge, peer) = ctk::bus::test_bridge("test");
+    app.insert_resource(bridge);
+    app.update();
+    assert!(outbox.lock().unwrap().is_empty());
+    assert_eq!(peer.drain_calls().len(), 1);
+}

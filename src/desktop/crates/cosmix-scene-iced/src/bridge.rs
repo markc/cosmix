@@ -71,6 +71,9 @@ pub(crate) struct SurfaceState {
     events: Vec<SurfaceEvent>,
     hovered: bool,
     repaint: bool,
+    /// Times the render world gave up on this surface's texture without the
+    /// geometry changing. Repaint cycles do not clear it.
+    giveups: u32,
     last: Processed,
 }
 
@@ -446,6 +449,7 @@ pub(crate) fn spawn_surface(world: &mut World, scene: &str) -> Entity {
             events: Vec::new(),
             hovered: false,
             repaint: false,
+            giveups: 0,
             last: Processed::default(),
         },
     ));
@@ -885,8 +889,15 @@ fn cursor_shape(icon: CursorIcon) -> CursorShape {
 }
 
 /// Frames the host is kept awake for staged uploads before the wait is
-/// abandoned: twice the render world's own `MAX_WAIT_FRAMES`.
+/// abandoned: twice the render world's own `MAX_WAIT_FRAMES`. It bounds one
+/// stretch of waiting; [`MAX_GIVEUPS`] bounds the repaint cycles themselves.
 pub const MAX_KEEP_AWAKE_FRAMES: u32 = 240;
+
+/// Times a surface's texture may be given up on before the surface stops
+/// uploading. Each cycle costs `MAX_WAIT_FRAMES` in the render world, so a
+/// texture that never prepares stops the traffic in a few seconds instead of
+/// re-arming for ever. A geometry change clears the count.
+pub const MAX_GIVEUPS: u32 = 3;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn frame(
@@ -946,8 +957,20 @@ pub(crate) fn frame(
             // Consumed from the channel now; kept here until the surface
             // next draws.
             state.size = UVec2::ZERO;
+            state.giveups += 1;
+            if state.giveups == MAX_GIVEUPS {
+                warn!(
+                    "scene-iced: a surface texture was abandoned {} times; it stays blank until \
+                     its geometry changes",
+                    state.giveups
+                );
+            }
         }
         let size = geometry.size;
+        if state.size != UVec2::ZERO && (state.size != size || state.scale != geometry.scale) {
+            // Real geometry movement, not a repaint cycle: start counting again.
+            state.giveups = 0;
+        }
         let renderer = renderers.0.get_mut(&entity);
         let Some(renderer) = renderer.filter(|_| size.x > 0 && size.y > 0 && geometry.scale > 0.0)
         else {
@@ -1061,6 +1084,7 @@ pub(crate) fn frame(
         counters.current.bytes_queued += upload::byte_len(&rects);
         if let Some(channel) = channel.as_ref()
             && !rects.is_empty()
+            && state.giveups < MAX_GIVEUPS
         {
             channel.0.push(SurfaceUpload {
                 image: state.image.as_ref().unwrap().id(),

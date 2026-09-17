@@ -130,8 +130,9 @@ given another name.
 
 `iced_scene::IcedRendererPlugin` replaces the stand-in factory with
 `IcedSceneRenderer`: one `cosmix_iced_host::Surface` per mounted scene,
-drawing RGBA8 with tiny-skia. Quoin's `scene-iced` feature selects it;
-`scene-iced-standin` builds the bridge with the stand-in only.
+drawing RGBA8 with tiny-skia. Quoin's `scene-iced-standin` feature mounts the
+bridge with the stand-in renderer; `scene-iced` includes it and adds the iced
+renderer on top, so `scene-iced` is what a desktop build wants.
 
 Scene families map as the CTK adapter maps them:
 
@@ -145,7 +146,7 @@ Scene families map as the CTK adapter maps them:
 | `toggle` | toggler | |
 | `list` | scrollable keyed column of template instances, row click with `item` | `{cells[n]}` substitution, `max_rows`, `hidden_if_empty` |
 | `spacer`, `window` | space | as CTK's sizes |
-| `image` | space of `w` x `h` | not drawn: iced's image feature is off |
+| `image` | space of `w` x `h` | not drawn; logged once per node and counted by `undrawn_nodes()` |
 
 Handler ports produce `{scene, node, kind, value?, item?}` calls. The
 renderer queues them; `IcedRendererPlugin` sends them with
@@ -154,8 +155,19 @@ reply bookkeeping as CTK-mounted scenes.
 
 Editing state lives in the iced widget tree and survives reloads and
 patches that keep the node: focus, selection, undo history and an open
-preedit. A changed `value` port replaces a field's text only while it is not
-focused, as CTK does.
+preedit, including while the node is `hidden` (the widget stays in the tree
+inside a clipped zero-size box, as CTK keeps the entity with `Display::None`).
+A changed `value` port replaces a field's text only while it is not focused,
+as CTK does. One divergence: iced 0.14 has no keyed row, so a `row`'s children
+are matched by position and reordering siblings resets their editing state; a
+`column`'s children are keyed by node id and survive.
+
+Clicks match CTK's routing: rows and list rows fire on release, a template row
+with its own `on_click` reports `<row>@<row id>` with no item and the list
+does not also fire, and a list row without one reports the list with its item.
+Buttons, the toggler and text fields are styled from the resolved design
+tokens, and the iced theme follows the scheme's mode; `danger` has no token
+pair, so it keeps the theme's danger colour.
 
 The look follows CTK: `CtkDesign`'s resolved dictionary gives the
 `cosmix-iced-widgets` tokens, `CtkTypography` the family (effective, else

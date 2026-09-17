@@ -72,6 +72,7 @@ impl Plugin for IcedRendererPlugin {
 pub fn default_look() -> Look {
     let tokens = default_tokens().unwrap_or_default();
     Look {
+        dark: is_dark(tokens.surface),
         tokens,
         font: Font::DEFAULT,
         text_px: DEFAULT_TEXT_PX,
@@ -96,6 +97,11 @@ fn default_tokens() -> Option<Tokens> {
         }
         cosmix_design::DesignCompileResult::Fatal(_) => None,
     }
+}
+
+/// Whether a surface colour reads as dark, by relative luminance.
+pub fn is_dark(surface: cosmix_iced_host::core::Color) -> bool {
+    0.2126 * surface.r + 0.7152 * surface.g + 0.0722 * surface.b < 0.5
 }
 
 /// An iced font naming `family`. iced fonts hold `&'static str`, so each
@@ -143,8 +149,10 @@ fn sync_look(
         .and_then(|live| Tokens::from_dictionary(live.dictionary()).ok());
     let mut share = design.0.write().unwrap();
     share.revision += 1;
+    let tokens = tokens.unwrap_or(share.look.tokens);
     share.look = Look {
-        tokens: tokens.unwrap_or(share.look.tokens),
+        tokens,
+        dark: is_dark(tokens.surface),
         font: family.as_deref().map_or(Font::DEFAULT, named_font),
         text_px,
     };
@@ -155,10 +163,12 @@ fn send_actions(
     bridge: Option<Res<BusBridge>>,
     mut events: ResMut<SceneEvents>,
 ) {
-    let actions = std::mem::take(&mut *outbox.0.lock().unwrap());
+    // Keep the queue until there is a bridge: a click before the Bus is up
+    // must not vanish.
     let Some(bridge) = bridge else {
         return;
     };
+    let actions = std::mem::take(&mut *outbox.0.lock().unwrap());
     for action in actions {
         events.send_handler(
             &bridge,

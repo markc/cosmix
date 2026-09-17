@@ -892,10 +892,45 @@ fn count_wakes(mut reader: MessageReader<bevy::window::RequestRedraw>, mut wakes
     wakes.0 += reader.read().count() as u32;
 }
 
-/// A texture that never prepares must not keep an idle desktop rendering.
+/// The render world, minus Bevy: a real (noop-backend) queue and an asset
+/// store that never gets a texture, so every staged upload is given up on.
+struct NeverPrepares {
+    world: World,
+    shared: std::sync::Arc<crate::gpu::Shared>,
+}
+
+impl NeverPrepares {
+    fn new(channel: &crate::gpu::GpuChannel) -> Self {
+        use bevy::render::render_asset::RenderAssets;
+        use bevy::render::renderer::{RenderQueue, WgpuWrapper};
+        use bevy::render::texture::GpuImage;
+        let (_device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let mut world = World::new();
+        world.insert_resource(RenderQueue(std::sync::Arc::new(WgpuWrapper::new(queue))));
+        world.insert_resource(RenderAssets::<GpuImage>::default());
+        world.insert_resource(channel.clone());
+        world.init_resource::<crate::gpu::Staged>();
+        Self {
+            world,
+            shared: channel.0.clone(),
+        }
+    }
+
+    fn frame(&mut self) {
+        use bevy::ecs::system::RunSystemOnce;
+        let shared = self.shared.clone();
+        self.world
+            .resource_scope(|_, mut staged: Mut<crate::gpu::Staged>| {
+                crate::gpu::stage(&shared, &mut staged);
+            });
+        self.world.run_system_once(crate::gpu::write).unwrap();
+    }
+}
+
+/// A texture that never prepares must not keep an idle desktop rendering: the
+/// give-up/repaint/re-upload cycle has to stop, not re-arm for ever.
 #[test]
-fn keeping_the_host_awake_for_staged_uploads_is_bounded() {
-    use std::sync::atomic::Ordering;
+fn a_texture_that_never_prepares_stops_the_upload_cycle() {
     let mut h = Harness::new();
     let channel = crate::gpu::GpuChannel::default();
     h.app
@@ -903,23 +938,42 @@ fn keeping_the_host_awake_for_staged_uploads_is_bounded() {
         .add_message::<bevy::window::RequestRedraw>()
         .init_resource::<Wakes>()
         .add_systems(Last, count_wakes);
-    channel.0.waiting.store(true, Ordering::Relaxed);
-    h.run(crate::bridge::MAX_KEEP_AWAKE_FRAMES as usize * 2);
+    let mut gpu = NeverPrepares::new(&channel);
+    let mut bytes = 0;
+    // Each cycle is MAX_WAIT_FRAMES in the render world; run several.
+    for _ in 0..(crate::bridge::MAX_GIVEUPS as usize + 3) {
+        for _ in 0..=crate::gpu::MAX_WAIT_FRAMES {
+            h.app.update();
+            gpu.frame();
+        }
+        bytes = h.totals().bytes_queued;
+    }
+    let settled = h.app.world().resource::<Wakes>().0;
+    let queued = bytes;
+    for _ in 0..(crate::gpu::MAX_WAIT_FRAMES * 2) {
+        h.app.update();
+        gpu.frame();
+    }
     assert_eq!(
         h.app.world().resource::<Wakes>().0,
-        crate::bridge::MAX_KEEP_AWAKE_FRAMES,
-        "the keep-awake path must stop"
+        settled,
+        "the host is still being woken for a texture that never prepares"
+    );
+    assert_eq!(
+        h.totals().bytes_queued,
+        queued,
+        "uploads are still being queued for an abandoned texture"
+    );
+    assert!(
+        settled < crate::bridge::MAX_KEEP_AWAKE_FRAMES * crate::bridge::MAX_GIVEUPS,
+        "{settled} wakeups is not a bound"
     );
 
-    // An upload that lands clears the flag and rearms the budget.
-    channel.0.waiting.store(false, Ordering::Relaxed);
-    h.run(2);
-    channel.0.waiting.store(true, Ordering::Relaxed);
-    h.run(5);
-    assert_eq!(
-        h.app.world().resource::<Wakes>().0,
-        crate::bridge::MAX_KEEP_AWAKE_FRAMES + 5
-    );
+    // Geometry movement is a fresh start: the surface tries again.
+    h.geometry(220, 120, 1.5);
+    h.app.update();
+    gpu.frame();
+    assert!(h.totals().bytes_queued > queued, "a resize must retry");
 }
 
 // ---- host-agnostic seams ----

@@ -19,7 +19,7 @@ use crate::upload::UploadOp;
 
 /// Frames an upload may wait for its texture before it is dropped and the
 /// surface asked for a full repaint instead.
-const MAX_WAIT_FRAMES: u32 = 120;
+pub(crate) const MAX_WAIT_FRAMES: u32 = 120;
 
 pub struct SurfaceUpload {
     pub image: AssetId<Image>,
@@ -59,7 +59,7 @@ impl Shared {
 pub struct GpuChannel(pub Arc<Shared>);
 
 #[derive(Resource, Default)]
-struct Staged {
+pub(crate) struct Staged {
     uploads: Vec<(SurfaceUpload, u32)>,
     /// The texture last written for each image: a different one means Bevy
     /// re-created it and the old contents are gone.
@@ -86,12 +86,12 @@ fn extract(channel: Extract<Res<GpuChannel>>, mut staged: ResMut<Staged>) {
     stage(&channel.0, &mut staged);
 }
 
-fn stage(shared: &Shared, staged: &mut Staged) {
+pub(crate) fn stage(shared: &Shared, staged: &mut Staged) {
     let uploads = std::mem::take(&mut *shared.pending.lock().unwrap());
     staged.uploads.extend(uploads.into_iter().map(|u| (u, 0)));
 }
 
-fn write(
+pub(crate) fn write(
     mut staged: ResMut<Staged>,
     channel: Res<GpuChannel>,
     images: Res<RenderAssets<GpuImage>>,
