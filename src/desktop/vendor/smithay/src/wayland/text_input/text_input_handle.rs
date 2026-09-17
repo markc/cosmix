@@ -153,6 +153,19 @@ impl TextInputHandle {
         });
     }
 
+    /// Whether a focused client has an ACTIVE text input, i.e. whether
+    /// [`Self::with_active_text_input`] would call its closure. The
+    /// compositor sink for in-process content is used only when this is
+    /// false (see `InputMethodHandle::set_sink`).
+    pub fn has_active_text_input(&self) -> bool {
+        let mut active = false;
+        self.inner
+            .lock()
+            .unwrap()
+            .with_active_text_input(|_, _, _| active = true);
+        active
+    }
+
     /// Access the active text-input instance for the currently focused surface.
     pub fn with_active_text_input<F>(&self, mut f: F)
     where

@@ -22,7 +22,11 @@ bus = [
 ]
 explicit-sync-live-test = []
 hud-probe = ["dep:cosmix-bg-boing", "bevy/bevy_pbr", "bevy/bevy_ui_render"]
-native-quoin = ["hud-probe", "dep:cosmix-quoin", "dep:cosmix-shell"]
+native-quoin = ["hud-probe", "native-input", "dep:cosmix-quoin", "dep:cosmix-shell"]
+# Keyboard and IME for content comp draws itself (scenes mounted in comp's
+# own Bevy app). Off by default: without it the seat behaves exactly as
+# before and the vendored input-method sink is never registered.
+native-input = []
 frame-capture = ["dep:signal-hook"]
 kms-live = [
     "dep:signal-hook",

@@ -365,6 +365,64 @@ frame trace as `comp_window_control` (subject the id; detail 1 minimize,
 Every argument object is checked for unknown fields
 (`{"error":"invalid_args",field,allowed}`).
 
+### Native input (content comp draws itself)
+
+A scene mounted in comp's own Bevy app has no Wayland client, so the two
+input paths a client relies on end at the compositor. The `native-input`
+feature (off by default, implied by `native-quoin`) closes them.
+
+**Registration** is on the Bevy side: add `NativeInputPlugin`, then use the
+`NativeKeyboard` and `NativeIme` resources it inserts.
+
+| Call | Meaning |
+| --- | --- |
+| `NativeKeyboard::request_focus(bool)` | Ask for, or give up, the keyboard. |
+| `NativeKeyboard::focused()` | What arbitration decided. |
+| `NativeIme::enable(bool)` | Take or give up the input method (a client's `text_input.enable`). |
+| `NativeIme::set_caret(x, y, w, h)` | The caret rectangle in output-space logical pixels. |
+| `NativeIme::set_surrounding_text(text, cursor, anchor)` | As `text_input.set_surrounding_text`. |
+| `NativeIme::set_content_type(hint, purpose)` | As `text_input.set_content_type`. |
+| `NativeIme::done()` | End the batch (a client's `text_input.commit`). |
+
+Keys arrive as ordinary Bevy `KeyboardInput` messages, IME output as
+`NativeImeEvent` messages (`Commit`, `Preedit`, `DeleteSurrounding`,
+`Done`).
+
+**Focus** is decided in one place, `arbitrate_keyboard_focus`, where
+in-process content is one more requester:
+
+- A session lock, an exclusive layer surface and an override-redirect X11
+  window all still win; while content holds the keyboard, no client does,
+  which is what comp already meant by focusing `None`.
+- Giving the keyboard back focuses the highest visible toplevel again.
+- The content's request survives being outranked: when the lock ends, it is
+  arbitrated again.
+
+**Keys** take the client path up to the last step: the compositor's
+bindings are dispatched first (an injected or typed `Super+Shift+M` still
+restores a window and the content never sees the M), and only what a client
+would have received goes to the content. Injected `comp.input.key` is the
+same path, so a script types into in-process content exactly as it types
+into a client. The compositor also generates key repeats for content,
+because `wl_keyboard.repeat_info` — which a client repeats from — has no
+in-process equivalent; the rate is the seat's own (500 ms, 30/s), one key at
+a time.
+
+**IME** works in both directions through a small vendored patch (see
+`src/desktop/vendor/README.md`). A focused client's active text input still
+takes priority: the compositor sink receives `commit_string`,
+`set_preedit_string`, `delete_surrounding_text` and `commit` only when no
+client would. The reverse direction — enable, caret rectangle, surrounding
+text, content type, done — drives the input method as a client's text input
+does. A candidate popup created for in-process content has no parent
+surface, so comp anchors it under the caret rectangle the content reported.
+
+`COSMIX_COMP_NATIVE_INPUT_PROBE=1` installs a test-only text field drawn by
+the compositor: it takes the keyboard, enables the input method and logs a
+`NATIVE_INPUT_PROBE` line (focus, text, preedit, commit count) whenever its
+state changes. It is the gate client for this surface, because no Wayland
+client can stand in for content that has no client.
+
 ### Input injection
 
 The `comp.input.*` verbs feed the seat exactly as a device does. Every event

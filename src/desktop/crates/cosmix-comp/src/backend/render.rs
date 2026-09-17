@@ -844,6 +844,10 @@ fn build_live_render_app(
     // starves the wallpaper client (the Boing wallpaper stutter). Install the
     // panels here for the persistent case; when HUD_PROBE=1 the harness
     // above already installed them, so guard against a double-install.
+    // Keyboard and IME for content comp draws itself (the probe, or a
+    // mounted scene). A no-op without its environment variable.
+    #[cfg(feature = "native-input")]
+    crate::native_input::install_from_environment(&mut app);
     #[cfg(feature = "native-quoin")]
     if scene_mode == LiveSceneMode::ClientContent
         && std::env::var("COSMIX_COMP_NATIVE_QUOIN").as_deref() == Ok("1")

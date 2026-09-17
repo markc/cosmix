@@ -1,5 +1,34 @@
 # Vendored upstream sources
 
+## Smithay input-method: a compositor sink for in-process content
+
+`smithay/src/wayland/input_method/input_method_handle.rs` (plus one read-only
+helper in `text_input/text_input_handle.rs`) lets the compositor receive
+input-method output for content it draws ITSELF.
+
+Upstream routes every `zwp_input_method_v2` request to the focused client's
+`zwp_text_input_v3` (`with_active_text_input`), and `TextInputHandle::set_focus`
+takes a `WlSurface`. Compositor-drawn content (comp's in-process scenes) has no
+surface and therefore no text input, so every commit, preedit and delete was
+dropped on the floor with no way to observe it.
+
+The patch adds an optional sink on `InputMethodHandle`
+(`set_sink` / `sink`). `CommitString`, `SetPreeditString`,
+`DeleteSurroundingText` and `Commit` go to it ONLY when
+`TextInputHandle::has_active_text_input()` is false, so a focused client keeps
+priority and unpatched behaviour is unchanged when no sink is registered.
+The reverse direction is four thin `pub` entry points — `activate_for_sink`,
+the now-`pub` `deactivate_input_method` and `set_text_input_rectangle`, plus
+`with_active_instance` / `send_done` — so the compositor's own field can
+report enable, caret rectangle, surrounding text and content type the way a
+client's text input does. A popup created while a sink is registered is
+handed to `InputMethodHandler::new_popup` even without a parent surface; comp
+anchors it from its own caret rectangle.
+
+Comp's side is `crates/cosmix-comp/src/native_input.rs` and the
+`native-input` feature. Retain this patch until upstream offers a
+surface-free text-input target.
+
 ## Smithay libinput: opt-in dispatch fairness
 
 `smithay/src/backend/libinput/mod.rs` adds `set_dispatch_budget` for comp's

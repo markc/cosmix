@@ -80,7 +80,9 @@ use crate::{
     utils::{Logical, Rectangle},
 };
 
-pub use input_method_handle::{InputMethodHandle, InputMethodUserData};
+pub use input_method_handle::{
+    InputMethodHandle, InputMethodSink, InputMethodSinkEvent, InputMethodUserData,
+};
 pub use input_method_keyboard_grab::{InputMethodKeyboardGrab, InputMethodKeyboardUserData};
 pub use input_method_popup_surface::InputMethodPopupSurfaceUserData;
 

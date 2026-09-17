@@ -780,6 +780,56 @@ windows and is empty while a session lock is active.</li>
 </ul>
 <p>Every argument object is checked for unknown fields
 (<code>{"error":"invalid_args",field,allowed}</code>).</p>
+<h3 id="native-input-content-comp-draws-itself">Native input (content comp draws itself)</h3>
+<p>A scene mounted in comp's own Bevy app has no Wayland client, so the two
+input paths a client relies on end at the compositor. The <code>native-input</code>
+feature (off by default, implied by <code>native-quoin</code>) closes them.</p>
+<p><strong>Registration</strong> is on the Bevy side: add <code>NativeInputPlugin</code>, then use the
+<code>NativeKeyboard</code> and <code>NativeIme</code> resources it inserts.</p>
+<table><thead><tr><th>Call</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>NativeKeyboard::request_focus(bool)</code></td><td>Ask for, or give up, the keyboard.</td></tr>
+<tr><td><code>NativeKeyboard::focused()</code></td><td>What arbitration decided.</td></tr>
+<tr><td><code>NativeIme::enable(bool)</code></td><td>Take or give up the input method (a client's <code>text_input.enable</code>).</td></tr>
+<tr><td><code>NativeIme::set_caret(x, y, w, h)</code></td><td>The caret rectangle in output-space logical pixels.</td></tr>
+<tr><td><code>NativeIme::set_surrounding_text(text, cursor, anchor)</code></td><td>As <code>text_input.set_surrounding_text</code>.</td></tr>
+<tr><td><code>NativeIme::set_content_type(hint, purpose)</code></td><td>As <code>text_input.set_content_type</code>.</td></tr>
+<tr><td><code>NativeIme::done()</code></td><td>End the batch (a client's <code>text_input.commit</code>).</td></tr>
+</tbody></table>
+<p>Keys arrive as ordinary Bevy <code>KeyboardInput</code> messages, IME output as
+<code>NativeImeEvent</code> messages (<code>Commit</code>, <code>Preedit</code>, <code>DeleteSurrounding</code>,
+<code>Done</code>).</p>
+<p><strong>Focus</strong> is decided in one place, <code>arbitrate_keyboard_focus</code>, where
+in-process content is one more requester:</p>
+<ul>
+<li>A session lock, an exclusive layer surface and an override-redirect X11
+window all still win; while content holds the keyboard, no client does,
+which is what comp already meant by focusing <code>None</code>.</li>
+<li>Giving the keyboard back focuses the highest visible toplevel again.</li>
+<li>The content's request survives being outranked: when the lock ends, it is
+arbitrated again.</li>
+</ul>
+<p><strong>Keys</strong> take the client path up to the last step: the compositor's
+bindings are dispatched first (an injected or typed <code>Super+Shift+M</code> still
+restores a window and the content never sees the M), and only what a client
+would have received goes to the content. Injected <code>comp.input.key</code> is the
+same path, so a script types into in-process content exactly as it types
+into a client. The compositor also generates key repeats for content,
+because <code>wl_keyboard.repeat_info</code> — which a client repeats from — has no
+in-process equivalent; the rate is the seat's own (500 ms, 30/s), one key at
+a time.</p>
+<p><strong>IME</strong> works in both directions through a small vendored patch (see
+<code>src/desktop/vendor/README.md</code>). A focused client's active text input still
+takes priority: the compositor sink receives <code>commit_string</code>,
+<code>set_preedit_string</code>, <code>delete_surrounding_text</code> and <code>commit</code> only when no
+client would. The reverse direction — enable, caret rectangle, surrounding
+text, content type, done — drives the input method as a client's text input
+does. A candidate popup created for in-process content has no parent
+surface, so comp anchors it under the caret rectangle the content reported.</p>
+<p><code>COSMIX_COMP_NATIVE_INPUT_PROBE=1</code> installs a test-only text field drawn by
+the compositor: it takes the keyboard, enables the input method and logs a
+<code>NATIVE_INPUT_PROBE</code> line (focus, text, preedit, commit count) whenever its
+state changes. It is the gate client for this surface, because no Wayland
+client can stand in for content that has no client.</p>
 <h3 id="input-injection">Input injection</h3>
 <p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply

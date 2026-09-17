@@ -14,6 +14,8 @@ mod decoration_scene;
 mod frame_capture;
 mod frame_content;
 mod frame_trace;
+#[cfg(feature = "native-input")]
+mod native_input;
 #[cfg(feature = "native-quoin")]
 mod native_shell;
 #[cfg(feature = "bus")]
@@ -356,6 +358,10 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         tracing::info!("nested DMA-BUF import logging enabled");
     }
     NestedDmabufTeardownGuard::install(&mut app);
+    // Keyboard and IME for content comp draws itself; a no-op unless the
+    // probe (or a mounted scene) asks for them.
+    #[cfg(feature = "native-input")]
+    native_input::install_from_environment(&mut app);
     let pipelined_rendering = app.is_plugin_added::<PipelinedRenderingPlugin>()
         || app.get_sub_app(RenderExtractApp).is_some();
     tracing::debug!(

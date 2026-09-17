@@ -40938,3 +40938,9 @@ mod window_control_tests {
     use super::*;
     include!("window_control_tests.rs");
 }
+
+#[cfg(feature = "native-input")]
+mod native_input_tests {
+    use super::*;
+    include!("native_input_tests.rs");
+}

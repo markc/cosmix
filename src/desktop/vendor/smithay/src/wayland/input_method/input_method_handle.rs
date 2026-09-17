@@ -27,12 +27,62 @@ use super::{
     InputMethodPopupSurfaceUserData, INPUT_POPUP_SURFACE_ROLE,
 };
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub(crate) struct InputMethod {
     pub instance: Option<Instance>,
     pub popup_handle: PopupHandle,
     pub keyboard_grab: InputMethodKeyboardGrab,
+    pub sink: Option<InputMethodSink>,
 }
+
+impl fmt::Debug for InputMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InputMethod")
+            .field("instance", &self.instance)
+            .field("popup_handle", &self.popup_handle)
+            .field("keyboard_grab", &self.keyboard_grab)
+            .field("sink", &self.sink.is_some())
+            .finish()
+    }
+}
+
+/// What an input method produced, for content the compositor draws itself.
+///
+/// COSMIX PATCH (see `vendor/README.md`): a compositor that renders its own
+/// text field has no `wl_surface` and therefore no `zwp_text_input_v3`, so
+/// upstream's routing (`with_active_text_input`) drops every request. These
+/// are handed to the sink instead, and only when no focused client has an
+/// active text input.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputMethodSinkEvent {
+    /// Text to insert at the cursor.
+    CommitString(String),
+    /// The preedit (composing) string and its cursor span.
+    PreeditString {
+        /// The composing text.
+        text: String,
+        /// Cursor start, in bytes of `text`.
+        cursor_begin: i32,
+        /// Cursor end, in bytes of `text`.
+        cursor_end: i32,
+    },
+    /// Delete around the cursor before applying the rest of this batch.
+    DeleteSurroundingText {
+        /// Bytes to delete before the cursor.
+        before_length: u32,
+        /// Bytes to delete after the cursor.
+        after_length: u32,
+    },
+    /// The end of one input-method batch; apply what came before it.
+    /// `discard_state` mirrors upstream's serial mismatch.
+    Done {
+        /// The batch's serial did not match: discard rather than apply.
+        discard_state: bool,
+    },
+}
+
+/// Sink for [`InputMethodSinkEvent`] (see `InputMethodHandle::set_sink`).
+pub type InputMethodSink = Arc<dyn Fn(InputMethodSinkEvent) + Send + Sync>;
 
 #[derive(Debug)]
 pub(crate) struct Instance {
@@ -68,6 +118,66 @@ impl InputMethodHandle {
         }
     }
 
+    /// COSMIX PATCH: route input-method output to compositor-drawn content
+    /// when no focused client has an active text input. `None` restores the
+    /// upstream behaviour of dropping those requests.
+    pub fn set_sink(&self, sink: Option<InputMethodSink>) {
+        self.inner.lock().unwrap().sink = sink;
+    }
+
+    /// COSMIX PATCH: the registered sink, if any.
+    pub fn sink(&self) -> Option<InputMethodSink> {
+        self.inner.lock().unwrap().sink.clone()
+    }
+
+    /// COSMIX PATCH: deliver to the compositor sink when the focused client
+    /// has no active text input. Returns whether the sink took it.
+    fn to_sink(&self, text_input: &TextInputHandle, event: InputMethodSinkEvent) -> bool {
+        if text_input.has_active_text_input() {
+            return false;
+        }
+        let Some(sink) = self.sink() else {
+            return false;
+        };
+        sink(event);
+        true
+    }
+
+    /// COSMIX PATCH: activate the input method for compositor-drawn content.
+    /// There is no client surface, so the popup keeps the parent it has (none
+    /// for a compositor field) and the compositor places it from its own
+    /// caret rectangle.
+    pub fn activate_for_sink<D: SeatHandler + 'static>(&self, state: &mut D) {
+        self.with_input_method(|im| {
+            if let Some(instance) = im.instance.as_ref() {
+                instance.object.activate();
+                if let Some(popup) = im.popup_handle.surface.as_ref() {
+                    let data = instance.object.data::<InputMethodUserData<D>>().unwrap();
+                    (data.popup_repositioned)(state, popup.clone());
+                }
+            }
+        });
+    }
+
+    /// COSMIX PATCH: the compositor's own text field reporting its state to
+    /// the input method (`surrounding_text`, `content_type`,
+    /// `text_change_cause`), ending with [`Self::send_done`].
+    pub fn with_active_instance<F>(&self, f: F)
+    where
+        F: FnOnce(&ZwpInputMethodV2),
+    {
+        let inner = self.inner.lock().unwrap();
+        if let Some(instance) = inner.instance.as_ref() {
+            f(&instance.object);
+        }
+    }
+
+    /// COSMIX PATCH: end a compositor-side batch (upstream's `done`, serial
+    /// incremented).
+    pub fn send_done(&self) {
+        self.with_instance(|instance| instance.done());
+    }
+
     /// Whether there's an acitve instance of input-method.
     pub(crate) fn has_instance(&self) -> bool {
         self.inner.lock().unwrap().instance.is_some()
@@ -100,7 +210,10 @@ impl InputMethodHandle {
         keyboard.grab.is_some()
     }
 
-    pub(crate) fn set_text_input_rectangle<D: SeatHandler + 'static>(
+    /// COSMIX PATCH: `pub` so the compositor can report the caret rectangle
+    /// of content it draws itself (upstream reaches this only through a
+    /// client's `zwp_text_input_v3`).
+    pub fn set_text_input_rectangle<D: SeatHandler + 'static>(
         &self,
         state: &mut D,
         rect: Rectangle<i32, Logical>,
@@ -146,8 +259,9 @@ impl InputMethodHandle {
 
     /// Deactivate the active input method.
     ///
-    /// The `done` is always send when deactivating IME.
-    pub(crate) fn deactivate_input_method<D: SeatHandler + 'static>(&self, state: &mut D) {
+    /// The `done` is always send when deactivating IME. COSMIX PATCH: `pub`
+    /// so compositor-drawn content can end its own IME session.
+    pub fn deactivate_input_method<D: SeatHandler + 'static>(&self, state: &mut D) {
         self.with_input_method(|im| {
             if let Some(instance) = im.instance.as_mut() {
                 instance.object.deactivate();
@@ -206,26 +320,48 @@ where
     ) {
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.commit_string(Some(text.clone()));
-                });
+                if !data.handle.to_sink(
+                    &data.text_input_handle,
+                    InputMethodSinkEvent::CommitString(text.clone()),
+                ) {
+                    data.text_input_handle.with_active_text_input(|ti, _surface| {
+                        ti.commit_string(Some(text.clone()));
+                    });
+                }
             }
             zwp_input_method_v2::Request::SetPreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
-                });
+                if !data.handle.to_sink(
+                    &data.text_input_handle,
+                    InputMethodSinkEvent::PreeditString {
+                        text: text.clone(),
+                        cursor_begin,
+                        cursor_end,
+                    },
+                ) {
+                    data.text_input_handle.with_active_text_input(|ti, _surface| {
+                        ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
+                    });
+                }
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
                 before_length,
                 after_length,
             } => {
-                data.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.delete_surrounding_text(before_length, after_length);
-                });
+                if !data.handle.to_sink(
+                    &data.text_input_handle,
+                    InputMethodSinkEvent::DeleteSurroundingText {
+                        before_length,
+                        after_length,
+                    },
+                ) {
+                    data.text_input_handle.with_active_text_input(|ti, _surface| {
+                        ti.delete_surrounding_text(before_length, after_length);
+                    });
+                }
             }
             zwp_input_method_v2::Request::Commit { serial } => {
                 let current_serial = data
@@ -238,7 +374,13 @@ where
                     .map(|i| i.serial)
                     .unwrap_or(0);
 
-                data.text_input_handle.done(serial != current_serial);
+                let discard_state = serial != current_serial;
+                if !data.handle.to_sink(
+                    &data.text_input_handle,
+                    InputMethodSinkEvent::Done { discard_state },
+                ) {
+                    data.text_input_handle.done(discard_state);
+                }
             }
             zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
                 if compositor::give_role(&surface, INPUT_POPUP_SURFACE_ROLE).is_err()
@@ -270,7 +412,11 @@ where
                 let popup_rect = Arc::new(Mutex::new(input_method.popup_handle.rectangle));
                 let popup = PopupSurface::new(instance, surface, popup_rect, parent);
                 input_method.popup_handle.surface = Some(popup.clone());
-                if popup.get_parent().is_some() {
+                // COSMIX PATCH: with a compositor sink there is no parent
+                // surface, and the compositor places the popup from its own
+                // caret rectangle.
+                if popup.get_parent().is_some() || input_method.sink.is_some() {
+                    drop(input_method);
                     state.new_popup(popup);
                 }
             }
