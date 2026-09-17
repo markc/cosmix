@@ -809,6 +809,9 @@ pub(crate) fn route_keyboard(
         control: b.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]),
         alt: b.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]),
         logo: b.any_pressed([KeyCode::SuperLeft, KeyCode::SuperRight]),
+        // Bevy's `ButtonInput` reports the key, not the lock state; a host
+        // that carries its own seat modifiers fills these in instead.
+        ..Modifiers::default()
     });
     for input in keys.read() {
         let key = convert_key(&input.logical_key);
