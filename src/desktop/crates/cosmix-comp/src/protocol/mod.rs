@@ -2242,7 +2242,6 @@ impl WaylandRuntime {
         }
     }
 
-    #[cfg(any(all(feature = "kms-live", not(test)), test))]
     pub(crate) fn client_frame_clock(&self) -> ClientFrameClock {
         ClientFrameClock {
             commands: self.commands.clone(),
