@@ -234,7 +234,13 @@ impl WaylandState {
 pub(crate) struct WindowWaiters {
     next: u64,
     pub(super) waiters: BTreeMap<u64, WindowWaiter>,
+    /// `(generation, presented count)` when each window last mapped, so
+    /// `until: presented` means a frame of THIS mapping, not an earlier one
+    /// (the counters live as long as the `wl_surface`).
+    presented_base: HashMap<SurfaceId, (u64, u64)>,
 }
+
+const MAX_PRESENTED_BASES: usize = 1024;
 
 pub(super) struct WindowWaiter {
     kind: WaiterKind,
@@ -392,7 +398,9 @@ impl WaylandState {
         }
         let surface = record.role.wl_surface().clone();
         let origin = record.window_origin;
-        let configured = record.configured_size;
+        // An absent axis keeps the size the window really has, as the
+        // interactive resize does, not the last size comp asked for.
+        let current = geometry_size(record);
         let (key, row) = match self.place_output(spec.id, spec.output.as_deref()) {
             Ok(output) => output,
             Err(reply) => return reply,
@@ -411,11 +419,34 @@ impl WaylandState {
             self.clamp_window_size(
                 &surface,
                 (
-                    spec.width.unwrap_or(configured.0),
-                    spec.height.unwrap_or(configured.1),
+                    spec.width.unwrap_or(current.0),
+                    spec.height.unwrap_or(current.1),
                 ),
             )
         });
+        // A window placed wholly off every output could never be seen or
+        // clicked again by a caller that trusted the reply.
+        let size = requested.unwrap_or(current);
+        let on_output = port_snapshot::project_outputs(self).is_some_and(|projection| {
+            projection.rows.values().any(|output| {
+                target.0 < (output.x as f32 + output.width as f32)
+                    && target.0 + size.0 as f32 > output.x as f32
+                    && target.1 < (output.y as f32 + output.height as f32)
+                    && target.1 + size.1 as f32 > output.y as f32
+            })
+        });
+        if !on_output {
+            return ControlReply::refused(
+                "off_output",
+                json!({
+                    "id": spec.id,
+                    "x": target.0 - row.x as f32,
+                    "y": target.1 - row.y as f32,
+                    "width": size.0,
+                    "height": size.1,
+                }),
+            );
+        }
         // A client move/resize in progress would steer the window straight
         // back.
         if interactive_surface(self.interactive_pointer.as_ref())
@@ -446,26 +477,72 @@ impl WaylandState {
         }))
     }
 
+    /// A window is about to map: remember how many frames it had presented
+    /// before, so `until: presented` waits for a frame of this mapping.
+    pub(crate) fn note_window_mapping(&mut self, id: SurfaceId, generation: u64) {
+        let count = self.presentation.ledger.counters(id).presented;
+        let objects = &self.surface_objects;
+        let bases = &mut self.window_waiters.presented_base;
+        if bases.len() >= MAX_PRESENTED_BASES {
+            bases.retain(|id, _| objects.contains_key(id));
+        }
+        bases.insert(id, (generation, count));
+    }
+
+    fn presented_since_map(&self, record: &SurfaceRecord) -> bool {
+        let count = self.presentation.ledger.counters(record.id).presented;
+        let base = self
+            .window_waiters
+            .presented_base
+            .get(&record.id)
+            .filter(|(generation, _)| *generation == record.generation)
+            .map_or(0, |(_, base)| *base);
+        count > base
+    }
+
+    /// The target's role ended or was replaced (as opposed to a live window
+    /// that is merely unmapped, which a hide-on-close app is).
+    fn window_gone(&self, id: u64, generation: u64) -> bool {
+        matches!(
+            self.resolve_window_target(id, Some(generation)),
+            Err(WindowTargetError::UnknownWindow | WindowTargetError::StaleTarget { .. })
+        )
+    }
+
     pub(crate) fn start_window_wait(
         &mut self,
         spec: WaitSpec,
         reply: tokio::sync::oneshot::Sender<ControlReply>,
+        admitted: Instant,
     ) {
         let timeout = spec.timeout;
         crate::frame_trace::event("comp_window_control", || {
             (spec.window.id.unwrap_or(0), 7, millis(timeout))
         });
-        self.register_waiter(WaiterKind::Wait(spec), timeout, reply);
+        // An id that was never handed out would otherwise satisfy `gone`
+        // at once, hiding a typo.
+        if let Some(id) = spec.window.id
+            && (id == 0 || id >= self.next_surface_id)
+        {
+            let _ = reply.send(ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            });
+            return;
+        }
+        self.register_waiter(WaiterKind::Wait(spec), timeout, admitted, reply);
     }
 
     /// `comp.window.close {force}`: the polite close now, the kill only if
-    /// the same `{id, generation}` is still alive at the deadline.
+    /// the same `{id, generation}` is still alive (mapped or not) at the
+    /// deadline.
     pub(crate) fn start_force_close(
         &mut self,
         id: u64,
         generation: u64,
         timeout: Duration,
         reply: tokio::sync::oneshot::Sender<ControlReply>,
+        admitted: Instant,
     ) {
         crate::frame_trace::event("comp_window_control", || (id, 8, generation));
         if self.session_lock_active() {
@@ -479,21 +556,46 @@ impl WaylandState {
                 return;
             }
         };
-        let surface = self.surfaces[&object].role.wl_surface().clone();
+        let record = &self.surfaces[&object];
+        let x11 = !matches!(record.role, SurfaceRole::Toplevel(_));
+        let surface = record.role.wl_surface().clone();
         self.close_managed_toplevel(&surface);
-        self.register_waiter(WaiterKind::ForceClose { id, generation }, timeout, reply);
+        if x11 {
+            // An X11 window's Wayland client is Xwayland itself, and the XWM
+            // offers no per-client kill: refuse now rather than after the
+            // wait. The polite close was still sent.
+            let _ = reply.send(ControlReply::refused(
+                "still_open",
+                json!({
+                    "id": id,
+                    "generation": generation,
+                    "reason": "x11_kill_unsupported",
+                    "polite_close_sent": true,
+                }),
+            ));
+            return;
+        }
+        self.register_waiter(
+            WaiterKind::ForceClose { id, generation },
+            timeout,
+            admitted,
+            reply,
+        );
     }
 
     fn register_waiter(
         &mut self,
         kind: WaiterKind,
         timeout: Duration,
+        admitted: Instant,
         reply: tokio::sync::oneshot::Sender<ControlReply>,
     ) {
         let key = self.window_waiters.next;
         self.window_waiters.next = key.wrapping_add(1);
+        // The caller's budget started at admission, not here.
+        let remaining = timeout.saturating_sub(admitted.elapsed());
         let timer = self.capture_loop_handle.insert_source(
-            Timer::from_duration(timeout),
+            Timer::from_duration(remaining),
             move |_, _, state| {
                 state.expire_window_waiter(key);
                 TimeoutAction::Drop
@@ -511,7 +613,7 @@ impl WaylandState {
             key,
             WindowWaiter {
                 kind,
-                started: Instant::now(),
+                started: admitted,
                 timer: Some(timer),
                 reply,
             },
@@ -547,8 +649,7 @@ impl WaylandState {
                     .wait_outcome(spec)
                     .map(|window| wait_reply(spec, window, waited_ms)),
                 WaiterKind::ForceClose { id, generation } => self
-                    .resolve_window_target(*id, Some(*generation))
-                    .is_err()
+                    .window_gone(*id, *generation)
                     .then(|| close_reply(*id, *generation, "gone", waited_ms)),
             };
             if let Some(reply) = outcome {
@@ -574,6 +675,10 @@ impl WaylandState {
         let Some(waiter) = self.window_waiters.waiters.remove(&key) else {
             return;
         };
+        // Nobody is waiting any more: no side effect on their behalf.
+        if waiter.reply.is_closed() {
+            return;
+        }
         let waited_ms = millis(waiter.started.elapsed());
         let reply = match &waiter.kind {
             // An edge in this very dispatch may have beaten the timer.
@@ -592,13 +697,22 @@ impl WaylandState {
     }
 
     fn force_close_deadline(&mut self, id: u64, generation: u64, waited_ms: u64) -> ControlReply {
-        let Ok(object) = self.resolve_window_target(id, Some(generation)) else {
+        if self.window_gone(id, generation) {
+            return close_reply(id, generation, "gone", waited_ms);
+        }
+        // The lock owns the screen; no kill lands while it is up.
+        if self.session_lock_active() {
+            return ControlReply::Locked;
+        }
+        let Some(record) = self
+            .surface_objects
+            .get(&SurfaceId(id))
+            .and_then(|object| self.surfaces.get(object))
+        else {
             return close_reply(id, generation, "gone", waited_ms);
         };
-        let record = &self.surfaces[&object];
+        let mapped = record.mapped;
         if !matches!(record.role, SurfaceRole::Toplevel(_)) {
-            // An X11 window's wl_surface belongs to Xwayland itself: a
-            // client kill would take every X11 window down.
             return ControlReply::refused(
                 "still_open",
                 json!({"id": id, "generation": generation, "reason": "x11_kill_unsupported"}),
@@ -615,8 +729,7 @@ impl WaylandState {
             .surfaces
             .values()
             .filter(|record| {
-                record.mapped
-                    && record.role.managed_toplevel()
+                record.role.managed_toplevel()
                     && record.role.wl_surface().client().as_ref() == Some(&client)
             })
             .map(|record| record.id.0)
@@ -625,6 +738,7 @@ impl WaylandState {
         tracing::info!(
             id,
             ?pid,
+            mapped,
             ?windows,
             "comp.window.close force: killing the client"
         );
@@ -634,6 +748,7 @@ impl WaylandState {
         let ControlReply::Body(mut body) = close_reply(id, generation, "killed", waited_ms) else {
             unreachable!("close_reply builds a body");
         };
+        body["window"] = json!(if mapped { "mapped" } else { "unmapped" });
         body["scope"] = json!("client");
         body["pid"] = json!(pid);
         body["windows"] = json!(windows);
@@ -643,10 +758,19 @@ impl WaylandState {
     /// The window row a wait resolves to (`null` for `unmapped` / `gone`),
     /// or `None` while the condition does not hold.
     fn wait_outcome(&self, spec: &WaitSpec) -> Option<Value> {
+        // Under a session lock the read tree hides every window, so a wait
+        // learns nothing from it either: only whether a named id's role
+        // ended or unmapped, which `surfaces.*` still shows.
+        if self.session_lock_active()
+            && !(spec.window.id.is_some()
+                && matches!(spec.until, WaitUntil::Gone | WaitUntil::Unmapped))
+        {
+            return None;
+        }
         let holds = |record: &SurfaceRecord| match spec.until {
             WaitUntil::Mapped => true,
             WaitUntil::Visible => record.layout.visible && !record.minimized,
-            WaitUntil::Presented => self.presentation.ledger.counters(record.id).presented > 0,
+            WaitUntil::Presented => self.presented_since_map(record),
             WaitUntil::Size { width, height } => geometry_size(record) == (width, height),
             WaitUntil::Focused => record.focused,
             WaitUntil::Unmapped | WaitUntil::Gone => false,

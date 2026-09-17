@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use serde_json::{Value, json};
 use smithay::input::keyboard::{Keysym, xkb};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::wayland::input_method::InputMethodSeat as _;
 
 use super::*;
 use crate::port::{
@@ -39,18 +40,58 @@ pub(crate) struct InputMark {
     pub(crate) injected_at_us: u64,
 }
 
+/// A sequence yields to the event loop (dispatch, client flush) after this
+/// many injected events, so a long zero-delay run cannot fill a client's
+/// socket inside one callback.
+const SEQUENCE_YIELD_EVENTS: u64 = 256;
+const SEQUENCE_YIELD: Duration = Duration::from_millis(1);
+
+/// Keys (raw XKB codes) and buttons pressed by injection and not released.
+#[derive(Default)]
+pub(super) struct Holds {
+    pub(super) keys: BTreeSet<u32>,
+    pub(super) buttons: BTreeSet<u32>,
+}
+
+impl Holds {
+    fn note(&mut self, input: &HostInput) {
+        match *input {
+            HostInput::Key { keycode, state, .. } => {
+                if state == HostButtonState::Pressed {
+                    self.keys.insert(keycode.raw());
+                } else {
+                    self.keys.remove(&keycode.raw());
+                }
+            }
+            HostInput::PointerButton { button, state, .. } => {
+                if state == HostButtonState::Pressed {
+                    self.buttons.insert(button);
+                } else {
+                    self.buttons.remove(&button);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub(crate) struct InjectionState {
     next_seq: u64,
-    /// Keys and buttons an injection pressed and has not released; the
-    /// only state `release_all` touches.
-    pub(super) held_keys: BTreeSet<u32>,
-    held_buttons: BTreeSet<u32>,
+    /// Everything injection holds; `release_all` releases all of it.
+    pub(super) held: Holds,
+    /// The sequence whose step is running, so its holds are also recorded
+    /// on the run: an aborted run releases only its own.
+    current_run: Option<u64>,
+    /// Injected events so far (for the sequence yield).
+    pub(super) events: u64,
     marks: HashMap<SurfaceId, InputMark>,
     host_passthrough: bool,
     /// Host keys and buttons pressed while passthrough was on. Their
     /// releases always pass, so turning passthrough off never strands one.
     host_held_keys: BTreeSet<u32>,
     host_held_buttons: BTreeSet<u32>,
+    /// Pointer moves skip hot-corner sampling while set (`corners: false`).
+    pub(super) suppress_corners: bool,
     pub(super) sequences: HashMap<u64, SequenceRun>,
     next_sequence: u64,
 }
@@ -59,12 +100,14 @@ impl Default for InjectionState {
     fn default() -> Self {
         Self {
             next_seq: 0,
-            held_keys: BTreeSet::new(),
-            held_buttons: BTreeSet::new(),
+            held: Holds::default(),
+            current_run: None,
+            events: 0,
             marks: HashMap::new(),
             host_passthrough: true,
             host_held_keys: BTreeSet::new(),
             host_held_buttons: BTreeSet::new(),
+            suppress_corners: false,
             sequences: HashMap::new(),
             next_sequence: 0,
         }
@@ -78,6 +121,7 @@ pub(super) struct SequenceRun {
     delay_elapsed: bool,
     replies: Vec<Value>,
     started: Instant,
+    pub(super) holds: Holds,
     reply: tokio::sync::oneshot::Sender<ControlReply>,
 }
 
@@ -173,37 +217,15 @@ impl WaylandState {
     }
 
     fn inject(&mut self, input: HostInput) {
-        match input {
-            HostInput::Key {
-                keycode,
-                state: HostButtonState::Pressed,
-                ..
-            } => {
-                self.injection.held_keys.insert(keycode.raw());
-            }
-            HostInput::Key {
-                keycode,
-                state: HostButtonState::Released,
-                ..
-            } => {
-                self.injection.held_keys.remove(&keycode.raw());
-            }
-            HostInput::PointerButton {
-                button,
-                state: HostButtonState::Pressed,
-                ..
-            } => {
-                self.injection.held_buttons.insert(button);
-            }
-            HostInput::PointerButton {
-                button,
-                state: HostButtonState::Released,
-                ..
-            } => {
-                self.injection.held_buttons.remove(&button);
-            }
-            _ => {}
+        self.injection.held.note(&input);
+        if let Some(run) = self
+            .injection
+            .current_run
+            .and_then(|run| self.injection.sequences.get_mut(&run))
+        {
+            run.holds.note(&input);
         }
+        self.injection.events = self.injection.events.wrapping_add(1);
         self.handle_host_input(input);
     }
 
@@ -221,12 +243,14 @@ impl WaylandState {
         let injected_at_us = monotonic_micros();
         let time = (injected_at_us / 1_000) as u32;
         let (kind, keyboard) = match op {
-            InputOp::PointerMove(target) => {
+            InputOp::PointerMove { target, corners } => {
                 let input = match self.pointer_move_input(target, time) {
                     Ok(input) => input,
                     Err(reply) => return reply,
                 };
+                self.injection.suppress_corners = !corners;
                 self.inject(input);
+                self.injection.suppress_corners = false;
                 (InjectedKind::PointerMove, false)
             }
             InputOp::PointerButton { button, action } => {
@@ -305,6 +329,11 @@ impl WaylandState {
                 (InjectedKind::Key, true)
             }
             InputOp::Text(text) => {
+                // An input method holding the keyboard would compose the
+                // keys into something else; typed text must arrive as sent.
+                if self.seat.input_method().keyboard_grabbed() {
+                    return ControlReply::refused("ime_active", json!({}));
+                }
                 let index = self.keymap_index();
                 let shift = self.resolve_key(&index, &KeySpec::Name("Shift_L".into()));
                 let mut keys = Vec::with_capacity(text.len());
@@ -373,21 +402,29 @@ impl WaylandState {
         }))
     }
 
-    /// Release what injections hold (and only that): keys the seat still
-    /// has pressed, then buttons.
+    /// `release_all`: release everything injection holds, and only that.
     fn release_injected(&mut self, time: u32) {
+        let holds = std::mem::take(&mut self.injection.held);
+        self.release_holds(holds, time, false);
+    }
+
+    /// Release the given holds the seat still has pressed: keys, then
+    /// buttons. With `still_held`, only those injection still holds (a run
+    /// never releases what `release_all` or another caller already let go
+    /// of, nor anything a device holds).
+    fn release_holds(&mut self, holds: Holds, time: u32, still_held: bool) {
         let pressed = self.keyboard.pressed_keys();
-        let keys = std::mem::take(&mut self.injection.held_keys);
-        for raw in keys.into_iter().rev() {
+        for raw in holds.keys.into_iter().rev() {
             let keycode = Keycode::new(raw);
-            if pressed.contains(&keycode) {
+            let ours = !still_held || self.injection.held.keys.contains(&raw);
+            if pressed.contains(&keycode) && ours {
                 self.inject_key(keycode, HostButtonState::Released, time);
             }
         }
         let pressed = self.pointer.current_pressed();
-        let buttons = std::mem::take(&mut self.injection.held_buttons);
-        for button in buttons {
-            if pressed.contains(&button) {
+        for button in holds.buttons {
+            let ours = !still_held || self.injection.held.buttons.contains(&button);
+            if pressed.contains(&button) && ours {
                 self.inject(HostInput::PointerButton {
                     button,
                     state: HostButtonState::Released,
@@ -600,12 +637,16 @@ impl WaylandState {
                     if open {
                         passed.push(input);
                     } else {
+                        // Release only the host-held keys, then the rest of
+                        // the focus-loss reset (chrome grab, hover, cursor)
+                        // without touching an injected hold.
                         let time = monotonic_millis();
                         passed.extend(held.into_iter().map(|raw| HostInput::Key {
                             keycode: Keycode::new(raw),
                             state: HostButtonState::Released,
                             time,
                         }));
+                        passed.push(HostInput::KeyboardFocusLostKeepingKeys);
                     }
                 }
                 _ => passed.push(input),
@@ -614,11 +655,14 @@ impl WaylandState {
         passed
     }
 
-    /// Take ownership of a long verb's reply and start it.
+    /// Take ownership of a long verb's reply and start it. `admitted` is
+    /// when the worker admitted it: deadlines run from there, so the reply
+    /// is due when the caller's own budget says.
     pub(crate) fn start_long_op(
         &mut self,
         op: LongOp,
         reply: tokio::sync::oneshot::Sender<ControlReply>,
+        admitted: Instant,
     ) {
         match op {
             LongOp::Sequence(steps) => {
@@ -631,25 +675,56 @@ impl WaylandState {
                         index: 0,
                         delay_elapsed: false,
                         replies: Vec::new(),
-                        started: Instant::now(),
+                        started: admitted,
+                        holds: Holds::default(),
                         reply,
                     },
                 );
                 self.advance_sequence(id);
             }
-            LongOp::Wait(spec) => self.start_window_wait(spec, reply),
+            LongOp::Wait(spec) => self.start_window_wait(spec, reply, admitted),
             LongOp::ForceClose {
                 id,
                 generation,
                 timeout,
-            } => self.start_force_close(id, generation, timeout, reply),
+            } => self.start_force_close(id, generation, timeout, reply, admitted),
         }
     }
 
-    /// Run a sequence's due steps; a delayed step arms one calloop timer
-    /// and resumes from it. A failed step ends the run and releases every
-    /// injected hold, so an aborted drag never leaves a button down.
-    fn advance_sequence(&mut self, id: u64) {
+    /// End a run early: release only the holds this run still owns.
+    fn abort_sequence(&mut self, id: u64) -> Option<SequenceRun> {
+        let mut run = self.injection.sequences.remove(&id)?;
+        let holds = std::mem::take(&mut run.holds);
+        self.release_holds(holds, monotonic_millis(), true);
+        Some(run)
+    }
+
+    fn arm_sequence_timer(&mut self, id: u64, delay: Duration, elapses_delay: bool) {
+        let armed = self.capture_loop_handle.insert_source(
+            Timer::from_duration(delay),
+            move |_, _, state| {
+                if elapses_delay && let Some(run) = state.injection.sequences.get_mut(&id) {
+                    run.delay_elapsed = true;
+                }
+                state.advance_sequence(id);
+                TimeoutAction::Drop
+            },
+        );
+        if let Err(error) = armed {
+            tracing::warn!(%error, "input sequence timer unavailable");
+            if let Some(run) = self.abort_sequence(id) {
+                let _ = run.reply.send(ControlReply::Busy);
+            }
+        }
+    }
+
+    /// Run a sequence's due steps. A delayed step arms one calloop timer
+    /// and resumes from it; a long zero-delay stretch yields to the loop
+    /// every [`SEQUENCE_YIELD_EVENTS`] events. A failed step ends the run
+    /// and releases what this run holds, so an aborted drag never leaves a
+    /// button down (and never lets go of another caller's hold).
+    pub(super) fn advance_sequence(&mut self, id: u64) {
+        let events_at_start = self.injection.events;
         loop {
             let Some(run) = self.injection.sequences.get_mut(&id) else {
                 return;
@@ -657,8 +732,7 @@ impl WaylandState {
             if run.reply.is_closed() {
                 // The caller stopped waiting; do not keep driving the seat
                 // for nobody.
-                self.injection.sequences.remove(&id);
-                self.release_injected(monotonic_millis());
+                self.abort_sequence(id);
                 return;
             }
             let Some(step) = run.steps.front() else {
@@ -677,52 +751,34 @@ impl WaylandState {
             };
             if !step.delay.is_zero() && !run.delay_elapsed {
                 let delay = step.delay;
-                let armed = self.capture_loop_handle.insert_source(
-                    Timer::from_duration(delay),
-                    move |_, _, state| {
-                        if let Some(run) = state.injection.sequences.get_mut(&id) {
-                            run.delay_elapsed = true;
-                        }
-                        state.advance_sequence(id);
-                        TimeoutAction::Drop
-                    },
-                );
-                if let Err(error) = armed {
-                    tracing::warn!(%error, "input sequence timer unavailable");
-                    let run = self
-                        .injection
-                        .sequences
-                        .remove(&id)
-                        .expect("sequence run present");
-                    self.release_injected(monotonic_millis());
-                    let _ = run.reply.send(ControlReply::Busy);
-                }
+                self.arm_sequence_timer(id, delay, true);
+                return;
+            }
+            if self.injection.events.wrapping_sub(events_at_start) >= SEQUENCE_YIELD_EVENTS {
+                self.arm_sequence_timer(id, SEQUENCE_YIELD, false);
                 return;
             }
             let step = run.steps.pop_front().expect("front step present");
             let index = run.index;
             run.index += 1;
             run.delay_elapsed = false;
-            match self.service_input_op(&step.op) {
+            self.injection.current_run = Some(id);
+            let reply = self.service_input_op(&step.op);
+            self.injection.current_run = None;
+            match reply {
                 ControlReply::Body(body) => {
                     if let Some(run) = self.injection.sequences.get_mut(&id) {
                         run.replies.push(body);
                     }
                 }
                 refusal => {
-                    let run = self
-                        .injection
-                        .sequences
-                        .remove(&id)
-                        .expect("sequence run present");
-                    self.release_injected(monotonic_millis());
-                    let (_, body) = refusal.into_wire();
+                    let run = self.abort_sequence(id).expect("sequence run present");
                     let _ = run.reply.send(ControlReply::refused(
                         "step_failed",
                         json!({
                             "index": index,
                             "verb": step.verb,
-                            "step": serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+                            "step": refusal.wire_json(),
                             "completed": run.replies,
                             "released": true,
                         }),

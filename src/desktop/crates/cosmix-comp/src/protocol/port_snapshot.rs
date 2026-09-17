@@ -1856,8 +1856,8 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
     for (slot, name) in texts.iter_mut().zip(["app_id", "title", "title_contains"]) {
         match object.get(name) {
             None | Some(Value::Null) => {}
-            Some(Value::String(value)) => *slot = Some(value.as_str()),
-            Some(_) => return list_argument(name, "string", "any string"),
+            Some(Value::String(value)) if value.len() <= 4096 => *slot = Some(value.as_str()),
+            Some(_) => return list_argument(name, "string", "at most 4096 bytes"),
         }
     }
     let [app_id, title, title_contains] = texts;

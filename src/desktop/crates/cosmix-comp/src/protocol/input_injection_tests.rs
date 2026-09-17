@@ -10,6 +10,13 @@ const KEY_M: u32 = 50;
 const KEY_O: u32 = 24;
 const KEY_LEFTSHIFT: u32 = 42;
 
+fn move_op(target: PointerMoveTarget) -> InputOp {
+    InputOp::PointerMove {
+        target,
+        corners: true,
+    }
+}
+
 fn inject(
     harness: &mut KeybindingHarness,
     ingress: &crate::port::PortIngress,
@@ -90,7 +97,7 @@ fn injected_move_and_click_reach_the_window_under_the_point() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Output {
+        move_op(PointerMoveTarget::Output {
             output: None,
             x: 250.0,
             y: 200.0,
@@ -104,7 +111,7 @@ fn injected_move_and_click_reach_the_window_under_the_point() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Window {
+        move_op(PointerMoveTarget::Window {
             id: alpha_id,
             generation: alpha_generation,
             x: 40.0,
@@ -174,7 +181,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
     let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
     harness.server.state.cursor_position = (250.0, 250.0);
     let window = |x, y, require_hit| {
-        InputOp::PointerMove(PointerMoveTarget::Window {
+        move_op(PointerMoveTarget::Window {
             id: alpha_id,
             generation: alpha_generation,
             x,
@@ -205,7 +212,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
     assert_eq!(body["target"]["id"], beta_id);
 
     // Stale and unknown targets are refused before anything moves.
-    let stale = InputOp::PointerMove(PointerMoveTarget::Window {
+    let stale = move_op(PointerMoveTarget::Window {
         id: alpha_id,
         generation: alpha_generation + 1,
         x: 1.0,
@@ -220,7 +227,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Output {
+        move_op(PointerMoveTarget::Output {
             output: Some("o_nowhere".into()),
             x: 1.0,
             y: 1.0,
@@ -233,7 +240,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Output {
+        move_op(PointerMoveTarget::Output {
             output: None,
             x: f64::from(width),
             y: 0.0,
@@ -249,7 +256,7 @@ fn require_hit_refuses_an_occluded_point_without_moving() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Relative { dx: 5.0, dy: -2.0 }),
+        move_op(PointerMoveTarget::Relative { dx: 5.0, dy: -2.0 }),
     );
     assert_eq!(rc, 0, "{body}");
     assert_eq!(harness.server.state.cursor_position, (45.0, 28.0));
@@ -291,7 +298,7 @@ fn injected_binding_chord_is_consumed_by_the_binding() {
         "the binding swallowed M: {keys:?}"
     );
     assert!(harness.server.state.keyboard.pressed_keys().is_empty());
-    assert!(harness.server.state.injection.held_keys.is_empty());
+    assert!(harness.server.state.injection.held.keys.is_empty());
 
     // An unknown key name is refused and sends nothing.
     let (rc, body) = inject(
@@ -370,7 +377,7 @@ fn release_all_clears_only_injected_holds() {
     harness.server.state.activate_managed_window(&surface);
     harness.key(KEY_B, HostButtonState::Pressed);
     for op in [
-        InputOp::PointerMove(PointerMoveTarget::Output {
+        move_op(PointerMoveTarget::Output {
             output: None,
             x: 10.0,
             y: 10.0,
@@ -435,7 +442,7 @@ fn injected_scroll_keeps_absent_axes_absent() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Output {
+        move_op(PointerMoveTarget::Output {
             output: None,
             x: 20.0,
             y: 20.0,
@@ -500,7 +507,7 @@ fn injection_while_locked_reaches_only_the_lock_surface() {
         &mut harness,
         &ingress,
         &runtime,
-        InputOp::PointerMove(PointerMoveTarget::Output {
+        move_op(PointerMoveTarget::Output {
             output: None,
             x: 30.0,
             y: 30.0,
@@ -708,7 +715,7 @@ fn sequence_runs_timed_steps_and_releases_on_failure() {
         vec![
             step(
                 "comp.input.pointer.move",
-                InputOp::PointerMove(PointerMoveTarget::Output {
+                move_op(PointerMoveTarget::Output {
                     output: None,
                     x: 10.0,
                     y: 10.0,
@@ -725,7 +732,7 @@ fn sequence_runs_timed_steps_and_releases_on_failure() {
             ),
             step(
                 "comp.input.pointer.move",
-                InputOp::PointerMove(PointerMoveTarget::Relative { dx: 20.0, dy: 5.0 }),
+                move_op(PointerMoveTarget::Relative { dx: 20.0, dy: 5.0 }),
                 30,
             ),
             step(
@@ -768,7 +775,7 @@ fn sequence_runs_timed_steps_and_releases_on_failure() {
             ),
             step(
                 "comp.input.pointer.move",
-                InputOp::PointerMove(PointerMoveTarget::Window {
+                move_op(PointerMoveTarget::Window {
                     id: alpha_id,
                     generation: alpha_generation + 7,
                     x: 1.0,
@@ -807,4 +814,232 @@ fn event_time_base_is_clock_monotonic() {
     assert!(micros >= expected_us && micros - expected_us < 1_000_000);
     let millis = monotonic_millis();
     assert!(millis.wrapping_sub((expected_us / 1_000) as u32) < 1_000);
+}
+
+/// A failing sequence releases only what it pressed: another caller's held
+/// button and key stay down.
+#[test]
+fn a_failed_sequence_releases_only_its_own_holds() {
+    let (mut harness, ingress, runtime, _pointer, alpha, _beta) = two_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    for op in [
+        move_op(PointerMoveTarget::Output {
+            output: None,
+            x: 10.0,
+            y: 10.0,
+        }),
+        InputOp::PointerButton {
+            button: BTN_LEFT,
+            action: PressAction::Press,
+        },
+        InputOp::Key {
+            key: KeySpec::Evdev(KEY_A),
+            action: PressAction::Press,
+            modifiers: Vec::new(),
+        },
+    ] {
+        let (rc, body) = inject(&mut harness, &ingress, &runtime, op);
+        assert_eq!(rc, 0, "{body}");
+    }
+    let (rc, body) = run_sequence(
+        &mut harness,
+        &ingress,
+        &runtime,
+        vec![
+            step(
+                "comp.input.key",
+                InputOp::Key {
+                    key: KeySpec::Evdev(KEY_B),
+                    action: PressAction::Press,
+                    modifiers: Vec::new(),
+                },
+                0,
+            ),
+            step(
+                "comp.input.pointer.button",
+                InputOp::PointerButton {
+                    button: 0x111,
+                    action: PressAction::Press,
+                },
+                0,
+            ),
+            step(
+                "comp.input.pointer.move",
+                move_op(PointerMoveTarget::Window {
+                    id: alpha_id,
+                    generation: alpha_generation + 3,
+                    x: 1.0,
+                    y: 1.0,
+                    require_hit: false,
+                }),
+                0,
+            ),
+        ],
+    );
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "step_failed");
+    let state = &harness.server.state;
+    let mut keys = state
+        .keyboard
+        .pressed_keys()
+        .into_iter()
+        .map(|key| key.raw() - 8)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, [KEY_A], "the run's B was released, the other A was not");
+    assert_eq!(state.pointer.current_pressed(), [BTN_LEFT]);
+    // release_all is still global.
+    let (rc, _) = inject(&mut harness, &ingress, &runtime, InputOp::ReleaseAll);
+    assert_eq!(rc, 0);
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.pointer.current_pressed().is_empty());
+}
+
+/// Two sequences interleave on timers; one failing leaves the other's
+/// hold alone, and that one still completes.
+#[test]
+fn concurrent_sequences_keep_separate_holds() {
+    let (mut harness, ingress, runtime, _pointer, alpha, _beta) = two_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let press = |key| InputOp::Key {
+        key: KeySpec::Evdev(key),
+        action: PressAction::Press,
+        modifiers: Vec::new(),
+    };
+    let release = |key| InputOp::Key {
+        key: KeySpec::Evdev(key),
+        action: PressAction::Release,
+        modifiers: Vec::new(),
+    };
+    let long = ingress
+        .request_long(crate::port::LongOp::Sequence(vec![
+            step("comp.input.key", press(KEY_A), 0),
+            step("comp.input.key", release(KEY_A), 80),
+        ]))
+        .expect("long run admitted");
+    let failing = ingress
+        .request_long(crate::port::LongOp::Sequence(vec![
+            step("comp.input.key", press(KEY_B), 0),
+            step(
+                "comp.input.pointer.move",
+                move_op(PointerMoveTarget::Window {
+                    id: alpha_id,
+                    generation: alpha_generation + 1,
+                    x: 0.0,
+                    y: 0.0,
+                    require_hit: false,
+                }),
+                20,
+            ),
+        ]))
+        .expect("failing run admitted");
+    let (rc, body) = long_reply(&mut harness, &runtime, failing, |state| {
+        state.injection.sequences.len() == 1
+    });
+    assert_eq!((rc, body["error"].clone()), (10, json!("step_failed")));
+    let pressed = harness
+        .server
+        .state
+        .keyboard
+        .pressed_keys()
+        .into_iter()
+        .map(|key| key.raw() - 8)
+        .collect::<Vec<_>>();
+    assert_eq!(pressed, [KEY_A], "the other run's hold survives the failure");
+    let (rc, body) = long_reply(&mut harness, &runtime, long, |state| {
+        state.injection.sequences.is_empty()
+    });
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+}
+
+/// A long zero-delay run yields to the loop instead of injecting
+/// everything in one callback.
+#[test]
+fn a_long_sequence_yields_between_chunks() {
+    let (mut harness, ingress, runtime, _pointer, alpha, _beta) = two_windows();
+    let surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&surface);
+    let steps = (0..60)
+        .map(|_| step("comp.input.key", InputOp::Text("abcdefghij".into()), 0))
+        .collect::<Vec<_>>();
+    let admission = ingress
+        .request_long(crate::port::LongOp::Sequence(steps))
+        .expect("admitted");
+    let before = harness.server.state.injection.events;
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("first cycle");
+    let first_pass = harness.server.state.injection.events - before;
+    assert!(
+        (256..256 + 40).contains(&first_pass),
+        "one pass stops at the yield: {first_pass}"
+    );
+    assert_eq!(harness.server.state.injection.sequences.len(), 1);
+    let (rc, body) = long_reply(&mut harness, &runtime, admission, |state| {
+        state.injection.sequences.is_empty()
+    });
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["steps"].as_array().unwrap().len(), 60);
+    assert_eq!(harness.server.state.injection.events - before, 60 * 20);
+    let keys = keyboard_key_events(&harness.sync());
+    assert_eq!(keys.len(), 60 * 20, "every key reached the client");
+}
+
+/// `corners: false` moves the pointer without arming a hot corner; a
+/// default move into the corner arms it like a mouse.
+#[test]
+fn corners_false_skips_hot_corner_sampling() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let runtime = control_reply_runtime();
+    port_observation::service_observations(&mut harness.server.state);
+    harness.server.state.refresh_corner_regions();
+    drain_observations(&observations);
+    let corner_move = |corners| InputOp::PointerMove {
+        target: PointerMoveTarget::Output {
+            output: None,
+            x: 5.0,
+            y: 5.0,
+        },
+        corners,
+    };
+    let entered = |harness: &mut KeybindingHarness| {
+        harness
+            .server
+            .event_loop
+            .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+            .expect("corner deadline dispatch");
+        port_observation::service_observations(&mut harness.server.state);
+        drain_observations(&observations).iter().any(|record| {
+            matches!(
+                record,
+                port_observation::ObservationRecord::CornerEntered { .. }
+            )
+        })
+    };
+    harness.server.state.cursor_position = (100.0, 100.0);
+    let (rc, _) = inject(&mut harness, &ingress, &runtime, corner_move(false));
+    assert_eq!(rc, 0);
+    assert_eq!(harness.server.state.cursor_position, (5.0, 5.0));
+    assert!(!harness.server.state.injection.suppress_corners);
+    assert!(!entered(&mut harness), "corners:false arms nothing");
+
+    let (rc, _) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        move_op(PointerMoveTarget::Output {
+            output: None,
+            x: 100.0,
+            y: 100.0,
+        }),
+    );
+    assert_eq!(rc, 0);
+    let (rc, _) = inject(&mut harness, &ingress, &runtime, corner_move(true));
+    assert_eq!(rc, 0);
+    assert!(entered(&mut harness), "a default move arms the corner");
 }

@@ -49,7 +49,12 @@ pub(crate) const LONG_VERB_MAX: Duration = Duration::from_secs(60);
 /// thread answers at the deadline, and the worker must still be listening.
 const LONG_VERB_SLACK: Duration = Duration::from_secs(1);
 const SEQUENCE_MAX_STEPS: usize = 256;
-const TEXT_MAX_CHARS: usize = 4096;
+/// At most four events a character (Shift press, key press/release,
+/// Shift release), so the largest text stays within one verb's event cap
+/// and small enough to write to a client in one pass.
+const TEXT_MAX_CHARS: usize = 256;
+/// The most seat events one verb (a whole sequence included) may inject.
+pub(crate) const MAX_EVENTS_PER_VERB: usize = 4096;
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
 const GAP_RETRY_INITIAL: Duration = Duration::from_secs(1);
@@ -236,7 +241,11 @@ pub(crate) enum KeySpec {
 /// One `comp.input.*` operation, parsed and bounded on the worker.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InputOp {
-    PointerMove(PointerMoveTarget),
+    /// `corners: false` keeps the move from arming a hot corner.
+    PointerMove {
+        target: PointerMoveTarget,
+        corners: bool,
+    },
     PointerButton {
         button: u32,
         action: PressAction,
@@ -255,6 +264,19 @@ pub(crate) enum InputOp {
     },
     Text(String),
     ReleaseAll,
+}
+
+impl InputOp {
+    /// The most seat events this op can inject. `release_all` releases what
+    /// is held, which earlier (capped) verbs bounded.
+    pub(crate) fn event_bound(&self) -> usize {
+        match self {
+            Self::PointerMove { .. } | Self::PointerScroll { .. } | Self::ReleaseAll => 1,
+            Self::PointerButton { .. } => 2,
+            Self::Key { modifiers, .. } => 2 * (modifiers.len() + 2),
+            Self::Text(text) => 4 * text.chars().count(),
+        }
+    }
 }
 
 pub(crate) struct PortInputRequest {
@@ -304,6 +326,8 @@ pub(crate) struct PortLongRequest {
     /// taken it: dropping it there frees the slot while the verb waits, so
     /// long waits never fill the bounded ingress.
     pub(crate) slot: Option<QueueSlot>,
+    /// When the worker admitted it; the verb's deadline runs from here.
+    pub(crate) admitted: std::time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -364,7 +388,33 @@ pub(crate) enum ControlReply {
     },
 }
 
+/// Every refusal carries `error_code` beside `error` (the 0.58.x alias), so
+/// Mix `send` hands a script the whole structured body.
+pub(crate) fn with_error_code(rc: u8, body: Arc<str>) -> (u8, Arc<str>) {
+    if rc == 0 {
+        return (rc, body);
+    }
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(&body) else {
+        return (rc, body);
+    };
+    if fields.contains_key("error_code") {
+        return (rc, body);
+    }
+    let Some(code) = fields.get("error").filter(|code| code.is_string()).cloned() else {
+        return (rc, body);
+    };
+    fields.insert("error_code".into(), code);
+    (rc, Arc::from(Value::Object(fields).to_string()))
+}
+
 impl ControlReply {
+    /// The reply body as a JSON value, `error_code` included.
+    pub(crate) fn wire_json(self) -> Value {
+        let (rc, body) = self.into_wire();
+        let (_, body) = with_error_code(rc, body);
+        serde_json::from_str(&body).unwrap_or(Value::Null)
+    }
+
     pub(crate) fn refused(error: &'static str, detail: Value) -> Self {
         Self::Refused { error, detail }
     }
@@ -616,6 +666,7 @@ impl PortIngress {
             op: Some(op),
             reply: Some(reply),
             slot: Some(slot),
+            admitted: std::time::Instant::now(),
         });
         // A refused send drops the command, and with it the slot.
         self.sender.try_send(command).map_err(|_| ())?;
@@ -1138,6 +1189,7 @@ struct PendingReply {
 
 impl PendingReply {
     fn new(command: cosmix_client::IncomingCommand, (rc, body): (u8, Arc<str>)) -> Self {
+        let (rc, body) = with_error_code(rc, body);
         Self {
             from: command.from,
             command: command.command,
@@ -2005,6 +2057,17 @@ pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, 
                 title: string_arg(filters, "title")?,
                 title_contains: string_arg(filters, "title_contains")?,
             };
+            if window.id.is_some()
+                && (window.app_id.is_some()
+                    || window.title.is_some()
+                    || window.title_contains.is_some())
+            {
+                return Err(invalid_argument(
+                    "match",
+                    "object",
+                    "match by id or by app_id/title/title_contains, not both",
+                ));
+            }
             if window.generation.is_some() && window.id.is_none() {
                 return Err(invalid_argument(
                     "match.id",
@@ -2193,8 +2256,19 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
     let empty = serde_json::Map::new();
     match verb {
         "comp.input.pointer.move" => {
-            const ALLOWED: &[&str] = &["output", "x", "y", "dx", "dy", "window", "require_hit"];
+            const ALLOWED: &[&str] = &[
+                "output",
+                "x",
+                "y",
+                "dx",
+                "dy",
+                "window",
+                "require_hit",
+                "corners",
+            ];
             let object = args_object(args, &empty, ALLOWED)?;
+            let corners = bool_arg(object, "corners", true)?;
+            let moved = |target| Ok(InputOp::PointerMove { target, corners });
             let require_hit = match present(object, "require_hit") {
                 None => None,
                 Some(Value::Bool(value)) => Some(*value),
@@ -2230,13 +2304,13 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
                         "required (read windows.s<id>.generation)",
                     )
                 })?;
-                return Ok(InputOp::PointerMove(PointerMoveTarget::Window {
+                return moved(PointerMoveTarget::Window {
                     id,
                     generation,
                     x: required_finite(object, "x")?,
                     y: required_finite(object, "y")?,
                     require_hit: require_hit.unwrap_or(false),
-                }));
+                });
             }
             if require_hit.is_some() {
                 return Err(invalid_argument(
@@ -2256,10 +2330,10 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
                         "{dx, dy} takes no output, x or y",
                     ));
                 }
-                return Ok(InputOp::PointerMove(PointerMoveTarget::Relative {
+                return moved(PointerMoveTarget::Relative {
                     dx: finite_arg(object, "dx")?.unwrap_or(0.0),
                     dy: finite_arg(object, "dy")?.unwrap_or(0.0),
-                }));
+                });
             }
             let output = match present(object, "output") {
                 None => None,
@@ -2272,11 +2346,11 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
                     ));
                 }
             };
-            Ok(InputOp::PointerMove(PointerMoveTarget::Output {
+            moved(PointerMoveTarget::Output {
                 output,
                 x: required_finite(object, "x")?,
                 y: required_finite(object, "y")?,
-            }))
+            })
         }
         "comp.input.pointer.button" => {
             const ALLOWED: &[&str] = &["button", "action"];
@@ -2404,7 +2478,7 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
                     {
                         Ok(InputOp::Text(text.clone()))
                     }
-                    _ => Err(invalid_argument("text", "string", "1..=4096 characters")),
+                    _ => Err(invalid_argument("text", "string", "1..=256 characters")),
                 };
             }
             let key = present(object, "key")
@@ -2469,6 +2543,7 @@ fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
     };
     let mut parsed = Vec::with_capacity(steps.len());
     let mut total = Duration::ZERO;
+    let mut events = 0_usize;
     for (index, step) in steps.iter().enumerate() {
         const STEP: &[&str] = &["verb", "args", "delay_ms"];
         let step = match step {
@@ -2509,6 +2584,14 @@ fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
                 other => other,
             },
         )?;
+        events += op.event_bound();
+        if events > MAX_EVENTS_PER_VERB {
+            return Err(invalid_argument(
+                "steps",
+                "injected events",
+                "at most 4096 injected events per verb (MAX_EVENTS_PER_VERB)",
+            ));
+        }
         let delay = delay_arg(present(step, "delay_ms"), "steps.delay_ms")?.unwrap_or(interval);
         total += delay;
         if total > LONG_VERB_MAX {
@@ -3874,6 +3957,13 @@ mod tests {
         responders.abort_all();
     }
 
+    fn move_op(target: PointerMoveTarget) -> InputOp {
+        InputOp::PointerMove {
+            target,
+            corners: true,
+        }
+    }
+
     fn refusal(reply: ControlReply) -> Value {
         let (rc, body) = reply.into_wire();
         assert_eq!(rc, 10, "{body}");
@@ -3884,7 +3974,7 @@ mod tests {
     fn input_verbs_parse_every_documented_form() {
         assert_eq!(
             parse_input_op("comp.input.pointer.move", &json!({"x": 40, "y": 30.5})),
-            Ok(InputOp::PointerMove(PointerMoveTarget::Output {
+            Ok(move_op(PointerMoveTarget::Output {
                 output: None,
                 x: 40.0,
                 y: 30.5
@@ -3895,7 +3985,7 @@ mod tests {
                 "comp.input.pointer.move",
                 &json!({"output": "o_nested", "x": 1, "y": 2})
             ),
-            Ok(InputOp::PointerMove(PointerMoveTarget::Output {
+            Ok(move_op(PointerMoveTarget::Output {
                 output: Some("o_nested".into()),
                 x: 1.0,
                 y: 2.0
@@ -3903,7 +3993,7 @@ mod tests {
         );
         assert_eq!(
             parse_input_op("comp.input.pointer.move", &json!({"dx": -3})),
-            Ok(InputOp::PointerMove(PointerMoveTarget::Relative {
+            Ok(move_op(PointerMoveTarget::Relative {
                 dx: -3.0,
                 dy: 0.0
             }))
@@ -3913,7 +4003,7 @@ mod tests {
                 "comp.input.pointer.move",
                 &json!({"window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
             ),
-            Ok(InputOp::PointerMove(PointerMoveTarget::Window {
+            Ok(move_op(PointerMoveTarget::Window {
                 id: 7,
                 generation: 3,
                 x: 4.0,
@@ -4229,6 +4319,46 @@ mod tests {
         assert_eq!(reply.id.as_deref(), Some("2"));
         assert_eq!(reply.rc, 0);
         responders.abort_all();
+    }
+
+    #[test]
+    fn one_verb_is_capped_at_4096_injected_events() {
+        let text = "a".repeat(TEXT_MAX_CHARS);
+        let step = json!({"verb": "comp.input.key", "args": {"text": text}});
+        // 4 x 256 x 4 = 4096 fits exactly; one more event does not.
+        let Ok(LongOp::Sequence(steps)) = parse_sequence(&json!({"steps": vec![step.clone(); 4]}))
+        else {
+            panic!("exactly at the cap parses");
+        };
+        assert_eq!(
+            steps.iter().map(|step| step.op.event_bound()).sum::<usize>(),
+            MAX_EVENTS_PER_VERB
+        );
+        let mut over = vec![step; 4];
+        over.push(json!({"verb": "comp.input.pointer.move", "args": {"dx": 1}}));
+        let body = refusal(parse_sequence(&json!({"steps": over})).expect_err("over the cap"));
+        assert_eq!(body["path"], "steps");
+        assert!(body["range"].as_str().unwrap().contains("4096"), "{body}");
+        let body = refusal(
+            parse_input_op("comp.input.key", &json!({"text": "a".repeat(TEXT_MAX_CHARS + 1)}))
+                .expect_err("text over the cap"),
+        );
+        assert_eq!(body["path"], "text");
+        assert_eq!(
+            parse_input_op("comp.input.pointer.move", &json!({"dx": 1, "corners": false})),
+            Ok(InputOp::PointerMove {
+                target: PointerMoveTarget::Relative { dx: 1.0, dy: 0.0 },
+                corners: false
+            })
+        );
+        let body = refusal(
+            parse_window_verb(
+                "comp.window.wait",
+                &json!({"match": {"id": 7, "app_id": "a"}, "until": "mapped"}),
+            )
+            .expect_err("id with names"),
+        );
+        assert_eq!(body["path"], "match");
     }
 
     #[test]

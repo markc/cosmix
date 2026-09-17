@@ -705,14 +705,21 @@ without focusing it. The reply is <code>{id,generation,raised}</code>.</li>
 or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
 <ul>
 <li>With <code>force:true</code> (and optional <code>timeout_ms</code>, default 3000, at most
-60000) the reply waits. If the window goes first, it is
-<code>{closed:"gone",waited_ms}</code>. If the same <code>{id,generation}</code> is still
-alive at the deadline, comp disconnects its client and replies
-<code>{closed:"killed",scope:"client",pid,windows,waited_ms}</code>.</li>
+60000) the reply waits. The deadline runs from when the port admitted
+the request.</li>
+<li>If the window's role ends first (the client destroyed it, or the id now
+names another role), the reply is <code>{closed:"gone",waited_ms}</code>.</li>
+<li>A window that is only unmapped is still alive: an app that hides to a
+tray on close is not gone. If the same <code>{id,generation}</code> is still alive
+at the deadline, mapped or not, comp disconnects its client and replies
+<code>{closed:"killed",window:"mapped"|"unmapped",scope:"client",pid,windows,waited_ms}</code>.</li>
 <li>The kill ends the whole client connection, so every window in
-<code>windows</code> goes with it.</li>
-<li>An X11 window is never killed this way (its client is XWayland); at the
-deadline it replies <code>{"error":"still_open","reason":"x11_kill_unsupported"}</code>.</li>
+<code>windows</code> goes with it. No kill happens if the caller has stopped
+waiting, or while a session lock is active (the reply is then <code>locked</code>).</li>
+<li>An X11 window is never killed this way: its Wayland client is XWayland,
+and the window manager has no per-client kill. The polite close is sent
+and the verb replies at once with
+<code>{"error":"still_open","reason":"x11_kill_unsupported",polite_close_sent:true}</code>.</li>
 </ul>
 </li>
 <li><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
@@ -723,27 +730,35 @@ origin (<code>window_x</code>/<code>window_y</code>). <code>output</code> is an 
 name, and defaults to the window's own output. An absent coordinate
 keeps the window's offset within its output.</li>
 <li><code>width</code>/<code>height</code> request a window-geometry size, clamped to the client's
-minimum and maximum. For an xdg window this is a configure, so the size
+minimum and maximum. An absent one keeps the window's current
+window-geometry size (what the client committed, not what comp last
+asked for). For an xdg window this is a configure, so the size
 changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
 <li>The reply is
 <code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
 <li>A maximised or fullscreen window is refused with
 <code>{"error":"invalid_state",maximized,fullscreen}</code>. An unknown output is
-<code>unknown_output</code>.</li>
+<code>unknown_output</code>. A place that would leave the window wholly outside
+every output is refused with <code>{"error":"off_output",x,y,width,height}</code>.</li>
 </ul>
 </li>
 <li><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
 window reaches a state.
 <ul>
-<li><code>match</code> is <code>{id?,generation?,app_id?,title?,title_contains?}</code> with at
-least one field; <code>generation</code> needs <code>id</code>. With <code>id</code>, the wait is about
-that window. Without it, the wait is about the lowest-id mapped window
-whose names match.</li>
-<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (at least one frame
-presented), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
+<li><code>match</code> is either <code>{id,generation?}</code> or
+<code>{app_id?,title?,title_contains?}</code> with at least one field. Name filters
+are at most 4096 bytes. With <code>id</code>, the wait is about that window; an id
+comp never handed out is refused with <code>unknown_window</code>. Without it, the
+wait is about the lowest-id mapped window whose names match.</li>
+<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (at least one frame of the
+current mapping presented), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
 window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
 without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.</li>
-<li><code>timeout_ms</code> defaults to 10000 and is at most 60000.</li>
+<li><code>timeout_ms</code> defaults to 10000 and is at most 60000, counted from when
+the port admitted the request.</li>
+<li>While a session lock is active a wait learns nothing it could not read
+from the (redacted) tree: only <code>gone</code> and <code>unmapped</code> for a named <code>id</code> can
+resolve; everything else waits for the unlock or the deadline.</li>
 <li>A condition that already holds is answered at once. Otherwise comp
 checks after each dispatch cycle and sets one timer for the deadline;
 nothing polls.</li>
@@ -755,7 +770,8 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 </ul>
 </li>
 <li><code>comp.windows.list {app_id?,title?,title_contains?,visible?}</code> returns
-<code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field. The
+<code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field (text
+filters at most 4096 bytes). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
 windows and is empty while a session lock is active.</li>
 </ul>
@@ -773,10 +789,10 @@ is the clock <code>wp_presentation</code> reports, so a client can subtract an i
 event time from a presentation time. Real input from the nested host window
 uses the same clock.</p>
 <table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
-<tr><td><code>comp.input.pointer.move</code></td><td>One of three forms. <code>{x,y,output?}</code>: output-local absolute; <code>output</code> is an <code>outputs</code> key or output name, and defaults to the default output. <code>{dx,dy}</code>: relative. <code>{window:{id,generation},x,y,require_hit?}</code>: relative to the window-geometry origin.</td></tr>
+<tr><td><code>comp.input.pointer.move</code></td><td>One of three forms. <code>{x,y,output?}</code>: output-local absolute; <code>output</code> is an <code>outputs</code> key or output name, and defaults to the default output. <code>{dx,dy}</code>: relative. <code>{window:{id,generation},x,y,require_hit?}</code>: relative to the window-geometry origin. Any form takes <code>corners?</code> (default <code>true</code>); <code>false</code> keeps the move from arming a hot corner.</td></tr>
 <tr><td><code>comp.input.pointer.button</code></td><td><code>{button?,action?}</code>. <code>button</code>: <code>left</code> (default), <code>right</code>, <code>middle</code>, or an evdev code <code>0x100..=0x2ff</code>. <code>action</code>: <code>press</code>, <code>release</code> or <code>click</code> (default).</td></tr>
 <tr><td><code>comp.input.pointer.scroll</code></td><td><code>{dx?,dy?,source?,v120?}</code>. At least one axis is required; an omitted axis stays absent. Positive <code>dy</code> scrolls down. <code>source</code>: <code>wheel</code> (default), <code>finger</code> or <code>continuous</code>; a zero on <code>finger</code> or <code>continuous</code> is an axis stop. <code>v120:{dx?,dy?}</code> sets wheel detents; without it, a wheel derives 120 per 15 units.</td></tr>
-<tr><td><code>comp.input.key</code></td><td><code>{key,action?,modifiers?}</code>. <code>key</code>: an XKB keysym name (<code>Return</code>, <code>a</code>, <code>F5</code>, <code>Super_L</code>) or an evdev code. <code>action</code>: <code>press</code>, <code>release</code> or <code>tap</code> (default). <code>modifiers</code>: any of <code>shift</code>, <code>ctrl</code>, <code>alt</code>, <code>super</code>, <code>altgr</code>, held around the key. A keysym that needs Shift gets Shift added. <strong>Or</strong> <code>{text}</code>, at most 4096 characters.</td></tr>
+<tr><td><code>comp.input.key</code></td><td><code>{key,action?,modifiers?}</code>. <code>key</code>: an XKB keysym name (<code>Return</code>, <code>a</code>, <code>F5</code>, <code>Super_L</code>) or an evdev code. <code>action</code>: <code>press</code>, <code>release</code> or <code>tap</code> (default). <code>modifiers</code>: any of <code>shift</code>, <code>ctrl</code>, <code>alt</code>, <code>super</code>, <code>altgr</code>, held around the key. A keysym that needs Shift gets Shift added. <strong>Or</strong> <code>{text}</code>, at most 256 characters.</td></tr>
 <tr><td><code>comp.input.release_all</code></td><td><code>{}</code></td></tr>
 <tr><td><code>comp.input.sequence</code></td><td><code>{steps:[{verb,args?,delay_ms?}],interval_ms?}</code></td></tr>
 </tbody></table>
@@ -794,10 +810,19 @@ surface, not only a window.</li>
 <p><code>text</code> maps each character through the live seat keymap, honouring Caps Lock
 and the active layout. Only characters on the first two shift levels map; each
 is typed as press and release, with Shift where needed. A newline types
-Return. Characters that need AltGr or a compose sequence cannot be typed. If
-any character cannot be typed, nothing is sent and the reply is
-<code>{"error":"unmappable","char","index"}</code>. An unknown key name replies
-<code>{"error":"unknown_key","key"}</code>.</p>
+Return. Characters that need AltGr (the third and fourth levels), a dead
+key or a compose sequence are refused as unmappable. If any character cannot
+be typed, nothing is sent and the reply is
+<code>{"error":"unmappable","char","index"}</code>. While an input method holds the
+keyboard, <code>text</code> is refused with <code>{"error":"ime_active"}</code>, because the IME
+would turn the keys into something other than the text sent. An unknown key
+name replies <code>{"error":"unknown_key","key"}</code>.</p>
+<p>An absolute or window-relative move is real pointer motion, so moving into an
+output corner arms the hot corner exactly as a mouse would; pass
+<code>corners:false</code> to move without that.</p>
+<p>One verb injects at most 4096 seat events (a whole sequence included; a text
+character counts four, a key with modifiers two per key). A larger request is
+refused before anything is sent with <code>invalid_value</code> naming the limit.</p>
 <p>Every refusal is decided before anything is sent:</p>
 <ul>
 <li><code>stale_target</code>, or another window-target error, for the <code>window</code> form;</li>
@@ -819,10 +844,13 @@ never leave a key or button down; only <code>action: press</code> holds one.</p>
 seconds.</li>
 <li>A drag is a <code>press</code>, some moves, and a <code>release</code>.</li>
 <li>The reply is <code>{steps:[&lt;each step's reply&gt;],elapsed_ms}</code>.</li>
-<li>If a step is refused, the run stops and every injected hold is released. The
-reply is rc 10
+<li>A run yields to the event loop after every 256 injected events, so a long
+zero-delay stretch cannot fill a client's socket in one pass.</li>
+<li>If a step is refused, the run stops and releases the keys and buttons this
+run pressed and still holds; holds of other callers and other runs stay.
+The reply is rc 10
 <code>{"error":"step_failed",index,verb,step:&lt;the refusal&gt;,completed:[...],released:true}</code>.</li>
-<li>If the caller stops waiting, the run also stops and releases its holds.</li>
+<li>If the caller stops waiting, the run also stops and releases its own holds.</li>
 </ul>
 <p>Sequences use their own pool of eight permits. Each waits for its own delays
 plus one second, not the two-second budget of other verbs. When all eight
@@ -833,7 +861,9 @@ buttons, scroll and keys reaching the seat, so the host cursor cannot
 overwrite an injected position. Output resize and scale, pointer leave and
 touch still pass. A host key or button pressed before the switch still gets
 its release. A host focus loss releases only those host keys, never an
-injected hold. The value lasts for the compositor process.</p>
+injected hold, and still resets compositor chrome state (a title-bar drag,
+hover, cursor override). The value persists until it is set back to <code>true</code>
+or the compositor exits; a script that turns it off should turn it on again.</p>
 <p>The frame trace records each injected verb as <code>comp_input_injected</code>:</p>
 <ul>
 <li>subject: <code>input_seq</code>;</li>
@@ -860,7 +890,9 @@ below, so handlers do not depend on the instance name.</p>
 <p>Map edges carry the surface's role <code>generation</code> and its <code>app_id</code> and <code>title</code>
 (null when the client set none, and null while a session lock is active). A
 map edge reports the values at the end of the cycle; an unmap edge reports the
-values from before the unmap. An XWayland window whose buffer arrived before
+values from before the unmap. A window unmapped and mapped again under a new
+role within one cycle emits both edges (unmap with the old generation, then
+map with the new one). An XWayland window whose buffer arrived before
 its map request now emits its map edge too.</p>
 <p>For a stream of window changes (moves, resizes, state, focus), hold a
 <code>comp.props.watch</code> and read the <code>windows.s&lt;id&gt;.*</code> <code>props.changed</code> frames, plus
@@ -1053,7 +1085,10 @@ empty. During the KMS unlock window (<code>normal_scene_restricted()</code>), th
 tree stays redacted with <code>focus.session_lock="unlocking"</code> until the
 compositor's own presentation predicate lifts, at the same moment the renderer
 resumes. Unlock then restores the ordinary projection.</p>
-<p>All application errors use Bus rc 10. In addition to the write errors above,
+<p>All application errors use Bus rc 10. Every refusal body carries
+<code>error_code</code> with the same value as <code>error</code> (<code>error</code> is kept as an alias for
+0.58.x), so a Mix <code>send</code> receives the whole object: <code>$result.error_code</code>,
+<code>$result.under</code> and so on. In addition to the write errors above,
 read/dispatch errors include <code>unknown_path</code>, <code>busy</code> and <code>unknown_verb</code>, plus
 <code>{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}</code> when a
 serialised reply would exceed the effective broker-path ceiling. <code>N</code> is

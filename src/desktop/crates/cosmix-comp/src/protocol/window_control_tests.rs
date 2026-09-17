@@ -694,3 +694,364 @@ fn windows_list_filters_rows_in_id_order() {
     assert_eq!(rc, 10);
     assert_eq!(body["path"], "visible");
 }
+
+fn unmap_alpha(harness: &mut KeybindingHarness) {
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+}
+
+/// A hide-on-close app unmaps but stays alive: that is not `gone`, and the
+/// deadline kills it, saying it was unmapped.
+#[test]
+fn force_close_kills_a_window_that_only_unmapped() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        LongOp::ForceClose {
+            id,
+            generation,
+            timeout: Duration::from_millis(40),
+        },
+        |harness| {
+            unmap_alpha(harness);
+            assert!(!test_toplevel_record(harness).mapped);
+            harness
+                .server
+                .dispatch_cycle(Some(Duration::ZERO))
+                .expect("cycle after the unmap");
+            assert_eq!(
+                harness.server.state.window_waiters.waiters.len(),
+                1,
+                "an unmapped window is not gone"
+            );
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["closed"], "killed");
+    assert_eq!(body["window"], "unmapped");
+}
+
+/// The deadline runs from admission, not from when the protocol thread
+/// took the request.
+#[test]
+fn force_close_deadline_counts_from_admission() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let admission = ingress
+        .request_long(LongOp::ForceClose {
+            id,
+            generation,
+            timeout: Duration::from_millis(600),
+        })
+        .expect("admitted");
+    // Sit in the queue for most of the budget before the dequeue.
+    std::thread::sleep(Duration::from_millis(500));
+    let dequeued = Instant::now();
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("registration cycle");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !harness.server.state.window_waiters.waiters.is_empty() {
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::from_millis(5)))
+            .expect("cycle");
+        assert!(Instant::now() < deadline, "the waiter never expired");
+    }
+    assert!(
+        dequeued.elapsed() < Duration::from_millis(450),
+        "the timer was armed for what was left of the budget: {:?}",
+        dequeued.elapsed()
+    );
+    let body = runtime
+        .block_on(admission.receive())
+        .expect("reply")
+        .wire_json();
+    assert_eq!(body["closed"], "killed", "{body}");
+    assert!(body["waited_ms"].as_u64().unwrap() >= 600);
+}
+
+/// A caller that stopped waiting gets no kill on its behalf.
+#[test]
+fn force_close_does_nothing_for_a_caller_that_left() {
+    let (mut harness, ingress, _observations, _runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let admission = ingress
+        .request_long(LongOp::ForceClose {
+            id,
+            generation,
+            timeout: Duration::from_millis(30),
+        })
+        .expect("admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("registration cycle");
+    assert_eq!(harness.server.state.window_waiters.waiters.len(), 1);
+    drop(admission);
+    std::thread::sleep(Duration::from_millis(40));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !harness.server.state.window_waiters.waiters.is_empty() {
+        harness
+            .server
+            .dispatch_cycle(Some(Duration::from_millis(5)))
+            .expect("cycle");
+        assert!(Instant::now() < deadline, "the waiter was never dropped");
+    }
+    harness.dispatch_client();
+    harness.assert_client_connected("nobody was waiting, so nothing was killed");
+    assert!(test_toplevel_record(&harness).mapped);
+}
+
+/// `presented` means a frame of the current mapping: a window presented
+/// before it unmapped does not satisfy it again after the remap.
+#[test]
+fn presented_waits_for_a_frame_of_the_current_mapping() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(surface_id, 1_000_000, content_seq(&harness, &alpha), true);
+    harness.server.state.frame_presented(frame, content);
+    let presented = wait_for(by_id(id, generation), WaitUntil::Presented, 30);
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented.clone(), |_| {});
+    assert_eq!(rc, 0, "presented before the remap: {body}");
+
+    unmap_alpha(&mut harness);
+    let mut traffic = harness.sync();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    traffic.extend(harness.sync());
+    ack_and_map_test_toplevel(&mut harness, configured_toplevel_serial(&traffic));
+    assert!(test_toplevel_record(&harness).mapped);
+    assert_eq!(
+        window_id_and_generation(&harness, &alpha),
+        (id, generation),
+        "a remap keeps the generation"
+    );
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented, |_| {});
+    assert_eq!(rc, 10, "the old frame does not count: {body}");
+    assert_eq!(body["error"], "timeout");
+
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
+        |harness| {
+            let (frame, content) =
+                test_frame_report(surface_id, 2_000_000, content_seq(harness, &alpha), true);
+            harness.server.state.frame_presented(frame, content);
+        },
+    );
+    assert_eq!(rc, 0, "a frame of this mapping: {body}");
+}
+
+/// Waits learn nothing under a session lock (a named id's `gone` still
+/// resolves), a kill never lands under it, and a never-issued id is
+/// refused.
+#[test]
+fn wait_respects_the_lock_and_refuses_unissued_ids() {
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(999_999, 1), WaitUntil::Gone, 5_000),
+        |_| {},
+    );
+    assert_eq!((rc, body["error"].clone()), (10, json!("unknown_window")), "{body}");
+
+    // The lock arrives while a forced close waits: the deadline refuses.
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        LongOp::ForceClose {
+            id: beta_id,
+            generation: beta_generation,
+            timeout: Duration::from_millis(40),
+        },
+        |harness| {
+            let lock = begin_test_session_lock(harness);
+            ack_and_map_test_lock_surface(harness, lock);
+        },
+    );
+    assert_eq!((rc, body["error"].clone()), (10, json!("locked")), "{body}");
+    harness.assert_client_connected("no kill under the lock");
+
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(
+            WindowMatch {
+                app_id: Some("dev.cosmix.Beta".into()),
+                ..WindowMatch::default()
+            },
+            WaitUntil::Mapped,
+            40,
+        ),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "a mapped window is hidden while locked: {body}");
+    assert_eq!(body["error"], "timeout");
+    let (rc, _) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(beta_id, beta_generation), WaitUntil::Visible, 40),
+        |_| {},
+    );
+    assert_eq!(rc, 10);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(alpha_id, alpha_generation), WaitUntil::Gone, 5_000),
+        |harness| {
+            send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]);
+            harness.dispatch_client();
+        },
+    );
+    assert_eq!(rc, 0, "gone by id still resolves under the lock: {body}");
+}
+
+/// A same-cycle unmap and remap under a new role emits both edges.
+#[test]
+fn role_replacement_in_one_cycle_emits_unmap_then_map() {
+    let (mut harness, _ingress, observations, _runtime, alpha, _beta) = two_mapped_windows();
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let (id, old_generation) = window_id_and_generation(&harness, &alpha);
+    let surface = harness.server.state.surfaces[&alpha].role.wl_surface().clone();
+    harness.server.state.mark_surface_unmapped(&surface);
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&alpha)
+        .expect("record")
+        .generation += 7;
+    port_observation::service_observations(&mut harness.server.state);
+    let edges = drain_observations(&observations)
+        .into_iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::SurfaceMapped { id: edge, window, .. } => {
+                Some(("mapped", edge, window.generation))
+            }
+            port_observation::ObservationRecord::SurfaceUnmapped { id: edge, window, .. } => {
+                Some(("unmapped", edge, window.generation))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        edges,
+        [
+            ("unmapped", id, old_generation),
+            ("mapped", id, old_generation + 7)
+        ]
+    );
+}
+
+/// An absent size axis is the committed geometry, and placing a window
+/// at its own size needs no configure and still satisfies a size wait.
+#[test]
+fn place_keeps_the_real_size_and_refuses_off_output() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let current = geometry_size_of(&harness, &alpha);
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&alpha)
+        .expect("record")
+        .configured_size = (current.0 + 50, current.1 + 50);
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Place(PlaceSpec {
+            height: Some(current.1),
+            ..place(id, generation)
+        }),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["requested"], json!({"width": current.0, "height": current.1}));
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(
+            by_id(id, generation),
+            WaitUntil::Size {
+                width: current.0,
+                height: current.1,
+            },
+            5_000,
+        ),
+        |_| {},
+    );
+    assert_eq!(rc, 0, "{body}");
+
+    let origin = harness.server.state.surfaces[&alpha].window_origin;
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Place(PlaceSpec {
+            x: Some(100_000.0),
+            ..place(id, generation)
+        }),
+    );
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "off_output", "{body}");
+    assert_eq!(harness.server.state.surfaces[&alpha].window_origin, origin);
+}
+
+/// Every refusal reaches the wire with `error_code` beside `error`.
+#[test]
+fn refusals_carry_error_code() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let admission = ingress
+        .request_window(WindowOp::Raise {
+            id,
+            generation: generation + 1,
+        })
+        .expect("admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("cycle");
+    let body = runtime
+        .block_on(admission.receive())
+        .expect("reply")
+        .wire_json();
+    assert_eq!(body["error"], "stale_target");
+    assert_eq!(body["error_code"], "stale_target");
+    assert_eq!(body["current"], generation);
+    let (rc, wire) = crate::port::with_error_code(10, Arc::from(r#"{"error":"busy"}"#));
+    assert_eq!((rc, &*wire), (10, r#"{"error":"busy","error_code":"busy"}"#));
+    let (_, untouched) = crate::port::with_error_code(0, Arc::from(r#"{"error":"x"}"#));
+    assert_eq!(&*untouched, r#"{"error":"x"}"#);
+}

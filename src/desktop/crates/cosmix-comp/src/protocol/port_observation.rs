@@ -686,15 +686,16 @@ impl WaylandState {
         &mut self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) {
-        let Some((id, was_mapped)) = self
+        let Some((id, was_mapped, generation)) = self
             .surfaces
             .get(&surface.id())
-            .map(|record| (record.id, record.mapped))
+            .map(|record| (record.id, record.mapped, record.generation))
         else {
             return;
         };
         if !was_mapped {
             self.mark_surface_before_change(id);
+            self.note_window_mapping(id, generation);
         }
         self.mark_surface_dirty(id, "wayland.map");
         if !was_mapped {
@@ -1073,14 +1074,21 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     service_focus_edge(state);
     service_output_edges(state);
     service_property_diffs(state);
-    if service_controls(state) {
-        // A mutation (window op, injected input) moved state after the
-        // edge passes above ran; report it in this cycle rather than on
-        // whatever event wakes the loop next.
-        service_surface_edges(state);
-        service_focus_edge(state);
-        service_output_edges(state);
-        service_property_diffs(state);
+    match service_controls(state) {
+        // A mutation moved state after the edge passes above ran; report it
+        // in this cycle rather than on whatever event wakes the loop next.
+        // Injected input can only move focus (and the rows that show it).
+        ControlMutation::None => {}
+        ControlMutation::Input => {
+            service_focus_edge(state);
+            service_property_diffs(state);
+        }
+        ControlMutation::Any => {
+            service_surface_edges(state);
+            service_focus_edge(state);
+            service_output_edges(state);
+            service_property_diffs(state);
+        }
     }
     state.service_window_waiters();
     service_pointer(state);
@@ -1194,9 +1202,21 @@ fn service_surface_edges(state: &mut WaylandState) {
             .get(&id)
             .and_then(|object| state.surfaces.get(object));
         let final_mapped = final_record.is_some_and(|record| record.mapped);
-        if old.mapped == final_mapped {
+        // An unmap and a remap under a new role inside one cycle is still
+        // two edges: the window observers knew is gone.
+        let replaced = old.mapped
+            && final_mapped
+            && final_record.is_some_and(|record| record.generation != old.window.generation);
+        if old.mapped == final_mapped && !replaced {
             continue;
         }
+        let previous = replaced.then(|| {
+            (
+                old.role.clone(),
+                old.foreign_id.clone(),
+                old.window.clone(),
+            )
+        });
         let role = if final_mapped {
             final_record
                 .map(|record| record.role.kind().to_string())
@@ -1213,6 +1233,17 @@ fn service_surface_edges(state: &mut WaylandState) {
             Some(record) if final_mapped => edge_window(state, record),
             _ => old.window,
         };
+        if let Some((role, foreign_id, window)) = previous {
+            state
+                .observations
+                .offer(|event_seq| ObservationRecord::SurfaceUnmapped {
+                    id: raw_id,
+                    role,
+                    foreign_id,
+                    window,
+                    event_seq,
+                });
+        }
         state.observations.offer(|event_seq| {
             if final_mapped {
                 ObservationRecord::SurfaceMapped {
@@ -2117,8 +2148,15 @@ fn unix_millis() -> i64 {
         })
 }
 
-/// Returns whether any control mutated compositor state.
-fn service_controls(state: &mut WaylandState) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlMutation {
+    None,
+    Input,
+    Any,
+}
+
+/// Returns the widest kind of state change the controls made.
+fn service_controls(state: &mut WaylandState) -> ControlMutation {
     let mut controls = std::mem::take(&mut state.pending_port_controls);
     if let Some(context) = state.port_context.as_ref() {
         for (active, order) in [
@@ -2132,36 +2170,36 @@ fn service_controls(state: &mut WaylandState) -> bool {
     }
     controls.sort_by_key(PortControl::order);
     let mut changes = PendingPropChanges::new();
-    let mut mutated = false;
+    let mut mutated = ControlMutation::None;
     // Mutations run in arrival order, so a script's set -> minimise ->
     // restore -> click lands in the order it was sent.
     for control in &mut controls {
         match control {
             PortControl::Set(request) => {
-                mutated = true;
+                mutated = ControlMutation::Any;
                 service_set(state, request, &mut changes);
             }
             PortControl::Window(request) => {
-                mutated = true;
+                mutated = ControlMutation::Any;
                 let reply = state.service_window_op(&request.op);
                 if let Some(sender) = request.reply.take() {
                     let _ = sender.send(reply);
                 }
             }
             PortControl::Input(request) => {
-                mutated = true;
+                mutated = mutated.max(ControlMutation::Input);
                 let reply = state.service_input_op(&request.op);
                 if let Some(sender) = request.reply.take() {
                     let _ = sender.send(reply);
                 }
             }
             PortControl::Long(request) => {
-                mutated = true;
+                mutated = ControlMutation::Any;
                 // The ingress slot is released here: the verb now waits on
                 // its own permit and deadline, not on the bounded queue.
                 request.slot.take();
                 if let (Some(op), Some(reply)) = (request.op.take(), request.reply.take()) {
-                    state.start_long_op(op, reply);
+                    state.start_long_op(op, reply, request.admitted);
                 }
             }
             PortControl::Watch(_)

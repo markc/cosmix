@@ -861,6 +861,11 @@ pub(crate) enum HostInput {
         time: u32,
     },
     KeyboardFocusLost,
+    /// The focus-loss reset without the key release: the nested host
+    /// window lost focus while `input.host.passthrough` is off, so held keys
+    /// belong to injection and stay down (host-held ones are released
+    /// individually first).
+    KeyboardFocusLostKeepingKeys,
     /// A device reporting a touch capability was attached.
     ///
     /// Unlike the keyboard and the pointer, the touch capability is *not*
@@ -8643,6 +8648,11 @@ impl WaylandState {
                 self.set_chrome_cursor_override(None);
                 self.release_pressed_keys();
             }
+            HostInput::KeyboardFocusLostKeepingKeys => {
+                self.cancel_chrome_pointer_grab(true);
+                self.update_chrome_hover(None);
+                self.set_chrome_cursor_override(None);
+            }
             HostInput::TouchDeviceAdded => self.add_touch_device(),
             HostInput::TouchDeviceRemoved => self.remove_touch_device(),
             HostInput::TouchDown { slot, x, y, time } => self.touch_down(slot, x, y, time),
@@ -11298,11 +11308,13 @@ impl WaylandState {
         let clamped = clamp_point_to_seat((x, y), &self.backend.seat_regions());
         let (x, y) = clamped.position;
         #[cfg(feature = "bus")]
-        self.sample_corner_motion(
-            clamped.position,
-            clamped.region_index,
-            clamped.attempted_motion,
-        );
+        if !self.injection.suppress_corners {
+            self.sample_corner_motion(
+                clamped.position,
+                clamped.region_index,
+                clamped.attempted_motion,
+            );
+        }
         {
             let mut snapshot = self
                 .cursor_position_snapshot
