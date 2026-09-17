@@ -61,6 +61,19 @@ Contracts a host must honour:
   surface, so a host must draw and route `UserInterface` overlays. A menu is
   always present as an inert overlay; it returns `mouse::Interaction::None`
   while closed, so it does not steal the pointer from the base layer.
+- **Modal while open.** An open menu captures every key press and IME
+  preedit/commit, so neither the wrapped content nor `keyboard::listen`
+  subscriptions see them. Modifier, IME open/close and window events still
+  reach the content.
+- **iced internals.** The batch handling relies on private behaviour of
+  `iced_runtime` 0.14 (`UserInterface::update` drops the rest of a batch when
+  an overlay disappears). The lock pins `iced_runtime`, `iced_widget` and the
+  other `iced_*` crates; any change to them must pass this crate's
+  `runtime_*` tests first.
+- **Known limit.** iced 0.14 has no focus-change event. A context target with
+  no focusable child remembers a click as focus until the next press, so if
+  keyboard focus then moves into another context target's field, Shift+F10
+  can open the clicked one instead.
 - **Popup clamping** uses the overlay bounds the host passes to
   `UserInterface::build`, so a popup never leaves the surface.
 
