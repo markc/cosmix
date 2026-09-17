@@ -33,7 +33,6 @@ pub(crate) struct Snapshot {
     text: Vec<Vec<TextItem>>,
 }
 
-#[derive(Debug)]
 struct TextItem {
     clip: Rectangle,
     transformation: Transformation,
@@ -42,7 +41,7 @@ struct TextItem {
     bounds: Vec<Rectangle>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 enum TextKey {
     Paragraph {
         position: Point,
@@ -57,7 +56,7 @@ enum TextKey {
     Other(Text),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 struct Content {
     lines: Vec<(String, AttrsList)>,
     metrics: (f32, f32),
@@ -227,30 +226,37 @@ fn slices_eq<T>(a: &[T], b: &[T], eq: impl Fn(&T, &T) -> bool) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| eq(x, y))
 }
 
-/// Pushes the bounds of every item between the common prefix and suffix.
-fn middle<T: std::fmt::Debug>(
+/// Pushes the bounds of every item not in a longest common subsequence of
+/// `a` and `b`. Items in the subsequence are unchanged and keep their
+/// relative order, so only the others' old and new bounds can change pixels.
+fn middle<T>(
     a: &[T],
     b: &[T],
     bounds: impl Fn(&T) -> Vec<Rectangle>,
     eq: impl Fn(&T, &T) -> bool,
     out: &mut Vec<Rectangle>,
 ) {
-    let (lo, a_hi, b_hi) = changed_span(a, b, eq);
-    if std::env::var_os("COSMIX_ICED_DAMAGE_DEBUG").is_some() && (lo < a_hi || lo < b_hi) {
-        eprintln!("DAMAGE_DEBUG span lo={lo} a_hi={a_hi} b_hi={b_hi} a={:#?} b={:#?}", &a[lo..a_hi], &b[lo..b_hi]);
+    let (a_changed, b_changed) = changed_items(a, b, eq);
+    for i in a_changed {
+        out.extend(bounds(&a[i]));
     }
-    for item in a[lo..a_hi].iter().chain(&b[lo..b_hi]) {
-        out.extend(bounds(item));
+    for i in b_changed {
+        out.extend(bounds(&b[i]));
     }
 }
 
-/// `(prefix, a_end, b_end)`: `a[prefix..a_end]` and `b[prefix..b_end]` are
-/// the items not shared by the common prefix and suffix.
-pub(crate) fn changed_span<T>(
+/// Longest-common-subsequence cells above which the middle is treated as
+/// wholly changed.
+const LCS_LIMIT: usize = 1 << 14;
+
+/// Indices of `a` and `b` outside a longest common subsequence. The common
+/// prefix and suffix are matched first; the rest by dynamic programming when
+/// small enough, otherwise all of it counts as changed.
+pub(crate) fn changed_items<T>(
     a: &[T],
     b: &[T],
     eq: impl Fn(&T, &T) -> bool,
-) -> (usize, usize, usize) {
+) -> (Vec<usize>, Vec<usize>) {
     let prefix = a.iter().zip(b).take_while(|(x, y)| eq(x, y)).count();
     let max_suffix = a.len().min(b.len()) - prefix;
     let suffix = a
@@ -260,7 +266,43 @@ pub(crate) fn changed_span<T>(
         .take(max_suffix)
         .take_while(|(x, y)| eq(x, y))
         .count();
-    (prefix, a.len() - suffix, b.len() - suffix)
+    let (am, bm) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
+    let (n, m) = (am.len(), bm.len());
+    if n == 0 || m == 0 || n * m > LCS_LIMIT {
+        return (
+            (prefix..prefix + n).collect(),
+            (prefix..prefix + m).collect(),
+        );
+    }
+    // lcs[i][j]: length of the LCS of am[i..] and bm[j..].
+    let mut lcs = vec![0u16; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[at(i, j)] = if eq(&am[i], &bm[j]) {
+                lcs[at(i + 1, j + 1)] + 1
+            } else {
+                lcs[at(i + 1, j)].max(lcs[at(i, j + 1)])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let (mut a_changed, mut b_changed) = (Vec::new(), Vec::new());
+    while i < n && j < m {
+        if eq(&am[i], &bm[j]) && lcs[at(i, j)] == lcs[at(i + 1, j + 1)] + 1 {
+            i += 1;
+            j += 1;
+        } else if lcs[at(i + 1, j)] >= lcs[at(i, j + 1)] {
+            a_changed.push(prefix + i);
+            i += 1;
+        } else {
+            b_changed.push(prefix + j);
+            j += 1;
+        }
+    }
+    a_changed.extend(prefix + i..prefix + n);
+    b_changed.extend(prefix + j..prefix + m);
+    (a_changed, b_changed)
 }
 
 /// Physical rectangles, merged where their union wastes at most
@@ -317,15 +359,42 @@ mod tests {
     }
 
     #[test]
-    fn span_isolates_an_inserted_item() {
+    fn changed_items_isolate_insertions_and_separate_edits() {
         let eq = |a: &u8, b: &u8| a == b;
-        assert_eq!(changed_span(&[1, 2, 3], &[1, 9, 2, 3], eq), (1, 1, 2));
-        assert_eq!(changed_span(&[1, 9, 2, 3], &[1, 2, 3], eq), (1, 2, 1));
-        assert_eq!(changed_span(&[1, 2, 3], &[1, 2, 3], eq), (3, 3, 3));
-        assert_eq!(changed_span(&[1, 2], &[3, 4], eq), (0, 2, 2));
+        let none: Vec<usize> = vec![];
+        assert_eq!(
+            changed_items(&[1, 2, 3], &[1, 9, 2, 3], eq),
+            (none.clone(), vec![1])
+        );
+        assert_eq!(
+            changed_items(&[1, 9, 2, 3], &[1, 2, 3], eq),
+            (vec![1], none.clone())
+        );
+        assert_eq!(
+            changed_items(&[1, 2, 3], &[1, 2, 3], eq),
+            (none.clone(), none.clone())
+        );
+        assert_eq!(
+            changed_items(&[1, 2], &[3, 4], eq),
+            (vec![0, 1], vec![0, 1])
+        );
         // Repeated items: the suffix never overlaps the prefix.
-        assert_eq!(changed_span(&[1, 1], &[1, 1, 1], eq), (2, 2, 3));
-        assert_eq!(changed_span::<u8>(&[], &[5], eq), (0, 0, 1));
+        assert_eq!(
+            changed_items(&[1, 1], &[1, 1, 1], eq),
+            (none.clone(), vec![2])
+        );
+        assert_eq!(changed_items::<u8>(&[], &[5], eq), (none.clone(), vec![0]));
+        // Two separate edits leave the unchanged items between them alone
+        // (a text field and a status line with tab labels in between).
+        assert_eq!(
+            changed_items(&[1, 2, 3, 4, 5, 6], &[1, 7, 3, 4, 5, 8], eq),
+            (vec![1, 5], vec![1, 5])
+        );
+        // A moved item: only it is damaged, at both positions.
+        assert_eq!(
+            changed_items(&[1, 2, 3, 4], &[2, 3, 4, 1], eq),
+            (vec![0], vec![3])
+        );
     }
 
     #[test]
