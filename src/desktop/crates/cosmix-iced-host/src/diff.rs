@@ -37,8 +37,10 @@ struct TextItem {
     clip: Rectangle,
     transformation: Transformation,
     texts: Vec<TextKey>,
-    /// Logical damage bounds of the item.
+    /// Logical damage bounds of each text, with room for ink overhang.
     bounds: Vec<Rectangle>,
+    /// The same bounds as the renderer measures them, without that room.
+    measured: Vec<Rectangle>,
 }
 
 #[derive(PartialEq)]
@@ -126,6 +128,12 @@ impl Snapshot {
                                 .filter_map(Text::visible_bounds)
                                 .map(|r| r.expand(TEXT_MARGIN) * t)
                                 .collect(),
+                            measured: item
+                                .as_slice()
+                                .iter()
+                                .filter_map(Text::visible_bounds)
+                                .map(|r| r * t)
+                                .collect(),
                         }
                     })
                     .collect()
@@ -187,8 +195,11 @@ pub(crate) fn expand_unclipped(
                     }
                 }
                 for item in &snapshot.text[index] {
-                    for ink in &item.bounds {
-                        if touches(rects, ink) && !covered(rects, ink) {
+                    // The mask is skipped only for text wholly inside the
+                    // clip; anything crossing a damage edge is clipped, so
+                    // only fully covered text can paint ink outside.
+                    for (ink, measured) in item.bounds.iter().zip(&item.measured) {
+                        if covered(rects, measured) && !covered(rects, ink) {
                             rects.push(*ink);
                         }
                     }
