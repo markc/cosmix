@@ -250,7 +250,8 @@ fn caret_blink_damages_about_the_caret() {
                 "caret at {physical_cursor:?} not in {:?}",
                 frame.damage
             );
-            assert_eq!(t.buffer, t.full_redraw(), "blink {step} left stale pixels");
+            let full = t.full_redraw();
+            assert!(t.buffer == full, "blink {step} left stale pixels");
         }
     }
 }
@@ -282,7 +283,8 @@ fn one_character_edit_damages_the_field_and_its_echo() {
         );
     }
     assert!(frame.damage.iter().any(|r| r.is_within(&field)));
-    assert_eq!(t.buffer, t.full_redraw());
+    let full = t.full_redraw();
+    assert!(t.buffer == full, "edit left stale pixels");
 }
 
 /// Deterministic pseudo-random sequence (xorshift).

@@ -438,7 +438,7 @@ impl<P: Program> Surface<P> {
         if width == 0 || height == 0 {
             return Err(DrawError::ZeroSize);
         }
-        if stride % 4 != 0 || u64::from(stride) < u64::from(width) * 4 {
+        if !stride.is_multiple_of(4) || u64::from(stride) < u64::from(width) * 4 {
             return Err(DrawError::UnsupportedStride { stride, width });
         }
         // Rows may be padded (a texture wider than the surface); the padding
