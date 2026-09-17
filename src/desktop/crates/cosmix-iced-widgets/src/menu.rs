@@ -5,7 +5,7 @@
 //! Escape navigate. Accelerator strings are labels; the app owns shortcuts.
 
 use iced::advanced::{
-    Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer, text,
+    Clipboard, Layout, Shell, Widget, input_method, layout, mouse, overlay, renderer, text,
     widget::{Operation, Tree, tree},
 };
 use iced::{Border, Color, Element, Event, Length, Point, Rectangle, Size, Vector, keyboard};
@@ -197,11 +197,13 @@ impl Operation for ChildFocus {
     }
 }
 
+// State-only events that content must see even while a menu is open. IME
+// preedit and commit are input, so the open menu blocks them like key presses.
 fn housekeeping(event: &Event) -> bool {
     matches!(
         event,
         Event::Window(_)
-            | Event::InputMethod(_)
+            | Event::InputMethod(input_method::Event::Opened | input_method::Event::Closed)
             | Event::Keyboard(keyboard::Event::ModifiersChanged(_))
     )
 }
@@ -645,11 +647,10 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> Widget<Message, Theme, Ren
             return;
         }
         let bar = self.content.is_none();
-        if matches!(
-            event,
-            Event::Mouse(mouse::Event::ButtonPressed(_))
-                | Event::Touch(iced::touch::Event::FingerPressed { .. })
-        ) {
+        if let Event::Touch(iced::touch::Event::FingerPressed { position, .. }) = event {
+            state.focused =
+                !previously_captured && layout.bounds().contains(*position - state.translation);
+        } else if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_))) {
             state.focused = !previously_captured && cursor.is_over(layout.bounds());
         } else if matches!(event, Event::Window(iced::window::Event::Unfocused)) {
             state.focused = false;
@@ -1034,7 +1035,14 @@ impl<Message: Clone, Theme, Renderer: text::Renderer> overlay::Overlay<Message, 
                 }
                 shell.capture_event();
             }
-            Event::Keyboard(keyboard::Event::KeyReleased { .. }) => shell.capture_event(),
+            // The menu is modal: no key press or IME text may reach the app or
+            // `keyboard::listen` subscriptions behind it.
+            Event::Keyboard(
+                keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. },
+            )
+            | Event::InputMethod(
+                input_method::Event::Preedit(..) | input_method::Event::Commit(_),
+            ) => shell.capture_event(),
             Event::Mouse(mouse::Event::CursorMoved { .. })
             | Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let clicked = matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)));
@@ -1297,6 +1305,26 @@ mod tests {
             iced::event::Status::Captured,
             "keyboard-focused child enables context shortcut without click"
         );
+        let (_, statuses) = ui.update(
+            &[
+                character("q"),
+                Event::InputMethod(iced::advanced::input_method::Event::Preedit(
+                    "界".into(),
+                    Some(0..3),
+                )),
+                Event::InputMethod(iced::advanced::input_method::Event::Commit("界".into())),
+            ],
+            mouse::Cursor::Unavailable,
+            &mut (),
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        assert_eq!(
+            statuses,
+            [iced::event::Status::Captured; 3],
+            "an open menu blocks key presses and IME text from the app behind it"
+        );
+        assert!(messages.is_empty());
         let (_, statuses) = ui.update(
             &[
                 Event::Keyboard(keyboard::Event::ModifiersChanged(
