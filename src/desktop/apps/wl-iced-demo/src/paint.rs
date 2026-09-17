@@ -75,25 +75,6 @@ impl Canvas<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fill_clips_and_writes_bgra() {
-        let mut buf = vec![0u8; 4 * 4 * 3];
-        let mut c = Canvas {
-            pixels: &mut buf,
-            width: 4,
-            height: 3,
-            stride: 16,
-        };
-        c.fill(Rect::new(3, 2, 10, 10), Rgb(1, 2, 3));
-        assert_eq!(&buf[(2 * 16 + 12)..], &[3, 2, 1, 255]);
-        assert!(buf[..2 * 16 + 12].iter().all(|b| *b == 0));
-    }
-}
-
 /// Writes an ARGB8888 buffer as a binary PPM, for a measurement that needs
 /// the pixels the client actually committed (a screen capture of a scaled
 /// output would show the compositor's resampling instead). `WL_DEMO_DUMP`
@@ -111,4 +92,23 @@ pub fn dump_ppm(
         out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
     }
     std::fs::File::create(path)?.write_all(&out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fill_clips_and_writes_bgra() {
+        let mut buf = vec![0u8; 4 * 4 * 3];
+        let mut c = Canvas {
+            pixels: &mut buf,
+            width: 4,
+            height: 3,
+            stride: 16,
+        };
+        c.fill(Rect::new(3, 2, 10, 10), Rgb(1, 2, 3));
+        assert_eq!(&buf[(2 * 16 + 12)..], &[3, 2, 1, 255]);
+        assert!(buf[..2 * 16 + 12].iter().all(|b| *b == 0));
+    }
 }
