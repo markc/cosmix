@@ -11,8 +11,10 @@ default-run = "cosmix-quoin"
 [features]
 default = []
 scene-gates = ["cosmix-scene-bevy/gate"]
-# Mounts scenes loaded with `adapter: iced` through cosmix-scene-iced.
-scene-iced = ["dep:cosmix-scene-iced"]
+# Mounts scenes loaded with `adapter: iced` through cosmix-scene-iced, drawn by iced
+# (tiny-skia). `scene-iced-standin` keeps the bridge's stand-in renderer instead.
+scene-iced = ["scene-iced-standin", "cosmix-scene-iced/iced"]
+scene-iced-standin = ["dep:cosmix-scene-iced"]
 demo = ["cosmix-shell/dev-host"]
 
 [[bin]]

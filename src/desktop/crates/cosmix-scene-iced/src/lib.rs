@@ -9,6 +9,8 @@
 //! `RenderQueue::write_texture` from the render world.
 mod bridge;
 mod gpu;
+#[cfg(feature = "iced")]
+pub mod iced_scene;
 pub mod standin;
 pub mod surface;
 pub mod upload;

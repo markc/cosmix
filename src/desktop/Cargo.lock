@@ -3285,6 +3285,9 @@ name = "cosmix-scene-iced"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "cosmix-design",
+ "cosmix-iced-host",
+ "cosmix-iced-widgets",
  "cosmix-scene",
  "cosmix-scene-bevy",
  "cosmix-shell",

@@ -115,6 +115,34 @@ impl Events {
         }
     }
 
+    /// Sends a handler call on behalf of another adapter, with the same body,
+    /// request ids and reply bookkeeping as CTK-mounted scenes. `kind` is
+    /// `click`, `change` or `submit`; `handler` is the node's matching port.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_handler(
+        &mut self,
+        bridge: &BusBridge,
+        scene: &str,
+        citizen: &str,
+        node: &str,
+        kind: &str,
+        handler: &str,
+        value: Option<Value>,
+        item: Option<Value>,
+    ) {
+        let handler = Some(handler.to_owned());
+        let binding = Binding {
+            scene: scene.into(),
+            node: node.into(),
+            citizen: citizen.into(),
+            click: handler.clone(),
+            change: handler.clone(),
+            submit: handler,
+            item,
+        };
+        self.send(bridge, &binding, kind, value);
+    }
+
     pub fn reply(&mut self, event: &BusBridgeEvent) {
         if let BusBridgeEvent::Reply { request_id, result } = event
             && let Some((citizen, _)) = self.pending.remove(request_id)

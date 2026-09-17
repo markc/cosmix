@@ -1,0 +1,495 @@
+use std::collections::HashSet;
+use std::time::Duration;
+
+use cosmix_iced_host::core::Rectangle;
+use cosmix_scene::ResolvedScene;
+use serde_json::{Value, json};
+
+use super::*;
+use crate::surface::{
+    ImeEvent, ImeRequest, Key, Modifiers, NamedKey, PointerButton, Processed, Rect, SurfaceEvent,
+    SurfaceRenderer,
+};
+
+const CONFORMANCE: &str = include_str!("../../../cosmix-scene/tests/fixtures/conformance.scene.md");
+const CLIPPANEL: &str = include_str!("../../../cosmix-scene/tests/fixtures/clippanel.scene.md");
+const STATIC: &str = include_str!("../../../cosmix-scene/tests/fixtures/static.scene.md");
+static FONT: &[u8] = include_bytes!("../../../cosmix-comp/assets/fonts/DejaVuSans.ttf");
+
+fn resolve(source: &str) -> ResolvedScene {
+    cosmix_scene::resolve(&cosmix_scene::parse(source).unwrap()).unwrap()
+}
+
+fn test_design() -> SharedDesign {
+    cosmix_iced_host::load_font(FONT);
+    Arc::new(RwLock::new(DesignShare {
+        revision: 0,
+        look: Look {
+            font: named_font("DejaVu Sans"),
+            ..default_look()
+        },
+    }))
+}
+
+struct Rig {
+    renderer: IcedSceneRenderer,
+    outbox: Outbox,
+    buffer: Vec<u8>,
+    width: u32,
+    height: u32,
+    scale: f32,
+    now: Duration,
+}
+
+impl Rig {
+    fn new(source: &str, width: u32, height: u32, scale: f32) -> Self {
+        let outbox = Outbox::default();
+        let mut renderer = IcedSceneRenderer::new(test_design(), outbox.clone());
+        renderer.resize(width, height, scale);
+        renderer.set_scene(&resolve(source));
+        Self {
+            renderer,
+            outbox,
+            buffer: vec![0; width as usize * height as usize * 4],
+            width,
+            height,
+            scale,
+            now: Duration::from_secs(1),
+        }
+    }
+
+    /// One host update, as `bridge::frame` runs it.
+    fn frame(&mut self) -> (Processed, Option<Vec<Rect>>) {
+        self.now += Duration::from_millis(16);
+        let processed = self.renderer.process(self.now);
+        let damage = processed.needs_redraw.then(|| {
+            self.renderer
+                .draw(&mut self.buffer, self.width, self.height, self.width * 4)
+        });
+        (processed, damage)
+    }
+
+    fn settle(&mut self) -> Processed {
+        for _ in 0..8 {
+            let (processed, damage) = self.frame();
+            if damage.is_none() {
+                return processed;
+            }
+        }
+        panic!("surface never settled");
+    }
+
+    fn bounds(&mut self, key: &str) -> Rectangle {
+        self.renderer
+            .node_bounds(key)
+            .unwrap_or_else(|| panic!("no bounds for {key}"))
+    }
+
+    fn physical(&mut self, key: &str, margin: f32) -> Rect {
+        let b = self.bounds(key).expand(margin);
+        let s = self.scale;
+        let x = (b.x * s).floor().max(0.0);
+        let y = (b.y * s).floor().max(0.0);
+        Rect::new(
+            x as u32,
+            y as u32,
+            ((b.x + b.width) * s).ceil() as u32 - x as u32,
+            ((b.y + b.height) * s).ceil() as u32 - y as u32,
+        )
+    }
+
+    fn point(&mut self, key: &str) {
+        let c = self.bounds(key).center();
+        self.renderer.queue(SurfaceEvent::PointerMoved {
+            x: c.x * self.scale,
+            y: c.y * self.scale,
+        });
+    }
+
+    fn click(&mut self, key: &str) {
+        self.point(key);
+        for pressed in [true, false] {
+            self.renderer.queue(SurfaceEvent::PointerButton {
+                button: PointerButton::Primary,
+                pressed,
+            });
+        }
+        self.settle();
+    }
+
+    fn key(&mut self, key: Key, text: Option<&str>, modifiers: Modifiers) {
+        let latin = match &key {
+            Key::Character(c) => c.chars().next().filter(char::is_ascii_alphanumeric),
+            _ => None,
+        };
+        for pressed in [true, false] {
+            self.renderer.queue(SurfaceEvent::Key {
+                key: key.clone(),
+                latin,
+                text: pressed.then(|| text.map(str::to_owned)).flatten(),
+                pressed,
+                repeat: false,
+                modifiers,
+            });
+        }
+        self.settle();
+    }
+
+    fn type_text(&mut self, text: &str) {
+        for c in text.chars() {
+            let s = c.to_string();
+            self.key(Key::Character(s.clone()), Some(&s), Modifiers::default());
+        }
+    }
+
+    fn ctrl(&mut self, letter: &str, shift: bool) {
+        self.key(
+            Key::Character(letter.into()),
+            None,
+            Modifiers {
+                control: true,
+                shift,
+                ..Modifiers::default()
+            },
+        );
+    }
+
+    fn actions(&self) -> Vec<SceneAction> {
+        std::mem::take(&mut *self.outbox.lock().unwrap())
+    }
+
+    fn field(&self) -> String {
+        self.renderer
+            .program()
+            .field_value("field")
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    fn colours(&self) -> usize {
+        self.buffer
+            .chunks_exact(4)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect::<HashSet<_>>()
+            .len()
+    }
+}
+
+fn action(kind: &'static str, handler: &str, node: &str, value: Option<Value>) -> SceneAction {
+    SceneAction {
+        scene: "conformance".into(),
+        citizen: "conformance-citizen".into(),
+        node: node.into(),
+        kind,
+        handler: handler.into(),
+        value,
+        item: None,
+    }
+}
+
+#[test]
+fn fixtures_render_then_idle() {
+    for (source, width, height) in [(CLIPPANEL, 720, 520), (CONFORMANCE, 640, 480), (STATIC, 300, 200)] {
+        for scale in [1.0, 1.5] {
+            let (w, h) = ((width as f32 * scale) as u32, (height as f32 * scale) as u32);
+            let mut rig = Rig::new(source, w, h, scale);
+            let (processed, damage) = rig.frame();
+            assert!(processed.needs_redraw);
+            assert_eq!(damage.unwrap(), vec![Rect::new(0, 0, w, h)]);
+            assert!(rig.colours() > 8, "only {} colours", rig.colours());
+            let settled = rig.settle();
+            assert!(!settled.needs_redraw);
+            assert_eq!(settled.wake_at, None, "an unfocused scene must not wake");
+            assert_eq!(settled.ime, ImeRequest::Disabled);
+            // A forced redraw of an unchanged scene paints nothing.
+            let buffer = rig.buffer.clone();
+            assert!(
+                rig.renderer
+                    .draw(&mut rig.buffer, w, h, w * 4)
+                    .is_empty()
+            );
+            assert!(rig.buffer == buffer);
+        }
+    }
+}
+
+#[test]
+fn text_is_drawn_from_cells() {
+    let mut rig = Rig::new(CLIPPANEL, 720, 520, 1.0);
+    rig.settle();
+    let row = rig.physical("r_prev@e1", 0.0);
+    let background = rig.buffer[(row.y * 720 + row.x) as usize * 4..][..4].to_vec();
+    let mut ink = 0;
+    for y in row.y..row.bottom() {
+        for x in row.x..row.right() {
+            let i = (y * 720 + x) as usize * 4;
+            if rig.buffer[i..i + 4] != background[..] {
+                ink += 1;
+            }
+        }
+    }
+    assert!(ink > 50, "preview cell has {ink} ink pixels");
+}
+
+#[test]
+fn hover_damage_stays_on_the_row() {
+    let mut rig = Rig::new(CLIPPANEL, 720, 520, 1.5);
+    rig.settle();
+    let row = rig.physical("entry_row@e1", 2.0);
+    let probe = (row.x + 4, row.y + row.h / 2);
+    let at = |rig: &Rig| {
+        let i = (probe.1 * rig.width + probe.0) as usize * 4;
+        rig.buffer[i..i + 4].to_vec()
+    };
+    let before = at(&rig);
+    rig.point("entry_row@e1");
+    let (processed, damage) = rig.frame();
+    assert!(processed.needs_redraw);
+    let damage = damage.unwrap();
+    assert!(!damage.is_empty());
+    for rect in &damage {
+        assert!(
+            rect.x >= row.x && rect.y >= row.y && rect.right() <= row.right() && rect.bottom() <= row.bottom(),
+            "{rect:?} outside {row:?}"
+        );
+    }
+    assert_ne!(at(&rig), before, "hover colour not drawn");
+    assert!(rig.settle().wake_at.is_none());
+}
+
+#[test]
+fn clicks_toggles_and_rows_reach_their_handlers() {
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 1.0);
+    rig.settle();
+    rig.click("button");
+    assert_eq!(rig.actions(), vec![action("click", "go", "button", None)]);
+    rig.click("toggle");
+    assert_eq!(
+        rig.actions(),
+        vec![action("change", "toggle", "toggle", Some(json!(true)))]
+    );
+    rig.click("row");
+    assert_eq!(rig.actions(), vec![action("click", "pick", "row", None)]);
+    rig.click("template@1");
+    assert_eq!(
+        rig.actions(),
+        vec![SceneAction {
+            item: Some(json!({"id": "1", "cells": ["one"]})),
+            ..action("click", "select", "list", None)
+        }]
+    );
+    // A patched toggle value is adopted.
+    let mut tree = resolve(CONFORMANCE);
+    tree.nodes["toggle"].ports.insert("value".into(), json!(false));
+    rig.renderer.set_scene(&resolve(CONFORMANCE));
+    rig.settle();
+    rig.click("toggle");
+    assert_eq!(
+        rig.actions(),
+        vec![action("change", "toggle", "toggle", Some(json!(true)))]
+    );
+}
+
+#[test]
+fn field_edits_submit_undo_and_survive_reloads() {
+    let mut rig = Rig::new(CONFORMANCE, 640, 480, 1.25);
+    rig.settle();
+    rig.click("field");
+    let processed = rig.settle();
+    let ImeRequest::Enabled { cursor } = processed.ime else {
+        panic!("focused field requested no IME: {processed:?}");
+    };
+    let field = rig.physical("field", 0.0);
+    assert!(field.contains(cursor.x as f32 + 0.5, cursor.y as f32 + 0.5));
+    assert!(processed.wake_at.is_some(), "caret blink not scheduled");
+
+    rig.type_text("ab");
+    assert_eq!(rig.field(), "ab");
+    assert_eq!(
+        rig.actions(),
+        vec![
+            action("change", "change", "field", Some(json!("a"))),
+            action("change", "change", "field", Some(json!("ab"))),
+        ]
+    );
+    rig.key(Key::Named(NamedKey::Enter), Some("\r"), Modifiers::default());
+    assert_eq!(
+        rig.actions(),
+        vec![action("submit", "submit", "field", Some(json!("ab")))]
+    );
+
+    // An unrelated patch plus an external value while focused: text, focus
+    // and history are retained.
+    let mut patched = resolve(CONFORMANCE);
+    patched.nodes["text"].ports.insert("text".into(), json!("new status"));
+    patched.nodes["field"].ports.insert("value".into(), json!("external"));
+    rig.renderer.set_scene(&patched);
+    rig.settle();
+    assert_eq!(rig.field(), "ab");
+    assert!(rig.renderer.focused().contains("field"));
+    rig.ctrl("z", false);
+    let undone = rig.field();
+    assert_ne!(undone, "ab", "undo history lost across reload");
+    rig.ctrl("y", false);
+    assert_eq!(rig.field(), "ab");
+    rig.actions();
+
+    // Preedit survives a reload and commits into the retained text.
+    rig.renderer.queue(SurfaceEvent::Ime(ImeEvent::Preedit {
+        text: "zz".into(),
+        cursor: Some((2, 2)),
+    }));
+    rig.settle();
+    let preedit = |rig: &Rig| match &rig.renderer.host_requests().ime {
+        cosmix_iced_host::ImeRequest::Enabled { preedit, .. } => {
+            preedit.as_ref().map(|p| p.content.clone())
+        }
+        cosmix_iced_host::ImeRequest::Disabled => None,
+    };
+    assert_eq!(preedit(&rig).as_deref(), Some("zz"));
+    patched.nodes["text"].ports.insert("text".into(), json!("again"));
+    rig.renderer.set_scene(&patched);
+    rig.settle();
+    assert_eq!(preedit(&rig).as_deref(), Some("zz"));
+    rig.renderer
+        .queue(SurfaceEvent::Ime(ImeEvent::Commit("zz".into())));
+    rig.renderer.queue(SurfaceEvent::Ime(ImeEvent::Disabled));
+    rig.settle();
+    assert_eq!(rig.field(), "abzz");
+
+    // Once unfocused, an external value replaces the text.
+    rig.click("text");
+    assert!(!rig.renderer.focused().contains("field"));
+    assert_eq!(rig.settle().ime, ImeRequest::Disabled);
+    patched.nodes["field"].ports.insert("value".into(), json!("external 2"));
+    rig.renderer.set_scene(&patched);
+    rig.settle();
+    assert_eq!(rig.field(), "external 2");
+}
+
+#[test]
+fn scene_get_returns_the_p1_resolved_scene() {
+    use cosmix_scene_bevy::SceneStore;
+    use cosmix_shell::runtime::SceneVerb;
+    let (bridge, _peer) = ctk::bus::test_bridge("test");
+    for source in [CONFORMANCE, CLIPPANEL, STATIC] {
+        let expected = resolve(source);
+        let mut store = SceneStore::default();
+        store.register_adapter(crate::ADAPTER);
+        let (rc, reply) = store.dispatch(
+            SceneVerb::Load,
+            source,
+            &json!({"adapter": crate::ADAPTER}),
+            &bridge,
+        );
+        assert_eq!(rc, 0, "{reply}");
+        let (rc, reply) = store.dispatch(
+            SceneVerb::Get,
+            "",
+            &json!({"scene": expected.name}),
+            &bridge,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(serde_json::from_str::<Value>(&reply).unwrap(), json!(expected));
+    }
+}
+
+#[test]
+fn plugin_mounts_iced_and_sends_handlers_on_the_scene_bus_path() {
+    use bevy::asset::AssetPlugin;
+    use cosmix_scene_bevy::SceneStore;
+    use cosmix_shell::runtime::SceneVerb;
+
+    let mut app = App::new();
+    app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+        .init_asset::<Image>()
+        .add_plugins((crate::SceneIcedPlugin, IcedRendererPlugin));
+    let (bridge, peer) = ctk::bus::test_bridge("test");
+    let (rc, reply) = app.world_mut().resource_mut::<SceneStore>().dispatch(
+        SceneVerb::Load,
+        CONFORMANCE,
+        &json!({"adapter": crate::ADAPTER}),
+        &bridge,
+    );
+    assert_eq!(rc, 0, "{reply}");
+    app.insert_resource(bridge);
+    app.update();
+    let surface = app
+        .world_mut()
+        .query_filtered::<Entity, With<crate::IcedSurface>>()
+        .single(app.world())
+        .unwrap();
+    app.world_mut()
+        .entity_mut(surface)
+        .insert(crate::IcedSurfaceGeometry {
+            size: UVec2::new(640, 480),
+            scale: 1.0,
+            origin: Vec2::ZERO,
+        });
+    for _ in 0..4 {
+        app.update();
+    }
+    let counters = app.world().resource::<crate::SceneIcedCounters>();
+    assert_eq!(counters.totals.allocations, 1);
+    assert!(counters.totals.draws >= 1);
+    assert!(
+        counters.totals.bytes_queued >= 640 * 480 * 4,
+        "{:?}",
+        counters.totals
+    );
+
+    let outbox = app.world().resource::<IcedOutbox>().0.clone();
+    outbox
+        .lock()
+        .unwrap()
+        .push(action("click", "go", "button", None));
+    app.update();
+    let calls = peer.drain_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].to, "conformance-citizen");
+    assert_eq!(calls[0].command, "go");
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[0].body).unwrap(),
+        json!({"scene": "conformance", "node": "button", "kind": "click"})
+    );
+}
+
+#[test]
+fn font_faces_resolve_to_the_same_family_in_both_stacks() {
+    use cosmix_iced_host::tiny_skia_renderer::graphics::text::font_system;
+
+    cosmix_iced_host::load_font(FONT);
+    let mut bevy_fonts = bevy::text::FontCx::default();
+    let registered = bevy_fonts
+        .collection
+        .register_fonts(parley::fontique::Blob::from(FONT.to_vec()), None);
+    let bevy_names: Vec<String> = registered
+        .iter()
+        .filter_map(|(id, _)| bevy_fonts.collection.family_name(*id).map(str::to_owned))
+        .collect();
+    assert_eq!(bevy_names, ["DejaVu Sans"]);
+
+    let iced_family = |name: &str| {
+        let mut system = font_system().write().unwrap();
+        system
+            .raw()
+            .db()
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(family, _)| family.clone()))
+            .find(|family| family.eq_ignore_ascii_case(name))
+    };
+    assert_eq!(iced_family("DejaVu Sans").as_deref(), Some("DejaVu Sans"));
+
+    // CTK's configured family comes from the system in both stacks; report
+    // whether this machine has it rather than assume.
+    let ctk_family = ctk::theme::CtkTypography::default().requested_family;
+    let bevy_has = bevy_fonts
+        .collection
+        .family_by_name(&ctk_family)
+        .map(|f| f.name().to_owned());
+    let iced_has = iced_family(&ctk_family);
+    println!("FONT_CHECK family={ctk_family:?} bevy={bevy_has:?} iced={iced_has:?}");
+    if let (Some(bevy), Some(iced)) = (&bevy_has, &iced_has) {
+        assert_eq!(bevy, iced);
+    }
+}

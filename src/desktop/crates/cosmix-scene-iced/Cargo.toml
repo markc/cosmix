@@ -7,12 +7,20 @@ rust-version = "1.95"
 license = "MIT"
 publish = false
 
+[features]
+# The iced renderer (cosmix-iced-host + cosmix-iced-widgets) and `IcedRendererPlugin`.
+iced = ["dep:cosmix-iced-host", "dep:cosmix-iced-widgets", "cosmix-iced-widgets/tiny-skia", "dep:cosmix-design", "dep:ctk"]
+
 [dependencies]
 bevy = { version = "=0.19.0", default-features = false, features = ["ui_api", "bevy_render", "bevy_ui_widgets", "bevy_feathers", "png"] }
 cosmix-scene = { path = "../cosmix-scene" }
 cosmix-scene-bevy = { path = "../cosmix-scene-bevy" }
 cosmix-shell = { path = "../cosmix-shell", features = ["chrome"] }
 serde_json = "1"
+cosmix-design = { path = "../cosmix-design", optional = true }
+cosmix-iced-host = { path = "../cosmix-iced-host", optional = true }
+cosmix-iced-widgets = { path = "../cosmix-iced-widgets", optional = true }
+ctk = { path = "../../ctk", default-features = false, features = ["bus"], optional = true }
 
 [dev-dependencies]
 ctk = { path = "../../ctk", default-features = false, features = ["bus", "test-support"] }

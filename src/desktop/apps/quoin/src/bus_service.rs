@@ -107,7 +107,7 @@ struct SceneBus<'w, 's> {
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
-    #[cfg(feature = "scene-iced")]
+    #[cfg(feature = "scene-iced-standin")]
     iced: (
         Option<Res<'w, cosmix_scene_iced::SceneIcedCounters>>,
         Option<Res<'w, cosmix_scene_iced::SceneIcedFocus>>,
@@ -309,12 +309,12 @@ fn service_bus(
                 let (rc, body) = content.scenes.dispatch(verb, &request.body, &args, &bridge);
                 (rc, body, None)
             } else if request.command == "shell.debug.status" {
-                #[cfg(feature = "scene-iced")]
+                #[cfg(feature = "scene-iced-standin")]
                 let scene_iced = match &content.iced {
                     (Some(counters), Some(focus)) => counters.snapshot(focus).json(),
                     _ => Value::Null,
                 };
-                #[cfg(not(feature = "scene-iced"))]
+                #[cfg(not(feature = "scene-iced-standin"))]
                 let scene_iced = Value::Null;
                 (
                     0,

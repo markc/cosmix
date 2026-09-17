@@ -166,14 +166,16 @@ fn configure_content(
             Update,
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
-    #[cfg(feature = "scene-iced")]
+    #[cfg(feature = "scene-iced-standin")]
     app.add_plugins(cosmix_scene_iced::SceneIcedPlugin)
         .add_systems(Last, scene_iced_wake);
+    #[cfg(feature = "scene-iced")]
+    app.add_plugins(cosmix_scene_iced::iced_scene::IcedRendererPlugin);
 }
 
 /// Caret blink and other renderer timers become the layer host's one-shot
 /// application wake; the earliest pending deadline wins.
-#[cfg(feature = "scene-iced")]
+#[cfg(feature = "scene-iced-standin")]
 fn scene_iced_wake(
     wake: Res<cosmix_scene_iced::SceneIcedWake>,
     mut deadline: ResMut<cosmix_shell_host::LayerHostDeadline>,
