@@ -155,6 +155,10 @@ struct Options {
     /// Keep the window mapped this long after the result line, so a gate
     /// can read the compositor's stats for it (G1+).
     hold: Duration,
+    /// Measure only the compositor's frame-callback cadence, without
+    /// wp_presentation: the one measurement that works against a
+    /// compositor that does not advertise it.
+    callbacks_only: bool,
 }
 
 fn options() -> Result<Options, String> {
@@ -165,6 +169,7 @@ fn options() -> Result<Options, String> {
         height: 256,
         timeout: Duration::from_secs(60),
         hold: Duration::ZERO,
+        callbacks_only: false,
     };
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -199,6 +204,7 @@ fn options() -> Result<Options, String> {
                         .map_err(|error| format!("--timeout-s: {error}"))?,
                 );
             }
+            "--callbacks-only" => options.callbacks_only = true,
             "--hold-s" => {
                 options.hold = Duration::from_secs(
                     value()?
@@ -242,10 +248,10 @@ fn run() -> Result<bool, String> {
         .ok_or("wl_compositor unavailable")?;
     let shm = probe.shm.clone().ok_or("wl_shm unavailable")?;
     let wm_base = probe.wm_base.clone().ok_or("xdg_wm_base unavailable")?;
-    let presentation = probe
-        .presentation
-        .clone()
-        .ok_or("wp_presentation is not advertised")?;
+    let presentation = probe.presentation.clone();
+    if !options.callbacks_only && presentation.is_none() {
+        return Err("wp_presentation is not advertised".into());
+    }
     queue
         .roundtrip(&mut probe)
         .map_err(|error| format!("clock roundtrip failed: {error}"))?;
@@ -305,6 +311,7 @@ fn run() -> Result<bool, String> {
     let started = monotonic_now();
     let mut pixels = vec![0_u8; buffer_bytes];
     let mut commit = 0;
+    let mut callbacks = Vec::with_capacity(options.frames);
     for _ in 0..options.frames {
         for step in 0..options.burst {
             // Consecutive commits never share a buffer (there is one more
@@ -322,7 +329,10 @@ fn run() -> Result<bool, String> {
             if step + 1 == options.burst {
                 surface.frame(&qh, ());
             }
-            if asks_feedback(commit, options.burst) {
+            if let Some(presentation) = &presentation
+                && !options.callbacks_only
+                && asks_feedback(commit, options.burst)
+            {
                 presentation.feedback(&surface, &qh, commit);
             }
             commit_times[commit] = monotonic_now();
@@ -337,6 +347,32 @@ fn run() -> Result<bool, String> {
             |probe| probe.frame_done,
             "frame callback",
         )?;
+        callbacks.push(monotonic_now());
+    }
+    if options.callbacks_only {
+        let mut intervals = callbacks
+            .windows(2)
+            .map(|pair| pair[1].saturating_sub(pair[0]).as_micros() as u64)
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let at = |percent: usize| {
+            intervals
+                .get((intervals.len().saturating_sub(1)) * percent / 100)
+                .copied()
+                .unwrap_or(0)
+        };
+        println!(
+            "COSMIX_PRESENTATION_PROBE CALLBACKS frames={} callback_p50_us={} \
+             callback_p99_us={} callback_min_us={} callback_max_us={} presentation={}",
+            options.frames,
+            at(50),
+            at(99),
+            intervals.first().copied().unwrap_or(0),
+            intervals.last().copied().unwrap_or(0),
+            presentation.is_some(),
+        );
+        toplevel.destroy();
+        return Ok(!intervals.is_empty());
     }
     let committed = monotonic_now();
     let burst = options.burst;
