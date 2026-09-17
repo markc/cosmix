@@ -15,7 +15,7 @@ gallery-wgpu = ["gallery", "wgpu"]
 gallery-tiny-skia = ["gallery", "tiny-skia"]
 
 [dependencies]
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "wayland"] }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "wayland", "thread-pool"] }
 cosmix-design = { path = "../cosmix-design", default-features = false }
 
 [[example]]
