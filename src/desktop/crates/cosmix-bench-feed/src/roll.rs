@@ -142,13 +142,32 @@ impl RollViewport {
         }
     }
 
-    /// The black-key rows, top to bottom, as `(key, y, height)`.
-    pub fn black_key_rows(&self, height: f32) -> impl Iterator<Item = (u8, f32, f32)> + '_ {
+    /// The black-key row bands, top to bottom, in a `width` x `height` roll.
+    pub fn black_key_rows(&self, width: f32, height: f32) -> impl Iterator<Item = (u8, Rect)> + '_ {
         let row = self.row_height(height);
         (self.key_lo..=self.key_hi)
             .rev()
             .filter(|key| crate::layout::is_black_key(*key))
-            .map(move |key| (key, self.key_y(key, height), row))
+            .map(move |key| {
+                let rect = Rect {
+                    x: 0.0,
+                    y: self.key_y(key, height),
+                    w: width,
+                    h: row,
+                };
+                (key, rect)
+            })
+    }
+
+    /// Where `line` is drawn: one pixel wide, its left edge snapped down to a
+    /// whole pixel.
+    pub fn gridline_rect(&self, line: &GridLine, width: f32, height: f32) -> Rect {
+        Rect {
+            x: self.tick_x(f64::from(line.tick), width).floor(),
+            y: 0.0,
+            w: 1.0,
+            h: height,
+        }
     }
 
     /// Visible notes of `song` (indices into `song.notes`), capped at
