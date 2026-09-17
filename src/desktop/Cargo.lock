@@ -2785,6 +2785,13 @@ name = "cosmix-app-identity"
 version = "0.2.0"
 
 [[package]]
+name = "cosmix-bench-feed"
+version = "0.1.0"
+dependencies = [
+ "cosmix-song",
+]
+
+[[package]]
 name = "cosmix-bg-boing"
 version = "0.1.0"
 dependencies = [

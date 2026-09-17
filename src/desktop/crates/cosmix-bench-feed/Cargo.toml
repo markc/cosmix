@@ -1,0 +1,14 @@
+# desktop/crates/cosmix-bench-feed — the toolkit-free data source for the
+# mixer + roll bake-off (test C). Every arm links this crate unchanged, so the
+# arms draw identical state; it must never depend on Bevy, iced or CTK.
+[package]
+name = "cosmix-bench-feed"
+version = "0.1.0"
+description = "Seeded synthetic mixer state, fixed-rate meters and the dense-song note model for the mixer + roll toolkit bake-off"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[dependencies]
+cosmix-song = { path = "../../../crates/cosmix-song" }
