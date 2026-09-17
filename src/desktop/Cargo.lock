@@ -2996,7 +2996,11 @@ version = "0.1.0"
 dependencies = [
  "cosmix-design",
  "iced",
+ "iced_core",
+ "iced_graphics",
+ "iced_renderer",
  "iced_runtime",
+ "iced_widget",
 ]
 
 [[package]]
