@@ -17,7 +17,8 @@ use std::os::fd::{AsFd, OwnedFd};
 pub use drm::{VulkanDrmAdapter, VulkanDrmProbe};
 pub use import::{
     DmabufImportPlugin, DmabufMaterial2dRegistrationExt, DmabufProbePlugin, DmabufRelease,
-    DmabufValidator, ImportedDmabufImages, ValidateDmabuf, dmabuf_material_prepare_barrier,
+    DmabufValidator, ImportProgress, ImportedDmabufImages, ValidateDmabuf,
+    dmabuf_material_prepare_barrier,
 };
 pub use init::{ManualVulkanRenderer, ScanoutProbeRenderer};
 pub use retirement::{

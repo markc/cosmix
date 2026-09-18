@@ -31,8 +31,9 @@ use super::{
     port_snapshot::{
         BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
         SurfaceSnapshot, WindowSnapshot, project_focus, project_output, project_outputs,
-        project_stack, project_surface_by_id, project_window_row, snapshot,
+        project_stack, project_surface_by_id, project_window_row, snapshot, volatile_path,
     },
+    window_control::WindowTargetError,
 };
 
 pub(crate) const PROPS_TOPIC_SUFFIX: &str = "props.changed";
@@ -118,12 +119,14 @@ pub(crate) enum ObservationRecord {
         id: u64,
         role: String,
         foreign_id: Option<String>,
+        window: SurfaceEdgeWindow,
         event_seq: u64,
     },
     SurfaceUnmapped {
         id: u64,
         role: String,
         foreign_id: Option<String>,
+        window: SurfaceEdgeWindow,
         event_seq: u64,
     },
     FocusChanged {
@@ -220,17 +223,22 @@ impl ObservationRecord {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
             }
             | Self::SurfaceUnmapped {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
             } => {
                 let mut body = json!({
                     "id": id,
                     "role": role,
+                    "generation": window.generation,
+                    "app_id": window.app_id.as_deref(),
+                    "title": window.title.as_deref(),
                     "event_seq": event_seq,
                 });
                 if let Some(foreign_id) = foreign_id {
@@ -523,6 +531,17 @@ struct SurfaceEdgeStart {
     mapped: bool,
     role: String,
     foreign_id: Option<String>,
+    window: SurfaceEdgeWindow,
+}
+
+/// Identity fields a map edge carries, so a streaming observer can match
+/// the window without a props read. Title and app id are null while a
+/// session lock is active, as in the read tree.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SurfaceEdgeWindow {
+    pub(crate) generation: u64,
+    pub(crate) app_id: Option<std::sync::Arc<str>>,
+    pub(crate) title: Option<std::sync::Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -654,29 +673,29 @@ impl WaylandState {
         let Some(record) = self.surfaces.get(object) else {
             return;
         };
-        self.observations.pending_surface_edges.insert(
-            id.0,
-            SurfaceEdgeStart {
-                mapped: record.mapped,
-                role: record.role.kind().to_string(),
-                foreign_id: self.foreign_toplevel_identifiers.get(&id).cloned(),
-            },
-        );
+        let start = SurfaceEdgeStart {
+            mapped: record.mapped,
+            role: record.role.kind().to_string(),
+            foreign_id: self.foreign_toplevel_identifiers.get(&id).cloned(),
+            window: edge_window(self, record),
+        };
+        self.observations.pending_surface_edges.insert(id.0, start);
     }
 
     pub(crate) fn mark_surface_mapped(
         &mut self,
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) {
-        let Some((id, was_mapped)) = self
+        let Some((id, was_mapped, generation)) = self
             .surfaces
             .get(&surface.id())
-            .map(|record| (record.id, record.mapped))
+            .map(|record| (record.id, record.mapped, record.generation))
         else {
             return;
         };
         if !was_mapped {
             self.mark_surface_before_change(id);
+            self.note_window_mapping(id, generation);
         }
         self.mark_surface_dirty(id, "wayland.map");
         if !was_mapped {
@@ -1055,7 +1074,23 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     service_focus_edge(state);
     service_output_edges(state);
     service_property_diffs(state);
-    service_controls(state);
+    match service_controls(state) {
+        // A mutation moved state after the edge passes above ran; report it
+        // in this cycle rather than on whatever event wakes the loop next.
+        // Injected input can only move focus (and the rows that show it).
+        ControlMutation::None => {}
+        ControlMutation::Input => {
+            service_focus_edge(state);
+            service_property_diffs(state);
+        }
+        ControlMutation::Any => {
+            service_surface_edges(state);
+            service_focus_edge(state);
+            service_output_edges(state);
+            service_property_diffs(state);
+        }
+    }
+    state.service_window_waiters();
     service_pointer(state);
 }
 
@@ -1149,6 +1184,15 @@ fn service_pointer(state: &mut WaylandState) {
     }
 }
 
+fn edge_window(state: &WaylandState, record: &super::SurfaceRecord) -> SurfaceEdgeWindow {
+    let redact = state.session_lock_active();
+    SurfaceEdgeWindow {
+        generation: record.generation,
+        app_id: (!redact).then(|| record.app_id.clone()).flatten(),
+        title: (!redact).then(|| record.title.clone()).flatten(),
+    }
+}
+
 fn service_surface_edges(state: &mut WaylandState) {
     let pending = std::mem::take(&mut state.observations.pending_surface_edges);
     for (raw_id, old) in pending {
@@ -1158,9 +1202,21 @@ fn service_surface_edges(state: &mut WaylandState) {
             .get(&id)
             .and_then(|object| state.surfaces.get(object));
         let final_mapped = final_record.is_some_and(|record| record.mapped);
-        if old.mapped == final_mapped {
+        // An unmap and a remap under a new role inside one cycle is still
+        // two edges: the window observers knew is gone.
+        let replaced = old.mapped
+            && final_mapped
+            && final_record.is_some_and(|record| record.generation != old.window.generation);
+        if old.mapped == final_mapped && !replaced {
             continue;
         }
+        let previous = replaced.then(|| {
+            (
+                old.role.clone(),
+                old.foreign_id.clone(),
+                old.window.clone(),
+            )
+        });
         let role = if final_mapped {
             final_record
                 .map(|record| record.role.kind().to_string())
@@ -1173,12 +1229,28 @@ fn service_surface_edges(state: &mut WaylandState) {
             .get(&id)
             .cloned()
             .or(old.foreign_id);
+        let window = match final_record {
+            Some(record) if final_mapped => edge_window(state, record),
+            _ => old.window,
+        };
+        if let Some((role, foreign_id, window)) = previous {
+            state
+                .observations
+                .offer(|event_seq| ObservationRecord::SurfaceUnmapped {
+                    id: raw_id,
+                    role,
+                    foreign_id,
+                    window,
+                    event_seq,
+                });
+        }
         state.observations.offer(|event_seq| {
             if final_mapped {
                 ObservationRecord::SurfaceMapped {
                     id: raw_id,
                     role,
                     foreign_id,
+                    window,
                     event_seq,
                 }
             } else {
@@ -1186,6 +1258,7 @@ fn service_surface_edges(state: &mut WaylandState) {
                     id: raw_id,
                     role,
                     foreign_id,
+                    window,
                     event_seq,
                 }
             }
@@ -1557,6 +1630,7 @@ fn diff_corners(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
+    let (old_host, new_host) = (old.input.host, new.input.host);
     let old = old.input.corners;
     let new = new.input.corners;
     for (leaf, old, new) in [
@@ -1583,6 +1657,15 @@ fn diff_corners(
     ] {
         queue_prop_change(pending, format!("input.corners.{leaf}"), old, new, cause);
     }
+    if let (Some(old), Some(new)) = (old_host, new_host) {
+        queue_prop_change(
+            pending,
+            HOST_PASSTHROUGH_PATH.into(),
+            PropValue::Bool(old.passthrough),
+            PropValue::Bool(new.passthrough),
+            cause,
+        );
+    }
 }
 
 fn diff_output_row(
@@ -1599,7 +1682,10 @@ fn diff_output_row(
                 pending,
                 prefix.into(),
                 PropValue::null(),
-                PropValue::OutputRow(Box::new(new.clone())),
+                PropValue::OutputRow(Box::new(OutputSnapshot {
+                    presentation: None,
+                    ..new.clone()
+                })),
                 cause,
             );
         }
@@ -1607,7 +1693,10 @@ fn diff_output_row(
             queue_prop_change(
                 pending,
                 prefix.into(),
-                PropValue::OutputRow(Box::new(old.clone())),
+                PropValue::OutputRow(Box::new(OutputSnapshot {
+                    presentation: None,
+                    ..old.clone()
+                })),
                 PropValue::null(),
                 cause,
             );
@@ -1787,6 +1876,11 @@ fn diff_surface_row(
             prop_opt_string(old.foreign_id.as_deref()),
             prop_opt_string(new.foreign_id.as_deref()),
         ),
+        (
+            "generation",
+            PropValue::U64(old.generation),
+            PropValue::U64(new.generation),
+        ),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -1838,7 +1932,10 @@ fn diff_window_row(
                 pending,
                 prefix.into(),
                 PropValue::null(),
-                PropValue::WindowRow(Box::new(new.clone())),
+                PropValue::WindowRow(Box::new(WindowSnapshot {
+                    presentation: None,
+                    ..new.clone()
+                })),
                 cause,
             );
             return;
@@ -1847,7 +1944,10 @@ fn diff_window_row(
             queue_prop_change(
                 pending,
                 prefix.into(),
-                PropValue::WindowRow(Box::new(old.clone())),
+                PropValue::WindowRow(Box::new(WindowSnapshot {
+                    presentation: None,
+                    ..old.clone()
+                })),
                 PropValue::null(),
                 cause,
             );
@@ -1914,6 +2014,27 @@ fn diff_window_row(
             PropValue::String(old.band.into()),
             PropValue::String(new.band.into()),
         ),
+        (
+            "generation",
+            PropValue::U64(old.generation),
+            PropValue::U64(new.generation),
+        ),
+        (
+            "window_x",
+            PropValue::F32(old.window_x),
+            PropValue::F32(new.window_x),
+        ),
+        (
+            "window_y",
+            PropValue::F32(old.window_y),
+            PropValue::F32(new.window_y),
+        ),
+        (
+            "visible",
+            PropValue::Bool(old.visible),
+            PropValue::Bool(new.visible),
+        ),
+        ("pid", prop_opt_u64(old.pid), prop_opt_u64(new.pid)),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -1952,6 +2073,16 @@ fn diff_focus(
             prop_str(old.session_lock),
             prop_str(new.session_lock),
         ),
+        (
+            "window.id",
+            prop_opt_u64(old.window.id),
+            prop_opt_u64(new.window.id),
+        ),
+        (
+            "window.generation",
+            prop_opt_u64(old.window.generation),
+            prop_opt_u64(new.window.generation),
+        ),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -1976,7 +2107,7 @@ fn queue_prop_change(
     new: PropValue,
     cause: &'static str,
 ) {
-    if old == new || path.starts_with("port.") {
+    if old == new || path.starts_with("port.") || volatile_path(&path) {
         return;
     }
     match pending.entry(path) {
@@ -2005,7 +2136,7 @@ fn emit_prop_change(
     new: PropValue,
     cause: &'static str,
 ) {
-    if old == new || path.starts_with("port.") {
+    if old == new || path.starts_with("port.") || volatile_path(&path) {
         return;
     }
     let unix_ms = unix_millis();
@@ -2029,7 +2160,15 @@ fn unix_millis() -> i64 {
         })
 }
 
-fn service_controls(state: &mut WaylandState) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlMutation {
+    None,
+    Input,
+    Any,
+}
+
+/// Returns the widest kind of state change the controls made.
+fn service_controls(state: &mut WaylandState) -> ControlMutation {
     let mut controls = std::mem::take(&mut state.pending_port_controls);
     if let Some(context) = state.port_context.as_ref() {
         for (active, order) in [
@@ -2043,9 +2182,41 @@ fn service_controls(state: &mut WaylandState) {
     }
     controls.sort_by_key(PortControl::order);
     let mut changes = PendingPropChanges::new();
+    let mut mutated = ControlMutation::None;
+    // Mutations run in arrival order, so a script's set -> minimise ->
+    // restore -> click lands in the order it was sent.
     for control in &mut controls {
-        if let PortControl::Set(request) = control {
-            service_set(state, request, &mut changes);
+        match control {
+            PortControl::Set(request) => {
+                mutated = ControlMutation::Any;
+                service_set(state, request, &mut changes);
+            }
+            PortControl::Window(request) => {
+                mutated = ControlMutation::Any;
+                let reply = state.service_window_op(&request.op);
+                if let Some(sender) = request.reply.take() {
+                    let _ = sender.send(reply);
+                }
+            }
+            PortControl::Input(request) => {
+                mutated = mutated.max(ControlMutation::Input);
+                let reply = state.service_input_op(&request.op);
+                if let Some(sender) = request.reply.take() {
+                    let _ = sender.send(reply);
+                }
+            }
+            PortControl::Long(request) => {
+                mutated = ControlMutation::Any;
+                // The ingress slot is released here: the verb now waits on
+                // its own permit and deadline, not on the bounded queue.
+                request.slot.take();
+                if let (Some(op), Some(reply)) = (request.op.take(), request.reply.take()) {
+                    state.start_long_op(op, reply, request.admitted);
+                }
+            }
+            PortControl::Watch(_)
+            | PortControl::PointerWatch(_)
+            | PortControl::WatchState { .. } => {}
         }
     }
     flush_set_changes(state, changes);
@@ -2070,7 +2241,10 @@ fn service_controls(state: &mut WaylandState) {
                 watches.push(request);
             }
             PortControl::WatchState { active, .. } => desired_active = active,
-            PortControl::Set(_) => {}
+            PortControl::Set(_)
+            | PortControl::Window(_)
+            | PortControl::Input(_)
+            | PortControl::Long(_) => {}
         }
     }
 
@@ -2101,6 +2275,7 @@ fn service_controls(state: &mut WaylandState) {
             });
         let _ = request.reply.send(reply);
     }
+    mutated
 }
 
 fn service_set(
@@ -2114,8 +2289,41 @@ fn service_set(
         service_set_xwayland_enabled(state, request, changes);
         return;
     }
-    if let Some(window) = parse_window_band_path(&path) {
-        service_set_window_band(state, request, window);
+    if let Some((window, leaf)) = parse_window_leaf_path(&path) {
+        // The optional fence is checked before any leaf logic, so a stale
+        // write never reaches whatever window inherited the id.
+        if let Some(generation) = request.generation
+            && let Err(error @ WindowTargetError::StaleTarget { .. }) =
+                state.resolve_window_target(window, Some(generation))
+        {
+            if let Some(reply) = request.reply.take() {
+                let _ = reply.send(ControlReply::WindowTarget { id: window, error });
+            }
+            return;
+        }
+        match leaf {
+            "band" => service_set_window_band(state, request, window),
+            "minimized" => service_set_window_minimized(state, request, window),
+            _ => {
+                if let Some(reply) = request.reply.take() {
+                    let _ = reply.send(ControlReply::Validation(read_only_or_unknown(&path)));
+                }
+            }
+        }
+        return;
+    }
+    if request.generation.is_some() {
+        if let Some(reply) = request.reply.take() {
+            let _ = reply.send(ControlReply::Validation(invalid_value(
+                "generation",
+                "absent",
+                "generation applies to windows.s<id>.* paths only",
+            )));
+        }
+        return;
+    }
+    if path == HOST_PASSTHROUGH_PATH {
+        service_set_host_passthrough(state, request, changes);
         return;
     }
     let old_config = state.observations.corner_config;
@@ -2141,6 +2349,45 @@ fn service_set(
             new,
             persisted: None,
         });
+    }
+}
+
+pub(crate) const HOST_PASSTHROUGH_PATH: &str = "input.host.passthrough";
+
+/// `input.host.passthrough` (nested only): `false` stops host pointer and
+/// key input reaching the seat, so the host cursor cannot overwrite an
+/// injected position. Process-lifetime; the leaf does not exist on kms.
+fn service_set_host_passthrough(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    changes: &mut PendingPropChanges,
+) {
+    let path = request.path.clone();
+    let reply = if !state.host_passthrough_available() {
+        ControlReply::Validation(SetValidationError::UnknownPath)
+    } else if let Some(value) = request.value.as_bool() {
+        let old = state.host_passthrough();
+        if old != value {
+            state.set_host_passthrough(value);
+            queue_prop_change(
+                changes,
+                path.clone(),
+                PropValue::Bool(old),
+                PropValue::Bool(value),
+                "props.set",
+            );
+        }
+        ControlReply::Set {
+            path,
+            old: PropValue::Bool(old),
+            new: PropValue::Bool(value),
+            persisted: None,
+        }
+    } else {
+        ControlReply::Validation(invalid_value(&path, "bool", "true|false"))
+    };
+    if let Some(sender) = request.reply.take() {
+        let _ = sender.send(reply);
     }
 }
 
@@ -2252,10 +2499,67 @@ fn service_set_window_band(state: &mut WaylandState, request: &mut PortSetReques
     }
 }
 
+/// The `windows.s<id>.minimized` set: `true` minimises exactly like the
+/// title-bar button, `false` restores THIS window (not the LIFO top) and
+/// focuses and raises it. Like the band leaf, the changed events come from
+/// the window-row diff, here attributed to `props.set`.
+fn service_set_window_minimized(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    window: u64,
+) {
+    let path = request.path.clone();
+    let Some(minimized) = request.value.as_bool() else {
+        if let Some(reply) = request.reply.take() {
+            let _ = reply.send(ControlReply::Validation(invalid_value(
+                &path,
+                "bool",
+                "true|false",
+            )));
+        }
+        return;
+    };
+    let reply_value = if state.session_lock_active() {
+        ControlReply::Locked
+    } else {
+        match state.resolve_window_target(window, request.generation) {
+            Ok(object) => {
+                state.mark_surface_dirty(SurfaceId(window), "props.set");
+                match state.set_window_minimized(&object, minimized) {
+                    Some((old, new)) => ControlReply::Set {
+                        path,
+                        old: PropValue::Bool(old),
+                        new: PropValue::Bool(new),
+                        persisted: None,
+                    },
+                    None => missing_window(&path),
+                }
+            }
+            Err(error @ WindowTargetError::StaleTarget { .. }) => {
+                ControlReply::WindowTarget { id: window, error }
+            }
+            Err(_) => missing_window(&path),
+        }
+    };
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(reply_value);
+    }
+}
+
+fn missing_window(path: &str) -> ControlReply {
+    ControlReply::Validation(invalid_value(
+        path,
+        "existing window id",
+        "a live toplevel window",
+    ))
+}
+
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     flush_prop_changes(state, changes);
+    let host = state.host_input_snapshot();
     if let Some(baseline) = state.observations.watched_baseline.as_mut() {
         baseline.input.corners = state.observations.corner_config.into();
+        baseline.input.host = host;
         #[cfg(feature = "xwayland")]
         {
             baseline.xwayland.enabled = state.xwayland.enabled;
@@ -2267,7 +2571,16 @@ fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
 /// Only this exact shape is writable; every other `windows.*` path stays
 /// read-only through `known_read_only_path`.
 pub(crate) fn parse_window_band_path(path: &str) -> Option<u64> {
-    let id = path.strip_prefix("windows.s")?.strip_suffix(".band")?;
+    parse_window_leaf_path(path).and_then(|(id, leaf)| (leaf == "band").then_some(id))
+}
+
+/// Parse `windows.s<id>.<leaf>` into the canonical id and the one-segment
+/// leaf name. Used by the write gate and the `generation` fence.
+pub(crate) fn parse_window_leaf_path(path: &str) -> Option<(u64, &str)> {
+    let (id, leaf) = path.strip_prefix("windows.s")?.split_once('.')?;
+    if leaf.is_empty() || leaf.contains('.') {
+        return None;
+    }
     // Canonical ids only: a leading zero ("windows.s0007.band") would write
     // through an alias that reads, describes and event-diffs as "s7" — the
     // reply would name a path that can never be read back.
@@ -2277,7 +2590,16 @@ pub(crate) fn parse_window_band_path(path: &str) -> Option<u64> {
     {
         return None;
     }
-    id.parse().ok()
+    Some((id.parse().ok()?, leaf))
+}
+
+/// Unknown and read-only window leaves keep the ordinary set errors.
+fn read_only_or_unknown(path: &str) -> SetValidationError {
+    if known_read_only_path(path) {
+        SetValidationError::ReadOnly
+    } else {
+        SetValidationError::UnknownPath
+    }
 }
 
 /// A window band write accepts exactly the two operator-reachable bands:
@@ -2312,6 +2634,22 @@ pub(crate) fn validate_set_request(path: &str, value: &Value) -> Result<(), SetV
     }
     if parse_window_band_path(path).is_some() {
         return validate_window_band_value(path, value).map(|_| ());
+    }
+    if path == HOST_PASSTHROUGH_PATH {
+        // Backend presence is the service's call (the leaf exists only on
+        // the nested backend).
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(invalid_value(path, "bool", "true|false"))
+        };
+    }
+    if parse_window_leaf_path(path).is_some_and(|(_, leaf)| leaf == "minimized") {
+        return if value.is_boolean() {
+            Ok(())
+        } else {
+            Err(invalid_value(path, "bool", "true|false"))
+        };
     }
     validate_corner_value(path, value).map(|_| ())
 }
@@ -2421,6 +2759,7 @@ fn known_read_only_path(path: &str) -> bool {
     }
     path == "input"
         || path == "input.corners"
+        || path == "input.host"
         || ROOTS
             .iter()
             .any(|root| path == *root || path.starts_with(&format!("{root}.")))
@@ -2695,12 +3034,28 @@ mod tests {
                 width: 640.0,
                 height: 480.0,
             },
+            presentation: None,
+        };
+        // A read snapshot's row carries volatile presentation leaves; a row
+        // event never does.
+        let read_row = OutputSnapshot {
+            presentation: Some(crate::protocol::port_snapshot::OutputPresentationSnapshot {
+                clock_id: 1,
+                flags: None,
+                flags_mask: None,
+                refresh_us: None,
+                frames: 9,
+                interval_p50_us: None,
+                interval_p99_us: None,
+                since_us: 0,
+            }),
+            ..row.clone()
         };
         let mut changes = PendingPropChanges::new();
         diff_output_row(
             "outputs.o_nested",
             None,
-            Some(&row),
+            Some(&read_row),
             "output.geometry",
             &mut changes,
         );
@@ -2716,7 +3071,7 @@ mod tests {
         let wire = ObservationRecord::PropsChanged {
             path: "outputs.o_nested".into(),
             old: PropValue::null(),
-            new: PropValue::OutputRow(Box::new(row)),
+            new: PropValue::OutputRow(Box::new(row.clone())),
             unix_ms: 0,
             cause: "output.geometry",
             event_seq: 1,
@@ -2751,8 +3106,14 @@ mod tests {
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("f_7".into()),
+            generation: 1,
+            window: Default::default(),
         };
         let window = project_window_row(&surface);
+        let read_window = WindowSnapshot {
+            presentation: Some(Default::default()),
+            ..window.clone()
+        };
         let mut keyed = PendingPropChanges::new();
         diff_surface_row(
             "surfaces.s7",
@@ -2761,11 +3122,39 @@ mod tests {
             "wayland.map",
             &mut keyed,
         );
-        diff_window_row("windows.s7", None, Some(&window), "wayland.map", &mut keyed);
+        diff_window_row(
+            "windows.s7",
+            None,
+            Some(&read_window),
+            "wayland.map",
+            &mut keyed,
+        );
         assert_eq!(
             keyed.keys().cloned().collect::<Vec<_>>(),
             ["surfaces.s7", "windows.s7"]
         );
+        assert_eq!(
+            keyed["windows.s7"].1,
+            PropValue::WindowRow(Box::new(window.clone())),
+            "the added row has no presentation leaves"
+        );
+        // Rows that differ only in presentation produce no change.
+        let mut quiet = PendingPropChanges::new();
+        diff_window_row(
+            "windows.s7",
+            Some(&window),
+            Some(&read_window),
+            "wayland.commit",
+            &mut quiet,
+        );
+        diff_output_row(
+            "outputs.o_nested",
+            Some(&row),
+            Some(&read_row),
+            "output.geometry",
+            &mut quiet,
+        );
+        assert!(quiet.is_empty(), "{quiet:?}");
         let mut removed = PendingPropChanges::new();
         diff_surface_row(
             "surfaces.s7",
@@ -2808,6 +3197,20 @@ mod tests {
             PropValue::U64(2),
             "wayland.map",
         );
+        for volatile in [
+            "windows.s2.presentation.presented",
+            "outputs.o_dp_1.presentation.frames",
+            "sources.scene.revision",
+            "sources.scene.presentation.presented",
+        ] {
+            queue_prop_change(
+                &mut pending,
+                volatile.into(),
+                PropValue::U64(1),
+                PropValue::U64(2),
+                "frame",
+            );
+        }
         assert_eq!(
             pending.remove("surfaces.s2.title"),
             Some((prop_str("old"), prop_str("new"), "wayland.map"))
@@ -2837,6 +3240,11 @@ mod tests {
             id: 7,
             role: "toplevel".into(),
             foreign_id: Some("f_7".into()),
+            window: SurfaceEdgeWindow {
+                generation: 3,
+                app_id: Some("dev.cosmix.Probe".into()),
+                title: None,
+            },
             event_seq: 9,
         };
         let wire = record.wire();
@@ -2851,6 +3259,9 @@ mod tests {
             json!({
                 "id": 7,
                 "role": "toplevel",
+                "generation": 3,
+                "app_id": "dev.cosmix.Probe",
+                "title": null,
                 "foreign_id": "f_7",
                 "event_seq": 9,
             })
@@ -2929,12 +3340,14 @@ mod tests {
                 id: 1,
                 role: "toplevel".into(),
                 foreign_id: None,
+                window: SurfaceEdgeWindow::default(),
                 event_seq: 2,
             },
             ObservationRecord::SurfaceUnmapped {
                 id: 1,
                 role: "toplevel".into(),
                 foreign_id: None,
+                window: SurfaceEdgeWindow::default(),
                 event_seq: 3,
             },
             ObservationRecord::FocusChanged {
@@ -2960,6 +3373,7 @@ mod tests {
                         width: 1.0,
                         height: 1.0,
                     },
+                    presentation: None,
                 },
                 event_seq: 5,
             },

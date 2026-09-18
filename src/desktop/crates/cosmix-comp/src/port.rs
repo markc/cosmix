@@ -25,7 +25,10 @@ use tokio::{
 
 use crate::{
     decoration::DecorationStartup,
-    protocol::{port_observation, port_snapshot},
+    protocol::{
+        port_observation, port_snapshot, presentation_stats::STATS_RING,
+        window_control::WindowTargetError,
+    },
 };
 use port_observation::{
     LossCause, LossInterval, ObservationOutbox, ObservationProducer, ObservationRecord, PropValue,
@@ -39,6 +42,22 @@ use port_snapshot::{
 pub(crate) const PORT_QUEUE_CAPACITY: usize = 16;
 const PORT_REPLY_CAPACITY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Verbs that reply after a wait (`comp.input.sequence`, and in step 8
+/// `comp.window.wait` / `close {force}`) hold their own permits, so a few
+/// long waits can never starve ordinary reads and controls.
+const LONG_VERB_PERMITS: usize = 8;
+/// The longest a long verb may run before its reply is due.
+pub(crate) const LONG_VERB_MAX: Duration = Duration::from_secs(60);
+/// Admission slack on top of a long verb's own deadline: the protocol
+/// thread answers at the deadline, and the worker must still be listening.
+const LONG_VERB_SLACK: Duration = Duration::from_secs(1);
+const SEQUENCE_MAX_STEPS: usize = 256;
+/// At most four events a character (Shift press, key press/release,
+/// Shift release), so the largest text stays within one verb's event cap
+/// and small enough to write to a client in one pass.
+const TEXT_MAX_CHARS: usize = 256;
+/// The most seat events one verb (a whole sequence included) may inject.
+pub(crate) const MAX_EVENTS_PER_VERB: usize = 4096;
 const REPLY_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
 const GAP_RETRY_INITIAL: Duration = Duration::from_secs(1);
@@ -53,11 +72,17 @@ pub(crate) enum PortCommand {
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
+    Window(PortWindowRequest),
+    Input(PortInputRequest),
+    Long(PortLongRequest),
     WatchState { active: bool, order: u64 },
 }
 
 pub(crate) struct PortRequest {
     pub(crate) reply: tokio::sync::oneshot::Sender<Arc<CompSnapshot>>,
+    /// The read's own path or prefix, so the snapshot can be scoped to it
+    /// (`ReadScopes`); `None` asks for the whole tree.
+    pub(crate) scope: Option<String>,
 }
 
 pub(crate) struct PortReply {
@@ -69,7 +94,270 @@ pub(crate) struct PortSetRequest {
     pub(crate) order: u64,
     pub(crate) path: String,
     pub(crate) value: Value,
+    /// Optional role-generation fence for `windows.s<id>.*` writes.
+    pub(crate) generation: Option<u64>,
     pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+/// What `comp.window.stats` / `.stats.reset` measure: a window, fenced by
+/// its role generation, or a content source, optionally fenced by its
+/// registration number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StatsTarget {
+    Window {
+        id: u64,
+        generation: u64,
+    },
+    Source {
+        id: String,
+        registration: Option<u64>,
+    },
+}
+
+/// A window-addressed verb. `{id, generation}` is always required when a
+/// window is named; only `restore` may name none (most recently minimised).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum WindowOp {
+    Minimize {
+        id: u64,
+        generation: u64,
+    },
+    Restore {
+        target: Option<(u64, u64)>,
+    },
+    /// Keyboard focus; `raise` also raises and retargets the pointer (the
+    /// Alt+Tab activation).
+    Focus {
+        id: u64,
+        generation: u64,
+        raise: bool,
+    },
+    Raise {
+        id: u64,
+        generation: u64,
+    },
+    /// The polite close (xdg `close` / X11 `WM_DELETE_WINDOW`).
+    Close {
+        id: u64,
+        generation: u64,
+    },
+    Place(PlaceSpec),
+    /// Presentation statistics for one window or content source.
+    Stats {
+        target: StatsTarget,
+        samples: usize,
+    },
+    /// Zero one window's, one source's, or every row's statistics.
+    StatsReset {
+        target: Option<StatsTarget>,
+    },
+}
+
+/// `comp.window.place`: output-local logical window-geometry coordinates.
+/// An absent field keeps its current value.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PlaceSpec {
+    pub(crate) id: u64,
+    pub(crate) generation: u64,
+    pub(crate) output: Option<String>,
+    pub(crate) x: Option<f64>,
+    pub(crate) y: Option<f64>,
+    pub(crate) width: Option<i32>,
+    pub(crate) height: Option<i32>,
+}
+
+/// What `comp.window.wait` waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WaitUntil {
+    Mapped,
+    Visible,
+    Presented,
+    Size { width: i32, height: i32 },
+    Focused,
+    Unmapped,
+    Gone,
+}
+
+impl WaitUntil {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Mapped => "mapped",
+            Self::Visible => "visible",
+            Self::Presented => "presented",
+            Self::Size { .. } => "size",
+            Self::Focused => "focused",
+            Self::Unmapped => "unmapped",
+            Self::Gone => "gone",
+        }
+    }
+}
+
+/// Which window a wait is about: one `{id, generation?}`, or the first
+/// window matching the name filters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WindowMatch {
+    pub(crate) id: Option<u64>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) app_id: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) title_contains: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WaitSpec {
+    pub(crate) window: WindowMatch,
+    pub(crate) until: WaitUntil,
+    pub(crate) timeout: Duration,
+}
+
+/// A parsed `comp.window.*` verb: answered in one pass, or long.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum WindowVerb {
+    Op(WindowOp),
+    Long(LongOp),
+}
+
+pub(crate) struct PortWindowRequest {
+    pub(crate) order: u64,
+    pub(crate) op: WindowOp,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+/// Press, release, or both in one verb (`click` for buttons, `tap` for
+/// keys).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PressAction {
+    Press,
+    Release,
+    Both,
+}
+
+/// Where `comp.input.pointer.move` puts the pointer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PointerMoveTarget {
+    /// Output-local logical coordinates; `None` is the default output.
+    Output {
+        output: Option<String>,
+        x: f64,
+        y: f64,
+    },
+    /// A relative device delta (accelerated == unaccelerated).
+    Relative { dx: f64, dy: f64 },
+    /// Window-local coordinates, relative to the window-geometry origin.
+    Window {
+        id: u64,
+        generation: u64,
+        x: f64,
+        y: f64,
+        require_hit: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScrollSource {
+    Wheel,
+    Finger,
+    Continuous,
+}
+
+/// A key named by XKB keysym (`"Return"`, `"a"`, `"Super_L"`) or by raw
+/// evdev code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeySpec {
+    Name(String),
+    Evdev(u32),
+}
+
+/// One `comp.input.*` operation, parsed and bounded on the worker.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum InputOp {
+    /// `corners: false` keeps the move from arming a hot corner.
+    PointerMove {
+        target: PointerMoveTarget,
+        corners: bool,
+    },
+    PointerButton {
+        button: u32,
+        action: PressAction,
+    },
+    PointerScroll {
+        dx: Option<f64>,
+        dy: Option<f64>,
+        source: ScrollSource,
+        v120: (Option<i32>, Option<i32>),
+    },
+    Key {
+        key: KeySpec,
+        action: PressAction,
+        /// Keysym names of modifiers held around the key.
+        modifiers: Vec<KeySpec>,
+    },
+    Text(String),
+    ReleaseAll,
+}
+
+impl InputOp {
+    /// The most seat events this op can inject. `release_all` releases what
+    /// is held, which earlier (capped) verbs bounded.
+    pub(crate) fn event_bound(&self) -> usize {
+        match self {
+            Self::PointerMove { .. } | Self::PointerScroll { .. } | Self::ReleaseAll => 1,
+            Self::PointerButton { .. } => 2,
+            Self::Key { modifiers, .. } => 2 * (modifiers.len() + 2),
+            Self::Text(text) => 4 * text.chars().count(),
+        }
+    }
+}
+
+pub(crate) struct PortInputRequest {
+    pub(crate) order: u64,
+    pub(crate) op: InputOp,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+}
+
+/// One step of `comp.input.sequence`: the delay runs before the step.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SequenceStep {
+    pub(crate) verb: &'static str,
+    pub(crate) op: InputOp,
+    pub(crate) delay: Duration,
+}
+
+/// A verb whose reply waits on a timer or an edge.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LongOp {
+    Sequence(Vec<SequenceStep>),
+    Wait(WaitSpec),
+    /// Polite close now; if the same `{id, generation}` is still alive at
+    /// the deadline, kill its client.
+    ForceClose {
+        id: u64,
+        generation: u64,
+        timeout: Duration,
+    },
+}
+
+impl LongOp {
+    /// When the protocol thread must have answered by.
+    fn budget(&self) -> Duration {
+        match self {
+            Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
+            Self::Wait(spec) => spec.timeout,
+            Self::ForceClose { timeout, .. } => *timeout,
+        }
+    }
+}
+
+pub(crate) struct PortLongRequest {
+    pub(crate) order: u64,
+    pub(crate) op: Option<LongOp>,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
+    /// The queue slot this request holds until the protocol thread has
+    /// taken it: dropping it there frees the slot while the verb waits, so
+    /// long waits never fill the bounded ingress.
+    pub(crate) slot: Option<QueueSlot>,
+    /// When the worker admitted it; the verb's deadline runs from here.
+    pub(crate) admitted: std::time::Instant,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -96,10 +384,71 @@ pub(crate) enum ControlReply {
         persisted: Option<bool>,
     },
     Validation(SetValidationError),
+    /// A `comp.window.*` success.
+    Window {
+        id: u64,
+        generation: u64,
+        title: Option<Arc<str>>,
+        app_id: Option<Arc<str>>,
+        minimized: bool,
+        changed: bool,
+    },
+    WindowTarget {
+        id: u64,
+        error: WindowTargetError,
+    },
+    NotFound {
+        minimized_count: usize,
+    },
+    /// A verb argument the verb does not define (a typo must not be
+    /// silently ignored, or `{"gen": 3}` would act unfenced).
+    InvalidArgs {
+        field: String,
+        allowed: &'static [&'static str],
+    },
+    Locked,
     Busy,
+    /// A verb's success body (rc 0).
+    Body(Value),
+    /// A refusal: `{"error": error, ...detail}` (rc 10). `detail` is an
+    /// object or null.
+    Refused {
+        error: &'static str,
+        detail: Value,
+    },
+}
+
+/// Every refusal carries `error_code` beside `error` (the 0.58.x alias), so
+/// Mix `send` hands a script the whole structured body.
+pub(crate) fn with_error_code(rc: u8, body: Arc<str>) -> (u8, Arc<str>) {
+    if rc == 0 {
+        return (rc, body);
+    }
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(&body) else {
+        return (rc, body);
+    };
+    if fields.contains_key("error_code") {
+        return (rc, body);
+    }
+    let Some(code) = fields.get("error").filter(|code| code.is_string()).cloned() else {
+        return (rc, body);
+    };
+    fields.insert("error_code".into(), code);
+    (rc, Arc::from(Value::Object(fields).to_string()))
 }
 
 impl ControlReply {
+    /// The reply body as a JSON value, `error_code` included.
+    pub(crate) fn wire_json(self) -> Value {
+        let (rc, body) = self.into_wire();
+        let (_, body) = with_error_code(rc, body);
+        serde_json::from_str(&body).unwrap_or(Value::Null)
+    }
+
+    pub(crate) fn refused(error: &'static str, detail: Value) -> Self {
+        Self::Refused { error, detail }
+    }
+
     pub(crate) fn into_wire(self) -> (u8, Arc<str>) {
         match self {
             Self::PointerWatch { topic, lease_ms } => (
@@ -161,7 +510,74 @@ impl ControlReply {
                     .to_string(),
                 ),
             ),
+            Self::Window {
+                id,
+                generation,
+                title,
+                app_id,
+                minimized,
+                changed,
+            } => (
+                0,
+                Arc::from(
+                    json!({
+                        "id": id,
+                        "generation": generation,
+                        "title": title.as_deref(),
+                        "app_id": app_id.as_deref(),
+                        "minimized": minimized,
+                        "changed": changed,
+                    })
+                    .to_string(),
+                ),
+            ),
+            Self::WindowTarget { id, error } => {
+                let body = match error {
+                    WindowTargetError::UnknownWindow => {
+                        json!({"error": "unknown_window", "id": id})
+                    }
+                    WindowTargetError::StaleTarget { requested, current } => json!({
+                        "error": "stale_target",
+                        "id": id,
+                        "generation": requested,
+                        "current": current,
+                    }),
+                    WindowTargetError::NotManaged => json!({"error": "not_managed", "id": id}),
+                    WindowTargetError::NotMapped => json!({"error": "not_mapped", "id": id}),
+                };
+                (10, Arc::from(body.to_string()))
+            }
+            Self::NotFound { minimized_count } => (
+                10,
+                Arc::from(
+                    json!({"error": "not_found", "minimized_count": minimized_count}).to_string(),
+                ),
+            ),
+            Self::InvalidArgs { field, allowed } => (
+                10,
+                Arc::from(
+                    json!({"error": "invalid_args", "field": field, "allowed": allowed})
+                        .to_string(),
+                ),
+            ),
+            Self::Locked => error("locked"),
             Self::Busy => error("busy"),
+            Self::Body(body) => (0, Arc::from(body.to_string())),
+            Self::Refused {
+                error: code,
+                detail,
+            } => {
+                let mut body = serde_json::Map::new();
+                body.insert("error".into(), json!(code));
+                if let Value::Object(fields) = detail {
+                    for (name, value) in fields {
+                        if name != "error" {
+                            body.insert(name, value);
+                        }
+                    }
+                }
+                (10, Arc::from(Value::Object(body).to_string()))
+            }
         }
     }
 }
@@ -170,6 +586,9 @@ pub(crate) enum PortControl {
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
+    Window(PortWindowRequest),
+    Input(PortInputRequest),
+    Long(PortLongRequest),
     WatchState { active: bool, order: u64 },
 }
 
@@ -179,6 +598,9 @@ impl PortControl {
             Self::Watch(request) => request.order,
             Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
+            Self::Window(request) => request.order,
+            Self::Input(request) => request.order,
+            Self::Long(request) => request.order,
             Self::WatchState { order, .. } => *order,
         }
     }
@@ -194,9 +616,21 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
+    /// Whole-tree snapshot; production reads go through the scoped form.
+    #[cfg(test)]
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
+        self.request_snapshot_scoped(None)
+    }
+
+    /// A snapshot request that names the read's own path or prefix, so the
+    /// merged `ReadScopes` can skip subtrees nobody asked for; `None` reads
+    /// the whole tree.
+    pub(crate) fn request_snapshot_scoped(
+        &self,
+        scope: Option<String>,
+    ) -> Result<SnapshotAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.admit(PortCommand::Snapshot(PortRequest { reply }), receive)
+        self.admit(PortCommand::Snapshot(PortRequest { reply, scope }), receive)
             .map(SnapshotAdmission)
     }
 
@@ -214,17 +648,71 @@ impl PortIngress {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn request_set(&self, path: String, value: Value) -> Result<ControlAdmission, ()> {
+        self.request_set_fenced(path, value, None)
+    }
+
+    pub(crate) fn request_set_fenced(
+        &self,
+        path: String,
+        value: Value,
+        generation: Option<u64>,
+    ) -> Result<ControlAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
         self.admit(
             PortCommand::Set(PortSetRequest {
                 order: self.next_control_order(),
                 path,
                 value,
+                generation,
                 reply: Some(reply),
             }),
             receive,
         )
+    }
+
+    pub(crate) fn request_window(&self, op: WindowOp) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(
+            PortCommand::Window(PortWindowRequest {
+                order: self.next_control_order(),
+                op,
+                reply: Some(reply),
+            }),
+            receive,
+        )
+    }
+
+    pub(crate) fn request_input(&self, op: InputOp) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(
+            PortCommand::Input(PortInputRequest {
+                order: self.next_control_order(),
+                op,
+                reply: Some(reply),
+            }),
+            receive,
+        )
+    }
+
+    /// Admit a long verb. The queue slot rides inside the command and is
+    /// released when the protocol thread takes it, not when the reply
+    /// arrives; the reply wait is bounded by the verb's own budget.
+    pub(crate) fn request_long(&self, op: LongOp) -> Result<LongAdmission, ()> {
+        let timeout = op.budget().min(LONG_VERB_MAX) + LONG_VERB_SLACK;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let slot = self.reserve_slot()?;
+        let command = PortCommand::Long(PortLongRequest {
+            order: self.next_control_order(),
+            op: Some(op),
+            reply: Some(reply),
+            slot: Some(slot),
+            admitted: std::time::Instant::now(),
+        });
+        // A refused send drops the command, and with it the slot.
+        self.sender.try_send(command).map_err(|_| ())?;
+        Ok(LongAdmission { receive, timeout })
     }
 
     pub(crate) fn set_watch_state(&self, active: bool) {
@@ -255,6 +743,14 @@ impl PortIngress {
         command: PortCommand,
         receive: tokio::sync::oneshot::Receiver<T>,
     ) -> Result<Admission<T>, ()> {
+        let depth = self.reserve_slot()?;
+        match self.sender.try_send(command) {
+            Ok(()) => Ok(Admission { receive, depth }),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => Err(()),
+        }
+    }
+
+    fn reserve_slot(&self) -> Result<QueueSlot, ()> {
         let mut depth = self.queue_depth.load(Ordering::Acquire);
         loop {
             if depth >= PORT_QUEUE_CAPACITY {
@@ -266,18 +762,8 @@ impl PortIngress {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => break,
+                Ok(_) => return Ok(QueueSlot(Arc::clone(&self.queue_depth))),
                 Err(observed) => depth = observed,
-            }
-        }
-        match self.sender.try_send(command) {
-            Ok(()) => Ok(Admission {
-                receive,
-                depth: QueueDepthGuard(Arc::clone(&self.queue_depth)),
-            }),
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                self.queue_depth.fetch_sub(1, Ordering::AcqRel);
-                Err(())
             }
         }
     }
@@ -290,7 +776,26 @@ impl PortIngress {
 
 pub(crate) struct Admission<T> {
     receive: tokio::sync::oneshot::Receiver<T>,
-    depth: QueueDepthGuard,
+    depth: QueueSlot,
+}
+
+pub(crate) struct LongAdmission {
+    receive: tokio::sync::oneshot::Receiver<ControlReply>,
+    timeout: Duration,
+}
+
+impl LongAdmission {
+    pub(crate) async fn receive(self) -> Result<ControlReply, ()> {
+        match tokio::time::timeout(self.timeout, self.receive).await {
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) | Err(_) => Err(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeout_for_test(&self) -> Duration {
+        self.timeout
+    }
 }
 
 impl<T> Admission<T> {
@@ -556,9 +1061,10 @@ impl Drop for CompletionOnDrop {
     }
 }
 
-struct QueueDepthGuard(Arc<AtomicUsize>);
+/// One admitted ingress entry; dropping it frees the slot.
+pub(crate) struct QueueSlot(Arc<AtomicUsize>);
 
-impl Drop for QueueDepthGuard {
+impl Drop for QueueSlot {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -725,6 +1231,7 @@ struct PendingReply {
 
 impl PendingReply {
     fn new(command: cosmix_client::IncomingCommand, (rc, body): (u8, Arc<str>)) -> Self {
+        let (rc, body) = with_error_code(rc, body);
         Self {
             from: command.from,
             command: command.command,
@@ -773,6 +1280,7 @@ async fn worker_loop<F, Fut, C>(
     apply_connection_state(&broker, *states.borrow());
     let mut responders = JoinSet::new();
     let responder_permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+    let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
     let (reply_sender, reply_receiver) = tokio_mpsc::channel(PORT_REPLY_CAPACITY);
     let reply_task = tokio::spawn(reply_loop(
         Arc::clone(&client),
@@ -818,10 +1326,11 @@ async fn worker_loop<F, Fut, C>(
                     }
                     break;
                 };
-                handle_incoming(
+                dispatch_incoming(
                     &ingress,
                     &mut responders,
                     &responder_permits,
+                    &long_permits,
                     &reply_sender,
                     &reply_timeouts,
                     &service,
@@ -894,10 +1403,36 @@ fn apply_connection_state(broker: &AtomicU8, state: ConnState) {
     );
 }
 
+/// The pre-long-verb entry the existing tests drive: a fresh long pool per
+/// call, so only the tests that exercise long verbs see pool pressure.
+#[cfg(test)]
 fn handle_incoming(
     ingress: &PortIngress,
     responders: &mut JoinSet<()>,
     responder_permits: &Arc<Semaphore>,
+    reply_sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &Arc<AtomicU64>,
+    service: &str,
+    command: cosmix_client::IncomingCommand,
+) {
+    dispatch_incoming(
+        ingress,
+        responders,
+        responder_permits,
+        &Arc::new(Semaphore::new(LONG_VERB_PERMITS)),
+        reply_sender,
+        reply_timeouts,
+        service,
+        command,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_incoming(
+    ingress: &PortIngress,
+    responders: &mut JoinSet<()>,
+    responder_permits: &Arc<Semaphore>,
+    long_permits: &Arc<Semaphore>,
     reply_sender: &tokio_mpsc::Sender<PendingReply>,
     reply_timeouts: &Arc<AtomicU64>,
     service: &str,
@@ -930,14 +1465,6 @@ fn handle_incoming(
         return;
     }
     if command.command == "comp.props.watch" || command.command == "comp.pointer.watch" {
-        if command.command == "comp.pointer.watch" && authorize_set(&command).is_err() {
-            queue_reply(
-                reply_sender,
-                reply_timeouts,
-                PendingReply::new(command, error("not_local")),
-            );
-            return;
-        }
         if malformed {
             queue_reply(
                 reply_sender,
@@ -984,20 +1511,12 @@ fn handle_incoming(
         return;
     }
     if command.command == "comp.props.set" {
-        if authorize_set(&command).is_err() {
-            queue_reply(
-                reply_sender,
-                reply_timeouts,
-                PendingReply::new(command, error("not_local")),
-            );
-            return;
-        }
         let parsed = if malformed {
             Err(invalid_set_shape(None))
         } else {
             parse_set(&command.args)
         };
-        let (path, value) = match parsed {
+        let (path, value, generation) = match parsed {
             Ok(parsed) => parsed,
             Err(reply) => {
                 queue_reply(
@@ -1027,7 +1546,145 @@ fn handle_incoming(
                 return;
             }
         };
-        let admission = match ingress.request_set(path, value) {
+        let admission = match ingress.request_set_fenced(path, value, generation) {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        spawn_control_responder(
+            responders,
+            reply_sender,
+            reply_timeouts,
+            command,
+            admission,
+            permit,
+        );
+        return;
+    }
+    if let Some(verb) = window_verb(&command.command) {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "{id, generation}"))
+        } else {
+            parse_window_verb(verb, &command.args)
+        };
+        let op = match parsed {
+            Ok(WindowVerb::Op(op)) => op,
+            Ok(WindowVerb::Long(op)) => {
+                spawn_long_verb(
+                    ingress,
+                    responders,
+                    long_permits,
+                    reply_sender,
+                    reply_timeouts,
+                    command,
+                    op,
+                );
+                return;
+            }
+            Err(reply) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()),
+                );
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_window(op) {
+            Ok(admission) => admission,
+            Err(()) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        spawn_control_responder(
+            responders,
+            reply_sender,
+            reply_timeouts,
+            command,
+            admission,
+            permit,
+        );
+        return;
+    }
+    if command.command == "comp.input.sequence" {
+        let parsed = if malformed {
+            Err(invalid_argument(
+                "args",
+                "JSON object",
+                "{steps, interval_ms?}",
+            ))
+        } else {
+            parse_sequence(&command.args)
+        };
+        match parsed {
+            Ok(op) => spawn_long_verb(
+                ingress,
+                responders,
+                long_permits,
+                reply_sender,
+                reply_timeouts,
+                command,
+                op,
+            ),
+            Err(reply) => queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, reply.into_wire()),
+            ),
+        }
+        return;
+    }
+    if let Some(verb) = input_verb(&command.command) {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "verb arguments"))
+        } else {
+            parse_input_op(verb, &command.args)
+        };
+        let op = match parsed {
+            Ok(op) => op,
+            Err(reply) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()),
+                );
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(
+                    reply_sender,
+                    reply_timeouts,
+                    PendingReply::new(command, error("busy")),
+                );
+                return;
+            }
+        };
+        let admission = match ingress.request_input(op) {
             Ok(admission) => admission,
             Err(()) => {
                 queue_reply(
@@ -1050,7 +1707,11 @@ fn handle_incoming(
     }
     let needs_snapshot = matches!(
         command.command.as_str(),
-        "comp.info" | "comp.props.get" | "comp.props.list" | "comp.props.describe"
+        "comp.info"
+            | "comp.props.get"
+            | "comp.props.list"
+            | "comp.props.describe"
+            | "comp.windows.list"
     );
     if !needs_snapshot {
         queue_reply(
@@ -1079,7 +1740,10 @@ fn handle_incoming(
             return;
         }
     };
-    let admission = match ingress.request_snapshot() {
+    // The read's own subtree scopes the snapshot (`read_scope`: info,
+    // list's prefix, get/describe's path; windows.list has none = whole tree).
+    let scope = read_scope(command.command.as_str(), &command.args);
+    let admission = match ingress.request_snapshot_scoped(scope) {
         Ok(admission) => admission,
         Err(()) => {
             queue_reply(
@@ -1147,30 +1811,9 @@ pub(crate) fn inject_topic_lifecycle_notice_for_test(
     debug_assert!(responders.is_empty());
 }
 
-fn authorize_set(command: &cosmix_client::IncomingCommand) -> Result<(), ()> {
-    if command.from == "anonymous"
-        || validate_service_name(&command.from).is_err()
-        || command.headers.keys().any(|name| {
-            name.eq_ignore_ascii_case("source_peer")
-                || name.eq_ignore_ascii_case("permissions")
-                || name.eq_ignore_ascii_case("signed_ident")
-        })
-    {
-        return Err(());
-    }
-    let origins = command
-        .headers
-        .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
-        .collect::<Vec<_>>();
-    if origins.len() == 1 && origins[0].1 == "local" {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
+type ParsedSet = (String, Value, Option<u64>);
 
-fn parse_set(args: &Value) -> Result<(String, Value), (u8, Arc<str>)> {
+fn parse_set(args: &Value) -> Result<ParsedSet, (u8, Arc<str>)> {
     let object = args.as_object().ok_or_else(|| invalid_set_shape(None))?;
     let path = object
         .get("path")
@@ -1180,7 +1823,986 @@ fn parse_set(args: &Value) -> Result<(String, Value), (u8, Arc<str>)> {
         .get("value")
         .cloned()
         .ok_or_else(|| invalid_set_shape(Some(path)))?;
-    Ok((path.to_string(), value))
+    let generation = match object.get("generation") {
+        None | Some(Value::Null) => None,
+        Some(generation) => Some(generation.as_u64().ok_or_else(|| {
+            invalid_argument("generation", "unsigned integer", "windows.s<id>.generation")
+                .into_wire()
+        })?),
+    };
+    // The fence names a window, so it only means something on a window
+    // leaf; anywhere else it is a mis-aimed request, not something to drop.
+    if generation.is_some() && port_observation::parse_window_leaf_path(path).is_none() {
+        return Err(invalid_argument(
+            "generation",
+            "absent",
+            "generation applies to windows.s<id>.* paths only",
+        )
+        .into_wire());
+    }
+    Ok((path.to_string(), value, generation))
+}
+
+fn invalid_argument(path: &str, expected: &'static str, range: &'static str) -> ControlReply {
+    ControlReply::Validation(SetValidationError::InvalidValue {
+        path: path.to_string(),
+        expected,
+        range,
+    })
+}
+
+fn window_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<u64>, ControlReply> {
+    match object.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| invalid_argument(name, "unsigned integer", "0..=u64::MAX")),
+    }
+}
+
+/// `comp.window.minimize {id, generation}` and
+/// `comp.window.restore {id?, generation?}` (both or neither).
+fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    let object = match args {
+        Value::Null => &empty,
+        Value::Object(object) => object,
+        _ => {
+            return Err(invalid_argument("args", "JSON object", "{id, generation}"));
+        }
+    };
+    const WINDOW_ARGS: &[&str] = &["id", "generation"];
+    if let Some(field) = object
+        .keys()
+        .find(|field| !WINDOW_ARGS.contains(&field.as_str()))
+    {
+        return Err(ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed: WINDOW_ARGS,
+        });
+    }
+    let id = window_arg(object, "id")?;
+    let generation = window_arg(object, "generation")?;
+    let target = match (id, generation) {
+        (Some(id), Some(generation)) => Some((id, generation)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(invalid_argument(
+                "generation",
+                "unsigned integer",
+                "required with id (read windows.s<id>.generation)",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid_argument(
+                "id",
+                "unsigned integer",
+                "required with generation",
+            ));
+        }
+    };
+    if verb == "comp.window.minimize" {
+        let Some((id, generation)) = target else {
+            return Err(invalid_argument("id", "unsigned integer", "required"));
+        };
+        Ok(WindowOp::Minimize { id, generation })
+    } else {
+        Ok(WindowOp::Restore { target })
+    }
+}
+
+const WINDOW_VERBS: &[&str] = &[
+    "comp.window.minimize",
+    "comp.window.restore",
+    "comp.window.focus",
+    "comp.window.raise",
+    "comp.window.close",
+    "comp.window.place",
+    "comp.window.wait",
+    "comp.window.stats",
+    "comp.window.stats.reset",
+];
+
+fn window_verb(verb: &str) -> Option<&'static str> {
+    WINDOW_VERBS.iter().copied().find(|known| *known == verb)
+}
+
+/// The default and the ceiling for `comp.window.wait` and
+/// `comp.window.close {force}`.
+const WINDOW_WAIT_DEFAULT: Duration = Duration::from_secs(10);
+const CLOSE_FORCE_DEFAULT: Duration = Duration::from_secs(3);
+
+fn required_target(object: &serde_json::Map<String, Value>) -> Result<(u64, u64), ControlReply> {
+    let id = window_arg(object, "id")?
+        .ok_or_else(|| invalid_argument("id", "unsigned integer", "required"))?;
+    let generation = window_arg(object, "generation")?.ok_or_else(|| {
+        invalid_argument(
+            "generation",
+            "unsigned integer",
+            "required (read windows.s<id>.generation)",
+        )
+    })?;
+    Ok((id, generation))
+}
+
+fn bool_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ControlReply> {
+    match present(object, name) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(invalid_argument(name, "bool", "true|false")),
+    }
+}
+
+fn size_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<i32>, ControlReply> {
+    match present(object, name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|size| (1..=32_767).contains(size))
+            .map(|size| Some(size as i32))
+            .ok_or_else(|| invalid_argument(name, "integer", "1..=32767")),
+    }
+}
+
+fn string_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<String>, ControlReply> {
+    match present(object, name) {
+        None => Ok(None),
+        Some(Value::String(value)) if value.len() <= 4096 => Ok(Some(value.clone())),
+        Some(_) => Err(invalid_argument(name, "string", "at most 4096 bytes")),
+    }
+}
+
+fn timeout_arg(
+    object: &serde_json::Map<String, Value>,
+    default: Duration,
+) -> Result<Duration, ControlReply> {
+    match present(object, "timeout_ms") {
+        None => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| (1..=LONG_VERB_MAX.as_millis() as u64).contains(ms))
+            .map(Duration::from_millis)
+            .ok_or_else(|| invalid_argument("timeout_ms", "unsigned integer", "1..=60000")),
+    }
+}
+
+/// Every `comp.window.*` verb. Minimise and restore keep their own parser.
+pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, ControlReply> {
+    let empty = serde_json::Map::new();
+    match verb {
+        "comp.window.minimize" | "comp.window.restore" => {
+            parse_window_op(verb, args).map(WindowVerb::Op)
+        }
+        "comp.window.stats" | "comp.window.stats.reset" => {
+            parse_stats_op(verb, args).map(WindowVerb::Op)
+        }
+        "comp.window.focus" => {
+            const ALLOWED: &[&str] = &["id", "generation", "raise"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            Ok(WindowVerb::Op(WindowOp::Focus {
+                id,
+                generation,
+                raise: bool_arg(object, "raise", true)?,
+            }))
+        }
+        "comp.window.raise" => {
+            const ALLOWED: &[&str] = &["id", "generation"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            Ok(WindowVerb::Op(WindowOp::Raise { id, generation }))
+        }
+        "comp.window.close" => {
+            const ALLOWED: &[&str] = &["id", "generation", "force", "timeout_ms"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            if bool_arg(object, "force", false)? {
+                Ok(WindowVerb::Long(LongOp::ForceClose {
+                    id,
+                    generation,
+                    timeout: timeout_arg(object, CLOSE_FORCE_DEFAULT)?,
+                }))
+            } else if present(object, "timeout_ms").is_some() {
+                Err(invalid_argument(
+                    "timeout_ms",
+                    "absent",
+                    "timeout_ms applies with force:true only",
+                ))
+            } else {
+                Ok(WindowVerb::Op(WindowOp::Close { id, generation }))
+            }
+        }
+        "comp.window.place" => {
+            const ALLOWED: &[&str] = &["id", "generation", "output", "x", "y", "width", "height"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            let output = match present(object, "output") {
+                None => None,
+                Some(Value::String(output)) if !output.is_empty() => Some(output.clone()),
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "output",
+                        "string",
+                        "outputs.<key> key or output name",
+                    ));
+                }
+            };
+            let spec = PlaceSpec {
+                id,
+                generation,
+                x: finite_arg(object, "x")?,
+                y: finite_arg(object, "y")?,
+                width: size_arg(object, "width")?,
+                height: size_arg(object, "height")?,
+                output,
+            };
+            if spec.output.is_none()
+                && spec.x.is_none()
+                && spec.y.is_none()
+                && spec.width.is_none()
+                && spec.height.is_none()
+            {
+                return Err(invalid_argument(
+                    "x",
+                    "finite number",
+                    "place needs at least one of output, x, y, width, height",
+                ));
+            }
+            Ok(WindowVerb::Op(WindowOp::Place(spec)))
+        }
+        "comp.window.wait" => {
+            const ALLOWED: &[&str] = &["match", "until", "width", "height", "timeout_ms"];
+            const MATCH: &[&str] = &["id", "generation", "app_id", "title", "title_contains"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let filters = match present(object, "match") {
+                Some(Value::Object(filters)) => filters,
+                _ => {
+                    return Err(invalid_argument(
+                        "match",
+                        "object",
+                        "{id?, generation?, app_id?, title?, title_contains?}",
+                    ));
+                }
+            };
+            if let Some(field) = filters
+                .keys()
+                .find(|field| !MATCH.contains(&field.as_str()))
+            {
+                return Err(ControlReply::InvalidArgs {
+                    field: format!("match.{field}"),
+                    allowed: MATCH,
+                });
+            }
+            let window = WindowMatch {
+                id: window_arg(filters, "id")?,
+                generation: window_arg(filters, "generation")?,
+                app_id: string_arg(filters, "app_id")?,
+                title: string_arg(filters, "title")?,
+                title_contains: string_arg(filters, "title_contains")?,
+            };
+            if window.id.is_some()
+                && (window.app_id.is_some()
+                    || window.title.is_some()
+                    || window.title_contains.is_some())
+            {
+                return Err(invalid_argument(
+                    "match",
+                    "object",
+                    "match by id or by app_id/title/title_contains, not both",
+                ));
+            }
+            if window.generation.is_some() && window.id.is_none() {
+                return Err(invalid_argument(
+                    "match.id",
+                    "unsigned integer",
+                    "required with generation",
+                ));
+            }
+            if window == WindowMatch::default() {
+                return Err(invalid_argument(
+                    "match",
+                    "object",
+                    "at least one of id, app_id, title, title_contains",
+                ));
+            }
+            let width = size_arg(object, "width")?;
+            let height = size_arg(object, "height")?;
+            let until = match present(object, "until").and_then(Value::as_str) {
+                Some("mapped") => WaitUntil::Mapped,
+                Some("visible") => WaitUntil::Visible,
+                Some("presented") => WaitUntil::Presented,
+                Some("size") => match (width, height) {
+                    (Some(width), Some(height)) => WaitUntil::Size { width, height },
+                    _ => {
+                        return Err(invalid_argument(
+                            "width",
+                            "integer",
+                            "until:size needs width and height",
+                        ));
+                    }
+                },
+                Some("focused") => WaitUntil::Focused,
+                Some("unmapped") => WaitUntil::Unmapped,
+                Some("gone") => WaitUntil::Gone,
+                _ => {
+                    return Err(invalid_argument(
+                        "until",
+                        "string",
+                        "mapped|visible|presented|size|focused|unmapped|gone",
+                    ));
+                }
+            };
+            if !matches!(until, WaitUntil::Size { .. }) && (width.is_some() || height.is_some()) {
+                return Err(invalid_argument(
+                    "width",
+                    "absent",
+                    "width and height apply to until:size only",
+                ));
+            }
+            Ok(WindowVerb::Long(LongOp::Wait(WaitSpec {
+                window,
+                until,
+                timeout: timeout_arg(object, WINDOW_WAIT_DEFAULT)?,
+            })))
+        }
+        _ => Err(invalid_argument("verb", "window verb", "comp.window.*")),
+    }
+}
+
+const INPUT_VERBS: &[&str] = &[
+    "comp.input.pointer.move",
+    "comp.input.pointer.button",
+    "comp.input.pointer.scroll",
+    "comp.input.key",
+    "comp.input.release_all",
+];
+
+/// The canonical `&'static` name of a single-step input verb.
+fn input_verb(verb: &str) -> Option<&'static str> {
+    INPUT_VERBS.iter().copied().find(|known| *known == verb)
+}
+
+/// evdev `BTN_LEFT` / `BTN_RIGHT` / `BTN_MIDDLE`.
+pub(crate) const BTN_LEFT: u32 = 0x110;
+pub(crate) const BTN_RIGHT: u32 = 0x111;
+pub(crate) const BTN_MIDDLE: u32 = 0x112;
+/// evdev `KEY_MAX`: every key and button code is at most this.
+const EVDEV_CODE_MAX: u64 = 0x2ff;
+
+fn args_object<'a>(
+    args: &'a Value,
+    empty: &'a serde_json::Map<String, Value>,
+    allowed: &'static [&'static str],
+) -> Result<&'a serde_json::Map<String, Value>, ControlReply> {
+    let object = match args {
+        Value::Null => empty,
+        Value::Object(object) => object,
+        _ => return Err(invalid_argument("args", "JSON object", "verb arguments")),
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed,
+        });
+    }
+    Ok(object)
+}
+
+fn present<'a>(object: &'a serde_json::Map<String, Value>, name: &str) -> Option<&'a Value> {
+    object.get(name).filter(|value| !value.is_null())
+}
+
+fn finite_arg(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<f64>, ControlReply> {
+    match present(object, name) {
+        None => Ok(None),
+        Some(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite() && value.abs() <= 1.0e6)
+            .map(Some)
+            .ok_or_else(|| invalid_argument(name, "finite number", "-1e6..=1e6")),
+    }
+}
+
+fn required_finite(
+    object: &serde_json::Map<String, Value>,
+    name: &'static str,
+) -> Result<f64, ControlReply> {
+    finite_arg(object, name)?.ok_or_else(|| invalid_argument(name, "finite number", "required"))
+}
+
+fn press_action(
+    object: &serde_json::Map<String, Value>,
+    both: &'static str,
+) -> Result<PressAction, ControlReply> {
+    match present(object, "action") {
+        None => Ok(PressAction::Both),
+        Some(Value::String(action)) if action == "press" => Ok(PressAction::Press),
+        Some(Value::String(action)) if action == "release" => Ok(PressAction::Release),
+        Some(Value::String(action)) if action == both => Ok(PressAction::Both),
+        Some(_) => Err(invalid_argument(
+            "action",
+            "string",
+            if both == "click" {
+                "press|release|click"
+            } else {
+                "press|release|tap"
+            },
+        )),
+    }
+}
+
+fn evdev_code(value: &Value, name: &'static str, minimum: u64) -> Result<u32, ControlReply> {
+    value
+        .as_u64()
+        .filter(|code| (minimum..=EVDEV_CODE_MAX).contains(code))
+        .map(|code| code as u32)
+        .ok_or_else(|| invalid_argument(name, "evdev code", "an evdev code up to 0x2ff"))
+}
+
+fn key_spec(value: &Value, name: &'static str) -> Result<KeySpec, ControlReply> {
+    match value {
+        Value::String(key) if !key.is_empty() && key.len() <= 64 => Ok(KeySpec::Name(key.clone())),
+        Value::Number(_) => evdev_code(value, name, 1).map(KeySpec::Evdev),
+        _ => Err(invalid_argument(
+            name,
+            "keysym name or evdev code",
+            "XKB keysym name (\"Return\", \"a\") or 1..=0x2ff",
+        )),
+    }
+}
+
+fn modifier_spec(value: &Value) -> Result<KeySpec, ControlReply> {
+    let name = match value.as_str() {
+        Some("shift") => "Shift_L",
+        Some("ctrl" | "control") => "Control_L",
+        Some("alt") => "Alt_L",
+        Some("super" | "logo") => "Super_L",
+        Some("altgr") => "ISO_Level3_Shift",
+        _ => {
+            return Err(invalid_argument(
+                "modifiers",
+                "list of modifier names",
+                "shift|ctrl|alt|super|altgr",
+            ));
+        }
+    };
+    Ok(KeySpec::Name(name.into()))
+}
+
+/// Parse one `comp.input.*` verb's arguments. Shared by the direct verbs
+/// and `comp.input.sequence` steps, so a step is exactly the verb.
+pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    match verb {
+        "comp.input.pointer.move" => {
+            const ALLOWED: &[&str] = &[
+                "output",
+                "x",
+                "y",
+                "dx",
+                "dy",
+                "window",
+                "require_hit",
+                "corners",
+            ];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let corners = bool_arg(object, "corners", true)?;
+            let moved = |target| Ok(InputOp::PointerMove { target, corners });
+            let require_hit = match present(object, "require_hit") {
+                None => None,
+                Some(Value::Bool(value)) => Some(*value),
+                Some(_) => return Err(invalid_argument("require_hit", "bool", "true|false")),
+            };
+            let relative = present(object, "dx").is_some() || present(object, "dy").is_some();
+            if let Some(window) = present(object, "window") {
+                const WINDOW: &[&str] = &["id", "generation"];
+                let window = match window {
+                    Value::Object(window) => window,
+                    _ => return Err(invalid_argument("window", "object", "{id, generation}")),
+                };
+                if let Some(field) = window
+                    .keys()
+                    .find(|field| !WINDOW.contains(&field.as_str()))
+                {
+                    return Err(ControlReply::InvalidArgs {
+                        field: format!("window.{field}"),
+                        allowed: WINDOW,
+                    });
+                }
+                if relative || present(object, "output").is_some() {
+                    return Err(invalid_argument(
+                        "window",
+                        "exclusive form",
+                        "{window, x, y} takes no output, dx or dy",
+                    ));
+                }
+                let id = window_arg(window, "id")?
+                    .ok_or_else(|| invalid_argument("window.id", "unsigned integer", "required"))?;
+                let generation = window_arg(window, "generation")?.ok_or_else(|| {
+                    invalid_argument(
+                        "window.generation",
+                        "unsigned integer",
+                        "required (read windows.s<id>.generation)",
+                    )
+                })?;
+                return moved(PointerMoveTarget::Window {
+                    id,
+                    generation,
+                    x: required_finite(object, "x")?,
+                    y: required_finite(object, "y")?,
+                    require_hit: require_hit.unwrap_or(false),
+                });
+            }
+            if require_hit.is_some() {
+                return Err(invalid_argument(
+                    "require_hit",
+                    "absent",
+                    "require_hit applies to the {window, x, y} form only",
+                ));
+            }
+            if relative {
+                if present(object, "x").is_some()
+                    || present(object, "y").is_some()
+                    || present(object, "output").is_some()
+                {
+                    return Err(invalid_argument(
+                        "dx",
+                        "exclusive form",
+                        "{dx, dy} takes no output, x or y",
+                    ));
+                }
+                return moved(PointerMoveTarget::Relative {
+                    dx: finite_arg(object, "dx")?.unwrap_or(0.0),
+                    dy: finite_arg(object, "dy")?.unwrap_or(0.0),
+                });
+            }
+            let output = match present(object, "output") {
+                None => None,
+                Some(Value::String(output)) if !output.is_empty() => Some(output.clone()),
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "output",
+                        "string",
+                        "outputs.<key> key or output name",
+                    ));
+                }
+            };
+            moved(PointerMoveTarget::Output {
+                output,
+                x: required_finite(object, "x")?,
+                y: required_finite(object, "y")?,
+            })
+        }
+        "comp.input.pointer.button" => {
+            const ALLOWED: &[&str] = &["button", "action"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let button = match present(object, "button") {
+                None => BTN_LEFT,
+                Some(Value::String(name)) if name == "left" => BTN_LEFT,
+                Some(Value::String(name)) if name == "right" => BTN_RIGHT,
+                Some(Value::String(name)) if name == "middle" => BTN_MIDDLE,
+                Some(value @ Value::Number(_)) => evdev_code(value, "button", 0x100)?,
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "button",
+                        "button name or evdev code",
+                        "left|right|middle|0x100..=0x2ff",
+                    ));
+                }
+            };
+            Ok(InputOp::PointerButton {
+                button,
+                action: press_action(object, "click")?,
+            })
+        }
+        "comp.input.pointer.scroll" => {
+            const ALLOWED: &[&str] = &["dx", "dy", "source", "v120"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let dx = finite_arg(object, "dx")?;
+            let dy = finite_arg(object, "dy")?;
+            if dx.is_none() && dy.is_none() {
+                return Err(invalid_argument(
+                    "dy",
+                    "finite number",
+                    "dx or dy is required",
+                ));
+            }
+            let source = match present(object, "source") {
+                None => ScrollSource::Wheel,
+                Some(Value::String(source)) if source == "wheel" => ScrollSource::Wheel,
+                Some(Value::String(source)) if source == "finger" => ScrollSource::Finger,
+                Some(Value::String(source)) if source == "continuous" => ScrollSource::Continuous,
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "source",
+                        "string",
+                        "wheel|finger|continuous",
+                    ));
+                }
+            };
+            let detent = |name: &'static str,
+                          value: Option<&Value>,
+                          amount: Option<f64>|
+             -> Result<Option<i32>, ControlReply> {
+                match value {
+                    Some(value) => {
+                        if amount.is_none() {
+                            return Err(invalid_argument(
+                                name,
+                                "absent",
+                                "a detent count needs the matching axis",
+                            ));
+                        }
+                        value
+                            .as_i64()
+                            .and_then(|value| i32::try_from(value).ok())
+                            .filter(|value| value.unsigned_abs() <= 120 * 1000)
+                            .map(Some)
+                            .ok_or_else(|| invalid_argument(name, "integer", "-120000..=120000"))
+                    }
+                    // A wheel reports detents: 15 logical units to one
+                    // detent (120) is libinput's convention. Other sources
+                    // have none, and an absent count stays absent.
+                    None if source == ScrollSource::Wheel => {
+                        Ok(amount.map(|amount| (amount * 8.0).round() as i32))
+                    }
+                    None => Ok(None),
+                }
+            };
+            let v120 = match present(object, "v120") {
+                None => (detent("v120.dx", None, dx)?, detent("v120.dy", None, dy)?),
+                Some(Value::Object(v120)) => {
+                    const V120: &[&str] = &["dx", "dy"];
+                    if let Some(field) = v120.keys().find(|field| !V120.contains(&field.as_str())) {
+                        return Err(ControlReply::InvalidArgs {
+                            field: format!("v120.{field}"),
+                            allowed: V120,
+                        });
+                    }
+                    if source != ScrollSource::Wheel {
+                        return Err(invalid_argument(
+                            "v120",
+                            "absent",
+                            "detent counts belong to source wheel",
+                        ));
+                    }
+                    (
+                        detent("v120.dx", present(v120, "dx"), dx)?,
+                        detent("v120.dy", present(v120, "dy"), dy)?,
+                    )
+                }
+                Some(_) => return Err(invalid_argument("v120", "object", "{dx?, dy?}")),
+            };
+            Ok(InputOp::PointerScroll {
+                dx,
+                dy,
+                source,
+                v120,
+            })
+        }
+        "comp.input.key" => {
+            const ALLOWED: &[&str] = &["key", "action", "modifiers", "text"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            if let Some(text) = present(object, "text") {
+                if ["key", "action", "modifiers"]
+                    .iter()
+                    .any(|name| present(object, name).is_some())
+                {
+                    return Err(invalid_argument(
+                        "text",
+                        "exclusive form",
+                        "{text} takes no key, action or modifiers",
+                    ));
+                }
+                return match text {
+                    Value::String(text)
+                        if !text.is_empty() && text.chars().count() <= TEXT_MAX_CHARS =>
+                    {
+                        Ok(InputOp::Text(text.clone()))
+                    }
+                    _ => Err(invalid_argument("text", "string", "1..=256 characters")),
+                };
+            }
+            let key = present(object, "key")
+                .ok_or_else(|| invalid_argument("key", "keysym name or evdev code", "required"))
+                .and_then(|key| key_spec(key, "key"))?;
+            let modifiers = match present(object, "modifiers") {
+                None => Vec::new(),
+                Some(Value::Array(modifiers)) if modifiers.len() <= 5 => modifiers
+                    .iter()
+                    .map(modifier_spec)
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some(_) => {
+                    return Err(invalid_argument(
+                        "modifiers",
+                        "list of modifier names",
+                        "shift|ctrl|alt|super|altgr",
+                    ));
+                }
+            };
+            Ok(InputOp::Key {
+                key,
+                action: press_action(object, "tap")?,
+                modifiers,
+            })
+        }
+        "comp.input.release_all" => {
+            args_object(args, &empty, &[])?;
+            Ok(InputOp::ReleaseAll)
+        }
+        _ => Err(invalid_argument(
+            "verb",
+            "input verb",
+            "comp.input.pointer.move|pointer.button|pointer.scroll|key|release_all",
+        )),
+    }
+}
+
+fn delay_arg(value: Option<&Value>, name: &'static str) -> Result<Option<Duration>, ControlReply> {
+    match value {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| *ms <= LONG_VERB_MAX.as_millis() as u64)
+            .map(|ms| Some(Duration::from_millis(ms)))
+            .ok_or_else(|| invalid_argument(name, "unsigned integer", "0..=60000")),
+    }
+}
+
+/// `comp.input.sequence {steps:[{verb, args?, delay_ms?}], interval_ms?}`.
+/// `delay_ms` (default `interval_ms`, default 0) runs before its step; the
+/// delays together are capped at 60 s.
+fn parse_sequence(args: &Value) -> Result<LongOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    const ALLOWED: &[&str] = &["steps", "interval_ms"];
+    let object = args_object(args, &empty, ALLOWED)?;
+    let interval = delay_arg(present(object, "interval_ms"), "interval_ms")?.unwrap_or_default();
+    let steps = match present(object, "steps") {
+        Some(Value::Array(steps)) if !steps.is_empty() && steps.len() <= SEQUENCE_MAX_STEPS => {
+            steps
+        }
+        _ => return Err(invalid_argument("steps", "list", "1..=256 steps")),
+    };
+    let mut parsed = Vec::with_capacity(steps.len());
+    let mut total = Duration::ZERO;
+    let mut events = 0_usize;
+    for (index, step) in steps.iter().enumerate() {
+        const STEP: &[&str] = &["verb", "args", "delay_ms"];
+        let step = match step {
+            Value::Object(step) => step,
+            _ => {
+                return Err(invalid_argument(
+                    "steps",
+                    "list of objects",
+                    "{verb, args?, delay_ms?}",
+                ));
+            }
+        };
+        if let Some(field) = step.keys().find(|field| !STEP.contains(&field.as_str())) {
+            return Err(ControlReply::InvalidArgs {
+                field: format!("steps[{index}].{field}"),
+                allowed: STEP,
+            });
+        }
+        let verb = present(step, "verb")
+            .and_then(Value::as_str)
+            .and_then(input_verb)
+            .ok_or_else(|| {
+                invalid_argument(
+                    "steps.verb",
+                    "input verb",
+                    "comp.input.pointer.move|pointer.button|pointer.scroll|key|release_all",
+                )
+            })?;
+        let op =
+            parse_input_op(verb, step.get("args").unwrap_or(&Value::Null)).map_err(|reply| {
+                match reply {
+                    ControlReply::Validation(SetValidationError::InvalidValue {
+                        path,
+                        expected,
+                        range,
+                    }) => ControlReply::Validation(SetValidationError::InvalidValue {
+                        path: format!("steps[{index}].args.{path}"),
+                        expected,
+                        range,
+                    }),
+                    ControlReply::InvalidArgs { field, allowed } => ControlReply::InvalidArgs {
+                        field: format!("steps[{index}].args.{field}"),
+                        allowed,
+                    },
+                    other => other,
+                }
+            })?;
+        events += op.event_bound();
+        if events > MAX_EVENTS_PER_VERB {
+            return Err(invalid_argument(
+                "steps",
+                "injected events",
+                "at most 4096 injected events per verb (MAX_EVENTS_PER_VERB)",
+            ));
+        }
+        let delay = delay_arg(present(step, "delay_ms"), "steps.delay_ms")?.unwrap_or(interval);
+        total += delay;
+        if total > LONG_VERB_MAX {
+            return Err(invalid_argument(
+                "steps",
+                "total delay",
+                "the delays together are at most 60000 ms",
+            ));
+        }
+        parsed.push(SequenceStep { verb, op, delay });
+    }
+    Ok(LongOp::Sequence(parsed))
+}
+
+/// `comp.window.stats {id, generation | source, registration?, samples?}`
+/// and `comp.window.stats.reset {id, generation | source, registration? |
+/// nothing}`. `{id, generation}` and `{source}` are mutually exclusive.
+fn parse_stats_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
+    const STATS_ARGS: &[&str] = &["id", "generation", "source", "registration", "samples"];
+    const RESET_ARGS: &[&str] = &["id", "generation", "source", "registration"];
+    let reset = verb == "comp.window.stats.reset";
+    let empty = serde_json::Map::new();
+    let object = match args {
+        Value::Null => &empty,
+        Value::Object(object) => object,
+        _ => {
+            return Err(invalid_argument(
+                "args",
+                "JSON object",
+                "{id, generation} or {source}",
+            ));
+        }
+    };
+    let allowed = if reset { RESET_ARGS } else { STATS_ARGS };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed,
+        });
+    }
+    let id = window_arg(object, "id")?;
+    let generation = window_arg(object, "generation")?;
+    let registration = window_arg(object, "registration")?;
+    let source = match object.get("source") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(source))
+            if crate::content_source::ContentSourceId::new(source.as_str()).is_ok() =>
+        {
+            Some(source.clone())
+        }
+        Some(_) => {
+            return Err(invalid_argument("source", "string", "[a-z0-9_-]{1,64}"));
+        }
+    };
+    let window = match (id, generation) {
+        (Some(id), Some(generation)) => Some((id, generation)),
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err(invalid_argument(
+                "generation",
+                "unsigned integer",
+                "required with id (read windows.s<id>.generation)",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid_argument(
+                "id",
+                "unsigned integer",
+                "required with generation",
+            ));
+        }
+    };
+    let target = match (window, source) {
+        (Some(_), Some(_)) => {
+            return Err(invalid_argument(
+                "source",
+                "absent when id is given",
+                "{id, generation} and {source} are mutually exclusive",
+            ));
+        }
+        (Some((id, generation)), None) => {
+            if registration.is_some() {
+                return Err(invalid_argument(
+                    "registration",
+                    "absent when id is given",
+                    "only with source (read sources.<id>.registration)",
+                ));
+            }
+            Some(StatsTarget::Window { id, generation })
+        }
+        (None, Some(id)) => Some(StatsTarget::Source { id, registration }),
+        (None, None) => {
+            if registration.is_some() {
+                return Err(invalid_argument(
+                    "source",
+                    "string",
+                    "required with registration",
+                ));
+            }
+            None
+        }
+    };
+    if reset {
+        return Ok(WindowOp::StatsReset { target });
+    }
+    let Some(target) = target else {
+        return Err(invalid_argument(
+            "id",
+            "unsigned integer",
+            "required (with generation), or give source",
+        ));
+    };
+    let samples = match window_arg(object, "samples")? {
+        None => STATS_RING,
+        Some(samples) if samples <= STATS_RING as u64 => samples as usize,
+        Some(_) => {
+            return Err(invalid_argument("samples", "unsigned integer", "0..=512"));
+        }
+    };
+    Ok(WindowOp::Stats { target, samples })
+}
+
+/// The tree path a read verb can reach; `None` for the whole tree.
+///
+/// A `list` prefix and a scope relate to paths the same way: at segment
+/// boundaries (`PropPath::starts_with`, `ReadScopes::wants`). A mid-segment
+/// prefix such as `"windows.s"` therefore lists nothing and scopes nothing,
+/// consistently, so the raw prefix is the scope.
+fn read_scope(verb: &str, args: &Value) -> Option<String> {
+    // Explicit per verb: a verb added to `needs_snapshot` later must say
+    // what its scope is, rather than inherit "path" and be mis-scoped by a
+    // same-named argument that means something else.
+    let key = match verb {
+        "comp.info" => return Some("info".to_string()),
+        "comp.props.list" => "prefix",
+        "comp.props.get" | "comp.props.describe" => "path",
+        _ => return None,
+    };
+    args.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
@@ -1196,6 +2818,56 @@ fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
             .to_string(),
         ),
     )
+}
+
+/// Admit a long verb under the long pool and reply when it resolves.
+#[allow(clippy::too_many_arguments)]
+fn spawn_long_verb(
+    ingress: &PortIngress,
+    responders: &mut JoinSet<()>,
+    long_permits: &Arc<Semaphore>,
+    reply_sender: &tokio_mpsc::Sender<PendingReply>,
+    reply_timeouts: &Arc<AtomicU64>,
+    command: cosmix_client::IncomingCommand,
+    op: LongOp,
+) {
+    let permit = match Arc::clone(long_permits).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("busy")),
+            );
+            return;
+        }
+    };
+    let admission = match ingress.request_long(op) {
+        Ok(admission) => admission,
+        Err(()) => {
+            queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, error("busy")),
+            );
+            return;
+        }
+    };
+    let reply_sender = reply_sender.clone();
+    let reply_timeouts = Arc::clone(reply_timeouts);
+    responders.spawn(async move {
+        let _permit = permit;
+        let reply = admission
+            .receive()
+            .await
+            .unwrap_or(ControlReply::Busy)
+            .into_wire();
+        queue_reply(
+            &reply_sender,
+            &reply_timeouts,
+            PendingReply::new(command, reply),
+        );
+    });
 }
 
 fn spawn_control_responder(
@@ -1608,7 +3280,8 @@ fn reply_wire_bytes(service: &str, reply: &PendingReply) -> usize {
 
 fn enforce_reply_wire_limit(service: &str, mut reply: PendingReply) -> Option<PendingReply> {
     if reply_wire_bytes(service, &reply) > MAX_REPLY_WIRE_BYTES {
-        (reply.rc, reply.body) = too_large(MAX_REPLY_BODY_BYTES);
+        let (rc, body) = too_large(MAX_REPLY_BODY_BYTES);
+        (reply.rc, reply.body) = with_error_code(rc, body);
     }
     (reply_wire_bytes(service, &reply) <= MAX_REPLY_WIRE_BYTES).then_some(reply)
 }
@@ -1650,6 +3323,37 @@ mod tests {
         future,
         sync::atomic::{AtomicBool, AtomicUsize},
     };
+
+    /// The verb-to-scope mapping is the only production path into the
+    /// scoped snapshot (round 1 of the 0.58.0 integration review): pin it,
+    /// and pin that a list prefix and its scope agree at segment boundaries.
+    #[test]
+    fn read_scope_names_each_snapshot_verbs_subtree() {
+        let list = |prefix: &str| read_scope("comp.props.list", &json!({ "prefix": prefix }));
+        assert_eq!(list("windows"), Some("windows".to_string()));
+        assert_eq!(list("windows.s3"), Some("windows.s3".to_string()));
+        assert_eq!(list("windows.s"), Some("windows.s".to_string()));
+        assert_eq!(read_scope("comp.props.list", &json!({})), None, "no prefix: whole tree");
+        assert_eq!(
+            read_scope("comp.props.get", &json!({ "path": "windows.s3.visible" })),
+            Some("windows.s3.visible".to_string())
+        );
+        assert_eq!(
+            read_scope("comp.props.describe", &json!({ "path": "windows.s3" })),
+            Some("windows.s3".to_string())
+        );
+        assert_eq!(read_scope("comp.info", &json!({})), Some("info".to_string()));
+        assert_eq!(read_scope("comp.windows.list", &json!({})), None);
+        // A scope reaches its own subtree and no sibling; a mid-segment
+        // prefix scopes nothing, exactly as the list itself matches nothing.
+        let mut scopes = crate::protocol::port_snapshot::ReadScopes::Paths(Vec::new());
+        scopes.add(list("windows.s3").as_deref());
+        assert!(scopes.wants("windows.s3.presentation"));
+        assert!(!scopes.wants("windows.s30.presentation"));
+        let mut partial = crate::protocol::port_snapshot::ReadScopes::Paths(Vec::new());
+        partial.add(list("windows.s").as_deref());
+        assert!(!partial.wants("windows.s3.presentation"));
+    }
 
     type PublishedMessages = Arc<Mutex<Vec<(BTreeMap<String, String>, String)>>>;
 
@@ -2018,6 +3722,7 @@ mod tests {
             serde_json::from_str::<Value>(&checked.body).expect("too_large JSON"),
             serde_json::json!({
                 "error": "too_large",
+                "error_code": "too_large",
                 "limit_bytes": MAX_REPLY_BODY_BYTES,
                 "hint": "read a subtree",
             })
@@ -2061,7 +3766,10 @@ mod tests {
         );
         let reply = replies.recv().await.expect("malformed read reply queued");
         assert_eq!(reply.rc, 10);
-        assert_eq!(reply.body.as_ref(), "{\"error\":\"unknown_path\"}");
+        assert_eq!(
+            reply.body.as_ref(),
+            "{\"error\":\"unknown_path\",\"error_code\":\"unknown_path\"}"
+        );
         assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
@@ -2075,38 +3783,1043 @@ mod tests {
         command
     }
 
-    #[test]
-    fn set_authorisation_requires_one_local_stamp_and_canonical_caller() {
-        assert!(authorize_set(&local_set_command(1, "input.corners.enabled", json!(true))).is_ok());
-
-        let mut missing = local_set_command(1, "input.corners.enabled", json!(true));
-        missing.headers.clear();
-        assert!(authorize_set(&missing).is_err());
-
-        let mut duplicate = local_set_command(1, "input.corners.enabled", json!(true));
-        duplicate
+    /// Mesh law (2026-09-15): being on the mesh is the whole authorization.
+    /// A mesh-stamped caller with peer/identity headers, a caller with no
+    /// origin stamp at all, and one with an unusual name all reach the
+    /// calloop exactly like a local one, for writes and pointer watches.
+    #[tokio::test]
+    async fn mesh_and_unstamped_callers_reach_set_and_pointer_watch() {
+        let mut mesh = local_set_command(1, "input.corners.enabled", json!(true));
+        mesh.headers.insert("broker_origin".into(), "mesh".into());
+        mesh.headers
+            .insert("source_peer".into(), "beta.example".into());
+        mesh.headers.insert("signed_ident".into(), "opaque".into());
+        let mut unstamped = local_set_command(2, "input.corners.enabled", json!(false));
+        unstamped.headers.clear();
+        let mut odd_caller = local_set_command(3, "input.corners.dwell_ms", json!(250));
+        odd_caller.from = "anonymous".into();
+        let mut mesh_pointer = command("comp.pointer.watch", 4);
+        mesh_pointer
             .headers
-            .insert("Broker_Origin".into(), "local".into());
-        assert!(authorize_set(&duplicate).is_err());
+            .insert("broker_origin".into(), "mesh".into());
+        mesh_pointer
+            .headers
+            .insert("source_peer".into(), "beta.example".into());
 
-        let mut remote = local_set_command(1, "input.corners.enabled", json!(true));
-        remote.headers.insert("broker_origin".into(), "mesh".into());
-        assert!(authorize_set(&remote).is_err());
-
-        for caller in ["", "anonymous", "Bad-Caller", "a"] {
-            let mut command = local_set_command(1, "input.corners.enabled", json!(true));
-            command.from = caller.into();
-            assert!(authorize_set(&command).is_err(), "caller {caller:?}");
+        for command in [mesh, unstamped, odd_caller, mesh_pointer] {
+            let (ingress, source, _) = test_ingress();
+            let mut responders = JoinSet::new();
+            let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+            let (reply_sender, mut replies) = tokio_mpsc::channel(2);
+            let reply_timeouts = Arc::new(AtomicU64::new(0));
+            let verb = command.command.clone();
+            let id = command.id.clone();
+            handle_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                command,
+            );
+            match source.try_recv() {
+                Ok(PortCommand::Set(_)) => assert_eq!(verb, "comp.props.set", "{id:?}"),
+                Ok(PortCommand::PointerWatch(_)) => {
+                    assert_eq!(verb, "comp.pointer.watch", "{id:?}")
+                }
+                _ => panic!("{verb} {id:?} was not admitted"),
+            }
+            assert!(
+                replies.try_recv().is_err(),
+                "{verb} {id:?} got an early refusal"
+            );
+            responders.abort_all();
         }
     }
 
     #[test]
-    fn set_authorisation_rejects_every_wire_identity_claim() {
-        for claim in ["source_peer", "permissions", "signed_ident"] {
-            let mut command = local_set_command(1, "input.corners.enabled", json!(true));
-            command.headers.insert(claim.into(), "forged".into());
-            assert!(authorize_set(&command).is_err(), "claim {claim}");
+    fn window_verb_arguments_parse_with_both_or_neither_target_fields() {
+        assert_eq!(
+            parse_window_op("comp.window.restore", &Value::Null),
+            Ok(WindowOp::Restore { target: None })
+        );
+        assert_eq!(
+            parse_window_op("comp.window.restore", &json!({})),
+            Ok(WindowOp::Restore { target: None })
+        );
+        assert_eq!(
+            parse_window_op("comp.window.restore", &json!({"id": 7, "generation": 3})),
+            Ok(WindowOp::Restore {
+                target: Some((7, 3))
+            })
+        );
+        assert_eq!(
+            parse_window_op("comp.window.minimize", &json!({"id": 7, "generation": 3})),
+            Ok(WindowOp::Minimize {
+                id: 7,
+                generation: 3
+            })
+        );
+        for (verb, args, field) in [
+            ("comp.window.restore", json!({"id": 7}), "generation"),
+            ("comp.window.restore", json!({"generation": 3}), "id"),
+            (
+                "comp.window.restore",
+                json!({"id": "7", "generation": 3}),
+                "id",
+            ),
+            (
+                "comp.window.restore",
+                json!({"id": 7, "generation": -1}),
+                "generation",
+            ),
+            ("comp.window.restore", json!([7, 3]), "args"),
+            ("comp.window.minimize", json!({}), "id"),
+            ("comp.window.minimize", json!({"id": 7}), "generation"),
+        ] {
+            let Err(reply) = parse_window_op(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let (rc, body) = reply.into_wire();
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(rc, 10, "{verb} {args}");
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}");
+            assert_eq!(body["path"], field, "{verb} {args}");
         }
+    }
+
+    #[test]
+    fn stats_verb_arguments_name_a_window_or_a_source() {
+        let window = StatsTarget::Window {
+            id: 7,
+            generation: 3,
+        };
+        assert_eq!(
+            parse_stats_op("comp.window.stats", &json!({"id": 7, "generation": 3})),
+            Ok(WindowOp::Stats {
+                target: window.clone(),
+                samples: STATS_RING,
+            })
+        );
+        assert_eq!(
+            parse_stats_op(
+                "comp.window.stats",
+                &json!({"source": "scene", "registration": 2, "samples": 0})
+            ),
+            Ok(WindowOp::Stats {
+                target: StatsTarget::Source {
+                    id: "scene".into(),
+                    registration: Some(2),
+                },
+                samples: 0,
+            })
+        );
+        assert_eq!(
+            parse_stats_op("comp.window.stats.reset", &Value::Null),
+            Ok(WindowOp::StatsReset { target: None })
+        );
+        assert_eq!(
+            parse_stats_op(
+                "comp.window.stats.reset",
+                &json!({"id": 7, "generation": 3})
+            ),
+            Ok(WindowOp::StatsReset {
+                target: Some(window)
+            })
+        );
+        assert_eq!(
+            parse_stats_op("comp.window.stats.reset", &json!({"source": "scene"})),
+            Ok(WindowOp::StatsReset {
+                target: Some(StatsTarget::Source {
+                    id: "scene".into(),
+                    registration: None,
+                })
+            })
+        );
+        for (verb, args, field) in [
+            (
+                "comp.window.stats",
+                json!({"id": 7, "generation": 3, "source": "scene"}),
+                "source",
+            ),
+            ("comp.window.stats", json!({}), "id"),
+            ("comp.window.stats", json!({"id": 7}), "generation"),
+            ("comp.window.stats", json!({"source": "Bad.Id"}), "source"),
+            ("comp.window.stats", json!({"source": 7}), "source"),
+            (
+                "comp.window.stats",
+                json!({"source": "scene", "samples": 513}),
+                "samples",
+            ),
+            (
+                "comp.window.stats",
+                json!({"id": 7, "generation": 3, "registration": 1}),
+                "registration",
+            ),
+            (
+                "comp.window.stats.reset",
+                json!({"registration": 1}),
+                "source",
+            ),
+            ("comp.window.stats.reset", json!({"generation": 3}), "id"),
+            ("comp.window.stats.reset", json!([1]), "args"),
+        ] {
+            let Err(reply) = parse_stats_op(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let (rc, body) = reply.into_wire();
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(rc, 10, "{verb} {args}");
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}");
+            assert_eq!(body["path"], field, "{verb} {args}");
+        }
+        let reply = parse_stats_op("comp.window.stats.reset", &json!({"samples": 1}))
+            .expect_err("reset takes no samples");
+        let body = serde_json::from_str::<Value>(&reply.into_wire().1).unwrap();
+        assert_eq!(body["error"], "invalid_args");
+        assert_eq!(body["field"], "samples");
+    }
+
+    #[test]
+    fn window_verb_unknown_fields_are_refused_by_name() {
+        for verb in ["comp.window.restore", "comp.window.minimize"] {
+            let reply = parse_window_op(verb, &json!({"id": 7, "gen": 3}))
+                .expect_err("a typo must not be ignored");
+            let (rc, body) = reply.into_wire();
+            assert_eq!(rc, 10);
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"error": "invalid_args", "field": "gen", "allowed": ["id", "generation"]}),
+                "{verb}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_eight_window_verbs_parse_and_refuse_by_field() {
+        assert_eq!(
+            parse_window_verb("comp.window.focus", &json!({"id": 7, "generation": 3})),
+            Ok(WindowVerb::Op(WindowOp::Focus {
+                id: 7,
+                generation: 3,
+                raise: true
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.focus",
+                &json!({"id": 7, "generation": 3, "raise": false})
+            ),
+            Ok(WindowVerb::Op(WindowOp::Focus {
+                id: 7,
+                generation: 3,
+                raise: false
+            }))
+        );
+        assert_eq!(
+            parse_window_verb("comp.window.raise", &json!({"id": 7, "generation": 3})),
+            Ok(WindowVerb::Op(WindowOp::Raise {
+                id: 7,
+                generation: 3
+            }))
+        );
+        assert_eq!(
+            parse_window_verb("comp.window.close", &json!({"id": 7, "generation": 3})),
+            Ok(WindowVerb::Op(WindowOp::Close {
+                id: 7,
+                generation: 3
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.close",
+                &json!({"id": 7, "generation": 3, "force": true})
+            ),
+            Ok(WindowVerb::Long(LongOp::ForceClose {
+                id: 7,
+                generation: 3,
+                timeout: CLOSE_FORCE_DEFAULT
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.close",
+                &json!({"id": 7, "generation": 3, "force": true, "timeout_ms": 250})
+            ),
+            Ok(WindowVerb::Long(LongOp::ForceClose {
+                id: 7,
+                generation: 3,
+                timeout: Duration::from_millis(250)
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.place",
+                &json!({"id": 7, "generation": 3, "output": "o_x", "x": 10, "height": 300})
+            ),
+            Ok(WindowVerb::Op(WindowOp::Place(PlaceSpec {
+                id: 7,
+                generation: 3,
+                output: Some("o_x".into()),
+                x: Some(10.0),
+                y: None,
+                width: None,
+                height: Some(300),
+            })))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.wait",
+                &json!({"match": {"app_id": "a", "title_contains": "b"}, "until": "presented"})
+            ),
+            Ok(WindowVerb::Long(LongOp::Wait(WaitSpec {
+                window: WindowMatch {
+                    app_id: Some("a".into()),
+                    title_contains: Some("b".into()),
+                    ..WindowMatch::default()
+                },
+                until: WaitUntil::Presented,
+                timeout: WINDOW_WAIT_DEFAULT,
+            })))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.wait",
+                &json!({
+                    "match": {"id": 7},
+                    "until": "size",
+                    "width": 500,
+                    "height": 300,
+                    "timeout_ms": 60_000,
+                })
+            ),
+            Ok(WindowVerb::Long(LongOp::Wait(WaitSpec {
+                window: WindowMatch {
+                    id: Some(7),
+                    ..WindowMatch::default()
+                },
+                until: WaitUntil::Size {
+                    width: 500,
+                    height: 300
+                },
+                timeout: LONG_VERB_MAX,
+            })))
+        );
+
+        for (verb, args, path) in [
+            ("comp.window.focus", json!({"id": 7}), "generation"),
+            (
+                "comp.window.focus",
+                json!({"id": 7, "generation": 3, "raise": 1}),
+                "raise",
+            ),
+            ("comp.window.raise", json!({"generation": 3}), "id"),
+            (
+                "comp.window.close",
+                json!({"id": 7, "generation": 3, "timeout_ms": 5}),
+                "timeout_ms",
+            ),
+            (
+                "comp.window.close",
+                json!({"id": 7, "generation": 3, "force": true, "timeout_ms": 60_001}),
+                "timeout_ms",
+            ),
+            ("comp.window.place", json!({"id": 7, "generation": 3}), "x"),
+            (
+                "comp.window.place",
+                json!({"id": 7, "generation": 3, "width": 0}),
+                "width",
+            ),
+            (
+                "comp.window.place",
+                json!({"id": 7, "generation": 3, "y": "1"}),
+                "y",
+            ),
+            ("comp.window.wait", json!({"until": "mapped"}), "match"),
+            (
+                "comp.window.wait",
+                json!({"match": {}, "until": "mapped"}),
+                "match",
+            ),
+            (
+                "comp.window.wait",
+                json!({"match": {"generation": 3}, "until": "mapped"}),
+                "match.id",
+            ),
+            ("comp.window.wait", json!({"match": {"id": 7}}), "until"),
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 7}, "until": "resized"}),
+                "until",
+            ),
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 7}, "until": "size", "width": 5}),
+                "width",
+            ),
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 7}, "until": "mapped", "height": 5}),
+                "width",
+            ),
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 7}, "until": "mapped", "timeout_ms": 0}),
+                "timeout_ms",
+            ),
+        ] {
+            let body = refusal(parse_window_verb(verb, &args).expect_err("refused"));
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}: {body}");
+            assert_eq!(body["path"], path, "{verb} {args}: {body}");
+        }
+        for (verb, args, field) in [
+            (
+                "comp.window.focus",
+                json!({"id": 7, "generation": 3, "rise": true}),
+                "rise",
+            ),
+            (
+                "comp.window.close",
+                json!({"id": 7, "generation": 3, "kill": true}),
+                "kill",
+            ),
+            (
+                "comp.window.place",
+                json!({"id": 7, "generation": 3, "w": 5}),
+                "w",
+            ),
+            (
+                "comp.window.wait",
+                json!({"match": {"appid": "x"}, "until": "mapped"}),
+                "match.appid",
+            ),
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 1}, "until": "mapped", "for": 1}),
+                "for",
+            ),
+        ] {
+            let body = refusal(parse_window_verb(verb, &args).expect_err("typo refused"));
+            assert_eq!(body["error"], "invalid_args", "{verb}");
+            assert_eq!(body["field"], field, "{verb}");
+        }
+    }
+
+    #[tokio::test]
+    async fn window_wait_and_forced_close_take_the_long_pool() {
+        let (ingress, source, depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, _replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        for (index, (verb, args)) in [
+            (
+                "comp.window.wait",
+                json!({"match": {"id": 7}, "until": "gone", "timeout_ms": 30_000}),
+            ),
+            (
+                "comp.window.close",
+                json!({"id": 7, "generation": 3, "force": true}),
+            ),
+            ("comp.window.close", json!({"id": 7, "generation": 3})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut incoming = command(verb, index);
+            incoming.body = args.to_string();
+            incoming.args = args;
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                incoming,
+            );
+        }
+        let Ok(PortCommand::Long(wait)) = source.try_recv() else {
+            panic!("wait is long");
+        };
+        let Ok(PortCommand::Long(close)) = source.try_recv() else {
+            panic!("forced close is long");
+        };
+        let Ok(PortCommand::Window(polite)) = source.try_recv() else {
+            panic!("polite close is a window op");
+        };
+        assert!(matches!(wait.op, Some(LongOp::Wait(_))));
+        assert!(matches!(close.op, Some(LongOp::ForceClose { .. })));
+        assert_eq!(
+            polite.op,
+            WindowOp::Close {
+                id: 7,
+                generation: 3
+            }
+        );
+        assert_eq!(long_permits.available_permits(), LONG_VERB_PERMITS - 2);
+        assert_eq!(depth.load(Ordering::Acquire), 3);
+        drop((wait, close));
+        assert_eq!(depth.load(Ordering::Acquire), 1);
+        responders.abort_all();
+    }
+
+    #[test]
+    fn set_generation_is_accepted_only_on_window_leaves() {
+        let (path, value, generation) =
+            parse_set(&json!({"path": "windows.s7.minimized", "value": true, "generation": 3}))
+                .expect("fenced window write parses");
+        assert_eq!(
+            (path.as_str(), value, generation),
+            ("windows.s7.minimized", json!(true), Some(3))
+        );
+        let (_, _, generation) =
+            parse_set(&json!({"path": "windows.s7.band", "value": "bottom"})).unwrap();
+        assert_eq!(generation, None, "the fence is optional");
+        for args in [
+            json!({"path": "input.corners.enabled", "value": true, "generation": 3}),
+            json!({"path": "windows.s7.minimized", "value": true, "generation": "3"}),
+        ] {
+            let Err((rc, body)) = parse_set(&args) else {
+                panic!("{args} must be refused");
+            };
+            let body = serde_json::from_str::<Value>(&body).unwrap();
+            assert_eq!(rc, 10);
+            assert_eq!(body["error"], "invalid_value");
+            assert_eq!(body["path"], "generation");
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_window_verbs_cross_ingress_in_order() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(4);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let mut minimize = command("comp.window.minimize", 1);
+        minimize.args = json!({"id": 7, "generation": 3});
+        minimize.body = minimize.args.to_string();
+        minimize
+            .headers
+            .insert("broker_origin".into(), "mesh".into());
+        let mut restore = command("comp.window.restore", 2);
+        restore.args = json!({});
+        restore.body = restore.args.to_string();
+        let mut malformed = command("comp.window.restore", 3);
+        malformed.body = "{".into();
+        for command in [minimize, restore, malformed] {
+            handle_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                command,
+            );
+        }
+        let PortCommand::Window(first) = source.try_recv().expect("minimize admitted") else {
+            panic!("window command expected");
+        };
+        let PortCommand::Window(second) = source.try_recv().expect("restore admitted") else {
+            panic!("window command expected");
+        };
+        assert_eq!(
+            first.op,
+            WindowOp::Minimize {
+                id: 7,
+                generation: 3
+            }
+        );
+        assert_eq!(second.op, WindowOp::Restore { target: None });
+        assert!(first.order < second.order, "arrival order is kept");
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let refused = replies.recv().await.expect("malformed body refused");
+        assert_eq!(refused.id.as_deref(), Some("3"));
+        assert_eq!(refused.rc, 10);
+        responders.abort_all();
+    }
+
+    fn move_op(target: PointerMoveTarget) -> InputOp {
+        InputOp::PointerMove {
+            target,
+            corners: true,
+        }
+    }
+
+    fn refusal(reply: ControlReply) -> Value {
+        let (rc, body) = reply.into_wire();
+        assert_eq!(rc, 10, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn input_verbs_parse_every_documented_form() {
+        assert_eq!(
+            parse_input_op("comp.input.pointer.move", &json!({"x": 40, "y": 30.5})),
+            Ok(move_op(PointerMoveTarget::Output {
+                output: None,
+                x: 40.0,
+                y: 30.5
+            }))
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.move",
+                &json!({"output": "o_nested", "x": 1, "y": 2})
+            ),
+            Ok(move_op(PointerMoveTarget::Output {
+                output: Some("o_nested".into()),
+                x: 1.0,
+                y: 2.0
+            }))
+        );
+        assert_eq!(
+            parse_input_op("comp.input.pointer.move", &json!({"dx": -3})),
+            Ok(move_op(PointerMoveTarget::Relative { dx: -3.0, dy: 0.0 }))
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.move",
+                &json!({"window": {"id": 7, "generation": 3}, "x": 4, "y": 5, "require_hit": true})
+            ),
+            Ok(move_op(PointerMoveTarget::Window {
+                id: 7,
+                generation: 3,
+                x: 4.0,
+                y: 5.0,
+                require_hit: true
+            }))
+        );
+        assert_eq!(
+            parse_input_op("comp.input.pointer.button", &Value::Null),
+            Ok(InputOp::PointerButton {
+                button: BTN_LEFT,
+                action: PressAction::Both
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.button",
+                &json!({"button": "right", "action": "press"})
+            ),
+            Ok(InputOp::PointerButton {
+                button: BTN_RIGHT,
+                action: PressAction::Press
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.button",
+                &json!({"button": 0x113, "action": "release"})
+            ),
+            Ok(InputOp::PointerButton {
+                button: 0x113,
+                action: PressAction::Release
+            })
+        );
+        // A wheel derives detents (15 units = 120); a finger has none and a
+        // missing axis stays missing.
+        assert_eq!(
+            parse_input_op("comp.input.pointer.scroll", &json!({"dy": 15})),
+            Ok(InputOp::PointerScroll {
+                dx: None,
+                dy: Some(15.0),
+                source: ScrollSource::Wheel,
+                v120: (None, Some(120))
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.scroll",
+                &json!({"dx": 0, "source": "finger"})
+            ),
+            Ok(InputOp::PointerScroll {
+                dx: Some(0.0),
+                dy: None,
+                source: ScrollSource::Finger,
+                v120: (None, None)
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.scroll",
+                &json!({"dy": 10, "v120": {"dy": -240}})
+            ),
+            Ok(InputOp::PointerScroll {
+                dx: None,
+                dy: Some(10.0),
+                source: ScrollSource::Wheel,
+                v120: (None, Some(-240))
+            })
+        );
+        assert_eq!(
+            parse_input_op(
+                "comp.input.key",
+                &json!({"key": "q", "modifiers": ["super", "shift"]})
+            ),
+            Ok(InputOp::Key {
+                key: KeySpec::Name("q".into()),
+                action: PressAction::Both,
+                modifiers: vec![
+                    KeySpec::Name("Super_L".into()),
+                    KeySpec::Name("Shift_L".into())
+                ],
+            })
+        );
+        assert_eq!(
+            parse_input_op("comp.input.key", &json!({"key": 28, "action": "press"})),
+            Ok(InputOp::Key {
+                key: KeySpec::Evdev(28),
+                action: PressAction::Press,
+                modifiers: Vec::new(),
+            })
+        );
+        assert_eq!(
+            parse_input_op("comp.input.key", &json!({"text": "ok\n"})),
+            Ok(InputOp::Text("ok\n".into()))
+        );
+        assert_eq!(
+            parse_input_op("comp.input.release_all", &json!({})),
+            Ok(InputOp::ReleaseAll)
+        );
+    }
+
+    #[test]
+    fn input_verbs_refuse_ambiguous_and_out_of_range_arguments() {
+        for (verb, args, path) in [
+            ("comp.input.pointer.move", json!({"x": 1}), "y"),
+            (
+                "comp.input.pointer.move",
+                json!({"x": 1, "y": 2, "dx": 1}),
+                "dx",
+            ),
+            (
+                "comp.input.pointer.move",
+                json!({"x": 1, "y": 2, "require_hit": true}),
+                "require_hit",
+            ),
+            (
+                "comp.input.pointer.move",
+                json!({"window": {"id": 7}, "x": 1, "y": 2}),
+                "window.generation",
+            ),
+            (
+                "comp.input.pointer.move",
+                json!({"window": {"id": 7, "generation": 1}, "dx": 1, "x": 1, "y": 2}),
+                "window",
+            ),
+            ("comp.input.pointer.move", json!({"x": "1", "y": 2}), "x"),
+            ("comp.input.pointer.move", json!({"x": 1e9, "y": 2}), "x"),
+            (
+                "comp.input.pointer.button",
+                json!({"button": "back"}),
+                "button",
+            ),
+            ("comp.input.pointer.button", json!({"button": 30}), "button"),
+            (
+                "comp.input.pointer.button",
+                json!({"action": "tap"}),
+                "action",
+            ),
+            ("comp.input.pointer.scroll", json!({}), "dy"),
+            (
+                "comp.input.pointer.scroll",
+                json!({"dy": 1, "source": "finger", "v120": {"dy": 120}}),
+                "v120",
+            ),
+            (
+                "comp.input.pointer.scroll",
+                json!({"dy": 1, "v120": {"dx": 120}}),
+                "v120.dx",
+            ),
+            ("comp.input.key", json!({}), "key"),
+            ("comp.input.key", json!({"key": ""}), "key"),
+            ("comp.input.key", json!({"key": 0}), "key"),
+            (
+                "comp.input.key",
+                json!({"key": "a", "action": "click"}),
+                "action",
+            ),
+            (
+                "comp.input.key",
+                json!({"key": "a", "modifiers": ["hyper"]}),
+                "modifiers",
+            ),
+            ("comp.input.key", json!({"text": "a", "key": "b"}), "text"),
+            ("comp.input.key", json!({"text": ""}), "text"),
+            ("comp.input.key", json!({"text": "x".repeat(4097)}), "text"),
+            ("comp.input.release_all", json!([1]), "args"),
+        ] {
+            let Err(reply) = parse_input_op(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let body = refusal(reply);
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}: {body}");
+            assert_eq!(body["path"], path, "{verb} {args}: {body}");
+        }
+        for (verb, args, field) in [
+            (
+                "comp.input.pointer.move",
+                json!({"x": 1, "y": 2, "screen": 0}),
+                "screen",
+            ),
+            (
+                "comp.input.pointer.move",
+                json!({"window": {"id": 7, "generation": 1, "gen": 1}, "x": 1, "y": 2}),
+                "window.gen",
+            ),
+            ("comp.input.pointer.button", json!({"btn": "left"}), "btn"),
+            (
+                "comp.input.pointer.scroll",
+                json!({"dy": 1, "discrete": 1}),
+                "discrete",
+            ),
+            ("comp.input.key", json!({"key": "a", "mods": []}), "mods"),
+            ("comp.input.release_all", json!({"all": true}), "all"),
+        ] {
+            let body = refusal(parse_input_op(verb, &args).expect_err("typo refused"));
+            assert_eq!(body["error"], "invalid_args", "{verb}");
+            assert_eq!(body["field"], field, "{verb}");
+        }
+    }
+
+    #[test]
+    fn sequence_parses_delays_and_names_the_failing_step() {
+        let Ok(LongOp::Sequence(steps)) = parse_sequence(&json!({
+            "interval_ms": 10,
+            "steps": [
+                {"verb": "comp.input.pointer.button", "args": {"action": "press"}, "delay_ms": 0},
+                {"verb": "comp.input.pointer.move", "args": {"dx": 5}},
+                {"verb": "comp.input.release_all"},
+            ],
+        })) else {
+            panic!("sequence parses");
+        };
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step.verb, step.delay))
+                .collect::<Vec<_>>(),
+            [
+                ("comp.input.pointer.button", Duration::ZERO),
+                ("comp.input.pointer.move", Duration::from_millis(10)),
+                ("comp.input.release_all", Duration::from_millis(10)),
+            ]
+        );
+        assert_eq!(LongOp::Sequence(steps).budget(), Duration::from_millis(20));
+
+        let body = refusal(
+            parse_sequence(&json!({"steps": [
+                {"verb": "comp.input.key", "args": {"key": "a"}},
+                {"verb": "comp.input.key", "args": {"key": "a", "action": "hold"}},
+            ]}))
+            .expect_err("bad step refused"),
+        );
+        assert_eq!(body["path"], "steps[1].args.action");
+        let body = refusal(
+            parse_sequence(&json!({"steps": [{"verb": "comp.input.key", "args": {"k": 1}}]}))
+                .expect_err("bad step field refused"),
+        );
+        assert_eq!(body["field"], "steps[0].args.k");
+        for (args, path) in [
+            (json!({"steps": []}), "steps"),
+            (
+                json!({"steps": [{"verb": "comp.window.focus"}]}),
+                "steps.verb",
+            ),
+            (
+                json!({"steps": [{"verb": "comp.input.sequence"}]}),
+                "steps.verb",
+            ),
+            (
+                json!({"steps": [
+                    {"verb": "comp.input.release_all", "delay_ms": 40_000},
+                    {"verb": "comp.input.release_all", "delay_ms": 30_000},
+                ]}),
+                "steps",
+            ),
+            (
+                json!({"steps": [{"verb": "comp.input.release_all"}], "interval_ms": -1}),
+                "interval_ms",
+            ),
+        ] {
+            let body = refusal(parse_sequence(&args).expect_err("refused"));
+            assert_eq!(body["path"], path, "{args}");
+        }
+        let too_many = vec![json!({"verb": "comp.input.release_all"}); SEQUENCE_MAX_STEPS + 1];
+        let body = refusal(parse_sequence(&json!({"steps": too_many})).expect_err("capped"));
+        assert_eq!(body["path"], "steps");
+        let body = refusal(
+            parse_sequence(&json!({"steps": [{"verb": "comp.input.release_all", "wait": 1}]}))
+                .expect_err("unknown step field"),
+        );
+        assert_eq!(body["field"], "steps[0].wait");
+    }
+
+    #[tokio::test]
+    async fn input_verbs_cross_ingress_in_order_and_long_verbs_release_their_slot() {
+        let (ingress, source, depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(1));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let mut dispatch = |verb: &str, id: usize, args: Value| {
+            let mut incoming = command(verb, id);
+            incoming.body = args.to_string();
+            incoming.args = args;
+            incoming
+                .headers
+                .insert("broker_origin".into(), "mesh".into());
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                incoming,
+            );
+        };
+        dispatch("comp.input.pointer.move", 1, json!({"x": 1, "y": 2}));
+        dispatch(
+            "comp.input.sequence",
+            2,
+            json!({"steps": [{"verb": "comp.input.release_all", "delay_ms": 50}]}),
+        );
+        // The long pool has one permit and it is held.
+        dispatch(
+            "comp.input.sequence",
+            3,
+            json!({"steps": [{"verb": "comp.input.release_all"}]}),
+        );
+        dispatch("comp.input.key", 4, json!({"text": "ok"}));
+        dispatch("comp.input.teleport", 5, json!({}));
+        dispatch("comp.input.key", 6, json!({"key": "a", "hold": true}));
+
+        let Ok(PortCommand::Input(first)) = source.try_recv() else {
+            panic!("move admitted");
+        };
+        let Ok(PortCommand::Long(mut second)) = source.try_recv() else {
+            panic!("sequence admitted");
+        };
+        let Ok(PortCommand::Input(third)) = source.try_recv() else {
+            panic!("text admitted");
+        };
+        assert!(first.order < second.order && second.order < third.order);
+        assert_eq!(third.op, InputOp::Text("ok".into()));
+        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(depth.load(Ordering::Acquire), 3);
+        // Taking the long request off the queue frees its slot while the
+        // verb itself keeps waiting.
+        assert!(second.slot.take().is_some());
+        assert_eq!(depth.load(Ordering::Acquire), 2);
+
+        let mut refusals = BTreeMap::new();
+        for _ in 0..3 {
+            let reply = replies.recv().await.expect("refusal");
+            refusals.insert(
+                reply.id.clone().unwrap(),
+                serde_json::from_str::<Value>(&reply.body).unwrap(),
+            );
+        }
+        assert_eq!(refusals["3"]["error"], "busy");
+        assert_eq!(refusals["5"]["error"], "unknown_verb");
+        assert_eq!(refusals["6"]["error"], "invalid_args");
+
+        // The long reply waits for its own budget, not the 2 s snapshot one.
+        let _ = second
+            .reply
+            .take()
+            .unwrap()
+            .send(ControlReply::Body(json!({"steps": []})));
+        let reply = replies.recv().await.expect("sequence reply");
+        assert_eq!(reply.id.as_deref(), Some("2"));
+        assert_eq!(reply.rc, 0);
+        responders.abort_all();
+    }
+
+    #[test]
+    fn one_verb_is_capped_at_4096_injected_events() {
+        let text = "a".repeat(TEXT_MAX_CHARS);
+        let step = json!({"verb": "comp.input.key", "args": {"text": text}});
+        // 4 x 256 x 4 = 4096 fits exactly; one more event does not.
+        let Ok(LongOp::Sequence(steps)) = parse_sequence(&json!({"steps": vec![step.clone(); 4]}))
+        else {
+            panic!("exactly at the cap parses");
+        };
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| step.op.event_bound())
+                .sum::<usize>(),
+            MAX_EVENTS_PER_VERB
+        );
+        let mut over = vec![step; 4];
+        over.push(json!({"verb": "comp.input.pointer.move", "args": {"dx": 1}}));
+        let body = refusal(parse_sequence(&json!({"steps": over})).expect_err("over the cap"));
+        assert_eq!(body["path"], "steps");
+        assert!(body["range"].as_str().unwrap().contains("4096"), "{body}");
+        let body = refusal(
+            parse_input_op(
+                "comp.input.key",
+                &json!({"text": "a".repeat(TEXT_MAX_CHARS + 1)}),
+            )
+            .expect_err("text over the cap"),
+        );
+        assert_eq!(body["path"], "text");
+        assert_eq!(
+            parse_input_op(
+                "comp.input.pointer.move",
+                &json!({"dx": 1, "corners": false})
+            ),
+            Ok(InputOp::PointerMove {
+                target: PointerMoveTarget::Relative { dx: 1.0, dy: 0.0 },
+                corners: false
+            })
+        );
+        let body = refusal(
+            parse_window_verb(
+                "comp.window.wait",
+                &json!({"match": {"id": 7, "app_id": "a"}, "until": "mapped"}),
+            )
+            .expect_err("id with names"),
+        );
+        assert_eq!(body["path"], "match");
+    }
+
+    #[test]
+    fn long_admission_budget_is_the_verb_deadline_plus_slack() {
+        let (ingress, _source, _) = test_ingress();
+        let admission = ingress
+            .request_long(LongOp::Sequence(vec![SequenceStep {
+                verb: "comp.input.release_all",
+                op: InputOp::ReleaseAll,
+                delay: Duration::from_millis(1500),
+            }]))
+            .expect("admitted");
+        assert_eq!(
+            admission.timeout_for_test(),
+            Duration::from_millis(1500) + LONG_VERB_SLACK
+        );
+    }
+
+    #[test]
+    fn refused_reply_carries_code_and_detail() {
+        assert_eq!(
+            ControlReply::refused("occluded", json!({"id": 7, "error": "ignored"})).into_wire(),
+            (10, Arc::from(r#"{"error":"occluded","id":7}"#))
+        );
+        assert_eq!(
+            ControlReply::refused("busy", Value::Null).into_wire(),
+            (10, Arc::from(r#"{"error":"busy"}"#))
+        );
     }
 
     #[tokio::test]
@@ -2151,30 +4864,6 @@ mod tests {
         assert_eq!(reply.id.as_deref(), Some("37"));
         assert_eq!(reply.command, "comp.props.set");
         assert_eq!(reply.rc, 0);
-    }
-
-    #[tokio::test]
-    async fn unauthorised_set_is_rejected_before_admission() {
-        let (ingress, source, _) = test_ingress();
-        let mut responders = JoinSet::new();
-        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
-        let (reply_sender, mut replies) = tokio_mpsc::channel(2);
-        let reply_timeouts = Arc::new(AtomicU64::new(0));
-        let mut command = local_set_command(2, "input.corners.enabled", json!(false));
-        command.headers.clear();
-        handle_incoming(
-            &ingress,
-            &mut responders,
-            &permits,
-            &reply_sender,
-            &reply_timeouts,
-            "comp-nested",
-            command,
-        );
-        let reply = replies.recv().await.expect("not-local reply");
-        assert_eq!(reply.rc, 10);
-        assert_eq!(reply.body.as_ref(), "{\"error\":\"not_local\"}");
-        assert!(matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     #[tokio::test]
@@ -2316,7 +5005,10 @@ mod tests {
             local_set_command(3, "input.corners.dwell_ms", json!(250)),
         );
         let reply = replies.recv().await.expect("busy reply");
-        assert_eq!(reply.body.as_ref(), "{\"error\":\"busy\"}");
+        assert_eq!(
+            reply.body.as_ref(),
+            "{\"error\":\"busy\",\"error_code\":\"busy\"}"
+        );
         for _ in 0..PORT_QUEUE_CAPACITY {
             assert!(matches!(source.try_recv(), Ok(PortCommand::Snapshot(_))));
         }
@@ -2711,6 +5403,7 @@ mod tests {
                 id: event_seq,
                 role: "toplevel".into(),
                 foreign_id: None,
+                window: Default::default(),
                 event_seq,
             });
         }

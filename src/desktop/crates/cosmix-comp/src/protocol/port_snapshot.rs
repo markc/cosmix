@@ -13,14 +13,18 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use smithay::{
     output::Output,
+    reexports::wayland_server::Resource as _,
     wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer},
 };
 
+use super::presentation::SourcePresentationLeaves;
+use super::presentation_stats::{OutputStats, PresentationLeaves};
 use super::{
     ChromePointerGrabKind, InteractivePointer, LayerOutputBinding, LockLifecycle,
     LogicalOutputRect, SceneDecorationMode, StackBand, SurfaceId, SurfaceRecord, SurfaceRole,
-    WaylandState, corner::CornerConfig, surface_stack_cmp,
+    WaylandState, corner::CornerConfig, port_observation::SetValidationError, surface_stack_cmp,
 };
+use crate::port::ControlReply;
 
 pub(crate) const BROKER_RETRYING: u8 = 0;
 pub(crate) const BROKER_CONNECTED: u8 = 1;
@@ -86,6 +90,7 @@ pub(crate) struct CompSnapshot {
     pub(crate) outputs: BTreeMap<String, OutputSnapshot>,
     pub(crate) surfaces: BTreeMap<String, SurfaceSnapshot>,
     pub(crate) windows: BTreeMap<String, WindowSnapshot>,
+    pub(crate) sources: BTreeMap<String, SourceSnapshot>,
     pub(crate) stack: Vec<u64>,
     pub(crate) focus: FocusSnapshot,
     pub(crate) decoration: DecorationSnapshot,
@@ -126,6 +131,9 @@ pub(crate) struct OutputSnapshot {
     pub(crate) scale: f64,
     pub(crate) refresh_mhz: u32,
     pub(crate) usable: RectSnapshot,
+    /// Volatile; filled only in read snapshots (never in diffed rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) presentation: Option<OutputPresentationSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -161,6 +169,18 @@ pub(crate) struct SurfaceSnapshot {
     pub(crate) decoration: Option<&'static str>,
     pub(crate) layer: Option<LayerSnapshot>,
     pub(crate) foreign_id: Option<String>,
+    pub(crate) generation: u64,
+    /// Window-only values carried to `project_window_row`; not part of the
+    /// `surfaces.*` tree.
+    #[serde(skip)]
+    pub(crate) window: WindowExtras,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct WindowExtras {
+    pub(crate) window_x: f32,
+    pub(crate) window_y: f32,
+    pub(crate) pid: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -187,6 +207,57 @@ pub(crate) struct WindowSnapshot {
     pub(crate) minimized: bool,
     pub(crate) output: Option<String>,
     pub(crate) band: &'static str,
+    pub(crate) generation: u64,
+    pub(crate) window_x: f32,
+    pub(crate) window_y: f32,
+    pub(crate) visible: bool,
+    pub(crate) pid: Option<u64>,
+    /// Volatile; filled only in read snapshots (never in diffed rows).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) presentation: Option<PresentationLeaves>,
+}
+
+/// `outputs.o_<slug>.presentation.*` (volatile).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OutputPresentationSnapshot {
+    pub(crate) clock_id: u32,
+    /// Kind flag names of the newest frame; null before the first frame.
+    pub(crate) flags: Option<Vec<&'static str>>,
+    pub(crate) flags_mask: Option<u32>,
+    pub(crate) refresh_us: Option<u64>,
+    pub(crate) frames: u64,
+    pub(crate) interval_p50_us: Option<u64>,
+    pub(crate) interval_p99_us: Option<u64>,
+    pub(crate) since_us: u64,
+}
+
+/// `sources.<id>` (volatile, like everything a source reports).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct SourceSnapshot {
+    pub(crate) output: Option<String>,
+    pub(crate) registered_at_us: u64,
+    pub(crate) revision: u64,
+    pub(crate) registration: u64,
+    pub(crate) presentation: SourcePresentationLeaves,
+}
+
+/// Select inside a small volatile object through its serialised form.
+fn select_serialised<T: Serialize>(value: &T, path: &[&str]) -> Option<Value> {
+    let mut node = serialise_selected(value)?;
+    for segment in path {
+        node = node.as_object_mut()?.remove(*segment)?;
+    }
+    Some(node)
+}
+
+fn serialised_node_kind<T: Serialize>(value: &T, path: &[&str]) -> Option<SnapshotNodeKind> {
+    select_serialised(value, path).map(|node| {
+        if node.is_object() {
+            SnapshotNodeKind::Object
+        } else {
+            SnapshotNodeKind::Leaf
+        }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -196,6 +267,15 @@ pub(crate) struct FocusSnapshot {
     pub(crate) pointer: Option<u64>,
     pub(crate) pointer_grab: &'static str,
     pub(crate) session_lock: &'static str,
+    pub(crate) window: FocusWindowSnapshot,
+}
+
+/// `{id, generation}` of the focused window row, both null when no window
+/// has keyboard focus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct FocusWindowSnapshot {
+    pub(crate) id: Option<u64>,
+    pub(crate) generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -220,6 +300,14 @@ pub(crate) struct BindingRowSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct InputSnapshot {
     pub(crate) corners: CornersSnapshot,
+    /// Nested backend only: whether host pointer/key input reaches the seat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<HostInputSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct HostInputSnapshot {
+    pub(crate) passthrough: bool,
 }
 
 /// The XWayland runtime switch as a props subtree: `xwayland.enabled` is
@@ -288,6 +376,7 @@ impl CompSnapshot {
             "outputs" => select_map(&self.outputs, tail, OutputSnapshot::select),
             "surfaces" => select_map(&self.surfaces, tail, SurfaceSnapshot::select),
             "windows" => select_map(&self.windows, tail, WindowSnapshot::select),
+            "sources" => select_map(&self.sources, tail, select_serialised::<SourceSnapshot>),
             "stack" if tail.is_empty() => serialise_selected(&self.stack),
             "focus" => self.focus.select(tail),
             "decoration" => self.decoration.select(tail),
@@ -309,6 +398,7 @@ impl CompSnapshot {
             "outputs" => map_node_kind(&self.outputs, tail, OutputSnapshot::node_kind),
             "surfaces" => map_node_kind(&self.surfaces, tail, SurfaceSnapshot::node_kind),
             "windows" => map_node_kind(&self.windows, tail, WindowSnapshot::node_kind),
+            "sources" => map_node_kind(&self.sources, tail, serialised_node_kind::<SourceSnapshot>),
             "stack" if tail.is_empty() => Some(SnapshotNodeKind::Leaf),
             "focus" => self.focus.node_kind(tail),
             "decoration" => self.decoration.node_kind(tail),
@@ -345,6 +435,9 @@ impl CompSnapshot {
                 PatternSegment::Literal(segment) => append_segments(&mut paths, [*segment]),
                 PatternSegment::OutputKey => {
                     append_segments(&mut paths, self.outputs.keys().map(String::as_str));
+                }
+                PatternSegment::SourceKey => {
+                    append_segments(&mut paths, self.sources.keys().map(String::as_str));
                 }
                 PatternSegment::SurfaceKey => match pattern.first() {
                     Some(PatternSegment::Literal("surfaces")) => {
@@ -436,31 +529,65 @@ flat_snapshot!(
 );
 #[cfg(feature = "xwayland")]
 flat_snapshot!(XwaylandSnapshot, enabled, persist_path);
-flat_snapshot!(
-    WindowSnapshot,
-    id,
-    foreign_id,
-    title,
-    app_id,
-    x,
-    y,
-    width,
-    height,
-    focused,
-    maximized,
-    fullscreen,
-    minimized,
-    output,
-    band,
+macro_rules! window_snapshot {
+    ($($field:ident),+ $(,)?) => {
+        impl WindowSnapshot {
+            fn select(&self, path: &[&str]) -> Option<Value> {
+                match path {
+                    [] => serialise_selected(self),
+                    $([stringify!($field)] => serialise_selected(&self.$field),)+
+                    ["presentation", tail @ ..] => {
+                        select_serialised(self.presentation.as_ref()?, tail)
+                    }
+                    _ => None,
+                }
+            }
+
+            fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+                match path {
+                    [] => Some(SnapshotNodeKind::Object),
+                    $([stringify!($field)] => Some(SnapshotNodeKind::Leaf),)+
+                    ["presentation", tail @ ..] => {
+                        serialised_node_kind(self.presentation.as_ref()?, tail)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+window_snapshot!(
+    id, foreign_id, title, app_id, x, y, width, height, focused, maximized, fullscreen, minimized,
+    output, band, generation, window_x, window_y, visible, pid,
 );
-flat_snapshot!(
-    FocusSnapshot,
-    keyboard,
-    exclusive_latch,
-    pointer,
-    pointer_grab,
-    session_lock,
-);
+flat_snapshot!(FocusWindowSnapshot, id, generation);
+
+impl FocusSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        match path {
+            [] => serialise_selected(self),
+            ["keyboard"] => serialise_selected(&self.keyboard),
+            ["exclusive_latch"] => serialise_selected(&self.exclusive_latch),
+            ["pointer"] => serialise_selected(&self.pointer),
+            ["pointer_grab"] => serialise_selected(&self.pointer_grab),
+            ["session_lock"] => serialise_selected(&self.session_lock),
+            ["window", tail @ ..] => self.window.select(tail),
+            _ => None,
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        match path {
+            [] | ["window"] => Some(SnapshotNodeKind::Object),
+            ["keyboard" | "exclusive_latch" | "pointer" | "pointer_grab" | "session_lock"] => {
+                Some(SnapshotNodeKind::Leaf)
+            }
+            ["window", tail @ ..] => self.window.node_kind(tail),
+            _ => None,
+        }
+    }
+}
 flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
 flat_snapshot!(
@@ -503,6 +630,7 @@ impl OutputSnapshot {
             ["scale"] => serialise_selected(&self.scale),
             ["refresh_mhz"] => serialise_selected(&self.refresh_mhz),
             ["usable", tail @ ..] => self.usable.select(tail),
+            ["presentation", tail @ ..] => select_serialised(self.presentation.as_ref()?, tail),
             _ => None,
         }
     }
@@ -514,6 +642,7 @@ impl OutputSnapshot {
                 Some(SnapshotNodeKind::Leaf)
             }
             ["usable", tail @ ..] => self.usable.node_kind(tail),
+            ["presentation", tail @ ..] => serialised_node_kind(self.presentation.as_ref()?, tail),
             _ => None,
         }
     }
@@ -524,6 +653,11 @@ impl InputSnapshot {
         match path {
             [] => serialise_selected(self),
             ["corners", tail @ ..] => self.corners.select(tail),
+            ["host"] => self.host.as_ref().and_then(serialise_selected),
+            ["host", "passthrough"] => self
+                .host
+                .as_ref()
+                .and_then(|host| serialise_selected(&host.passthrough)),
             _ => None,
         }
     }
@@ -532,6 +666,8 @@ impl InputSnapshot {
         match path {
             [] | ["corners"] => Some(SnapshotNodeKind::Object),
             ["corners", tail @ ..] => self.corners.node_kind(tail),
+            ["host"] => self.host.map(|_| SnapshotNodeKind::Object),
+            ["host", "passthrough"] => self.host.map(|_| SnapshotNodeKind::Leaf),
             _ => None,
         }
     }
@@ -565,6 +701,7 @@ impl SurfaceSnapshot {
             ["layer"] => serialise_selected(&self.layer),
             ["layer", tail @ ..] => self.layer.as_ref()?.select(tail),
             ["foreign_id"] => serialise_selected(&self.foreign_id),
+            ["generation"] => serialise_selected(&self.generation),
             _ => None,
         }
     }
@@ -576,7 +713,7 @@ impl SurfaceSnapshot {
                 "id" | "role" | "mapped" | "visible" | "x" | "y" | "width" | "height" | "band"
                 | "sequence" | "tree_index" | "parent" | "output" | "title" | "app_id" | "focused"
                 | "activated" | "maximized" | "fullscreen" | "minimized" | "decoration"
-                | "foreign_id",
+                | "foreign_id" | "generation",
             ] => Some(SnapshotNodeKind::Leaf),
             ["layer"] => Some(if self.layer.is_some() {
                 SnapshotNodeKind::Object
@@ -624,6 +761,7 @@ pub(super) fn project_outputs(state: &WaylandState) -> Option<OutputProjection> 
                     width: usable.width,
                     height: usable.height,
                 },
+                presentation: None,
             },
         );
     }
@@ -658,6 +796,7 @@ pub(super) fn project_output(
                 width: usable.width,
                 height: usable.height,
             },
+            presentation: None,
         },
     ))
 }
@@ -727,6 +866,22 @@ fn project_surface_row(
         foreign_id: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
             .then(|| state.foreign_toplevel_identifiers.get(&record.id).cloned())
             .flatten(),
+        generation: record.generation,
+        window: WindowExtras {
+            window_x: record.window_origin.0,
+            window_y: record.window_origin.1,
+            // Only rows that become windows pay for the credentials lookup.
+            pid: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
+                .then(|| {
+                    record
+                        .role
+                        .wl_surface()
+                        .client()
+                        .and_then(|client| client.get_credentials(&state.display_handle).ok())
+                })
+                .flatten()
+                .and_then(|credentials| u64::try_from(credentials.pid).ok()),
+        },
     }
 }
 
@@ -746,6 +901,12 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         minimized: surface.minimized,
         output: surface.output.clone(),
         band: surface.band,
+        generation: surface.generation,
+        window_x: surface.window.window_x,
+        window_y: surface.window.window_y,
+        visible: surface.visible,
+        pid: surface.window.pid,
+        presentation: None,
     }
 }
 
@@ -770,6 +931,19 @@ pub(super) fn project_focus(state: &WaylandState) -> FocusSnapshot {
             .and_then(|object| state.surfaces.get(&object))
             .map(|record| record.id.0),
         pointer_grab: pointer_grab_name(state),
+        window: if session_lock_active {
+            FocusWindowSnapshot::default()
+        } else {
+            state
+                .surfaces
+                .values()
+                .filter(|record| record.focused && record.mapped && record.role.managed_toplevel())
+                .min_by_key(|record| record.id.0)
+                .map_or_else(FocusWindowSnapshot::default, |record| FocusWindowSnapshot {
+                    id: Some(record.id.0),
+                    generation: Some(record.generation),
+                })
+        },
         session_lock: if !session_lock_active {
             "none"
         } else {
@@ -848,6 +1022,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         outputs,
         surfaces,
         windows,
+        sources: BTreeMap::new(),
         stack,
         focus: project_focus(state),
         decoration: DecorationSnapshot {
@@ -868,6 +1043,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         },
         input: InputSnapshot {
             corners: state.observations.corner_config.into(),
+            host: state.host_input_snapshot(),
         },
         #[cfg(feature = "xwayland")]
         xwayland: XwaylandSnapshot {
@@ -894,6 +1070,131 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         },
         full_tree: tokio::sync::OnceCell::new(),
     })
+}
+
+/// Which read paths a batch of reads can reach. Volatile presentation
+/// leaves are computed only for those (and never for diff baselines).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadScopes {
+    All,
+    Paths(Vec<String>),
+}
+
+impl ReadScopes {
+    /// Merge one request's scope (`None` = the whole tree).
+    pub(crate) fn add(&mut self, scope: Option<&str>) {
+        match (&mut *self, scope) {
+            (Self::All, _) => {}
+            (Self::Paths(_), None) => *self = Self::All,
+            (Self::Paths(paths), Some(path)) => paths.push(path.to_string()),
+        }
+    }
+
+    /// Whether a read under one of the scopes can include `path`: the scope
+    /// is `path`, an ancestor of it, or a descendant of it.
+    pub(crate) fn wants(&self, path: &str) -> bool {
+        let related = |scope: &str| {
+            scope == path
+                || path
+                    .strip_prefix(scope)
+                    .is_some_and(|rest| rest.starts_with('.'))
+                || scope
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        };
+        match self {
+            Self::All => true,
+            Self::Paths(paths) => paths.iter().any(|scope| related(scope)),
+        }
+    }
+}
+
+/// A read snapshot: the diff snapshot plus the volatile presentation leaves
+/// the scopes can reach.
+pub(super) fn read_snapshot(
+    state: &WaylandState,
+    context: &SnapshotContext,
+    scopes: &ReadScopes,
+) -> Option<CompSnapshot> {
+    let mut snapshot = snapshot(state, context)?;
+    let stats = &state.presentation.stats;
+    for (key, window) in &mut snapshot.windows {
+        if !scopes.wants(&format!("windows.{key}.presentation")) {
+            continue;
+        }
+        window.presentation = Some(stats.window(window.id, window.generation).map_or_else(
+            || PresentationLeaves {
+                since_us: stats.epoch_us,
+                ..PresentationLeaves::default()
+            },
+            |window| window.leaves(),
+        ));
+    }
+    for (key, output) in &mut snapshot.outputs {
+        if !scopes.wants(&format!("outputs.{key}.presentation")) {
+            continue;
+        }
+        output.presentation = Some(output_presentation(
+            stats.output(&output.name),
+            stats.epoch_us,
+        ));
+    }
+    if scopes.wants("sources") {
+        snapshot.sources = state
+            .presentation
+            .sources
+            .iter()
+            .filter(|(id, _)| scopes.wants(&format!("sources.{id}")))
+            .map(|(id, counters)| {
+                (
+                    id.clone(),
+                    SourceSnapshot {
+                        output: counters.output.clone(),
+                        registered_at_us: counters.registered_at_us,
+                        revision: counters.revision,
+                        registration: counters.registration,
+                        presentation: counters.leaves(),
+                    },
+                )
+            })
+            .collect();
+    }
+    Some(snapshot)
+}
+
+/// `wp_presentation_feedback` kind bits by name (design C3).
+const PRESENTATION_FLAG_NAMES: [(u32, &str); 4] = [
+    (0x1, "vsync"),
+    (0x2, "hw_clock"),
+    (0x4, "hw_completion"),
+    (0x8, "zero_copy"),
+];
+
+pub(crate) fn presentation_flag_names(mask: u32) -> Vec<&'static str> {
+    PRESENTATION_FLAG_NAMES
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+fn output_presentation(stats: Option<&OutputStats>, epoch_us: u64) -> OutputPresentationSnapshot {
+    let intervals = stats
+        .map(|stats| stats.intervals_us.summary())
+        .unwrap_or_default();
+    let flags_mask = stats
+        .filter(|stats| stats.frames > 0)
+        .map(|stats| stats.flags);
+    OutputPresentationSnapshot {
+        clock_id: libc::CLOCK_MONOTONIC as u32,
+        flags: flags_mask.map(presentation_flag_names),
+        flags_mask,
+        refresh_us: stats.and_then(|stats| stats.refresh_us),
+        frames: stats.map_or(0, |stats| stats.frames),
+        interval_p50_us: intervals.p50,
+        interval_p99_us: intervals.p99,
+        since_us: stats.map_or(epoch_us, |stats| stats.since_us),
+    }
 }
 
 fn output_slug_collides(
@@ -1054,6 +1355,8 @@ pub(crate) enum PatternSegment {
     Literal(&'static str),
     OutputKey,
     SurfaceKey,
+    /// A content source id (`[a-z0-9_-]{1,64}`).
+    SourceKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1068,6 +1371,8 @@ pub(crate) struct DescribeEntry {
     pub(crate) range: Option<&'static str>,
     pub(crate) persistence: Option<&'static str>,
     pub(crate) owner: &'static str,
+    /// Served by reads but never reported by `props.changed`.
+    pub(crate) volatile: bool,
 }
 
 macro_rules! descriptor {
@@ -1083,6 +1388,7 @@ macro_rules! descriptor {
             range: None,
             persistence: None,
             owner: "comp",
+            volatile: false,
         }
     };
     ($segments:expr, $ty:ident, $description:expr, mutable, range = $range:expr) => {
@@ -1114,7 +1420,16 @@ macro_rules! descriptor {
     };
 }
 
-use PatternSegment::{Literal as L, OutputKey as O, SurfaceKey as S};
+macro_rules! volatile {
+    ([$($segment:expr),+ $(,)?], $ty:ident, $description:expr) => {
+        DescribeEntry {
+            volatile: true,
+            ..descriptor!(&[$($segment),+], $ty, $description)
+        }
+    };
+}
+
+use PatternSegment::{Literal as L, OutputKey as O, SourceKey as C, SurfaceKey as S};
 
 pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
@@ -1333,6 +1648,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Mapped foreign-toplevel identifier or null"
     ),
     descriptor!(
+        &[L("surfaces"), S, L("generation")],
+        Number,
+        "Role generation; a new role (including the role ending) takes a new value, an unmap/remap of the same role keeps it"
+    ),
+    descriptor!(
         &[L("windows"), S, L("id")],
         Number,
         "Session-local toplevel id",
@@ -1395,14 +1715,48 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("minimized")],
         Bool,
-        "Compositor minimized state"
+        "Compositor minimized state; write false to restore and focus this window, true to minimise it",
+        mutable
     ),
     descriptor!(
         &[L("windows"), S, L("output")],
         String,
         "Output key or null"
     ),
-    descriptor!(&[L("windows"), S, L("band")], String, "Compositor stack band; writable as bottom|normal to demote a window behind all normal windows or restore it", enum = &["background", "bottom", "normal", "top", "overlay", "lock"]),
+    // Writable (bottom|normal) and process-lifetime; the enum still lists
+    // every band a read can report.
+    DescribeEntry {
+        mutable: true,
+        persistence: Some("none"),
+        ..descriptor!(&[L("windows"), S, L("band")], String, "Compositor stack band; writable as bottom|normal to demote a window behind all normal windows or restore it", enum = &["background", "bottom", "normal", "top", "overlay", "lock"])
+    },
+    descriptor!(
+        &[L("windows"), S, L("generation")],
+        Number,
+        "Role generation (same value as surfaces.s<id>.generation); {id, generation} names one window"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("window_x")],
+        Number,
+        "Window-geometry x origin (x/y are the buffer origin, CSD shadow included)",
+        format = "logical_px"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("window_y")],
+        Number,
+        "Window-geometry y origin",
+        format = "logical_px"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("visible")],
+        Bool,
+        "Whether the window is effectively on screen (false while minimised)"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("pid")],
+        Number,
+        "Process id of the client socket peer (a proxy or sandbox may report its own), or null"
+    ),
     descriptor!(
         &[L("stack")],
         List,
@@ -1428,6 +1782,17 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         format = "surface_id"
     ),
     descriptor!(&[L("focus"), L("pointer_grab")], String, "Active pointer grab kind", enum = &["none", "chrome", "move", "resize", "popup"]),
+    descriptor!(
+        &[L("focus"), L("window"), L("id")],
+        Number,
+        "Keyboard-focused managed window (xdg or X11) id or null",
+        format = "surface_id"
+    ),
+    descriptor!(
+        &[L("focus"), L("window"), L("generation")],
+        Number,
+        "Role generation of the keyboard-focused window or null"
+    ),
     descriptor!(&[L("focus"), L("session_lock")], String, "Session-lock observation state", enum = &["none", "locking", "locked", "orphaned", "unlocking"]),
     descriptor!(
         &[L("decoration"), L("enabled")],
@@ -1473,6 +1838,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         mutable,
         range = "1.0..=20000.0"
     ),
+    descriptor!(
+        &[L("input"), L("host"), L("passthrough")],
+        Bool,
+        "Nested backend only: false drops host pointer and key input (resize, \
+         scale and pointer leave still pass) so injected input is not overwritten",
+        mutable
+    ),
     // The one file-persisted leaf on this surface (see the resolver in
     // xwayland.rs for why startup-read + persistence:none would make the
     // leaf decorative). `persistence: "file"` overrides the mutable
@@ -1495,6 +1867,269 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         String,
         "Resolved per-socket file xwayland.enabled persists to (root- and \
          socket-dependent; read-only so the governing file is visible, not deduced)"
+    ),
+    // Presentation statistics are volatile: served by get/list/describe,
+    // never diffed into props.changed (a watched 60 Hz client would flood
+    // the topic). Times are CLOCK_MONOTONIC µs.
+    volatile!(
+        [L("windows"), S, L("presentation"), L("presented")],
+        Number,
+        "Content updates shown since since_us (one per frame, subsurfaces included)"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("discarded")],
+        Number,
+        "Content updates superseded before any frame showed them"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("last_presented_us")],
+        Number,
+        "Time of the newest frame that showed an update, or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("interval_p50_us")],
+        Number,
+        "Median interval between consecutive presentations while shown (newest 512), or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("interval_p99_us")],
+        Number,
+        "99th percentile interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("interval_max_us")],
+        Number,
+        "Largest interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("commit_to_present_p50_us")
+        ],
+        Number,
+        "Median buffer commit to presentation latency (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("commit_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile buffer commit to presentation latency (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("input_to_present_p50_us")
+        ],
+        Number,
+        "Median injected input to first presented update committed after it, or null"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("presentation"),
+            L("input_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile injected input to presentation latency, or null"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("missed")],
+        Number,
+        "Vblanks skipped while an update was pending; null while the refresh is unknown (nested)"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("refresh_us")],
+        Number,
+        "Fixed refresh of the newest presentation's output, or null (unknown or variable)"
+    ),
+    volatile!(
+        [L("windows"), S, L("presentation"), L("since_us")],
+        Number,
+        "When counting started (the window's first update or the last reset)"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("clock_id")],
+        Number,
+        "Presentation clock id (1 = CLOCK_MONOTONIC)"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("flags")],
+        List,
+        "Kind flags of the newest frame (vsync, hw_clock, hw_completion, zero_copy), or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("flags_mask")],
+        Number,
+        "wp_presentation_feedback kind bits of the newest frame, or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("refresh_us")],
+        Number,
+        "Fixed refresh reported with the newest frame, or null (unknown or variable; never 0)"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("frames")],
+        Number,
+        "Frames presented on this output since since_us"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("interval_p50_us")],
+        Number,
+        "Median interval between presented frames (newest 512), or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("interval_p99_us")],
+        Number,
+        "99th percentile interval between presented frames (newest 512), or null"
+    ),
+    volatile!(
+        [L("outputs"), O, L("presentation"), L("since_us")],
+        Number,
+        "When counting started (compositor start or the last reset)"
+    ),
+    volatile!(
+        [L("sources"), C, L("output")],
+        String,
+        "Output the content source asked to be measured on, or null for any"
+    ),
+    volatile!(
+        [L("sources"), C, L("registered_at_us")],
+        Number,
+        "When this registration of the id began"
+    ),
+    volatile!(
+        [L("sources"), C, L("revision")],
+        Number,
+        "Newest content revision reported by the source"
+    ),
+    volatile!(
+        [L("sources"), C, L("registration")],
+        Number,
+        "Registration number; a new one each time the id is registered"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("presented")],
+        Number,
+        "Revisions shown since since_us"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("discarded")],
+        Number,
+        "Revisions superseded before any frame showed them"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("last_presented_us")],
+        Number,
+        "Time of the newest frame that showed a revision, or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("interval_p50_us")],
+        Number,
+        "Median interval between consecutive presentations while shown (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("interval_p99_us")],
+        Number,
+        "99th percentile interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("interval_max_us")],
+        Number,
+        "Largest interval between consecutive presentations (newest 512), or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("commit_to_present_p50_us")
+        ],
+        Number,
+        "Median time from comp first seeing a revision to its presentation, or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("commit_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile time from comp first seeing a revision to its presentation, or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("input_to_present_p50_us")
+        ],
+        Number,
+        "Median injected input to presentation of the revision that answered it, or null"
+    ),
+    volatile!(
+        [
+            L("sources"),
+            C,
+            L("presentation"),
+            L("input_to_present_p99_us")
+        ],
+        Number,
+        "99th percentile injected input to presentation latency, or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("missed")],
+        Number,
+        "Vblanks skipped while a revision was pending; null while the refresh is unknown (nested)"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("refresh_us")],
+        Number,
+        "Fixed refresh of the newest presentation's output, or null (unknown or variable)"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("since_us")],
+        Number,
+        "When counting started (registration or the last reset)"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("upload_bytes_total")],
+        Number,
+        "GPU upload bytes the source reported since since_us"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("damage_px_total")],
+        Number,
+        "Damaged physical pixels the source reported since since_us"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("upload_bytes_p50")],
+        Number,
+        "Median upload bytes per reported frame (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("upload_bytes_p99")],
+        Number,
+        "99th percentile upload bytes per reported frame (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("damage_px_p50")],
+        Number,
+        "Median damaged pixels per reported frame (newest 512), or null"
+    ),
+    volatile!(
+        [L("sources"), C, L("presentation"), L("damage_px_p99")],
+        Number,
+        "99th percentile damaged pixels per reported frame (newest 512), or null"
     ),
     descriptor!(&[L("port"), L("level")], String, "Implemented property substrate level", enum = &["L2"]),
     descriptor!(
@@ -1543,6 +2178,15 @@ impl DescribeEntry {
                     PatternSegment::SurfaceKey => actual.strip_prefix('s').is_some_and(|id| {
                         !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
                     }),
+                    PatternSegment::SourceKey => {
+                        (1..=64).contains(&actual.len())
+                            && actual.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || byte == b'_'
+                                    || byte == b'-'
+                            })
+                    }
                 })
     }
 }
@@ -1566,10 +2210,24 @@ struct DescribeReply<'a> {
     owner: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     children: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "is_false")]
+    volatile: bool,
 }
 
 fn slice_is_empty(values: &&[&str]) -> bool {
     values.is_empty()
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Paths `props.changed` never reports: presentation statistics and the
+/// content-source registry change every frame.
+pub(crate) fn volatile_path(path: &str) -> bool {
+    path == "sources"
+        || path.starts_with("sources.")
+        || path.split('.').any(|segment| segment == "presentation")
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -1591,7 +2249,11 @@ pub(super) fn service_requests(state: &mut WaylandState) {
         state.pending_port_requests.clear();
         return;
     };
-    let Some(snapshot) = snapshot(state, &context).map(Arc::new) else {
+    let mut scopes = ReadScopes::Paths(Vec::new());
+    for request in &state.pending_port_requests {
+        scopes.add(request.scope.as_deref());
+    }
+    let Some(snapshot) = read_snapshot(state, &context, &scopes).map(Arc::new) else {
         tracing::warn!(
             "compositor Bus snapshot contains coordinates not exactly representable as f32"
         );
@@ -1638,6 +2300,9 @@ async fn dispatch_read_with_limit(
             limit_bytes,
         );
     }
+    if command == "comp.windows.list" {
+        return enforce_reply_limit(windows_list(&snapshot, &args), limit_bytes);
+    }
     if !matches!(
         command.as_str(),
         "comp.props.get" | "comp.props.list" | "comp.props.describe"
@@ -1661,6 +2326,67 @@ async fn dispatch_read_with_limit(
             .await
             .unwrap_or_else(|_| error("busy"));
     enforce_reply_limit(reply, limit_bytes)
+}
+
+fn list_argument(path: &str, expected: &'static str, range: &'static str) -> (u8, Arc<str>) {
+    ControlReply::Validation(SetValidationError::InvalidValue {
+        path: path.into(),
+        expected,
+        range,
+    })
+    .into_wire()
+}
+
+/// `comp.windows.list {app_id?, title?, title_contains?, visible?}`: the
+/// window rows matching every given filter, in id order.
+fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
+    const ALLOWED: &[&str] = &["app_id", "title", "title_contains", "visible"];
+    let empty = serde_json::Map::new();
+    let object = match args {
+        Value::Null => &empty,
+        Value::Object(object) => object,
+        _ => return list_argument("args", "JSON object", "filter object"),
+    };
+    if let Some(field) = object.keys().find(|field| !ALLOWED.contains(&field.as_str())) {
+        return ControlReply::InvalidArgs {
+            field: field.clone(),
+            allowed: ALLOWED,
+        }
+        .into_wire();
+    }
+    let mut texts = [None; 3];
+    for (slot, name) in texts.iter_mut().zip(["app_id", "title", "title_contains"]) {
+        match object.get(name) {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) if value.len() <= 4096 => *slot = Some(value.as_str()),
+            Some(_) => return list_argument(name, "string", "at most 4096 bytes"),
+        }
+    }
+    let [app_id, title, title_contains] = texts;
+    let visible = match object.get("visible") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(visible)) => Some(*visible),
+        Some(_) => return list_argument("visible", "bool", "true|false"),
+    };
+    let mut rows = snapshot
+        .windows
+        .values()
+        .filter(|row| {
+            app_id.is_none_or(|app_id| row.app_id.as_deref() == Some(app_id))
+                && title.is_none_or(|title| row.title.as_deref() == Some(title))
+                && title_contains.is_none_or(|needle| {
+                    row.title
+                        .as_deref()
+                        .is_some_and(|title| title.contains(needle))
+                })
+                && visible.is_none_or(|visible| row.visible == visible)
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.id);
+    match serde_json::to_string(&json!({ "windows": rows })) {
+        Ok(body) => (0, Arc::from(body)),
+        Err(_) => error("busy"),
+    }
 }
 
 async fn full_tree(snapshot: Arc<CompSnapshot>) -> Result<SerialisedReply, ()> {
@@ -1826,6 +2552,7 @@ fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
             persistence: entry.persistence,
             owner: entry.owner,
             children: None,
+            volatile: entry.volatile,
         })
         .ok();
     }
@@ -1850,6 +2577,7 @@ fn describe(snapshot: &CompSnapshot, path: &PropPath) -> Option<String> {
         persistence: None,
         owner: "comp",
         children: Some(children.into_iter().collect()),
+        volatile: volatile_path(path.as_str()),
     })
     .ok()
 }
@@ -1882,6 +2610,16 @@ mod tests {
                     width: 1920.0,
                     height: 1050.0,
                 },
+                presentation: Some(OutputPresentationSnapshot {
+                    clock_id: 1,
+                    flags: Some(vec!["vsync"]),
+                    flags_mask: Some(1),
+                    refresh_us: None,
+                    frames: 3,
+                    interval_p50_us: Some(16_000),
+                    interval_p99_us: Some(17_000),
+                    since_us: 5,
+                }),
             },
         );
         let layer = SurfaceSnapshot {
@@ -1913,6 +2651,8 @@ mod tests {
                 binding: "explicit",
             }),
             foreign_id: None,
+            generation: 3,
+            window: WindowExtras::default(),
         };
         let toplevel = SurfaceSnapshot {
             id: 2,
@@ -1938,6 +2678,12 @@ mod tests {
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("foreign-2".into()),
+            generation: 4,
+            window: WindowExtras {
+                window_x: 52.0,
+                window_y: 72.0,
+                pid: Some(4242),
+            },
         };
         let mut surfaces = BTreeMap::new();
         surfaces.insert("s1".into(), layer);
@@ -1995,6 +2741,31 @@ mod tests {
                 minimized: toplevel.minimized,
                 output: toplevel.output.clone(),
                 band: toplevel.band,
+                generation: toplevel.generation,
+                window_x: toplevel.window.window_x,
+                window_y: toplevel.window.window_y,
+                visible: toplevel.visible,
+                pid: toplevel.window.pid,
+                presentation: Some(PresentationLeaves {
+                    presented: 3,
+                    interval_p50_us: Some(16_000),
+                    since_us: 5,
+                    ..PresentationLeaves::default()
+                }),
+            },
+        );
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "scene".to_string(),
+            SourceSnapshot {
+                output: None,
+                registered_at_us: 7,
+                revision: 4,
+                registration: 1,
+                presentation: SourcePresentationLeaves {
+                    upload_bytes_total: 640,
+                    ..SourcePresentationLeaves::default()
+                },
             },
         );
         CompSnapshot {
@@ -2010,6 +2781,7 @@ mod tests {
             outputs,
             surfaces,
             windows,
+            sources,
             stack: vec![1, 2],
             focus: FocusSnapshot {
                 keyboard: Some(2),
@@ -2017,6 +2789,10 @@ mod tests {
                 pointer: Some(2),
                 pointer_grab: "none",
                 session_lock: "none",
+                window: FocusWindowSnapshot {
+                    id: Some(2),
+                    generation: Some(4),
+                },
             },
             decoration: DecorationSnapshot {
                 enabled: true,
@@ -2032,6 +2808,7 @@ mod tests {
             },
             input: InputSnapshot {
                 corners: CornerConfig::default().into(),
+                host: Some(HostInputSnapshot { passthrough: true }),
             },
             #[cfg(feature = "xwayland")]
             xwayland: XwaylandSnapshot {
@@ -2053,25 +2830,29 @@ mod tests {
     }
 
     #[test]
-    fn corner_descriptors_are_the_only_mutable_process_lifetime_leaves() {
+    fn mutable_descriptors_match_the_writable_leaves() {
         let snapshot = fixture();
         let mutable = DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.mutable)
             .collect::<Vec<_>>();
-        // The corner leaves are process-lifetime (persistence "none");
-        // `xwayland.enabled` is deliberately the surface's ONE
-        // file-persisted mutable leaf (startup-read — a non-persisted
-        // startup switch would be unreachable from its own surface).
+        // The corner leaves and the window band are process-lifetime
+        // (persistence "none"); `xwayland.enabled` is deliberately the
+        // surface's ONE file-persisted mutable leaf (startup-read — a
+        // non-persisted startup switch would be unreachable from its own
+        // surface).
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 5);
+        assert_eq!(mutable.len(), 8);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 4);
+        assert_eq!(mutable.len(), 7);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
             "input.corners.velocity_max_px_s",
+            "input.host.passthrough",
+            "windows.s2.band",
+            "windows.s2.minimized",
         ] {
             let path = PropPath::new(path).unwrap();
             let body = describe(&snapshot, &path).expect("mutable descriptor");
@@ -2113,6 +2894,111 @@ mod tests {
                 descriptor.pattern
             );
         }
+    }
+
+    /// S14: the descriptor table's `volatile` flag and the path rule
+    /// `props.changed` filters on never disagree.
+    #[test]
+    fn descriptor_volatility_matches_the_path_rule() {
+        let mut volatile = 0;
+        for descriptor in DESCRIPTORS {
+            let path = descriptor
+                .pattern
+                .iter()
+                .map(|segment| match segment {
+                    PatternSegment::Literal(literal) => *literal,
+                    PatternSegment::OutputKey => "o_dp_1",
+                    PatternSegment::SurfaceKey => "s2",
+                    PatternSegment::SourceKey => "scene",
+                })
+                .collect::<Vec<_>>()
+                .join(".");
+            assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
+            volatile += usize::from(descriptor.volatile);
+        }
+        assert_eq!(volatile, 13 + 8 + 4 + 19);
+    }
+
+    #[test]
+    fn scopes_reach_ancestors_and_descendants_only() {
+        let scopes = ReadScopes::Paths(vec!["windows.s2".into(), "outputs".into()]);
+        assert!(scopes.wants("windows.s2.presentation"));
+        assert!(scopes.wants("outputs.o_dp_1.presentation"));
+        assert!(!scopes.wants("windows.s20.presentation"));
+        assert!(!scopes.wants("sources"));
+        assert!(ReadScopes::Paths(vec!["sources.scene.revision".into()]).wants("sources"));
+        let mut merged = ReadScopes::Paths(Vec::new());
+        assert!(!merged.wants("sources"));
+        merged.add(Some("info"));
+        assert!(!merged.wants("sources"));
+        merged.add(None);
+        assert_eq!(merged, ReadScopes::All);
+    }
+
+    #[test]
+    fn flag_names_follow_the_kind_bits() {
+        assert_eq!(presentation_flag_names(0), Vec::<&str>::new());
+        assert_eq!(
+            presentation_flag_names(0x7),
+            ["vsync", "hw_clock", "hw_completion"]
+        );
+        assert_eq!(presentation_flag_names(0x8), ["zero_copy"]);
+    }
+
+    #[test]
+    fn presentation_and_source_leaves_are_described_as_volatile() {
+        let snapshot = fixture();
+        let describe_json = |path: &str| {
+            let body = describe(&snapshot, &PropPath::new(path).unwrap())
+                .unwrap_or_else(|| panic!("describe {path}"));
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        for path in [
+            "windows.s2.presentation.presented",
+            "windows.s2.presentation.missed",
+            "outputs.o_dp_1.presentation.frames",
+            "sources.scene.revision",
+            "sources.scene.output",
+            "sources.scene.presentation.upload_bytes_p99",
+        ] {
+            let body = describe_json(path);
+            assert_eq!(body["volatile"], true, "{path}");
+            assert_eq!(body["mutable"], false, "{path}");
+            assert!(volatile_path(path), "{path}");
+        }
+        for path in ["windows.s2.presentation", "sources.scene", "sources"] {
+            let body = describe_json(path);
+            assert_eq!(body["type"], "object");
+            assert_eq!(body["volatile"], true, "{path}");
+        }
+        assert!(
+            describe_json("windows.s2.presentation")["children"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("windows.s2.presentation.since_us"))
+        );
+        for path in ["windows.s2.title", "outputs.o_dp_1", "windows"] {
+            assert!(describe_json(path).get("volatile").is_none(), "{path}");
+            assert!(!volatile_path(path), "{path}");
+        }
+        assert_eq!(
+            snapshot.select(&["sources", "scene", "presentation", "upload_bytes_total"]),
+            Some(json!(640))
+        );
+        assert_eq!(
+            snapshot.select(&["windows", "s2", "presentation", "missed"]),
+            Some(Value::Null),
+            "unmeasured missed is null"
+        );
+        assert_eq!(
+            snapshot.select(&["outputs", "o_dp_1", "presentation", "clock_id"]),
+            Some(json!(1))
+        );
+        assert_eq!(snapshot.select(&["sources", "scene", "nope"]), None);
+        assert_eq!(
+            snapshot.select(&["windows", "s2", "presentation", "presented", "x"]),
+            None
+        );
     }
 
     #[tokio::test]

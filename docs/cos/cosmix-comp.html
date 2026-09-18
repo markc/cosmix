@@ -572,7 +572,7 @@ The seat/KMS compositor registers as <code>comp</code>; <code>--nested</code> re
 instead of silently ignoring it. The broker independently enforces the same
 SPEC 10 service-name grammar at registration and rejects an invalid <code>from</code>
 with Bus rc 10.</p>
-<p>The control plane exposes eight verbs:</p>
+<p>The control plane exposes these verbs:</p>
 <ul>
 <li><code>comp.ping</code> returns <code>{"pong":true}</code> without taking a compositor snapshot.</li>
 <li><code>comp.info</code> returns service/build/backend provenance plus output and surface
@@ -589,33 +589,79 @@ owner) or an object subtree with its immediate children.</li>
 the name this compositor instance actually registered. The reply is truthful
 only for a caller that subscribed to that topic before calling <code>watch</code> and
 remains subscribed.</li>
-<li><code>comp.props.set {path,value}</code> mutates the four corner properties,
-<code>windows.s&lt;id&gt;.band</code>, or <code>xwayland.enabled</code> and returns
-<code>{path,old,new}</code>; for the file-persisted <code>xwayland.enabled</code> the reply also
-carries <code>persisted</code> — <code>false</code> means the in-memory change and the changed
-event stand but the write to disk failed and the value will not survive
-restart.</li>
-<li><code>comp.pointer.watch</code> renews a three-second local pointer observation lease
+<li><code>comp.props.set {path,value,generation?}</code> mutates the four corner
+properties, <code>windows.s&lt;id&gt;.band</code>, <code>windows.s&lt;id&gt;.minimized</code>,
+<code>input.host.passthrough</code>, or <code>xwayland.enabled</code> and returns <code>{path,old,new}</code>; for the file-persisted
+<code>xwayland.enabled</code> the reply also carries <code>persisted</code> — <code>false</code> means the
+in-memory change and the changed event stand but the write to disk failed
+and the value will not survive restart. The optional <code>generation</code> fences a
+<code>windows.s&lt;id&gt;.*</code> write (see Window identity below); it is refused on any
+other path.</li>
+<li><code>comp.pointer.watch</code> renews a three-second pointer observation lease
 and returns <code>{version:1,topic:"&lt;service&gt;.pointer.changed",lease_ms:3000}</code>.
 Subscribe before calling; renew about once per second while observation is
-wanted. This verb uses the same broker-proven local caller requirement as
-property writes. The acknowledgement contains no pointer coordinates.</li>
+wanted. The acknowledgement contains no pointer coordinates.</li>
+<li><code>comp.window.minimize {id,generation}</code> minimises one window, like its
+title-bar button. Both fields are required.</li>
+<li><code>comp.window.restore {id?,generation?}</code> with no arguments restores the most
+recently minimised window, exactly like the <code>Super+Shift+M</code> binding; with
+<code>{id,generation}</code> (both required together) it restores that window. If the
+window is minimised, either form un-minimises, raises and focuses it; if it
+is not, nothing happens and the reply says <code>changed:false</code>.</li>
+<li><code>comp.window.stats {id,generation | source}</code> and
+<code>comp.window.stats.reset {id,generation | source | nothing}</code> read and zero
+presentation statistics (see Presentation statistics below).</li>
+<li><code>comp.window.focus</code>, <code>comp.window.raise</code>, <code>comp.window.close</code>,
+<code>comp.window.place</code> and <code>comp.window.wait</code> act on or wait for one window
+(see Window control below). <code>comp.windows.list</code> lists window rows.</li>
+<li><code>comp.input.pointer.move</code>, <code>comp.input.pointer.button</code>,
+<code>comp.input.pointer.scroll</code>, <code>comp.input.key</code>, <code>comp.input.release_all</code> and
+<code>comp.input.sequence</code> inject input through the real seat (see Input
+injection below).</li>
 </ul>
+<p>Minimise and restore reply <code>{id,generation,title,app_id,minimized,changed}</code>;
+<code>changed:false</code> means the window was already in the requested state.
+<code>comp.window.restore {}</code> with nothing to restore replies rc 10
+<code>{"error":"not_found","minimized_count":N}</code>. While a session lock is active
+both verbs, and writes to <code>windows.s&lt;id&gt;.minimized</code>, reply
+<code>{"error":"locked"}</code>. An argument other than <code>id</code> or <code>generation</code> is refused
+with <code>{"error":"invalid_args","field":"&lt;name&gt;","allowed":["id","generation"]}</code>,
+so a typo such as <code>gen</code> cannot silently turn a fenced call into an unfenced
+one.</p>
+<p>No verb checks who the caller is. Any caller that noded delivers, local or from
+the WireGuard mesh, can read, write and watch; being on the mesh is the whole
+authorization. What the port still refuses is a malformed or mis-aimed request
+(unknown path, wrong type, out-of-range value, a window that is not there).</p>
 <p>The complete L2 read tree is:</p>
 <pre><code class="language-text">info.{service,version,backend,engine,instance}
 outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
-                  usable.{x,y,width,height}}
+                  usable.{x,y,width,height},
+                  presentation.{clock_id,flags,flags_mask,refresh_us,frames,
+                    interval_p50_us,interval_p99_us,since_us}}  (presentation: volatile)
 surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
                 maximized,fullscreen,minimized,decoration,
-                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id}
+                layer.{stratum,interactivity,exclusive_zone,binding},foreign_id,
+                generation}
 windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
-               maximized,fullscreen,minimized,output,band}
+               maximized,fullscreen,minimized,output,band,generation,
+               window_x,window_y,visible,pid,
+               presentation.{presented,discarded,last_presented_us,
+                 interval_p50_us,interval_p99_us,interval_max_us,
+                 commit_to_present_p50_us,commit_to_present_p99_us,
+                 input_to_present_p50_us,input_to_present_p99_us,
+                 missed,refresh_us,since_us}}          (presentation: volatile)
+sources.&lt;id&gt;.{output,registered_at_us,revision,registration,
+              presentation.{&lt;the window leaves&gt;,upload_bytes_total,
+                damage_px_total,upload_bytes_p50,upload_bytes_p99,
+                damage_px_p50,damage_px_p99}}          (volatile)
 stack
-focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock}
+focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
+       window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
@@ -632,6 +678,37 @@ sequence watermark across every topic, and <code>port.lost_count</code> is cumul
 <code>port.broker</code> is driven by connection-state edges and is <code>connected</code> or
 <code>retrying</code>. <code>port.reply_timeouts</code> and <code>port.publish_timeouts</code> count their
 separate bounded lanes; both abandon a sink wait after two seconds.</p>
+<p>Window rows add five read-only leaves. <code>generation</code> is the window's role
+generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin; <code>x</code>/<code>y</code>
+stay the buffer origin, which includes any client-side shadow. <code>visible</code> is
+effective on-screen visibility: use it to ask "is this on screen", and
+<code>minimized</code> for the user's minimise state. <code>pid</code> is the process id of the
+client's socket peer, or null when the compositor cannot read it. A client
+reached through a proxy (waypipe, a sandbox, a PID namespace) reports the
+proxy's or namespace's view, which may not be the application's own pid.
+<code>focus.window.{id,generation}</code> names the managed window (xdg or X11) that
+holds keyboard focus, both null when none does.</p>
+<p><strong>Window identity.</strong> A <code>wl_surface</code> keeps its <code>s&lt;id&gt;</code> when a client gives it a
+new role, so an id alone can name a different window than the one a script
+read. Every role assignment (including the role ending) takes a new,
+never-reused <code>generation</code>. Unmapping and remapping the same role (a null
+buffer, then a new one) keeps it; an X11 window that is associated again
+counts as a new role.
+Every surface row publishes it as <code>surfaces.s&lt;id&gt;.generation</code>, and window rows
+repeat it. X11 windows have no <code>windows.*</code> row yet, so read their generation
+from <code>surfaces.s&lt;id&gt;</code>. Treat <code>{id, generation}</code> as the window's identity:
+the window verbs require both, and <code>comp.props.set</code> accepts <code>generation</code> on
+any <code>windows.s&lt;id&gt;.*</code> path. A mismatch replies rc 10
+<code>{"error":"stale_target","id","generation","current"}</code> and changes nothing.
+The window verbs also reply <code>unknown_window</code>, <code>not_managed</code> or <code>not_mapped</code>
+(each with <code>id</code>) when the target is not a mapped managed window. Moving or
+resizing a window never changes its generation.</p>
+<p><code>windows.s&lt;id&gt;.minimized</code> accepts <code>true</code> or <code>false</code>. <code>true</code> minimises the
+window; <code>false</code> restores that window (not the most recently minimised one),
+takes it out of the restore order, and raises and focuses it. X11 windows are
+accepted too and get the EWMH hidden state cleared. A write to a window that
+does not exist or is not a mapped managed window replies <code>invalid_value</code>, like
+the band leaf.</p>
 <p>Window band writes accept <code>bottom</code> or <code>normal</code>. They move the complete window
 tree, including popups, behind normal windows or back into their normal band.
 Assignments last for the current session. Use the canonical ID returned by
@@ -639,6 +716,202 @@ Assignments last for the current session. Use the canonical ID returned by
 reserved for layer-shell and session-lock roles. Corner activation takes
 priority over client pointer constraints; reactivation waits for physical
 pointer motion out of the corner.</p>
+<h3 id="window-control">Window control</h3>
+<p>Every verb here names its window with <code>{id, generation}</code>, refuses a stale or
+missing target as described under Window identity, and replies
+<code>{"error":"locked"}</code> while a session lock is active. Each is recorded in the
+frame trace as <code>comp_window_control</code> (subject the id; detail 1 minimize,
+2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close).</p>
+<ul>
+<li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
+With <code>raise</code> (the default) it also raises it and re-targets the pointer,
+exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
+<code>focused</code> is false, <code>reason</code> says why: <code>exclusive_layer</code> (an exclusive
+layer surface holds the keyboard), <code>minimized</code>, <code>not_visible</code>,
+<code>not_presentable</code>, or <code>refused</code>.</li>
+<li><code>comp.window.raise {id,generation}</code> raises the window within its band
+without focusing it. The reply is <code>{id,generation,raised}</code>.</li>
+<li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
+or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
+<ul>
+<li>With <code>force:true</code> (and optional <code>timeout_ms</code>, default 3000, at most
+60000) the reply waits. The deadline runs from when the port admitted
+the request.</li>
+<li>If the window's role ends first (the client destroyed it, or the id now
+names another role), the reply is <code>{closed:"gone",waited_ms}</code>.</li>
+<li>A window that is only unmapped is still alive: an app that hides to a
+tray on close is not gone. If the same <code>{id,generation}</code> is still alive
+at the deadline, mapped or not, comp disconnects its client and replies
+<code>{closed:"killed",window:"mapped"|"unmapped",scope:"client",pid,windows,waited_ms}</code>.</li>
+<li>The kill ends the whole client connection, so every window in
+<code>windows</code> goes with it. No kill happens if the caller has stopped
+waiting, or while a session lock is active (the reply is then <code>locked</code>).</li>
+<li>An X11 window is never killed this way: its Wayland client is XWayland,
+and the window manager has no per-client kill. The polite close is sent
+and the verb replies at once with
+<code>{"error":"still_open","reason":"x11_kill_unsupported",polite_close_sent:true}</code>.</li>
+</ul>
+</li>
+<li><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
+and/or resizes the window, with at least one field given.
+<ul>
+<li><code>x</code>/<code>y</code> are output-local logical coordinates of the window-geometry
+origin (<code>window_x</code>/<code>window_y</code>). <code>output</code> is an <code>outputs</code> key or output
+name, and defaults to the window's own output. An absent coordinate
+keeps the window's offset within its output.</li>
+<li><code>width</code>/<code>height</code> request a window-geometry size, clamped to the client's
+minimum and maximum. An absent one keeps the window's current
+window-geometry size (what the client committed, not what comp last
+asked for), so a width-only or height-only place re-sends the current
+size for the other axis in the configure. For an xdg window this is a configure, so the size
+changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
+<li>The reply is
+<code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
+<li>A maximised or fullscreen window is refused with
+<code>{"error":"invalid_state",maximized,fullscreen}</code>. An unknown output is
+<code>unknown_output</code>. A place that would leave the window wholly outside
+every output is refused with <code>{"error":"off_output",x,y,width,height}</code>.</li>
+</ul>
+</li>
+<li><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
+window reaches a state.
+<ul>
+<li><code>match</code> is either <code>{id,generation?}</code> or
+<code>{app_id?,title?,title_contains?}</code> with at least one field. Name filters
+are at most 4096 bytes. With <code>id</code>, the wait is about that window; an id
+comp never handed out is refused with <code>unknown_window</code>. Without it, the
+wait is about the lowest-id mapped window whose names match.</li>
+<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (a frame presented at or
+after the current mapping began; a late report of an earlier frame does
+not count), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
+window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
+without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.</li>
+<li><code>timeout_ms</code> defaults to 10000 and is at most 60000, counted from when
+the port admitted the request.</li>
+<li>While a session lock is active a wait learns nothing it could not read
+from the (redacted) tree: only <code>gone</code> and <code>unmapped</code> for a named <code>id</code> can
+resolve; everything else waits for the unlock or the deadline, so a
+name-based wait that spans the whole lock ends with <code>timeout</code>.</li>
+<li>A condition that already holds is answered at once. Otherwise comp
+checks after each dispatch cycle and sets one timer for the deadline;
+nothing polls.</li>
+<li>The reply is <code>{window:&lt;row&gt;|null,until,waited_ms}</code>. <code>window</code> is the
+<code>windows.s&lt;id&gt;</code> row, or null for <code>unmapped</code> and <code>gone</code>. On the deadline
+the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
+<li>Waits and forced closes use the same eight-permit pool as
+<code>comp.input.sequence</code>.</li>
+</ul>
+</li>
+<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?}</code> returns
+<code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field (text
+filters at most 4096 bytes). The
+rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
+windows and is empty while a session lock is active.</li>
+</ul>
+<p>Every argument object is checked for unknown fields
+(<code>{"error":"invalid_args",field,allowed}</code>).</p>
+<h3 id="input-injection">Input injection</h3>
+<p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
+enters the one seat entry point with user activity on, so these all apply
+unchanged: bindings (an injected <code>Super+Shift+M</code> restores a window, and the
+client never sees the M), pointer grabs and constraints, click-to-focus and
+raise, idle notification, and the session lock. Under a session lock,
+injected input reaches only the lock surface.</p>
+<p>Event timestamps are CLOCK_MONOTONIC milliseconds, wrapping at 32 bits. That
+is the clock <code>wp_presentation</code> reports, so a client can subtract an input
+event time from a presentation time. Real input from the nested host window
+uses the same clock.</p>
+<table><thead><tr><th>Verb</th><th>Arguments</th></tr></thead><tbody>
+<tr><td><code>comp.input.pointer.move</code></td><td>One of three forms. <code>{x,y,output?}</code>: output-local absolute; <code>output</code> is an <code>outputs</code> key or output name, and defaults to the default output. <code>{dx,dy}</code>: relative. <code>{window:{id,generation},x,y,require_hit?}</code>: relative to the window-geometry origin. Any form takes <code>corners?</code> (default <code>true</code>); <code>false</code> keeps the move from arming a hot corner.</td></tr>
+<tr><td><code>comp.input.pointer.button</code></td><td><code>{button?,action?}</code>. <code>button</code>: <code>left</code> (default), <code>right</code>, <code>middle</code>, or an evdev code <code>0x100..=0x2ff</code>. <code>action</code>: <code>press</code>, <code>release</code> or <code>click</code> (default).</td></tr>
+<tr><td><code>comp.input.pointer.scroll</code></td><td><code>{dx?,dy?,source?,v120?}</code>. At least one axis is required; an omitted axis stays absent. Positive <code>dy</code> scrolls down. <code>source</code>: <code>wheel</code> (default), <code>finger</code> or <code>continuous</code>; a zero on <code>finger</code> or <code>continuous</code> is an axis stop. <code>v120:{dx?,dy?}</code> sets wheel detents; without it, a wheel derives 120 per 15 units.</td></tr>
+<tr><td><code>comp.input.key</code></td><td><code>{key,action?,modifiers?}</code>. <code>key</code>: an XKB keysym name (<code>Return</code>, <code>a</code>, <code>F5</code>, <code>Super_L</code>) or an evdev code. <code>action</code>: <code>press</code>, <code>release</code> or <code>tap</code> (default). <code>modifiers</code>: any of <code>shift</code>, <code>ctrl</code>, <code>alt</code>, <code>super</code>, <code>altgr</code>, held around the key. A keysym that needs Shift gets Shift added. <strong>Or</strong> <code>{text}</code>, at most 256 characters.</td></tr>
+<tr><td><code>comp.input.release_all</code></td><td><code>{}</code></td></tr>
+<tr><td><code>comp.input.sequence</code></td><td><code>{steps:[{verb,args?,delay_ms?}],interval_ms?}</code></td></tr>
+</tbody></table>
+<p>Each single verb replies:</p>
+<pre><code class="language-text">{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null}
+</code></pre>
+<ul>
+<li><code>input_seq</code> increases by one per verb.</li>
+<li><code>injected_at_us</code> is CLOCK_MONOTONIC microseconds.</li>
+<li><code>pointer</code> is the cursor after the verb, in output-local coordinates.</li>
+<li><code>target</code> is the root surface the seat now delivers to: pointer focus for
+pointer verbs, keyboard focus for key verbs. It can be a layer or lock
+surface, not only a window.</li>
+</ul>
+<p><code>text</code> maps each character through the live seat keymap, honouring Caps Lock
+and the active layout. Only characters on the first two shift levels map; each
+is typed as press and release, with Shift where needed. A newline types
+Return. Characters that need AltGr (the third and fourth levels), a dead
+key or a compose sequence are refused as unmappable. If any character cannot
+be typed, nothing is sent and the reply is
+<code>{"error":"unmappable","char","index"}</code>. While an input method holds the
+keyboard, <code>text</code> is refused with <code>{"error":"ime_active"}</code>, because the IME
+would turn the keys into something other than the text sent. Some input
+methods hold that grab whenever a text field has focus; with one of those,
+every <code>text</code> call is refused, so type with <code>comp.input.key</code> instead. An unknown key
+name replies <code>{"error":"unknown_key","key"}</code>.</p>
+<p>An absolute or window-relative move is real pointer motion, so moving into an
+output corner arms the hot corner exactly as a mouse would; pass
+<code>corners:false</code> to move without arming one. Such a move still leaves an
+engaged corner and cancels a pending dwell.</p>
+<p>One verb injects at most 4096 seat events (a whole sequence included; a text
+character counts four, a key with modifiers two per key). A larger request is
+refused before anything is sent with <code>invalid_value</code> naming the limit.</p>
+<p>Every refusal is decided before anything is sent:</p>
+<ul>
+<li><code>stale_target</code>, or another window-target error, for the <code>window</code> form;</li>
+<li><code>occluded</code> when <code>require_hit</code> is true and the point is not on that window or
+its frame. <code>under</code> names the window actually at that point, or is null;</li>
+<li><code>off_output</code> when <code>require_hit</code> is true and no output shows the point;</li>
+<li><code>unknown_output</code>;</li>
+<li><code>out_of_bounds</code>, with the output size, for a point outside the output.</li>
+</ul>
+<p>The verbs are not refused while the session is locked; the seat decides where
+the input goes.</p>
+<p><code>release_all</code> releases the keys and buttons that injection pressed and has not
+released. It never releases anything a physical device holds. Taps and clicks
+never leave a key or button down; only <code>action: press</code> holds one.</p>
+<p><code>comp.input.sequence</code> runs up to 256 steps in order:</p>
+<ul>
+<li>Each step is one of the single input verbs above, with its usual arguments.</li>
+<li><code>delay_ms</code> is a wait before that step, on a compositor timer. It defaults to
+<code>interval_ms</code>, which defaults to 0. The delays together may total at most 60
+seconds.</li>
+<li>A drag is a <code>press</code>, some moves, and a <code>release</code>.</li>
+<li>The reply is <code>{steps:[&lt;each step's reply&gt;],elapsed_ms}</code>.</li>
+<li>A run yields to the event loop after every 256 injected events, so a long
+zero-delay stretch cannot fill a client's socket in one pass. A run is
+therefore not atomic even without delays: other runs and single verbs can
+interleave at those yields (and at every delay).</li>
+<li>If a step is refused, the run stops and gives up the keys and buttons it
+pressed. A hold is released only when no other owner (another run, or a
+single verb that pressed the same key) still holds it; an explicit release
+by anyone lets the key go for every owner.
+The reply is rc 10
+<code>{"error":"step_failed",index,verb,step:&lt;the refusal&gt;,completed:[...],released:true}</code>.</li>
+<li>If the caller stops waiting, the run also stops and releases its own holds.</li>
+</ul>
+<p>Sequences use their own pool of eight permits. Each waits for its own delays
+plus one second, not the two-second budget of other verbs. When all eight
+permits are in use, a new sequence gets <code>busy</code>.</p>
+<p><code>input.host.passthrough</code> exists only on the nested backend; on KMS the path is
+<code>unknown_path</code>. Setting it to <code>false</code> stops the host window's pointer motion,
+buttons, scroll and keys reaching the seat, so the host cursor cannot
+overwrite an injected position. Output resize and scale, pointer leave and
+touch still pass. A host key or button pressed before the switch still gets
+its release. A host focus loss releases only those host keys, never an
+injected hold, and still resets compositor chrome state (a title-bar drag,
+hover, cursor override). The value persists until it is set back to <code>true</code>
+or the compositor exits; a script that turns it off should turn it on again.</p>
+<p>The frame trace records each injected verb as <code>comp_input_injected</code>:</p>
+<ul>
+<li>subject: <code>input_seq</code>;</li>
+<li>detail: the verb kind (1 move, 2 button, 3 scroll, 4 key, 5 text,
+6 release_all);</li>
+<li>aux: the target id, or 0.</li>
+</ul>
 <p>The compositor publishes non-retained messages under the registered service
 namespace. The seat instance therefore uses <code>comp.*</code>, the default nested
 instance uses <code>comp-nested.*</code>, and <code>--bus-service NAME</code> moves the complete
@@ -646,8 +919,8 @@ namespace to <code>NAME.*</code>. Every inner command is the unprefixed suffix s
 below, so handlers do not depend on the instance name.</p>
 <table><thead><tr><th>Topic</th><th>Inner command</th><th>Exact body</th></tr></thead><tbody>
 <tr><td><code>&lt;service&gt;.props.changed</code></td><td><code>props.changed</code></td><td><code>{path,old,new,ts,cause,event_seq}</code></td></tr>
-<tr><td><code>&lt;service&gt;.surface.mapped</code></td><td><code>surface.mapped</code></td><td><code>{id,role,foreign_id?,event_seq}</code></td></tr>
-<tr><td><code>&lt;service&gt;.surface.unmapped</code></td><td><code>surface.unmapped</code></td><td><code>{id,role,foreign_id?,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.surface.mapped</code></td><td><code>surface.mapped</code></td><td><code>{id,role,generation,app_id,title,foreign_id?,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.surface.unmapped</code></td><td><code>surface.unmapped</code></td><td><code>{id,role,generation,app_id,title,foreign_id?,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.focus.changed</code></td><td><code>focus.changed</code></td><td><code>{keyboard,previous,exclusive_latch,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.output.changed</code></td><td><code>output.changed</code></td><td><code>{output,geometry:{x,y,width,height},usable:{x,y,width,height},event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.entered</code></td><td><code>corner.entered</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
@@ -655,6 +928,19 @@ below, so handlers do not depend on the instance name.</p>
 <tr><td><code>&lt;service&gt;.corner.clicked</code></td><td><code>corner.clicked</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.pointer.changed</code></td><td><code>pointer.changed</code></td><td><code>{version:1,instance,output,position,valid,timestamp_ms,event_seq}</code></td></tr>
 </tbody></table>
+<p>Map edges carry the surface's role <code>generation</code> and its <code>app_id</code> and <code>title</code>
+(null when the client set none, and null while a session lock is active). A
+map edge reports the values at the end of the cycle; an unmap edge reports the
+values from before the unmap. A window unmapped and mapped again under a new
+role within one cycle emits both edges (unmap with the old generation, then
+map with the new one). An XWayland window whose buffer arrived before
+its map request now emits its map edge too.</p>
+<p>For a stream of window changes (moves, resizes, state, focus), hold a
+<code>comp.props.watch</code> and read the <code>windows.s&lt;id&gt;.*</code> <code>props.changed</code> frames, plus
+<code>focus.changed</code>. There is no separate window topic. To wait for one
+condition, use <code>comp.window.wait</code> rather than subscribing and hoping: the
+topics are not retained, so an edge that happened before the subscription is
+never delivered.</p>
 <p><code>corner.clicked</code> observes a left-button press while a corner is engaged, carrying
 the same engagement dwell as entered/left. It does not consume the button event;
 clients can map it to a panel pin toggle.</p>
@@ -811,10 +1097,13 @@ ranges are:</p>
 <tr><td><code>input.corners.dwell_ms</code></td><td style="text-align: right"><code>200</code></td><td style="text-align: right"><code>0..=5000</code> ms</td></tr>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
 </tbody></table>
-<p>The corner leaves and <code>xwayland.enabled</code> are the only mutable leaves. The
-corner descriptors say <code>mutable:true</code> and <code>persistence:"none"</code> (numeric
-leaves also carry the range above) and those values live for the compositor
-process only. <code>xwayland.enabled</code> is the one exception: its descriptor says
+<p>The mutable leaves are the four corner leaves, <code>windows.s&lt;id&gt;.band</code>,
+<code>windows.s&lt;id&gt;.minimized</code>, <code>input.host.passthrough</code> (nested only) and
+<code>xwayland.enabled</code>. The corner and window
+descriptors say <code>mutable:true</code> and
+<code>persistence:"none"</code> (numeric leaves also carry the range above) and those
+values live for the compositor process only. <code>xwayland.enabled</code> is the one
+exception: its descriptor says
 <code>persistence:"file"</code> — the value is read once at compositor startup (whether
 to spawn XWayland at all; there is no live toggle) and a write persists it
 for the NEXT startup into a per-socket file under the COSMIX etc tree, whose
@@ -822,11 +1111,7 @@ resolved absolute path the read-only <code>xwayland.persist_path</code> leaf rep
 and the compositor logs at startup. The <code>COSMIX_COMP_XWAYLAND</code> environment
 variable (<code>0/false/off/no</code> or <code>1/true/on/yes</code>) overrides both the file and
 the default at launch — the no-rebuild back-out that works even when the
-props surface is unreachable. Writes are admitted only when noded supplied
-exactly one case-insensitive <code>broker_origin</code> header whose value is <code>local</code>,
-the caller has a canonical registered service name, and the wire contains no
-<code>source_peer</code>, <code>permissions</code> or <code>signed_ident</code> claim. Otherwise the reply is
-rc 10 <code>{"error":"not_local"}</code> before calloop admission. Unknown and immutable
+props surface is unreachable. Unknown and immutable
 paths return <code>unknown_path</code> and <code>read_only</code>; type/range failures return
 <code>{error:"invalid_value",path,expected,range}</code>. All four path/type/range checks
 run on the worker before admission and are repeated on calloop as
@@ -841,7 +1126,10 @@ empty. During the KMS unlock window (<code>normal_scene_restricted()</code>), th
 tree stays redacted with <code>focus.session_lock="unlocking"</code> until the
 compositor's own presentation predicate lifts, at the same moment the renderer
 resumes. Unlock then restores the ordinary projection.</p>
-<p>All application errors use Bus rc 10. In addition to the write errors above,
+<p>All application errors use Bus rc 10. Every refusal body carries
+<code>error_code</code> with the same value as <code>error</code> (<code>error</code> is kept as an alias for
+0.58.x), so a Mix <code>send</code> receives the whole object: <code>$result.error_code</code>,
+<code>$result.under</code> and so on. In addition to the write errors above,
 read/dispatch errors include <code>unknown_path</code>, <code>busy</code> and <code>unknown_verb</code>, plus
 <code>{"error":"too_large","limit_bytes":N,"hint":"read a subtree"}</code> when a
 serialised reply would exceed the effective broker-path ceiling. <code>N</code> is
@@ -849,7 +1137,12 @@ serialised reply would exceed the effective broker-path ceiling. <code>N</code> 
 4 KiB of documented header/framing headroom. Immediately before sending, comp
 also measures the actual canonical response headers, correlation id and
 framing with the body and refuses any reply whose complete wire size would
-exceed that ceiling. Replies are never truncated. An absent broker never
+exceed that ceiling. Replies are never truncated.</p>
+<p>A <code>busy</code> reply to <code>comp.props.set</code> or a window verb means the reply missed its
+two-second budget or the queue was full at admission. If the request had
+already been queued, it can still be applied when the compositor drains the
+queue. A caller that gets <code>busy</code> should read the state again (for example
+<code>windows.s&lt;id&gt;.minimized</code>) before retrying, not retry blindly. An absent broker never
 delays compositor startup: the port thread reports <code>retrying</code> and reconnects
 independently. A registration rejection (collision, invalid SPEC 10 name or
 admission) is logged once, ends the port worker without renaming, and leaves
@@ -878,8 +1171,8 @@ from the same snapshot. Single-flight serialisation prevents same-snapshot
 multiplication.</p>
 <p>Absent by design after P-1:</p>
 <ul>
-<li><code>comp.surface.*</code> control verbs, because focus/raise/close operations arrive in P-2 and
-move/resize in P-3;</li>
+<li><code>comp.surface.*</code> control verbs: focus, raise, close, move and resize are
+<code>comp.window.*</code> verbs on managed windows only;</li>
 <li>render timings, because they are metrics rather than properties; and</li>
 <li>a Bus screenshot verb, because it is a later control-plane slice; Arc 4's
 capture service is available through the Wayland protocol described below.</li>
@@ -887,7 +1180,7 @@ capture service is available through the Wayland protocol described below.</li>
 <h2 id="supported-wayland-protocols">Supported Wayland protocols</h2>
 <p>The compositor advertises the core compositor, subcompositor, seat, output,
 shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
-presentation-time, XDG shell and XDG decoration globals needed by its desktop
+presentation-time (see below), XDG shell and XDG decoration globals needed by its desktop
 clients.</p>
 <table><thead><tr><th>Protocol</th><th style="text-align: right">Version</th><th>Current support</th></tr></thead><tbody>
 <tr><td><code>zwlr_layer_shell_v1</code></td><td style="text-align: right">4</td><td>Layer surfaces and layer popups map, arrange and configure through Smithay's <code>LayerMap</code>; protocol strata, keyboard interactivity, input regions and exclusive usable-area effects are supported.</td></tr>
@@ -895,7 +1188,188 @@ clients.</p>
 <tr><td><code>ext_foreign_toplevel_list_v1</code></td><td style="text-align: right">1</td><td>Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set.</td></tr>
 <tr><td><code>ext_session_lock_v1</code></td><td style="text-align: right">1</td><td>Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle.</td></tr>
 <tr><td><code>zwlr_screencopy_manager_v1</code></td><td style="text-align: right">3</td><td>Compatibility output capture into exact-layout <code>wl_shm</code> buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion.</td></tr>
+<tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below).</td></tr>
 </tbody></table>
+<h3 id="presentation-feedback">Presentation feedback</h3>
+<p><code>wp_presentation</code> reports when a client's commit was actually shown. The
+global is advertised only once a backend has wired a frame reporter, so no
+client waits on feedback nothing will resolve.</p>
+<ul>
+<li><strong>Clock:</strong> CLOCK_MONOTONIC (<code>clock_id</code> 1), the same clock <code>frame_trace</code>
+uses.</li>
+<li><strong>Which commit a frame showed:</strong> feedback is taken when the commit is
+applied, so a later commit cannot discard it while the earlier one is still
+on its way to the screen. Every new buffer the compositor hands to the
+renderer gets a content sequence number, and a presented frame reports, per
+surface, the sequence it actually sampled. Feedback for exactly that commit
+is <code>presented</code>. Commits older than it were replaced before any frame showed
+them, so they are <code>discarded</code>. Newer commits keep waiting. A commit without
+a new buffer carries the sequence of the content it leaves on screen, so it
+is presented with the next frame that shows that content. When one
+transaction applies several commits at once (a synchronised subsurface
+waiting for its parent, or a commit held by a blocker), each commit keeps
+its own feedback: a commit whose buffer a later commit in the same
+transaction replaced is <code>discarded</code>, even if the later commit asked for no
+feedback.</li>
+<li><strong>Re-uploads are not refusals:</strong> when the compositor re-sends a surface's
+current content (a relayout or recovery) and that upload fails, the content
+already on screen stays shown and its feedback is not discarded. Only a
+failed newer commit is.</li>
+<li><strong>What "shown" means:</strong> the surface is mapped and visible, lies at least
+partly on the output, and the frame samples that commit's texture.
+Occlusion by other windows is not checked, so a fully covered window still
+counts as shown.</li>
+<li><strong>Discarded without a frame:</strong> unmap, minimise, destroy, a new role, a
+buffer the compositor or renderer refused, a surface that can no longer be
+drawn, and commits made before the surface was mapped (including an X11
+window's commits before its map). A session lock needs no extra step: while
+locked, every frame treats the surfaces the lock hides as not shown. At most
+8 commits per surface wait; a faster client loses the oldest as <code>discarded</code>.</li>
+<li><strong>Nested backend:</strong> the host compositor gives no presentation timing, so
+<code>tv</code> is CLOCK_MONOTONIC when the frame was handed to the host (not first
+photon), <code>flags</code> is 0, <code>seq</code> is 0 and <code>refresh</code> is 0 (unknown). It is
+reported only after the swapchain image was actually presented.</li>
+<li><strong>KMS backend:</strong> advertised in client-content mode (not in
+<code>--first-light</code>, which draws no clients). A frame is reported only
+after its atomic commit's page-flip event arrived; a cancelled or failed
+flip reports nothing, and its commits keep waiting.
+<ul>
+<li><code>tv</code> is the kernel's page-flip time. At startup comp asks DRM whether
+those stamps are CLOCK_MONOTONIC (<code>DRM_CAP_TIMESTAMP_MONOTONIC</code>). If they
+are not, each stamp is moved from CLOCK_REALTIME by the offset between
+the two clocks sampled when the event is read. If the capability query
+fails, <code>tv</code> is the time the event was read.</li>
+<li>A MONOTONIC stamp may lie up to one refresh period in the future:
+vblank-helper drivers stamp the start of scanout, which the flip event
+can precede. Such a stamp is kept. A stamp further ahead is reported at
+read time without <code>hw_clock</code>; a second ahead, or three such flips in a
+row, and the capability is not trusted for the rest of the run.</li>
+<li><code>flags</code> are <code>vsync</code> (there are no async flips) and <code>hw_completion</code> (the
+flip-complete event), plus <code>hw_clock</code> only when <code>tv</code> is the kernel's own
+MONOTONIC stamp. Never <code>zero_copy</code>: client buffers are composited into
+scanout buffers, not scanned out directly.</li>
+<li>A device without vblank support (virtio-gpu, simpledrm; probed with
+<code>DRM_IOCTL_CRTC_GET_SEQUENCE</code>, or seen as a sequence stuck at 0)
+completes flips on no vblank grid, so its frames carry only
+<code>hw_completion</code> and <code>seq</code> 0.</li>
+<li><code>seq</code> is the CRTC's vblank counter at the flip, extended per output
+beyond 32 bits so it only ever increases (across wraps, and across a
+counter that restarts on resume).</li>
+<li><code>refresh</code> is the scanned-out mode's period, <code>1e12 / refresh_mHz</code> ns.</li>
+<li>Each flip is reported on the client output registered for its
+connector; a flip on an output that is not a client output resolves
+nothing. A flip that completed just before a VT switch is still
+reported.</li>
+<li>With several outputs, each flip carries the frame's content and the first
+presented one wins (content is not yet tracked per output); content-source
+costs are counted with the first flip only.</li>
+<li>A buffer the renderer fails to import is discarded as soon as the render
+world sees it, as on the nested backend.</li>
+</ul>
+</li>
+<li><strong>SHM clients:</strong> a surface counts as sampling its newest buffer once the
+GPU image is prepared. Bevy drops the old GPU image while a replacement is
+pending, so a pending upload is reported as not shown rather than stale.</li>
+<li><strong>DMA-BUF clients:</strong> the import bridge replaces images in place and keeps
+the previous texture while a replacement is pending or after it failed.
+A frame therefore counts a commit as shown only when the bridge reports
+that commit's import as the installed one. A failed import is <code>discarded</code>,
+never presented.</li>
+</ul>
+<p>In-process scene content (a Bevy plugin inside comp, not a Wayland client)
+can be measured the same way: the plugin puts a <code>ContentSource</code> component on
+its root entity and bumps <code>ContentSourceFrame.revision</code> for every content
+update. Revisions shown in a presented frame count as presented, skipped ones
+as discarded, and upload/damage costs are carried until a presented frame
+reports them. Changing the id (re-inserting the component) re-registers the
+source; a refused duplicate takes over the id when its holder goes.
+<code>ContentSource.output</code> is reported as <code>sources.&lt;id&gt;.output</code>; the source is
+measured on the output that reports the frame (nested has one).</p>
+<h3 id="presentation-statistics">Presentation statistics</h3>
+<p>Every window, output and content source is measured, whether or not the
+client asks for feedback. The statistics follow content, not feedback
+objects: an update is one buffer handed to the renderer (a window) or one
+revision (a content source). A frame that shows a newer update presents it;
+the updates it skipped count as <code>discarded</code>.</p>
+<ul>
+<li><strong>Windows:</strong> <code>windows.s&lt;id&gt;.presentation.*</code>. Subsurface updates count for
+their window; a frame that shows several surfaces of one window counts
+once. A new role (a new <code>generation</code>) starts from zero.</li>
+<li><strong>Shown, stalled, hidden.</strong> A frame that samples a newer update presents
+it. A visible window whose newest update is not sampled yet (a texture
+still uploading) is stalled: its run continues, and the eventual
+presentation measures the whole gap and counts the vblanks it missed. A
+frame that hides a window (minimised, off the output, locked away, or not
+in the frame at all) discards the updates it did not show, as the feedback
+protocol does; showing the same content again later is not a new
+presentation.</li>
+<li><strong>Intervals</strong> are measured only between two presentations while the window
+stays shown, so a minimised or hidden stretch is not one long interval. An
+idle client's gaps are included, so the interval leaves describe cadence
+only for a client that updates steadily.</li>
+<li><strong><code>commit_to_present</code></strong> runs from the moment the compositor publishes the
+buffer to the renderer (inside the client's commit, after it is accepted)
+to the frame that showed it. For a content source it starts when comp
+first sees the revision.</li>
+<li><strong><code>missed</code></strong> counts vblanks skipped while an update was waiting: for a
+fixed refresh <code>R</code>, a gap of <code>round(interval / R)</code> vblanks counts the skipped
+ones at or after the moment the oldest waiting update was committed. An
+idle client that commits late misses nothing. With an unknown or variable
+refresh (nested) <code>missed</code> is null, never 0: unmeasured is not perfect.</li>
+<li><strong><code>input_to_present</code></strong> is the time from an injected input to the first
+presented update committed after it, within one second (a comp-side upper
+bound; a hide or reset drops the wait). The input goes to the window that
+owns the target surface, through subsurfaces and popups. A content
+source's update records it when it names the input's <code>input_seq</code>. These
+leaves stay null until the <code>comp.input.*</code> injection verbs record marks;
+every injection has its own increasing <code>input_seq</code>.</li>
+<li><strong>Outputs:</strong> <code>outputs.o_&lt;slug&gt;.presentation.*</code> counts presented frames.
+<code>flags</code> names the newest frame's kind flags (<code>vsync</code>, <code>hw_clock</code>,
+<code>hw_completion</code>, <code>zero_copy</code>) and <code>flags_mask</code> is the same as a number;
+both are null before the first frame. <code>refresh_us</code> is null when the
+refresh is unknown (nested) or variable, never 0.</li>
+<li><strong>Single output for now:</strong> a frame report names one output and a surface
+is either shown by it or not; per-output accounting of a window shown on
+two outputs is not split yet.</li>
+<li><strong>Rings</strong> keep the newest 512 samples; <code>_p50</code>/<code>_p99</code> are nearest-rank
+percentiles over them, null without samples.</li>
+<li>All times are CLOCK_MONOTONIC microseconds; <code>since_us</code> is when counting
+started (the first update, registration, compositor start, or the last
+reset).</li>
+</ul>
+<p>The presentation leaves and the whole <code>sources</code> subtree are <strong>volatile</strong>:
+<code>get</code>, <code>list</code> and <code>describe</code> serve them (<code>describe</code> says <code>volatile: true</code>),
+but <code>props.changed</code> never reports them, so a watched client presenting at
+60 Hz does not flood the topic. Row add and remove events carry no
+presentation leaves either. Reads compute these leaves only for the paths
+they can reach, and property-change diffs never compute them.</p>
+<p>Counts saturate. Updates are assumed to be numbered one apart (a surface's
+buffers, a source's revisions); a jump counts every skipped number as
+discarded.</p>
+<p><code>comp.window.stats {id, generation, samples?}</code> returns the window's leaves
+plus the newest <code>samples</code> (default and maximum 512) of <code>intervals_us</code>,
+<code>commit_to_present_us</code> and <code>input_to_present_us</code>. <code>{source, registration?, samples?}</code> does the same for a content source and adds <code>upload_bytes</code> and
+<code>damage_px</code> (per reported frame). <code>{id, generation}</code> and <code>{source}</code> are
+mutually exclusive (<code>invalid_value</code>). <code>comp.window.stats.reset</code> takes the same
+targets without <code>samples</code>, or no target to zero every window, output and
+source; it replies <code>{reset, since_us, ...}</code>. Errors: the window errors of
+<code>comp.window.*</code>, <code>unknown_source</code>, and <code>stale_target</code> with <code>registration</code> and
+<code>current</code> when the source id was registered again. A session lock refuses the
+window forms (<code>locked</code>); source reads and the global reset still work.</p>
+<p>Each <code>comp.window.*</code> verb emits a <code>comp_window_control</code> trace record
+(subject window id or 0, detail 1 minimise / 2 restore / 3 stats / 4 reset,
+aux generation).</p>
+<p>Content-source honesty limits: a source counts as presented when its entity
+was visible in a presented frame; comp cannot tell whether the plugin's own
+texture upload for that revision had finished. Flags and clock are the
+frame's. Re-inserting the same id with another <code>output</code> keeps the original
+registration and its output. Only the newest <code>consumed_input</code> is kept
+between two reports.</p>
+<p>Gate G1s: a build with the test-only <code>content-source-probe</code> feature adds a
+nested quad registered as source <code>probe</code> that changes every frame for
+<code>COSMIX_CONTENT_SOURCE_PROBE_REVISIONS</code> revisions (default 300), logs
+<code>COSMIX_CONTENT_SOURCE_PROBE DONE revisions=… upload_bytes=… damage_px=…</code>,
+holds for four seconds and despawns (<code>… DESPAWNED</code>).</p>
 <h2 id="xwayland">XWayland</h2>
 <p>The <code>xwayland</code> cargo feature is in the default set: every default build
 supervises one rootless Xwayland instance and acts as its X11 window

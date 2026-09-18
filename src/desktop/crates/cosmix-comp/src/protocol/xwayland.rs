@@ -1378,6 +1378,17 @@ impl WaylandState {
             return;
         }
         if record.buffer_dimensions.is_some() {
+            // The map edge (`surface.mapped`) needs the unmapped start
+            // recorded before the flag flips; a buffer committed in an
+            // earlier dispatch left no pending edge to carry it.
+            #[cfg(feature = "bus")]
+            {
+                let surface = record.role.wl_surface().clone();
+                self.mark_surface_mapped(&surface);
+            }
+            let Some(record) = self.x11_role_record_mut(xid) else {
+                return;
+            };
             record.mapped = true;
             let id = record.id;
             self.pending_full_upserts.insert(id);
@@ -1675,8 +1686,7 @@ impl WaylandState {
                 // the window's position memory for the remap, and
                 // discarding it here would reopen a moved/maximized window
                 // in the wrong place.
-                displaced_geometry =
-                    Some(role.granted_geometry).filter(|_| role.phase.ever_granted);
+                displaced_geometry = role.phase.ever_granted.then_some(role.granted_geometry);
                 Some(role.wl_surface.clone())
             });
             match displaced_surface {
@@ -1857,8 +1867,10 @@ impl WaylandState {
         }));
         #[cfg(feature = "bus")]
         self.mark_surface_unmapped(&wl_surface);
+        let role_generation = self.role_change_generation(&object);
         let id = if let Some(record) = self.surfaces.get_mut(&object) {
             let id = record.id;
+            record.generation = role_generation;
             // Re-associating a presented record withdraws it: tell the
             // renderer, or it keeps an entity the protocol thinks is gone.
             if record.mapped {
@@ -1898,6 +1910,7 @@ impl WaylandState {
                 object.clone(),
                 SurfaceRecord {
                     id,
+                    generation: role_generation,
                     role,
                     mapped: false,
                     layout,
@@ -1906,6 +1919,7 @@ impl WaylandState {
                     window_origin: origin,
                     configured_size,
                     commit_count: 0,
+                    content_seq: 0,
                     shm_backing: None,
                     dmabuf_backing: None,
                     buffer_dimensions: None,

@@ -7,10 +7,12 @@ mod capture;
 mod chrome_frame_material;
 mod client_surface_material;
 mod compositor_scene;
+mod content_source;
 mod decoration;
 mod decoration_scene;
 #[cfg(feature = "frame-capture")]
 mod frame_capture;
+mod frame_content;
 mod frame_trace;
 #[cfg(feature = "native-quoin")]
 mod native_shell;
@@ -63,8 +65,8 @@ use decoration::DecorationStartup;
 use decoration_scene::init_chrome_font_cx;
 use protocol::{
     CaptureCompletionReporter, EcsAction, ExplicitSyncExposureMode, ExplicitSyncPreparation,
-    ExplicitSyncStartupReport, ExplicitSyncStartupVerdict, HostAxis, HostButtonState, HostInput,
-    SecurityPresentationReporter, WaylandRuntime, WaylandRuntimePolicy,
+    ExplicitSyncStartupReport, ExplicitSyncStartupVerdict, FramePresentationReporter, HostAxis,
+    HostButtonState, HostInput, SecurityPresentationReporter, WaylandRuntime, WaylandRuntimePolicy,
     judge_explicit_sync_startup,
 };
 
@@ -411,9 +413,23 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         runtime.security_presentation_reporter(),
         capture_reporter.clone(),
     );
+    install_nested_frame_presentation(&mut app, runtime.frame_presentation_reporter());
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.insert_resource(runtime.client_frame_clock());
+        render_app.add_systems(
+            NestedPostPresent,
+            pulse_nested_client_frames.after(complete_nested_security_presentation),
+        );
+    }
+    // Opt-in (COSMIX_FRAME_TRACE): render phases and wgpu acquire/present.
+    frame_trace::install_render_phases(&mut app);
+    #[cfg(feature = "content-source-probe")]
+    app.add_plugins(content_source::probe::ContentSourceProbePlugin);
     #[cfg(feature = "bus")]
     runtime.start_port().map_err(io::Error::other)?;
 
+    app.world_mut()
+        .insert_non_send(NestedUpdateTrace::default());
     // `App::run` reports how the app ended (window close / exit chord →
     // Success; render-error, device-lost, winit-loop, Ctrl-C → Error).
     // Propagate it so the process exit code stays truthful.
@@ -433,6 +449,14 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
         .add_systems(Startup, setup_scene)
         .add_systems(Update, (animate_background, collect_host_input))
         .add_systems(Last, finish_wayland_frame)
+        // The last drain before extract: a client that drew on the callback
+        // this frame pulsed is shown by the next frame, not the one after.
+        .add_systems(
+            Last,
+            compositor_scene::drain_protocol_events.after(finish_wayland_frame),
+        )
+        .add_systems(First, begin_nested_update_trace.before(CompositorSceneSet))
+        .add_systems(Last, end_nested_update_trace.after(finish_wayland_frame))
         .run();
     Ok(exit)
 }
@@ -1295,6 +1319,18 @@ fn pump_wayland(world: &mut World) {
     }
 }
 
+/// `comp_update` for one nested main-world update (frame tracing only).
+#[derive(Default)]
+struct NestedUpdateTrace(Option<frame_trace::Span>);
+
+fn begin_nested_update_trace(mut trace: NonSendMut<NestedUpdateTrace>) {
+    trace.0 = Some(frame_trace::span("comp_update", 0));
+}
+
+fn end_nested_update_trace(mut trace: NonSendMut<NestedUpdateTrace>) {
+    trace.0.take();
+}
+
 #[derive(ScheduleLabel, Clone, Debug, Eq, Hash, PartialEq)]
 struct NestedPostPresent;
 
@@ -1303,6 +1339,47 @@ struct NestedPresentCandidate {
     acquisition: Option<capture::NestedCaptureAcquisition>,
     epochs: Vec<(u64, protocol::SecurityPresentationTarget)>,
     captures: Vec<capture::PendingCapturePresentation>,
+    content: Option<protocol::presentation::FrameContent>,
+}
+
+/// Nested `wp_presentation`: report a frame's content only after its
+/// swapchain image was handed to the host (the same proof capture and the
+/// security barrier use). The host gives no timing signal, so the report is
+/// honest about it: CLOCK_MONOTONIC at hand-off, no flags, no sequence,
+/// unknown refresh. The nested backend has one output and renders every
+/// frame, so every presented frame reports every surface.
+fn install_nested_frame_presentation(app: &mut App, reporter: FramePresentationReporter) {
+    app.insert_resource(reporter.clone());
+    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+        render_app.insert_resource(reporter);
+    }
+}
+
+/// A frame is reported only when its swapchain image was consumed (and a
+/// hand-off time could be read).
+fn nested_frame_report(
+    content: Option<protocol::presentation::FrameContent>,
+    acquisition_consumed: bool,
+    timestamp: Option<(u64, u32)>,
+) -> Option<(
+    protocol::presentation::PresentedFrame,
+    protocol::presentation::FrameContent,
+)> {
+    if !acquisition_consumed {
+        return None;
+    }
+    Some((nested_presented_frame(timestamp?), content?))
+}
+
+fn nested_presented_frame(timestamp: (u64, u32)) -> protocol::presentation::PresentedFrame {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    protocol::presentation::PresentedFrame {
+        output: None,
+        time: Duration::new(timestamp.0, timestamp.1),
+        refresh: smithay::wayland::presentation::Refresh::Unknown,
+        seq: 0,
+        flags: Kind::empty(),
+    }
 }
 
 #[derive(Resource)]
@@ -1359,11 +1436,13 @@ fn capture_nested_swapchain_acquisition(
     pending: Res<NestedSecurityPresentation>,
     capture_pending: Res<capture::CapturePresentationPending>,
     windows: Res<ExtractedWindows>,
+    content: Option<Res<frame_content::RenderFrameContent>>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     candidate.acquisition = None;
     candidate.epochs.clear();
     candidate.captures.clear();
+    candidate.content = None;
     capture_pending.set_nested_acquisition(None);
     let Some(primary) = windows.primary else {
         return;
@@ -1384,6 +1463,7 @@ fn capture_nested_swapchain_acquisition(
         texture_view: texture_view.id(),
     };
     candidate.acquisition = Some(acquisition);
+    candidate.content = content.map(|content| content.0.clone());
     capture_pending.set_nested_acquisition(Some(acquisition));
     candidate.epochs = pending.snapshot();
 }
@@ -1404,6 +1484,8 @@ fn complete_nested_security_presentation(
     completion: Res<NestedPresentationCompletion>,
     render_device: Res<RenderDevice>,
     windows: Res<ExtractedWindows>,
+    frames: Option<Res<FramePresentationReporter>>,
+    sources: Option<ResMut<content_source::ExtractedContentSources>>,
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     let Some(acquisition) = candidate.acquisition.take() else {
@@ -1411,16 +1493,37 @@ fn complete_nested_security_presentation(
     };
     let epochs = mem::take(&mut candidate.epochs);
     let captures = mem::take(&mut candidate.captures);
+    let content = candidate.content.take();
     let acquisition_consumed = nested_swapchain_acquisition_was_consumed(acquisition, &windows);
+    let timestamp = acquisition_consumed
+        .then(monotonic_capture_timestamp)
+        .flatten();
+    frame_trace::event("comp_nested_handoff", || {
+        (
+            u64::from(acquisition_consumed),
+            timestamp.map_or(0, |(seconds, nanos)| {
+                seconds * 1_000_000 + u64::from(nanos) / 1_000
+            }),
+            0,
+        )
+    });
     complete_nested_capture_presentations(
         &completion.capture_reporter,
         captures,
         acquisition,
         acquisition_consumed,
-        acquisition_consumed
-            .then(monotonic_capture_timestamp)
-            .flatten(),
+        timestamp,
     );
+    if let (Some(frames), Some((frame, content))) = (
+        frames,
+        nested_frame_report(content, acquisition_consumed, timestamp),
+    ) {
+        frames.presented(frame, content);
+        // The report carried the content sources' accumulated costs.
+        if let Some(mut sources) = sources {
+            sources.consume();
+        }
+    }
     if !acquisition_consumed {
         return;
     }
@@ -1529,8 +1632,20 @@ fn finish_wayland_frame(world: &mut World) {
         return;
     }
     let inputs = mem::take(&mut world.resource_mut::<HostInputQueue>().pending);
-    if let Err(error) = world.resource::<WaylandRuntime>().finish_frame(inputs) {
+    if let Err(error) = world
+        .resource::<WaylandRuntime>()
+        .deliver_host_input(inputs)
+    {
         panic!("{error}");
+    }
+}
+
+/// The nested frame boundary: clients are told to draw once this frame is
+/// with the host, so their commit lands in the next extract rather than
+/// just missing the one that already happened.
+fn pulse_nested_client_frames(clock: Res<protocol::ClientFrameClock>) {
+    if let Err(error) = clock.pulse() {
+        error!(%error, "nested client frame pulse failed");
     }
 }
 
@@ -1663,6 +1778,22 @@ mod tests {
             deadline: std::time::Instant::now() + Duration::from_secs(30),
             nested_acquisition: Some(acquisition),
         }
+    }
+
+    #[test]
+    fn nested_frames_are_reported_only_after_the_acquisition_was_consumed() {
+        let content = || Some(protocol::presentation::FrameContent::default());
+        assert!(nested_frame_report(content(), false, Some((1, 2))).is_none());
+        assert!(nested_frame_report(content(), true, None).is_none());
+        assert!(nested_frame_report(None, true, Some((1, 2))).is_none());
+        let (frame, _) = nested_frame_report(content(), true, Some((1, 2))).expect("reported");
+        assert_eq!(frame.time, Duration::new(1, 2));
+        assert_eq!((frame.seq, frame.flags.bits()), (0, 0));
+        assert_eq!(
+            frame.refresh,
+            smithay::wayland::presentation::Refresh::Unknown
+        );
+        assert!(frame.output.is_none());
     }
 
     #[test]

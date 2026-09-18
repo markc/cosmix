@@ -86,6 +86,7 @@ fn test_atomic_selection(
 
 fn scene(layout: SurfaceLayout) -> SurfaceSceneSnapshot {
     SurfaceSceneSnapshot {
+        commit_seq: 0,
         layout,
         kind: if layout.toplevel.is_some() {
             SceneSurfaceKind::Toplevel
@@ -1882,7 +1883,9 @@ impl KeybindingHarness {
             .state
             .surfaces
             .values_mut()
-            .find(|record| record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
+            .find(|record| {
+                record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID
+            })
             .expect("real toplevel exists");
         toplevel.layout.x = 0.0;
         toplevel.layout.y = 0.0;
@@ -11377,6 +11380,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         .push(ProtocolEvent::SurfaceUpserted {
             id,
             scene: SurfaceSceneSnapshot {
+                commit_seq: 0,
                 layout: first_layout,
                 kind: SceneSurfaceKind::Toplevel,
                 title: Some(Arc::from("First title")),
@@ -11394,6 +11398,7 @@ fn pending_title_relayout_folds_into_queued_upsert() {
         .push(ProtocolEvent::SurfaceRelayout {
             id,
             scene: SurfaceSceneSnapshot {
+                commit_seq: 0,
                 layout: newest_layout,
                 kind: SceneSurfaceKind::Toplevel,
                 title: Some(Arc::from("Newest title")),
@@ -27823,19 +27828,32 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
     map_initial_test_toplevel(&mut harness);
     port_observation::service_observations(&mut harness.server.state);
     let mapped = drain_observations(&observations);
-    let (id, foreign_id, mapped_sequence) = mapped
+    let (id, foreign_id, mapped_sequence, mapped_window) = mapped
         .iter()
         .find_map(|record| match record {
             port_observation::ObservationRecord::SurfaceMapped {
                 id,
                 role,
                 foreign_id,
+                window,
                 event_seq,
-            } if role == "toplevel" => Some((*id, foreign_id.clone(), *event_seq)),
+            } if role == "toplevel" => {
+                Some((*id, foreign_id.clone(), *event_seq, window.clone()))
+            }
             _ => None,
         })
         .expect("one converged toplevel map edge");
     assert!(foreign_id.is_some());
+    // The map edge names the window without a props read.
+    let record = test_toplevel_record(&harness);
+    assert_eq!(
+        mapped_window,
+        port_observation::SurfaceEdgeWindow {
+            generation: record.generation,
+            app_id: record.app_id.clone(),
+            title: record.title.clone(),
+        }
+    );
 
     send_request(
         &mut harness.client,
@@ -27853,8 +27871,10 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
             id: observed,
             role,
             foreign_id: Some(observed_foreign),
+            window,
             event_seq,
         } if *observed == id
+            && *window == mapped_window
             && role == "toplevel"
             && Some(observed_foreign) == foreign_id.as_ref()
             && *event_seq > mapped_sequence
@@ -28846,6 +28866,1606 @@ fn window_band_prop_demotes_and_restores_toplevels() {
         .into_wire();
     assert_eq!(rc, 10);
     assert!(body.contains("a live toplevel window"), "{body}");
+}
+
+#[cfg(feature = "bus")]
+fn control_reply_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("control reply runtime")
+}
+
+/// Service one control admission and decode its wire reply.
+#[cfg(feature = "bus")]
+fn serviced_control_reply(
+    harness: &mut KeybindingHarness,
+    runtime: &tokio::runtime::Runtime,
+    admission: crate::port::ControlAdmission,
+) -> (u8, Value) {
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("control service cycle");
+    let (rc, body) = runtime
+        .block_on(admission.receive())
+        .expect("control reply")
+        .into_wire();
+    (rc, serde_json::from_str(&body).expect("control reply JSON"))
+}
+
+/// Service a props watch so the window-row diff lane runs.
+#[cfg(feature = "bus")]
+fn serviced_watch(
+    harness: &mut KeybindingHarness,
+    runtime: &tokio::runtime::Runtime,
+    admission: crate::port::ControlAdmission,
+) {
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    runtime.block_on(admission.receive()).expect("watch reply");
+}
+
+#[cfg(feature = "bus")]
+fn window_id_and_generation(harness: &KeybindingHarness, object: &ObjectId) -> (u64, u64) {
+    let record = &harness.server.state.surfaces[object];
+    (record.id.0, record.generation)
+}
+
+/// C0.3 fencing: the `wl_surface` keeps its id across a role re-take, but
+/// every role assignment (including going dormant) takes a new generation,
+/// and a write fenced with an old generation is refused before it can reach
+/// whatever now owns the id.
+#[cfg(feature = "bus")]
+#[test]
+fn role_retake_bumps_generation_and_stale_writes_are_refused() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, first) = window_id_and_generation(&harness, &object);
+    assert!(first > 0, "generations start at 1");
+    assert_eq!(
+        harness.server.state.resolve_window_target(id, Some(first)),
+        Ok(object.clone())
+    );
+
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the xdg_toplevel role");
+    let (dormant_id, dormant) = window_id_and_generation(&harness, &object);
+    assert_eq!(dormant_id, id, "the id survives the role");
+    assert!(dormant > first, "going dormant is a role change");
+    assert_eq!(
+        harness.server.state.resolve_window_target(id, None),
+        Err(window_control::WindowTargetError::UnknownWindow)
+    );
+
+    let replacement = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        1,
+        &words(&[replacement]),
+    );
+    harness.dispatch_client();
+    harness.assert_client_connected("after re-taking the toplevel role");
+    let record = &harness.server.state.surfaces[&object];
+    assert!(matches!(record.role, SurfaceRole::Toplevel(_)));
+    let (retaken_id, retaken) = window_id_and_generation(&harness, &object);
+    assert_eq!(retaken_id, id, "a re-taken role keeps the surface id");
+    assert!(retaken > dormant, "a re-taken role takes a new generation");
+    assert_eq!(
+        harness.server.state.resolve_window_target(id, Some(first)),
+        Err(window_control::WindowTargetError::StaleTarget {
+            requested: first,
+            current: retaken,
+        })
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .resolve_window_target(id, Some(retaken)),
+        Err(window_control::WindowTargetError::NotMapped),
+        "the replacement has no content yet"
+    );
+
+    let runtime = control_reply_runtime();
+    for leaf in ["minimized", "band"] {
+        let value = if leaf == "band" {
+            json!("bottom")
+        } else {
+            json!(true)
+        };
+        let admission = ingress
+            .request_set_fenced(format!("windows.s{id}.{leaf}"), value, Some(first))
+            .expect("fenced set admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 10, "{leaf}");
+        assert_eq!(
+            body,
+            json!({"error": "stale_target", "id": id, "generation": first, "current": retaken}),
+            "{leaf}"
+        );
+    }
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.minimized);
+    assert_eq!(record.layout.z.band, StackBand::Normal);
+}
+
+/// `windows.s<id>.minimized` is writable: true minimises, false restores
+/// THAT window (not the LIFO top), drops it from the LIFO, focuses and
+/// raises it, and both directions reach props.changed as `props.set`.
+#[cfg(feature = "bus")]
+#[test]
+fn minimized_prop_round_trips_and_restores_that_window() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let (_, _, _, beta) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    runtime.block_on(watch.receive()).expect("watch reply");
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let alpha_path = format!("windows.s{alpha_id}.minimized");
+    let admission = ingress
+        .request_set_fenced(alpha_path.clone(), json!(true), Some(alpha_generation))
+        .expect("minimise admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"path": alpha_path, "old": false, "new": true}));
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    for leaf in ["minimized", "visible"] {
+        let expected = format!("windows.s{alpha_id}.{leaf}");
+        assert!(
+            changed.iter().any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::PropsChanged {
+                    path,
+                    cause: "props.set",
+                    ..
+                } if *path == expected
+            )),
+            "{expected} reaches props.changed: {changed:?}"
+        );
+    }
+
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Minimize {
+            id: beta_id,
+            generation: beta_generation,
+        })
+        .expect("minimize verb admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["id"], beta_id);
+    assert_eq!(body["generation"], beta_generation);
+    assert_eq!(body["title"], "Beta");
+    assert_eq!(body["minimized"], true);
+    assert_eq!(body["changed"], true);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        [alpha.clone(), beta.clone()]
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    // Restore Alpha, which is NOT the LIFO top, by id only (unfenced).
+    let admission = ingress
+        .request_set(alpha_path.clone(), json!(false))
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"path": alpha_path, "old": true, "new": false}));
+    let state = &harness.server.state;
+    assert!(!state.surfaces[&alpha].minimized);
+    assert!(state.surfaces[&beta].minimized, "the LIFO top stays hidden");
+    assert_eq!(state.minimized_toplevels, std::slice::from_ref(&beta));
+    assert!(state.surfaces[&alpha].focused);
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(alpha.clone())
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if *path == alpha_path && new.wire_value() == json!(false)
+        )),
+        "restore reaches props.changed: {changed:?}"
+    );
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if path == "focus.window.id" && new.wire_value() == json!(alpha_id)
+        )),
+        "focus.window follows the restored window: {changed:?}"
+    );
+
+    // A no-op write replies normally and publishes nothing.
+    let admission = ingress
+        .request_set(alpha_path.clone(), json!(false))
+        .expect("no-op admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0);
+    assert_eq!(body["old"], false);
+    assert_eq!(body["new"], false);
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+
+    // Refusals: wrong type, unknown window.
+    let admission = ingress
+        .request_set(alpha_path, json!("yes"))
+        .expect("bad value reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "invalid_value");
+    let admission = ingress
+        .request_set("windows.s999999.minimized".into(), json!(true))
+        .expect("missing window reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["range"], "a live toplevel window");
+
+    // The new read-only row leaves are served from the snapshot.
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    let row = &snapshot.windows[&format!("s{alpha_id}")];
+    assert_eq!(row.generation, alpha_generation);
+    assert!(row.visible);
+    assert_eq!(row.pid, Some(u64::from(std::process::id())));
+    let record = &harness.server.state.surfaces[&alpha];
+    assert_eq!((row.window_x, row.window_y), record.window_origin);
+    assert!(!snapshot.windows[&format!("s{beta_id}")].visible);
+    assert_eq!(snapshot.focus.window.id, Some(alpha_id));
+    assert_eq!(snapshot.focus.window.generation, Some(alpha_generation));
+}
+
+/// `comp.window.restore` without an id is exactly the Super+Shift+M
+/// binding (LIFO pop); with nothing left it answers not_found, and every
+/// named form is fenced.
+#[cfg(feature = "bus")]
+#[test]
+fn window_restore_verb_pops_lifo_then_reports_not_found() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let beta = map_test_undecorated_toplevel(&mut harness);
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    for object in [&alpha, &beta] {
+        let surface = harness.server.state.surfaces[object]
+            .role
+            .wl_surface()
+            .clone();
+        harness.server.state.minimize_toplevel(&surface);
+    }
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let restore_any = crate::port::WindowOp::Restore { target: None };
+
+    for (expected_id, expected_generation, object, other) in [
+        (beta_id, beta_generation, &beta, &alpha),
+        (alpha_id, alpha_generation, &alpha, &beta),
+    ] {
+        let admission = ingress
+            .request_window(restore_any.clone())
+            .expect("restore admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["id"], expected_id);
+        assert_eq!(body["generation"], expected_generation);
+        assert_eq!(body["minimized"], false);
+        assert_eq!(body["changed"], true);
+        assert!(body.get("title").is_some() && body.get("app_id").is_some());
+        assert!(!harness.server.state.surfaces[object].minimized);
+        assert_eq!(
+            focused_surface(harness.server.state.keyboard.current_focus())
+                .map(|surface| surface.id()),
+            Some(object.clone())
+        );
+        // Restore raises: the restored window ends above the other normal
+        // window (Alpha starts below Beta, so the second pass is the real
+        // check).
+        let surfaces = &harness.server.state.surfaces;
+        assert_eq!(surfaces[object].layout.z.band, StackBand::Normal);
+        assert!(surfaces[object].layout.z > surfaces[other].layout.z);
+        // The LIFO form attributes its changes to the verb, like the named
+        // forms.
+        port_observation::service_observations(&mut harness.server.state);
+        let changed = drain_observations(&observations);
+        let minimized_path = format!("windows.s{expected_id}.minimized");
+        assert!(
+            changed.iter().any(|record| matches!(
+                record,
+                port_observation::ObservationRecord::PropsChanged {
+                    path,
+                    cause: "comp.window",
+                    ..
+                } if *path == minimized_path
+            )),
+            "restore {{}} reports cause comp.window: {changed:?}"
+        );
+    }
+
+    let admission = ingress
+        .request_window(restore_any.clone())
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body, json!({"error": "not_found", "minimized_count": 0}));
+
+    // Named forms: stale, unknown, then minimise + restore by id, and a
+    // restore of a window that is not minimised is a successful no-op.
+    let stale = crate::port::WindowOp::Restore {
+        target: Some((alpha_id, alpha_generation + 100)),
+    };
+    let admission = ingress.request_window(stale).expect("admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "stale_target");
+    assert_eq!(body["current"], alpha_generation);
+
+    let unknown = crate::port::WindowOp::Minimize {
+        id: 999_999,
+        generation: 1,
+    };
+    let admission = ingress.request_window(unknown).expect("admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body, json!({"error": "unknown_window", "id": 999_999}));
+
+    let minimise = crate::port::WindowOp::Minimize {
+        id: alpha_id,
+        generation: alpha_generation,
+    };
+    let admission = ingress.request_window(minimise).expect("admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!((rc, body["changed"].clone()), (0, json!(true)));
+    let restore_alpha = crate::port::WindowOp::Restore {
+        target: Some((alpha_id, alpha_generation)),
+    };
+    for expected_change in [true, false] {
+        let admission = ingress
+            .request_window(restore_alpha.clone())
+            .expect("admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["changed"], expected_change);
+        assert_eq!(body["minimized"], false);
+    }
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+}
+
+/// A Bus minimise that lands mid-drag ends the client-started move, as an
+/// unmap does: pointer motion while hidden, and after restore, never moves
+/// the window.
+#[cfg(feature = "bus")]
+#[test]
+fn mesh_minimise_cancels_a_client_move_in_progress() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let origin = harness.server.state.surfaces[&object].window_origin;
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Move {
+        surface,
+        start_pointer: (0.0, 0.0),
+        start_origin: origin,
+    });
+    let runtime = control_reply_runtime();
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Minimize { id, generation })
+        .expect("minimize admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.interactive_pointer.is_none());
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(150.0, 120.0)
+    );
+    assert_eq!(harness.server.state.surfaces[&object].window_origin, origin);
+
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Restore {
+            target: Some((id, generation)),
+        })
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(300.0, 240.0)
+    );
+    assert_eq!(harness.server.state.surfaces[&object].window_origin, origin);
+}
+
+/// The resize case of the above: a minimised window stays alive, so the
+/// client must be told the resize ended (Resizing unset), and restore must
+/// not resume it.
+#[cfg(feature = "bus")]
+#[test]
+fn mesh_minimise_ends_a_client_resize_in_progress() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let record = &harness.server.state.surfaces[&object];
+    let toplevel = record.role.toplevel().expect("xdg toplevel").clone();
+    let surface = toplevel.wl_surface().clone();
+    let (origin, size) = (record.window_origin, record.configured_size);
+    // What the xdg resize request handler does on a matching grab.
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
+        surface: surface.clone(),
+        edges: xdg_toplevel::ResizeEdge::BottomRight,
+        start_pointer: (0.0, 0.0),
+        start_origin: origin,
+        start_size: size,
+    });
+    toplevel.with_pending_state(|state| {
+        state.states.set(xdg_toplevel::State::Resizing);
+    });
+    let _ = harness
+        .server
+        .state
+        .send_pending_toplevel_configure(&surface, false);
+    let started = harness.sync();
+    assert!(
+        toplevel_configure_states(&started, TEST_TOPLEVEL_ID)
+            .last()
+            .is_some_and(|states| states.contains(&(xdg_toplevel::State::Resizing as u32))),
+        "precondition: the client was told it is resizing"
+    );
+
+    let runtime = control_reply_runtime();
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Minimize { id, generation })
+        .expect("minimize admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.interactive_pointer.is_none());
+    let ended = toplevel_configure_states(&harness.sync(), TEST_TOPLEVEL_ID);
+    // Focus also leaves the window, which may send its own configure; what
+    // matters is that the client hears the resize end and never again
+    // hears it continue.
+    assert!(!ended.is_empty(), "the client is told the resize ended");
+    assert!(
+        ended
+            .iter()
+            .all(|states| !states.contains(&(xdg_toplevel::State::Resizing as u32))),
+        "{ended:?}"
+    );
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(400.0, 300.0)
+    );
+    assert_eq!(harness.server.state.surfaces[&object].configured_size, size);
+
+    let admission = ingress
+        .request_window(crate::port::WindowOp::Restore {
+            target: Some((id, generation)),
+        })
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.interactive_pointer.is_none());
+    assert!(
+        !harness
+            .server
+            .state
+            .update_interactive_pointer(500.0, 400.0)
+    );
+    assert!(
+        toplevel_configure_states(&harness.sync(), TEST_TOPLEVEL_ID)
+            .iter()
+            .all(|states| !states.contains(&(xdg_toplevel::State::Resizing as u32))),
+        "restore does not resume the resize"
+    );
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.configured_size, size);
+    assert_eq!(record.window_origin, origin);
+}
+
+fn request_presentation_feedback(harness: &mut KeybindingHarness, presentation: u32) -> u32 {
+    request_surface_feedback(harness, presentation, TEST_TOPLEVEL_SURFACE_ID)
+}
+
+fn request_surface_feedback(
+    harness: &mut KeybindingHarness,
+    presentation: u32,
+    surface: u32,
+) -> u32 {
+    let callback = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        presentation,
+        1,
+        &words(&[surface, callback]),
+    );
+    callback
+}
+
+/// Enable the global (as a backend's reporter does), bind it through a
+/// fresh registry, and return the object id plus the bind traffic.
+fn bind_test_presentation(harness: &mut KeybindingHarness) -> (u32, Vec<(u32, u16, Vec<u8>)>) {
+    harness.server.state.enable_presentation();
+    let registry = harness.allocate_object_id();
+    let sync = harness.allocate_object_id();
+    send_display_request(&mut harness.client, 1, registry);
+    send_display_request(&mut harness.client, 0, sync);
+    harness.dispatch_client();
+    let globals = registry_globals_for(&mut harness.client, registry, sync);
+    let (name, version) = globals["wp_presentation"];
+    let presentation = harness.allocate_object_id();
+    let interface = "wp_presentation";
+    let string_len = interface.len() + 1;
+    let mut body = Vec::new();
+    body.extend_from_slice(&name.to_ne_bytes());
+    body.extend_from_slice(&(string_len as u32).to_ne_bytes());
+    body.extend_from_slice(interface.as_bytes());
+    body.resize(8 + string_len.div_ceil(4) * 4, 0);
+    body.extend_from_slice(&version.min(2).to_ne_bytes());
+    body.extend_from_slice(&presentation.to_ne_bytes());
+    send_request(&mut harness.client, registry, 0, &body);
+    let bound = harness.sync();
+    (presentation, bound)
+}
+
+fn commit_test_buffer(harness: &mut KeybindingHarness, surface: u32) {
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(&mut harness.client, surface, 1, &words(&[buffer, 0, 0]));
+    send_request(&mut harness.client, surface, 6, &[]);
+}
+
+fn test_frame_report(
+    id: SurfaceId,
+    time_us: u64,
+    commit_seq: u64,
+    shown: bool,
+) -> (presentation::PresentedFrame, presentation::FrameContent) {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    (
+        presentation::PresentedFrame {
+            output: None,
+            time: Duration::from_micros(time_us),
+            refresh: smithay::wayland::presentation::Refresh::Unknown,
+            seq: 0,
+            flags: Kind::empty(),
+        },
+        presentation::FrameContent {
+            surfaces: vec![presentation::FrameSurface {
+                id,
+                commit_seq,
+                shown,
+                waiting: false,
+            }],
+            sources: Vec::new(),
+        },
+    )
+}
+
+/// Non-`sync_output` events addressed to one feedback object.
+fn feedback_outcome(events: &[(u32, u16, Vec<u8>)], callback: u32) -> Vec<(u16, Vec<u8>)> {
+    events
+        .iter()
+        .filter(|(object, opcode, _)| *object == callback && *opcode != 0)
+        .map(|(_, opcode, body)| (*opcode, body.clone()))
+        .collect()
+}
+
+/// Just the opcodes: 1 = presented, 2 = discarded.
+fn feedback_opcodes(events: &[(u32, u16, Vec<u8>)], callback: u32) -> Vec<u16> {
+    feedback_outcome(events, callback)
+        .into_iter()
+        .map(|(opcode, _)| opcode)
+        .collect()
+}
+
+fn content_seq(harness: &KeybindingHarness, object: &ObjectId) -> u64 {
+    harness.server.state.surfaces[object].content_seq
+}
+
+#[cfg(feature = "bus")]
+fn stats_reply(harness: &mut KeybindingHarness, op: crate::port::WindowOp) -> (u8, Value) {
+    let (rc, body) = harness.server.state.service_window_op(&op).into_wire();
+    (rc, serde_json::from_str(&body).expect("stats reply body"))
+}
+
+/// Step 6: presentation stats follow a client's content whether or not it
+/// asks for feedback, are served by reads and the stats verbs, and a
+/// watched client presenting every frame never puts a volatile leaf into
+/// `props.changed` (neither the incremental nor the full-snapshot diff).
+#[cfg(feature = "bus")]
+#[test]
+fn presentation_stats_are_read_and_reset_but_never_diffed() {
+    use crate::port::{StatsTarget, WindowOp};
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.enable_presentation();
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let record = &harness.server.state.surfaces[&object];
+    let (id, generation) = (record.id, record.generation);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("watch reply runtime");
+    let watch = ingress.request_watch().expect("watch admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("watch service cycle");
+    assert_eq!(runtime.block_on(watch.receive()).unwrap().into_wire().0, 0);
+    drain_observations(&observations);
+
+    // A client committing every frame, without asking for feedback, on the
+    // real clock (publish stamps are CLOCK_MONOTONIC). A second window maps
+    // and unmaps inside the watched loop, so row events are covered too.
+    let mapped_seq = content_seq(&harness, &object);
+    let start = crate::frame_trace::monotonic_us();
+    let mut changed = Vec::new();
+    let mut second = None;
+    for frame in 1..=6_u64 {
+        commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+        harness.dispatch_client();
+        if frame == 2 {
+            second = Some(map_named_test_toplevel(
+                &mut harness,
+                "Second",
+                "dev.cosmix.Second",
+            ));
+        }
+        if frame == 4
+            && let Some((surface, ..)) = second
+        {
+            send_request(&mut harness.client, surface, 1, &words(&[0, 0, 0]));
+            send_request(&mut harness.client, surface, 6, &[]);
+            harness.dispatch_client();
+        }
+        let (report, content) = test_frame_report(
+            id,
+            start + frame * 16_667,
+            content_seq(&harness, &object),
+            true,
+        );
+        harness.server.state.frame_presented(report, content);
+        port_observation::service_observations(&mut harness.server.state);
+        changed.extend(drain_observations(&observations));
+    }
+    let (_, _, _, second_object) = second.expect("second window mapped");
+    let second_key = format!(
+        "windows.s{}",
+        harness.server.state.surfaces[&second_object].id.0
+    );
+    let row_events = changed
+        .iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if *path == second_key =>
+            {
+                Some(new.wire_value().is_null())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(row_events, [false, true], "row added then removed");
+    // Force the full-snapshot diff too.
+    harness.server.state.mark_session_observation_dirty();
+    port_observation::service_observations(&mut harness.server.state);
+    changed.extend(drain_observations(&observations));
+    let volatile = changed
+        .iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, new, .. } => {
+                let row = new.wire_value();
+                (port_snapshot::volatile_path(path) || row.get("presentation").is_some())
+                    .then(|| path.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(volatile.is_empty(), "{volatile:?}");
+
+    let context = harness.server.state.port_context.clone().unwrap();
+    let all = port_snapshot::ReadScopes::All;
+    // Diff snapshots never carry volatile leaves; read snapshots do.
+    let key = format!("s{}", id.0);
+    let diff = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    assert!(diff.windows[&key].presentation.is_none() && diff.sources.is_empty());
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
+    let leaves = snapshot.windows[&key].presentation.clone().unwrap();
+    // The mapping content was never in a reported frame: superseded.
+    assert_eq!(leaves.presented, 6);
+    assert_eq!(leaves.discarded, mapped_seq, "{leaves:?}");
+    assert_eq!(leaves.interval_p50_us, Some(16_667));
+    assert_eq!(leaves.missed, None, "nested refresh is unknown");
+    assert!(leaves.commit_to_present_p50_us.unwrap() > 0, "{leaves:?}");
+    let scoped = port_snapshot::ReadScopes::Paths(vec!["outputs".into()]);
+    let narrow = port_snapshot::read_snapshot(&harness.server.state, &context, &scoped).unwrap();
+    assert!(narrow.windows[&key].presentation.is_none(), "out of scope");
+    assert!(
+        narrow
+            .outputs
+            .values()
+            .all(|row| row.presentation.is_some())
+    );
+    let tree = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(tree["windows"][&key]["presentation"]["presented"], 6);
+    let output = snapshot
+        .outputs
+        .values()
+        .find(|output| output.default)
+        .expect("default output row");
+    assert_eq!(output.presentation.as_ref().unwrap().frames, 6);
+
+    let window = StatsTarget::Window {
+        id: id.0,
+        generation,
+    };
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: window.clone(),
+            samples: 2,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["presented"], 6);
+    assert_eq!(body["generation"], generation);
+    assert_eq!(body["intervals_us"], json!([16_667, 16_667]));
+    assert_eq!(body["missed"], Value::Null);
+    assert_eq!(body["commit_to_present_us"].as_array().unwrap().len(), 2);
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: StatsTarget::Window {
+                id: id.0,
+                generation: generation + 1,
+            },
+            samples: 0,
+        },
+    );
+    assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
+
+    // Injected input: the next update committed after it answers it.
+    let mark = presentation_stats::InputMark {
+        input_seq: 1,
+        injected_at_us: crate::frame_trace::monotonic_us(),
+    };
+    assert!(harness.server.state.note_injected_input(Some(id), mark));
+    assert!(
+        !harness.server.state.note_injected_input(Some(id), mark),
+        "an input_seq names one injection"
+    );
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let tv = crate::frame_trace::monotonic_us() + 1_000;
+    let (report, content) = test_frame_report(id, tv, content_seq(&harness, &object), true);
+    harness.server.state.frame_presented(report, content);
+    let (_, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: window.clone(),
+            samples: 512,
+        },
+    );
+    assert_eq!(body["input_to_present_us"].as_array().unwrap().len(), 1);
+    assert!(body["input_to_present_p50_us"].as_u64().unwrap() >= 1_000);
+
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::StatsReset {
+            target: Some(window.clone()),
+        },
+    );
+    assert_eq!((rc, body["reset"].as_str()), (0, Some("window")));
+    let (_, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: window,
+            samples: 512,
+        },
+    );
+    assert_eq!(
+        (body["presented"].as_u64(), body["discarded"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert_eq!(body["intervals_us"], json!([]));
+    assert!(body["since_us"].as_u64().unwrap() > 0);
+
+    // A content source: registered, measured, read, reset, gone.
+    harness
+        .server
+        .state
+        .content_source_registered("scene", Some("nested".into()));
+    let source = |revision, upload| presentation::FrameSource {
+        id: "scene".into(),
+        revision,
+        shown: true,
+        upload_bytes: upload,
+        damage_px: upload,
+        ..presentation::FrameSource::default()
+    };
+    for (frame, revision, upload) in [(7_u64, 1, 10), (8, 3, 20)] {
+        let tv = crate::frame_trace::monotonic_us() + frame * 16_667;
+        let (report, mut content) = test_frame_report(id, tv, 0, false);
+        content.surfaces.clear();
+        content.sources.push(source(revision, upload));
+        harness.server.state.frame_presented(report, content);
+    }
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
+    let scene = &snapshot.sources["scene"];
+    assert_eq!(
+        (scene.revision, scene.registration, scene.output.as_deref()),
+        (3, 1, Some("nested"))
+    );
+    assert_eq!(
+        (
+            scene.presentation.common.presented,
+            scene.presentation.common.discarded,
+            scene.presentation.upload_bytes_total
+        ),
+        (2, 1, 30)
+    );
+    let scene_target = |registration| StatsTarget::Source {
+        id: "scene".into(),
+        registration,
+    };
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: scene_target(Some(1)),
+            samples: 512,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["upload_bytes"], json!([10, 20]));
+    assert_eq!(body["damage_px_total"], 30);
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: scene_target(Some(9)),
+            samples: 1,
+        },
+    );
+    assert_eq!((rc, body["error"].as_str()), (10, Some("stale_target")));
+    let (rc, _) = stats_reply(&mut harness, WindowOp::StatsReset { target: None });
+    assert_eq!(rc, 0);
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
+    assert_eq!(snapshot.sources["scene"].presentation.upload_bytes_total, 0);
+    let window_leaves = snapshot.windows[&key].presentation.as_ref().unwrap();
+    assert_eq!(window_leaves.presented, 0);
+    assert_eq!(
+        snapshot
+            .outputs
+            .values()
+            .find(|output| output.default)
+            .and_then(|output| output.presentation.as_ref())
+            .map(|presentation| presentation.frames),
+        Some(0)
+    );
+
+    harness.server.state.content_source_unregistered("scene", 3);
+    let snapshot = port_snapshot::read_snapshot(&harness.server.state, &context, &all).unwrap();
+    assert!(snapshot.sources.is_empty());
+    let (rc, body) = stats_reply(
+        &mut harness,
+        WindowOp::Stats {
+            target: scene_target(None),
+            samples: 1,
+        },
+    );
+    assert_eq!((rc, body["error"].as_str()), (10, Some("unknown_source")));
+}
+
+/// The global exists only after a reporter asked for it.
+#[test]
+fn presentation_global_waits_for_a_frame_reporter() {
+    let mut harness = KeybindingHarness::new(true);
+    let registry = harness.allocate_object_id();
+    let sync = harness.allocate_object_id();
+    send_display_request(&mut harness.client, 1, registry);
+    send_display_request(&mut harness.client, 0, sync);
+    harness.dispatch_client();
+    let globals = registry_globals_for(&mut harness.client, registry, sync);
+    assert!(!globals.contains_key("wp_presentation"));
+    harness.server.state.enable_presentation();
+    harness.server.state.enable_presentation();
+    let (_, bound) = bind_test_presentation(&mut harness);
+    harness.assert_client_connected("after binding wp_presentation");
+    assert!(!bound.is_empty());
+}
+
+/// `wp_presentation` end to end on the protocol thread: feedback is taken at
+/// commit (so a later commit cannot discard it), a frame report presents
+/// the commit it sampled and leaves newer ones waiting, a commit without a
+/// new buffer resolves with the content it left on screen, and minimising
+/// discards what is still pending.
+#[test]
+fn presentation_feedback_is_taken_at_commit_and_resolved_by_frame_reports() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, bound) = bind_test_presentation(&mut harness);
+    assert!(
+        bound
+            .iter()
+            .any(|(object, opcode, body)| *object == presentation
+                && *opcode == 0
+                && body[0..4] == (libc::CLOCK_MONOTONIC as u32).to_ne_bytes()),
+        "wp_presentation.clock_id is CLOCK_MONOTONIC: {bound:?}"
+    );
+
+    let first = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let second = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let third = request_presentation_feedback(&mut harness, presentation);
+    // No new buffer: this commit shows whatever the second one left.
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after committing with presentation feedback");
+    let seq = content_seq(&harness, &object);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        3,
+        "all three survive the later commits"
+    );
+    assert!(
+        harness
+            .sync()
+            .iter()
+            .all(|(object, _, _)| ![first, second, third].contains(object)),
+        "nothing resolves before a frame report"
+    );
+
+    let (frame, content) = test_frame_report(id, 1_000_000, seq - 1, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    let presented = feedback_outcome(&events, first);
+    assert_eq!(presented.len(), 1, "{events:?}");
+    assert_eq!(presented[0].0, 1, "presented");
+    let body = &presented[0].1;
+    assert_eq!(word(body, 0), 0, "tv_sec_hi");
+    assert_eq!(word(body, 1), 1, "tv_sec_lo");
+    assert_eq!(word(body, 2), 0, "tv_nsec");
+    assert_eq!(word(body, 3), 0, "refresh unknown");
+    assert_eq!((word(body, 4), word(body, 5)), (0, 0), "no sequence");
+    assert_eq!(word(body, 6), 0, "no flags");
+    assert!(feedback_outcome(&events, second).is_empty());
+    assert!(feedback_outcome(&events, third).is_empty());
+
+    let (frame, content) = test_frame_report(id, 2_000_000, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    for callback in [second, third] {
+        let resolved = feedback_outcome(&events, callback);
+        assert_eq!(resolved.len(), 1, "{events:?}");
+        assert_eq!(resolved[0].0, 1, "presented at the second frame");
+        assert_eq!(word(&resolved[0].1, 1), 2);
+    }
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .counters(id)
+            .presented,
+        3
+    );
+
+    // Pending feedback does not survive a minimise.
+    let fourth = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&surface);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, fourth), [2], "discarded");
+}
+
+/// A commit superseded by a newer buffer before any frame sampled it is
+/// discarded, not reported as presented by the later frame.
+#[test]
+fn presentation_feedback_of_a_superseded_commit_is_discarded() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let older = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let newer = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    let (frame, content) = test_frame_report(id, 3_000, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, older), [2], "{events:?}");
+    assert_eq!(feedback_opcodes(&events, newer), [1], "{events:?}");
+}
+
+/// A frame that does not show the surface discards what it covered, and
+/// unmapping discards what waits.
+#[test]
+fn presentation_feedback_is_discarded_when_not_shown_or_unmapped() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+
+    let hidden = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    let (frame, content) = test_frame_report(id, 5_000, seq, false);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, hidden), [2], "{events:?}");
+
+    let unmapped = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // Detach the buffer: the unmap path discards immediately.
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[0, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after unmapping");
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, unmapped), [2], "{events:?}");
+}
+
+/// A pending commit whose surface the renderer can no longer present, and
+/// did not list, is discarded by the next report's sweep.
+#[test]
+fn presentation_sweep_discards_unlisted_surfaces_that_cannot_be_presented() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let pending = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // Still presentable and unlisted: in flight, kept.
+    let (frame, _) = test_frame_report(id, 1, 0, true);
+    harness
+        .server
+        .state
+        .frame_presented(frame.clone(), presentation::FrameContent::default());
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // No longer presentable (flip the record the way a protocol path would
+    // without passing a discard edge): the sweep resolves it.
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&object)
+        .unwrap()
+        .mapped = false;
+    harness
+        .server
+        .state
+        .frame_presented(frame, presentation::FrameContent::default());
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, pending), [2], "{events:?}");
+}
+
+/// A KMS harness with its selected output registered as a client output;
+/// returns that output's key.
+fn register_test_kms_output(harness: &mut KeybindingHarness) -> OutputKey {
+    harness.admit_kms_4k_at_250_percent();
+    let display = harness.server.state.display_handle.clone();
+    harness
+        .server
+        .state
+        .backend
+        .reconcile_kms_client_output::<WaylandState>(&display, &[]);
+    let key = OutputKey {
+        device: 226,
+        connector_name: "Fractional-1".into(),
+    };
+    assert!(
+        harness
+            .server
+            .state
+            .backend
+            .kms_registered_outputs()
+            .iter()
+            .any(|(registered, _)| *registered == key)
+    );
+    key
+}
+
+/// Step 5: a KMS flip is presented on the client output of its own key,
+/// with its own timing; a flip on an output that is not a client output
+/// resolves nothing.
+#[test]
+fn kms_frame_reports_name_their_own_output() {
+    use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    let key = register_test_kms_output(&mut harness);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let callback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    harness
+        .server
+        .state
+        .content_source_registered("scene", None);
+    let content = presentation::FrameContent {
+        surfaces: vec![presentation::FrameSurface {
+            id,
+            commit_seq: content_seq(&harness, &object),
+            shown: true,
+            waiting: false,
+        }],
+        sources: vec![presentation::FrameSource {
+            id: "scene".into(),
+            revision: 1,
+            shown: true,
+            upload_bytes: 64,
+            damage_px: 16,
+            ..Default::default()
+        }],
+    };
+    let flip = |seq| presentation::PresentedFrame {
+        output: None,
+        time: Duration::new(5, 250),
+        refresh: smithay::wayland::presentation::Refresh::fixed(Duration::from_nanos(16_666_666)),
+        seq,
+        flags: Kind::Vsync | Kind::HwCompletion | Kind::HwClock,
+    };
+    let (reporter, probe) = FramePresentationReporter::test_channel();
+
+    reporter.kms_presented(
+        OutputKey {
+            device: 226,
+            connector_name: "Other-2".into(),
+        },
+        flip(90),
+        content.clone(),
+    );
+    assert_eq!(probe.deliver(&mut harness.server.state), 1);
+    assert!(feedback_outcome(&harness.sync(), callback).is_empty());
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    // K-N1: the renderer already handed over this frame's content-source
+    // costs, so a report no surface can be presented on still spends them.
+    let scene = harness
+        .server
+        .state
+        .presentation
+        .sources
+        .get("scene")
+        .expect("registered source");
+    assert_eq!(
+        (scene.upload_bytes_total, scene.damage_px_total, scene.frames),
+        (64, 16, 1)
+    );
+
+    let mut second = content.clone();
+    second.sources[0].revision = 2;
+    reporter.kms_presented(key, flip(91), second);
+    assert_eq!(probe.deliver(&mut harness.server.state), 1);
+    let events = harness.sync();
+    let outcome = feedback_outcome(&events, callback);
+    assert_eq!(outcome.len(), 1, "{events:?}");
+    assert_eq!(outcome[0].0, 1, "presented");
+    let body = &outcome[0].1;
+    assert_eq!((word(body, 0), word(body, 1), word(body, 2)), (0, 5, 250));
+    assert_eq!(word(body, 3), 16_666_666, "refresh");
+    assert_eq!((word(body, 4), word(body, 5)), (0, 91), "seq");
+    assert_eq!(word(body, 6), 0x7, "vsync | hw_clock | hw_completion");
+}
+
+/// Step 5 (K3): on KMS the render world holds the frame reporter, so a
+/// refusal it sees reaches the ledger at once, without riding a flip.
+#[test]
+fn kms_render_world_refusals_reach_the_ledger() {
+    let mut harness = KeybindingHarness::new_with_backend(true, BackendKind::Kms);
+    register_test_kms_output(&mut harness);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let refused = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+
+    let mut app = bevy::app::App::new();
+    app.insert_sub_app(bevy::render::RenderApp, bevy::app::SubApp::new());
+    let (reporter, probe) = FramePresentationReporter::test_channel();
+    crate::backend::render::install_live_frame_reporter(&mut app, reporter);
+    assert!(app.world().contains_resource::<FramePresentationReporter>());
+    app.sub_app(bevy::render::RenderApp)
+        .world()
+        .resource::<FramePresentationReporter>()
+        .commit_refused(id, None, seq);
+    assert_eq!(probe.deliver(&mut harness.server.state), 1);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, refused), [2], "{events:?}");
+}
+
+/// A buffer the commit path counted but never published (here: the client
+/// vanished mid-import, a test hook) is not content: its feedback is
+/// discarded at once and the content sequence does not move. A buffer the
+/// renderer refuses later is discarded when it says so.
+#[test]
+fn presentation_feedback_of_refused_buffers_is_discarded() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let before = content_seq(&harness, &object);
+    let count_before = harness.server.state.surfaces[&object].commit_count;
+
+    harness.server.state.release_use_force_client_missing = true;
+    let refused = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    assert!(harness.server.state.surfaces[&object].commit_count > count_before);
+    assert_eq!(content_seq(&harness, &object), before);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, refused), [2], "{events:?}");
+
+    // Render-side refusal, directly and through a frame report.
+    let direct = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    assert!(seq > before);
+    let kept = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    harness.server.state.commit_refused(id, None, seq);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, direct), [2], "{events:?}");
+    assert!(
+        feedback_opcodes(&events, kept).is_empty(),
+        "a later commit keeps waiting"
+    );
+
+    // M1(a): a bufferless commit on top of refused content is discarded at
+    // once instead of waiting for content that will never be sampled.
+    let reported = content_seq(&harness, &object);
+    harness
+        .server
+        .state
+        .commit_refused(id, Some(seq.saturating_sub(1)), reported);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, kept), [2], "{events:?}");
+    let on_refused = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, on_refused), [2], "{events:?}");
+    // New content lifts the block.
+    let after = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    let (frame, content) = test_frame_report(id, 11, content_seq(&harness, &object), true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, after), [1], "{events:?}");
+}
+
+/// M1(b): a DMA-BUF import that failed after superseding a still-pending
+/// request takes that request's feedback with it, since neither will ever
+/// be installed.
+#[test]
+fn a_render_refusal_discards_the_requests_it_superseded() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let sampled = content_seq(&harness, &object);
+    let superseded = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let failed = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    let later = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let newest = content_seq(&harness, &object);
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        3
+    );
+    // The renderer still samples `sampled`; the import for newest - 1 failed.
+    harness
+        .server
+        .state
+        .commit_refused(id, Some(sampled), newest - 1);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, superseded), [2], "{events:?}");
+    assert_eq!(feedback_opcodes(&events, failed), [2], "{events:?}");
+    assert!(feedback_opcodes(&events, later).is_empty());
+    let (frame, content) = test_frame_report(id, 12, newest, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, later), [1], "{events:?}");
+}
+
+/// A role change (the xdg_toplevel is destroyed) discards what waits.
+#[test]
+fn presentation_feedback_is_discarded_on_role_change() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let pending = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after destroying the role");
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, pending), [2], "{events:?}");
+}
+
+/// A rebuilt upsert (relayout or dirty recovery) carries the sequence of the
+/// content it rebuilds from, not of a refused commit.
+#[test]
+fn rebuilt_upserts_carry_the_published_content_sequence() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let published = content_seq(&harness, &object);
+    harness.server.state.release_use_force_client_missing = true;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    assert!(harness.server.state.surfaces[&object].commit_count > published);
+    let LatestSurfaceUpsert::Ready(event) = harness.server.state.latest_surface_upsert(id) else {
+        panic!("a mapped surface rebuilds an upsert");
+    };
+    let ProtocolEvent::SurfaceUpserted { scene, frame, .. } = *event else {
+        panic!("an upsert");
+    };
+    assert_eq!(scene.commit_seq, published);
+    if let SurfaceFrame::Dmabuf(frame) = frame {
+        harness.server.state.release_buffer_token(frame.token);
+    }
+    for event in mem::take(&mut harness.server.state.events) {
+        if let Some(token) = protocol_event_dmabuf_token(&event) {
+            harness.server.state.release_buffer_token(token);
+        }
+    }
+}
+
+/// A synchronised subsurface's commit is applied (and its feedback taken)
+/// only when the parent commits.
+#[test]
+fn synchronised_subsurface_feedback_is_taken_when_the_parent_applies() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let callback = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    harness.dispatch_client();
+    harness.assert_client_connected("after the cached child commit");
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        0,
+        "a synchronised child's commit is cached until its parent commits"
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        1
+    );
+    let seq = content_seq(&harness, &child.id());
+    let (frame, content) = test_frame_report(child_id, 42, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, callback), [1], "{events:?}");
+}
+
+/// G3: several cached commits applied in one transaction keep their own
+/// feedback. A commit whose buffer a later cached commit replaced is
+/// discarded even when the later commit asked for no feedback; a commit
+/// followed only by bufferless commits is presented with its own buffer.
+#[test]
+fn interior_cached_commits_are_superseded_not_presented_late() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let pending = |harness: &KeybindingHarness| {
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id)
+    };
+    // Transaction 1: a commit with feedback, then a cached commit that
+    // replaces its buffer and asks for none. (Smithay alone would keep the
+    // first commit's callbacks, since the later commit had none.)
+    let interior = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    harness.dispatch_client();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let events = harness.sync();
+    assert_eq!(
+        feedback_opcodes(&events, interior),
+        [2],
+        "the superseded interior commit is discarded at apply: {events:?}"
+    );
+    assert_eq!(pending(&harness), 0);
+
+    // Transaction 2: a buffer with feedback, then a bufferless commit
+    // without feedback. The first commit's buffer is what is shown.
+    let shown = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    harness.dispatch_client();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert!(feedback_opcodes(&harness.sync(), shown).is_empty());
+    assert_eq!(pending(&harness), 1);
+    let seq = content_seq(&harness, &child.id());
+    let (frame, content) = test_frame_report(child_id, 42, seq, true);
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, shown), [1], "{events:?}");
+}
+
+/// A-N4: a NULL attach replaces the content with nothing, so a commit
+/// with feedback followed in the same transaction by an unmap attach is
+/// discarded, not admitted at the unchanged content sequence.
+#[test]
+fn a_null_attach_supersedes_the_commits_before_it() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (child, child_surface, _child_role) = harness.extra_mapped_subsurface_with_role();
+    let child_id = harness.server.state.surfaces[&child.id()].id;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let doomed = request_surface_feedback(&mut harness, presentation, child_surface);
+    commit_test_buffer(&mut harness, child_surface);
+    // The unmap attach lands in the same cached transaction.
+    send_request(&mut harness.client, child_surface, 1, &words(&[0, 0, 0]));
+    send_request(&mut harness.client, child_surface, 6, &[]);
+    harness.dispatch_client();
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let events = harness.sync();
+    assert_eq!(
+        feedback_opcodes(&events, doomed),
+        [2],
+        "content replaced by nothing is never shown: {events:?}"
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .presentation
+            .ledger
+            .pending_count(child_id),
+        0
+    );
 }
 
 /// The XWayland runtime switch as a props leaf: set round-trip, changed
@@ -39894,4 +41514,16 @@ mod x11 {
         use super::*;
         include!("x11_placement_tests.rs");
     }
+}
+
+#[cfg(feature = "bus")]
+mod injection_tests {
+    use super::*;
+    include!("input_injection_tests.rs");
+}
+
+#[cfg(feature = "bus")]
+mod window_control_tests {
+    use super::*;
+    include!("window_control_tests.rs");
 }

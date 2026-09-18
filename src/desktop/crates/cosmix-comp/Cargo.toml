@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.57.0"
+version = "0.58.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -21,6 +21,8 @@ bus = [
     "dep:tokio",
 ]
 explicit-sync-live-test = []
+# Gate G1s only: a nested scene quad registered as content source `probe`.
+content-source-probe = []
 hud-probe = ["dep:cosmix-bg-boing", "bevy/bevy_pbr", "bevy/bevy_ui_render"]
 native-quoin = ["hud-probe", "dep:cosmix-quoin", "dep:cosmix-shell"]
 frame-capture = ["dep:signal-hook"]
@@ -49,6 +51,14 @@ required-features = ["kms-live"]
 [[bin]]
 name = "cosmix-screencopy-probe"
 path = "src/bin/cosmix-screencopy-probe.rs"
+
+[[bin]]
+name = "cosmix-presentation-probe"
+path = "src/bin/cosmix-presentation-probe.rs"
+
+[[bin]]
+name = "cosmix-input-probe"
+path = "src/bin/cosmix-input-probe.rs"
 
 [dependencies]
 cosmix-quoin = { path = "../../apps/quoin", optional = true }

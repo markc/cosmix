@@ -426,6 +426,11 @@ pub(crate) struct SurfaceSceneSnapshot {
     pub(crate) layout: SurfaceLayout,
     pub(crate) kind: SceneSurfaceKind,
     pub(crate) title: Option<Arc<str>>,
+    /// The surface's content sequence (`SurfaceRecord::content_seq`) when
+    /// the snapshot was taken: the sequence of the newest buffer published
+    /// to the renderer, so a rebuilt upsert (relayout or dirty recovery)
+    /// names the content it carries.
+    pub(crate) commit_seq: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -856,6 +861,11 @@ pub(crate) enum HostInput {
         time: u32,
     },
     KeyboardFocusLost,
+    /// The focus-loss reset without the key release: the nested host
+    /// window lost focus while `input.host.passthrough` is off, so held keys
+    /// belong to injection and stay down (host-held ones are released
+    /// individually first).
+    KeyboardFocusLostKeepingKeys,
     /// A device reporting a touch capability was attached.
     ///
     /// Unlike the keyboard and the pointer, the touch capability is *not*
@@ -979,6 +989,39 @@ enum ProtocolCommand {
         presentation_epoch: u64,
         evidence: SecurityPresentationEvidence,
     },
+    FramePresented {
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    },
+    /// A displayed KMS flip, named by the output it was scanned out on.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    KmsFramePresented {
+        output: crate::backend::kms::OutputKey,
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    },
+    ContentSourceRegistered {
+        id: String,
+        output: Option<String>,
+    },
+    ContentSourceUnregistered {
+        id: String,
+        revision: u64,
+    },
+    /// A committed buffer will never be shown. With `sampled`, every
+    /// pending commit in `(sampled, commit_seq]` is gone too (requests the
+    /// failed one superseded); without it, only `commit_seq`.
+    CommitRefused {
+        id: SurfaceId,
+        sampled: Option<u64>,
+        commit_seq: u64,
+    },
+    /// Host input without a frame boundary (the nested backend's input lane).
+    HostInput {
+        inputs: Vec<HostInput>,
+    },
+    /// A backend wired its frame reporter: advertise `wp_presentation`.
+    EnablePresentation,
     CapturePixels(CapturePixels),
     CaptureDmabufComplete(CaptureDmabufComplete),
     CaptureDmabufFailed(CaptureDmabufFailed),
@@ -1316,6 +1359,25 @@ impl ClientSceneFeed {
         }
     }
 
+    /// The renderer refused a committed buffer (DMA-BUF import rejected), so
+    /// that commit will never be shown.
+    pub(crate) fn commit_refused(&self, id: SurfaceId, commit_seq: u64) {
+        if self
+            .commands
+            .send(ProtocolCommand::CommitRefused {
+                id,
+                sampled: None,
+                commit_seq,
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                surface_id = id.0,
+                "protocol thread gone before a refused commit"
+            );
+        }
+    }
+
     pub(crate) fn dmabuf_release_callback(&self, token: u64) -> ReleaseCallback {
         let commands = self.commands.clone();
         Box::new(move || {
@@ -1438,9 +1500,11 @@ pub(crate) enum CaptureTestOutcome {
 ///
 /// Unlike [`WaylandRuntime`], this cloneable seam can send only an empty frame
 /// boundary. The live coordinator owns it; render Apps cannot inject input or
-/// gain topology and shutdown authority through it.
-#[cfg(any(all(feature = "kms-live", not(test)), test))]
-#[derive(Clone)]
+/// gain topology and shutdown authority through it. Both backends pulse it
+/// once a frame has reached the screen (kms-live from the page flip, nested
+/// from the swapchain hand-off), so a client that draws on its callback is
+/// committing into the frame comp extracts next, not the one it just sent.
+#[derive(Clone, bevy::prelude::Resource)]
 pub(crate) struct ClientFrameClock {
     commands: CommandSender<ProtocolCommand>,
 }
@@ -1485,6 +1549,121 @@ impl SecurityPresentationReporter {
                 evidence: SecurityPresentationEvidence::Kms { generation, output },
             })
             .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
+}
+
+/// Renderer-to-protocol report of presented frames and content-source
+/// registrations. Only what a backend proved goes through it.
+#[derive(Clone, bevy::prelude::Resource)]
+pub(crate) struct FramePresentationReporter {
+    commands: CommandSender<ProtocolCommand>,
+}
+
+impl FramePresentationReporter {
+    pub(crate) fn presented(
+        &self,
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    ) {
+        if self
+            .commands
+            .send(ProtocolCommand::FramePresented { frame, content })
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before a frame presentation report");
+        }
+    }
+
+    /// A displayed KMS flip on `output`; the protocol thread names the
+    /// client output for that key.
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(crate) fn kms_presented(
+        &self,
+        output: crate::backend::kms::OutputKey,
+        frame: presentation::PresentedFrame,
+        content: presentation::FrameContent,
+    ) {
+        if self
+            .commands
+            .send(ProtocolCommand::KmsFramePresented {
+                output,
+                frame,
+                content,
+            })
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before a KMS frame presentation report");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, PresentationCommandProbe) {
+        let (commands, source) = channel::channel();
+        (Self { commands }, PresentationCommandProbe(source))
+    }
+
+    /// A DMA-BUF import failed for good (see `frame_content::Refusal`).
+    /// Sent as soon as the renderer sees it, not with a frame report.
+    pub(crate) fn commit_refused(&self, id: SurfaceId, sampled: Option<u64>, commit_seq: u64) {
+        if self
+            .commands
+            .send(ProtocolCommand::CommitRefused {
+                id,
+                sampled,
+                commit_seq,
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                surface_id = id.0,
+                "protocol thread gone before a refused commit"
+            );
+        }
+    }
+
+    pub(crate) fn source_registered(&self, id: String, output: Option<String>) {
+        let _ = self
+            .commands
+            .send(ProtocolCommand::ContentSourceRegistered { id, output });
+    }
+
+    pub(crate) fn source_unregistered(&self, id: String, revision: u64) {
+        let _ = self
+            .commands
+            .send(ProtocolCommand::ContentSourceUnregistered { id, revision });
+    }
+}
+
+/// The protocol end of a test `FramePresentationReporter`.
+#[cfg(test)]
+pub(crate) struct PresentationCommandProbe(channel::Channel<ProtocolCommand>);
+
+#[cfg(test)]
+impl PresentationCommandProbe {
+    /// Hand every queued report to `state` as the protocol loop does, and
+    /// return how many there were.
+    fn deliver(&self, state: &mut WaylandState) -> usize {
+        let mut delivered = 0;
+        while let Ok(command) = self.0.try_recv() {
+            delivered += 1;
+            match command {
+                ProtocolCommand::CommitRefused {
+                    id,
+                    sampled,
+                    commit_seq,
+                } => state.commit_refused(id, sampled, commit_seq),
+                ProtocolCommand::KmsFramePresented {
+                    output,
+                    frame,
+                    content,
+                } => state.kms_frame_presented(&output, frame, content),
+                ProtocolCommand::FramePresented { frame, content } => {
+                    state.frame_presented(frame, content);
+                }
+                _ => panic!("a presentation reporter sent another command"),
+            }
+        }
+        delivered
     }
 }
 
@@ -1574,7 +1753,6 @@ impl CaptureCompletionReporter {
     }
 }
 
-#[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl ClientFrameClock {
     pub(crate) fn pulse(&self) -> Result<(), String> {
         self.commands
@@ -2137,7 +2315,6 @@ impl WaylandRuntime {
         }
     }
 
-    #[cfg(any(all(feature = "kms-live", not(test)), test))]
     pub(crate) fn client_frame_clock(&self) -> ClientFrameClock {
         ClientFrameClock {
             commands: self.commands.clone(),
@@ -2152,6 +2329,21 @@ impl WaylandRuntime {
 
     pub(crate) fn capture_completion_reporter(&self) -> CaptureCompletionReporter {
         CaptureCompletionReporter {
+            commands: self.commands.clone(),
+        }
+    }
+
+    /// The backend's frame reporter. Asking for it is what advertises
+    /// `wp_presentation`: the global never exists without a reporter.
+    pub(crate) fn frame_presentation_reporter(&self) -> FramePresentationReporter {
+        if self
+            .commands
+            .send(ProtocolCommand::EnablePresentation)
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before enabling presentation");
+        }
+        FramePresentationReporter {
             commands: self.commands.clone(),
         }
     }
@@ -2268,9 +2460,24 @@ impl WaylandRuntime {
         drain_kms_render_commands(&self.kms_render_commands)
     }
 
+    /// Input plus a frame boundary in one command: how the test harnesses
+    /// drive a frame (production splits the two, see below).
+    #[cfg(test)]
     pub(crate) fn finish_frame(&self, inputs: Vec<HostInput>) -> Result<(), String> {
         self.commands
             .send(ProtocolCommand::Frame { inputs })
+            .map_err(|_| "Wayland protocol thread disconnected".to_string())
+    }
+
+    /// Host input for this frame. Frame callbacks are NOT sent here: the
+    /// nested backend pulses them from the post-present schedule, once the
+    /// frame is with the host.
+    pub(crate) fn deliver_host_input(&self, inputs: Vec<HostInput>) -> Result<(), String> {
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        self.commands
+            .send(ProtocolCommand::HostInput { inputs })
             .map_err(|_| "Wayland protocol thread disconnected".to_string())
     }
 
@@ -3013,6 +3220,7 @@ impl ProtocolServer {
             xdg_decoration_state,
             fractional_scale_state,
             viewporter_state,
+            presentation: presentation::PresentationRuntime::default(),
             #[cfg(feature = "xwayland")]
             xwayland_shell_state,
             #[cfg(feature = "xwayland")]
@@ -3102,6 +3310,10 @@ impl ProtocolServer {
             #[cfg(feature = "bus")]
             pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             #[cfg(feature = "bus")]
+            injection: input_injection::InjectionState::default(),
+            #[cfg(feature = "bus")]
+            window_waiters: window_control::WindowWaiters::default(),
+            #[cfg(feature = "bus")]
             observations: port_observation::ObservationState::new(
                 observation_producer,
                 observation_event_seq,
@@ -3112,6 +3324,7 @@ impl ProtocolServer {
             pending_full_upserts: HashSet::new(),
             pending_cursor_update: false,
             next_surface_id: 1,
+            next_role_generation: 1,
             next_layout_index: 0,
             next_stack_sequences: [0; StackBand::COUNT],
             next_buffer_token: 1,
@@ -3256,6 +3469,23 @@ impl ProtocolServer {
                             state.pending_port_controls.push(PortControl::Set(request));
                         }
                     }
+                    ChannelEvent::Msg(PortCommand::Window(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state
+                                .pending_port_controls
+                                .push(PortControl::Window(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Input(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Input(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::Long(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Long(request));
+                        }
+                    }
                     ChannelEvent::Msg(PortCommand::WatchState { active, order }) => {
                         if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
                             state
@@ -3352,6 +3582,38 @@ impl ProtocolServer {
                     evidence,
                 }) => {
                     state.acknowledge_security_presentation(presentation_epoch, evidence);
+                }
+                ChannelEvent::Msg(ProtocolCommand::FramePresented { frame, content }) => {
+                    state.frame_presented(frame, content);
+                }
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                ChannelEvent::Msg(ProtocolCommand::KmsFramePresented {
+                    output,
+                    frame,
+                    content,
+                }) => {
+                    state.kms_frame_presented(&output, frame, content);
+                }
+                ChannelEvent::Msg(ProtocolCommand::ContentSourceRegistered { id, output }) => {
+                    state.content_source_registered(&id, output);
+                }
+                ChannelEvent::Msg(ProtocolCommand::ContentSourceUnregistered { id, revision }) => {
+                    state.content_source_unregistered(&id, revision);
+                }
+                ChannelEvent::Msg(ProtocolCommand::CommitRefused {
+                    id,
+                    sampled,
+                    commit_seq,
+                }) => {
+                    state.commit_refused(id, sampled, commit_seq);
+                }
+                ChannelEvent::Msg(ProtocolCommand::HostInput { inputs }) => {
+                    for input in inputs {
+                        state.handle_host_input(input);
+                    }
+                }
+                ChannelEvent::Msg(ProtocolCommand::EnablePresentation) => {
+                    state.enable_presentation();
                 }
                 ChannelEvent::Msg(ProtocolCommand::CapturePixels(pixels)) => {
                     state.capture_pixels_ready(pixels);
@@ -4680,6 +4942,11 @@ fn sync_toplevel_scene_state(record: &mut SurfaceRecord) {
 struct SurfaceRecord {
     id: SurfaceId,
     role: SurfaceRole,
+    /// Bumped every time this `wl_surface` takes a role (including going
+    /// dormant). The id survives a role re-take; the generation does not, so
+    /// a Bus caller holding `{id, generation}` cannot act on a different
+    /// window that inherited the id.
+    generation: u64,
     mapped: bool,
     layout: SurfaceLayout,
     title: Option<Arc<str>>,
@@ -4689,6 +4956,10 @@ struct SurfaceRecord {
     window_origin: (f32, f32),
     configured_size: (i32, i32),
     commit_count: u64,
+    /// +1 each time a new buffer is published to the renderer (dense, so a
+    /// gap between two shown sequences counts the updates never shown;
+    /// `commit_count` also counts bufferless and refused commits).
+    content_seq: u64,
     shm_backing: Option<ShmBacking>,
     dmabuf_backing: Option<DmabufBacking>,
     buffer_dimensions: Option<(u32, u32)>,
@@ -4734,6 +5005,7 @@ impl SurfaceRecord {
             layout: self.layout,
             kind: self.role.scene_kind(),
             title: self.title.clone(),
+            commit_seq: self.content_seq,
         }
     }
 }
@@ -5749,6 +6021,7 @@ struct WaylandState {
     fractional_scale_state: FractionalScaleManagerState,
     #[allow(dead_code)]
     viewporter_state: ViewporterState,
+    presentation: presentation::PresentationRuntime,
     #[cfg(feature = "xwayland")]
     xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     #[cfg(feature = "xwayland")]
@@ -5872,6 +6145,12 @@ struct WaylandState {
     pending_port_requests: Vec<PortRequest>,
     #[cfg(feature = "bus")]
     pending_port_controls: Vec<PortControl>,
+    /// Bus-injected input: held keys/buttons, sequences, host passthrough.
+    #[cfg(feature = "bus")]
+    injection: input_injection::InjectionState,
+    /// `comp.window.wait` / `close {force}` waiters.
+    #[cfg(feature = "bus")]
+    window_waiters: window_control::WindowWaiters,
     #[cfg(feature = "bus")]
     observations: port_observation::ObservationState,
     events: Vec<ProtocolEvent>,
@@ -5895,6 +6174,9 @@ struct WaylandState {
     /// path can retain the current DMA-BUF once pressure clears.
     pending_cursor_update: bool,
     next_surface_id: u64,
+    /// Source of `SurfaceRecord::generation`. Never reused, so a
+    /// `{id, generation}` pair names one role assignment for the session.
+    next_role_generation: u64,
     next_layout_index: u32,
     next_stack_sequences: [u64; StackBand::COUNT],
     next_buffer_token: u64,
@@ -8320,6 +8602,8 @@ impl WaylandState {
     }
 
     fn handle_frame(&mut self, inputs: Vec<HostInput>) {
+        #[cfg(feature = "bus")]
+        let inputs = self.filter_host_passthrough(inputs);
         for input in inputs {
             self.handle_host_input(input);
         }
@@ -8356,6 +8640,7 @@ impl WaylandState {
         if delivered > 0 {
             tracing::trace!(delivered, "completed Wayland frame callbacks");
         }
+        crate::frame_trace::event("comp_frame_callbacks", || (delivered as u64, 0, 0));
     }
 
     fn surface_belongs_to_minimized_toplevel(&self, surface: &WlSurface) -> bool {
@@ -8496,6 +8781,11 @@ impl WaylandState {
                 self.update_chrome_hover(None);
                 self.set_chrome_cursor_override(None);
                 self.release_pressed_keys();
+            }
+            HostInput::KeyboardFocusLostKeepingKeys => {
+                self.cancel_chrome_pointer_grab(true);
+                self.update_chrome_hover(None);
+                self.set_chrome_cursor_override(None);
             }
             HostInput::TouchDeviceAdded => self.add_touch_device(),
             HostInput::TouchDeviceRemoved => self.remove_touch_device(),
@@ -10457,18 +10747,24 @@ impl WaylandState {
         {
             self.dismiss_popup_descendants(surface);
         }
+        if self
+            .surfaces
+            .get(&surface.id())
+            .is_none_or(|record| matches!(record.role, SurfaceRole::Dormant(_)))
+        {
+            return;
+        }
+        let role_generation = self.role_change_generation(&surface.id());
         let Some(record) = self.surfaces.get_mut(&surface.id()) else {
             return;
         };
-        if matches!(record.role, SurfaceRole::Dormant(_)) {
-            return;
-        }
         // Whether the renderer can be holding an entity for this surface. A
         // surface the compositor called mapped is one it may have published a
         // complete upsert for, so going dormant has to be *said*, below.
         let was_mapped = was_mapped_before;
         let id = record.id;
         record.role = SurfaceRole::Dormant(surface.clone());
+        record.generation = role_generation;
         record.required_configure = None;
         record.last_acked_configure = None;
         record.last_acked_size = None;
@@ -11146,11 +11442,17 @@ impl WaylandState {
         let clamped = clamp_point_to_seat((x, y), &self.backend.seat_regions());
         let (x, y) = clamped.position;
         #[cfg(feature = "bus")]
-        self.sample_corner_motion(
-            clamped.position,
-            clamped.region_index,
-            clamped.attempted_motion,
-        );
+        if self.injection.suppress_corners {
+            // `corners: false` suppresses arming only: an engaged or
+            // dwelling corner is still left (and its dwell timer dropped).
+            self.reset_corner_detector();
+        } else {
+            self.sample_corner_motion(
+                clamped.position,
+                clamped.region_index,
+                clamped.attempted_motion,
+            );
+        }
         {
             let mut snapshot = self
                 .cursor_position_snapshot
@@ -13186,6 +13488,16 @@ impl WaylandState {
         }) else {
             return;
         };
+        self.discard_presentation_feedback(_id, presentation::DiscardReason::Minimize);
+        // A client-started move/resize must not keep steering a hidden
+        // window (a Bus minimise can land mid-drag). Unlike unmap, the
+        // window stays alive, so a resize ends properly: Resizing is unset
+        // and the client is told (xdg only; X11 and moves send nothing).
+        if interactive_surface(self.interactive_pointer.as_ref())
+            .is_some_and(|interactive| interactive == surface)
+        {
+            self.finish_interactive_pointer(true);
+        }
         // X11 windows also learn the state through EWMH so the client can
         // stop rendering.
         #[cfg(feature = "xwayland")]
@@ -13205,34 +13517,66 @@ impl WaylandState {
         self.retarget_pointer_after_visibility_change();
     }
 
-    fn restore_most_recently_minimized(&mut self) {
+    /// Pops the minimise LIFO until one entry restores; returns the
+    /// restored object, or `None` when nothing restorable was left.
+    fn restore_most_recently_minimized(&mut self) -> Option<ObjectId> {
         while let Some(object) = self.minimized_toplevels.pop() {
-            let restored = self.surfaces.get_mut(&object).and_then(|record| {
-                if !record.mapped || !record.minimized || !record.role.managed_toplevel() {
-                    return None;
-                }
-                record.minimized = false;
-                Some((record.role.wl_surface().clone(), record.id))
-            });
-            let Some((surface, _id)) = restored else {
-                continue;
-            };
-            #[cfg(feature = "xwayland")]
-            if let Some(role) = self
-                .surfaces
-                .get(&object)
-                .and_then(|record| record.role.x11())
-            {
-                let _ = role.surface.set_suspended(false);
+            if self.restore_window(&object) {
+                return Some(object);
             }
-            #[cfg(feature = "bus")]
-            self.mark_surface_dirty(_id, "wayland.focus");
-            self.recompute_effective_visibility();
-            self.raise_surface(&surface);
-            self.arbitrate_keyboard_focus(Some(surface), false, false);
-            self.retarget_pointer_after_visibility_change();
-            return;
         }
+        None
+    }
+
+    /// The per-window half of a restore: un-minimise one mapped managed
+    /// toplevel, drop it from the LIFO, then raise, focus and retarget the
+    /// pointer. Returns `false` (and changes nothing but the LIFO entry) when
+    /// the object is not a mapped, minimised, managed toplevel.
+    fn restore_window(&mut self, object: &ObjectId) -> bool {
+        self.minimized_toplevels.retain(|entry| entry != object);
+        let restored = self.surfaces.get_mut(object).and_then(|record| {
+            if !record.mapped || !record.minimized || !record.role.managed_toplevel() {
+                return None;
+            }
+            record.minimized = false;
+            Some((record.role.wl_surface().clone(), record.id))
+        });
+        let Some((surface, _id)) = restored else {
+            return false;
+        };
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = self
+            .surfaces
+            .get(object)
+            .and_then(|record| record.role.x11())
+        {
+            let _ = role.surface.set_suspended(false);
+        }
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(_id, "wayland.focus");
+        self.recompute_effective_visibility();
+        self.raise_surface(&surface);
+        self.arbitrate_keyboard_focus(Some(surface), false, false);
+        self.retarget_pointer_after_visibility_change();
+        true
+    }
+
+    /// A surface is about to take (or lose) a role: whatever it committed
+    /// under the old role will never be shown as that role's content.
+    fn role_change_generation(&mut self, object: &ObjectId) -> u64 {
+        if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
+            self.discard_presentation_feedback(id, presentation::DiscardReason::Role);
+            // A new role is a new window: its stats start over.
+            self.presentation.stats.forget_surface(id.0);
+        }
+        self.next_role_generation()
+    }
+
+    /// Hands out the next role generation (see `SurfaceRecord::generation`).
+    fn next_role_generation(&mut self) -> u64 {
+        let generation = self.next_role_generation;
+        self.next_role_generation = generation.saturating_add(1);
+        generation
     }
 
     fn logical_output_rect(&self) -> LogicalOutputRect {
@@ -13710,53 +14054,15 @@ impl WaylandState {
                 start_pointer,
                 start_origin,
             } => {
-                let Some(record) = self.surfaces.get_mut(&surface.id()) else {
-                    self.interactive_pointer = None;
-                    return false;
-                };
-                let old_origin = record.window_origin;
-                record.window_origin = (
+                let origin = (
                     start_origin.0 + (x - start_pointer.0) as f32,
                     start_origin.1 + (y - start_pointer.1) as f32,
                 );
-                let offset = record
-                    .committed_window_geometry
-                    .map(|geometry| (geometry.x, geometry.y))
-                    .unwrap_or_default();
-                record.layout.x = record.window_origin.0 - offset.0;
-                record.layout.y = record.window_origin.1 - offset.1;
-                let delta = (
-                    record.window_origin.0 - old_origin.0,
-                    record.window_origin.1 - old_origin.1,
-                );
-                let id = record.id;
-                let scene = record.scene_snapshot();
-                // An X11 window must learn its new position through an X
-                // configure (there is no xdg configure for it), or the client
-                // keeps stale global coordinates.
-                #[cfg(feature = "xwayland")]
-                if delta != (0.0, 0.0)
-                    && let SurfaceRole::X11(role) = &mut record.role
-                {
-                    let rect = Rectangle::new(
-                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
-                        (
-                            record.configured_size.0.max(1),
-                            record.configured_size.1.max(1),
-                        )
-                            .into(),
-                    );
-                    role.granted_geometry = rect;
-                    if let Err(error) = role.surface.configure(Some(rect)) {
-                        tracing::debug!(%error, "failed to send X11 move configure");
-                    }
-                }
-                self.events
-                    .push(ProtocolEvent::SurfaceRelayout { id, scene });
-                #[cfg(feature = "bus")]
-                self.mark_surface_dirty(id, "wayland.map");
-                self.shift_surface_descendants(id, delta);
-                delta != (0.0, 0.0)
+                self.move_window_to(&surface, origin, "wayland.map")
+                    .unwrap_or_else(|| {
+                        self.interactive_pointer = None;
+                        false
+                    })
             }
             InteractivePointer::Resize {
                 surface,
@@ -13805,31 +14111,14 @@ impl WaylandState {
                 } else {
                     0
                 };
-                let (min_size, max_size) =
-                    clamped_toplevel_constraints(self.managed_size_constraints(&surface));
-                let min_width = min_size.0;
-                let min_height = min_size.1;
-                let max_width = max_size.0;
-                let max_height = max_size.1;
-                let new_size = (
-                    start_size
-                        .0
-                        .saturating_add(width_delta)
-                        .clamp(min_width, max_width),
-                    start_size
-                        .1
-                        .saturating_add(height_delta)
-                        .clamp(min_height, max_height),
+                let new_size = self.clamp_window_size(
+                    &surface,
+                    (
+                        start_size.0.saturating_add(width_delta),
+                        start_size.1.saturating_add(height_delta),
+                    ),
                 );
-                let Some(record) = self.surfaces.get_mut(&surface.id()) else {
-                    self.interactive_pointer = None;
-                    return false;
-                };
-                if new_size == record.configured_size {
-                    return false;
-                }
-                let old_origin = record.window_origin;
-                record.window_origin = (
+                let origin = (
                     if left {
                         start_origin.0 + (start_size.0 - new_size.0) as f32
                     } else {
@@ -13841,45 +14130,131 @@ impl WaylandState {
                         start_origin.1
                     },
                 );
-                let offset = record
-                    .committed_window_geometry
-                    .map(|geometry| (geometry.x, geometry.y))
-                    .unwrap_or_default();
-                record.layout.x = record.window_origin.0 - offset.0;
-                record.layout.y = record.window_origin.1 - offset.1;
-                record.configured_size = new_size;
-                let toplevel = record.role.toplevel().cloned();
-                let id = record.id;
-                let scene = record.scene_snapshot();
-                let delta = (
-                    record.window_origin.0 - old_origin.0,
-                    record.window_origin.1 - old_origin.1,
-                );
-                // X11 interactive resize is granted through X configures; the
-                // committed buffer remains the presentation authority.
-                #[cfg(feature = "xwayland")]
-                if let SurfaceRole::X11(role) = &mut record.role {
-                    let rect = Rectangle::new(
-                        (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
-                        (new_size.0.max(1), new_size.1.max(1)).into(),
-                    );
-                    role.granted_geometry = rect;
-                    if let Err(error) = role.surface.configure(Some(rect)) {
-                        tracing::debug!(%error, "failed to send X11 resize configure");
-                    }
-                }
-                if let Some(toplevel) = toplevel {
-                    set_toplevel_configuration(&toplevel, new_size);
-                    let _ = self.send_pending_toplevel_configure(&surface, true);
-                }
-                self.events
-                    .push(ProtocolEvent::SurfaceRelayout { id, scene });
-                #[cfg(feature = "bus")]
-                self.mark_surface_dirty(id, "wayland.map");
-                self.shift_surface_descendants(id, delta);
-                true
+                self.resize_window_to(&surface, origin, new_size, "wayland.map")
+                    .unwrap_or_else(|| {
+                        self.interactive_pointer = None;
+                        false
+                    })
             }
         }
+    }
+
+    /// A window size inside the client's (clamped) min/max constraints.
+    fn clamp_window_size(&self, surface: &WlSurface, size: (i32, i32)) -> (i32, i32) {
+        let (min_size, max_size) =
+            clamped_toplevel_constraints(self.managed_size_constraints(surface));
+        (
+            size.0.clamp(min_size.0, max_size.0),
+            size.1.clamp(min_size.1, max_size.1),
+        )
+    }
+
+    /// Put a window's geometry origin at `origin` (global logical), moving
+    /// its descendants with it; an X11 window hears it through a configure.
+    /// `None` when the surface has no record; otherwise whether it moved.
+    fn move_window_to(
+        &mut self,
+        surface: &WlSurface,
+        origin: (f32, f32),
+        #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
+    ) -> Option<bool> {
+        let record = self.surfaces.get_mut(&surface.id())?;
+        let old_origin = record.window_origin;
+        record.window_origin = origin;
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        record.layout.x = record.window_origin.0 - offset.0;
+        record.layout.y = record.window_origin.1 - offset.1;
+        let delta = (
+            record.window_origin.0 - old_origin.0,
+            record.window_origin.1 - old_origin.1,
+        );
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        // An X11 window must learn its new position through an X
+        // configure (there is no xdg configure for it), or the client
+        // keeps stale global coordinates.
+        #[cfg(feature = "xwayland")]
+        if delta != (0.0, 0.0)
+            && let SurfaceRole::X11(role) = &mut record.role
+        {
+            let rect = Rectangle::new(
+                (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
+                (
+                    record.configured_size.0.max(1),
+                    record.configured_size.1.max(1),
+                )
+                    .into(),
+            );
+            role.granted_geometry = rect;
+            if let Err(error) = role.surface.configure(Some(rect)) {
+                tracing::debug!(%error, "failed to send X11 move configure");
+            }
+        }
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, cause);
+        self.shift_surface_descendants(id, delta);
+        Some(delta != (0.0, 0.0))
+    }
+
+    /// Ask a window for `size` (already clamped) with its geometry origin at
+    /// `origin`. xdg windows get a configure and answer asynchronously; X11
+    /// windows get an X configure. `None` when the surface has no record;
+    /// `Some(false)`, changing nothing, when `size` is already configured.
+    fn resize_window_to(
+        &mut self,
+        surface: &WlSurface,
+        origin: (f32, f32),
+        size: (i32, i32),
+        #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
+    ) -> Option<bool> {
+        let record = self.surfaces.get_mut(&surface.id())?;
+        if size == record.configured_size {
+            return Some(false);
+        }
+        let old_origin = record.window_origin;
+        record.window_origin = origin;
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        record.layout.x = record.window_origin.0 - offset.0;
+        record.layout.y = record.window_origin.1 - offset.1;
+        record.configured_size = size;
+        let toplevel = record.role.toplevel().cloned();
+        let id = record.id;
+        let scene = record.scene_snapshot();
+        let delta = (
+            record.window_origin.0 - old_origin.0,
+            record.window_origin.1 - old_origin.1,
+        );
+        // X11 resize is granted through X configures; the committed buffer
+        // remains the presentation authority.
+        #[cfg(feature = "xwayland")]
+        if let SurfaceRole::X11(role) = &mut record.role {
+            let rect = Rectangle::new(
+                (record.window_origin.0 as i32, record.window_origin.1 as i32).into(),
+                (size.0.max(1), size.1.max(1)).into(),
+            );
+            role.granted_geometry = rect;
+            if let Err(error) = role.surface.configure(Some(rect)) {
+                tracing::debug!(%error, "failed to send X11 resize configure");
+            }
+        }
+        if let Some(toplevel) = toplevel {
+            set_toplevel_configuration(&toplevel, size);
+            let _ = self.send_pending_toplevel_configure(surface, true);
+        }
+        self.events
+            .push(ProtocolEvent::SurfaceRelayout { id, scene });
+        #[cfg(feature = "bus")]
+        self.mark_surface_dirty(id, cause);
+        self.shift_surface_descendants(id, delta);
+        Some(true)
     }
 
     fn shift_surface_descendants(&mut self, parent: SurfaceId, delta: (f32, f32)) {
@@ -15000,11 +15375,15 @@ impl WaylandState {
                         self.release_shm_bytes(surface, released_shm_bytes);
                     }
                     self.recompute_effective_visibility();
-                    let scene = self
-                        .surfaces
-                        .get(&surface.id())
-                        .expect("mapped surface remains tracked")
-                        .scene_snapshot();
+                    let scene = {
+                        let record = self
+                            .surfaces
+                            .get_mut(&surface.id())
+                            .expect("mapped surface remains tracked");
+                        record.content_seq += 1;
+                        record.scene_snapshot()
+                    };
+                    self.note_content_published(surface);
                     self.push_surface_upsert(
                         surface,
                         ProtocolEvent::SurfaceUpserted {
@@ -15175,11 +15554,15 @@ impl WaylandState {
                     self.release_buffer_token(released_dmabuf_token);
                 }
                 self.recompute_effective_visibility();
-                let scene = self
-                    .surfaces
-                    .get(&surface.id())
-                    .expect("mapped surface remains tracked")
-                    .scene_snapshot();
+                let scene = {
+                    let record = self
+                        .surfaces
+                        .get_mut(&surface.id())
+                        .expect("mapped surface remains tracked");
+                    record.content_seq += 1;
+                    record.scene_snapshot()
+                };
+                self.note_content_published(surface);
                 self.push_surface_upsert(
                     surface,
                     ProtocolEvent::SurfaceUpserted {
@@ -15366,7 +15749,13 @@ mod explicit_sync;
 mod focus;
 mod handlers;
 mod input;
+pub(crate) mod presentation;
+pub(crate) mod presentation_stats;
 mod release_use;
+#[cfg(feature = "bus")]
+mod input_injection;
+#[cfg(feature = "bus")]
+pub(crate) mod window_control;
 mod window_switching;
 #[cfg(feature = "xwayland")]
 mod xwayland;
@@ -15595,10 +15984,28 @@ fn clamp_point_to_seat(position: (f64, f64), regions: &[SeatRegion]) -> ClampRes
     }
 }
 
+/// Event time in milliseconds on CLOCK_MONOTONIC, wrapping at `u32`.
+///
+/// The Wayland base is unspecified, but CLOCK_MONOTONIC is the clock
+/// `wp_presentation` reports, so a client can subtract an input event time
+/// from a presentation time without a second clock.
 pub(crate) fn monotonic_millis() -> u32 {
-    // Wayland timestamps have an unspecified monotonic base and wrap naturally.
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as u32
+    (monotonic_micros() / 1_000) as u32
+}
+
+/// CLOCK_MONOTONIC in microseconds.
+pub(crate) fn monotonic_micros() -> u64 {
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: value points to a valid, writable timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) } != 0 {
+        return 0;
+    }
+    (value.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(value.tv_nsec as u64 / 1_000)
 }
 
 fn root_compositor_surface(surface: &WlSurface) -> WlSurface {
