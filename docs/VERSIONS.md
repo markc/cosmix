@@ -103,7 +103,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bg-showcase` | 0.2.5 |
 | `cosmix-busviewer` | 0.1.1 |
 | `cosmix-capture` | 0.1.2 |
-| `cosmix-comp` | 0.57.0 |
+| `cosmix-comp` | 0.58.0 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
@@ -125,7 +125,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
 | `cosmix-wallpaper` | 0.2.0 |
-| `cosmix-wgpu-dmabuf` | 0.16.1 |
+| `cosmix-wgpu-dmabuf` | 0.16.2 |
 | `cosmix-wl-dnd` | 0.4.2 |
 | `ctk` | 0.56.0 |
 | `spike-wl-dnd` | 0.1.0 |
