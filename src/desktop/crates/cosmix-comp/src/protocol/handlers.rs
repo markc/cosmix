@@ -2408,8 +2408,12 @@ impl XdgActivationHandler for WaylandState {
             tracing::debug!("xdg-activation for a surface this compositor does not know");
             return;
         };
-        // KWin/GNOME parity (0.59.1): an activation of a MINIMISED window
-        // restores it rather than being refused. `arbitrate_keyboard_focus`
+        // 0.59.1: an activation of a MINIMISED window restores it rather
+        // than being refused — KWin/GNOME's behaviour, WITHOUT their
+        // focus-stealing guard: they gate this on the activation token /
+        // timestamp, comp does not validate tokens (the agentic-first law —
+        // a focus-stealing guard is a future opt-in, see above), so any
+        // client can un-minimise and focus its own window this way. `arbitrate_keyboard_focus`
         // has no minimised term and `minimize_toplevel` moves focus OFF a
         // window as it hides it, so activating in place (the old refusal's
         // alternative) would either do nothing visible or focus a hidden
