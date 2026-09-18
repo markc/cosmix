@@ -172,10 +172,19 @@ window or a stale identity. A pager's `_NET_CURRENT_DESKTOP` root message
 (`wmctrl -s N`, `xdotool set_desktop N`) is honoured as a switch of the
 default output, exactly like `comp.workspace.switch {index: N + 1}`
 without wrap; a desktop at or above the count and a request under a
-session lock are ignored with a debug log. The root pair is also
-republished after a KMS topology change, because `workspaces.current` is
-the default output's and a replaced output reads as workspace 1 with no
-switch having run. `xprop -root _NET_CURRENT_DESKTOP` /
+session lock are ignored with a debug log. A pager's
+`_NET_NUMBER_OF_DESKTOPS` root message (`wmctrl -n N`) is NOT honoured —
+the count is `workspaces.count`, compositor-owned — and is dropped with a
+debug log; the atom stays in `_NET_SUPPORTED` for the property, which is.
+A KMS topology change that replaces the default output carries the
+retiring output's current workspace to the replacing one (`workspaces.
+current` is keyed by the default output, and a replugged monitor must not
+change the desktop) and republishes the root pair; if the effective
+workspace changed anyway (the only output went away, or came back under a
+key that still held an older value) the visibility and suspended state of
+every window are re-derived in one settle, so no reader — frame callbacks,
+presentation, `windows.*` — can see a workspace the scene does not.
+`xprop -root _NET_CURRENT_DESKTOP` /
 `_NET_NUMBER_OF_DESKTOPS` and `xprop -id <xid> _NET_WM_DESKTOP` via
 `xwayland.display` are the live checks (the nested workspace gate's rule
 10, which also drives both client messages through `xdotool`); the offline
@@ -383,7 +392,11 @@ for the user's minimise state). A move never changes the window's
 generation. `surfaces.s<id>.workspace` carries the same value for every
 mapped managed toplevel, X11 windows included (they have no `windows.*`
 row), and null for every other surface and for an unmapped one. A window
-that unmaps and remaps joins the current workspace again. X11 clients see
+that unmaps and remaps joins the current workspace again. An
+override-redirect X11 window (a menu, tooltip, dropdown, DND icon) is not a
+window — no row, no workspace value, never movable — but it hides with the
+workspace it mapped on, so an open menu does not outlive the switch that
+hid its owner; it is back, still open, when that workspace is. X11 clients see
 the same model through EWMH: the root `_NET_NUMBER_OF_DESKTOPS` and
 `_NET_CURRENT_DESKTOP` (0-based, so workspace 1 is desktop 0) follow every
 switch and count change, every managed X11 window carries `_NET_WM_DESKTOP`
@@ -422,7 +435,11 @@ minimized:false`, gets no frame callbacks and is never presented. Every
 path that brings a window into view — `comp.window.focus`,
 `comp.window.restore`, a client's xdg-activation, an X11
 `_NET_ACTIVE_WINDOW` or un-minimise — switches to the window's workspace
-first and never pulls the window across; where the switch is not allowed
+first and never pulls the window across, in one settle with the keyboard
+landing on that window and on no bystander in between (the same
+preference `send_to_workspace {follow:true}` gives a followed window: the
+highest window already on the arriving workspace never sees a
+`wl_keyboard.enter` the activation then reverses); where the switch is not allowed
 (a session lock, an exclusive layer, the VT switched away) the window is
 not focused either, so the keyboard never lands on a window that is off
 screen: `focus` replies with the reason, an activation request is ignored,

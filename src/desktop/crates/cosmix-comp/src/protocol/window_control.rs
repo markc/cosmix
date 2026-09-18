@@ -493,6 +493,13 @@ impl WaylandState {
             WindowOp::Restore { target: None } => {
                 // Mark first: the first cause recorded for a surface wins,
                 // and the restore itself would record "wayland.focus".
+                // When rule 8's candidate is on another workspace the
+                // restore switches, and a switch is a full-snapshot cause
+                // (`workspace.switch`) that discards the per-surface marks
+                // — as `service_send_to_workspace` documents for its own
+                // accepted move — so the edges then read the larger
+                // change, not `comp.window`. Deliberate: the mark is only
+                // ever read when nothing bigger happened.
                 let expected = self.next_lifo_restore();
                 if let Some((_, id)) = &expected {
                     self.mark_surface_dirty(*id, "comp.window");

@@ -6,6 +6,13 @@
 //! minimise uses (`visible:false, minimized:false`), so bands, popups and
 //! subsurfaces need no code of their own. A switch is the minimise caller
 //! sequence over every leaving window plus one recompute/refocus/retarget.
+//! An override-redirect X11 window (a menu, tooltip, dropdown, DND icon)
+//! is a root of its own in that recompute — it has no `layout.parent` —
+//! so it carries the workspace it mapped on too (`carries_workspace`),
+//! and follows it through the same funnel: hidden, no frame callbacks,
+//! never presented while its workspace is not current. It is still not a
+//! managed toplevel: never movable, never suspended, no `_NET_WM_DESKTOP`,
+//! no `windows.*` or `surfaces.s<id>.workspace` value.
 //! No `ext-workspace-v1`; the Bus props, verbs and bindings live in their
 //! own modules and call the `pub(crate)` primitives here.
 //!
@@ -91,14 +98,32 @@ pub(crate) fn output_key(name: &str) -> String {
     key
 }
 
+/// Whether a role has a workspace of its own: a managed toplevel, or an
+/// override-redirect X11 window. Everything else (bands, layers, popups,
+/// subsurfaces, locks) is on every workspace — popups and subsurfaces
+/// follow their toplevel through `layout.parent` in the recompute, but an
+/// OR record has no parent (xwayland.rs creates it as a root), so without
+/// a workspace of its own an open menu would outlive the switch that hid
+/// its owner, floating over the next workspace with no window under it.
+pub(super) fn carries_workspace(role: &SurfaceRole) -> bool {
+    #[cfg(feature = "xwayland")]
+    if role.x11().is_some_and(|x11| x11.override_redirect) {
+        return true;
+    }
+    role.managed_toplevel()
+}
+
 /// Rule 2: a managed toplevel joins the current workspace at its mapped
 /// false→true edge — the first buffer commit, or an X11 remap from retained
 /// content. Called with `was_mapped` read BEFORE the flag flipped. A remap
 /// rejoins the current workspace (D4). This is the ONE hook per-window
 /// `_NET_WM_DESKTOP` publication attaches to (D19): after a MapRequest a
-/// first-map X11 record is still unmapped and reads `workspace == 0`.
+/// first-map X11 record is still unmapped and reads `workspace == 0`. An
+/// override-redirect record is stamped the same way (it hides with the
+/// workspace it mapped on) but gets no `_NET_WM_DESKTOP`: EWMH gives the
+/// property to managed windows, and `sync_x11_desktops` skips OR too.
 pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: bool, current: u32) {
-    if !was_mapped && record.mapped && record.role.managed_toplevel() {
+    if !was_mapped && record.mapped && carries_workspace(&record.role) {
         record.workspace = current;
         // EWMH: the window's `_NET_WM_DESKTOP` is written HERE, at the
         // stamping edge, never at MapRequest (D19). Debug, not warn, on
@@ -106,6 +131,7 @@ pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: boo
         // failure is a dying generation `disconnected` cleans up.
         #[cfg(feature = "xwayland")]
         if let Some(role) = record.role.x11()
+            && !role.override_redirect
             && let Err(error) = role.surface.set_desktop(current.saturating_sub(1))
         {
             tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP at map");
@@ -114,8 +140,9 @@ pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: boo
 }
 
 /// THE workspace term, shared by every reader: whether `record` is on the
-/// workspace `current`. Only managed toplevels have a workspace; everything
-/// else (bands, layers, popups, locks) is on every workspace. Takes the
+/// workspace `current`. Only a record that `carries_workspace` (a managed
+/// toplevel, an override-redirect X11 window) has one; everything else
+/// (bands, layers, popups, locks) is on every workspace. Takes the
 /// current workspace as a value so hot paths (`handle_frame`,
 /// `recompute_effective_visibility`, `frame_presented`) read it once per
 /// frame instead of once per surface — `workspace_current` clones an
@@ -126,7 +153,7 @@ pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: boo
 // `WaylandState` is (rustc private_interfaces under -D warnings). Every
 // caller lives inside `protocol`.
 pub(super) fn on_workspace(record: &SurfaceRecord, current: u32) -> bool {
-    !record.role.managed_toplevel() || record.workspace == current
+    !carries_workspace(&record.role) || record.workspace == current
 }
 
 /// THE movable term: what `move_window_to_workspace` (and so every move —
@@ -599,8 +626,10 @@ impl WaylandState {
         }
         #[cfg(feature = "bus")]
         let mut stranded = Vec::new();
+        // Every record with a workspace, override-redirect included: an OR
+        // record left above the count would be hidden on every workspace.
         for record in self.surfaces.values_mut() {
-            if record.role.managed_toplevel() && record.workspace > count {
+            if carries_workspace(&record.role) && record.workspace > count {
                 record.workspace = count;
                 #[cfg(feature = "bus")]
                 stranded.push(record.id);
@@ -684,6 +713,16 @@ impl WaylandState {
     /// this). Returns `true` when it switched; inert — no side effects at
     /// all — whenever `workspace_switch_allowed_for` says no, or the window
     /// is already on the current workspace.
+    ///
+    /// The switch's settle prefers the window itself (the same preference
+    /// `move_window_and_follow` gives a followed window): every caller goes
+    /// on to focus it, and the gate above has already admitted it as a
+    /// focus candidate, so settling on the highest bystander first would
+    /// hand that bystander one `wl_keyboard.enter` plus an activated
+    /// configure the caller's own arbitration reverses a statement later.
+    /// With the preference the caller's `arbitrate_keyboard_focus` is a
+    /// no-op and there is exactly one enter, on the window brought into
+    /// view.
     pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
         let Some(workspace) = self.workspace_switch_allowed_for(object) else {
             return false;
@@ -691,7 +730,52 @@ impl WaylandState {
         if workspace == self.workspace_current() {
             return false;
         }
-        self.switch_workspace(None, WorkspaceTarget::Index(workspace), true)
+        let prefer = self
+            .surfaces
+            .get(object)
+            .map(|record| record.role.wl_surface().clone());
+        self.switch_workspace_focusing(None, WorkspaceTarget::Index(workspace), true, prefer)
             .is_ok()
+    }
+
+    /// After a KMS topology change. `workspaces.current` is keyed by the
+    /// DEFAULT output (D3) and a hotplug can replace that output: a fresh
+    /// `o_<slug>` key reads as workspace 1 with no switch having run, so
+    /// from the next statement on every per-frame reader (`handle_frame`,
+    /// `frame_presented`) would see one workspace while `layout.visible`
+    /// and the X11 suspended flags still described the other — windows on
+    /// the old current workspace frozen on screen with no callbacks, the
+    /// ones on workspace 1 composited nowhere yet reading `visible:false`
+    /// and staying suspended. So the retiring output's current workspace
+    /// is CARRIED to the replacing one (the user's desktop does not change
+    /// because a monitor was replugged), and if the effective value changed
+    /// anyway — the only output went away, or one came back under a key
+    /// that still holds an older entry while windows mapped meanwhile were
+    /// stamped 1 — the state is re-derived the way a count shrink does it:
+    /// every X11 flag from `x11_suspended`, then one settle. The EWMH root
+    /// pair is republished either way (a no-op without an XWM), or
+    /// `_NET_CURRENT_DESKTOP` keeps the retired output's index until the
+    /// next switch. `previous_key` and `previous_current` are read BEFORE
+    /// the backend applied the event; the `workspaces.*` snapshot is
+    /// already fully dirtied by the apply site (`output.geometry`).
+    #[cfg(any(all(feature = "kms-live", not(test)), test))]
+    pub(super) fn reconcile_workspace_current_after_topology_change(
+        &mut self,
+        previous_key: Option<&str>,
+        previous_current: u32,
+    ) {
+        if let Some(key) = self.default_output_key()
+            && previous_key.is_some_and(|previous| previous != key)
+        {
+            self.workspaces.current.insert(key, previous_current);
+        }
+        #[cfg(feature = "xwayland")]
+        self.publish_x11_desktops();
+        if self.workspace_current() == previous_current {
+            return;
+        }
+        #[cfg(feature = "xwayland")]
+        self.sync_x11_suspended_for_workspaces();
+        self.settle_workspace_visibility(None);
     }
 }

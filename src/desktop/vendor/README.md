@@ -683,7 +683,11 @@ for 32-bit `_NET_CURRENT_DESKTOP` root messages (a pager's switch request:
 no window lookup, data[0] the desktop, data[1] the timestamp), a no-op by
 default, nothing written by the arm — added in review because both root
 atoms are advertised in `_NET_SUPPORTED`, so a pager that reads it and sends
-the standard message must be answered. Property delivery is a live-gate
+the standard message must be answered. A 32-bit `_NET_NUMBER_OF_DESKTOPS`
+root message (`wmctrl -n N`) has an arm that only logs at debug: the count
+is compositor-owned and the request is not honoured, but the atom stays
+advertised for the property, so a spec-following pager's request is named
+in the log rather than falling through silently. Property delivery is a live-gate
 obligation (`xprop -root _NET_CURRENT_DESKTOP` / `_NET_NUMBER_OF_DESKTOPS`,
 `xprop -id <xid> _NET_WM_DESKTOP`, and both messages through `xdotool`, in
 the nested workspace gate).

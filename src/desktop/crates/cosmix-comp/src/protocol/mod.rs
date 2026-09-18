@@ -3683,6 +3683,12 @@ impl ProtocolServer {
                     let previous_scale = state.backend.output_scale();
                     let previous_output = state.logical_output_rect();
                     let previous_usable = state.usable_output_rect();
+                    // Read before the backend applies the event: the
+                    // default output — and with it the key
+                    // `workspaces.current` is read under (D3) — can be
+                    // replaced by it.
+                    let previous_workspace_key = state.default_output_key();
+                    let previous_workspace_current = state.workspace_current();
                     let result = state
                         .backend
                         .apply_kms_topology_lifecycle(event)
@@ -3743,15 +3749,19 @@ impl ProtocolServer {
                                 );
                                 // `workspaces.current` is the DEFAULT
                                 // output's (D3) and a topology change can
-                                // replace that output — a new key reads as
-                                // workspace 1 with no switch having run —
-                                // so the EWMH root pair is republished
-                                // here, or `_NET_CURRENT_DESKTOP` keeps
-                                // the retired output's index until the
-                                // next switch. Two property writes per
-                                // hotplug; a no-op without an XWM.
-                                #[cfg(feature = "xwayland")]
-                                state.publish_x11_desktops();
+                                // replace that output: the retiring
+                                // output's current workspace is carried to
+                                // the replacing one, the EWMH root pair is
+                                // republished, and if the effective value
+                                // changed anyway the visibility and X11
+                                // suspend state are re-derived in one
+                                // settle — `workspace_current()` is read
+                                // fresh every frame, so it must never
+                                // disagree with `layout.visible`.
+                                state.reconcile_workspace_current_after_topology_change(
+                                    previous_workspace_key.as_deref(),
+                                    previous_workspace_current,
+                                );
                                 state.end_pointer_hit_test_batch();
                             }
                             for command in commands {

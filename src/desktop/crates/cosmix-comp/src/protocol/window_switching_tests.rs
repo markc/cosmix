@@ -191,23 +191,54 @@ fn supported_atoms_list_desktop_atoms() {
     assert!(ready.contains("self.publish_x11_desktops();"));
     assert!(ready.contains("self.sync_x11_desktops();"));
     // A KMS topology change can replace the default output, whose current
-    // workspace `_NET_CURRENT_DESKTOP` mirrors (D3): the apply site
-    // republishes the root pair after the output bindings are reconciled,
-    // or the property keeps the retired output's index until the next
-    // switch. A source pin: the site is KMS event plumbing the offline
-    // harness cannot drive.
+    // workspace `_NET_CURRENT_DESKTOP` mirrors (D3): the apply site hands
+    // the pre-apply key and current to
+    // `reconcile_workspace_current_after_topology_change` after the output
+    // bindings are reconciled, and THAT carries the workspace over,
+    // republishes the root pair and settles when the value changed (the
+    // behaviour is unit-tested on the helper in `tests.rs`;
+    // `a_replaced_default_output_keeps_its_workspace_and_a_changed_one_settles`).
+    // A source pin for the wiring: the site is KMS event plumbing the
+    // offline harness cannot drive.
     let protocol = std::fs::read_to_string(root.join("src/protocol/mod.rs")).unwrap();
-    let topology = protocol
-        .split("state.reconcile_output_after_topology_change_if_needed(")
+    let apply = protocol
+        .split("ChannelEvent::Msg(ProtocolCommand::KmsTopologyLifecycle {")
         .nth(1)
         .expect("topology apply site")
         .split("state.end_pointer_hit_test_batch();")
         .next()
         .unwrap();
+    let read_before = apply
+        .find("let previous_workspace_key = state.default_output_key();")
+        .expect("the pre-apply key is read");
+    let applied = apply
+        .find(".apply_kms_topology_lifecycle(event)")
+        .expect("the backend applies the event");
+    let reconciled = apply
+        .find("state.reconcile_workspace_current_after_topology_change(")
+        .expect("a topology change reconciles the default output's current workspace");
     assert!(
-        topology.contains("state.publish_x11_desktops();"),
+        read_before < applied && applied < reconciled,
+        "key and current are read BEFORE the apply and reconciled AFTER it"
+    );
+    let helper = workspaces
+        .split("pub(super) fn reconcile_workspace_current_after_topology_change(")
+        .nth(1)
+        .expect("reconcile_workspace_current_after_topology_change")
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    assert!(
+        helper.contains("self.publish_x11_desktops();"),
         "a topology change republishes the root pair"
     );
+    let resynced = helper
+        .find("self.sync_x11_suspended_for_workspaces();")
+        .expect("a changed current re-derives every X11 suspended flag");
+    let settled = helper
+        .find("self.settle_workspace_visibility(None);")
+        .expect("a changed current settles");
+    assert!(resynced < settled, "flags before the settle, as the shrink does it");
 }
 
 #[test]

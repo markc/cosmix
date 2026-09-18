@@ -2392,6 +2392,19 @@ where
                     drop(_guard);
                     state.current_desktop_request(xwm_id, data[0], data[1]);
                 }
+                // Downstream (cosmix): the count is WM-owned (the
+                // compositor's `workspaces.count`); a pager's request to
+                // change it (`wmctrl -n N`) is not honoured. Logged rather
+                // than silently dropped, because the atom is advertised in
+                // `_NET_SUPPORTED` (for the property, which IS supported)
+                // and a spec-following pager sends this message.
+                x if x == xwm.atoms._NET_NUMBER_OF_DESKTOPS && msg.format == 32 => {
+                    let data = msg.data.as_data32();
+                    debug!(
+                        requested = data[0],
+                        "ignored _NET_NUMBER_OF_DESKTOPS client message: the desktop count is compositor-owned"
+                    );
+                }
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];
                     info!(
