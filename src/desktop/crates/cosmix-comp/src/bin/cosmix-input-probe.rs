@@ -240,7 +240,7 @@ fn run() -> Result<(), String> {
     let mut awaiting_configure = false;
     let mut remap_at: Option<Instant> = None;
     let mut remap_left = options.remap_once;
-    while Instant::now() < deadline && !(probe.closed && !options.hide_on_close) {
+    while Instant::now() < deadline && (!probe.closed || options.hide_on_close) {
         if probe.closed && !hidden {
             probe.closed = false;
             hidden = true;
