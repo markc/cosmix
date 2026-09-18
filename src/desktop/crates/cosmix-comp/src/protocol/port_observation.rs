@@ -3428,6 +3428,7 @@ mod tests {
             maximized: false,
             fullscreen: false,
             minimized: false,
+            workspace: Some(1),
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("f_7".into()),
