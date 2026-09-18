@@ -2795,10 +2795,14 @@ fn parse_stats_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
 /// `"windows.s3"`). Widening only computes more, never less; an empty
 /// or dot-less prefix reads the whole tree.
 fn read_scope(verb: &str, args: &Value) -> Option<String> {
+    // Explicit per verb: a verb added to `needs_snapshot` later must say
+    // what its scope is, rather than inherit "path" and be mis-scoped by a
+    // same-named argument that means something else.
     let key = match verb {
         "comp.info" => return Some("info".to_string()),
         "comp.props.list" => "prefix",
-        _ => "path",
+        "comp.props.get" | "comp.props.describe" => "path",
+        _ => return None,
     };
     let raw = args.get(key).and_then(Value::as_str)?;
     if key != "prefix" {
