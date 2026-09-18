@@ -362,6 +362,21 @@ impl WaylandState {
     /// withdraw/present half and the settle. One site, so the per-move
     /// publication lands on every path (including the release-arm revert
     /// in `move_window_and_follow`, which relabels back to `from`).
+    ///
+    /// 0.59.1: also relabels `object`'s override-redirect children (a menu,
+    /// a tooltip) to the same workspace, one level, recursively through
+    /// this same function — never `_NET_WM_DESKTOP` for one of them (guarded
+    /// below), since EWMH gives that property to managed windows only
+    /// (`stamp_workspace_at_map`). An OR record has no `layout.parent`
+    /// linking it to its owner in the visibility recompute (X-2a: it is a
+    /// root of its own, stamped with the workspace it mapped on), so
+    /// without this a move of the owner strands the child on the old
+    /// workspace — it goes invisible while the owner is on screen
+    /// elsewhere. This cannot recurse past one level in practice: an OR
+    /// record is never `workspace_movable`, so it is never the `object` a
+    /// caller of `move_window_to_workspace`/`move_window_and_follow` names;
+    /// only a real move seeds the walk, and `or_children_of` only follows
+    /// WM_TRANSIENT_FOR one hop from wherever it is seeded.
     fn relabel_workspace(&mut self, object: &ObjectId, to: u32) {
         let Some(record) = self.surfaces.get_mut(object) else {
             return;
@@ -369,6 +384,7 @@ impl WaylandState {
         record.workspace = to;
         #[cfg(feature = "xwayland")]
         if let Some(role) = record.role.x11()
+            && !role.override_redirect
             && let Err(error) = role.surface.set_desktop(to - 1)
         {
             tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP on move");
@@ -378,6 +394,38 @@ impl WaylandState {
             let id = record.id;
             self.mark_surface_dirty(id, "workspace.move");
         }
+        #[cfg(feature = "xwayland")]
+        for child in self.or_children_of(object) {
+            self.relabel_workspace(&child, to);
+        }
+    }
+
+    /// Every override-redirect record whose WM_TRANSIENT_FOR names
+    /// `owner`'s X11 window (`X11Surface::is_transient_for`) — the same
+    /// identity every OR window that names an owner sets, menu or tooltip
+    /// alike. `owner` itself must be an X11 window for any hit to exist
+    /// (WM_TRANSIENT_FOR names an X window), so a non-X11 or unassociated
+    /// `owner` returns empty rather than guessing. An OR record with no
+    /// transient-for (some tooltips set none) is not returned; it stays on
+    /// whatever workspace it mapped on, exactly as before this change.
+    #[cfg(feature = "xwayland")]
+    fn or_children_of(&self, owner: &ObjectId) -> Vec<ObjectId> {
+        let Some(owner_xid) = self.xwayland.xids_by_object.get(owner).copied() else {
+            return Vec::new();
+        };
+        self.surfaces
+            .iter()
+            .filter_map(|(child, record)| {
+                let role = record.role.x11()?;
+                // `child != owner` blocks a client-set transient-for-self
+                // (a malformed OR window naming its own XID) from making
+                // `relabel_workspace`'s recursion loop forever.
+                (child != owner
+                    && role.override_redirect
+                    && role.surface.is_transient_for() == Some(owner_xid))
+                .then(|| child.clone())
+            })
+            .collect()
     }
 
     /// Switch the output `key` (`None` = default) to `target`. Refuses an

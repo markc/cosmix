@@ -376,6 +376,23 @@ impl X11Surface {
         self.state.lock().unwrap().override_redirect = override_redirect;
     }
 
+    /// Set `WM_TRANSIENT_FOR` directly, bypassing the `PropertyNotify` that
+    /// normally refreshes it.
+    ///
+    /// CosMix vendor addition, same contract as
+    /// [`Self::set_wl_surface_offline`]: downstream deterministic compositor
+    /// tests fabricate offline `X11Surface`s (dangling connection) and must
+    /// still be able to drive [`Self::is_transient_for`] — the identity an
+    /// override-redirect child's owner is resolved through when the owner
+    /// moves workspace. Production code must never call this;
+    /// `update_transient_for`'s real `WM_TRANSIENT_FOR` property query owns
+    /// the real value. Same `cosmix_offline_test` feature guard as the
+    /// association setter.
+    #[cfg(feature = "cosmix_offline_test")]
+    pub fn set_transient_for_offline(&self, transient_for: Option<X11Window>) {
+        self.state.lock().unwrap().transient_for = transient_for;
+    }
+
     /// Returns the associated wl_surface.
     ///
     /// This will only return `Some` once:

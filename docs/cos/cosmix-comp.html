@@ -798,7 +798,13 @@ that unmaps and remaps joins the current workspace again. An
 override-redirect X11 window (a menu, tooltip, dropdown, DND icon) is not a
 window — no row, no workspace value, never movable — but it hides with the
 workspace it mapped on, so an open menu does not outlive the switch that
-hid its owner; it is back, still open, when that workspace is. X11 clients see
+hid its owner; it is back, still open, when that workspace is. Moving the
+OWNER (0.59.1: Super+Shift+N, <code>send_to_workspace</code>, a
+<code>windows.s&lt;id&gt;.workspace</code> write) carries its override-redirect children
+along, resolved through <code>WM_TRANSIENT_FOR</code> — the menu is relabelled to the
+same workspace as its owner, so it stays visible alongside it instead of
+being left open and invisible on the workspace it mapped on; it still gets
+no <code>_NET_WM_DESKTOP</code> of its own (that property is for managed windows). X11 clients see
 the same model through EWMH: the root <code>_NET_NUMBER_OF_DESKTOPS</code> and
 <code>_NET_CURRENT_DESKTOP</code> (0-based, so workspace 1 is desktop 0) follow every
 switch and count change, every managed X11 window carries <code>_NET_WM_DESKTOP</code>
@@ -840,11 +846,15 @@ highest window already on the arriving workspace never sees a
 (a session lock, an exclusive layer, the VT switched away) the window is
 not focused either, so the keyboard never lands on a window that is off
 screen: <code>focus</code> replies with the reason, an activation request is ignored,
-and a restore un-minimises without switching or focusing. Activation
-requests (xdg-activation and <code>_NET_ACTIVE_WINDOW</code>) of a MINIMISED window
-are a no-op in 0.59.0 — un-minimising is the restore path, not an
-activation; a GNOME-style restore-on-activation is a later call. Two verbs
-drive the workspaces:</p>
+and a restore un-minimises without switching or focusing. A client's
+xdg-activation of a MINIMISED window RESTORES it (0.59.1, KWin/GNOME
+parity): exactly <code>comp.window.restore</code> for that window — un-minimise,
+switch to its workspace where that is allowed, raise, focus, one settle —
+and it leaves the <code>minimized_toplevels</code> MRU list truthful, the same as any
+other restore. <code>_NET_ACTIVE_WINDOW</code> keeps the 0.59.0 refusal: a MINIMISED
+window is not a valid X11 activation target
+(<code>window_switch_candidate</code>), un-minimising is the separate request that
+restores it. Two verbs drive the workspaces:</p>
 <ul>
 <li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
 current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to

@@ -15223,6 +15223,121 @@ fn xdg_activation_switches_workspace_first() {
     );
 }
 
+/// KWin/GNOME parity (0.59.1): an xdg-activation of a MINIMISED window
+/// restores it — un-minimises, raises and focuses it, and drops it from
+/// the `minimized_toplevels` MRU list — rather than being refused. Same
+/// workspace throughout, so this pins the un-minimise/raise/focus/MRU
+/// quartet on its own; the cross-workspace half (switch first, never pull
+/// across) is
+/// `xdg_activation_of_a_minimised_window_on_another_workspace_restores_and_switches`.
+/// It reuses `restore_window` verbatim — the same code
+/// `comp.window.restore` and the writable `windows.s<id>.minimized` use.
+#[test]
+fn xdg_activation_of_a_minimised_window_restores_it() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    let second = map_test_undecorated_toplevel(&mut harness);
+    let second_surface = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+
+    harness.server.state.minimize_toplevel(&second_surface);
+    assert!(harness.server.state.surfaces[&second].minimized);
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        vec![second.clone()]
+    );
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(first),
+        "minimising moved focus off the hidden window"
+    );
+
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("restore-token")),
+        XdgActivationTokenData::default(),
+        second_surface.clone(),
+    );
+    let record = &harness.server.state.surfaces[&second];
+    assert!(!record.minimized, "activation of a minimised window restores it");
+    assert!(record.layout.visible, "restored: raised into view");
+    assert!(record.focused);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(second_surface)
+    );
+    assert!(
+        harness.server.state.minimized_toplevels.is_empty(),
+        "restore drops it from the MRU list"
+    );
+}
+
+/// The cross-workspace half of the same 0.59.1 behaviour: an xdg-activation
+/// of a window that is both MINIMISED and on another workspace switches to
+/// that workspace first (F1.2 — never pulls the window across) and restores
+/// it there, in one settle, exactly like `comp.window.restore`.
+#[test]
+fn xdg_activation_of_a_minimised_window_on_another_workspace_restores_and_switches() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    // Mapped while 2 is current: joins workspace 2 (rule 2).
+    let second = map_test_undecorated_toplevel(&mut harness);
+    let second_surface = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&second_surface);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let _ = harness.sync();
+    assert!(harness.server.state.surfaces[&second].minimized);
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        vec![second.clone()]
+    );
+
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("restore-token")),
+        XdgActivationTokenData::default(),
+        second_surface.clone(),
+    );
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        2,
+        "restores by switching to the window's workspace, never pulling it across"
+    );
+    let record = &harness.server.state.surfaces[&second];
+    assert!(!record.minimized, "restored: un-minimised");
+    assert_eq!(record.workspace, 2, "never pulled across");
+    assert!(record.layout.visible);
+    assert!(record.focused);
+    assert!(!harness.server.state.surfaces[&first].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(second_surface)
+    );
+    assert!(
+        harness.server.state.minimized_toplevels.is_empty(),
+        "restore drops it from the MRU list"
+    );
+}
+
 /// The presentable term at the two callers that focus after
 /// `ensure_workspace_shown` without re-checking Alt+Tab's candidate: behind
 /// the KMS input gate (`normal_scene_restricted` while unlocked — the VT is
@@ -41709,6 +41824,157 @@ mod x11 {
         let record = &state.surfaces[&surface_two.id()];
         assert_eq!(record.workspace, 1, "stranded onto the last workspace");
         assert!(record.layout.visible, "and on screen there");
+    }
+
+    /// The 0.59.0 final-review bug: an OR child (menu, tooltip) is stamped
+    /// with the workspace it mapped on (`stamp_workspace_at_map`), but
+    /// `relabel_workspace` used to relabel only the object a move named,
+    /// and `workspace_movable` excludes OR records from ever being that
+    /// object — so a move of the OWNER left an open menu labelled with the
+    /// workspace it mapped on: invisible while its owner sat on screen
+    /// elsewhere. `relabel_workspace` now also walks `WM_TRANSIENT_FOR`
+    /// (`or_children_of`) and relabels every OR child that names the moved
+    /// window as its owner, to the same workspace — no `_NET_WM_DESKTOP`
+    /// for the child (EWMH gives that property to managed windows only).
+    #[test]
+    fn moving_the_owner_relabels_its_override_redirect_children() {
+        use crate::protocol::workspaces::WorkspaceTarget;
+        let mut harness = KeybindingHarness::new(true);
+        map_initial_test_toplevel(&mut harness);
+        let (owner_sid, _owner_surface, _owner_window, owner_object) =
+            associate_normal_window(&mut harness, 960);
+        commit_dmabuf(&mut harness, owner_sid, 200, 200);
+        assert_eq!(harness.server.state.surfaces[&owner_object].workspace, 1);
+
+        let (menu_sid, menu_surface) = roleless_wl_surface(&mut harness);
+        let menu_window =
+            fake_x11_window(961, true, Rectangle::new((10, 10).into(), (60, 20).into()));
+        menu_window.set_wl_surface_offline(Some(menu_surface.clone()));
+        menu_window.set_transient_for_offline(Some(960));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(menu_window.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(menu_window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(menu_surface.clone(), menu_window.clone());
+        commit_dmabuf(&mut harness, menu_sid, 60, 20);
+        let menu_object = menu_surface.id();
+        assert_eq!(
+            harness.server.state.surfaces[&menu_object].workspace, 1,
+            "stamped with the workspace it mapped on"
+        );
+        assert!(harness.server.state.surfaces[&menu_object].layout.visible);
+        assert_eq!(
+            menu_window.desktop(),
+            None,
+            "an OR window still gets no _NET_WM_DESKTOP"
+        );
+
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&owner_object, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        let owner_record = &harness.server.state.surfaces[&owner_object];
+        assert_eq!(owner_record.workspace, 2);
+        assert!(!owner_record.layout.visible, "left the current workspace");
+        let menu_record = &harness.server.state.surfaces[&menu_object];
+        assert_eq!(
+            menu_record.workspace, 2,
+            "the OR child's workspace label followed its owner's move"
+        );
+        assert!(
+            !menu_record.layout.visible,
+            "hidden with its owner, off the current workspace"
+        );
+        assert_eq!(
+            menu_window.desktop(),
+            None,
+            "still no _NET_WM_DESKTOP after the relabel"
+        );
+
+        harness
+            .server
+            .state
+            .switch_workspace(None, WorkspaceTarget::Index(2), true)
+            .expect("switch to 2");
+        let owner_record = &harness.server.state.surfaces[&owner_object];
+        let menu_record = &harness.server.state.surfaces[&menu_object];
+        assert!(owner_record.layout.visible, "owner visible on 2");
+        assert!(
+            menu_record.layout.visible,
+            "the menu is visible alongside its owner, not stranded on 1"
+        );
+    }
+
+    /// Same bug, the OTHER move primitive: `move_window_and_follow`
+    /// (Super+Shift+N, `send_to_workspace {follow:true}`) relabels through
+    /// its own direct call to `relabel_workspace` rather than through
+    /// `move_window_to_workspace_focusing`, so it needs its own pin —
+    /// `relabel_workspace` is the one site both paths share, and this is
+    /// the path the 0.59.0 review actually flagged (Super+Shift+N leaving
+    /// an open menu behind).
+    #[test]
+    fn move_window_and_follow_relabels_its_override_redirect_children_too() {
+        use crate::protocol::workspaces::WorkspaceTarget;
+        let mut harness = KeybindingHarness::new(true);
+        map_initial_test_toplevel(&mut harness);
+        let (owner_sid, _owner_surface, _owner_window, owner_object) =
+            associate_normal_window(&mut harness, 964);
+        commit_dmabuf(&mut harness, owner_sid, 200, 200);
+
+        let (menu_sid, menu_surface) = roleless_wl_surface(&mut harness);
+        let menu_window =
+            fake_x11_window(965, true, Rectangle::new((10, 10).into(), (60, 20).into()));
+        menu_window.set_wl_surface_offline(Some(menu_surface.clone()));
+        menu_window.set_transient_for_offline(Some(964));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(menu_window.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(menu_window.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(menu_surface.clone(), menu_window.clone());
+        commit_dmabuf(&mut harness, menu_sid, 60, 20);
+        let menu_object = menu_surface.id();
+
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_and_follow(&owner_object, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        assert_eq!(
+            harness.server.state.workspace_current(),
+            2,
+            "follow switches too"
+        );
+        let owner_record = &harness.server.state.surfaces[&owner_object];
+        let menu_record = &harness.server.state.surfaces[&menu_object];
+        assert_eq!(owner_record.workspace, 2);
+        assert!(owner_record.layout.visible);
+        assert_eq!(
+            menu_record.workspace, 2,
+            "followed the owner through move_window_and_follow too"
+        );
+        assert!(
+            menu_record.layout.visible,
+            "visible with its owner, not stranded on workspace 1"
+        );
     }
 
     #[test]

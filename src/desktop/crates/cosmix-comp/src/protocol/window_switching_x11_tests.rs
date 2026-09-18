@@ -326,20 +326,21 @@ fn locked_x11_activation_and_unminimise_do_not_switch_workspace() {
     assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 
-/// The refusal half of F1.2 on the client-driven paths: a
-/// `_NET_ACTIVE_WINDOW` or an xdg-activation for a MINIMISED window on
-/// another workspace is a no-op — nothing is focused, and because the
-/// switch is gated on the same terms it does not change the workspace
-/// either. `_NET_ACTIVE_WINDOW` always refused a minimised target
-/// (`window_switch_candidate`); xdg-activation did NOT on the base tree —
-/// `arbitrate_keyboard_focus` has no minimised term, so the keyboard focus
-/// moved to the hidden window — and now refuses at `request_activation`.
-/// A switch that then focuses nothing would be a client-driven, unreported
-/// change of the user's desktop. (The unminimise request is the restore
-/// path and does switch:
+/// The two client-driven paths diverge on a MINIMISED target off the
+/// current workspace (0.59.1): `_NET_ACTIVE_WINDOW` still refuses outright
+/// (`window_switch_candidate`) — nothing is focused, and because the
+/// switch is gated on the same terms the workspace does not change either,
+/// so a request that would focus nothing never becomes a client-driven,
+/// unreported change of the user's desktop. xdg-activation, however, now
+/// RESTORES the target (KWin/GNOME parity, `request_activation` in
+/// `handlers.rs`): it reuses `restore_window` verbatim, so it un-minimises,
+/// switches to the window's workspace (F1.2 — never pulls it across),
+/// raises and focuses it, and drops it from `minimized_toplevels`. Before
+/// 0.59.1 both requests refused; see git history for that assertion. (The
+/// unminimise request was always the restore path and always switched:
 /// `x11_unminimise_of_an_off_workspace_window_switches_first`.)
 #[test]
-fn x11_activation_of_a_minimised_off_workspace_window_does_not_switch() {
+fn x11_active_window_still_refuses_a_minimised_target_but_xdg_activation_now_restores_it() {
     use crate::protocol::workspaces::WorkspaceTarget;
     let mut harness = KeybindingHarness::new(true);
     map_initial_test_toplevel(&mut harness);
@@ -385,16 +386,23 @@ fn x11_activation_of_a_minimised_off_workspace_window_does_not_switch() {
     );
     assert_eq!(
         harness.server.state.workspace_current(),
-        1,
-        "xdg-activation for a minimised window does not switch"
+        2,
+        "0.59.1: xdg-activation of a minimised window restores it, switching to its workspace"
     );
     let record = &harness.server.state.surfaces[&object];
-    assert!(record.minimized && !record.layout.visible && !record.focused);
+    assert!(!record.minimized, "restored: un-minimised");
+    assert!(record.layout.visible);
+    assert!(record.focused);
+    assert!(!window.is_minimized(), "on screen again: not suspended");
+    assert!(!harness.server.state.surfaces[&native.id()].layout.visible);
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
-        Some(native)
+        Some(surface)
     );
-    assert_eq!(harness.server.state.minimized_toplevels, vec![object]);
+    assert!(
+        harness.server.state.minimized_toplevels.is_empty(),
+        "restore drops it from the MRU list"
+    );
 }
 
 /// D15 at the switch halves: switching away suspends an X11 window left
