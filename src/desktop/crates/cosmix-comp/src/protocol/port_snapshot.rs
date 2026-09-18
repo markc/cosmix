@@ -207,7 +207,8 @@ pub(crate) struct OutputWorkspaceSnapshot {
 }
 
 /// One `workspaces.list` entry: the 1-based index and how many mapped
-/// managed windows (the `windows.*` rows) are on it.
+/// managed toplevels are on it (X11 windows included: every row with a
+/// non-null `surfaces.s<id>.workspace`, not only the `windows.*` rows).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct WorkspaceRowSnapshot {
     pub(crate) index: u32,
@@ -925,8 +926,10 @@ fn project_surface_row(
         minimized: record.minimized,
         // Stamped at the first map (rule 2): 0 until then, and only managed
         // toplevels have one. X11 toplevels have no `windows.*` row, so
-        // this leaf is where their workspace is read (D11).
-        workspace: (record.role.managed_toplevel() && record.workspace >= 1)
+        // this leaf is where their workspace is read (D11). Null again
+        // once unmapped: the record keeps its last stamp until the remap
+        // restamps it, but a withdrawn window is on no workspace.
+        workspace: (record.mapped && record.role.managed_toplevel() && record.workspace >= 1)
             .then_some(record.workspace),
         decoration: matches!(record.role, SurfaceRole::Toplevel(_))
             .then_some(decoration_name(record.committed_decoration)),
@@ -980,14 +983,18 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
     }
 }
 
-/// `workspaces.*` from the workspace state and the window rows already
-/// projected for this snapshot: per-workspace counts are counts of
-/// `windows.*` rows, so under a session lock (where that map is empty)
-/// they read 0, like every other window-derived leaf.
+/// `workspaces.*` from the workspace state and the surface rows already
+/// projected for this snapshot: per-workspace counts are the mapped
+/// managed toplevels on each workspace — the rows whose `workspace` leaf
+/// is non-null, so an X11 window counts although it has no `windows.*`
+/// row (D11: a pager must not show a workspace empty while the mail
+/// client is on it). Under a session lock they read 0, like every other
+/// window-derived leaf (the `windows.*` map is empty then).
 fn project_workspaces(
     state: &WaylandState,
     output_keys: &[(Output, String)],
-    windows: &BTreeMap<String, WindowSnapshot>,
+    surfaces: &BTreeMap<String, SurfaceSnapshot>,
+    session_lock_active: bool,
 ) -> WorkspacesSnapshot {
     let count = state.workspaces.count;
     let outputs = output_keys
@@ -1004,13 +1011,14 @@ fn project_workspaces(
     let mut list = (1..=count)
         .map(|index| WorkspaceRowSnapshot { index, windows: 0 })
         .collect::<Vec<_>>();
-    for row in windows.values() {
-        if let Some(slot) = row
-            .workspace
-            .checked_sub(1)
-            .and_then(|index| list.get_mut(index as usize))
-        {
-            slot.windows += 1;
+    if !session_lock_active {
+        for workspace in surfaces.values().filter_map(|row| row.workspace) {
+            if let Some(slot) = workspace
+                .checked_sub(1)
+                .and_then(|index| list.get_mut(index as usize))
+            {
+                slot.windows += 1;
+            }
         }
     }
     WorkspacesSnapshot {
@@ -1117,7 +1125,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             .collect()
     };
 
-    let workspaces = project_workspaces(state, &output_keys, &windows);
+    let workspaces = project_workspaces(state, &output_keys, &surfaces, session_lock_active);
     let stack = project_stack(state);
 
     let bindings = state.bindings.port_snapshot();
@@ -1902,7 +1910,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("workspaces"), L("list")],
         List,
-        "One {index, windows} row per workspace; windows counts the windows.* rows on it"
+        "One {index, windows} row per workspace; windows counts the mapped managed toplevels on it (X11 included: the surfaces.* rows with a workspace)"
     ),
     descriptor!(
         &[L("stack")],
@@ -2525,19 +2533,26 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
         Some(_) => return list_argument("visible", "bool", "true|false"),
     };
     // Rule 4: `"current"` is resolved against this snapshot's current
-    // workspace, so the reply is consistent with the rows it lists.
+    // workspace, so the reply is consistent with the rows it lists. An
+    // index above the count is refused like every other workspace input
+    // (props.set, the ingress gate): "no such workspace", not "no windows
+    // there".
+    const WORKSPACE_RANGE: &str = "1..=count|current|all";
     let workspace = match object.get("workspace") {
         None | Some(Value::Null) => None,
         Some(Value::String(word)) if word == "all" => None,
         Some(Value::String(word)) if word == "current" => Some(snapshot.workspaces.current),
-        Some(Value::Number(number)) => match number.as_u64() {
-            Some(index) if index >= 1 => Some(u32::try_from(index).unwrap_or(u32::MAX)),
+        Some(Value::Number(number)) => match number
+            .as_u64()
+            .and_then(|index| u32::try_from(index).ok())
+        {
+            Some(index) if (1..=snapshot.workspaces.count).contains(&index) => Some(index),
             _ => {
-                return list_argument("workspace", "unsigned integer or string", "<n>|current|all");
+                return list_argument("workspace", "unsigned integer or string", WORKSPACE_RANGE);
             }
         },
         Some(_) => {
-            return list_argument("workspace", "unsigned integer or string", "<n>|current|all");
+            return list_argument("workspace", "unsigned integer or string", WORKSPACE_RANGE);
         }
     };
     let mut rows = snapshot

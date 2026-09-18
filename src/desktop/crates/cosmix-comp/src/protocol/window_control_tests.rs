@@ -763,12 +763,23 @@ fn windows_list_filters_by_workspace() {
         Vec::<u64>::new(),
         "filters compose"
     );
-    for bad in [json!("sideways"), json!(0), json!(-1), json!(true), json!(1.5)] {
+    // An index above the count is "no such workspace", not an empty list
+    // (every other workspace input refuses it too); the u64 that does not
+    // fit a u32 is refused the same way rather than clamped.
+    for bad in [
+        json!("sideways"),
+        json!(0),
+        json!(-1),
+        json!(true),
+        json!(1.5),
+        json!(5),
+        json!(5_000_000_000_u64),
+    ] {
         let (rc, body) = list(&snapshot, json!({"workspace": bad}));
         assert_eq!(rc, 10, "{bad}: {body}");
         assert_eq!(body["error"], "invalid_value");
         assert_eq!(body["path"], "workspace");
-        assert_eq!(body["range"], "<n>|current|all");
+        assert_eq!(body["range"], "1..=count|current|all");
     }
 
     // "current" follows the snapshot's current workspace.

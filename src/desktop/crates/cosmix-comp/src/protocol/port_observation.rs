@@ -2663,6 +2663,11 @@ const WORKSPACE_INDEX_RANGE: &str = "1..=count";
 /// The `range` a count refusal reports — the same bound as the core's
 /// `WORKSPACE_COUNT_MAX`, pinned so the two cannot drift.
 const WORKSPACE_COUNT_RANGE: &str = "1..=16";
+/// The `range` an output-key refusal reports: only the default output's
+/// current workspace is switchable in 0.59 (D3), and its key is the one
+/// `workspaces.current` addresses without naming it.
+const WORKSPACE_OUTPUT_RANGE: &str =
+    "the default output's o_<slug> (the only switchable output; workspaces.current addresses it)";
 const _: () = assert!(
     WORKSPACE_COUNT_MAX == 16,
     "WORKSPACE_COUNT_RANGE names the core's cap"
@@ -2707,12 +2712,54 @@ fn workspace_value(
         .ok_or_else(|| invalid_value(path, "integer", range))
 }
 
+/// The dirty marks a workspace write plants BEFORE the core runs, so the
+/// diff the core schedules reads cause `props.set` (`full_dirty` and the
+/// per-surface entry both keep their FIRST cause). A write the core then
+/// refuses, or that changes nothing, must take its marks back out: a
+/// planted `full_dirty` would otherwise attribute the next unrelated
+/// change (another client's map, say) to a write that never took effect.
+/// `restore` puts back exactly what was there — a cause planted earlier
+/// by someone else was never overwritten, so it survives either way.
+struct PlantedWorkspaceMarks {
+    full: Option<&'static str>,
+    surface: Option<(u64, bool)>,
+}
+
+impl PlantedWorkspaceMarks {
+    fn plant(state: &mut WaylandState, surface: Option<u64>) -> Self {
+        let full = state.observations.full_dirty;
+        let surface = surface.map(|id| {
+            let had_entry = state.observations.dirty_surfaces.contains_key(&id);
+            state.mark_surface_dirty(SurfaceId(id), "props.set");
+            (id, had_entry)
+        });
+        state.mark_workspaces_dirty("props.set");
+        Self { full, surface }
+    }
+
+    /// The write changed nothing: back to the marks as they were.
+    fn restore(self, state: &mut WaylandState) {
+        state.observations.full_dirty = self.full;
+        if let Some((id, false)) = self.surface {
+            state.observations.dirty_surfaces.remove(&id);
+        }
+    }
+
+    /// Keep the marks only for a write that changed something.
+    fn settle(self, state: &mut WaylandState, outcome: &Result<(u32, u32), WorkspaceRefusal>) {
+        if !matches!(outcome, Ok((old, new)) if old != new) {
+            self.restore(state);
+        }
+    }
+}
+
 /// The `windows.s<id>.workspace` set: move THIS window to the workspace
 /// without switching (rule 5). The changed events come from the full
 /// snapshot diff the core's dirty mark schedules, attributed to
-/// `props.set` because the cause is planted before the core runs
-/// (`full_dirty` keeps the first cause). A move never bumps the
-/// generation, so a fenced retry after the move still resolves.
+/// `props.set` because the cause is planted before the core runs and
+/// taken back out when the core refuses (`PlantedWorkspaceMarks`). A move
+/// never bumps the generation, so a fenced retry after the move still
+/// resolves.
 fn service_set_window_workspace(
     state: &mut WaylandState,
     request: &mut PortSetRequest,
@@ -2724,9 +2771,11 @@ fn service_set_window_workspace(
         Ok(_) if state.session_lock_active() => ControlReply::Locked,
         Ok(index) => match state.resolve_window_target(window, request.generation) {
             Ok(object) => {
-                state.mark_surface_dirty(SurfaceId(window), "props.set");
-                state.mark_workspaces_dirty("props.set");
-                match state.move_window_to_workspace(&object, WorkspaceTarget::Index(index)) {
+                let marks = PlantedWorkspaceMarks::plant(state, Some(window));
+                let outcome =
+                    state.move_window_to_workspace(&object, WorkspaceTarget::Index(index));
+                marks.settle(state, &outcome);
+                match outcome {
                     Ok((old, new)) => ControlReply::Set {
                         path,
                         old: PropValue::U32(old),
@@ -2758,7 +2807,8 @@ fn service_set_window_workspace(
 /// lock like the window verbs (D12). No explicit change queueing: the
 /// core marks the full snapshot dirty and the next observation diffs
 /// `workspaces.*` and every window row (D7); the cause is planted first so
-/// it reads `props.set`.
+/// it reads `props.set`, and unplanted again on a refusal or a no-op
+/// (`PlantedWorkspaceMarks`).
 fn service_set_workspaces(
     state: &mut WaylandState,
     request: &mut PortSetRequest,
@@ -2774,13 +2824,14 @@ fn service_set_workspaces(
             Err(error) => ControlReply::Validation(error),
             Ok(_) if state.session_lock_active() => ControlReply::Locked,
             Ok(value) => {
-                state.mark_workspaces_dirty("props.set");
+                let marks = PlantedWorkspaceMarks::plant(state, None);
                 let outcome = match &target {
                     WorkspacesSetTarget::Count => state.set_workspace_count(value),
                     WorkspacesSetTarget::Current(key) => state
                         .switch_workspace(key.as_deref(), WorkspaceTarget::Index(value), true)
                         .map(|switch| (switch.from, switch.to)),
                 };
+                marks.settle(state, &outcome);
                 match outcome {
                     Ok((old, new)) => ControlReply::Set {
                         path,
@@ -2788,8 +2839,12 @@ fn service_set_workspaces(
                         new: PropValue::U32(new),
                         persisted: None,
                     },
+                    // The key may well exist under `outputs.*`; what the
+                    // core refuses is a key that is not the DEFAULT
+                    // output's (D3), so the range says that, not "an
+                    // existing key" the caller just read.
                     Err(WorkspaceRefusal::UnknownOutput) => ControlReply::Validation(
-                        invalid_value(&path, "output key", "an existing outputs.o_<slug>"),
+                        invalid_value(&path, "output key", WORKSPACE_OUTPUT_RANGE),
                     ),
                     Err(_) => ControlReply::Validation(invalid_value(&path, "integer", range)),
                 }
@@ -3013,9 +3068,11 @@ fn known_read_only_path(path: &str) -> bool {
         "port",
     ];
     #[cfg(feature = "xwayland")]
-    if path == "xwayland" {
-        // The subtree object is read-only like "input"; its one leaf is
-        // routed before validation ever runs.
+    if path == "xwayland" || path == "xwayland.persist_path" || path == "xwayland.display" {
+        // The subtree object is read-only like "input", and so are its two
+        // served-but-never-written leaves (they exist: a write is
+        // `read_only`, not `unknown_path`, like every `surfaces.*` leaf);
+        // the one writable leaf is routed before validation ever runs.
         return true;
     }
     // The subtree object and the row list; the three writable leaves are
@@ -3162,6 +3219,22 @@ mod tests {
             assert!(matches!(
                 validate_set_request("xwayland.enabled", &json!("nope")),
                 Err(SetValidationError::InvalidValue { .. })
+            ));
+            // The two served, never-written leaves exist, so a write is
+            // `read_only` (like `workspaces.list` and every `surfaces.*`
+            // leaf), not `unknown_path`.
+            for path in ["xwayland", "xwayland.persist_path", "xwayland.display"] {
+                assert!(
+                    matches!(
+                        validate_set_request(path, &json!(":9")),
+                        Err(SetValidationError::ReadOnly)
+                    ),
+                    "{path}"
+                );
+            }
+            assert!(matches!(
+                validate_set_request("xwayland.nope", &json!(1)),
+                Err(SetValidationError::UnknownPath)
             ));
         }
     }

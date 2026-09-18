@@ -243,7 +243,9 @@ pub(super) struct XwaylandRuntime {
     /// The display number of the READY generation (`xwayland.display`
     /// reads `:N`): set with the descriptor once the XWM owns WM_S0 and
     /// publication succeeded, cleared with it at teardown. `None` while no
-    /// generation serves X clients.
+    /// generation serves X clients. Its only reader is the `bus` snapshot,
+    /// so the field is allowed dead on a bus-less xwayland build.
+    #[cfg_attr(not(feature = "bus"), allow(dead_code))]
     pub(super) display_number: Option<u32>,
     pub(super) pending_windows: HashMap<X11Window, PendingX11Window>,
     /// XID → associated `wl_surface` object for normal managed windows.

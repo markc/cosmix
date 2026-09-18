@@ -718,17 +718,23 @@ removed workspace to the last remaining one and clamps every current.
 <code>workspaces.current</code> is the default output's current workspace and
 <code>workspaces.o_&lt;slug&gt;.current</code> the same value under the output's key (one
 output today, so they mirror each other; a key that is not the default
-output's is refused with <code>invalid_value</code>). Writing either switches, exactly
-like <code>comp.workspace.switch</code>. <code>workspaces.list</code> is read-only: one
-<code>{index,windows}</code> row per workspace, <code>windows</code> counting the <code>windows.*</code> rows
-on it. <code>windows.s&lt;id&gt;.workspace</code> is the window's workspace; writing it moves
-the window there WITHOUT switching, so a window moved off the current
-workspace reads <code>visible:false, minimized:false</code> (use <code>visible</code> for
-on-screen, <code>minimized</code> for the user's minimise state). A move never changes
-the window's generation. <code>surfaces.s&lt;id&gt;.workspace</code> carries the same value
-for every mapped managed toplevel, X11 windows included (they have no
-<code>windows.*</code> row), and null for every other surface. A window that unmaps and
-remaps joins the current workspace again. All of these are watchable; the
+output's — even one that exists under <code>outputs.*</code> — is refused with
+<code>invalid_value</code> whose <code>range</code> says only the default output switches).
+Writing either switches, exactly like <code>comp.workspace.switch</code>.
+<code>workspaces.list</code> is read-only: one <code>{index,windows}</code> row per workspace,
+<code>windows</code> counting the mapped managed toplevels on it — X11 windows
+included, although they have no <code>windows.*</code> row, so a pager never shows a
+workspace empty while an X11 window is on it. <code>windows.s&lt;id&gt;.workspace</code> is
+the window's workspace; writing it moves the window there WITHOUT
+switching, so a window moved off the current workspace reads
+<code>visible:false, minimized:false</code> (use <code>visible</code> for on-screen, <code>minimized</code>
+for the user's minimise state). A move never changes the window's
+generation. <code>surfaces.s&lt;id&gt;.workspace</code> carries the same value for every
+mapped managed toplevel, X11 windows included (they have no <code>windows.*</code>
+row), and null for every other surface and for an unmapped one. A window
+that unmaps and remaps joins the current workspace again. A refused or
+no-op write publishes nothing and attributes nothing: the next unrelated
+change keeps its own cause. All of these are watchable; the
 changed events of a switch, move or count change carry the cause of the
 write (<code>props.set</code>) or the verb. Values outside <code>1..=count</code> (0 included) and
 non-integers are <code>invalid_value</code>; every write is <code>locked</code> while a session
@@ -828,7 +834,8 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 </li>
 <li><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
 returns <code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field
-(text filters at most 4096 bytes; <code>workspace</code> is an index, <code>"current"</code> for
+(text filters at most 4096 bytes; <code>workspace</code> is an index in <code>1..=count</code>
+— above the count is <code>invalid_value</code>, not an empty list — <code>"current"</code> for
 the current workspace, or <code>"all"</code>, the default). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
 windows and is empty while a session lock is active.</li>

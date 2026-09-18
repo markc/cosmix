@@ -29768,6 +29768,11 @@ fn workspace_prop_round_trips_and_moves_without_switching() {
     assert_eq!(rc, 10, "{body}");
     assert_eq!(body["error"], "stale_target");
     assert_eq!(harness.server.state.surfaces[&alpha].workspace, 2);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        None,
+        "the no-op and the refusals leave no cause planted"
+    );
     port_observation::service_observations(&mut harness.server.state);
     assert!(drain_observations(&observations).is_empty());
 
@@ -29854,6 +29859,21 @@ fn workspaces_current_and_count_props_write_and_watch() {
         Some((json!(1), json!(2), "props.set")),
         "{changed:?}"
     );
+    // A no-op switch (the core's `to == from` early return) replies
+    // normally, publishes nothing and leaves no full-snapshot cause
+    // planted for the next unrelated change to be attributed to.
+    let admission = ingress
+        .request_set("workspaces.current".into(), json!(2))
+        .expect("no-op switch admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"path": "workspaces.current", "old": 2, "new": 2})
+    );
+    assert_eq!(harness.server.state.full_dirty_cause(), None);
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
     assert_eq!(
         changed_leaf(&changed, "workspaces.o_cosmix_nested_0.current"),
         Some((json!(1), json!(2), "props.set"))
@@ -29887,6 +29907,11 @@ fn workspaces_current_and_count_props_write_and_watch() {
         body,
         json!({"path": "workspaces.o_cosmix_nested_0.current", "old": 2, "new": 3})
     );
+    port_observation::service_observations(&mut harness.server.state);
+    assert_eq!(
+        changed_leaf(&drain_observations(&observations), "workspaces.current"),
+        Some((json!(2), json!(3), "props.set"))
+    );
     let admission = ingress
         .request_set("workspaces.o_nope.current".into(), json!(1))
         .expect("unknown key reaches the service");
@@ -29894,7 +29919,19 @@ fn workspaces_current_and_count_props_write_and_watch() {
     assert_eq!(rc, 10, "{body}");
     assert_eq!(body["error"], "invalid_value");
     assert_eq!(body["expected"], "output key");
+    // The range names the real constraint (D3: only the default output
+    // switches), not "an existing key" — a second output's key exists
+    // under outputs.* and is refused all the same.
+    assert_eq!(
+        body["range"],
+        "the default output's o_<slug> (the only switchable output; workspaces.current addresses it)"
+    );
     assert_eq!(harness.server.state.workspace_current(), 3);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        None,
+        "a refused write leaves no cause planted"
+    );
 
     // Rule 11: alpha on 4, current 4, then count 2 — alpha lands on 2 (the
     // last workspace), current clamps to 2, the list shrinks with its
@@ -30011,6 +30048,11 @@ fn workspaces_current_and_count_props_write_and_watch() {
     assert_eq!(body["path"], "generation");
     assert_eq!(harness.server.state.workspaces.count, 2);
     assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        None,
+        "refused writes leave no cause planted"
+    );
     port_observation::service_observations(&mut harness.server.state);
     assert!(drain_observations(&observations).is_empty());
 

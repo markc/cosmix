@@ -353,6 +353,18 @@ fn x11_window_workspace_is_readable_on_the_surfaces_row() {
         !mapped.windows.contains_key(&key),
         "X11 rows are not windows.* rows in 0.59"
     );
+    // ...but `workspaces.list` counts it: the pager reading that leaf must
+    // not show the workspace empty while the X11 window is on it.
+    let counts = |snapshot: &port_snapshot::CompSnapshot| {
+        snapshot
+            .workspaces
+            .list
+            .iter()
+            .map(|row| row.windows)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(counts(&before), [0, 0, 0, 0], "unmapped: on no workspace");
+    assert_eq!(counts(&mapped), [1, 0, 0, 0]);
 
     assert_eq!(
         harness
@@ -366,4 +378,5 @@ fn x11_window_workspace_is_readable_on_the_surfaces_row() {
     assert!(!moved.surfaces[&key].visible);
     assert!(!moved.surfaces[&key].minimized);
     assert_eq!(moved.workspaces.current, 1);
+    assert_eq!(counts(&moved), [0, 0, 1, 0]);
 }
