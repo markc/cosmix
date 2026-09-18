@@ -23,6 +23,15 @@ fn expect_raise($f, $want_code, $message)
   check($raised, $message .. " (no raise)")
 end
 
+-- Scratch environment for an --install child: HOME, XDG_CONFIG_HOME and
+-- XDG_DATA_HOME (every root the install paths consult) point inside the
+-- test's tmp dir, so the real ~/.config and ~/.local are never in play.
+fn install_env($tmp, $tag)
+  $root = $tmp .. "/" .. $tag
+  return {HOME: $root .. "/home", COSMIX: "", COSMIX_ETC: "",
+    XDG_CONFIG_HOME: $root .. "/cfg", XDG_DATA_HOME: $root .. "/data"}
+end
+
 -- No INI/CSS line may carry an empty value: every "=" line has text after
 -- the "=", every @define-color has a hex between name and ";".
 fn check_no_empty_values($lines, $file)
@@ -122,11 +131,13 @@ try
 
   -- ── option parsing (getopt long names cannot carry the hyphen) ───────
   $opts = $x.parse_args(["--theme", "/t.mix", "--out=/o", "--icon-theme", "adwaita",
-    "--install"])
+    "--install", "--force"])
   check($opts.theme == "/t.mix" and $opts.out == "/o" and
     $opts["icon-theme"] == "adwaita" and $opts.install == true and
-    $opts.defaults == nil, "parse_args values wrong: " .. json_encode($opts))
+    $opts.force == true and $opts.defaults == nil,
+    "parse_args values wrong: " .. json_encode($opts))
   check($x.parse_args([]).install == false, "install should default to false")
+  check($x.parse_args([]).force == false, "force should default to false")
   expect_raise(fn() = $x.parse_args(["--nope"]), "THEME_ARGS", "unknown option accepted")
   expect_raise(fn() = $x.parse_args(["extra"]), "THEME_ARGS", "positional accepted")
   expect_raise(fn() = $x.parse_args(["--theme"]), "THEME_ARGS", "missing value accepted")
@@ -154,8 +165,9 @@ try
 
   $kg = read_file($out .. "/kdeglobals")
   $kg_lines = split($kg, "\n")
-  check($kg_lines[0] == "[General]" and contains($kg, "ColorScheme=Cosmix"),
-    "kdeglobals [General] wrong")
+  check($kg_lines[0] == $x.ini_header() and $kg_lines[2] == "[General]" and
+    contains($kg, "ColorScheme=Cosmix"),
+    "kdeglobals generated-by header/[General] wrong")
   check(contains($kg, "font=Noto Sans,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
     "kdeglobals font line wrong")
   check(contains($kg, "contrast=4"), "kdeglobals contrast wrong")
@@ -178,12 +190,16 @@ try
 
   for each $ver in ["gtk-3.0", "gtk-4.0"]
     $ini = read_file($out .. "/" .. $ver .. "/settings.ini")
+    check(split($ini, "\n")[0] == $x.ini_header(),
+      $ver .. "/settings.ini missing generated-by header")
     check(contains($ini, "gtk-application-prefer-dark-theme=false"),
       $ver .. " light mode should not prefer dark")
     check(contains($ini, "gtk-font-name=Noto Sans 10"), $ver .. " font name wrong")
     check(contains($ini, "gtk-icon-theme-name=breeze"), $ver .. " icon theme default wrong")
     check_no_empty_values(split($ini, "\n"), $ver .. "/settings.ini")
     $css = read_file($out .. "/" .. $ver .. "/gtk.css")
+    check(split($css, "\n")[0] == $x.css_header(),
+      $ver .. "/gtk.css missing generated-by header")
     $defines = 0
     for each $line in split($css, "\n")
       if starts_with(trim($line), "@define-color") then $defines = $defines + 1 end
@@ -254,7 +270,97 @@ try
     "gtk-application-prefer-dark-theme=false"),
     "skipped broken theme should leave the defaults in force")
 
-  print("PASS theme-export: hex/alpha conversion, color-scheme mapping, px->pt fonts, overlay semantics, validation, path candidates, defaults + dark-override end-to-end exports")
+  -- ── --install safety against a scratch HOME/XDG triple ───────────────
+  -- (a) kdeglobals is never an install target, even when it exists
+  $env_a = install_env($tmp, "i-a")
+  $cfg_a = $env_a["XDG_CONFIG_HOME"]
+  mkdir($cfg_a)
+  $foreign_kg = "[General]\nColorScheme=Breeze\n[Shortcuts]\nq=quit\n"
+  write_file($cfg_a .. "/kdeglobals", $foreign_kg)
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $tmp .. "/i-a-out", "--install"], {timeout: 60, env: $env_a})
+  check($r.ok, "install run failed: " .. $r.stderr)
+  check(read_file($cfg_a .. "/kdeglobals") == $foreign_kg,
+    "install modified kdeglobals")
+  $installed = []
+  for each $line in split($r.stdout, "\n")
+    if starts_with($line, "installed ") then push($installed, $line) end
+  end
+  for each $line in $installed
+    check(not ends_with($line, "/kdeglobals"), "kdeglobals was installed: " .. $line)
+  end
+  check(join($installed, "\n") != "" and contains(join($installed, "\n"), $cfg_a),
+    "gtk files not installed into the scratch XDG_CONFIG_HOME")
+  $colors_a = $env_a["XDG_DATA_HOME"] .. "/color-schemes/Cosmix.colors"
+  check(read_file($colors_a) == read_file($tmp .. "/i-a-out/Cosmix.colors"),
+    "installed Cosmix.colors differs from the exported one")
+  check(contains($r.stdout, "apply with: plasma-apply-colorscheme Cosmix"),
+    "plasma-apply-colorscheme hint not printed")
+  check(split(read_file($cfg_a .. "/gtk-3.0/settings.ini"), "\n")[0] ==
+    $x.ini_header(), "installed settings.ini lacks the generated-by header")
+
+  -- (b) a foreign existing settings.ini is refused, byte-identical, exit 1
+  $env_b = install_env($tmp, "i-b")
+  $cfg_b = $env_b["XDG_CONFIG_HOME"]
+  mkdir($cfg_b .. "/gtk-3.0")
+  $foreign_ini = "[Settings]\ngtk-theme-name=Breeze\ngtk-icon-theme-name=breeze-dark\n"
+  write_file($cfg_b .. "/gtk-3.0/settings.ini", $foreign_ini)
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $tmp .. "/i-b-out", "--install"], {timeout: 60, env: $env_b})
+  check(not $r.ok and $r.exit_code == 1,
+    "a refused install should exit 1, got exit " .. to_string($r.exit_code))
+  check(contains($r.stderr, "refused") and
+    contains($r.stderr, $cfg_b .. "/gtk-3.0/settings.ini"),
+    "refusal message not on stderr")
+  check(read_file($cfg_b .. "/gtk-3.0/settings.ini") == $foreign_ini,
+    "the refused settings.ini was modified")
+  check(is_file($cfg_b .. "/gtk-4.0/settings.ini"),
+    "a refusal must not stop the remaining targets")
+
+  -- (c) --force backs the foreign file up, then overwrites it
+  $env_c = install_env($tmp, "i-c")
+  $cfg_c = $env_c["XDG_CONFIG_HOME"]
+  mkdir($cfg_c .. "/gtk-3.0")
+  write_file($cfg_c .. "/gtk-3.0/settings.ini", $foreign_ini)
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $tmp .. "/i-c-out", "--install", "--force"],
+    {timeout: 60, env: $env_c})
+  check($r.ok, "forced install run failed: " .. $r.stderr)
+  $baks = glob($cfg_c .. "/gtk-3.0/settings.ini.cosmix-bak-*")
+  check(len($baks) == 1, "expected exactly one backup, got " .. to_string(len($baks)))
+  check(re_match($baks[0], "\.cosmix-bak-[0-9]{8}-[0-9]{6}$"),
+    "backup name is not <file>.cosmix-bak-<YYYYmmdd-HHMMSS>: " .. $baks[0])
+  check(read_file($baks[0]) == $foreign_ini, "backup does not hold the foreign content")
+  $forced_ini = read_file($cfg_c .. "/gtk-3.0/settings.ini")
+  check(split($forced_ini, "\n")[0] == $x.ini_header(),
+    "forced settings.ini not replaced with generated content")
+  check($forced_ini == read_file($tmp .. "/i-c-out/gtk-3.0/settings.ini"),
+    "forced settings.ini differs from the exported one")
+
+  -- (d) a file this script generated before is overwritten, no --force,
+  --     no backup; (e) identical content on a second run reports unchanged
+  $env_d = install_env($tmp, "i-d")
+  $ini_d = $env_d["XDG_CONFIG_HOME"] .. "/gtk-4.0/settings.ini"
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $tmp .. "/i-d-out", "--install"], {timeout: 60, env: $env_d})
+  check($r.ok, "first install run failed: " .. $r.stderr)
+  check(contains(read_file($ini_d), "gtk-application-prefer-dark-theme=false"),
+    "the defaults install should be light")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--theme",
+    $tmp .. "/dark.conf.mix", "--out", $tmp .. "/i-d-out2", "--install"],
+    {timeout: 60, env: $env_d})
+  check($r.ok, "regenerating install run failed: " .. $r.stderr)
+  check(contains(read_file($ini_d), "gtk-application-prefer-dark-theme=true"),
+    "a previously generated settings.ini was not overwritten")
+  check(len(glob($ini_d .. ".cosmix-bak-*")) == 0,
+    "overwriting a previously generated file should not leave a backup")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--theme",
+    $tmp .. "/dark.conf.mix", "--out", $tmp .. "/i-d-out3", "--install"],
+    {timeout: 60, env: $env_d})
+  check($r.ok and contains($r.stdout, "unchanged " .. $ini_d),
+    "identical content should be reported unchanged")
+
+  print("PASS theme-export: hex/alpha conversion, color-scheme mapping, px->pt fonts, overlay semantics, validation, path candidates, defaults + dark-override end-to-end exports, install safety (kdeglobals untouched, refuse/backup/force/unchanged)")
 finally
   if starts_with($tmp, "/tmp/cosmix-theme-export-test.") then
     $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
