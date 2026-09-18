@@ -712,10 +712,13 @@ impl WaylandState {
             return;
         }
         let Some(surface) = window.wl_surface() else {
+            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP for an unassociated window");
             return;
         };
         // The same identity gate as `_NET_ACTIVE_WINDOW`: a stale association
         // or an override-redirect window is not a live managed identity.
+        // (`move_window_to_workspace` would refuse an OR record as not a
+        // managed toplevel anyway; the gate names the reason.)
         let object = surface.id();
         if !self.surfaces.get(&object).is_some_and(|record| {
             record
@@ -723,6 +726,11 @@ impl WaylandState {
                 .x11()
                 .is_some_and(|role| !role.override_redirect && role.surface == window)
         }) {
+            tracing::debug!(
+                xid,
+                desktop,
+                "ignored _NET_WM_DESKTOP for an override-redirect window or a stale identity"
+            );
             return;
         }
         match self.move_window_to_workspace(&object, workspaces::WorkspaceTarget::Index(desktop + 1)) {

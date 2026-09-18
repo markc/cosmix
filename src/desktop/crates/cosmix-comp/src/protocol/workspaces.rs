@@ -103,12 +103,14 @@ pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: boo
     if !was_mapped && record.mapped && record.role.managed_toplevel() {
         record.workspace = current;
         // EWMH: the window's `_NET_WM_DESKTOP` is written HERE, at the
-        // stamping edge, never at MapRequest (D19). `let _` like
-        // `set_suspended`: the offline fakes have a dead connection, and a
-        // live failure is a dying generation `disconnected` cleans up.
+        // stamping edge, never at MapRequest (D19). Debug, not warn, on
+        // failure: the offline fakes have a dead connection, and a live
+        // failure is a dying generation `disconnected` cleans up.
         #[cfg(feature = "xwayland")]
-        if let Some(role) = record.role.x11() {
-            let _ = role.surface.set_desktop(current.saturating_sub(1));
+        if let Some(role) = record.role.x11()
+            && let Err(error) = role.surface.set_desktop(current.saturating_sub(1))
+        {
+            tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP at map");
         }
     }
 }
@@ -394,8 +396,10 @@ impl WaylandState {
             // EWMH per-window `_NET_WM_DESKTOP` beside the record write
             // (the suspend sync below derives from the same record).
             #[cfg(feature = "xwayland")]
-            if let Some(role) = record.role.x11() {
-                let _ = role.surface.set_desktop(to - 1);
+            if let Some(role) = record.role.x11()
+                && let Err(error) = role.surface.set_desktop(to - 1)
+            {
+                tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP on move");
             }
         }
         if from == current {

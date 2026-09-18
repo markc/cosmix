@@ -743,3 +743,41 @@ fn shrinking_the_count_republishes_x11_desktops() {
     assert_eq!(window.desktop(), Some(0));
     assert!(!window.is_minimized(), "on the only workspace: resumed");
 }
+
+/// The override-redirect arm of the identity gate: a menu's `_NET_WM_DESKTOP`
+/// request is inert. An OR record is on every workspace (it is not a managed
+/// toplevel: `workspace` stays 0, no stamp, no property), and the request
+/// leaves the record and the mirror alone — the gate refuses it by role
+/// before `move_window_to_workspace` would refuse it as not a window.
+#[test]
+fn x11_desktop_request_ignores_an_override_redirect_window() {
+    let mut harness = KeybindingHarness::new(true);
+    let (sid, surface) = roleless_wl_surface(&mut harness);
+    let menu = fake_x11_window(916, true, Rectangle::new((10, 10).into(), (60, 20).into()));
+    menu.set_wl_surface_offline(Some(surface.clone()));
+    harness
+        .server
+        .state
+        .x11_new_override_redirect_window(menu.clone());
+    harness
+        .server
+        .state
+        .x11_mapped_override_redirect_window(menu.clone());
+    harness
+        .server
+        .state
+        .x11_associate_window(surface.clone(), menu.clone());
+    let object = surface.id();
+    commit_dmabuf(&mut harness, sid, 32, 24);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.mapped);
+    assert_eq!(record.workspace, 0, "an OR window is on every workspace");
+    assert_eq!(menu.desktop(), None, "no _NET_WM_DESKTOP for an OR window");
+
+    harness.server.state.x11_desktop_request(menu.clone(), 1);
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.workspace, 0);
+    assert!(record.layout.visible);
+    assert_eq!(menu.desktop(), None);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+}
