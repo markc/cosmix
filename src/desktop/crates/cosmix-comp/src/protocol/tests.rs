@@ -14476,7 +14476,8 @@ fn presentation_feedback_is_discarded_for_off_workspace_surfaces() {
     send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
     harness.dispatch_client();
     let seq = content_seq(&harness, &object);
-    let (frame, mut content) = test_frame_report(id, 5_000, seq, false);
+    let (frame, mut content) =
+        test_frame_report(id, crate::frame_trace::monotonic_us(), seq, false);
     content.surfaces[0].waiting = true;
     harness.server.state.frame_presented(frame, content);
     let events = harness.sync();

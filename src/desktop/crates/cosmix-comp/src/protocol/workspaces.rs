@@ -95,7 +95,7 @@ pub(crate) fn output_key(name: &str) -> String {
 /// rejoins the current workspace (D4). This is the ONE hook per-window
 /// `_NET_WM_DESKTOP` publication attaches to (D19): after a MapRequest a
 /// first-map X11 record is still unmapped and reads `workspace == 0`.
-pub(crate) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: bool, current: u32) {
+pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: bool, current: u32) {
     if !was_mapped && record.mapped && record.role.managed_toplevel() {
         record.workspace = current;
     }
@@ -310,9 +310,7 @@ impl WaylandState {
             self.present_window_for_workspace(object, "workspace.switch");
         }
         #[cfg(feature = "bus")]
-        self.observations
-            .full_dirty
-            .get_or_insert("workspace.switch");
+        self.mark_workspaces_dirty("workspace.switch");
         self.settle_workspace_visibility();
         Ok(WorkspaceSwitch { output, from, to })
     }
@@ -355,7 +353,7 @@ impl WaylandState {
         }
         // `workspaces.list` window counts change on every move.
         #[cfg(feature = "bus")]
-        self.observations.full_dirty.get_or_insert("workspace.move");
+        self.mark_workspaces_dirty("workspace.move");
         if from == current || to == current {
             self.settle_workspace_visibility();
         }
@@ -380,9 +378,7 @@ impl WaylandState {
             return Ok((old, count));
         }
         #[cfg(feature = "bus")]
-        self.observations
-            .full_dirty
-            .get_or_insert("workspace.count");
+        self.mark_workspaces_dirty("workspace.count");
         if count > old {
             return Ok((old, count));
         }

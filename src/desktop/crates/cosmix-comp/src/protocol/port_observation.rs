@@ -813,6 +813,13 @@ impl WaylandState {
         self.observations.full_dirty
     }
 
+    /// A workspace switch, move or count change: `workspaces.*` and every
+    /// window row's visibility may have changed, so the next observation
+    /// diffs a full snapshot (D7).
+    pub(crate) fn mark_workspaces_dirty(&mut self, cause: &'static str) {
+        self.observations.full_dirty.get_or_insert(cause);
+    }
+
     pub(crate) fn mark_session_observation_dirty(&mut self) {
         self.mark_focus_before_change("session.lock");
         self.observations.full_dirty.get_or_insert("session.lock");
