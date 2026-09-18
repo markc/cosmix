@@ -403,6 +403,8 @@ impl WaylandState {
         // nothing — it would only blame `comp.window` for the next
         // unrelated edge on this surface. `send_to_workspace_refused_index_
         // attributes_nothing` pins both halves.
+        // FALSIFICATION: a mark the verb never takes back.
+        self.mark_surface_dirty(SurfaceId(id), "comp.window");
         let follow_now = follow && self.workspace_switch_allowed_for(&object).is_some();
         let moved = if follow_now {
             self.move_window_and_follow(&object, index.into())
@@ -690,7 +692,8 @@ impl WaylandState {
             // Nothing changed, so the refusal attributes nothing — the
             // mark planted above would otherwise blame `comp.window` for
             // the next unrelated edge on this surface.
-            self.unplant_surface_mark(mark);
+            // FALSIFICATION: unplant removed.
+            let _ = mark;
         }
         let focused = self
             .surfaces
