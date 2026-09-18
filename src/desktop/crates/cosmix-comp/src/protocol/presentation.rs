@@ -921,6 +921,8 @@ impl WaylandState {
         };
         let mut reported = HashSet::new();
         let mut windows = HashMap::<u64, (u64, WindowFrame)>::new();
+        // Once per report, not once per surface (see `workspaces::on_workspace`).
+        let current_workspace = self.workspace_current();
         for surface in &content.surfaces {
             reported.insert(surface.id);
             let record = self
@@ -932,7 +934,7 @@ impl WaylandState {
             let presentable = record.is_some_and(|record| {
                 record.mapped
                     && !record.minimized
-                    && self.on_current_workspace(record)
+                    && super::workspaces::on_workspace(record, current_workspace)
                     && (!lock_active || self.surface_is_session_presentable(record))
             });
             let shown = surface.shown && presentable;

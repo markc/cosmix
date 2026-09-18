@@ -8624,6 +8624,8 @@ impl WaylandState {
         }
 
         let frame_time = monotonic_millis();
+        // Once per frame, not once per surface: see `workspaces::on_workspace`.
+        let current_workspace = self.workspace_current();
         let mut delivered = self
             .surfaces
             .values()
@@ -8631,7 +8633,10 @@ impl WaylandState {
                 !matches!(record.role, SurfaceRole::Dormant(_))
                     && self.surface_is_session_presentable(record)
                     && record.role.parent_surface().is_none()
-                    && !self.surface_belongs_to_hidden_toplevel(record.role.wl_surface())
+                    && !self.surface_belongs_to_hidden_toplevel(
+                        record.role.wl_surface(),
+                        current_workspace,
+                    )
             })
             .map(|record| {
                 send_frames_surface_tree(record.role.wl_surface(), frame_time, &self.surfaces)
@@ -8655,11 +8660,17 @@ impl WaylandState {
     /// `layout.visible`) so popups and subsurfaces follow their toplevel
     /// through `send_frames_surface_tree`. A root that has not mapped yet
     /// (`workspace == 0`) keeps 0.58.0's delivery: it is not off any
-    /// workspace, it has not joined one.
-    fn surface_belongs_to_hidden_toplevel(&self, surface: &WlSurface) -> bool {
+    /// workspace, it has not joined one. `current_workspace` is the
+    /// caller's once-per-frame read.
+    fn surface_belongs_to_hidden_toplevel(
+        &self,
+        surface: &WlSurface,
+        current_workspace: u32,
+    ) -> bool {
         let root = canonical_root_surface(&self.popup_manager, surface);
         self.surfaces.get(&root.id()).is_some_and(|record| {
-            record.minimized || (record.mapped && !self.on_current_workspace(record))
+            record.minimized
+                || (record.mapped && !workspaces::on_workspace(record, current_workspace))
         })
     }
 
@@ -10434,7 +10445,7 @@ impl WaylandState {
             let visible = effectively_visible(
                 record.mapped
                     && !record.minimized
-                    && (!record.role.managed_toplevel() || record.workspace == current_workspace),
+                    && workspaces::on_workspace(record, current_workspace),
                 ancestor_visible,
                 association_visible,
             );
@@ -13566,13 +13577,19 @@ impl WaylandState {
         let Some((surface, _id)) = restored else {
             return false;
         };
+        // D15: un-minimised is not the same as on screen — a window still
+        // off the current workspace (a restore the lock or an exclusive
+        // layer kept from switching) stays suspended.
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(object)
-            .and_then(|record| record.role.x11())
         {
-            let _ = role.surface.set_suspended(false);
+            let current = self.workspace_current();
+            if let Some(record) = self.surfaces.get(object)
+                && let Some(role) = record.role.x11()
+            {
+                let _ = role
+                    .surface
+                    .set_suspended(workspaces::x11_suspended(record, current));
+            }
         }
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(_id, "wayland.focus");

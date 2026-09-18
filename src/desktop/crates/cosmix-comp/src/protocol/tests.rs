@@ -14174,43 +14174,86 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
 /// visibility funnel (`visible:false`, `minimized:false`, LIFO untouched) and
 /// withholds its frame callbacks; switching back restores both with no client
 /// dispatch in between — the client never acks or commits, which is the "no
-/// round-trip" the contract promises. (Focus handoff still sends its
-/// activation-state configure, exactly as minimise does.)
+/// round-trip" the contract promises.
+///
+/// Two discriminators keep the test honest. Rule 9: a toplevel already on
+/// workspace 2 and a layer surface both hold pending callbacks across the
+/// switch and must complete on the first frame after it — "hidden windows
+/// starved" is distinguishable from "everything starved", and dropping the
+/// bands-are-everywhere term of `on_workspace` fails here. Rule 3: the
+/// window that was not focused gets NO xdg traffic at all, and the one that
+/// was gets only configures carrying the size the client last saw (the
+/// activation-state change focus handoff sends, exactly as minimise does),
+/// so a switch that re-sent geometry would fail even though no callback
+/// completes.
 #[test]
 fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
     use workspaces::WorkspaceTarget;
     let (mut harness, _pointer, object, _) =
         positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
     let (popup, _) = map_test_popup(&mut harness, None);
-    let replacement = map_test_undecorated_toplevel(&mut harness);
+    let (_, replacement_xdg_surface, replacement_toplevel, replacement) =
+        map_named_test_toplevel(&mut harness, "", "");
+    // Already on workspace 2 (hidden now, shown by the switch), and a layer
+    // surface (on every workspace).
+    let (elsewhere_surface, _, _, elsewhere) = map_named_test_toplevel(&mut harness, "", "");
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&elsewhere, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&elsewhere].layout.visible);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let _ = harness.sync();
+
     let root = harness.server.state.surfaces[&object]
         .role
         .wl_surface()
         .clone();
+    let replacement_root = harness.server.state.surfaces[&replacement]
+        .role
+        .wl_surface()
+        .clone();
     let keyboard = harness.server.state.keyboard.clone();
+    // Toggle focus away and back so the traffic carries the root's current
+    // configure: that is the size the client last saw, the reference for
+    // "no new size" below.
+    keyboard.set_focus(
+        &mut harness.server.state,
+        Some(SeatFocusTarget::Wayland(replacement_root)),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let _ = harness.sync();
     keyboard.set_focus(
         &mut harness.server.state,
         Some(SeatFocusTarget::Wayland(root.clone())),
         SERIAL_COUNTER.next_serial(),
     );
+    let last_seen_size = configured_toplevel_size(&harness.sync());
+
     let callback = harness.allocate_object_id();
     let popup_callback = harness.allocate_object_id();
-    send_request(
-        &mut harness.client,
-        TEST_TOPLEVEL_SURFACE_ID,
-        3,
-        &words(&[callback]),
-    );
-    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
-    send_request(
-        &mut harness.client,
-        popup.protocol_id(),
-        3,
-        &words(&[popup_callback]),
-    );
-    send_request(&mut harness.client, popup.protocol_id(), 6, &[]);
+    let elsewhere_callback = harness.allocate_object_id();
+    let layer_callback = harness.allocate_object_id();
+    for (surface, callback) in [
+        (TEST_TOPLEVEL_SURFACE_ID, callback),
+        (popup.protocol_id(), popup_callback),
+        (elsewhere_surface, elsewhere_callback),
+        (layer.surface, layer_callback),
+    ] {
+        send_request(&mut harness.client, surface, 3, &words(&[callback]));
+        send_request(&mut harness.client, surface, 6, &[]);
+    }
     harness.dispatch_client();
     let _ = harness.sync();
+    let completions = |events: &[(u32, u16, Vec<u8>)], of: &[u32]| {
+        events
+            .iter()
+            .filter(|(object, opcode, _)| of.contains(object) && *opcode == 0)
+            .count()
+    };
 
     assert_eq!(harness.server.state.workspace_current(), 1);
     assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
@@ -14229,23 +14272,56 @@ fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
         assert_eq!(record.workspace, 1, "{window:?} stays on its workspace");
     }
     assert!(!harness.server.state.surfaces[&popup].layout.visible);
+    assert!(harness.server.state.surfaces[&elsewhere].layout.visible);
     assert!(harness.server.state.minimized_toplevels.is_empty());
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
-        None,
-        "nothing on workspace 2 to focus"
+        Some(
+            harness.server.state.surfaces[&elsewhere]
+                .role
+                .wl_surface()
+                .clone()
+        ),
+        "the window on workspace 2 takes focus"
     );
-    // The switch itself sends no frame completions and no new configure
-    // the client would have to answer: the only xdg traffic is the
-    // activation-state change of the window that lost focus.
+    // Rule 3, the switch itself: no completions, no xdg traffic at all to
+    // the window that was not focused, and to the one that was only
+    // configures at the size it already had (its activation state change).
     let events = harness.sync();
-    assert!(events.iter().all(|(object, opcode, _)| {
-        (*object != callback && *object != popup_callback) || *opcode != 0
-    }));
+    assert_eq!(completions(&events, &[callback, popup_callback]), 0);
+    assert!(
+        events
+            .iter()
+            .all(|(object, _, _)| *object != replacement_xdg_surface
+                && *object != replacement_toplevel),
+        "an unfocused leaving window gets no xdg traffic: {events:?}"
+    );
+    let root_configures = toplevel_configure_states(&events, TEST_TOPLEVEL_ID);
+    assert!(
+        !root_configures.is_empty(),
+        "losing focus is the one configure a switch sends: {events:?}"
+    );
+    assert!(
+        root_configures
+            .iter()
+            .all(|states| !states.contains(&(xdg_toplevel::State::Activated as u32))),
+        "{root_configures:?}"
+    );
+    assert_eq!(
+        configured_toplevel_size(&events),
+        last_seen_size,
+        "a switch never configures a new size"
+    );
+    // Rule 9, first frame after the switch: the hidden tree is starved, the
+    // window now on screen and the layer surface are not.
     harness.server.state.handle_frame(Vec::new());
-    assert!(harness.sync().iter().all(|(object, opcode, _)| {
-        (*object != callback && *object != popup_callback) || *opcode != 0
-    }));
+    let frame = harness.sync();
+    assert_eq!(completions(&frame, &[callback, popup_callback]), 0);
+    assert_eq!(
+        completions(&frame, &[elsewhere_callback, layer_callback]),
+        2,
+        "{frame:?}"
+    );
 
     // Back, with no client dispatch in between: visible again at once, and
     // the withheld callbacks complete on the next frame.
@@ -14258,20 +14334,16 @@ fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
     assert!(harness.server.state.surfaces[&object].layout.visible);
     assert!(harness.server.state.surfaces[&replacement].layout.visible);
     assert!(harness.server.state.surfaces[&popup].layout.visible);
+    assert!(!harness.server.state.surfaces[&elsewhere].layout.visible);
     assert!(!harness.server.state.surfaces[&object].minimized);
     assert!(
         focused_surface(harness.server.state.keyboard.current_focus()).is_some(),
         "a visible toplevel takes focus again"
     );
+    let _ = harness.sync();
     harness.server.state.handle_frame(Vec::new());
     assert_eq!(
-        harness
-            .sync()
-            .iter()
-            .filter(|(object, opcode, _)| {
-                (*object == callback || *object == popup_callback) && *opcode == 0
-            })
-            .count(),
+        completions(&harness.sync(), &[callback, popup_callback]),
         2
     );
 }

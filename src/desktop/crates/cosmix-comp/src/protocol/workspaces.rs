@@ -9,18 +9,21 @@
 //! No `ext-workspace-v1`; the Bus props, verbs and bindings live in their
 //! own modules and call the `pub(crate)` primitives here.
 //!
-//! Single-output rule (0.59.0): `current` is keyed per output, but a record
-//! is compared against the DEFAULT output's current workspace only. A real
+//! Single-output rule (0.59.0, D3): `current` is keyed per output, but a
+//! record is compared against the DEFAULT output's current workspace only,
+//! so only the default output can be switched — a request naming any other
+//! output is refused (`UnknownOutput`) rather than moving `current` for an
+//! output whose windows the visibility term does not read. A real
 //! per-record output binding is a later refinement.
-
-// The switch/move/count/ensure primitives have no production caller until
-// the verb, prop and binding slices land on top of this one; the tests drive
-// them directly. Drop this once the first caller is wired.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use super::*;
 
 /// The most workspaces `set_workspace_count` accepts.
+// The primitives below have no production caller until the verb, prop and
+// binding slices land on top of this one; the tests drive them directly. The
+// allow is per item so a genuinely dead helper still trips the lint; drop
+// each once its first caller is wired.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const WORKSPACE_COUNT_MAX: u32 = 16;
 
 /// Per-compositor workspace state.
@@ -44,6 +47,7 @@ impl Default for WorkspaceState {
 
 /// Where a switch or a move is aimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {
     /// A 1-based workspace index.
     Index(u32),
@@ -53,12 +57,14 @@ pub(crate) enum WorkspaceTarget {
 
 /// Why a workspace primitive changed nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceRefusal {
     /// An index outside `1..=count`.
     InvalidIndex { count: u32 },
     /// `Next`/`Prev` at an end without `wrap`.
     AtEnd { from: u32, count: u32 },
-    /// No such output (or no output at all).
+    /// Not the default output (D3: the only one with a switchable current
+    /// workspace in 0.59.0), or no output at all.
     UnknownOutput,
     /// A count outside `1..=WORKSPACE_COUNT_MAX`.
     InvalidCount { max: u32 },
@@ -68,6 +74,7 @@ pub(crate) enum WorkspaceRefusal {
 
 /// What a switch did.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WorkspaceSwitch {
     pub(crate) output: String,
     pub(crate) from: u32,
@@ -101,7 +108,29 @@ pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: boo
     }
 }
 
+/// THE workspace term, shared by every reader: whether `record` is on the
+/// workspace `current`. Only managed toplevels have a workspace; everything
+/// else (bands, layers, popups, locks) is on every workspace. Takes the
+/// current workspace as a value so hot paths (`handle_frame`,
+/// `recompute_effective_visibility`, `frame_presented`) read it once per
+/// frame instead of once per surface — `workspace_current` clones an
+/// `Output` and builds a key `String`, which is per-frame churn of exactly
+/// the kind 0.56.1 removed.
+pub(crate) fn on_workspace(record: &SurfaceRecord, current: u32) -> bool {
+    !record.role.managed_toplevel() || record.workspace == current
+}
+
+/// D15's rule for an X11 window's `_NET_WM_STATE_HIDDEN` / suspended flag:
+/// hidden when minimised OR off the current workspace. Every site that
+/// sets the flag derives it from here, so no path can un-suspend a window
+/// that is still off screen.
+#[cfg(feature = "xwayland")]
+pub(crate) fn x11_suspended(record: &SurfaceRecord, current: u32) -> bool {
+    record.minimized || !on_workspace(record, current)
+}
+
 /// Resolve a target against the workspace `from` on a `count`-wide ring.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_workspace_target(
     from: u32,
     count: u32,
@@ -153,33 +182,39 @@ impl WaylandState {
         self.current_workspace_for(self.default_output_key().as_deref())
     }
 
-    /// Whether `record` is on the current workspace. Only managed toplevels
-    /// have a workspace; everything else (bands, layers, popups, locks) is
-    /// on every workspace.
+    /// Whether `record` is on the current workspace (`on_workspace` against
+    /// the default output's current). Per-event callers only (the
+    /// `windows.list` filter and the rows, slices 3-4); a per-frame loop
+    /// reads `workspace_current()` once and calls `on_workspace`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn on_current_workspace(&self, record: &SurfaceRecord) -> bool {
-        !record.role.managed_toplevel() || record.workspace == self.workspace_current()
+        on_workspace(record, self.workspace_current())
     }
+}
 
+// The primitives: no production caller until the verb, prop and binding
+// slices land on this one (the tests drive them directly), so the block is
+// allowed dead outside tests. The readers above are NOT — they have callers
+// on the frame path — so a genuinely dead helper there still trips the lint.
+// Drop the attribute with the first wired caller.
+#[cfg_attr(not(test), allow(dead_code))]
+impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
-    /// `Some(k)` matches a published output by key or by name. Without the
-    /// `bus` feature there is no output projection, so only the default
-    /// output can be named.
+    /// `Some(k)` must be the default output's key or name (D3). Any other
+    /// output is refused: `current` for it would be written, but the
+    /// visibility term reads the default output's, so windows would be
+    /// withdrawn (suspended, feedback discarded, drags ended) while staying
+    /// on screen. The refusal goes when records carry an output binding.
     fn resolve_workspace_output(&self, key: Option<&str>) -> Option<String> {
-        let Some(requested) = key else {
-            return self.default_output_key();
-        };
-        #[cfg(feature = "bus")]
-        if let Some(projection) = port_snapshot::project_outputs(self) {
-            return projection
-                .rows
-                .into_iter()
-                .find(|(key, row)| key == requested || row.name == requested)
-                .map(|(key, _)| key);
-        }
         let output = self.backend.default_output()?;
         let name = output.name();
-        let key = output_key(&name);
-        (key == requested || name == requested).then_some(key)
+        let key_of_default = output_key(&name);
+        match key {
+            None => Some(key_of_default),
+            Some(requested) => {
+                (key_of_default == requested || name == requested).then_some(key_of_default)
+            }
+        }
     }
 
     /// The per-window half of leaving the current workspace: what
@@ -226,13 +261,13 @@ impl WaylandState {
             return;
         };
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(object)
-            .filter(|record| !record.minimized)
-            .and_then(|record| record.role.x11())
         {
-            let _ = role.surface.set_suspended(false);
+            let current = self.workspace_current();
+            if let Some(record) = self.surfaces.get(object)
+                && let Some(role) = record.role.x11()
+            {
+                let _ = role.surface.set_suspended(x11_suspended(record, current));
+            }
         }
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(id, cause);
@@ -250,8 +285,7 @@ impl WaylandState {
                 continue;
             }
             if let Some(role) = record.role.x11() {
-                let hidden = record.minimized || record.workspace != current;
-                let _ = role.surface.set_suspended(hidden);
+                let _ = role.surface.set_suspended(x11_suspended(record, current));
             }
         }
     }
@@ -363,6 +397,14 @@ impl WaylandState {
     /// Set the workspace count. Shrinking strands: every window above the
     /// new count moves to the last workspace and every output's current is
     /// clamped. Returns `(old, new)`.
+    ///
+    /// A shrink is a mass re-derivation, not a per-window arrival: both the
+    /// window set AND `current` can change in one step, so it re-syncs every
+    /// X11 flag from `x11_suspended` and settles once rather than running
+    /// `present_window_for_workspace` per stranded window. Any per-arrival
+    /// side effect added to `present_window_for_workspace` later must be
+    /// added to `sync_x11_suspended_for_workspaces` too (or the shrink path
+    /// switched to the per-window halves).
     pub(crate) fn set_workspace_count(
         &mut self,
         count: u32,

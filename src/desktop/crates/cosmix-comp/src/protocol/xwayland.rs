@@ -2673,7 +2673,11 @@ impl WaylandState {
             return;
         };
         self.minimized_toplevels.retain(|entry| *entry != object);
-        let _ = window.set_suspended(false);
+        // D15: still suspended while off the current workspace.
+        let current = self.workspace_current();
+        if let Some(record) = self.surfaces.get(&object) {
+            let _ = window.set_suspended(workspaces::x11_suspended(record, current));
+        }
         self.recompute_effective_visibility();
         self.raise_surface(&surface);
         self.sync_xwm_stacking();

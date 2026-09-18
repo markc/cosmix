@@ -854,8 +854,9 @@ client waits on feedback nothing will resolve.
   counts as shown.
 - **Discarded without a frame:** unmap, minimise, destroy, a new role, a
   buffer the compositor or renderer refused, a surface that can no longer be
-  drawn, and commits made before the surface was mapped (including an X11
-  window's commits before its map). A session lock needs no extra step: while
+  drawn, a workspace switch or move that takes the window off the current
+  workspace, and commits made before the surface was mapped (including an
+  X11 window's commits before its map). A session lock needs no extra step: while
   locked, every frame treats the surfaces the lock hides as not shown. At most
   8 commits per surface wait; a faster client loses the oldest as `discarded`.
 - **Nested backend:** the host compositor gives no presentation timing, so
