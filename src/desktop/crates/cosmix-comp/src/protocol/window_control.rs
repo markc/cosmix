@@ -480,14 +480,18 @@ impl WaylandState {
         };
         let surface = record.role.wl_surface().clone();
         // The same candidacy Alt+Tab uses; a refusal says which gate held.
+        // The workspace-independent rungs (the `may_focus` terms) come
+        // before `not_visible`: they are what kept the switch from running,
+        // so an off-workspace window refused by one of them names that gate,
+        // not the visibility the switch would have given it.
         let reason = if self.highest_exclusive_layer().is_some() {
             Some("exclusive_layer")
         } else if record.minimized {
             Some("minimized")
-        } else if !record.layout.visible {
-            Some("not_visible")
         } else if !self.surface_is_input_presentable(record) {
             Some("not_presentable")
+        } else if !record.layout.visible {
+            Some("not_visible")
         } else {
             None
         };
@@ -509,6 +513,12 @@ impl WaylandState {
         ControlReply::Body(body)
     }
 
+    /// Stacking only: never a bring-into-view path. Rule 6 (F1.2) names
+    /// focus, restore and the activation requests; a raise of an
+    /// off-workspace (or minimised) window restacks it in place and replies
+    /// `raised` from the z delta, exactly as it would for a covered window
+    /// on the current workspace — the caller that wants it on screen uses
+    /// `focus` or `restore`. (Manual wording is the docs slice's.)
     fn service_window_raise(&mut self, id: u64, generation: u64) -> ControlReply {
         let object = match self.resolve_window_target(id, Some(generation)) {
             Ok(object) => object,

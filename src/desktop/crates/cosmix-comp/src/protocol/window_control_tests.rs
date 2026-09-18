@@ -1187,6 +1187,184 @@ fn focus_on_a_minimised_off_workspace_window_is_refused_without_switching() {
     }
 }
 
+/// The other rule-6 refusal rungs, after the switch-first: an
+/// off-workspace target under an exclusive layer replies `exclusive_layer`,
+/// and one behind the KMS input gate (`normal_scene_restricted`: the VT is
+/// switched away) replies `not_presentable` — not `not_visible`, which is
+/// only what the withheld switch left it as — and neither changes the
+/// workspace. Each arm is base-discriminating: lifting the gate makes the
+/// same focus switch and succeed.
+#[test]
+fn focus_on_an_off_workspace_window_names_the_gate_that_held_the_switch() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    // Exclusive layer.
+    {
+        let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+        let (id, generation) = window_id_and_generation(&harness, &alpha);
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        const TOP_LEFT: u32 = 1 | 4;
+        let _ = map_test_layer_surface(
+            &mut harness,
+            0,
+            TestLayerSpec {
+                anchor: TOP_LEFT,
+                keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive
+                    as u32,
+                ..TestLayerSpec::default()
+            },
+        );
+        let _ = harness.sync();
+        assert!(harness.server.state.highest_exclusive_layer().is_some());
+        for raise in [true, false] {
+            let (rc, body) = window_op(
+                &mut harness,
+                &ingress,
+                &runtime,
+                WindowOp::Focus {
+                    id,
+                    generation,
+                    raise,
+                },
+            );
+            assert_eq!(rc, 0, "raise {raise}: {body}");
+            assert_eq!(body["focused"], false, "raise {raise}: {body}");
+            assert_eq!(body["reason"], "exclusive_layer", "raise {raise}: {body}");
+            let state = &harness.server.state;
+            assert_eq!(state.workspace_current(), 1, "raise {raise}: no switch");
+            assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+            assert!(!state.surfaces[&alpha].layout.visible);
+            assert!(!state.surfaces[&alpha].focused);
+            assert!(state.surfaces[&beta].layout.visible);
+            assert_ne!(state.full_dirty_cause(), Some("workspace.switch"));
+        }
+    }
+    // The KMS input gate, then lifted.
+    {
+        let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+        let (id, generation) = window_id_and_generation(&harness, &alpha);
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        harness.server.state.kms_session_lock_gate.deferred_unlock = true;
+        {
+            let state = &harness.server.state;
+            assert!(state.kms_session_lock_gate.normal_scene_restricted());
+            assert!(!state.surface_is_input_presentable(&state.surfaces[&alpha]));
+        }
+        for raise in [true, false] {
+            let (rc, body) = window_op(
+                &mut harness,
+                &ingress,
+                &runtime,
+                WindowOp::Focus {
+                    id,
+                    generation,
+                    raise,
+                },
+            );
+            assert_eq!(rc, 0, "raise {raise}: {body}");
+            assert_eq!(body["focused"], false, "raise {raise}: {body}");
+            assert_eq!(body["reason"], "not_presentable", "raise {raise}: {body}");
+            let state = &harness.server.state;
+            assert_eq!(state.workspace_current(), 1, "raise {raise}: no switch");
+            assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+            assert!(!state.surfaces[&alpha].layout.visible);
+            assert!(!state.surfaces[&alpha].focused);
+            assert!(state.surfaces[&beta].layout.visible);
+            assert_ne!(state.full_dirty_cause(), Some("workspace.switch"));
+        }
+        harness.server.state.kms_session_lock_gate.deferred_unlock = false;
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::Focus {
+                id,
+                generation,
+                raise: true,
+            },
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["focused"], true, "gate lifted: {body}");
+        assert!(body.get("reason").is_none(), "{body}");
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 2, "gate lifted: switched");
+        assert!(state.surfaces[&alpha].layout.visible);
+        assert!(state.surfaces[&alpha].focused);
+        assert!(!state.surfaces[&beta].layout.visible);
+    }
+}
+
+/// What a watcher sees of a cross-workspace focus. The switch plants a
+/// full-snapshot cause (D7: every row's visibility may change), and
+/// `service_observations` attributes the WHOLE diff to that cause and
+/// discards the per-surface marks — so the target's `focused` edge reports
+/// `workspace.switch`, not `comp.window`, whichever is marked first. The
+/// verb's mark-before-switch order matches its siblings; it cannot change
+/// this, and this test says so rather than letting the order look
+/// load-bearing.
+#[test]
+fn focus_on_an_off_workspace_window_reports_every_change_as_the_switch() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Focus {
+            id,
+            generation,
+            raise: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["focused"], true, "{body}");
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    let focused_path = format!("windows.s{id}.focused");
+    let props = changed
+        .iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, cause, .. } => {
+                Some((path.as_str(), *cause))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        props.contains(&(focused_path.as_str(), "workspace.switch")),
+        "the target's focused edge is attributed to the switch: {props:?}"
+    );
+    assert!(
+        props.iter().all(|(_, cause)| *cause == "workspace.switch"),
+        "a full-snapshot diff carries one cause: {props:?}"
+    );
+}
+
 /// F1.2 at `comp.window.restore {id, generation}`: restoring a window that
 /// was minimised on another workspace switches to that workspace and shows
 /// it there.

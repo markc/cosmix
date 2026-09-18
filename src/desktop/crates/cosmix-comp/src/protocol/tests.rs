@@ -35896,6 +35896,62 @@ fn session_lock_suppresses_ordinary_bindings() {
     assert!(keys.contains(&(1, 0)));
 }
 
+/// The restore chord's lock guard is the dispatcher, not `restore_window`
+/// (which has none of its own): under a session lock
+/// `dispatch_session_locked` forwards every chord but the VT escape to the
+/// lock surface, so Super+Shift+M for a window minimised on ANOTHER
+/// workspace un-minimises nothing and — D18, through the helper it would
+/// have reached — switches nothing. Discriminated by the same chord once
+/// unlocked: it restores the window and switches to its workspace.
+#[test]
+fn session_lock_forwards_the_restore_chord_and_restores_nothing() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&object, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    harness.server.state.minimize_toplevel(&surface);
+    assert_eq!(harness.server.state.minimized_toplevels, [object.clone()]);
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    let _ = harness.sync();
+    assert!(harness.server.state.session_lock_active());
+
+    harness.chord(&[125, 42, 50]);
+    let traffic = harness.sync();
+    let keys = keyboard_key_events(&traffic);
+    assert!(keys.contains(&(50, 1)), "forwarded to the lock surface: {keys:?}");
+    assert!(keys.contains(&(50, 0)));
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.minimized, "locked: nothing restored");
+    assert_eq!(record.workspace, 2);
+    assert!(!record.layout.visible);
+    assert_eq!(harness.server.state.workspace_current(), 1, "locked: no switch");
+    assert_eq!(harness.server.state.minimized_toplevels, [object.clone()]);
+
+    present_test_security_epoch(&mut harness, lock.lock);
+    let _ = unlock_test_session(&mut harness, lock);
+    assert!(!harness.server.state.session_lock_active());
+    harness.chord(&[125, 42, 50]);
+    let _ = harness.sync();
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.minimized, "unlocked: restored");
+    assert_eq!(record.workspace, 2, "never pulled across");
+    assert!(record.layout.visible);
+    assert_eq!(harness.server.state.workspace_current(), 2, "unlocked: switched (F1.2)");
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+}
+
 #[test]
 fn session_lock_blank_only_swallowing_skips_hidden_compositor_chrome() {
     let mut harness = KeybindingHarness::new(true);

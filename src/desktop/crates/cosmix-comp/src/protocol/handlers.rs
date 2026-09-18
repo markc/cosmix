@@ -2404,17 +2404,26 @@ impl XdgActivationHandler for WaylandState {
         if self.session_lock_active() {
             return;
         }
-        let known = self.surfaces.contains_key(&surface.id());
-        if !known {
+        let Some(record) = self.surfaces.get(&surface.id()) else {
             tracing::debug!("xdg-activation for a surface this compositor does not know");
+            return;
+        };
+        // A minimised window is not activated: neither the raise nor the
+        // arbitration below would bring it on screen (`arbitrate_keyboard_focus`
+        // has no minimised term, so without this gate the keyboard focus moved
+        // to a hidden window), and `minimize_toplevel` moves focus OFF a window
+        // as it hides it. The same refusal `_NET_ACTIVE_WINDOW` gives through
+        // `window_switch_candidate`; un-minimising is the restore path, not an
+        // activation.
+        if record.minimized {
+            tracing::debug!("xdg-activation for a minimised window: not activated");
             return;
         }
         // F1.2: an activation of a window on another workspace switches to
         // that workspace first (the lock above and the exclusive-layer rule
         // inside the helper keep it inert where a switch is not allowed, and
-        // the helper's candidacy terms keep it inert for a minimised or
-        // non-presentable window, which the raise and arbitration below
-        // would not bring into view either).
+        // the helper's candidacy terms keep it inert for a non-presentable
+        // window, which the arbitration below would not focus either).
         self.ensure_workspace_shown(&surface.id());
         self.raise_for_focus_interaction(&surface);
         self.arbitrate_keyboard_focus(Some(surface), false, false);
