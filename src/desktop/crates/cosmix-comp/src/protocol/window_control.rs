@@ -10,11 +10,24 @@ use smithay::reexports::calloop::{
 };
 use smithay::reexports::wayland_server::backend::DisconnectReason;
 
+use super::port_observation::SetValidationError;
 use super::presentation_stats::PresentationStats;
+use super::workspaces::{WorkspaceRefusal, WorkspaceTarget};
 use super::*;
 use crate::port::{
     ControlReply, PlaceSpec, StatsTarget, WaitSpec, WaitUntil, WindowMatch, WindowOp,
+    WorkspaceIndex,
 };
+
+impl From<WorkspaceIndex> for WorkspaceTarget {
+    fn from(index: WorkspaceIndex) -> Self {
+        match index {
+            WorkspaceIndex::Absolute(index) => Self::Index(index),
+            WorkspaceIndex::Next => Self::Next,
+            WorkspaceIndex::Prev => Self::Prev,
+        }
+    }
+}
 
 fn window_of(target: Option<&StatsTarget>) -> Option<(u64, u64)> {
     match target {
@@ -282,6 +295,8 @@ impl WaylandState {
                 let (id, generation) = window_of(target.as_ref()).unwrap_or_default();
                 (8, id, generation)
             }
+            WindowOp::SwitchWorkspace { .. } => (9, 0, 0),
+            WindowOp::SendToWorkspace { id, generation, .. } => (10, *id, *generation),
         };
         crate::frame_trace::event("comp_window_control", || (id, code, generation));
         match op {
@@ -308,9 +323,135 @@ impl WaylandState {
             WindowOp::Place(spec) => self.service_window_place(spec),
             WindowOp::Stats { target, samples } => self.service_stats(target, *samples),
             WindowOp::StatsReset { target } => self.service_stats_reset(target.as_ref()),
+            WindowOp::SwitchWorkspace {
+                output,
+                index,
+                wrap,
+            } => self.service_workspace_switch(output.as_deref(), *index, *wrap),
+            WindowOp::SendToWorkspace {
+                id,
+                generation,
+                index,
+                follow,
+            } => self.service_send_to_workspace(*id, *generation, *index, *follow),
         }
     }
 
+    /// `comp.workspace.switch`: the contract's refusal vocabulary over the
+    /// core primitive — `invalid_value` for an index outside `1..=count`
+    /// or an unknown output (D13), `at_end` for `next`/`prev` at an end
+    /// without `wrap`.
+    fn service_workspace_switch(
+        &mut self,
+        output: Option<&str>,
+        index: WorkspaceIndex,
+        wrap: bool,
+    ) -> ControlReply {
+        match self.switch_workspace(output, index.into(), wrap) {
+            Ok(switched) => ControlReply::Body(json!({
+                "output": switched.output,
+                "from": switched.from,
+                "to": switched.to,
+            })),
+            Err(refusal) => {
+                // `at_end` names the output it was at: the requested one,
+                // else the default the switch would have addressed.
+                let output = output
+                    .map(str::to_string)
+                    .or_else(|| self.default_output_key());
+                workspace_refusal(refusal, output.as_deref(), 0)
+            }
+        }
+    }
+
+    /// `comp.window.send_to_workspace`: the `{id, generation}` fence, then
+    /// the move; with `follow`, a switch to the window's new workspace and
+    /// its activation (D9). `next`/`prev` are relative to the window's own
+    /// workspace and always wrap.
+    fn service_send_to_workspace(
+        &mut self,
+        id: u64,
+        generation: u64,
+        index: WorkspaceIndex,
+        follow: bool,
+    ) -> ControlReply {
+        let object = match self.resolve_window_target(id, Some(generation)) {
+            Ok(object) => object,
+            Err(error) => return ControlReply::WindowTarget { id, error },
+        };
+        // Mark first: the first cause recorded for a surface wins.
+        self.mark_surface_dirty(SurfaceId(id), "comp.window");
+        let (_, to) = match self.move_window_to_workspace(&object, index.into()) {
+            Ok(moved) => moved,
+            Err(refusal) => return workspace_refusal(refusal, None, id),
+        };
+        if follow {
+            // Not a refusal: `to` came from the move, so it is in range
+            // and the default output is the only one there is (D3).
+            let _ = self.switch_workspace(None, WorkspaceTarget::Index(to), true);
+            let surface = self.surfaces[&object].role.wl_surface().clone();
+            self.activate_managed_window(&surface);
+        }
+        ControlReply::Body(json!({
+            "id": id,
+            "generation": generation,
+            "index": to,
+        }))
+    }
+}
+
+/// The contract's wire form of a core refusal. `output` is the requested
+/// output, echoed on `at_end`; `id` the window a send named.
+fn workspace_refusal(refusal: WorkspaceRefusal, output: Option<&str>, id: u64) -> ControlReply {
+    match refusal {
+        WorkspaceRefusal::InvalidIndex { count } => {
+            ControlReply::Validation(SetValidationError::InvalidValue {
+                path: "index".into(),
+                expected: "unsigned integer",
+                range: workspace_index_range(count),
+            })
+        }
+        WorkspaceRefusal::AtEnd { from, count } => ControlReply::refused(
+            "at_end",
+            json!({"output": output, "from": from, "count": count}),
+        ),
+        WorkspaceRefusal::UnknownOutput => {
+            ControlReply::Validation(SetValidationError::InvalidValue {
+                path: "output".into(),
+                expected: "outputs.<key> key or output name",
+                range: "an existing output",
+            })
+        }
+        WorkspaceRefusal::InvalidCount { max: _ } => {
+            ControlReply::Validation(SetValidationError::InvalidValue {
+                path: "count".into(),
+                expected: "unsigned integer",
+                range: "1..=16",
+            })
+        }
+        // Unreachable after `resolve_window_target` (the record is a mapped
+        // managed toplevel with a stamped workspace), kept honest anyway.
+        WorkspaceRefusal::NotAWindow => ControlReply::WindowTarget {
+            id,
+            error: WindowTargetError::NotMapped,
+        },
+    }
+}
+
+/// `range` for an index refusal, as `1..=<count>`. `SetValidationError`
+/// carries `&'static str`, so the sixteen possible counts are spelled out.
+fn workspace_index_range(count: u32) -> &'static str {
+    const RANGES: [&str; 16] = [
+        "1..=1", "1..=2", "1..=3", "1..=4", "1..=5", "1..=6", "1..=7", "1..=8", "1..=9", "1..=10",
+        "1..=11", "1..=12", "1..=13", "1..=14", "1..=15", "1..=16",
+    ];
+    RANGES
+        .get(count.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("1..=workspaces.count")
+}
+
+impl WaylandState {
     fn service_minimize_op(&mut self, op: &WindowOp) -> ControlReply {
         let (target, minimized) = match *op {
             WindowOp::Minimize { id, generation } => ((id, generation), true),
@@ -351,7 +492,9 @@ impl WaylandState {
             | WindowOp::Close { .. }
             | WindowOp::Place(_)
             | WindowOp::Stats { .. }
-            | WindowOp::StatsReset { .. } => {
+            | WindowOp::StatsReset { .. }
+            | WindowOp::SwitchWorkspace { .. }
+            | WindowOp::SendToWorkspace { .. } => {
                 unreachable!("only minimise and restore are routed here")
             }
         };

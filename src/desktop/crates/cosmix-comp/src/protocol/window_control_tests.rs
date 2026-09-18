@@ -1,6 +1,9 @@
 // `comp.window.*` and `comp.windows.list` (included from tests.rs).
 
-use crate::port::{LongOp, PlaceSpec, WaitSpec, WaitUntil, WindowMatch, WindowOp};
+use crate::port::{
+    LongOp, PlaceSpec, WaitSpec, WaitUntil, WindowMatch, WindowOp, WorkspaceIndex,
+};
+use workspaces::WorkspaceTarget;
 
 fn window_op(
     harness: &mut KeybindingHarness,
@@ -404,6 +407,12 @@ fn window_verbs_refuse_stale_targets_and_the_lock() {
                 x: Some(1.0),
                 ..place(id, generation)
             }),
+            WindowOp::SendToWorkspace {
+                id,
+                generation,
+                index: WorkspaceIndex::Absolute(2),
+                follow: true,
+            },
         ]
     };
     let origin = harness.server.state.surfaces[&alpha].window_origin;
@@ -441,6 +450,353 @@ fn window_verbs_refuse_stale_targets_and_the_lock() {
     }
     assert_eq!(harness.server.state.surfaces[&alpha].window_origin, origin);
 }
+
+/// Rule 7 over the verb: `next`/`prev` wrap at the ends, `wrap:false`
+/// refuses `at_end` and leaves `current` alone, an index outside
+/// `1..=count` (0 included) and an unknown output are `invalid_value`, and
+/// a switch reaches the observation lane (the window rows' `visible`).
+#[test]
+fn workspace_switch_verb_wraps_and_refuses_at_end() {
+    let (mut harness, ingress, observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, _) = window_id_and_generation(&harness, &alpha);
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let switch = |index: WorkspaceIndex, wrap: bool| WindowOp::SwitchWorkspace {
+        output: None,
+        index,
+        wrap,
+    };
+    let output = "o_cosmix_nested_0";
+    assert_eq!(
+        harness.server.state.default_output_key().as_deref(),
+        Some(output)
+    );
+
+    for (from, to) in [(1, 2), (2, 3), (3, 4), (4, 1)] {
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            switch(WorkspaceIndex::Next, true),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body, json!({"output": output, "from": from, "to": to}));
+        assert_eq!(harness.server.state.workspace_current(), to);
+    }
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(harness.server.state.surfaces[&beta].layout.visible);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        switch(WorkspaceIndex::Prev, true),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"output": output, "from": 1, "to": 4}));
+    assert_eq!(harness.server.state.workspace_current(), 4);
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        Some("workspace.switch"),
+        "a switch re-diffs the whole tree (D7)"
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    let alpha_visible = format!("windows.s{alpha_id}.visible");
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, new, .. }
+                if *path == alpha_visible && new.wire_value() == json!(false)
+        )),
+        "the switch reaches props.changed: {changed:?}"
+    );
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        switch(WorkspaceIndex::Next, false),
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "at_end", "output": output, "from": 4, "count": 4})
+    );
+    assert_eq!(harness.server.state.workspace_current(), 4);
+
+    for (index, output) in [
+        (WorkspaceIndex::Absolute(5), None),
+        (WorkspaceIndex::Absolute(0), None),
+        (WorkspaceIndex::Absolute(1), Some("o_nope")),
+    ] {
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::SwitchWorkspace {
+                output: output.map(str::to_string),
+                index,
+                wrap: true,
+            },
+        );
+        assert_eq!(rc, 10, "{index:?} {output:?}: {body}");
+        assert_eq!(
+            body["error"], "invalid_value",
+            "{index:?} {output:?}: {body}"
+        );
+        assert_eq!(
+            body["path"],
+            if output.is_some() { "output" } else { "index" },
+            "{index:?} {output:?}: {body}"
+        );
+        assert_eq!(harness.server.state.workspace_current(), 4);
+    }
+    assert_eq!(
+        window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::SwitchWorkspace {
+                output: Some(output.into()),
+                index: WorkspaceIndex::Absolute(1),
+                wrap: true,
+            },
+        ),
+        (0, json!({"output": output, "from": 4, "to": 1})),
+        "the default output by its key"
+    );
+    let index_refusal = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        switch(WorkspaceIndex::Absolute(5), true),
+    )
+    .1;
+    assert_eq!(index_refusal["range"], "1..=4");
+}
+
+/// Rule 5 over the verb: a send without `follow` moves the window and
+/// leaves `current` alone; with `follow` it switches and activates it;
+/// `next`/`prev` are relative to the window's own workspace, not the
+/// current one.
+#[test]
+fn send_to_workspace_moves_and_follows() {
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let send = |id, generation, index, follow| WindowOp::SendToWorkspace {
+        id,
+        generation,
+        index,
+        follow,
+    };
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(beta_id, beta_generation, WorkspaceIndex::Absolute(3), false),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 3})
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 1);
+    assert_eq!(state.surfaces[&beta].workspace, 3);
+    assert!(!state.surfaces[&beta].layout.visible);
+    assert!(!state.surfaces[&beta].minimized);
+    assert!(state.surfaces[&alpha].layout.visible);
+    assert!(state.surfaces[&alpha].focused, "focus falls back to alpha");
+    assert_eq!(
+        window_id_and_generation(&harness, &beta),
+        (beta_id, beta_generation),
+        "a move never bumps the generation"
+    );
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(beta_id, beta_generation, WorkspaceIndex::Absolute(4), true),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 4})
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 4);
+    assert_eq!(state.surfaces[&beta].workspace, 4);
+    assert!(state.surfaces[&beta].layout.visible);
+    assert!(state.surfaces[&beta].focused, "follow activates the window");
+    assert!(!state.surfaces[&alpha].layout.visible);
+    assert!(!state.surfaces[&alpha].focused);
+
+    // Alpha is on 1 while current is 4: `next` relative to the window's
+    // own workspace is 2 (relative to the current one it would wrap to 1).
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(alpha_id, alpha_generation, WorkspaceIndex::Next, false),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["index"], 2);
+    let state = &harness.server.state;
+    assert_eq!(state.surfaces[&alpha].workspace, 2);
+    assert_eq!(state.workspace_current(), 4);
+    assert!(!state.surfaces[&alpha].layout.visible);
+    // `prev` from 1 wraps to the last workspace.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(
+            alpha_id,
+            alpha_generation,
+            WorkspaceIndex::Absolute(1),
+            false,
+        ),
+    );
+    assert_eq!(rc, 0, "{body}");
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(alpha_id, alpha_generation, WorkspaceIndex::Prev, false),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["index"], 4);
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    // Out of range is `invalid_value` naming the count.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(
+            alpha_id,
+            alpha_generation,
+            WorkspaceIndex::Absolute(5),
+            false,
+        ),
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+    assert_eq!(body["path"], "index");
+    assert_eq!(body["range"], "1..=4");
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, 4);
+}
+
+/// Rule 12 (F1.9): `wait {until:"visible"}` and `{until:"presented"}` on
+/// an off-workspace window time out rather than resolving, and resolve
+/// once a switch brings its workspace on screen.
+#[test]
+fn wait_until_visible_times_out_off_workspace_and_resolves_after_a_switch() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+
+    // Mapped regardless of workspace.
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Mapped, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 0, "mapped is workspace-blind: {body}");
+
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Visible, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "off-workspace is not visible: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["until"], "visible");
+
+    // A frame the renderer claims to have shown while the window is off
+    // its workspace is Hidden, never presented.
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(
+        surface_id,
+        monotonic_micros(),
+        content_seq(&harness, &alpha),
+        true,
+    );
+    harness.server.state.frame_presented(frame, content);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "off-workspace is not presented: {body}");
+    assert_eq!(body["error"], "timeout");
+
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Visible, 5_000),
+        |harness| {
+            harness
+                .server
+                .state
+                .switch_workspace(None, WorkspaceTarget::Index(2), true)
+                .expect("switch to the window's workspace");
+        },
+    );
+    assert_eq!(rc, 0, "visible after the switch: {body}");
+    assert_eq!(body["until"], "visible");
+    assert_eq!(body["window"]["id"], id);
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
+        |harness| {
+            let (frame, content) = test_frame_report(
+                surface_id,
+                monotonic_micros(),
+                content_seq(harness, &alpha),
+                true,
+            );
+            harness.server.state.frame_presented(frame, content);
+        },
+    );
+    assert_eq!(rc, 0, "presented once its workspace is current: {body}");
+    assert_eq!(body["until"], "presented");
+}
+
 
 #[test]
 fn wait_resolves_now_on_an_edge_or_times_out() {
@@ -1070,6 +1426,25 @@ fn refusals_carry_error_code() {
     assert_eq!(body["error"], "stale_target");
     assert_eq!(body["error_code"], "stale_target");
     assert_eq!(body["current"], generation);
+    let admission = ingress
+        .request_window(WindowOp::SwitchWorkspace {
+            output: None,
+            index: WorkspaceIndex::Prev,
+            wrap: false,
+        })
+        .expect("admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("cycle");
+    let body = runtime
+        .block_on(admission.receive())
+        .expect("reply")
+        .wire_json();
+    assert_eq!(body["error"], "at_end");
+    assert_eq!(body["error_code"], "at_end");
+    assert_eq!(body["from"], 1);
+    assert_eq!(body["count"], 4);
     let (rc, wire) = crate::port::with_error_code(10, Arc::from(r#"{"error":"busy"}"#));
     assert_eq!((rc, &*wire), (10, r#"{"error":"busy","error_code":"busy"}"#));
     let (_, untouched) = crate::port::with_error_code(0, Arc::from(r#"{"error":"x"}"#));

@@ -614,6 +614,9 @@ presentation statistics (see Presentation statistics below).</li>
 <li><code>comp.window.focus</code>, <code>comp.window.raise</code>, <code>comp.window.close</code>,
 <code>comp.window.place</code> and <code>comp.window.wait</code> act on or wait for one window
 (see Window control below). <code>comp.windows.list</code> lists window rows.</li>
+<li><code>comp.workspace.switch {index,output?,wrap?}</code> changes the output's current
+workspace and <code>comp.window.send_to_workspace {id,generation,index,follow?}</code>
+moves one window to a workspace (see Window control below).</li>
 <li><code>comp.input.pointer.move</code>, <code>comp.input.pointer.button</code>,
 <code>comp.input.pointer.scroll</code>, <code>comp.input.key</code>, <code>comp.input.release_all</code> and
 <code>comp.input.sequence</code> inject input through the real seat (see Input
@@ -721,8 +724,37 @@ pointer motion out of the corner.</p>
 missing target as described under Window identity, and replies
 <code>{"error":"locked"}</code> while a session lock is active. Each is recorded in the
 frame trace as <code>comp_window_control</code> (subject the id; detail 1 minimize,
-2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close).</p>
+2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close,
+9 workspace switch, 10 send to workspace; <code>comp.window.stats</code> and
+<code>.stats.reset</code> reuse 7 and 8, a collision kept until 0.60 renumbers them).</p>
+<p>Every window is on one workspace (<code>windows.s&lt;id&gt;.workspace</code>, joined at map),
+and each output has a current one (<code>workspaces.current</code>); a window off its
+output's current workspace reads <code>visible:false, minimized:false</code>, gets no
+frame callbacks and is never presented. <code>comp.window.focus</code>,
+<code>comp.window.restore</code> and xdg-activation switch to the window's workspace
+first when it is not the current one — the window is never pulled across.
+That switch does not happen under a session lock or an exclusive layer.</p>
 <ul>
+<li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
+current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
+the current one, which wrap at the ends unless <code>wrap:false</code>, when they are
+refused with <code>{"error":"at_end",output,from,count}</code>. <code>output</code> is an
+<code>outputs</code> key or output name and defaults to the default output (in
+0.59.0 the only output with a switchable workspace; any other is
+<code>invalid_value</code>). A number outside <code>1..=workspaces.count</code> (0 included) is
+<code>invalid_value</code> naming <code>index</code>. The reply is <code>{output,from,to}</code>; a switch
+to the current workspace replies with <code>from == to</code> and does nothing.
+Minimise state is untouched: a minimised window on the arriving workspace
+stays minimised. The verb names no window but changes what is on screen,
+so a session lock refuses it (<code>locked</code>).</li>
+<li><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
+window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</code> relative to the
+window's own workspace, always wrapping) without switching; the window
+becomes <code>visible:false, minimized:false</code> if it leaves the current
+workspace. With <code>follow:true</code> comp also switches to that workspace and
+activates the window. The reply is <code>{id,generation,index}</code>. A move never
+changes the window's <code>generation</code>. Out-of-range indices are
+<code>invalid_value</code>; the usual <code>{id,generation}</code> fence applies.</li>
 <li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
@@ -785,7 +817,11 @@ wait is about the lowest-id mapped window whose names match.</li>
 after the current mapping began; a late report of an earlier frame does
 not count), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
 window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
-without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.</li>
+without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.
+<code>mapped</code> is workspace-blind; <code>visible</code> and <code>presented</code> need the
+window's workspace to be the current one, so a wait on a window that
+is off its workspace times out rather than resolving, and resolves once
+a switch (or <code>send_to_workspace {follow:true}</code>) brings it on screen.</li>
 <li><code>timeout_ms</code> defaults to 10000 and is at most 60000, counted from when
 the port admitted the request.</li>
 <li>While a session lock is active a wait learns nothing it could not read
@@ -1358,8 +1394,10 @@ source; it replies <code>{reset, since_us, ...}</code>. Errors: the window error
 <code>current</code> when the source id was registered again. A session lock refuses the
 window forms (<code>locked</code>); source reads and the global reset still work.</p>
 <p>Each <code>comp.window.*</code> verb emits a <code>comp_window_control</code> trace record
-(subject window id or 0, detail 1 minimise / 2 restore / 3 stats / 4 reset,
-aux generation).</p>
+(subject window id or 0, aux generation; detail 1 minimise / 2 restore /
+3 focus / 4 raise / 5 close / 6 place / 7 wait and stats / 8 forced close
+and stats reset / 9 workspace switch / 10 send to workspace — the 7/8
+double use is renumbered in 0.60).</p>
 <p>Content-source honesty limits: a source counts as presented when its entity
 was visible in a presented frame; comp cannot tell whether the plugin's own
 texture upload for that revision had finished. Flags and clock are the

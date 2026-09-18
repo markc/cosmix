@@ -151,6 +151,32 @@ pub(crate) enum WindowOp {
     StatsReset {
         target: Option<StatsTarget>,
     },
+    /// `comp.workspace.switch`: the output's current workspace (`None` =
+    /// the default output). Names no window, but changes what is on
+    /// screen, so a session lock refuses it like the rest.
+    SwitchWorkspace {
+        output: Option<String>,
+        index: WorkspaceIndex,
+        wrap: bool,
+    },
+    /// `comp.window.send_to_workspace`: move one window; `follow` also
+    /// switches to it and activates the window.
+    SendToWorkspace {
+        id: u64,
+        generation: u64,
+        index: WorkspaceIndex,
+        follow: bool,
+    },
+}
+
+/// Where `comp.workspace.switch` / `send_to_workspace` aim: a 1-based
+/// index, or one step relative to the current (switch) or the window's own
+/// (send) workspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspaceIndex {
+    Absolute(u32),
+    Next,
+    Prev,
 }
 
 /// `comp.window.place`: output-local logical window-geometry coordinates.
@@ -1925,6 +1951,8 @@ const WINDOW_VERBS: &[&str] = &[
     "comp.window.wait",
     "comp.window.stats",
     "comp.window.stats.reset",
+    "comp.workspace.switch",
+    "comp.window.send_to_workspace",
 ];
 
 fn window_verb(verb: &str) -> Option<&'static str> {
@@ -1958,6 +1986,46 @@ fn bool_arg(
         None => Ok(default),
         Some(Value::Bool(value)) => Ok(*value),
         Some(_) => Err(invalid_argument(name, "bool", "true|false")),
+    }
+}
+
+/// `index` of the workspace verbs: an unsigned integer `>= 1`, `"next"` or
+/// `"prev"`. `0` is refused here as `invalid_value` (the contract: outside
+/// `1..count`, 0 included); an index above the count is refused by the
+/// compositor, which knows the count.
+fn workspace_index_arg(
+    object: &serde_json::Map<String, Value>,
+) -> Result<WorkspaceIndex, ControlReply> {
+    match present(object, "index") {
+        Some(Value::String(step)) if step == "next" => Ok(WorkspaceIndex::Next),
+        Some(Value::String(step)) if step == "prev" => Ok(WorkspaceIndex::Prev),
+        Some(value) if value.as_u64().is_some_and(|index| index >= 1) => value
+            .as_u64()
+            .and_then(|index| u32::try_from(index).ok())
+            .map(WorkspaceIndex::Absolute)
+            .ok_or_else(|| workspace_index_refusal("1..=workspaces.count|next|prev")),
+        Some(_) => Err(workspace_index_refusal("1..=workspaces.count|next|prev")),
+        None => Err(workspace_index_refusal(
+            "required: 1..=workspaces.count|next|prev",
+        )),
+    }
+}
+
+fn workspace_index_refusal(range: &'static str) -> ControlReply {
+    invalid_argument("index", "unsigned integer or next|prev", range)
+}
+
+/// `output` of a placement or a workspace switch: a non-empty `outputs`
+/// key or output name.
+fn output_arg(object: &serde_json::Map<String, Value>) -> Result<Option<String>, ControlReply> {
+    match present(object, "output") {
+        None => Ok(None),
+        Some(Value::String(output)) if !output.is_empty() => Ok(Some(output.clone())),
+        Some(_) => Err(invalid_argument(
+            "output",
+            "string",
+            "outputs.<key> key or output name",
+        )),
     }
 }
 
@@ -2050,17 +2118,7 @@ pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, 
             const ALLOWED: &[&str] = &["id", "generation", "output", "x", "y", "width", "height"];
             let object = args_object(args, &empty, ALLOWED)?;
             let (id, generation) = required_target(object)?;
-            let output = match present(object, "output") {
-                None => None,
-                Some(Value::String(output)) if !output.is_empty() => Some(output.clone()),
-                Some(_) => {
-                    return Err(invalid_argument(
-                        "output",
-                        "string",
-                        "outputs.<key> key or output name",
-                    ));
-                }
-            };
+            let output = output_arg(object)?;
             let spec = PlaceSpec {
                 id,
                 generation,
@@ -2083,6 +2141,26 @@ pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, 
                 ));
             }
             Ok(WindowVerb::Op(WindowOp::Place(spec)))
+        }
+        "comp.workspace.switch" => {
+            const ALLOWED: &[&str] = &["index", "output", "wrap"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            Ok(WindowVerb::Op(WindowOp::SwitchWorkspace {
+                index: workspace_index_arg(object)?,
+                output: output_arg(object)?,
+                wrap: bool_arg(object, "wrap", true)?,
+            }))
+        }
+        "comp.window.send_to_workspace" => {
+            const ALLOWED: &[&str] = &["id", "generation", "index", "follow"];
+            let object = args_object(args, &empty, ALLOWED)?;
+            let (id, generation) = required_target(object)?;
+            Ok(WindowVerb::Op(WindowOp::SendToWorkspace {
+                id,
+                generation,
+                index: workspace_index_arg(object)?,
+                follow: bool_arg(object, "follow", false)?,
+            }))
         }
         "comp.window.wait" => {
             const ALLOWED: &[&str] = &["match", "until", "width", "height", "timeout_ms"];
@@ -4198,6 +4276,145 @@ mod tests {
                 "comp.window.wait",
                 json!({"match": {"id": 1}, "until": "mapped", "for": 1}),
                 "for",
+            ),
+        ] {
+            let body = refusal(parse_window_verb(verb, &args).expect_err("typo refused"));
+            assert_eq!(body["error"], "invalid_args", "{verb}");
+            assert_eq!(body["field"], field, "{verb}");
+        }
+    }
+
+    /// `comp.workspace.switch` / `comp.window.send_to_workspace`: `index`
+    /// is `>= 1`, `next` or `prev` (0 is `invalid_value` at the parser),
+    /// `wrap` defaults on, `follow` off, and a typo is refused by name.
+    #[test]
+    fn workspace_verbs_parse_and_refuse_by_field() {
+        assert!(window_verb("comp.workspace.switch").is_some());
+        assert!(window_verb("comp.window.send_to_workspace").is_some());
+        assert_eq!(
+            parse_window_verb("comp.workspace.switch", &json!({"index": "next"})),
+            Ok(WindowVerb::Op(WindowOp::SwitchWorkspace {
+                output: None,
+                index: WorkspaceIndex::Next,
+                wrap: true,
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.workspace.switch",
+                &json!({"index": 3, "output": "o_x", "wrap": false})
+            ),
+            Ok(WindowVerb::Op(WindowOp::SwitchWorkspace {
+                output: Some("o_x".into()),
+                index: WorkspaceIndex::Absolute(3),
+                wrap: false,
+            }))
+        );
+        assert_eq!(
+            parse_window_verb("comp.workspace.switch", &json!({"index": "prev"})),
+            Ok(WindowVerb::Op(WindowOp::SwitchWorkspace {
+                output: None,
+                index: WorkspaceIndex::Prev,
+                wrap: true,
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.send_to_workspace",
+                &json!({"id": 7, "generation": 3, "index": 2})
+            ),
+            Ok(WindowVerb::Op(WindowOp::SendToWorkspace {
+                id: 7,
+                generation: 3,
+                index: WorkspaceIndex::Absolute(2),
+                follow: false,
+            }))
+        );
+        assert_eq!(
+            parse_window_verb(
+                "comp.window.send_to_workspace",
+                &json!({"id": 7, "generation": 3, "index": "prev", "follow": true})
+            ),
+            Ok(WindowVerb::Op(WindowOp::SendToWorkspace {
+                id: 7,
+                generation: 3,
+                index: WorkspaceIndex::Prev,
+                follow: true,
+            }))
+        );
+        for (verb, args, path) in [
+            ("comp.workspace.switch", json!({}), "index"),
+            ("comp.workspace.switch", json!({"index": 0}), "index"),
+            ("comp.workspace.switch", json!({"index": -1}), "index"),
+            ("comp.workspace.switch", json!({"index": 1.5}), "index"),
+            (
+                "comp.workspace.switch",
+                json!({"index": "sideways"}),
+                "index",
+            ),
+            (
+                "comp.workspace.switch",
+                json!({"index": 1, "wrap": "no"}),
+                "wrap",
+            ),
+            (
+                "comp.workspace.switch",
+                json!({"index": 1, "output": ""}),
+                "output",
+            ),
+            (
+                "comp.workspace.switch",
+                json!({"index": 1, "output": 3}),
+                "output",
+            ),
+            (
+                "comp.window.send_to_workspace",
+                json!({"id": 7, "index": 2}),
+                "generation",
+            ),
+            (
+                "comp.window.send_to_workspace",
+                json!({"generation": 3, "index": 2}),
+                "id",
+            ),
+            (
+                "comp.window.send_to_workspace",
+                json!({"id": 7, "generation": 3}),
+                "index",
+            ),
+            (
+                "comp.window.send_to_workspace",
+                json!({"id": 7, "generation": 3, "index": 0}),
+                "index",
+            ),
+            (
+                "comp.window.send_to_workspace",
+                json!({"id": 7, "generation": 3, "index": 2, "follow": 1}),
+                "follow",
+            ),
+        ] {
+            let body = refusal(parse_window_verb(verb, &args).expect_err("refused"));
+            assert_eq!(body["error"], "invalid_value", "{verb} {args}: {body}");
+            assert_eq!(body["path"], path, "{verb} {args}: {body}");
+        }
+        let body = refusal(
+            parse_window_verb(
+                "comp.window.send_to_workspace",
+                &json!({"id": 7, "index": 2}),
+            )
+            .expect_err("refused"),
+        );
+        assert_eq!(body["range"], "required (read windows.s<id>.generation)");
+        for (verb, args, field) in [
+            (
+                "comp.workspace.switch",
+                json!({"index": 1, "wrap_around": true}),
+                "wrap_around",
+            ),
+            (
+                "comp.window.send_to_workspace",
+                json!({"id": 7, "generation": 3, "index": 2, "output": "o_x"}),
+                "output",
             ),
         ] {
             let body = refusal(parse_window_verb(verb, &args).expect_err("typo refused"));
