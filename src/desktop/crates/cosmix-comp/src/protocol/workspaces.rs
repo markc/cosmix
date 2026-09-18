@@ -363,21 +363,38 @@ impl WaylandState {
     /// publication lands on every path (including the release-arm revert
     /// in `move_window_and_follow`, which relabels back to `from`).
     ///
-    /// 0.59.1: also relabels `object`'s override-redirect children (a menu,
-    /// a tooltip) to the same workspace, one level, recursively through
-    /// this same function — never `_NET_WM_DESKTOP` for one of them (guarded
-    /// below), since EWMH gives that property to managed windows only
+    /// 0.59.1: also relabels `object`'s override-redirect descendants (a
+    /// menu, its submenu, a tooltip) to the same workspace — never
+    /// `_NET_WM_DESKTOP` for one of them (guarded in `relabel_one`), since
+    /// EWMH gives that property to managed windows only
     /// (`stamp_workspace_at_map`). An OR record has no `layout.parent`
     /// linking it to its owner in the visibility recompute (X-2a: it is a
     /// root of its own, stamped with the workspace it mapped on), so
     /// without this a move of the owner strands the child on the old
     /// workspace — it goes invisible while the owner is on screen
-    /// elsewhere. This cannot recurse past one level in practice: an OR
-    /// record is never `workspace_movable`, so it is never the `object` a
-    /// caller of `move_window_to_workspace`/`move_window_and_follow` names;
-    /// only a real move seeds the walk, and `or_children_of` only follows
-    /// WM_TRANSIENT_FOR one hop from wherever it is seeded.
+    /// elsewhere. The walk follows WM_TRANSIENT_FOR chains (submenus)
+    /// iteratively. Each window names at most one owner and the seed is a
+    /// movable (never OR) window, so the reachable set is a tree; the
+    /// visited set is belt-and-braces because the property is
+    /// client-controlled, and a walk that ever looped would take the whole
+    /// session down.
     fn relabel_workspace(&mut self, object: &ObjectId, to: u32) {
+        self.relabel_one(object, to);
+        #[cfg(feature = "xwayland")]
+        {
+            let mut seen = std::collections::HashSet::from([object.clone()]);
+            let mut pending = self.or_children_of(object);
+            while let Some(child) = pending.pop() {
+                if !seen.insert(child.clone()) {
+                    continue;
+                }
+                self.relabel_one(&child, to);
+                pending.extend(self.or_children_of(&child));
+            }
+        }
+    }
+
+    fn relabel_one(&mut self, object: &ObjectId, to: u32) {
         let Some(record) = self.surfaces.get_mut(object) else {
             return;
         };
@@ -393,10 +410,6 @@ impl WaylandState {
         {
             let id = record.id;
             self.mark_surface_dirty(id, "workspace.move");
-        }
-        #[cfg(feature = "xwayland")]
-        for child in self.or_children_of(object) {
-            self.relabel_workspace(&child, to);
         }
     }
 
