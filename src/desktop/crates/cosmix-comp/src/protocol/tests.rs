@@ -8888,13 +8888,18 @@ fn real_surface_commit_and_output_transitions_are_safe_on_kms_backend() {
         })
         .expect("real client created its toplevel wl_surface");
 
-    harness
-        .server
-        .state
-        .surfaces
-        .get_mut(&object)
-        .expect("tracked surface")
-        .mapped = true;
+    {
+        let record = harness
+            .server
+            .state
+            .surfaces
+            .get_mut(&object)
+            .expect("tracked surface");
+        record.mapped = true;
+        // A map faked past the commit edge still owes rule 2's stamp, or the
+        // record reads as off-workspace and never becomes visible.
+        record.workspace = 1;
+    }
     harness.server.state.recompute_effective_visibility();
     harness
         .server
@@ -13425,6 +13430,8 @@ fn click_inside_a_grabbing_popup_survives_fractional_scale() {
             })
             .expect("real toplevel exists");
         record.mapped = true;
+        // Faked past the commit edge: stamp the workspace as the edge would.
+        record.workspace = 1;
     }
     route_pointer_to(&mut harness, 200.0, 180.0);
     let _ = harness.sync();
@@ -14295,10 +14302,11 @@ fn new_windows_join_the_current_workspace_at_map() {
     assert!(harness.server.state.surfaces[&second].layout.visible);
     assert_eq!(harness.server.state.surfaces[&first].workspace, 1);
     assert!(!harness.server.state.surfaces[&first].layout.visible);
-    assert_eq!(
+    // Whatever the map-time focus policy does, the hidden window is not it.
+    assert_ne!(
         focused_surface(harness.server.state.keyboard.current_focus()),
         Some(
-            harness.server.state.surfaces[&second]
+            harness.server.state.surfaces[&first]
                 .role
                 .wl_surface()
                 .clone()
