@@ -19,7 +19,7 @@ use std::{
 };
 
 use smithay::reexports::drm::{
-    Device as BasicDrmDevice,
+    Device as BasicDrmDevice, DriverCapability,
     buffer::PlanarBuffer,
     control::{self, Device as ControlDevice, ResourceHandle},
 };
@@ -104,6 +104,108 @@ pub(crate) struct AtomicPageFlip {
     pub(crate) tag: Option<AtomicPageFlipTag>,
     pub(crate) tv_sec: u32,
     pub(crate) tv_usec: u32,
+    /// The CRTC's vblank counter at the flip.
+    pub(crate) sequence: u32,
+}
+
+/// Which clock the kernel stamps page-flip events with
+/// (`DRM_CAP_TIMESTAMP_MONOTONIC`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PageFlipClock {
+    Monotonic,
+    Realtime,
+    /// The capability query failed: the stamp's clock is not known.
+    Unknown,
+}
+
+impl PageFlipClock {
+    fn from_capability(capability: io::Result<u64>) -> Self {
+        match capability {
+            Ok(1) => Self::Monotonic,
+            Ok(_) => Self::Realtime,
+            Err(_) => Self::Unknown,
+        }
+    }
+}
+
+/// A completed flip, with its time on CLOCK_MONOTONIC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DisplayedFlip {
+    pub(crate) seconds: u64,
+    pub(crate) nanoseconds: u32,
+    pub(crate) sequence: u32,
+    /// The time is the kernel's own CLOCK_MONOTONIC stamp. Otherwise it was
+    /// converted from CLOCK_REALTIME, or taken when the event was read.
+    pub(crate) hw_clock: bool,
+    /// The CRTC has a vblank counter, so the flip landed on a vblank and
+    /// `sequence` counts them.
+    pub(crate) vblank: bool,
+}
+
+/// Whether a CRTC counts vblanks (`DRM_IOCTL_CRTC_GET_SEQUENCE`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VblankSupport {
+    Supported,
+    /// The device has no vblank support (virtio-gpu, simpledrm): flips
+    /// complete on no vblank grid and are stamped at completion.
+    Unsupported,
+    /// The probe could not tell (for example a CRTC not yet enabled).
+    Unknown,
+}
+
+/// A MONOTONIC stamp this far ahead of the clock is not a vblank-helper
+/// stamp that runs ahead of the event; the capability cannot be trusted.
+const GROSS_FLIP_SKEW: Duration = Duration::from_secs(1);
+/// Consecutive stamps ahead by more than a period before HW_CLOCK is dropped
+/// for good.
+const SKEWED_FLIPS_BEFORE_DEMOTION: u32 = 3;
+/// Consecutive flips with sequence 0 before a CRTC of unknown vblank support
+/// is taken to have no counter.
+const ZERO_SEQUENCES_BEFORE_NO_VBLANK: u32 = 2;
+
+/// Place a kernel flip stamp on CLOCK_MONOTONIC. `realtime_now` and
+/// `monotonic_now` are sampled together, after the event was read.
+///
+/// vblank-helper drivers stamp the start of active scanout, which the flip
+/// event can precede by up to a blanking interval, so a MONOTONIC stamp up to
+/// `ahead_tolerance` (one refresh period) in the future is the kernel's real
+/// answer and is kept. Further ahead it is not trusted for this flip. A
+/// REALTIME stamp is moved by the sampled clock offset. Anything that cannot
+/// be placed falls back to `monotonic_now`, without claiming a hardware clock.
+fn flip_time_on_monotonic(
+    clock: PageFlipClock,
+    stamp: Duration,
+    realtime_now: Duration,
+    monotonic_now: Duration,
+    ahead_tolerance: Duration,
+) -> (Duration, bool) {
+    let placed = match clock {
+        PageFlipClock::Monotonic if stamp <= monotonic_now.saturating_add(ahead_tolerance) => {
+            return (stamp, true);
+        }
+        PageFlipClock::Realtime => realtime_now
+            .checked_sub(stamp)
+            .and_then(|age| monotonic_now.checked_sub(age)),
+        PageFlipClock::Monotonic | PageFlipClock::Unknown => None,
+    };
+    (placed.unwrap_or(monotonic_now), false)
+}
+
+/// `None` when the clock cannot be read: a zero reading would look like a
+/// stamp seconds in the future and demote a healthy clock.
+fn clock_now(clock: libc::clockid_t) -> Option<Duration> {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is valid writable storage for one timespec.
+    if unsafe { libc::clock_gettime(clock, &mut now) } != 0 {
+        return None;
+    }
+    Some(Duration::new(
+        u64::try_from(now.tv_sec).ok()?,
+        u32::try_from(now.tv_nsec).ok()?,
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,6 +336,11 @@ pub(crate) trait AtomicIo: Send + 'static {
         absolute_deadline: Instant,
     ) -> Result<AtomicWaitReady, String>;
     fn decode_pageflips(&mut self, crtc_id: u32) -> Result<Vec<AtomicPageFlip>, String>;
+    /// Whether the CRTC counts vblanks. Only a live DRM device can answer;
+    /// everything else leaves the question open.
+    fn vblank_support(&mut self, _crtc_id: u32) -> VblankSupport {
+        VblankSupport::Unknown
+    }
 }
 
 /// Generation-aware cancellation publication plus the non-blocking eventfd
@@ -388,7 +495,16 @@ pub(crate) struct AtomicPresenter<I: AtomicIo> {
     cancellation: Arc<AtomicCancellation>,
     modeset_required: bool,
     pending_commit: Option<PendingAtomicCommit>,
-    displayed_timestamp: Option<(u64, u32)>,
+    displayed_timestamp: Option<DisplayedFlip>,
+    flip_clock: PageFlipClock,
+    /// Consecutive MONOTONIC stamps more than a period ahead of the clock.
+    skewed_flips: u32,
+    skew_warned: bool,
+    vblank: VblankSupport,
+    vblank_reprobed: bool,
+    /// Consecutive zero sequences while support is unknown; a non-zero one
+    /// clears it, so this never latches.
+    zero_sequences: u32,
     pub(crate) cursor: cursor::HardwareCursorBridge,
 }
 
@@ -411,6 +527,15 @@ impl<I: AtomicIo> AtomicPresenter<I> {
             modeset_required: true,
             pending_commit: None,
             displayed_timestamp: None,
+            // Supported kernels stamp flips on CLOCK_MONOTONIC; the production
+            // constructor replaces this with the queried answer.
+            flip_clock: PageFlipClock::Monotonic,
+            skewed_flips: 0,
+            skew_warned: false,
+            // Likewise for vblank support, probed by the production constructor.
+            vblank: VblankSupport::Supported,
+            vblank_reprobed: false,
+            zero_sequences: 0,
             cursor: cursor::HardwareCursorBridge::default(),
         }
     }
@@ -499,8 +624,141 @@ impl<I: AtomicIo> AtomicPresenter<I> {
         self.modeset_required
     }
 
-    pub(crate) fn take_displayed_timestamp(&mut self) -> Option<(u64, u32)> {
+    pub(crate) fn take_displayed_timestamp(&mut self) -> Option<DisplayedFlip> {
         self.displayed_timestamp.take()
+    }
+
+    pub(crate) fn set_flip_clock(&mut self, clock: PageFlipClock) {
+        self.flip_clock = clock;
+    }
+
+    /// The scanned-out mode's refresh period, when the mode names one.
+    pub(crate) fn refresh_nanos(&self) -> Option<u64> {
+        let millihz = u64::from(self.selection.mode.refresh_millihz);
+        (millihz > 0).then(|| 1_000_000_000_000 / millihz)
+    }
+
+    pub(crate) fn set_vblank_support(&mut self, vblank: VblankSupport) {
+        self.vblank = vblank;
+    }
+
+    fn place_flip(&mut self, stamp: Duration, sequence: u32) -> DisplayedFlip {
+        let vblank = self.classify_sequence(sequence);
+        let (Some(realtime_now), Some(monotonic_now)) =
+            (clock_now(libc::CLOCK_REALTIME), clock_now(libc::CLOCK_MONOTONIC))
+        else {
+            // No clock to place the stamp against: report what the kernel
+            // said and judge nothing, rather than inventing a skew.
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                "CLOCK_MONOTONIC/CLOCK_REALTIME unreadable; the flip stamp is reported unplaced"
+            );
+            return DisplayedFlip {
+                seconds: stamp.as_secs(),
+                nanoseconds: stamp.subsec_nanos(),
+                sequence,
+                hw_clock: self.flip_clock == PageFlipClock::Monotonic,
+                vblank,
+            };
+        };
+        // Without a mode period, the longest frame the render path paces.
+        let period = self
+            .refresh_nanos()
+            .map_or(Duration::from_millis(50), Duration::from_nanos);
+        let (time, hw_clock) =
+            flip_time_on_monotonic(self.flip_clock, stamp, realtime_now, monotonic_now, period);
+        if self.flip_clock == PageFlipClock::Monotonic {
+            if hw_clock {
+                self.skewed_flips = 0;
+            } else {
+                self.note_skewed_flip(stamp.saturating_sub(monotonic_now));
+            }
+        }
+        DisplayedFlip {
+            seconds: time.as_secs(),
+            nanoseconds: time.subsec_nanos(),
+            sequence,
+            hw_clock,
+            vblank,
+        }
+    }
+
+    /// Whether this flip's sequence counts vblanks. The constructor's probe
+    /// runs before the first modeset, where a disabled CRTC answers EINVAL,
+    /// so an inconclusive probe is retried once the first flip proves the
+    /// CRTC active.
+    fn classify_sequence(&mut self, sequence: u32) -> bool {
+        if self.vblank == VblankSupport::Unknown && !self.vblank_reprobed {
+            self.vblank_reprobed = true;
+            let probed = self.io.vblank_support(self.selection.crtc_id);
+            if probed != VblankSupport::Unknown {
+                tracing::info!(
+                    crtc = self.selection.crtc_id,
+                    ?probed,
+                    "CRTC vblank support re-probed once it was active"
+                );
+                self.vblank = probed;
+            }
+        }
+        self.note_sequence(sequence)
+    }
+
+    /// One MONOTONIC stamp too far ahead is reported at read time; a gross
+    /// skew or a run of them means the stamps are not MONOTONIC at all.
+    fn note_skewed_flip(&mut self, ahead: Duration) {
+        self.skewed_flips = self.skewed_flips.saturating_add(1);
+        if !self.skew_warned {
+            self.skew_warned = true;
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                ?ahead,
+                "page-flip stamp is more than a refresh period ahead of CLOCK_MONOTONIC; reporting that flip at read time"
+            );
+        }
+        if ahead >= GROSS_FLIP_SKEW || self.skewed_flips >= SKEWED_FLIPS_BEFORE_DEMOTION {
+            tracing::warn!(
+                crtc = self.selection.crtc_id,
+                ?ahead,
+                skewed_flips = self.skewed_flips,
+                "page-flip stamps are not CLOCK_MONOTONIC; presentation times lose HW_CLOCK"
+            );
+            self.flip_clock = PageFlipClock::Unknown;
+        }
+    }
+
+    /// Whether this flip's sequence counts vblanks. A CRTC the probe could
+    /// not classify proves a counter with a non-zero sequence, and proves
+    /// the lack of one with a run of zeros; a zero is never trusted.
+    /// Only `EOPNOTSUPP` (`VblankSupport::Unsupported`) settles the question
+    /// for good. While it is unknown, a run of zero sequences is reported as
+    /// no counter — i915 resets the pipe counter across a modeset, so early
+    /// zeros are expected — but a later non-zero sequence proves one and
+    /// takes over.
+    fn note_sequence(&mut self, sequence: u32) -> bool {
+        match self.vblank {
+            VblankSupport::Supported => true,
+            VblankSupport::Unsupported => false,
+            VblankSupport::Unknown if sequence != 0 => {
+                tracing::info!(
+                    crtc = self.selection.crtc_id,
+                    sequence,
+                    "CRTC counts vblanks (a non-zero sequence)"
+                );
+                self.zero_sequences = 0;
+                self.vblank = VblankSupport::Supported;
+                true
+            }
+            VblankSupport::Unknown => {
+                self.zero_sequences = self.zero_sequences.saturating_add(1);
+                if self.zero_sequences == ZERO_SEQUENCES_BEFORE_NO_VBLANK {
+                    tracing::warn!(
+                        crtc = self.selection.crtc_id,
+                        "CRTC has reported no vblank counter so far; presentation claims neither VSYNC nor HW_CLOCK until one appears"
+                    );
+                }
+                false
+            }
+        }
     }
 
     /// Try the retained buffer as a same-mode plane flip. TEST_ONLY and the
@@ -673,7 +931,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                                     ),
                                 ));
                             }
-                            self.displayed_timestamp = Some((
+                            let stamp = Duration::new(
                                 u64::from(matching.tv_sec),
                                 matching.tv_usec.checked_mul(1_000).ok_or_else(|| {
                                     KmsRenderPlatformFailure::terminal(
@@ -681,7 +939,9 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                                         "kernel page-flip microseconds overflowed nanoseconds",
                                     )
                                 })?,
-                            ));
+                            );
+                            self.displayed_timestamp =
+                                Some(self.place_flip(stamp, matching.sequence));
                             // A retained same-mode flip deliberately does not
                             // establish the new generation's full property
                             // set. Keep the first fresh frame modeset-shaped so
@@ -1105,6 +1365,13 @@ impl AtomicPresenter<ProductionAtomicIo> {
     ) -> Result<Self, AtomicPresenterSetupError> {
         let selection = pool.selection();
         let mut io = ProductionAtomicIo::new(fd, events);
+        let flip_clock = io.flip_clock();
+        if flip_clock != PageFlipClock::Monotonic {
+            tracing::warn!(
+                ?flip_clock,
+                "DRM does not confirm CLOCK_MONOTONIC page-flip stamps; presentation times lose HW_CLOCK"
+            );
+        }
         let properties = io.property_ids(selection).map_err(|detail| {
             AtomicPresenterSetupError::new("kms-live-atomic-property-map-failed", detail)
         })?;
@@ -1160,6 +1427,12 @@ impl AtomicPresenter<ProductionAtomicIo> {
             framebuffers,
             cancellation,
         );
+        presenter.set_flip_clock(flip_clock);
+        let vblank = presenter.io.probe_vblank_support(selection.crtc_id);
+        if vblank != VblankSupport::Supported {
+            tracing::info!(?vblank, crtc = selection.crtc_id, "CRTC vblank support");
+        }
+        presenter.set_vblank_support(vblank);
         let probe_slot = pool.slot_ids().next().ok_or_else(|| {
             AtomicPresenterSetupError::new(
                 "kms-live-atomic-scanout-pool-empty",
@@ -1453,6 +1726,36 @@ impl ProductionAtomicIo {
         }
     }
 
+    /// `DRM_IOCTL_CRTC_GET_SEQUENCE`: EOPNOTSUPP means the device has no
+    /// vblank support; other errors (a CRTC not yet enabled) decide nothing.
+    fn probe_vblank_support(&self, crtc_id: u32) -> VblankSupport {
+        let mut request = DrmCrtcGetSequence {
+            crtc_id,
+            active: 0,
+            sequence: 0,
+            sequence_ns: 0,
+        };
+        let result = unsafe {
+            libc::ioctl(
+                self.card.as_fd().as_raw_fd(),
+                drm_ioctl_crtc_get_sequence(),
+                &mut request,
+            )
+        };
+        classify_vblank_probe(if result < 0 {
+            Err(io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        } else {
+            Ok(())
+        })
+    }
+
+    pub(crate) fn flip_clock(&self) -> PageFlipClock {
+        PageFlipClock::from_capability(
+            self.card
+                .get_driver_capability(DriverCapability::MonotonicTimestamp),
+        )
+    }
+
     pub(crate) fn property_ids(
         &self,
         selection: AtomicOutputSelection,
@@ -1557,6 +1860,35 @@ struct DrmEventVblank {
 }
 
 const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DrmCrtcGetSequence {
+    crtc_id: u32,
+    active: u32,
+    sequence: u64,
+    sequence_ns: i64,
+}
+
+const fn drm_ioctl_crtc_get_sequence() -> libc::c_ulong {
+    const IOC_WRITE: u64 = 1;
+    const IOC_READ: u64 = 2;
+    const IOC_TYPESHIFT: u64 = 8;
+    const IOC_SIZESHIFT: u64 = 16;
+    const IOC_DIRSHIFT: u64 = 30;
+    (((IOC_READ | IOC_WRITE) << IOC_DIRSHIFT)
+        | ((std::mem::size_of::<DrmCrtcGetSequence>() as u64) << IOC_SIZESHIFT)
+        | ((b'd' as u64) << IOC_TYPESHIFT)
+        | 0x3b) as libc::c_ulong
+}
+
+fn classify_vblank_probe(result: Result<(), i32>) -> VblankSupport {
+    match result {
+        Ok(()) => VblankSupport::Supported,
+        Err(errno) if errno == libc::EOPNOTSUPP => VblankSupport::Unsupported,
+        Err(_) => VblankSupport::Unknown,
+    }
+}
 
 const fn drm_ioctl_mode_atomic() -> libc::c_ulong {
     const IOC_WRITE: u64 = 1;
@@ -1674,6 +2006,7 @@ fn decode_raw_pageflips(
                 tag,
                 tv_sec: event.tv_sec,
                 tv_usec: event.tv_usec,
+                sequence: event.sequence,
             });
         }
         offset += length;
@@ -1682,6 +2015,10 @@ fn decode_raw_pageflips(
 }
 
 impl AtomicIo for ProductionAtomicIo {
+    fn vblank_support(&mut self, crtc_id: u32) -> VblankSupport {
+        self.probe_vblank_support(crtc_id)
+    }
+
     fn add_framebuffer(
         &mut self,
         _slot: ScanoutSlotId,
@@ -1832,6 +2169,7 @@ mod tests {
         cancel_on_decode: Option<(Arc<AtomicCancellation>, CancelScope)>,
         remove_results: VecDeque<Result<(), String>>,
         removed_framebuffers: Vec<u32>,
+        vblank_probes: VecDeque<VblankSupport>,
     }
 
     #[test]
@@ -1984,6 +2322,12 @@ mod tests {
             Ok(self.waits.pop_front().unwrap_or(AtomicWaitReady::Deadline))
         }
 
+        fn vblank_support(&mut self, _crtc_id: u32) -> VblankSupport {
+            self.vblank_probes
+                .pop_front()
+                .unwrap_or(VblankSupport::Unknown)
+        }
+
         fn decode_pageflips(&mut self, _crtc_id: u32) -> Result<Vec<AtomicPageFlip>, String> {
             if let Some((cancellation, scope)) = self.cancel_on_decode.take() {
                 cancellation.cancel(scope);
@@ -2104,6 +2448,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 123,
             tv_usec: 456_789,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2121,14 +2466,311 @@ mod tests {
         );
         assert_eq!(
             presenter.take_displayed_timestamp(),
-            Some((123, 456_789_000))
+            Some(DisplayedFlip {
+                seconds: 123,
+                nanoseconds: 456_789_000,
+                sequence: 0,
+                hw_clock: true,
+                vblank: true,
+            })
         );
+    }
+
+    fn present_one_flip(
+        presenter: &mut AtomicPresenter<FakeAtomicIo>,
+        generation: u64,
+        tv_sec: u32,
+        sequence: u32,
+    ) -> Option<DisplayedFlip> {
+        presenter.io.waits.push_back(AtomicWaitReady::Ready {
+            drm: true,
+            cancel: false,
+        });
+        presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec,
+            tv_usec: 250_000,
+            sequence,
+            ..matching_flip(generation)
+        }]);
+        assert_eq!(
+            presenter.present(
+                ScanoutSlotId(0),
+                generation,
+                PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+            ),
+            Ok(PresentOutcome::Displayed)
+        );
+        presenter.take_displayed_timestamp()
+    }
+
+    #[test]
+    fn displayed_flip_keeps_the_vblank_sequence_and_the_monotonic_stamp() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        let flip = present_one_flip(&mut presenter, 7, 5, 41).expect("displayed");
+        assert_eq!((flip.seconds, flip.nanoseconds), (5, 250_000_000));
+        assert_eq!(flip.sequence, 41);
+        assert!(flip.hw_clock);
+        let next = present_one_flip(&mut presenter, 7, 5, 42).expect("displayed");
+        assert_eq!(next.sequence, 42);
+        // Taking the stamp consumes it: nothing is reported twice.
+        assert_eq!(presenter.take_displayed_timestamp(), None);
+    }
+
+    #[test]
+    fn a_flip_that_never_completed_leaves_no_timestamp() {
+        let mut io = FakeAtomicIo::default();
+        // The commit lands, but no matching event arrives before the deadline.
+        io.waits.push_back(AtomicWaitReady::Deadline);
+        let mut presenter = presenter(io);
+        assert!(
+            presenter
+                .present(
+                    ScanoutSlotId(0),
+                    7,
+                    PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+                )
+                .is_err()
+        );
+        assert_eq!(presenter.take_displayed_timestamp(), None);
+    }
+
+    #[test]
+    fn a_realtime_flip_clock_is_converted_and_never_claims_hw_clock() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        presenter.set_flip_clock(PageFlipClock::Realtime);
+        let realtime = clock_now(libc::CLOCK_REALTIME).expect("the test host has a readable clock");
+        let before = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock");
+        let flip = present_one_flip(
+            &mut presenter,
+            7,
+            // A whole second back, so the stamp is surely in the past.
+            u32::try_from(realtime.as_secs() - 1).expect("realtime fits the kernel field"),
+            9,
+        )
+        .expect("displayed");
+        let after = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock");
+        let time = Duration::new(flip.seconds, flip.nanoseconds);
+        assert!(!flip.hw_clock);
+        assert_eq!(flip.sequence, 9);
+        // The stamp is 0.75-1.75 s before `realtime`, so on MONOTONIC it is
+        // that far before the sampled window, give or take the test's run time.
+        assert!(
+            time + Duration::from_millis(700) <= after,
+            "{time:?} not converted (after {after:?})"
+        );
+        assert!(
+            time + Duration::from_secs(3) >= before,
+            "{time:?} too far before {before:?}"
+        );
+    }
+
+    /// Present one flip whose kernel stamp is `stamp` (microsecond precision).
+    fn present_flip_at(
+        presenter: &mut AtomicPresenter<FakeAtomicIo>,
+        stamp: Duration,
+        sequence: u32,
+    ) -> DisplayedFlip {
+        presenter.io.waits.push_back(AtomicWaitReady::Ready {
+            drm: true,
+            cancel: false,
+        });
+        presenter.io.events.push_back(vec![AtomicPageFlip {
+            tv_sec: u32::try_from(stamp.as_secs()).expect("stamp fits the kernel field"),
+            tv_usec: stamp.subsec_micros(),
+            sequence,
+            ..matching_flip(7)
+        }]);
+        assert_eq!(
+            presenter.present(
+                ScanoutSlotId(0),
+                7,
+                PresentDeadline::bounded(Instant::now() + Duration::from_secs(1)),
+            ),
+            Ok(PresentOutcome::Displayed)
+        );
+        presenter.take_displayed_timestamp().expect("displayed")
+    }
+
+    fn stamp_of(flip: DisplayedFlip) -> Duration {
+        Duration::new(flip.seconds, flip.nanoseconds)
+    }
+
+    #[test]
+    fn an_in_blanking_monotonic_stamp_is_kept_with_hw_clock() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        // vblank helpers stamp the start of scanout, which the event can
+        // precede by a blanking interval: ~1 ms ahead is the kernel's answer.
+        for sequence in 1..=5 {
+            let stamp = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_millis(1);
+            let flip = present_flip_at(&mut presenter, stamp, sequence);
+            assert!(flip.hw_clock, "flip {sequence}");
+            assert_eq!(
+                stamp_of(flip),
+                Duration::new(stamp.as_secs(), stamp.subsec_micros() * 1_000)
+            );
+        }
+        assert_eq!(presenter.flip_clock, PageFlipClock::Monotonic);
+    }
+
+    #[test]
+    fn a_gross_monotonic_skew_demotes_the_clock() {
+        let mut presenter = presenter(FakeAtomicIo::default());
+        let ahead = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_secs(5);
+        let flip = present_flip_at(&mut presenter, ahead, 1);
+        assert!(!flip.hw_clock);
+        assert!(stamp_of(flip) < ahead, "reported at read time");
+        assert_eq!(presenter.flip_clock, PageFlipClock::Unknown);
+        let later = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"), 2);
+        assert!(!later.hw_clock, "no longer trusted");
+    }
+
+    #[test]
+    fn one_modest_skew_is_forgiven_but_a_run_demotes() {
+        // 100 ms is beyond the 16.7 ms period but not gross.
+        let modest = || clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_millis(100);
+        let mut presenter = presenter(FakeAtomicIo::default());
+        assert!(!present_flip_at(&mut presenter, modest(), 1).hw_clock);
+        assert_eq!(presenter.flip_clock, PageFlipClock::Monotonic);
+        let good = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"), 2);
+        assert!(good.hw_clock, "a plausible stamp after one skew is trusted");
+        for sequence in 3..=5 {
+            assert!(!present_flip_at(&mut presenter, modest(), sequence).hw_clock);
+        }
+        assert_eq!(presenter.flip_clock, PageFlipClock::Unknown);
+    }
+
+    #[test]
+    fn vblank_support_decides_the_counter() {
+        let now = || clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock");
+        let mut probed_absent = presenter(FakeAtomicIo::default());
+        probed_absent.set_vblank_support(VblankSupport::Unsupported);
+        assert!(!present_flip_at(&mut probed_absent, now(), 7).vblank);
+
+        // Unknown: zeros are reported as no counter, but nothing latches —
+        // i915 resets the pipe counter on a modeset, so a later non-zero
+        // sequence proves the counter after all.
+        let mut unknown = presenter(FakeAtomicIo::default());
+        unknown.set_vblank_support(VblankSupport::Unknown);
+        assert!(!present_flip_at(&mut unknown, now(), 0).vblank);
+        assert!(!present_flip_at(&mut unknown, now(), 0).vblank);
+        assert_eq!(unknown.vblank, VblankSupport::Unknown, "never latched");
+        assert!(present_flip_at(&mut unknown, now(), 9).vblank);
+        assert_eq!(unknown.vblank, VblankSupport::Supported);
+
+        // Unknown: a counting sequence proves one.
+        let mut counting = presenter(FakeAtomicIo::default());
+        counting.set_vblank_support(VblankSupport::Unknown);
+        assert!(present_flip_at(&mut counting, now(), 12).vblank);
+        assert_eq!(counting.vblank, VblankSupport::Supported);
+        assert!(present_flip_at(&mut counting, now(), 0).vblank);
+
+        assert_eq!(classify_vblank_probe(Ok(())), VblankSupport::Supported);
+        assert_eq!(
+            classify_vblank_probe(Err(libc::EOPNOTSUPP)),
+            VblankSupport::Unsupported
+        );
+        assert_eq!(
+            classify_vblank_probe(Err(libc::EINVAL)),
+            VblankSupport::Unknown
+        );
+        // _IOWR('d', 0x3b, struct drm_crtc_get_sequence), a 24-byte struct.
+        assert_eq!(std::mem::size_of::<DrmCrtcGetSequence>(), 24);
+        assert_eq!(drm_ioctl_crtc_get_sequence(), 0xc018_643b);
+    }
+
+    #[test]
+    fn an_inconclusive_vblank_probe_is_retried_once_the_crtc_is_active() {
+        let now = || clock_now(libc::CLOCK_MONOTONIC).expect("CLOCK_MONOTONIC");
+        // The constructor's probe hit a disabled CRTC (EINVAL -> Unknown);
+        // the first flip proves it active, so the answer is asked again.
+        let mut io = FakeAtomicIo::default();
+        io.vblank_probes.push_back(VblankSupport::Supported);
+        let mut presenter = presenter(io);
+        presenter.set_vblank_support(VblankSupport::Unknown);
+        assert!(
+            present_flip_at(&mut presenter, now(), 0).vblank,
+            "a re-probed CRTC counts vblanks even while its counter reads 0"
+        );
+        assert_eq!(presenter.vblank, VblankSupport::Supported);
+        // Asked once only.
+        assert!(present_flip_at(&mut presenter, now(), 0).vblank);
+
+        // EOPNOTSUPP is the one answer that settles it for good.
+        let mut io = FakeAtomicIo::default();
+        io.vblank_probes.push_back(VblankSupport::Unsupported);
+        let mut absent = presenter_with_cancellation(io, AtomicCancellation::new().expect("eventfd"));
+        absent.set_vblank_support(VblankSupport::Unknown);
+        assert!(!present_flip_at(&mut absent, now(), 4).vblank);
+        assert_eq!(absent.vblank, VblankSupport::Unsupported);
+        assert!(!present_flip_at(&mut absent, now(), 5).vblank);
+    }
+
+    #[test]
+    fn flip_time_placement_rules() {
+        let secs = Duration::from_secs;
+        let period = Duration::from_millis(16);
+        let place = |clock, stamp, realtime, monotonic| {
+            flip_time_on_monotonic(clock, stamp, realtime, monotonic, period)
+        };
+        assert_eq!(
+            place(PageFlipClock::Monotonic, secs(90), secs(5000), secs(100)),
+            (secs(90), true)
+        );
+        // Up to one period ahead is kept; beyond it is not.
+        let in_blanking = secs(100) + Duration::from_millis(15);
+        assert_eq!(
+            place(PageFlipClock::Monotonic, in_blanking, secs(5000), secs(100)),
+            (in_blanking, true)
+        );
+        assert_eq!(
+            place(PageFlipClock::Monotonic, secs(101), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        // REALTIME 4990 is 10 s old at REALTIME 5000, so MONOTONIC 90.
+        assert_eq!(
+            place(PageFlipClock::Realtime, secs(4990), secs(5000), secs(100)),
+            (secs(90), false)
+        );
+        // Older than boot, or from a clock stepped backwards: not placeable.
+        assert_eq!(
+            place(PageFlipClock::Realtime, secs(1), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        assert_eq!(
+            place(PageFlipClock::Realtime, secs(5001), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        assert_eq!(
+            place(PageFlipClock::Unknown, secs(90), secs(5000), secs(100)),
+            (secs(100), false)
+        );
+        assert_eq!(
+            PageFlipClock::from_capability(Ok(1)),
+            PageFlipClock::Monotonic
+        );
+        assert_eq!(
+            PageFlipClock::from_capability(Ok(0)),
+            PageFlipClock::Realtime
+        );
+        assert_eq!(
+            PageFlipClock::from_capability(Err(io::Error::from_raw_os_error(libc::EINVAL))),
+            PageFlipClock::Unknown
+        );
+    }
+
+    #[test]
+    fn refresh_period_comes_from_the_scanned_out_mode() {
+        let presenter = presenter(FakeAtomicIo::default());
+        let millihz = u64::from(selection().mode.refresh_millihz);
+        assert!(millihz > 0);
+        assert_eq!(presenter.refresh_nanos(), Some(1_000_000_000_000 / millihz));
     }
 
     fn matching_flip(generation: u64) -> AtomicPageFlip {
         AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation,
@@ -2500,6 +3142,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2530,6 +3173,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2602,6 +3246,7 @@ mod tests {
             vec![AtomicPageFlip {
                 tv_sec: 0,
                 tv_usec: 0,
+                sequence: 0,
                 crtc_id: 999,
                 tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                     generation: 7,
@@ -2666,6 +3311,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2701,6 +3347,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -2710,6 +3357,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2745,6 +3393,7 @@ mod tests {
         io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2821,6 +3470,7 @@ mod tests {
         stale.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 8,
@@ -2878,6 +3528,7 @@ mod tests {
         presenter.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -3035,6 +3686,7 @@ mod tests {
         presenter.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Presentation(AtomicCommitCorrelation {
                 generation: 7,
@@ -3063,6 +3715,7 @@ mod tests {
         presenter.io.events.push_back(vec![AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 20,
             tag: Some(AtomicPageFlipTag::Disable),
         }]);
@@ -3123,12 +3776,14 @@ mod tests {
                 AtomicPageFlip {
                     tv_sec: 0,
                     tv_usec: 0,
+                    sequence: 1,
                     crtc_id: 202,
                     tag: Some(AtomicPageFlipTag::Presentation(second)),
                 },
                 AtomicPageFlip {
                     tv_sec: 0,
                     tv_usec: 0,
+                    sequence: 2,
                     crtc_id: 101,
                     tag: Some(AtomicPageFlipTag::Presentation(first)),
                 },
@@ -3147,12 +3802,14 @@ mod tests {
         let first = AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 101,
             tag: Some(AtomicPageFlipTag::Disable),
         };
         let second = AtomicPageFlip {
             tv_sec: 0,
             tv_usec: 0,
+            sequence: 0,
             crtc_id: 202,
             tag: Some(AtomicPageFlipTag::Disable),
         };

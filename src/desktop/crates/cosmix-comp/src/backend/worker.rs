@@ -2184,6 +2184,7 @@ pub(crate) mod tests {
                             crate::backend::render::KmsPresentationTimestamp {
                                 seconds: 1,
                                 nanoseconds: 2,
+                                ..Default::default()
                             },
                         ))),
                         view: view.clone(),

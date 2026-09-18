@@ -1164,7 +1164,7 @@ capture service is available through the Wayland protocol described below.</li>
 <h2 id="supported-wayland-protocols">Supported Wayland protocols</h2>
 <p>The compositor advertises the core compositor, subcompositor, seat, output,
 shared-memory, DMA-BUF, explicit synchronisation, viewporter, fractional-scale,
-presentation-time (nested only, see below), XDG shell and XDG decoration globals needed by its desktop
+presentation-time (see below), XDG shell and XDG decoration globals needed by its desktop
 clients.</p>
 <table><thead><tr><th>Protocol</th><th style="text-align: right">Version</th><th>Current support</th></tr></thead><tbody>
 <tr><td><code>zwlr_layer_shell_v1</code></td><td style="text-align: right">4</td><td>Layer surfaces and layer popups map, arrange and configure through Smithay's <code>LayerMap</code>; protocol strata, keyboard interactivity, input regions and exclusive usable-area effects are supported.</td></tr>
@@ -1172,7 +1172,7 @@ clients.</p>
 <tr><td><code>ext_foreign_toplevel_list_v1</code></td><td style="text-align: right">1</td><td>Mapped XDG toplevels expose stable mapping identifiers, title and app ID updates; unmap or destruction closes the handle, and late clients receive the current mapped set.</td></tr>
 <tr><td><code>ext_session_lock_v1</code></td><td style="text-align: right">1</td><td>Nested and live KMS modes support immediate output-sized lock-surface configures, secure blank-first presentation acknowledgement, lock-only input, VT pause/resume preservation and the locked/orphaned lifecycle.</td></tr>
 <tr><td><code>zwlr_screencopy_manager_v1</code></td><td style="text-align: right">3</td><td>Compatibility output capture into exact-layout <code>wl_shm</code> buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion.</td></tr>
-<tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode only for now (see Presentation feedback below); the KMS backend does not advertise it until it reports page flips.</td></tr>
+<tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below).</td></tr>
 </tbody></table>
 <h3 id="presentation-feedback">Presentation feedback</h3>
 <p><code>wp_presentation</code> reports when a client's commit was actually shown. The
@@ -1213,8 +1213,44 @@ locked, every frame treats the surfaces the lock hides as not shown. At most
 <code>tv</code> is CLOCK_MONOTONIC when the frame was handed to the host (not first
 photon), <code>flags</code> is 0, <code>seq</code> is 0 and <code>refresh</code> is 0 (unknown). It is
 reported only after the swapchain image was actually presented.</li>
-<li><strong>KMS backend:</strong> not advertised yet. It will report the page-flip time,
-vblank sequence and the flags the kernel proves.</li>
+<li><strong>KMS backend:</strong> advertised in client-content mode (not in
+<code>--first-light</code>, which draws no clients). A frame is reported only
+after its atomic commit's page-flip event arrived; a cancelled or failed
+flip reports nothing, and its commits keep waiting.
+<ul>
+<li><code>tv</code> is the kernel's page-flip time. At startup comp asks DRM whether
+those stamps are CLOCK_MONOTONIC (<code>DRM_CAP_TIMESTAMP_MONOTONIC</code>). If they
+are not, each stamp is moved from CLOCK_REALTIME by the offset between
+the two clocks sampled when the event is read. If the capability query
+fails, <code>tv</code> is the time the event was read.</li>
+<li>A MONOTONIC stamp may lie up to one refresh period in the future:
+vblank-helper drivers stamp the start of scanout, which the flip event
+can precede. Such a stamp is kept. A stamp further ahead is reported at
+read time without <code>hw_clock</code>; a second ahead, or three such flips in a
+row, and the capability is not trusted for the rest of the run.</li>
+<li><code>flags</code> are <code>vsync</code> (there are no async flips) and <code>hw_completion</code> (the
+flip-complete event), plus <code>hw_clock</code> only when <code>tv</code> is the kernel's own
+MONOTONIC stamp. Never <code>zero_copy</code>: client buffers are composited into
+scanout buffers, not scanned out directly.</li>
+<li>A device without vblank support (virtio-gpu, simpledrm; probed with
+<code>DRM_IOCTL_CRTC_GET_SEQUENCE</code>, or seen as a sequence stuck at 0)
+completes flips on no vblank grid, so its frames carry only
+<code>hw_completion</code> and <code>seq</code> 0.</li>
+<li><code>seq</code> is the CRTC's vblank counter at the flip, extended per output
+beyond 32 bits so it only ever increases (across wraps, and across a
+counter that restarts on resume).</li>
+<li><code>refresh</code> is the scanned-out mode's period, <code>1e12 / refresh_mHz</code> ns.</li>
+<li>Each flip is reported on the client output registered for its
+connector; a flip on an output that is not a client output resolves
+nothing. A flip that completed just before a VT switch is still
+reported.</li>
+<li>With several outputs, each flip carries the frame's content and the first
+presented one wins (content is not yet tracked per output); content-source
+costs are counted with the first flip only.</li>
+<li>A buffer the renderer fails to import is discarded as soon as the render
+world sees it, as on the nested backend.</li>
+</ul>
+</li>
 <li><strong>SHM clients:</strong> a surface counts as sampling its newest buffer once the
 GPU image is prepared. Bevy drops the old GPU image while a replacement is
 pending, so a pending upload is reported as not shown rather than stale.</li>
