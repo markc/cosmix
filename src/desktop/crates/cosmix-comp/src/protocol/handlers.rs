@@ -2409,6 +2409,10 @@ impl XdgActivationHandler for WaylandState {
             tracing::debug!("xdg-activation for a surface this compositor does not know");
             return;
         }
+        // F1.2: an activation of a window on another workspace switches to
+        // that workspace first (the lock above and the exclusive-layer rule
+        // inside the helper keep it inert where a switch is not allowed).
+        self.ensure_workspace_shown(&surface.id());
         self.raise_for_focus_interaction(&surface);
         self.arbitrate_keyboard_focus(Some(surface), false, false);
     }

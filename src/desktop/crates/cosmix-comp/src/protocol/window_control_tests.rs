@@ -1075,3 +1075,99 @@ fn refusals_carry_error_code() {
     let (_, untouched) = crate::port::with_error_code(0, Arc::from(r#"{"error":"x"}"#));
     assert_eq!(&*untouched, r#"{"error":"x"}"#);
 }
+
+/// Rule 6 (F1.2): `comp.window.focus` on a window that lives on another
+/// workspace switches to that workspace and focuses it — never pulls the
+/// window across — on both the raise and the focus-only path, and the
+/// reason ladder sees it as on-current (no `reason` key).
+#[test]
+fn focus_on_an_off_workspace_window_switches_and_focuses() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    for raise in [true, false] {
+        assert_eq!(harness.server.state.workspace_current(), 1);
+        assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+        assert!(harness.server.state.surfaces[&beta].layout.visible);
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::Focus {
+                id,
+                generation,
+                raise,
+            },
+        );
+        assert_eq!(rc, 0, "raise {raise}: {body}");
+        assert_eq!(body["focused"], true, "raise {raise}: {body}");
+        assert!(body.get("reason").is_none(), "raise {raise}: {body}");
+        assert_eq!(harness.server.state.workspace_current(), 2);
+        let state = &harness.server.state;
+        assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+        assert!(state.surfaces[&alpha].layout.visible);
+        assert!(state.surfaces[&alpha].focused);
+        assert!(!state.surfaces[&beta].layout.visible);
+        assert_eq!(
+            focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+            Some(alpha.clone())
+        );
+        // Back to 1 for the focus-only pass.
+        harness
+            .server
+            .state
+            .switch_workspace(None, WorkspaceTarget::Index(1), true)
+            .expect("back to 1");
+        let _ = harness.sync();
+    }
+}
+
+/// F1.2 at `comp.window.restore {id, generation}`: restoring a window that
+/// was minimised on another workspace switches to that workspace and shows
+/// it there.
+#[test]
+fn restore_by_id_switches_to_the_windows_workspace() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&surface);
+    assert!(harness.server.state.surfaces[&alpha].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Restore {
+            target: Some((id, generation)),
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["minimized"], false);
+    assert_eq!(body["changed"], true);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    let state = &harness.server.state;
+    assert!(!state.surfaces[&alpha].minimized);
+    assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+    assert!(state.surfaces[&alpha].layout.visible);
+    assert!(state.surfaces[&alpha].focused);
+    assert!(!state.surfaces[&beta].layout.visible);
+    assert!(state.minimized_toplevels.is_empty());
+}

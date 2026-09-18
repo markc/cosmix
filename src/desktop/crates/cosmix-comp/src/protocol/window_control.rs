@@ -133,15 +133,12 @@ impl WaylandState {
             .count()
     }
 
-    /// The entry the LIFO pop will restore: the newest one that is still a
-    /// mapped, minimised, managed toplevel (the pop discards older invalid
-    /// entries on its way down).
+    /// The entry `restore {}` will restore: rule 8's candidate (the current
+    /// workspace's most recently minimised window, else the global one) —
+    /// the same predicate `restore_most_recently_minimized` uses, so the
+    /// prediction below and the restore cannot diverge.
     fn next_lifo_restore(&self) -> Option<(ObjectId, SurfaceId)> {
-        self.minimized_toplevels.iter().rev().find_map(|object| {
-            let record = self.surfaces.get(object)?;
-            (record.mapped && record.minimized && record.role.managed_toplevel())
-                .then(|| (object.clone(), record.id))
-        })
+        self.lifo_restore_candidate()
     }
 
     /// Every one-pass `comp.window.*` verb. A session lock refuses them all:
@@ -449,6 +446,12 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
+        // Rule 6 (F1.2): an off-workspace window is brought on screen by
+        // switching to its workspace, never by pulling it across, so the
+        // ladder below sees it as on-current. Both the raise and the
+        // focus-only path inherit; `service_window_op` already refused a
+        // session lock before reaching here.
+        self.ensure_workspace_shown(&object);
         let record = &self.surfaces[&object];
         let surface = record.role.wl_surface().clone();
         // The same candidacy Alt+Tab uses; a refusal says which gate held.

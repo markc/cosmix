@@ -14697,6 +14697,125 @@ fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
     assert_profile(&mut kms_live);
 }
 
+/// Rule 8 through the Super+Shift+M chord, in both binding profiles: the
+/// current workspace's most recently minimised window comes back first
+/// even though a window elsewhere was minimised later; the next press
+/// restores that one and switches to its workspace (F1.2).
+#[test]
+fn both_binding_profiles_restore_the_current_workspaces_minimized_toplevel_first() {
+    use workspaces::WorkspaceTarget;
+    let assert_profile = |harness: &mut KeybindingHarness| {
+        let configure = test_toplevel_record(harness)
+            .required_configure
+            .expect("initial configure exists");
+        ack_and_map_test_toplevel(harness, u32::from(configure));
+        let first = test_toplevel_record(harness).role.wl_surface().clone();
+        let second_object = map_test_undecorated_toplevel(harness);
+        let second = harness.server.state.surfaces[&second_object]
+            .role
+            .wl_surface()
+            .clone();
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&second_object, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        harness.server.state.minimize_toplevel(&first);
+        harness.server.state.minimize_toplevel(&second);
+        assert_eq!(
+            harness.server.state.minimized_toplevels,
+            [first.id(), second.id()]
+        );
+        assert_eq!(harness.server.state.workspace_current(), 1);
+        harness.chord(&[125, 42, 50]);
+        assert!(
+            !harness.server.state.surfaces[&first.id()].minimized,
+            "the current workspace's entry is restored first"
+        );
+        assert!(
+            harness.server.state.surfaces[&second.id()].minimized,
+            "the newer entry on another workspace stays hidden"
+        );
+        assert_eq!(harness.server.state.workspace_current(), 1);
+        assert_eq!(
+            focused_surface(harness.server.state.keyboard.current_focus()),
+            Some(first.clone())
+        );
+        harness.chord(&[125, 42, 50]);
+        assert!(!harness.server.state.surfaces[&second.id()].minimized);
+        assert_eq!(
+            harness.server.state.workspace_current(),
+            2,
+            "the global fallback switches to the window's workspace"
+        );
+        assert_eq!(harness.server.state.surfaces[&second.id()].workspace, 2);
+        assert!(harness.server.state.surfaces[&second.id()].layout.visible);
+        assert!(!harness.server.state.surfaces[&first.id()].layout.visible);
+        assert_eq!(
+            focused_surface(harness.server.state.keyboard.current_focus()),
+            Some(second.clone())
+        );
+        assert!(harness.server.state.minimized_toplevels.is_empty());
+    };
+
+    let mut nested = KeybindingHarness::new(true);
+    assert_profile(&mut nested);
+    let (vt_requests, _) = mpsc::channel();
+    let mut kms_live = KeybindingHarness::new_with_kms_live_bindings(vt_requests);
+    assert_profile(&mut kms_live);
+}
+
+/// F1.2 at xdg-activation: activating a window that lives on another
+/// workspace switches to that workspace (never pulls the window across)
+/// and then focuses it.
+#[test]
+fn xdg_activation_switches_workspace_first() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    // Mapped while 2 is current: joins workspace 2 (rule 2).
+    let second = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(harness.server.state.surfaces[&second].workspace, 2);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let _ = harness.sync();
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(first.clone())
+    );
+
+    let surface = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("test-token")),
+        XdgActivationTokenData::default(),
+        surface,
+    );
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&second].workspace, 2);
+    assert!(harness.server.state.surfaces[&second].layout.visible);
+    assert!(!harness.server.state.surfaces[&first].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(second.clone())
+    );
+}
+
 #[test]
 fn output_resize_reconfigures_a_maximized_window_to_the_new_outer_rectangle() {
     let (mut harness, _, _, _) = positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Mac);
@@ -29747,6 +29866,98 @@ fn window_restore_verb_pops_lifo_then_reports_not_found() {
         assert_eq!(body["minimized"], false);
     }
     assert!(harness.server.state.minimized_toplevels.is_empty());
+}
+
+/// Rule 8 (D14): `restore {}` prefers the most recently minimised window on
+/// the current workspace over a more recent one elsewhere, and only when the
+/// current workspace has none does it take the global most-recent — which
+/// then switches to that window's workspace (F1.2). The verb's prediction
+/// (`next_lifo_restore`) and the restore share one predicate, so the reply
+/// names the window that was actually restored.
+#[cfg(feature = "bus")]
+#[test]
+fn restore_prefers_the_current_workspaces_most_recent_minimised_window() {
+    use workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let beta = map_test_undecorated_toplevel(&mut harness);
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let runtime = control_reply_runtime();
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&beta, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    // Minimise alpha (on 1, current) then beta (on 2): beta is the LIFO top.
+    for object in [&alpha, &beta] {
+        let surface = harness.server.state.surfaces[object]
+            .role
+            .wl_surface()
+            .clone();
+        harness.server.state.minimize_toplevel(&surface);
+    }
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        [alpha.clone(), beta.clone()]
+    );
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    let restore_any = crate::port::WindowOp::Restore { target: None };
+
+    // First: alpha, the current workspace's entry, although beta is newer;
+    // no switch.
+    let admission = ingress
+        .request_window(restore_any.clone())
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["id"], alpha_id);
+    assert_eq!(body["generation"], alpha_generation);
+    assert_eq!(body["minimized"], false);
+    assert_eq!(body["changed"], true);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+    assert!(harness.server.state.surfaces[&beta].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        std::slice::from_ref(&beta)
+    );
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(alpha.clone())
+    );
+
+    // Second: nothing minimised on 1, so the global most-recent (beta) is
+    // restored AND its workspace becomes current; beta stays on 2.
+    let admission = ingress
+        .request_window(restore_any.clone())
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["id"], beta_id);
+    assert_eq!(body["generation"], beta_generation);
+    assert_eq!(body["minimized"], false);
+    assert!(!harness.server.state.surfaces[&beta].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&beta].workspace, 2);
+    assert!(harness.server.state.surfaces[&beta].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(beta.clone())
+    );
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+
+    // Third: nothing left anywhere.
+    let admission = ingress
+        .request_window(restore_any)
+        .expect("restore admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body, json!({"error": "not_found", "minimized_count": 0}));
 }
 
 /// A Bus minimise that lands mid-drag ends the client-started move, as an

@@ -15,13 +15,21 @@ impl WaylandState {
     /// Requests cannot escape session locking or an exclusive layer. This
     /// intentionally has no focus-stealing timestamp policy yet: local X11
     /// automation is allowed, but cannot activate hidden/unmanaged windows.
+    ///
+    /// F1.2: a window on another workspace is brought on screen by switching
+    /// to that workspace first (never by pulling it across). The guard runs
+    /// BEFORE the switch so an X11 `_NET_ACTIVE_WINDOW` cannot change
+    /// workspace under a lock, and the candidate check runs AFTER it, because
+    /// it reads `layout.visible`, which the switch's recompute sets.
     pub(super) fn activate_managed_window(&mut self, surface: &WlSurface) {
-        if self.session_lock_active()
-            || self.highest_exclusive_layer().is_some()
-            || !self
-                .surfaces
-                .get(&surface.id())
-                .is_some_and(|record| self.window_switch_candidate(record))
+        if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
+            return;
+        }
+        self.ensure_workspace_shown(&surface.id());
+        if !self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|record| self.window_switch_candidate(record))
         {
             return;
         }

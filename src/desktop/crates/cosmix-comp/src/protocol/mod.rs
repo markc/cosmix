@@ -4903,6 +4903,14 @@ fn configure_sequence_is_acked(required: Option<Serial>, acknowledged: Option<Se
         .is_some_and(|(required, acknowledged)| acknowledged >= required)
 }
 
+/// A minimise-LIFO entry that `restore_window` would restore: a mapped,
+/// minimised, managed toplevel. Every minimised window is on the LIFO; the
+/// entries that are not this are stale (unmapped or closed) and are pruned
+/// on the next `restore {}`.
+fn lifo_restorable(record: &SurfaceRecord) -> bool {
+    record.mapped && record.minimized && record.role.managed_toplevel()
+}
+
 fn effectively_visible(
     own_buffer: bool,
     ancestor_visible: bool,
@@ -13532,15 +13540,9 @@ impl WaylandState {
             self.finish_interactive_pointer(true);
         }
         // X11 windows also learn the state through EWMH so the client can
-        // stop rendering.
+        // stop rendering (D15: derived from the minimised flag just set).
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(&object)
-            .and_then(|record| record.role.x11())
-        {
-            let _ = role.surface.set_suspended(true);
-        }
+        self.sync_x11_suspended(&object);
         self.minimized_toplevels.retain(|entry| *entry != object);
         self.minimized_toplevels.push(object);
         #[cfg(feature = "bus")]
@@ -13550,21 +13552,52 @@ impl WaylandState {
         self.retarget_pointer_after_visibility_change();
     }
 
-    /// Pops the minimise LIFO until one entry restores; returns the
-    /// restored object, or `None` when nothing restorable was left.
+    /// Rule 8 (D14): the entry `restore {}` and the Super+Shift+M binding
+    /// restore — the most recently minimised window on the current
+    /// workspace, else the most recently minimised one anywhere (which then
+    /// switches to it through `restore_window`). Only entries that are still
+    /// mapped, minimised, managed toplevels count; the walk skips the rest
+    /// without discarding them. The ONE predicate for both the binding and
+    /// the verb's prediction (`next_lifo_restore`).
+    fn lifo_restore_candidate(&self) -> Option<(ObjectId, SurfaceId)> {
+        let current = self.workspace_current();
+        let restorable = || {
+            self.minimized_toplevels.iter().rev().filter_map(|object| {
+                self.surfaces
+                    .get(object)
+                    .filter(|record| lifo_restorable(record))
+                    .map(|record| (object, record))
+            })
+        };
+        restorable()
+            .find(|(_, record)| record.workspace == current)
+            .or_else(|| restorable().next())
+            .map(|(object, record)| (object.clone(), record.id))
+    }
+
+    /// Restores `lifo_restore_candidate` and prunes the LIFO of entries that
+    /// are no longer restorable (what the old pop discarded on its way
+    /// down); returns the restored object, or `None` when nothing
+    /// restorable was left.
     fn restore_most_recently_minimized(&mut self) -> Option<ObjectId> {
-        while let Some(object) = self.minimized_toplevels.pop() {
-            if self.restore_window(&object) {
-                return Some(object);
-            }
-        }
-        None
+        let restored = self
+            .lifo_restore_candidate()
+            .map(|(object, _)| object)
+            .filter(|object| self.restore_window(object));
+        let surfaces = &self.surfaces;
+        self.minimized_toplevels
+            .retain(|entry| surfaces.get(entry).is_some_and(lifo_restorable));
+        restored
     }
 
     /// The per-window half of a restore: un-minimise one mapped managed
-    /// toplevel, drop it from the LIFO, then raise, focus and retarget the
-    /// pointer. Returns `false` (and changes nothing but the LIFO entry) when
-    /// the object is not a mapped, minimised, managed toplevel.
+    /// toplevel, drop it from the LIFO, switch to its workspace when that is
+    /// allowed (F1.2 — never pulls the window across), then raise, focus
+    /// and retarget the pointer. Returns `false` (and changes nothing but
+    /// the LIFO entry) when the object is not a mapped, minimised, managed
+    /// toplevel. No lock guard of its own: `ensure_workspace_shown` is inert
+    /// under a session lock or an exclusive layer (D18), so a locked restore
+    /// un-minimises without switching and the window stays off screen.
     fn restore_window(&mut self, object: &ObjectId) -> bool {
         self.minimized_toplevels.retain(|entry| entry != object);
         let restored = self.surfaces.get_mut(object).and_then(|record| {
@@ -13577,20 +13610,12 @@ impl WaylandState {
         let Some((surface, _id)) = restored else {
             return false;
         };
+        self.ensure_workspace_shown(object);
         // D15: un-minimised is not the same as on screen — a window still
         // off the current workspace (a restore the lock or an exclusive
         // layer kept from switching) stays suspended.
         #[cfg(feature = "xwayland")]
-        {
-            let current = self.workspace_current();
-            if let Some(record) = self.surfaces.get(object)
-                && let Some(role) = record.role.x11()
-            {
-                let _ = role
-                    .surface
-                    .set_suspended(workspaces::x11_suspended(record, current));
-            }
-        }
+        self.sync_x11_suspended(object);
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(_id, "wayland.focus");
         self.recompute_effective_visibility();

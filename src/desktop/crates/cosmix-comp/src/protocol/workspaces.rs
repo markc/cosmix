@@ -197,14 +197,29 @@ impl WaylandState {
     pub(crate) fn on_current_workspace(&self, record: &SurfaceRecord) -> bool {
         on_workspace(record, self.workspace_current())
     }
+
+    /// D15 applied to one window: derive an X11 window's suspended flag from
+    /// what hides it (minimised OR off the current workspace) and set it.
+    /// Every `set_suspended` on a managed X11 window goes through here —
+    /// minimise, restore, the workspace switch and move halves — so no path
+    /// can resume a window that is still off screen. A no-op for every
+    /// other role.
+    #[cfg(feature = "xwayland")]
+    pub(super) fn sync_x11_suspended(&self, object: &ObjectId) {
+        let current = self.workspace_current();
+        if let Some(record) = self.surfaces.get(object)
+            && let Some(role) = record.role.x11()
+        {
+            let _ = role.surface.set_suspended(x11_suspended(record, current));
+        }
+    }
 }
 
-// The primitives: no production caller until the verb, prop and binding
-// slices land on this one (the tests drive them directly), so the block is
-// allowed dead outside tests. The readers above are NOT — they have callers
-// on the frame path — so a genuinely dead helper there still trips the lint.
-// Drop the attribute with the first wired caller.
-#[cfg_attr(not(test), allow(dead_code))]
+// `switch_workspace` and its halves have a production caller
+// (`ensure_workspace_shown`, wired at every bring-into-view path); the move
+// and count primitives are driven by the prop, verb and binding slices and
+// keep a per-item allow until those land. The allow is per item so a
+// genuinely dead helper still trips the lint.
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
     /// `Some(k)` must be the default output's key or name (D3). Any other
@@ -246,15 +261,10 @@ impl WaylandState {
             self.finish_interactive_pointer(true);
         }
         // X11 windows learn the state through EWMH so the client can stop
-        // rendering.
+        // rendering. Derived, not written as `true`: the caller has already
+        // moved the window (or `current`) so the rule reads "off screen".
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(object)
-            .and_then(|record| record.role.x11())
-        {
-            let _ = role.surface.set_suspended(true);
-        }
+        self.sync_x11_suspended(object);
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(id, cause);
         #[cfg(not(feature = "bus"))]
@@ -268,14 +278,7 @@ impl WaylandState {
             return;
         };
         #[cfg(feature = "xwayland")]
-        {
-            let current = self.workspace_current();
-            if let Some(record) = self.surfaces.get(object)
-                && let Some(role) = record.role.x11()
-            {
-                let _ = role.surface.set_suspended(x11_suspended(record, current));
-            }
-        }
+        self.sync_x11_suspended(object);
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(id, cause);
         #[cfg(not(feature = "bus"))]
@@ -343,10 +346,13 @@ impl WaylandState {
             (leaving, arriving)
         };
         self.titlebar_click_candidate = None;
+        // `current` moves first: the per-window halves derive the X11
+        // suspended flag from it (`sync_x11_suspended`), so a leaving window
+        // must already read as off the current workspace.
+        self.workspaces.current.insert(output.clone(), to);
         for object in &leaving {
             self.withdraw_window_for_workspace(object, "workspace.switch");
         }
-        self.workspaces.current.insert(output.clone(), to);
         for object in &arriving {
             self.present_window_for_workspace(object, "workspace.switch");
         }
@@ -360,6 +366,8 @@ impl WaylandState {
     /// `Next`/`Prev` are relative to the window's own workspace and always
     /// wrap. Returns `(from, to)`; never touches the window's generation
     /// (the object is the same window, only placed elsewhere).
+    // No production caller until the prop/verb/binding slices land.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn move_window_to_workspace(
         &mut self,
         object: &ObjectId,
@@ -412,6 +420,8 @@ impl WaylandState {
     /// side effect added to `present_window_for_workspace` later must be
     /// added to `sync_x11_suspended_for_workspaces` too (or the shrink path
     /// switched to the per-window halves).
+    // No production caller until the prop slice lands.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_workspace_count(
         &mut self,
         count: u32,

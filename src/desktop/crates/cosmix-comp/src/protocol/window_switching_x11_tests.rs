@@ -192,6 +192,103 @@ fn minimized_prop_suspends_and_resumes_x11_windows() {
     assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 
+/// F1.2 at the X11 unminimise request: an off-workspace X11 window that a
+/// client un-minimises is brought on screen by switching to its workspace
+/// (never pulled across), un-suspended (D15) and focused — the request is
+/// `restore_window` (D5), so it inherits the switch.
+#[test]
+fn x11_unminimise_of_an_off_workspace_window_switches_first() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let native = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, surface, window, object) = associate_normal_window(&mut harness, 908);
+    commit_dmabuf(&mut harness, id, 32, 24);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&object, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&object].layout.visible);
+    assert!(window.is_minimized(), "off-workspace: suspended (D15)");
+    harness.server.state.minimize_toplevel(&surface);
+    assert!(harness.server.state.surfaces[&object].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+
+    harness.server.state.x11_unminimize_request(window.clone());
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.minimized);
+    assert_eq!(record.workspace, 2, "never pulled across");
+    assert!(record.layout.visible);
+    assert!(!window.is_minimized(), "on screen again: not suspended");
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert!(!harness.server.state.surfaces[&native].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface)
+    );
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+}
+
+/// D18: under a session lock the client-driven X11 paths cannot change the
+/// workspace. `_NET_ACTIVE_WINDOW` is refused outright; an unminimise still
+/// clears the minimised flag but the window stays off its workspace and
+/// therefore suspended (D15), and `workspace_current()` is unchanged.
+#[test]
+fn locked_x11_activation_and_unminimise_do_not_switch_workspace() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let native = test_toplevel_record(&harness).role.wl_surface().clone();
+    let (id, _surface, window, object) = associate_normal_window(&mut harness, 909);
+    commit_dmabuf(&mut harness, id, 32, 24);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&object, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    harness.server.state.activate_managed_window(&native);
+    let _ = harness.sync();
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    assert!(harness.server.state.session_lock_active());
+    assert_eq!(harness.server.state.workspace_current(), 1);
+
+    harness.server.state.x11_activate_request(window.clone());
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(!harness.server.state.surfaces[&object].layout.visible);
+    assert!(!harness.server.state.surfaces[&object].focused);
+
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&object)
+        .unwrap()
+        .minimized = true;
+    harness
+        .server
+        .state
+        .minimized_toplevels
+        .push(object.clone());
+    harness.server.state.x11_unminimize_request(window.clone());
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.minimized, "un-minimised, but not switched to");
+    assert_eq!(record.workspace, 2);
+    assert!(!record.layout.visible);
+    assert!(
+        window.is_minimized(),
+        "still off screen: still suspended (D15)"
+    );
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+}
+
 /// X11 windows have no `windows.*` row, so their fence comes from
 /// `surfaces.s<id>.generation`; the id form of the window verbs then works
 /// on them, and `focus.window` names a focused X11 window.
