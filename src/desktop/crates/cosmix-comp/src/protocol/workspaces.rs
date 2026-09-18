@@ -473,9 +473,12 @@ impl WaylandState {
         {
             self.sync_x11_suspended_for_workspaces();
             // Both the count and (possibly) `current` changed, and stranded
-            // windows moved: republish the root pair and every window.
-            self.publish_x11_desktops();
+            // windows moved: republish every window, THEN the root pair, so
+            // no reader sees a `_NET_WM_DESKTOP` at or above the new
+            // `_NET_NUMBER_OF_DESKTOPS` (a window on an old desktop under
+            // the old count is valid; the reverse is not).
             self.sync_x11_desktops();
+            self.publish_x11_desktops();
         }
         self.settle_workspace_visibility();
         Ok((old, count))

@@ -143,7 +143,14 @@ fn supported_atoms_list_desktop_atoms() {
         2,
         "both the grow and the shrink arm publish the count"
     );
-    assert!(count.contains("self.sync_x11_desktops();"), "a shrink republishes every window");
+    let windows_synced = count
+        .find("self.sync_x11_desktops();")
+        .expect("a shrink republishes every window");
+    let root_published = count.rfind("self.publish_x11_desktops();").unwrap();
+    assert!(
+        windows_synced < root_published,
+        "shrink: windows first, then the root count, so no reader sees a desktop >= count"
+    );
     // The XWM start publishes the real model over start_wm's 1/0.
     let ready = comp
         .split("\"XWayland ready; XWM started\"")
