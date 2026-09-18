@@ -14163,6 +14163,415 @@ fn minimize_hides_the_tree_transfers_focus_withholds_frames_and_retargets_pointe
     );
 }
 
+/// Rules 3 and 9: a workspace switch hides the leaving tree through the
+/// visibility funnel (`visible:false`, `minimized:false`, LIFO untouched) and
+/// withholds its frame callbacks; switching back restores both with no client
+/// dispatch in between — the client never acks or commits, which is the "no
+/// round-trip" the contract promises. (Focus handoff still sends its
+/// activation-state configure, exactly as minimise does.)
+#[test]
+fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
+    use workspaces::WorkspaceTarget;
+    let (mut harness, _pointer, object, _) =
+        positioned_test_ssd_harness(cosmix_deco::ChromeStyle::Win11);
+    let (popup, _) = map_test_popup(&mut harness, None);
+    let replacement = map_test_undecorated_toplevel(&mut harness);
+    let root = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let keyboard = harness.server.state.keyboard.clone();
+    keyboard.set_focus(
+        &mut harness.server.state,
+        Some(SeatFocusTarget::Wayland(root.clone())),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let callback = harness.allocate_object_id();
+    let popup_callback = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        3,
+        &words(&[callback]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    send_request(
+        &mut harness.client,
+        popup.protocol_id(),
+        3,
+        &words(&[popup_callback]),
+    );
+    send_request(&mut harness.client, popup.protocol_id(), 6, &[]);
+    harness.dispatch_client();
+    let _ = harness.sync();
+
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert_eq!(harness.server.state.surfaces[&replacement].workspace, 1);
+    let switched = harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    assert_eq!((switched.from, switched.to), (1, 2));
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    for window in [&object, &replacement] {
+        let record = &harness.server.state.surfaces[window];
+        assert!(!record.layout.visible, "{window:?} hidden by the switch");
+        assert!(!record.minimized, "{window:?} is not minimised");
+        assert_eq!(record.workspace, 1, "{window:?} stays on its workspace");
+    }
+    assert!(!harness.server.state.surfaces[&popup].layout.visible);
+    assert!(harness.server.state.minimized_toplevels.is_empty());
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        None,
+        "nothing on workspace 2 to focus"
+    );
+    // The switch itself sends no frame completions and no new configure
+    // the client would have to answer: the only xdg traffic is the
+    // activation-state change of the window that lost focus.
+    let events = harness.sync();
+    assert!(events.iter().all(|(object, opcode, _)| {
+        (*object != callback && *object != popup_callback) || *opcode != 0
+    }));
+    harness.server.state.handle_frame(Vec::new());
+    assert!(harness.sync().iter().all(|(object, opcode, _)| {
+        (*object != callback && *object != popup_callback) || *opcode != 0
+    }));
+
+    // Back, with no client dispatch in between: visible again at once, and
+    // the withheld callbacks complete on the next frame.
+    let switched = harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("switch back to 1");
+    assert_eq!((switched.from, switched.to), (2, 1));
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert!(harness.server.state.surfaces[&replacement].layout.visible);
+    assert!(harness.server.state.surfaces[&popup].layout.visible);
+    assert!(!harness.server.state.surfaces[&object].minimized);
+    assert!(
+        focused_surface(harness.server.state.keyboard.current_focus()).is_some(),
+        "a visible toplevel takes focus again"
+    );
+    harness.server.state.handle_frame(Vec::new());
+    assert_eq!(
+        harness
+            .sync()
+            .iter()
+            .filter(|(object, opcode, _)| {
+                (*object == callback || *object == popup_callback) && *opcode == 0
+            })
+            .count(),
+        2
+    );
+}
+
+/// Rule 2 (D4): a managed toplevel reads `workspace == 0` until its first
+/// buffer commit maps it, then joins the current workspace at that edge.
+#[test]
+fn new_windows_join_the_current_workspace_at_map() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    // Role created, initial configure pending: not placed on any workspace.
+    assert!(!test_toplevel_record(&harness).mapped);
+    assert_eq!(test_toplevel_record(&harness).workspace, 0);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    assert!(harness.server.state.surfaces[&first].mapped);
+    assert_eq!(harness.server.state.surfaces[&first].workspace, 1);
+    assert!(harness.server.state.surfaces[&first].layout.visible);
+
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    assert!(!harness.server.state.surfaces[&first].layout.visible);
+    let second = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(harness.server.state.surfaces[&second].workspace, 2);
+    assert!(harness.server.state.surfaces[&second].layout.visible);
+    assert_eq!(harness.server.state.surfaces[&first].workspace, 1);
+    assert!(!harness.server.state.surfaces[&first].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(
+            harness.server.state.surfaces[&second]
+                .role
+                .wl_surface()
+                .clone()
+        )
+    );
+}
+
+/// Rule 7, core half: indices outside `1..=count` and `next`/`prev` at an
+/// end without `wrap` are refused; with `wrap` they go round.
+#[test]
+fn workspace_switch_refusals() {
+    use workspaces::{WorkspaceRefusal, WorkspaceTarget};
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let state = &mut harness.server.state;
+    assert_eq!(state.workspaces.count, 4);
+    assert_eq!(state.workspace_current(), 1);
+    assert_eq!(
+        state.switch_workspace(None, WorkspaceTarget::Index(0), true),
+        Err(WorkspaceRefusal::InvalidIndex { count: 4 })
+    );
+    assert_eq!(
+        state.switch_workspace(None, WorkspaceTarget::Index(5), true),
+        Err(WorkspaceRefusal::InvalidIndex { count: 4 })
+    );
+    assert_eq!(
+        state.switch_workspace(None, WorkspaceTarget::Prev, false),
+        Err(WorkspaceRefusal::AtEnd { from: 1, count: 4 })
+    );
+    assert_eq!(state.workspace_current(), 1);
+    let wrapped = state
+        .switch_workspace(None, WorkspaceTarget::Prev, true)
+        .expect("prev wraps");
+    assert_eq!((wrapped.from, wrapped.to), (1, 4));
+    assert_eq!(state.workspace_current(), 4);
+    assert_eq!(
+        state.switch_workspace(None, WorkspaceTarget::Next, false),
+        Err(WorkspaceRefusal::AtEnd { from: 4, count: 4 })
+    );
+    let wrapped = state
+        .switch_workspace(None, WorkspaceTarget::Next, true)
+        .expect("next wraps");
+    assert_eq!((wrapped.from, wrapped.to), (4, 1));
+    // Same workspace: Ok, nothing to do.
+    let same = state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("no-op switch");
+    assert_eq!((same.from, same.to), (1, 1));
+    assert_eq!(
+        state.switch_workspace(Some("o_no_such_output"), WorkspaceTarget::Index(2), true),
+        Err(WorkspaceRefusal::UnknownOutput)
+    );
+    // The default output is addressable by its key and by its name.
+    let key = state.default_output_key().expect("test output");
+    let name = state.backend.default_output().expect("test output").name();
+    let by_key = state
+        .switch_workspace(Some(&key), WorkspaceTarget::Index(2), true)
+        .expect("switch by key");
+    assert_eq!((by_key.output.as_str(), by_key.to), (key.as_str(), 2));
+    let by_name = state
+        .switch_workspace(Some(&name), WorkspaceTarget::Index(3), true)
+        .expect("switch by name");
+    assert_eq!(
+        (by_name.output.as_str(), by_name.from, by_name.to),
+        (key.as_str(), 2, 3)
+    );
+    assert_eq!(state.workspace_current(), 3);
+    // Counts outside 1..=16 are refused.
+    assert_eq!(
+        state.set_workspace_count(0),
+        Err(WorkspaceRefusal::InvalidCount { max: 16 })
+    );
+    assert_eq!(
+        state.set_workspace_count(17),
+        Err(WorkspaceRefusal::InvalidCount { max: 16 })
+    );
+    assert_eq!(state.workspaces.count, 4);
+}
+
+/// Rule 11, core half: shrinking the count moves stranded windows to the
+/// last workspace and clamps the current one, so they are visible again.
+#[test]
+fn shrinking_count_strands_windows_and_clamps_current() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(4), true)
+        .expect("switch to 4");
+    let fourth = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(harness.server.state.surfaces[&fourth].workspace, 4);
+    assert!(!harness.server.state.surfaces[&first].layout.visible);
+
+    assert_eq!(harness.server.state.set_workspace_count(2), Ok((4, 2)));
+    assert_eq!(harness.server.state.workspaces.count, 2);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&fourth].workspace, 2);
+    assert!(harness.server.state.surfaces[&fourth].layout.visible);
+    assert_eq!(harness.server.state.surfaces[&first].workspace, 1);
+    assert!(!harness.server.state.surfaces[&first].layout.visible);
+    // Growing again changes nothing about placement.
+    assert_eq!(harness.server.state.set_workspace_count(4), Ok((2, 4)));
+    assert_eq!(harness.server.state.surfaces[&fourth].workspace, 2);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+
+    // A move is relative to the window, wraps, and never bumps generation.
+    let generation = harness.server.state.surfaces[&fourth].generation;
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&fourth, WorkspaceTarget::Prev),
+        Ok((2, 1))
+    );
+    assert!(!harness.server.state.surfaces[&fourth].layout.visible);
+    assert!(!harness.server.state.surfaces[&fourth].minimized);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&fourth, WorkspaceTarget::Prev),
+        Ok((1, 4))
+    );
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&fourth, WorkspaceTarget::Index(2)),
+        Ok((4, 2))
+    );
+    assert!(harness.server.state.surfaces[&fourth].layout.visible);
+    assert_eq!(
+        harness.server.state.surfaces[&fourth].generation,
+        generation
+    );
+}
+
+/// F1.4: a switch discards the feedback of every window it hides
+/// (`DiscardReason::Workspace`), and a later report that lists an
+/// off-workspace surface as waiting counts it Hidden, never Waiting.
+#[test]
+fn presentation_feedback_is_discarded_for_off_workspace_surfaces() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let id = harness.server.state.surfaces[&object].id;
+    let generation = harness.server.state.surfaces[&object].generation;
+    let (presentation, _) = bind_test_presentation(&mut harness);
+
+    let pending = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        1
+    );
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    assert_eq!(
+        harness.server.state.presentation.ledger.pending_count(id),
+        0
+    );
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, pending), [2], "{events:?}");
+
+    // Committed while off-workspace, then reported as waiting: Hidden.
+    let hidden = request_presentation_feedback(&mut harness, presentation);
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &object);
+    let (frame, mut content) = test_frame_report(id, 5_000, seq, false);
+    content.surfaces[0].waiting = true;
+    harness.server.state.frame_presented(frame, content);
+    let events = harness.sync();
+    assert_eq!(feedback_opcodes(&events, hidden), [2], "{events:?}");
+    let stats = harness
+        .server
+        .state
+        .presentation
+        .stats
+        .window(id.0, generation)
+        .expect("window stats after a report");
+    assert_eq!(stats.presented, 0);
+    assert!(
+        stats.discarded > 0,
+        "an off-workspace surface is Hidden (discards counted), not Waiting"
+    );
+}
+
+/// D18: `ensure_workspace_shown` switches to the window's workspace when it
+/// may, and is inert — returns false, changes nothing — under a session
+/// lock or an exclusive layer.
+#[test]
+fn ensure_workspace_shown_is_inert_under_a_session_lock_and_an_exclusive_layer() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    let second = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&second, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    assert!(harness.server.state.surfaces[&first].layout.visible);
+    // Already on the current workspace: nothing to do.
+    assert!(!harness.server.state.ensure_workspace_shown(&first));
+    // Unlocked: it switches, and never pulls the window across.
+    assert!(harness.server.state.ensure_workspace_shown(&second));
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&second].workspace, 2);
+    assert!(harness.server.state.surfaces[&second].layout.visible);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let _ = harness.sync();
+
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    assert!(harness.server.state.session_lock_active());
+    assert!(!harness.server.state.ensure_workspace_shown(&second));
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    #[cfg(feature = "bus")]
+    assert_ne!(
+        harness.server.state.full_dirty_cause(),
+        Some("workspace.switch")
+    );
+
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let second = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&second, WorkspaceTarget::Index(3)),
+        Ok((1, 3))
+    );
+    const TOP_LEFT: u32 = 1 | 4;
+    let _ = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let _ = harness.sync();
+    assert!(harness.server.state.highest_exclusive_layer().is_some());
+    assert!(!harness.server.state.ensure_workspace_shown(&second));
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    #[cfg(feature = "bus")]
+    assert_ne!(
+        harness.server.state.full_dirty_cause(),
+        Some("workspace.switch")
+    );
+}
+
 #[test]
 fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
     let assert_profile = |harness: &mut KeybindingHarness| {

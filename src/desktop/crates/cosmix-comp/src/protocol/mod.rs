@@ -3290,6 +3290,7 @@ impl ProtocolServer {
             interactive_pointer: None,
             exclusive_keyboard_focus: None,
             minimized_toplevels: Vec::new(),
+            workspaces: workspaces::WorkspaceState::default(),
             surfaces: HashMap::new(),
             foreign_toplevels: HashMap::new(),
             foreign_toplevel_identifiers: HashMap::new(),
@@ -4979,6 +4980,10 @@ struct SurfaceRecord {
     pending_window_state: Option<WindowStateSnapshot>,
     configured_window_states: Vec<ConfigureWindowStateSnapshot>,
     minimized: bool,
+    /// The managed toplevel's workspace, 1-based; `0` until it maps (rule
+    /// 2 stamps the current workspace at the map edge). Never bumps
+    /// `generation`: a moved window is the same window.
+    workspace: u32,
     focused: bool,
     chrome_pointer: ChromePointerSceneState,
     committed_window_geometry: Option<SceneWindowGeometry>,
@@ -6119,6 +6124,7 @@ struct WaylandState {
     interactive_pointer: Option<InteractivePointer>,
     exclusive_keyboard_focus: Option<ObjectId>,
     minimized_toplevels: Vec<ObjectId>,
+    workspaces: workspaces::WorkspaceState,
     surfaces: HashMap<ObjectId, SurfaceRecord>,
     foreign_toplevels: HashMap<SurfaceId, ForeignToplevelHandle>,
     foreign_toplevel_identifiers: HashMap<SurfaceId, String>,
@@ -8625,7 +8631,7 @@ impl WaylandState {
                 !matches!(record.role, SurfaceRole::Dormant(_))
                     && self.surface_is_session_presentable(record)
                     && record.role.parent_surface().is_none()
-                    && !self.surface_belongs_to_minimized_toplevel(record.role.wl_surface())
+                    && !self.surface_belongs_to_hidden_toplevel(record.role.wl_surface())
             })
             .map(|record| {
                 send_frames_surface_tree(record.role.wl_surface(), frame_time, &self.surfaces)
@@ -8643,11 +8649,18 @@ impl WaylandState {
         crate::frame_trace::event("comp_frame_callbacks", || (delivered as u64, 0, 0));
     }
 
-    fn surface_belongs_to_minimized_toplevel(&self, surface: &WlSurface) -> bool {
+    /// Rule 9: frame callbacks stop for a tree whose root is minimised OR
+    /// off the current workspace — the two states that hide a window
+    /// through the visibility funnel. Decided on the canonical root (not
+    /// `layout.visible`) so popups and subsurfaces follow their toplevel
+    /// through `send_frames_surface_tree`. A root that has not mapped yet
+    /// (`workspace == 0`) keeps 0.58.0's delivery: it is not off any
+    /// workspace, it has not joined one.
+    fn surface_belongs_to_hidden_toplevel(&self, surface: &WlSurface) -> bool {
         let root = canonical_root_surface(&self.popup_manager, surface);
-        self.surfaces
-            .get(&root.id())
-            .is_some_and(|record| record.minimized)
+        self.surfaces.get(&root.id()).is_some_and(|record| {
+            record.minimized || (record.mapped && !self.on_current_workspace(record))
+        })
     }
 
     /// The single seat-policy entry point, shared by both input transports.
@@ -10391,6 +10404,8 @@ impl WaylandState {
         let mut output_changes = Vec::new();
         #[cfg(feature = "bus")]
         let mut observed = Vec::new();
+        // Read once: the loop holds `surfaces` mutably.
+        let current_workspace = self.workspace_current();
         while let Some((id, ancestor_visible)) = stack.pop() {
             let Some(object) = self.surface_objects.get(&id).cloned() else {
                 continue;
@@ -10411,8 +10426,15 @@ impl WaylandState {
                 #[cfg(feature = "xwayland")]
                 SurfaceRole::X11(_) => true,
             };
+            // The own-buffer term: hidden = minimised OR off the current
+            // workspace (managed toplevels only; bands, layers, popups and
+            // locks are on every workspace). Both hide through this one
+            // funnel, so `visible:false, minimized:false` needs no reader
+            // change.
             let visible = effectively_visible(
-                record.mapped && !record.minimized,
+                record.mapped
+                    && !record.minimized
+                    && (!record.role.managed_toplevel() || record.workspace == current_workspace),
                 ancestor_visible,
                 association_visible,
             );
@@ -15300,6 +15322,7 @@ impl WaylandState {
                     );
                     #[cfg(feature = "bus")]
                     self.mark_surface_mapped(surface);
+                    let current_workspace = self.workspace_current();
                     let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                         #[cfg(test)]
                         {
@@ -15310,7 +15333,9 @@ impl WaylandState {
                         self.release_buffer_token(backing_retention_token);
                         return;
                     };
+                    let was_mapped = record.mapped;
                     record.mapped = commit_may_map_surface(record);
+                    workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                     let old_origin = (record.layout.x, record.layout.y);
                     if let Some(window_geometry) = window_geometry {
                         record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -15471,10 +15496,13 @@ impl WaylandState {
                 );
                 #[cfg(feature = "bus")]
                 self.mark_surface_mapped(surface);
+                let current_workspace = self.workspace_current();
                 let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                     return;
                 };
+                let was_mapped = record.mapped;
                 record.mapped = commit_may_map_surface(record);
+                workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                 let old_origin = (record.layout.x, record.layout.y);
                 if let Some(window_geometry) = window_geometry {
                     record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -15757,6 +15785,7 @@ mod input_injection;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;
+pub(crate) mod workspaces;
 #[cfg(feature = "xwayland")]
 mod xwayland;
 

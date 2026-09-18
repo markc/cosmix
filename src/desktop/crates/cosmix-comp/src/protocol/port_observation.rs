@@ -806,6 +806,13 @@ impl WaylandState {
             .get_or_insert("output.geometry");
     }
 
+    /// The pending full-snapshot cause, for tests that assert a path stayed
+    /// inert.
+    #[cfg(test)]
+    pub(crate) fn full_dirty_cause(&self) -> Option<&'static str> {
+        self.observations.full_dirty
+    }
+
     pub(crate) fn mark_session_observation_dirty(&mut self) {
         self.mark_focus_before_change("session.lock");
         self.observations.full_dirty.get_or_insert("session.lock");

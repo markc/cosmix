@@ -127,6 +127,50 @@ fn switching_skips_minimised_and_unmapped_windows() {
     );
 }
 
+/// F1.7: Alt+Tab scoping is automatic — a window moved off the current
+/// workspace drops out of the cycle exactly as a minimised one does, and
+/// activating it directly is refused the same way.
+#[test]
+fn switching_skips_off_workspace_windows() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().clone();
+    let second = map_test_undecorated_toplevel(&mut harness);
+    let third = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&second, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&second].layout.visible);
+    assert!(!harness.server.state.surfaces[&second].minimized);
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&third)
+        .unwrap()
+        .mapped = false;
+    harness.server.state.activate_managed_window(&first);
+    harness.server.state.cycle_window(false);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(first.clone())
+    );
+    let elsewhere = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&elsewhere);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(first)
+    );
+}
+
 #[test]
 fn switching_does_not_raise_or_focus_through_exclusive_layer_or_lock() {
     let mut harness = KeybindingHarness::new(true);

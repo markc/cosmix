@@ -1386,10 +1386,15 @@ impl WaylandState {
                 let surface = record.role.wl_surface().clone();
                 self.mark_surface_mapped(&surface);
             }
+            let current_workspace = self.workspace_current();
             let Some(record) = self.x11_role_record_mut(xid) else {
                 return;
             };
+            // `was_mapped` is false here (the guard above returned on a
+            // mapped record): a remap rejoins the current workspace (D4).
+            let was_mapped = record.mapped;
             record.mapped = true;
+            workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
             let id = record.id;
             self.pending_full_upserts.insert(id);
             self.recompute_effective_visibility();
@@ -1937,6 +1942,7 @@ impl WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -2641,8 +2647,8 @@ impl WaylandState {
         let Some(surface) = window.wl_surface() else {
             return;
         };
+        // `minimize_toplevel` sets the X11 suspended flag itself.
         self.minimize_toplevel(&surface);
-        let _ = window.set_suspended(true);
     }
 
     pub(super) fn x11_unminimize_request(&mut self, window: X11Surface) {

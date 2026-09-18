@@ -1248,17 +1248,9 @@ fn output_key_for(outputs: &[(Output, String)], requested: &Output) -> Option<St
         .map(|(_, key)| key.clone())
 }
 
-pub(crate) fn output_key(name: &str) -> String {
-    let mut key = String::from("o_");
-    for character in name.chars() {
-        if character.is_ascii_alphanumeric() {
-            key.push(character.to_ascii_lowercase());
-        } else {
-            key.push('_');
-        }
-    }
-    key
-}
+// The slug encoding lives with the workspace model (which needs it without
+// the `bus` feature); this is its published home for the port.
+pub(crate) use super::workspaces::output_key;
 
 fn surface_key(id: SurfaceId) -> String {
     format!("s{}", id.0)
