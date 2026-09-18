@@ -41,27 +41,45 @@ fn split_theme_list($value)
   return $out
 end
 
+fn pick_locale($lc_all, $lc_messages, $lang)
+  -- glibc precedence: LC_ALL, then LC_MESSAGES, then LANG -- the first
+  -- non-empty wins. The encoding (".UTF-8") is stripped; the
+  -- lang_COUNTRY@MODIFIER shape is kept for the loc_key matching chain.
+  -- "" and the C/POSIX locales mean "unlocalised".
+  $raw = $lc_all != "" ? $lc_all : ($lc_messages != "" ? $lc_messages : $lang)
+  $stripped = before($raw, ".")
+  if $stripped != nil then $raw = $stripped end
+  if $raw == "C" or $raw == "POSIX" then return "" end
+  return $raw
+end
+
 fn locale_id()
-  -- The desktop-entry locale from LANG: "en_AU.UTF-8" -> "en_AU" (encoding
-  -- and @modifier stripped). "" or the C/POSIX locales mean "unlocalised".
-  $lang = env("LANG")
-  $stripped = before($lang, ".")
-  if $stripped != nil then $lang = $stripped end
-  $stripped = before($lang, "@")
-  if $stripped != nil then $lang = $stripped end
-  if $lang == "C" or $lang == "POSIX" then return "" end
-  return $lang
+  return pick_locale(env("LC_ALL"), env("LC_MESSAGES"), env("LANG"))
 end
 
 fn loc_key($group, $key, $locale)
-  -- Localised key lookup: Key[lang_CT], then Key[lang], then Key.
+  -- Localised key lookup per the spec's matching order:
+  -- Key[lang_COUNTRY@MODIFIER], Key[lang_COUNTRY], Key[lang@MODIFIER],
+  -- Key[lang], then the unlocalised Key.
   if $locale != "" then
-    if has_key($group, $key .. "[" .. $locale .. "]") then
-      return $group[$key .. "[" .. $locale .. "]"]
+    $base = $locale
+    $mod = ""
+    $at = before($locale, "@")
+    if $at != nil then
+      $mod = substr($locale, len($at) + 1, len($locale))
+      $base = $at
     end
-    $base = before($locale, "_")
-    if $base != nil and $base != $locale and has_key($group, $key .. "[" .. $base .. "]") then
-      return $group[$key .. "[" .. $base .. "]"]
+    $lang = before($base, "_")
+    if $lang == nil then $lang = $base end
+    $langmod = $mod == "" ? $lang : $lang .. "@" .. $mod
+    $tried = []
+    for each $cand in [$locale, $base, $langmod, $lang]
+      if $cand != "" and not contains($tried, $cand) then
+        $tried = concat($tried, [$cand])
+        if has_key($group, $key .. "[" .. $cand .. "]") then
+          return $group[$key .. "[" .. $cand .. "]"]
+        end
+      end
     end
   end
   return get_or($group, $key, "")
@@ -137,8 +155,11 @@ fn default_theme()
 end
 
 fn parse_entry($path, $id, $locale, $desktop_name)
-  -- Parse one .desktop file; nil unless it is a visible Type=Application
-  -- entry. Only the [Desktop Entry] group is read.
+  -- Parse one .desktop file; nil unless it is a launchable Type=Application
+  -- entry. Hidden=true erases the entry (the spec says treat it as deleted);
+  -- NoDisplay=true only hides it from menus, so the entry stays in the index
+  -- with no_display set for apps.get/apps.launch. Only the [Desktop Entry]
+  -- group is read.
   $ini = nil
   try
     $ini = ini_parse(read_file($path))
@@ -148,7 +169,6 @@ fn parse_entry($path, $id, $locale, $desktop_name)
   if type($ini) != "map" or not has_key($ini, "Desktop Entry") then return nil end
   $g = $ini["Desktop Entry"]
   if get_or($g, "Type", "") != "Application" then return nil end
-  if to_bool(get_or($g, "NoDisplay", "false")) then return nil end
   if to_bool(get_or($g, "Hidden", "false")) then return nil end
   -- OnlyShowIn limits the entry to listed desktops; NotShowIn excludes.
   -- Entries with neither are always acceptable.
@@ -172,6 +192,7 @@ fn parse_entry($path, $id, $locale, $desktop_name)
     exec: $exec,
     try_exec: $try_exec,
     terminal: to_bool(get_or($g, "Terminal", "false")),
+    no_display: to_bool(get_or($g, "NoDisplay", "false")),
     path: $path,
     workdir: get_or($g, "Path", ""),
     only_show_in: $only,
@@ -182,7 +203,8 @@ end
 fn scan_apps($dirs, $locale, $desktop_name)
   -- Walk each applications dir in priority order; earlier dirs win for the
   -- same desktop-file ID (subdir "/" becomes "-" in the ID; the .desktop
-  -- suffix is dropped). Returns the visible entries sorted by name.
+  -- suffix is dropped). Returns the launchable entries sorted by name --
+  -- including NoDisplay ones (flagged no_display; menus filter them out).
   $by_id = {}
   for each $dir in $dirs
     if is_dir($dir) then
@@ -284,8 +306,19 @@ fn parse_exec($exec)
 end
 
 fn uri_to_path($uri)
-  -- file:// URIs become decoded local paths; anything else passes through.
-  if starts_with($uri, "file://") then return url_decode(substr($uri, 7, len($uri))) end
+  -- RFC 8089: a file:// URI names a local path only when its authority is
+  -- empty or "localhost"; then the path (nothing else) is percent-decoded.
+  -- Any other authority names a remote host, so the URI is passed through
+  -- unchanged -- the app receives the URI, never a mangled pseudo-path.
+  if starts_with($uri, "file://") then
+    $rest = substr($uri, 7, len($uri))
+    $authority = before($rest, "/")
+    if $authority == nil then return $uri end
+    if $authority == "" or lower($authority) == "localhost" then
+      return url_decode(substr($rest, len($authority), len($rest)))
+    end
+    return $uri
+  end
   return $uri
 end
 
@@ -294,6 +327,8 @@ fn expand_codes($arg, $entry, $uris, $paths)
   -- {argv: replacement elements, file_code: whether a %f/%F/%u/%U was seen}.
   -- An argument that is exactly one field code is replaced whole (and is
   -- dropped when its value is absent); embedded codes substitute in place.
+  -- The spec allows %f/%F/%u/%U only as a standalone argument, so embedded
+  -- forms substitute their joined value into this one element by design.
   if $arg == "%f" then
     if len($paths) == 0 then return {argv: [], file_code: true} end
     return {argv: [$paths[0]], file_code: true}
@@ -310,6 +345,7 @@ fn expand_codes($arg, $entry, $uris, $paths)
   end
   $out = ""
   $file_code = false
+  $saw_code = false
   $cs = chars($arg)
   $i = 0
   $n = len($cs)
@@ -318,6 +354,7 @@ fn expand_codes($arg, $entry, $uris, $paths)
     if $c == "%" and $i + 1 < $n then
       $code = $cs[$i + 1]
       $i = $i + 2
+      $saw_code = true
       if $code == "%" then
         $out = $out .. "%"
       elif $code == "f" then
@@ -338,16 +375,21 @@ fn expand_codes($arg, $entry, $uris, $paths)
         $out = $out .. $entry.name
       elif $code == "k" then
         $out = $out .. $entry.path
+      elif contains(["d", "D", "n", "N", "v", "m"], $code) then
+        -- Deprecated legacy codes (%d %D %n %N %v %m): removed, no output.
+      else
+        -- An unrecognised code stays literal, both characters (GLib).
+        $out = $out .. "%" .. $code
       end
-      -- %d %D %n %N %v %m are deprecated legacy codes: removed, no output.
     else
       $out = $out .. $c
       $i = $i + 1
     end
   end
-  -- An argument whose every code expanded to nothing is dropped outright,
-  -- the same as an absent %f (the spec removes absent field codes).
-  if $out == "" then return {argv: [], file_code: $file_code} end
+  -- An argument is dropped only when it was made purely of field codes that
+  -- all expanded to nothing (an absent %f, deprecated codes); a literal
+  -- argument -- including an intentional "" -- survives.
+  if $out == "" and $saw_code then return {argv: [], file_code: $file_code} end
   return {argv: [$out], file_code: $file_code}
 end
 
@@ -527,10 +569,13 @@ end
 
 fn resolve_icon($ctx, $name, $size, $scale, $theme)
   -- Resolve an icon name to a file. $name may be an absolute path (Icon=
-  -- allows it): it is returned verbatim when it exists. Otherwise the theme
-  -- chain is searched (exact then closest, Inherits depth-first, hicolor,
-  -- then /usr/share/pixmaps). Returns {hit: map-or-nil, ctx} -- always
-  -- rebind the caller's context from ctx to keep the cache.
+  -- allows it): it is returned verbatim when it exists. That is a plain
+  -- existence check outside the theme tree -- intentional (WONTFIX): the
+  -- desktop-entry tree is trusted input and the entry author named the
+  -- file, so that file IS the icon. Otherwise the theme chain is searched
+  -- (exact then closest, Inherits depth-first, hicolor, then
+  -- /usr/share/pixmaps). Returns {hit: map-or-nil, ctx} -- always rebind
+  -- the caller's context from ctx to keep the cache.
   if starts_with($name, "/") then
     $kind = icon_kind($name)
     if $kind != nil and is_file($name) then

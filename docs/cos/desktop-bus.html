@@ -525,9 +525,14 @@ foundation for the desktop launcher and the taskbar's app icons. It scans
 the freedesktop desktop-entry directories (<code>$XDG_DATA_HOME/applications</code>,
 then each <code>$XDG_DATA_DIRS</code> entry's <code>applications</code>, subdirectories folded
 into the id with <code>-</code>), keeps <code>[Desktop Entry]</code>-group <code>Type=Application</code>
-entries that pass <code>NoDisplay</code>/<code>Hidden</code>, <code>OnlyShowIn</code>/<code>NotShowIn</code> (against
-the desktop name <code>COSMIX</code>) and <code>TryExec</code>, and resolves icons through the
-freedesktop icon-theme spec (exact size match, then closest by
+entries that pass <code>OnlyShowIn</code>/<code>NotShowIn</code> (against the desktop name
+<code>COSMIX</code>) and <code>TryExec</code>; <code>Hidden=true</code> erases an entry (the spec treats it
+as deleted) while <code>NoDisplay=true</code> only hides it from <code>apps.list</code> — the
+entry stays in the index with <code>no_display</code> set, so <code>apps.get</code> and
+<code>apps.launch</code> still find it. Localised keys resolve per the spec's
+<code>lang_COUNTRY@MODIFIER</code> order from <code>LC_ALL</code>, then <code>LC_MESSAGES</code>, then
+<code>LANG</code> (encoding stripped). Icons resolve through the freedesktop
+icon-theme spec (exact size match, then closest by
 <code>DirectorySizeDistance</code>, <code>Inherits</code> depth-first, <code>hicolor</code>, then
 <code>/usr/share/pixmaps</code>; parsed <code>index.theme</code> files are cached in memory).
 Start it like the session provider:</p>
@@ -539,18 +544,23 @@ intended rescan trigger. <code>src/desktop/scripts/cosmix-desk-apps.service</cod
 an example user unit bound to <code>graphical-session.target</code>.</p>
 <table><thead><tr><th>Verb</th><th>JSON request</th><th>Successful response</th></tr></thead><tbody>
 <tr><td><code>apps.list</code></td><td><code>{category?, query?}</code></td><td>array of <code>{id,name,generic_name,comment,icon,categories,exec,terminal,path}</code> sorted by name</td></tr>
-<tr><td><code>apps.get</code></td><td><code>{id}</code></td><td>the entry with all parsed fields (adds <code>keywords</code>, <code>try_exec</code>, <code>workdir</code>, <code>only_show_in</code>, <code>not_show_in</code>)</td></tr>
+<tr><td><code>apps.get</code></td><td><code>{id}</code></td><td>the entry with all parsed fields (adds <code>keywords</code>, <code>try_exec</code>, <code>no_display</code>, <code>workdir</code>, <code>only_show_in</code>, <code>not_show_in</code>)</td></tr>
 <tr><td><code>apps.icon</code></td><td><code>{name, size?, scale?, theme?}</code></td><td><code>{path,size,scale,theme,kind}</code> — <code>kind</code> is <code>svg</code>, <code>png</code> or <code>xpm</code>; <code>name</code> may be an absolute path</td></tr>
 <tr><td><code>apps.launch</code></td><td><code>{id, uris?}</code></td><td><code>{id,pid,argv}</code> — spawned detached via argv, never a shell</td></tr>
 <tr><td><code>apps.reload</code></td><td><code>{}</code></td><td><code>{count}</code></td></tr>
 </tbody></table>
 <p><code>query</code> is a case-insensitive substring over name, generic name, comment and
 keywords. <code>uris</code> feed the Exec field codes: <code>%f</code>/<code>%F</code> take <code>file://</code> URIs
-decoded to local paths, <code>%u</code>/<code>%U</code> take the URIs, <code>%i</code> becomes <code>--icon ICON</code>,
-<code>%c</code> the name, <code>%k</code> the desktop-file path; deprecated <code>%d %D %n %N %v %m</code>
-are dropped and Exec quoting is parsed into argv per the spec.
-<code>Terminal=true</code> entries are prefixed with the terminal property. Unknown ids
-answer <code>{error:"not_found"}</code> with rc 14; malformed requests rc 10.</p>
+decoded to local paths (an empty or <code>localhost</code> authority is local per
+RFC 8089; any other authority keeps the URI as-is), <code>%u</code>/<code>%U</code> take the
+URIs, <code>%i</code> becomes <code>--icon ICON</code>, <code>%c</code> the name, <code>%k</code> the desktop-file
+path; deprecated <code>%d %D %n %N %v %m</code> are dropped, unrecognised <code>%X</code>
+sequences stay literal, and Exec quoting is parsed into argv per the spec
+(<code>%f</code>/<code>%F</code>/<code>%u</code>/<code>%U</code> are only meaningful as a standalone argument).
+<code>Terminal=true</code> entries are prefixed with the terminal property's argv —
+<code>apps.terminal</code> may carry arguments (e.g. <code>kitty -e</code>) and is parsed with
+the same Exec rules. Unknown ids answer <code>{error:"not_found"}</code> with rc 14;
+malformed requests rc 10.</p>
 <p>Properties publish through <code>apps.props.watch</code> (snapshot read; optionally
 <code>{path}</code> for one leaf) and <code>apps.props.set</code> (<code>{path, value}</code>): <code>apps.count</code>
 (read-only), <code>apps.icon_theme</code> (default: <code>[Icons] Theme</code> from
@@ -571,7 +581,12 @@ admitted nodes and their Wayland sessions; unit gates do not prove that result.<
 <p><code>tests/apps-test.mix</code> exercises the apps citizen's desktop-entry parser and
 icon resolver against a fixture tree it creates under a temp dir (no Bus,
 nothing launched). The pure functions live in <code>src/desktop/scripts/lib/apps.mix</code>
-so the test can require them directly.</p></div></div>
+so the test can require them directly. <code>tests/apps-bus-test.mix</code> serves the
+production apps citizen against an isolated noded (private TCP port plus
+private verified-lane unix socket, so it needs no user systemd manager and
+cannot reach the host Bus) and covers list/get/launch/reload/props over the
+real Bus with recorder-script fixture "applications" — no real application
+is ever launched.</p></div></div>
     </div>
 
 </main>

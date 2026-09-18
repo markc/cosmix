@@ -1,0 +1,158 @@
+-- Real isolated noded + the production apps citizen driven over the Bus:
+-- list/get/launch/reload/props against fixture desktop files only. The
+-- broker gets a private TCP port AND a private unix socket -- the verified
+-- lane every `send` prefers -- so nothing here can reach, or be reached
+-- from, the host's real Bus (this is why it spawns directly instead of
+-- using systemd-run: it runs in sessions without a user systemd manager).
+-- XDG_DATA_HOME/XDG_DATA_DIRS/HOME point into the fixture tree, so no real
+-- desktop file or icon is ever read, and every fixture "binary" is a mix
+-- script that records its argv and exits -- no real application launches.
+$root = env("COSMIX")
+if $root == "" then raise("TEST_CONFIG", "set COSMIX to the checkout root") end
+$scripts = $root .. "/src/desktop/scripts"
+$mix = "/opt/cosmix/bin/mix"
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-apps-bus-test.XXXXXXXX"]))
+$tag = uuid()
+$port = random(46000, 46999)
+$node = $tmp .. "/node.conf.mix"
+write_file($node, json_encode({node: "apps-bus-test-" .. $tag, wg_ip: "", mesh: "apps-bus-test.invalid",
+  noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+$env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin"}
+$citizen_env = {
+  COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
+  HOME: $tmp,
+  XDG_DATA_HOME: $tmp .. "/data",
+  XDG_DATA_DIRS: $tmp .. "/sys"
+}
+-- Pre-bound so the finally block can run even when a setup step fails
+-- before the two daemons are spawned (an unbound read would raise there
+-- and skip the temp-dir cleanup).
+$svc_pid = nil
+$noded_pid = nil
+-- One-shot Bus client: cli.mix <target> <verb> [json-body] -> one JSON line.
+-- The send must NOT be assigned to $rc -- the runtime sets $rc/$result
+-- itself and an assignment would shadow them with the reply value.
+fn write_client()
+  write_file($tmp .. "/cli.mix", join([
+    "send $1 $2 timeout=15 body=$3",
+    "print(json_encode({rc: $rc, result: $result}))"
+  ], "\n"))
+end
+-- Fixture "binaries": record argv under the citizen's HOME and exit.
+fn write_recorder()
+  mkdir($tmp .. "/bin")
+  write_file($tmp .. "/bin/recorder", "#!/opt/cosmix/bin/mix\n" ..
+    "write_file(env(\"HOME\") .. \"/launched-\" .. basename($0), join(args(), \"\\n\") .. \"\\n\")\n")
+end
+fn check($condition, $message)
+  if not $condition then raise("APPS_BUS_TEST", $message) end
+end
+fn fixture($path, $content)
+  mkdir(dirname($tmp .. "/" .. $path))
+  write_file($tmp .. "/" .. $path, $content)
+end
+fn call($target, $verb, $body)
+  -- run_argv_must returns captured stdout directly (raising on a spawn
+  -- failure); the client prints exactly one JSON line.
+  return json_parse(run_argv_must([$mix, $tmp .. "/cli.mix", $target, $verb, $body], {env: $env, timeout: 25}))
+end
+fn wait_ready()
+  for each $i in range(1, 80)
+    $r = run_argv([$mix, $tmp .. "/cli.mix", "apps", "apps.list", "{}"], {env: $env, timeout: 25})
+    if $r.ok then
+      $parsed = json_parse($r.stdout)
+      if type($parsed) == "map" and $parsed.rc == 0 then return nil end
+    end
+    sleep(0.2)
+  end
+  $nlog = read_file_or_nil($tmp .. "/noded.log")
+  $slog = read_file_or_nil($tmp .. "/svc.log")
+  print("noded log: " .. ($nlog == nil ? "" : $nlog))
+  print("citizen log: " .. ($slog == nil ? "" : $slog))
+  raise("APPS_BUS_TEST", "apps citizen did not register")
+end
+fn read_file_or_nil($path)
+  try
+    return read_file($path)
+  catch $err
+    return nil
+  end
+end
+fn wait_file($path)
+  for each $i in range(1, 50)
+    if read_file_or_nil($path) != nil then return read_file($path) end
+    sleep(0.1)
+  end
+  raise("APPS_BUS_TEST", "launched fixture never ran: " .. $path)
+end
+try
+  write_client()
+  write_recorder()
+  fixture("data/applications/plain.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Plain App\nExec=" .. $tmp .. "/bin/recorder plain-arg\n" ..
+    "Icon=apps-bus-test-icon\nTerminal=false\nCategories=Utility;\n")
+  fixture("data/applications/nodisplay.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Menu Hidden\nExec=" .. $tmp .. "/bin/recorder nd-arg\nNoDisplay=true\n")
+  fixture("sys/applications/term.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Term App\nExec=" .. $tmp .. "/bin/recorder term-arg\nTerminal=true\n")
+  fixture("data/icons/hicolor/index.theme", "[Icon Theme]\n" ..
+    "Name=Hicolor\nDirectories=22x22\n\n[22x22]\nSize=22\nType=Fixed\n")
+  fixture("data/icons/hicolor/22x22/apps-bus-test-icon.png", "")
+  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/recorder"])
+
+  $noded_pid = spawn(["/opt/cosmix/bin/cosmix-noded", "serve", "--listen", "127.0.0.1:" .. to_string($port),
+    "--node", "apps-bus-test-" .. $tag, "--no-monitor", "--no-log"],
+    {detach: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+  $svc_pid = spawn([$mix, "--serve", $scripts .. "/apps.mix", "--name", "apps"],
+    {detach: true, env: $citizen_env, stdout: {file: $tmp .. "/svc.log"}, stderr: "stdout"})
+  wait_ready()
+
+  -- apps.list excludes NoDisplay; apps.get still finds it (B4 over the Bus).
+  $list = call("apps", "apps.list", "{}")
+  check($list.rc == 0, "apps.list failed")
+  $ids = []
+  for each $e in $list.result
+    $ids = concat($ids, [$e.id])
+  end
+  check(contains($ids, "plain") and contains($ids, "term"), "apps.list missing visible ids")
+  check(not contains($ids, "nodisplay"), "apps.list leaked a NoDisplay entry")
+  $got = call("apps", "apps.get", json_encode({id: "nodisplay"}))
+  check($got.rc == 0 and $got.result.no_display == true, "apps.get did not find the NoDisplay entry")
+  check(call("apps", "apps.get", json_encode({id: "no-such-app"})).rc == 14, "apps.get invented an app")
+
+  -- apps.launch spawns detached; the fixture recorder proves the argv.
+  $launch = call("apps", "apps.launch", json_encode({id: "plain"}))
+  check($launch.rc == 0 and type($launch.result.pid) == "number", "apps.launch failed")
+  check(wait_file($tmp .. "/launched-recorder") == "plain-arg\n", "launched argv wrong")
+
+  -- apps.terminal may carry arguments: parsed with the Exec rules and
+  -- prefixed as terminal argv + app argv (B7 over the Bus).
+  $set = call("apps", "apps.props.set", json_encode({path: "apps.terminal", value: $tmp .. "/bin/recorder -e"}))
+  check($set.rc == 0 and $set.result.value == $tmp .. "/bin/recorder -e", "apps.props.set terminal failed")
+  $launch = call("apps", "apps.launch", json_encode({id: "term"}))
+  check($launch.rc == 0, "terminal apps.launch failed")
+  check(wait_file($tmp .. "/launched-recorder") == "-e\n" .. $tmp .. "/bin/recorder\nterm-arg\n",
+    "terminal argv not parsed and prefixed onto the app argv")
+
+  -- apps.reload rebinds the scanned index after the tree changed.
+  check(call("apps", "apps.get", json_encode({id: "late"})).rc == 14, "stale index served an app that does not exist yet")
+  fixture("data/applications/late.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Late App\nExec=" .. $tmp .. "/bin/recorder late-arg\n")
+  $reload = call("apps", "apps.reload", "{}")
+  check($reload.rc == 0 and $reload.result.count == 4, "apps.reload count wrong (expected 4 index entries)")
+  check(call("apps", "apps.get", json_encode({id: "late"})).rc == 0, "apps.reload did not rebind the index")
+
+  -- Icon resolution through the citizen (theme chain, fixture hicolor).
+  $icon = call("apps", "apps.icon", json_encode({name: "apps-bus-test-icon", size: 22}))
+  check($icon.rc == 0 and ends_with($icon.result.path, "/data/icons/hicolor/22x22/apps-bus-test-icon.png"),
+    "apps.icon did not resolve the fixture icon")
+
+  print("PASS apps Bus surface: list excludes NoDisplay while get/launch find it, launch argv on the real Bus, terminal argv parsing, reload rebind, icon resolve")
+finally
+  if $svc_pid != nil then $_kill_svc = run_argv(["kill", "--", to_string($svc_pid)], {timeout: 10}) end
+  if $noded_pid != nil then $_kill_noded = run_argv(["kill", "--", to_string($noded_pid)], {timeout: 10}) end
+  -- Only the unique mktemp tree created by this test is removed.
+  if starts_with($tmp, "/tmp/cosmix-apps-bus-test.") then
+    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end

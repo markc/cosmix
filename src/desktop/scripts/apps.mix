@@ -33,7 +33,9 @@ on "apps.list" desc "list visible applications sorted by name (category, query o
   else
     $out = []
     for each $e in $apps
-      if ($category == "" or contains($e.categories, $category)) and $a.match_query($e, $query) then
+      -- NoDisplay entries stay launchable (apps.get/apps.launch) but are
+      -- hidden from the menu listing.
+      if not $e.no_display and ($category == "" or contains($e.categories, $category)) and $a.match_query($e, $query) then
         $out = concat($out, [$a.project_list($e)])
       end
     end
@@ -100,7 +102,9 @@ on "apps.launch" desc "launch an application by id, detached (uris optional)"
       reply(14, json_encode({error: "not_found"}))
     else
       $argv = $a.expand_exec($e.exec, $e, $uris)
-      if $e.terminal then $argv = concat([$terminal_cmd], $argv) end
+      -- apps.terminal may carry arguments (e.g. "kitty -e"), so it goes
+      -- through the same Exec parser: terminal argv first, then app argv.
+      if $e.terminal then $argv = concat($a.parse_exec($terminal_cmd), $argv) end
       $opts = {detach: true}
       if $e.workdir != "" and is_dir($e.workdir) then $opts.cwd = $e.workdir end
       try

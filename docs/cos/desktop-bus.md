@@ -110,9 +110,14 @@ foundation for the desktop launcher and the taskbar's app icons. It scans
 the freedesktop desktop-entry directories (`$XDG_DATA_HOME/applications`,
 then each `$XDG_DATA_DIRS` entry's `applications`, subdirectories folded
 into the id with `-`), keeps `[Desktop Entry]`-group `Type=Application`
-entries that pass `NoDisplay`/`Hidden`, `OnlyShowIn`/`NotShowIn` (against
-the desktop name `COSMIX`) and `TryExec`, and resolves icons through the
-freedesktop icon-theme spec (exact size match, then closest by
+entries that pass `OnlyShowIn`/`NotShowIn` (against the desktop name
+`COSMIX`) and `TryExec`; `Hidden=true` erases an entry (the spec treats it
+as deleted) while `NoDisplay=true` only hides it from `apps.list` — the
+entry stays in the index with `no_display` set, so `apps.get` and
+`apps.launch` still find it. Localised keys resolve per the spec's
+`lang_COUNTRY@MODIFIER` order from `LC_ALL`, then `LC_MESSAGES`, then
+`LANG` (encoding stripped). Icons resolve through the freedesktop
+icon-theme spec (exact size match, then closest by
 `DirectorySizeDistance`, `Inherits` depth-first, `hicolor`, then
 `/usr/share/pixmaps`; parsed `index.theme` files are cached in memory).
 Start it like the session provider:
@@ -129,18 +134,23 @@ an example user unit bound to `graphical-session.target`.
 | Verb | JSON request | Successful response |
 |---|---|---|
 | `apps.list` | `{category?, query?}` | array of `{id,name,generic_name,comment,icon,categories,exec,terminal,path}` sorted by name |
-| `apps.get` | `{id}` | the entry with all parsed fields (adds `keywords`, `try_exec`, `workdir`, `only_show_in`, `not_show_in`) |
+| `apps.get` | `{id}` | the entry with all parsed fields (adds `keywords`, `try_exec`, `no_display`, `workdir`, `only_show_in`, `not_show_in`) |
 | `apps.icon` | `{name, size?, scale?, theme?}` | `{path,size,scale,theme,kind}` — `kind` is `svg`, `png` or `xpm`; `name` may be an absolute path |
 | `apps.launch` | `{id, uris?}` | `{id,pid,argv}` — spawned detached via argv, never a shell |
 | `apps.reload` | `{}` | `{count}` |
 
 `query` is a case-insensitive substring over name, generic name, comment and
 keywords. `uris` feed the Exec field codes: `%f`/`%F` take `file://` URIs
-decoded to local paths, `%u`/`%U` take the URIs, `%i` becomes `--icon ICON`,
-`%c` the name, `%k` the desktop-file path; deprecated `%d %D %n %N %v %m`
-are dropped and Exec quoting is parsed into argv per the spec.
-`Terminal=true` entries are prefixed with the terminal property. Unknown ids
-answer `{error:"not_found"}` with rc 14; malformed requests rc 10.
+decoded to local paths (an empty or `localhost` authority is local per
+RFC 8089; any other authority keeps the URI as-is), `%u`/`%U` take the
+URIs, `%i` becomes `--icon ICON`, `%c` the name, `%k` the desktop-file
+path; deprecated `%d %D %n %N %v %m` are dropped, unrecognised `%X`
+sequences stay literal, and Exec quoting is parsed into argv per the spec
+(`%f`/`%F`/`%u`/`%U` are only meaningful as a standalone argument).
+`Terminal=true` entries are prefixed with the terminal property's argv —
+`apps.terminal` may carry arguments (e.g. `kitty -e`) and is parsed with
+the same Exec rules. Unknown ids answer `{error:"not_found"}` with rc 14;
+malformed requests rc 10.
 
 Properties publish through `apps.props.watch` (snapshot read; optionally
 `{path}` for one leaf) and `apps.props.set` (`{path, value}`): `apps.count`
@@ -165,4 +175,9 @@ admitted nodes and their Wayland sessions; unit gates do not prove that result.
 `tests/apps-test.mix` exercises the apps citizen's desktop-entry parser and
 icon resolver against a fixture tree it creates under a temp dir (no Bus,
 nothing launched). The pure functions live in `src/desktop/scripts/lib/apps.mix`
-so the test can require them directly.
+so the test can require them directly. `tests/apps-bus-test.mix` serves the
+production apps citizen against an isolated noded (private TCP port plus
+private verified-lane unix socket, so it needs no user systemd manager and
+cannot reach the host Bus) and covers list/get/launch/reload/props over the
+real Bus with recorder-script fixture "applications" — no real application
+is ever launched.

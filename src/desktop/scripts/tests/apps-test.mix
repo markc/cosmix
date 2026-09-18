@@ -33,7 +33,7 @@ try
   fixture("data/applications/quoted.desktop", "[Desktop Entry]\n" ..
     "Type=Application\nName=Quoted\nExec=quoted \"a b\" c\\ d \"say \\\"hi\\\"\" $x %U\n")
   fixture("data/applications/localized.desktop", "[Desktop Entry]\n" ..
-    "Type=Application\nName=Localized\nName[xx]=Base Local\nName[xx_YY]=Full Local\nExec=localized-run\n")
+    "Type=Application\nName=Localized\nName[xx]=Base Local\nName[xx_YY]=Full Local\nName[xx@mod]=Mod Local\nExec=localized-run\n")
   fixture("data/applications/subdir/nested.desktop", "[Desktop Entry]\n" ..
     "Type=Application\nName=Nested\nExec=nested-run\n")
   fixture("data/applications/override.desktop", "[Desktop Entry]\n" ..
@@ -69,17 +69,30 @@ try
   for each $e in $apps
     $ids = concat($ids, [$e.id])
   end
-  for each $want in ["plain", "only-cosmix", "quoted", "localized", "subdir-nested", "override", "system-only"]
-    check(contains($ids, $want), "visible id missing from scan: " .. $want)
+  for each $want in ["plain", "nodisplay", "only-cosmix", "quoted", "localized", "subdir-nested", "override", "system-only"]
+    check(contains($ids, $want), "launchable id missing from scan: " .. $want)
   end
-  for each $hidden in ["nodisplay", "hidden", "only-other", "not-cosmix", "tryexec-miss"]
-    check(not contains($ids, $hidden), "invisible id leaked into scan: " .. $hidden)
+  for each $hidden in ["hidden", "only-other", "not-cosmix", "tryexec-miss"]
+    check(not contains($ids, $hidden), "erased id leaked into scan: " .. $hidden)
   end
-  check(len($ids) == 7, "scan returned " .. to_string(len($ids)) .. " entries, expected 7")
+  check(len($ids) == 8, "scan returned " .. to_string(len($ids)) .. " entries, expected 8")
+  $nodisplay = $a.find_app($apps, "nodisplay")
+  check($nodisplay != nil and $nodisplay.no_display == true, "NoDisplay entry not kept in the index with no_display set")
+  check($a.find_app($apps, "hidden") == nil, "Hidden entry not erased")
+  check($a.find_app($apps, "plain").no_display == false, "no_display not false for a plain entry")
   $localized = $a.find_app($apps, "localized")
   check($localized.name == "Full Local", "Name[xx_YY] locale not preferred")
+  check($a.parse_entry($tmp .. "/data/applications/localized.desktop", "localized", "xx_YY@mod", "COSMIX").name == "Full Local", "Name[lang_COUNTRY] not preferred over Name[lang@MODIFIER]")
+  check($a.parse_entry($tmp .. "/data/applications/localized.desktop", "localized", "xx@mod", "COSMIX").name == "Mod Local", "Name[lang@MODIFIER] not matched")
   check($a.parse_entry($tmp .. "/data/applications/localized.desktop", "localized", "xx", "COSMIX").name == "Base Local", "Name[xx] language fallback not used")
   check($a.parse_entry($tmp .. "/data/applications/localized.desktop", "localized", "zz", "COSMIX").name == "Localized", "unlocalised Name fallback not used")
+  -- Locale selection: LC_ALL beats LC_MESSAGES beats LANG (first non-empty),
+  -- encoding stripped, lang_COUNTRY@MODIFIER kept, C/POSIX unlocalised.
+  check($a.pick_locale("fr_FR.UTF-8", "de_DE", "en_AU") == "fr_FR", "LC_ALL did not win")
+  check($a.pick_locale("", "de_DE@euro.UTF-8", "en_AU") == "de_DE@euro", "LC_MESSAGES not used with modifier kept")
+  check($a.pick_locale("", "", "en_AU.UTF-8") == "en_AU", "LANG fallback with encoding stripped failed")
+  check($a.pick_locale("C", "", "en_AU") == "", "C locale did not mean unlocalised")
+  check($a.pick_locale("", "", "") == "", "empty env did not mean unlocalised")
   $override = $a.find_app($apps, "override")
   check($override.name == "User Override" and $override.exec == "user-override-run", "earlier data dir did not win for the same id")
   $plain = $a.find_app($apps, "plain")
@@ -126,6 +139,13 @@ try
   check(deep_eq($a.expand_exec("run %% %d %D %n %N %v %m", $plain, nil), ["run", "%"]), "%% and deprecated codes wrong")
   check(deep_eq($a.expand_exec("quoted \"a b\" %U", $plain, ["u://1", "u://2"]),
     ["quoted", "a b", "u://1", "u://2"]), "quoted Exec with %U wrong")
+  check(deep_eq($a.expand_exec("app 50%off tail%", $plain, nil), ["app", "50%off", "tail%"]), "unknown field code ate a character")
+  check(deep_eq($a.expand_exec("app %q", $plain, nil), ["app", "%q"]), "unknown field code not left literal")
+  check(deep_eq($a.expand_exec("app \"\" x", $plain, nil), ["app", "", "x"]), "literal empty argument dropped")
+  check(deep_eq($a.expand_exec("plain-run %f", $plain, ["file://localhost/tmp/a%20b.txt"]),
+    ["plain-run", "/tmp/a b.txt"]), "file://localhost not treated as local")
+  check(deep_eq($a.expand_exec("plain-run %F", $plain, ["file://server/x", "file:///tmp/g"]),
+    ["plain-run", "file://server/x", "/tmp/g"]), "non-local file:// authority mangled into a path")
 
   -- ── Icon resolution ─────────────────────────────────────────────────
   $ctx = {icon_dirs: [$tmp .. "/icons"], pixmaps: $tmp .. "/pixmaps", cache: {}}
