@@ -810,17 +810,14 @@ impl WaylandState {
     }
 
     /// The pending full-snapshot cause, for tests that assert a path stayed
-    /// inert.
+    /// inert. Read it BEFORE a service cycle: `service_property_diffs`
+    /// takes it (and the per-surface marks with it) in the cycle that
+    /// runs a verb, so after `dispatch_cycle` it reads `None` whatever the
+    /// verb did — a serviced verb's marks are only observable through the
+    /// causes of the edges that cycle emitted.
     #[cfg(test)]
     pub(crate) fn full_dirty_cause(&self) -> Option<&'static str> {
         self.observations.full_dirty
-    }
-
-    /// The pending per-surface cause, for tests that assert a refusal
-    /// attributed nothing.
-    #[cfg(test)]
-    pub(crate) fn surface_dirty_cause(&self, id: u64) -> Option<&'static str> {
-        self.observations.dirty_surfaces.get(&id).copied()
     }
 
     /// A workspace switch, move or count change: `workspaces.*` and every

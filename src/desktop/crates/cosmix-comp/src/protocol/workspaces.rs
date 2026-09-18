@@ -516,9 +516,16 @@ impl WaylandState {
         ) {
             Ok(_) => Ok((from, to)),
             Err(refusal) => {
-                // Unreachable by construction (see above); if it ever were
-                // not, the move is undone rather than reported alongside a
-                // refusal — a refusal must mean nothing changed.
+                // Unreachable by construction (see above), and a debug
+                // build says so. The release arm puts the label back so a
+                // refusal is not reported alongside a half-done move; it
+                // is NOT a full undo — the raise above stays (there is no
+                // un-raise), and the `workspace.move` mark the first
+                // relabel planted stays on the surface (the second relabel
+                // only re-marks it). Both are accepted for a branch no
+                // caller can reach, rather than carrying restore state for
+                // it; if `switch_workspace_focusing` ever grows a refusal
+                // this can hit, this arm needs a real undo.
                 if cfg!(debug_assertions) {
                     unreachable!("move_window_and_follow: switch refused {refusal:?}");
                 }

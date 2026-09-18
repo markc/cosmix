@@ -393,11 +393,16 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
-        // Mark first: the first cause recorded for a surface wins. Planted,
-        // not just marked: a refused move (an index above `count`) changes
-        // nothing and must not leave `comp.window` blamed for the next
-        // unrelated edge on this surface.
-        let mark = self.plant_surface_mark(id, "comp.window");
+        // No `comp.window` mark, unlike the sibling verbs: every accepted
+        // move marks the FULL snapshot dirty (`workspace.move`, D7 — every
+        // row's visibility and the `workspaces.*` counts may change), and a
+        // full-snapshot diff carries that one cause and discards the
+        // per-surface marks, so a mark planted here could never be read.
+        // Where it could — a refused move (an index above `count`) or a
+        // send to the workspace the window is on, both of which change
+        // nothing — it would only blame `comp.window` for the next
+        // unrelated edge on this surface. `send_to_workspace_refused_index_
+        // attributes_nothing` pins both halves.
         let follow_now = follow && self.workspace_switch_allowed_for(&object).is_some();
         let moved = if follow_now {
             self.move_window_and_follow(&object, index.into())
@@ -406,10 +411,7 @@ impl WaylandState {
         };
         let (_, to) = match moved {
             Ok(moved) => moved,
-            Err(refusal) => {
-                self.unplant_surface_mark(mark);
-                return workspace_refusal(refusal, None, id);
-            }
+            Err(refusal) => return workspace_refusal(refusal, None, id),
         };
         let mut body = json!({
             "id": id,
