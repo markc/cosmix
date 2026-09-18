@@ -232,6 +232,7 @@ impl CompositorHandler for WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -858,6 +859,7 @@ impl WlrLayerShellHandler for WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -1068,6 +1070,7 @@ impl XdgShellHandler for WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -1292,6 +1295,7 @@ impl XdgShellHandler for WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -1805,6 +1809,7 @@ impl SessionLockHandler for WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -2300,6 +2305,7 @@ impl InputMethodHandler for WaylandState {
                 pending_window_state: None,
                 configured_window_states: Vec::new(),
                 minimized: false,
+                workspace: 0,
                 focused: false,
                 chrome_pointer: ChromePointerSceneState::default(),
                 committed_window_geometry: None,
@@ -2398,9 +2404,35 @@ impl XdgActivationHandler for WaylandState {
         if self.session_lock_active() {
             return;
         }
-        let known = self.surfaces.contains_key(&surface.id());
-        if !known {
+        let Some(record) = self.surfaces.get(&surface.id()) else {
             tracing::debug!("xdg-activation for a surface this compositor does not know");
+            return;
+        };
+        // A minimised window is not activated: neither the raise nor the
+        // arbitration below would bring it on screen (`arbitrate_keyboard_focus`
+        // has no minimised term, so without this gate the keyboard focus moved
+        // to a hidden window), and `minimize_toplevel` moves focus OFF a window
+        // as it hides it. The same refusal `_NET_ACTIVE_WINDOW` gives through
+        // `window_switch_candidate`; un-minimising is the restore path, not an
+        // activation.
+        if record.minimized {
+            tracing::debug!("xdg-activation for a minimised window: not activated");
+            return;
+        }
+        // F1.2: an activation of a window on another workspace switches to
+        // that workspace first (the lock above and the exclusive-layer rule
+        // inside the helper keep it inert where a switch is not allowed, and
+        // the helper's candidacy terms keep it inert for a non-presentable
+        // window). A window the helper could not bring on screen is then
+        // NOT activated: `arbitrate_keyboard_focus` has no presentable or
+        // workspace term, so without this refusal the keyboard would move
+        // to a window that is off screen (0.59.0 answers a withheld switch
+        // with a refusal, never with a focus the user cannot see).
+        self.ensure_workspace_shown(&surface.id());
+        if self.window_off_current_workspace(&surface.id()) {
+            tracing::debug!(
+                "xdg-activation for a window whose workspace cannot be shown: not activated"
+            );
             return;
         }
         self.raise_for_focus_interaction(&surface);

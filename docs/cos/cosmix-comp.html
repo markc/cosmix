@@ -544,6 +544,22 @@ non-minimised managed windows in stable creation order. This is not an MRU
 switcher or a visual switcher overlay. Both nested and KMS profiles support
 these bindings when interception is enabled. Session locking and exclusive
 keyboard layers retain priority.</p>
+<p>Workspace chords (comp 0.59.0) live in both profiles beside
+<code>restore-recent-minimized</code> and share one implementation with the
+<code>comp.workspace.switch</code> / <code>comp.window.send_to_workspace</code> verbs:
+<code>workspace-jump-&lt;n&gt;</code> (Super+<code>&lt;n&gt;</code>, n in 1..9) switches to workspace n;
+<code>workspace-move-&lt;n&gt;</code> (Super+Shift+<code>&lt;n&gt;</code>) moves the focused window to n and
+follows it; <code>workspace-next</code> / <code>workspace-prev</code> (Super+<code>]</code> / Super+<code>[</code>) step
+by one and wrap at the ends. <code>bindings.table</code> lists them with xkb keysym
+names: <code>Super+1</code>, <code>Super+Shift+1</code>, <code>Super+bracketright</code>. The matcher reads
+the level-0 symbol, so Super+Shift+1 is still the digit, not <code>exclam</code>; on a
+layout whose level 0 is not the digit the chord does not fire. A jump above
+<code>workspaces.count</code> is a silent no-op (a key press has nobody to reply to; the
+verb answers <code>invalid_value</code>). Under a session lock the chords reach the lock
+surface, never the compositor. Under an exclusive layer the move chord is
+withheld whole (no move, no switch) by the same gate as <code>send_to_workspace {follow:true}</code> — a chord that will activate the window must not re-arrange
+the desktop under a layer that owns the screen — while the jump and step
+chords, like <code>comp.workspace.switch</code>, still switch.</p>
 <p>X11 <code>_NET_ACTIVE_WINDOW</code> requests use the same managed-window admission and
 focus path. Local automation is accepted without timestamp-based focus-stealing
 prevention; source identifiers are not authentication. Unmapped, minimised and
@@ -553,6 +569,46 @@ X11 focus, including mouse and keyboard switching. Native, lock or absent
 focus clears it to zero; delayed X focus events cannot replace it with a root
 or ancestor window ID. This keeps <code>xdotool windowactivate --sync</code> and
 <code>getactivewindow</code> consistent with compositor focus.</p>
+<p>Workspaces reach X11 clients as EWMH virtual desktops (comp 0.59.0). The
+root <code>_NET_NUMBER_OF_DESKTOPS</code> and <code>_NET_CURRENT_DESKTOP</code> are rewritten on
+every workspace switch and count change (and once when the XWM starts, over
+the <code>1</code>/<code>0</code> the XWM writes at startup so <code>xprop -root</code> never sees them
+absent); EWMH desktops are 0-based, so <code>workspaces.current</code> 3 reads as
+<code>_NET_CURRENT_DESKTOP = 2</code>. Every managed X11 window carries
+<code>_NET_WM_DESKTOP</code>, written at the moment it maps (the same edge that stamps
+its workspace — a window that has only sent its MapRequest has no
+workspace and no property yet), rewritten by every move and by a count
+shrink that strands it. A client's <code>_NET_WM_DESKTOP</code> message is honoured as
+a move — the window goes to that desktop WITHOUT switching, exactly like a
+<code>windows.s&lt;id&gt;.workspace</code> write, and gets <code>_NET_WM_STATE_HIDDEN</code> if that
+takes it off screen; <code>_NET_ACTIVE_WINDOW</code> remains the request that brings a
+window on screen. Ignored, with a debug log: <code>0xFFFFFFFF</code> (all desktops —
+comp has no sticky windows in 0.59.0), a desktop at or above the count, a
+request while a session lock is active, and one for an override-redirect
+window or a stale identity. A pager's <code>_NET_CURRENT_DESKTOP</code> root message
+(<code>wmctrl -s N</code>, <code>xdotool set_desktop N</code>) is honoured as a switch of the
+default output, exactly like <code>comp.workspace.switch {index: N + 1}</code>
+without wrap; a desktop at or above the count and a request under a
+session lock are ignored with a debug log. A pager's
+<code>_NET_NUMBER_OF_DESKTOPS</code> root message (<code>wmctrl -n N</code>) is NOT honoured —
+the count is <code>workspaces.count</code>, compositor-owned — and is dropped with a
+debug log; the atom stays in <code>_NET_SUPPORTED</code> for the property, which is.
+A KMS topology change that replaces the default output carries the
+retiring output's current workspace to the replacing one (<code>workspaces. current</code> is keyed by the default output, and a replugged monitor must not
+change the desktop) and republishes the root pair; if the effective
+workspace changed anyway (the only output went away, or came back under a
+key that still held an older value) the visibility and suspended state of
+every window are re-derived in one settle, so no reader — frame callbacks,
+presentation, <code>windows.*</code> — can see a workspace the scene does not.
+<code>xprop -root _NET_CURRENT_DESKTOP</code> /
+<code>_NET_NUMBER_OF_DESKTOPS</code> and <code>xprop -id &lt;xid&gt; _NET_WM_DESKTOP</code> via
+<code>xwayland.display</code> are the live checks (the nested workspace gate's rule
+10, which also drives both client messages through <code>xdotool</code>); the offline
+suite pins the atoms, the callbacks and the values the compositor asks the
+XWM to write, never the X property itself. Note that a property write can
+only fail with a dead X connection (the X protocol reports per-request
+errors asynchronously): a failed write is a dying Xwayland generation, not
+a stale property on a live window.</p>
 <p>Initial X11 placement, including size-only configure requests before mapping,
 respects reserved panel space. Reserved-area changes reflow managed X11 windows;
 maximised windows use the usable area and fullscreen windows use the full
@@ -591,7 +647,9 @@ only for a caller that subscribed to that topic before calling <code>watch</code
 remains subscribed.</li>
 <li><code>comp.props.set {path,value,generation?}</code> mutates the four corner
 properties, <code>windows.s&lt;id&gt;.band</code>, <code>windows.s&lt;id&gt;.minimized</code>,
-<code>input.host.passthrough</code>, or <code>xwayland.enabled</code> and returns <code>{path,old,new}</code>; for the file-persisted
+<code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>, <code>workspaces.current</code>,
+<code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>, or
+<code>xwayland.enabled</code> and returns <code>{path,old,new}</code>; for the file-persisted
 <code>xwayland.enabled</code> the reply also carries <code>persisted</code> — <code>false</code> means the
 in-memory change and the changed event stand but the write to disk failed
 and the value will not survive restart. The optional <code>generation</code> fences a
@@ -606,14 +664,20 @@ title-bar button. Both fields are required.</li>
 <li><code>comp.window.restore {id?,generation?}</code> with no arguments restores the most
 recently minimised window, exactly like the <code>Super+Shift+M</code> binding; with
 <code>{id,generation}</code> (both required together) it restores that window. If the
-window is minimised, either form un-minimises, raises and focuses it; if it
-is not, nothing happens and the reply says <code>changed:false</code>.</li>
+window is minimised, either form un-minimises it, switches to its
+workspace if that is not the current one, raises and focuses it (where
+the switch is not allowed — an exclusive layer, the VT switched away — it
+un-minimises without switching or focusing); if it is not minimised,
+nothing happens and the reply says <code>changed:false</code>.</li>
 <li><code>comp.window.stats {id,generation | source}</code> and
 <code>comp.window.stats.reset {id,generation | source | nothing}</code> read and zero
 presentation statistics (see Presentation statistics below).</li>
 <li><code>comp.window.focus</code>, <code>comp.window.raise</code>, <code>comp.window.close</code>,
 <code>comp.window.place</code> and <code>comp.window.wait</code> act on or wait for one window
 (see Window control below). <code>comp.windows.list</code> lists window rows.</li>
+<li><code>comp.workspace.switch {index,output?,wrap?}</code> changes the output's current
+workspace and <code>comp.window.send_to_workspace {id,generation,index,follow?}</code>
+moves one window to a workspace (see Window control below).</li>
 <li><code>comp.input.pointer.move</code>, <code>comp.input.pointer.button</code>,
 <code>comp.input.pointer.scroll</code>, <code>comp.input.key</code>, <code>comp.input.release_all</code> and
 <code>comp.input.sequence</code> inject input through the real seat (see Input
@@ -640,12 +704,12 @@ outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
                     interval_p50_us,interval_p99_us,since_us}}  (presentation: volatile)
 surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
-                maximized,fullscreen,minimized,decoration,
+                maximized,fullscreen,minimized,workspace,decoration,
                 layer.{stratum,interactivity,exclusive_zone,binding},foreign_id,
                 generation}
 windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid,
+               window_x,window_y,visible,pid,workspace,
                presentation.{presented,discarded,last_presented_us,
                  interval_p50_us,interval_p99_us,interval_max_us,
                  commit_to_present_p50_us,commit_to_present_p99_us,
@@ -655,6 +719,7 @@ sources.&lt;id&gt;.{output,registered_at_us,revision,registration,
               presentation.{&lt;the window leaves&gt;,upload_bytes_total,
                 damage_px_total,upload_bytes_p50,upload_bytes_p99,
                 damage_px_p50,damage_px_p99}}          (volatile)
+workspaces.{count,current,o_&lt;slug&gt;.current,list}
 stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
@@ -662,7 +727,7 @@ decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
 input.host.passthrough            (nested backend only)
-xwayland.{enabled,persist_path}
+xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
 </code></pre>
@@ -709,6 +774,44 @@ takes it out of the restore order, and raises and focuses it. X11 windows are
 accepted too and get the EWMH hidden state cleared. A write to a window that
 does not exist or is not a mapped managed window replies <code>invalid_value</code>, like
 the band leaf.</p>
+<p>Workspaces (virtual desktops) are 1-based. <code>workspaces.count</code> (default 4,
+<code>1..=16</code>) is the number of workspaces; shrinking it moves every window on a
+removed workspace to the last remaining one and clamps every current.
+<code>workspaces.current</code> is the default output's current workspace and
+<code>workspaces.o_&lt;slug&gt;.current</code> the same value under the output's key (one
+output today, so they mirror each other; a key that is not the default
+output's — even one that exists under <code>outputs.*</code> — is refused with
+<code>invalid_value</code> whose <code>range</code> says only the default output switches).
+Writing either switches, exactly like <code>comp.workspace.switch</code>.
+<code>workspaces.list</code> is read-only: one <code>{index,windows}</code> row per workspace,
+<code>windows</code> counting the mapped managed toplevels on it — X11 windows
+included, although they have no <code>windows.*</code> row, so a pager never shows a
+workspace empty while an X11 window is on it. <code>windows.s&lt;id&gt;.workspace</code> is
+the window's workspace; writing it moves the window there WITHOUT
+switching, so a window moved off the current workspace reads
+<code>visible:false, minimized:false</code> (use <code>visible</code> for on-screen, <code>minimized</code>
+for the user's minimise state). A move never changes the window's
+generation. <code>surfaces.s&lt;id&gt;.workspace</code> carries the same value for every
+mapped managed toplevel, X11 windows included (they have no <code>windows.*</code>
+row), and null for every other surface and for an unmapped one. A window
+that unmaps and remaps joins the current workspace again. An
+override-redirect X11 window (a menu, tooltip, dropdown, DND icon) is not a
+window — no row, no workspace value, never movable — but it hides with the
+workspace it mapped on, so an open menu does not outlive the switch that
+hid its owner; it is back, still open, when that workspace is. X11 clients see
+the same model through EWMH: the root <code>_NET_NUMBER_OF_DESKTOPS</code> and
+<code>_NET_CURRENT_DESKTOP</code> (0-based, so workspace 1 is desktop 0) follow every
+switch and count change, every managed X11 window carries <code>_NET_WM_DESKTOP</code>
+from the moment it maps, a client's own <code>_NET_WM_DESKTOP</code> message moves
+its window exactly like a <code>windows.s&lt;id&gt;.workspace</code> write, and a pager's
+<code>_NET_CURRENT_DESKTOP</code> root message switches exactly like
+<code>comp.workspace.switch</code> (see Window switching and X11 placement). A refused or
+no-op write publishes nothing and attributes nothing: the next unrelated
+change keeps its own cause. All of these are watchable; the
+changed events of a switch, move or count change carry the cause of the
+write (<code>props.set</code>) or the verb. Values outside <code>1..=count</code> (0 included) and
+non-integers are <code>invalid_value</code>; every write is <code>locked</code> while a session
+lock is active.</p>
 <p>Window band writes accept <code>bottom</code> or <code>normal</code>. They move the complete window
 tree, including popups, behind normal windows or back into their normal band.
 Assignments last for the current session. Use the canonical ID returned by
@@ -721,16 +824,82 @@ pointer motion out of the corner.</p>
 missing target as described under Window identity, and replies
 <code>{"error":"locked"}</code> while a session lock is active. Each is recorded in the
 frame trace as <code>comp_window_control</code> (subject the id; detail 1 minimize,
-2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close).</p>
+2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close,
+9 workspace switch, 10 send to workspace; <code>comp.window.stats</code> and
+<code>.stats.reset</code> reuse 7 and 8, a collision kept until 0.60 renumbers them).</p>
+<p>Every mapped window is on one workspace and each output has a current one;
+a window off its output's current workspace reads <code>visible:false, minimized:false</code>, gets no frame callbacks and is never presented. Every
+path that brings a window into view — <code>comp.window.focus</code>,
+<code>comp.window.restore</code>, a client's xdg-activation, an X11
+<code>_NET_ACTIVE_WINDOW</code> or un-minimise — switches to the window's workspace
+first and never pulls the window across, in one settle with the keyboard
+landing on that window and on no bystander in between (the same
+preference <code>send_to_workspace {follow:true}</code> gives a followed window: the
+highest window already on the arriving workspace never sees a
+<code>wl_keyboard.enter</code> the activation then reverses); where the switch is not allowed
+(a session lock, an exclusive layer, the VT switched away) the window is
+not focused either, so the keyboard never lands on a window that is off
+screen: <code>focus</code> replies with the reason, an activation request is ignored,
+and a restore un-minimises without switching or focusing. Activation
+requests (xdg-activation and <code>_NET_ACTIVE_WINDOW</code>) of a MINIMISED window
+are a no-op in 0.59.0 — un-minimising is the restore path, not an
+activation; a GNOME-style restore-on-activation is a later call. Two verbs
+drive the workspaces:</p>
 <ul>
+<li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
+current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
+the current one, which wrap at the ends unless <code>wrap:false</code>, when they are
+refused with <code>{"error":"at_end",output,from,count}</code> (<code>output</code> there is the
+<code>outputs</code> key, as in the success reply, whichever spelling the request
+used). <code>output</code> is an <code>outputs</code> key or output name and defaults to the
+default output (in 0.59.0 the only output with a switchable workspace;
+any other is <code>invalid_value</code>). A number outside <code>1..=count</code> (0 included)
+is <code>invalid_value</code> naming <code>index</code> with the range. The reply is
+<code>{output,from,to}</code>; a switch to the current workspace replies with
+<code>from == to</code> and does nothing. Minimise state is untouched: a minimised
+window on the arriving workspace stays minimised. The verb names no
+window but changes what is on screen, so a session lock refuses it
+(<code>locked</code>).</li>
+<li><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
+window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</code> relative to the
+window's own workspace, always wrapping) without switching; the window
+becomes <code>visible:false, minimized:false</code> if it leaves the current
+workspace. With <code>follow:true</code> comp also switches to that workspace and
+activates the window — move and switch settle once, so no other window
+on either workspace takes the keyboard in between, whatever stacking
+band it is in — unless the switch is withheld by the same gate every
+bring-into-view path has: an exclusive layer owns the screen, the
+window is minimised, or it is not presentable while the VT is switched
+away. Then the move alone runs and nothing is activated. The reply
+gains <code>followed</code>, which is simply <code>workspaces.current == index</code> READ
+BACK after the attempt, not a claim that a switch or an activation
+happened: it is <code>false</code> when the gate held and the window's new
+workspace is not the current one, and it is <code>true</code> whenever the new
+workspace is the current one — including with no switch and no
+activation, when the window was already there and the gate held (a
+minimised window sent to the workspace it is on answers <code>followed:true</code>
+and stays minimised). With no default output there is nothing to switch
+and <code>current</code> reads 1, so a send to workspace 1 answers <code>followed:true</code>.
+The move has happened either way. The reply is <code>{id,generation,index}</code>
+(plus <code>followed</code> with <code>follow:true</code>). A move never changes the window's
+<code>generation</code>. Out-of-range indices are <code>invalid_value</code> and change
+nothing; the usual <code>{id,generation}</code> fence applies.</li>
 <li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
-<code>focused</code> is false, <code>reason</code> says why: <code>exclusive_layer</code> (an exclusive
-layer surface holds the keyboard), <code>minimized</code>, <code>not_visible</code>,
-<code>not_presentable</code>, or <code>refused</code>.</li>
+<code>focused</code> is false, <code>reason</code> says why, the first that holds in this
+order: <code>exclusive_layer</code> (an exclusive layer surface holds the keyboard),
+<code>minimized</code>, <code>not_presentable</code> (the VT is switched away), <code>not_visible</code>,
+or <code>refused</code>. The first three are what keep an off-workspace window's
+switch from running, so such a window names the gate that held it, not
+the visibility the switch would have given it; a refusal changes nothing
+and attributes nothing to the window.</li>
 <li><code>comp.window.raise {id,generation}</code> raises the window within its band
-without focusing it. The reply is <code>{id,generation,raised}</code>.</li>
+without focusing it. The reply is <code>{id,generation,raised}</code>. Raise is
+stacking only: it never switches workspace and never un-minimises. An
+off-workspace or minimised window is restacked in place and stays where it
+is; <code>raised</code> reports the stacking change alone. <code>comp.window.focus</code> and
+<code>comp.window.restore</code> are the verbs that bring a window into view.</li>
 <li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
 or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
 <ul>
@@ -785,7 +954,11 @@ wait is about the lowest-id mapped window whose names match.</li>
 after the current mapping began; a late report of an earlier frame does
 not count), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
 window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
-without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.</li>
+without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.
+<code>mapped</code> is workspace-blind; <code>visible</code> and <code>presented</code> need the
+window's workspace to be the current one, so a wait on a window that
+is off its workspace times out rather than resolving, and resolves once
+a switch (or <code>send_to_workspace {follow:true}</code>) brings it on screen.</li>
 <li><code>timeout_ms</code> defaults to 10000 and is at most 60000, counted from when
 the port admitted the request.</li>
 <li>While a session lock is active a wait learns nothing it could not read
@@ -802,9 +975,11 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 <code>comp.input.sequence</code>.</li>
 </ul>
 </li>
-<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?}</code> returns
-<code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field (text
-filters at most 4096 bytes). The
+<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
+returns <code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field
+(text filters at most 4096 bytes; <code>workspace</code> is an index in <code>1..=count</code>
+— above the count is <code>invalid_value</code>, not an empty list — <code>"current"</code> for
+the current workspace, or <code>"all"</code>, the default). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
 windows and is empty while a session lock is active.</li>
 </ul>
@@ -1098,8 +1273,9 @@ ranges are:</p>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
 </tbody></table>
 <p>The mutable leaves are the four corner leaves, <code>windows.s&lt;id&gt;.band</code>,
-<code>windows.s&lt;id&gt;.minimized</code>, <code>input.host.passthrough</code> (nested only) and
-<code>xwayland.enabled</code>. The corner and window
+<code>windows.s&lt;id&gt;.minimized</code>, <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>,
+<code>workspaces.current</code>, <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>
+(nested only) and <code>xwayland.enabled</code>. The corner, window and workspace
 descriptors say <code>mutable:true</code> and
 <code>persistence:"none"</code> (numeric leaves also carry the range above) and those
 values live for the compositor process only. <code>xwayland.enabled</code> is the one
@@ -1221,8 +1397,9 @@ Occlusion by other windows is not checked, so a fully covered window still
 counts as shown.</li>
 <li><strong>Discarded without a frame:</strong> unmap, minimise, destroy, a new role, a
 buffer the compositor or renderer refused, a surface that can no longer be
-drawn, and commits made before the surface was mapped (including an X11
-window's commits before its map). A session lock needs no extra step: while
+drawn, a workspace switch or move that takes the window off the current
+workspace, and commits made before the surface was mapped (including an
+X11 window's commits before its map). A session lock needs no extra step: while
 locked, every frame treats the surfaces the lock hides as not shown. At most
 8 commits per surface wait; a faster client loses the oldest as <code>discarded</code>.</li>
 <li><strong>Nested backend:</strong> the host compositor gives no presentation timing, so
@@ -1357,8 +1534,10 @@ source; it replies <code>{reset, since_us, ...}</code>. Errors: the window error
 <code>current</code> when the source id was registered again. A session lock refuses the
 window forms (<code>locked</code>); source reads and the global reset still work.</p>
 <p>Each <code>comp.window.*</code> verb emits a <code>comp_window_control</code> trace record
-(subject window id or 0, detail 1 minimise / 2 restore / 3 stats / 4 reset,
-aux generation).</p>
+(subject window id or 0, aux generation; detail 1 minimise / 2 restore /
+3 focus / 4 raise / 5 close / 6 place / 7 wait and stats / 8 forced close
+and stats reset / 9 workspace switch / 10 send to workspace — the 7/8
+double use is renumbered in 0.60).</p>
 <p>Content-source honesty limits: a source counts as presented when its entity
 was visible in a presented frame; comp cannot tell whether the plugin's own
 texture upload for that revision had finished. Flags and clock are the
@@ -1376,16 +1555,22 @@ supervises one rootless Xwayland instance and acts as its X11 window
 manager. The runtime control is the <code>xwayland.enabled</code> property described
 above (startup-read, file-persisted per socket) with the
 <code>COSMIX_COMP_XWAYLAND</code> environment variable as the launch-time override —
-the cargo feature is no longer the switch. Normal X11 windows become managed toplevels on the existing
+the cargo feature is no longer the switch. The read-only <code>xwayland.display</code>
+leaf reports the X display (<code>:N</code>) of the ready generation — the Bus-side
+equivalent of the per-socket <code>DISPLAY</code> descriptor file, published at the
+same moment and null while no generation serves X clients (watch it to know
+when <code>xprop</code>/<code>xdotool</code> can connect). Normal X11 windows become managed toplevels on the existing
 scene, buffer, focus, stacking and server-side-decoration paths: association
 (via the xwayland-shell serial handshake) creates the window's surface
 record, the map grant makes it eligible, and its first committed buffer
 renders through exactly the renderer path a Wayland toplevel uses — the
 renderer has no X11 branch. Title/class metadata, focus (including the X
 <code>SetInputFocus</code>/<code>WM_TAKE_FOCUS</code> half), interactive and client-requested
-move/resize, maximise/minimise/fullscreen, EWMH state mirroring, close via
-<code>WM_DELETE_WINDOW</code>, and cross-protocol stacking in the normal band are
-supported.</p>
+move/resize, maximise/minimise/fullscreen, EWMH state mirroring (including
+the virtual-desktop trio <code>_NET_NUMBER_OF_DESKTOPS</code> / <code>_NET_CURRENT_DESKTOP</code>
+/ <code>_NET_WM_DESKTOP</code>, described under Window switching and X11 placement),
+close via <code>WM_DELETE_WINDOW</code>, and cross-protocol stacking in the normal
+band are supported.</p>
 <p><code>DISPLAY</code> is never set globally. After the XWM owns <code>WM_S0</code>, the compositor
 atomically publishes a mode-0600 per-socket descriptor at
 <code>$XDG_RUNTIME_DIR/cosmix-comp/&lt;WAYLAND_DISPLAY&gt;.xwayland.env</code> containing
@@ -1828,6 +2013,18 @@ The xwayland-shell serial handshake owns the real association; the setter
 exists only so the compositor's deterministic tests can fabricate offline
 X11 surfaces whose focus forwarding and metadata lookups still reach a real
 <code>wl_surface</code>.</p>
+<p>The vendored XWM also carries the EWMH virtual-desktop additions (comp
+0.59.0): the <code>_NET_NUMBER_OF_DESKTOPS</code>, <code>_NET_CURRENT_DESKTOP</code> and
+<code>_NET_WM_DESKTOP</code> atoms (interned, advertised in <code>_NET_SUPPORTED</code>, the root
+pair written as <code>1</code>/<code>0</code> at WM start), <code>X11Wm::set_number_of_desktops</code> /
+<code>X11Wm::set_current_desktop</code> for the root pair, <code>X11Surface::set_desktop</code>
+for the per-window property (with a <code>desktop()</code> read-back of the last value
+asked for, so the offline tests can see it through a dead connection), and
+an <code>XwmHandler::desktop_request</code> callback dispatched for 32-bit
+<code>_NET_WM_DESKTOP</code> client messages and an <code>XwmHandler::current_desktop_request</code>
+callback for 32-bit <code>_NET_CURRENT_DESKTOP</code> root messages, both no-ops by
+default: the compositor owns the desktop model and decides whether a
+request becomes a move or a switch.</p>
 <p>The vendored session-lock implementation also carries five marked fixes:</p>
 <ul>
 <li>invalid <code>unlock_and_destroy</code> returns after posting <code>InvalidUnlock</code>, so a

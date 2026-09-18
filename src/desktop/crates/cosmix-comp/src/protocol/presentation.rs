@@ -605,6 +605,8 @@ pub(crate) enum DiscardReason {
     Refused = 7,
     Overflow = 8,
     NoFrame = 9,
+    /// The surface left the current workspace (a switch or a move).
+    Workspace = 10,
 }
 
 fn trace_discards(id: SurfaceId, resolution: &Resolution, reason: DiscardReason) {
@@ -919,15 +921,20 @@ impl WaylandState {
         };
         let mut reported = HashSet::new();
         let mut windows = HashMap::<u64, (u64, WindowFrame)>::new();
+        // Once per report, not once per surface (see `workspaces::on_workspace`).
+        let current_workspace = self.workspace_current();
         for surface in &content.surfaces {
             reported.insert(surface.id);
             let record = self
                 .surface_objects
                 .get(&surface.id)
                 .and_then(|object| self.surfaces.get(object));
+            // Off the current workspace is Hidden, never Waiting: the
+            // renderer will not sample it until a switch brings it back.
             let presentable = record.is_some_and(|record| {
                 record.mapped
                     && !record.minimized
+                    && super::workspaces::on_workspace(record, current_workspace)
                     && (!lock_active || self.surface_is_session_presentable(record))
             });
             let shown = surface.shown && presentable;

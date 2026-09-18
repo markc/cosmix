@@ -31,6 +31,13 @@ use smithay::{
 };
 use std::borrow::Cow;
 
+// `X11Surface` carries the XWM's whole interned `Atoms` table by value (one
+// `u32` per atom, ~60 of them), so it is ~270 bytes against `WlSurface`'s 64;
+// the EWMH desktop atoms (workspaces 0.59.0) tipped the gap over clippy's
+// 200-byte `large_enum_variant` threshold. Boxing the variant would trade a
+// few-hundred-byte copy per focus change for a heap allocation per clone;
+// the size is upstream's shape, not growth of ours.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SeatFocusTarget {
     Wayland(WlSurface),

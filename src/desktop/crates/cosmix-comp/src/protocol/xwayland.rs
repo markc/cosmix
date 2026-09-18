@@ -240,6 +240,13 @@ pub(super) struct XwaylandRuntime {
     /// `DISPLAY` descriptor so nested compositors never race one global file.
     pub(super) socket_name: String,
     pub(super) descriptor_path: Option<PathBuf>,
+    /// The display number of the READY generation (`xwayland.display`
+    /// reads `:N`): set with the descriptor once the XWM owns WM_S0 and
+    /// publication succeeded, cleared with it at teardown. `None` while no
+    /// generation serves X clients. Its only reader is the `bus` snapshot,
+    /// so the field is allowed dead on a bus-less xwayland build.
+    #[cfg_attr(not(feature = "bus"), allow(dead_code))]
+    pub(super) display_number: Option<u32>,
     pub(super) pending_windows: HashMap<X11Window, PendingX11Window>,
     /// XID → associated `wl_surface` object for normal managed windows.
     pub(super) surfaces_by_xid: HashMap<X11Window, ObjectId>,
@@ -328,6 +335,7 @@ impl XwaylandRuntime {
             retry: XwaylandRetryPolicy::new(),
             socket_name,
             descriptor_path: None,
+            display_number: None,
             pending_windows: HashMap::new(),
             surfaces_by_xid: HashMap::new(),
             xids_by_object: HashMap::new(),
@@ -644,6 +652,129 @@ impl WaylandState {
         }
     }
 
+    /// Publish the workspace model to the X root: `_NET_NUMBER_OF_DESKTOPS`
+    /// and the 0-based `_NET_CURRENT_DESKTOP`. Called on every switch and
+    /// count change and once at XWM start; a no-op without a live
+    /// generation. Property delivery is a live-gate obligation (the offline
+    /// suite never reaches `Ready`).
+    pub(super) fn publish_x11_desktops(&self) {
+        let XwaylandLifecycle::Ready { wm, .. } = &self.xwayland.lifecycle else {
+            return;
+        };
+        let count = self.workspaces.count;
+        let current = self.workspace_current().saturating_sub(1);
+        if let Err(error) = wm.set_number_of_desktops(count) {
+            tracing::warn!(%error, count, "failed to publish _NET_NUMBER_OF_DESKTOPS");
+        }
+        if let Err(error) = wm.set_current_desktop(current) {
+            tracing::warn!(%error, current, "failed to publish _NET_CURRENT_DESKTOP");
+        }
+    }
+
+    /// Re-publish `_NET_WM_DESKTOP` on every mapped managed X11 window from
+    /// its record (the mass re-derivation for a count shrink and for XWM
+    /// start). The per-window edges — the stamp at map and a move — write
+    /// their own value at the site that changes the record. Debug, not
+    /// warn, on failure, like those edges and the suspend sweep beside
+    /// this one: an `Err` from a property write is a dead connection (the
+    /// X protocol reports per-request errors asynchronously, never through
+    /// this `Result`), which is the offline fakes' normal state and, live,
+    /// a dying generation `disconnected` cleans up.
+    pub(super) fn sync_x11_desktops(&self) {
+        for record in self.surfaces.values() {
+            if !record.mapped || record.workspace == 0 {
+                continue;
+            }
+            if let Some(role) = record.role.x11()
+                && !role.override_redirect
+                && let Err(error) = role.surface.set_desktop(record.workspace - 1)
+            {
+                tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP");
+            }
+        }
+    }
+
+    /// A pager's `_NET_CURRENT_DESKTOP` root message: switch the default
+    /// output to the 0-based `desktop`, exactly like `comp.workspace.switch
+    /// {index: desktop + 1}` (no wrap; a switch to the current workspace is
+    /// a no-op). Refused, with a debug log: an index at or above the count
+    /// and a session lock (a client-driven path must not change the desktop
+    /// under the lock surface — the same gate as the `_NET_WM_DESKTOP`
+    /// arm and the props write). The switch itself publishes the new value.
+    pub(super) fn x11_current_desktop_request(&mut self, desktop: u32) {
+        let count = self.workspaces.count;
+        if desktop >= count {
+            tracing::debug!(desktop, count, "ignored _NET_CURRENT_DESKTOP above the workspace count");
+            return;
+        }
+        if self.session_lock_active() {
+            tracing::debug!(desktop, "ignored _NET_CURRENT_DESKTOP under a session lock");
+            return;
+        }
+        match self.switch_workspace(None, workspaces::WorkspaceTarget::Index(desktop + 1), false) {
+            Ok(switched) => tracing::debug!(
+                from = switched.from,
+                to = switched.to,
+                "switched workspace on _NET_CURRENT_DESKTOP"
+            ),
+            Err(refusal) => tracing::debug!(desktop, ?refusal, "refused _NET_CURRENT_DESKTOP switch"),
+        }
+    }
+
+    /// A client's `_NET_WM_DESKTOP` message: move its window to the 0-based
+    /// `desktop` without switching (the EWMH request is a placement, not an
+    /// activation; `_NET_ACTIVE_WINDOW` is the one that brings a window on
+    /// screen). Refused, with a debug log: `0xFFFFFFFF` (all desktops — no
+    /// sticky windows in 0.59.0), an index at or above the count, a session
+    /// lock (the props write refuses the same way), and any window that is
+    /// not a live managed one. The move itself publishes the new value.
+    pub(super) fn x11_desktop_request(&mut self, window: X11Surface, desktop: u32) {
+        let xid = window.window_id();
+        let count = self.workspaces.count;
+        if desktop == u32::MAX {
+            tracing::debug!(xid, "ignored _NET_WM_DESKTOP 0xFFFFFFFF: no sticky windows in 0.59");
+            return;
+        }
+        // The identity gate first, so the log names the reason a request
+        // that fails several gates was actually refused for: an
+        // override-redirect menu asking for a desktop above the count is
+        // refused because it is a menu, not because of the count.
+        let Some(surface) = window.wl_surface() else {
+            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP for an unassociated window");
+            return;
+        };
+        // The same identity gate as `_NET_ACTIVE_WINDOW`: a stale association
+        // or an override-redirect window is not a live managed identity.
+        // (`move_window_to_workspace` would refuse an OR record as not a
+        // managed toplevel anyway; the gate names the reason.)
+        let object = surface.id();
+        if !self.surfaces.get(&object).is_some_and(|record| {
+            record
+                .role
+                .x11()
+                .is_some_and(|role| !role.override_redirect && role.surface == window)
+        }) {
+            tracing::debug!(
+                xid,
+                desktop,
+                "ignored _NET_WM_DESKTOP for an override-redirect window or a stale identity"
+            );
+            return;
+        }
+        if desktop >= count {
+            tracing::debug!(xid, desktop, count, "ignored _NET_WM_DESKTOP above the workspace count");
+            return;
+        }
+        if self.session_lock_active() {
+            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP under a session lock");
+            return;
+        }
+        match self.move_window_to_workspace(&object, workspaces::WorkspaceTarget::Index(desktop + 1)) {
+            Ok((from, to)) => tracing::debug!(xid, from, to, "moved X11 window on _NET_WM_DESKTOP"),
+            Err(refusal) => tracing::debug!(xid, desktop, ?refusal, "refused _NET_WM_DESKTOP move"),
+        }
+    }
+
     pub(super) fn x11_activate_request(&mut self, window: X11Surface) {
         let Some(surface) = window.wl_surface() else {
             return;
@@ -794,6 +925,11 @@ impl WaylandState {
                     return;
                 }
                 self.xwayland.descriptor_path = path;
+                // `xwayland.display` follows the descriptor: published only
+                // for a generation X clients can actually reach.
+                self.xwayland.display_number = Some(display_number);
+                #[cfg(feature = "bus")]
+                self.mark_xwayland_dirty("xwayland.ready");
                 let stability_timer = match self.capture_loop_handle.insert_source(
                     Timer::from_duration(XWAYLAND_STABILITY_WINDOW),
                     move |_, (), state: &mut WaylandState| {
@@ -825,6 +961,14 @@ impl WaylandState {
                     wm: Box::new(wm),
                     stability_timer,
                 };
+                // The workspace model exists before any X client does:
+                // publish it now so the root pair reads the real count and
+                // current from the first `xprop` (start_wm wrote 1/0). The
+                // per-window sync is the same mass re-derivation a count
+                // shrink runs; at Ready it finds no X11 record of this
+                // generation and is a no-op kept for symmetry.
+                self.publish_x11_desktops();
+                self.sync_x11_desktops();
             }
             Err(error) => {
                 tracing::warn!(generation, %error, "failed to start XWM");
@@ -924,6 +1068,10 @@ impl WaylandState {
     fn teardown_xwayland_generation(&mut self) {
         remove_xwayland_descriptor(self.xwayland.descriptor_path.as_ref());
         self.xwayland.descriptor_path = None;
+        if self.xwayland.display_number.take().is_some() {
+            #[cfg(feature = "bus")]
+            self.mark_xwayland_dirty("xwayland.down");
+        }
         let lifecycle = mem::replace(&mut self.xwayland.lifecycle, XwaylandLifecycle::Inert);
         match lifecycle {
             // Removing `token` drops the `XWayland` source, whose `Drop`
@@ -1386,10 +1534,15 @@ impl WaylandState {
                 let surface = record.role.wl_surface().clone();
                 self.mark_surface_mapped(&surface);
             }
+            let current_workspace = self.workspace_current();
             let Some(record) = self.x11_role_record_mut(xid) else {
                 return;
             };
+            // `was_mapped` is false here (the guard above returned on a
+            // mapped record): a remap rejoins the current workspace (D4).
+            let was_mapped = record.mapped;
             record.mapped = true;
+            workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
             let id = record.id;
             self.pending_full_upserts.insert(id);
             self.recompute_effective_visibility();
@@ -1937,6 +2090,7 @@ impl WaylandState {
                     pending_window_state: None,
                     configured_window_states: Vec::new(),
                     minimized: false,
+                    workspace: 0,
                     focused: false,
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
@@ -2641,8 +2795,8 @@ impl WaylandState {
         let Some(surface) = window.wl_surface() else {
             return;
         };
+        // `minimize_toplevel` sets the X11 suspended flag itself.
         self.minimize_toplevel(&surface);
-        let _ = window.set_suspended(true);
     }
 
     pub(super) fn x11_unminimize_request(&mut self, window: X11Surface) {
@@ -2657,22 +2811,15 @@ impl WaylandState {
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
         };
-        let restored = self.surfaces.get_mut(&object).and_then(|record| {
-            (record.mapped && record.minimized).then(|| {
-                record.minimized = false;
-                record.role.wl_surface().clone()
-            })
-        });
-        let Some(surface) = restored else {
-            return;
-        };
-        self.minimized_toplevels.retain(|entry| *entry != object);
-        let _ = window.set_suspended(false);
-        self.recompute_effective_visibility();
-        self.raise_surface(&surface);
-        self.sync_xwm_stacking();
-        self.arbitrate_keyboard_focus(Some(surface), false, false);
-        self.retarget_pointer_after_visibility_change();
+        // One restore path (D5): `restore_window` drops the LIFO entry,
+        // switches to the window's workspace where allowed (F1.2; inert
+        // under a lock, D18), derives the suspended flag (D15), marks the
+        // surface dirty, recomputes, raises, arbitrates and retargets. The
+        // hand copy this replaced skipped the dirty mark and re-derived the
+        // rest.
+        if self.restore_window(&object) {
+            self.sync_xwm_stacking();
+        }
     }
 
     pub(super) fn x11_resize_request(
@@ -2933,6 +3080,20 @@ impl XwmHandler for WaylandState {
             return;
         }
         self.x11_activate_request(window);
+    }
+
+    fn desktop_request(&mut self, xwm: XwmId, window: X11Surface, desktop: u32, _source: u32) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
+        self.x11_desktop_request(window, desktop);
+    }
+
+    fn current_desktop_request(&mut self, xwm: XwmId, desktop: u32, _timestamp: u32) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
+        self.x11_current_desktop_request(desktop);
     }
 
     fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {

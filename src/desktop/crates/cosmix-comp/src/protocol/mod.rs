@@ -3290,6 +3290,7 @@ impl ProtocolServer {
             interactive_pointer: None,
             exclusive_keyboard_focus: None,
             minimized_toplevels: Vec::new(),
+            workspaces: workspaces::WorkspaceState::default(),
             surfaces: HashMap::new(),
             foreign_toplevels: HashMap::new(),
             foreign_toplevel_identifiers: HashMap::new(),
@@ -3682,6 +3683,12 @@ impl ProtocolServer {
                     let previous_scale = state.backend.output_scale();
                     let previous_output = state.logical_output_rect();
                     let previous_usable = state.usable_output_rect();
+                    // Read before the backend applies the event: the
+                    // default output — and with it the key
+                    // `workspaces.current` is read under (D3) — can be
+                    // replaced by it.
+                    let previous_workspace_key = state.default_output_key();
+                    let previous_workspace_current = state.workspace_current();
                     let result = state
                         .backend
                         .apply_kms_topology_lifecycle(event)
@@ -3739,6 +3746,21 @@ impl ProtocolServer {
                                 state.reconcile_output_after_topology_change_if_needed(
                                     previous_output,
                                     previous_usable,
+                                );
+                                // `workspaces.current` is the DEFAULT
+                                // output's (D3) and a topology change can
+                                // replace that output: the retiring
+                                // output's current workspace is carried to
+                                // the replacing one, the EWMH root pair is
+                                // republished, and if the effective value
+                                // changed anyway the visibility and X11
+                                // suspend state are re-derived in one
+                                // settle — `workspace_current()` is read
+                                // fresh every frame, so it must never
+                                // disagree with `layout.visible`.
+                                state.reconcile_workspace_current_after_topology_change(
+                                    previous_workspace_key.as_deref(),
+                                    previous_workspace_current,
                                 );
                                 state.end_pointer_hit_test_batch();
                             }
@@ -4902,6 +4924,14 @@ fn configure_sequence_is_acked(required: Option<Serial>, acknowledged: Option<Se
         .is_some_and(|(required, acknowledged)| acknowledged >= required)
 }
 
+/// A minimise-LIFO entry that `restore_window` would restore: a mapped,
+/// minimised, managed toplevel. Every minimised window is on the LIFO; the
+/// entries that are not this are stale (unmapped or closed) and are pruned
+/// on the next `restore {}`.
+fn lifo_restorable(record: &SurfaceRecord) -> bool {
+    record.mapped && record.minimized && record.role.managed_toplevel()
+}
+
 fn effectively_visible(
     own_buffer: bool,
     ancestor_visible: bool,
@@ -4979,6 +5009,10 @@ struct SurfaceRecord {
     pending_window_state: Option<WindowStateSnapshot>,
     configured_window_states: Vec<ConfigureWindowStateSnapshot>,
     minimized: bool,
+    /// The managed toplevel's workspace, 1-based; `0` until it maps (rule
+    /// 2 stamps the current workspace at the map edge). Never bumps
+    /// `generation`: a moved window is the same window.
+    workspace: u32,
     focused: bool,
     chrome_pointer: ChromePointerSceneState,
     committed_window_geometry: Option<SceneWindowGeometry>,
@@ -6119,6 +6153,7 @@ struct WaylandState {
     interactive_pointer: Option<InteractivePointer>,
     exclusive_keyboard_focus: Option<ObjectId>,
     minimized_toplevels: Vec<ObjectId>,
+    workspaces: workspaces::WorkspaceState,
     surfaces: HashMap<ObjectId, SurfaceRecord>,
     foreign_toplevels: HashMap<SurfaceId, ForeignToplevelHandle>,
     foreign_toplevel_identifiers: HashMap<SurfaceId, String>,
@@ -8618,6 +8653,8 @@ impl WaylandState {
         }
 
         let frame_time = monotonic_millis();
+        // Once per frame, not once per surface: see `workspaces::on_workspace`.
+        let current_workspace = self.workspace_current();
         let mut delivered = self
             .surfaces
             .values()
@@ -8625,7 +8662,10 @@ impl WaylandState {
                 !matches!(record.role, SurfaceRole::Dormant(_))
                     && self.surface_is_session_presentable(record)
                     && record.role.parent_surface().is_none()
-                    && !self.surface_belongs_to_minimized_toplevel(record.role.wl_surface())
+                    && !self.surface_belongs_to_hidden_toplevel(
+                        record.role.wl_surface(),
+                        current_workspace,
+                    )
             })
             .map(|record| {
                 send_frames_surface_tree(record.role.wl_surface(), frame_time, &self.surfaces)
@@ -8643,11 +8683,24 @@ impl WaylandState {
         crate::frame_trace::event("comp_frame_callbacks", || (delivered as u64, 0, 0));
     }
 
-    fn surface_belongs_to_minimized_toplevel(&self, surface: &WlSurface) -> bool {
+    /// Rule 9: frame callbacks stop for a tree whose root is minimised OR
+    /// off the current workspace — the two states that hide a window
+    /// through the visibility funnel. Decided on the canonical root (not
+    /// `layout.visible`) so popups and subsurfaces follow their toplevel
+    /// through `send_frames_surface_tree`. A root that has not mapped yet
+    /// (`workspace == 0`) keeps 0.58.0's delivery: it is not off any
+    /// workspace, it has not joined one. `current_workspace` is the
+    /// caller's once-per-frame read.
+    fn surface_belongs_to_hidden_toplevel(
+        &self,
+        surface: &WlSurface,
+        current_workspace: u32,
+    ) -> bool {
         let root = canonical_root_surface(&self.popup_manager, surface);
-        self.surfaces
-            .get(&root.id())
-            .is_some_and(|record| record.minimized)
+        self.surfaces.get(&root.id()).is_some_and(|record| {
+            record.minimized
+                || (record.mapped && !workspaces::on_workspace(record, current_workspace))
+        })
     }
 
     /// The single seat-policy entry point, shared by both input transports.
@@ -10391,6 +10444,8 @@ impl WaylandState {
         let mut output_changes = Vec::new();
         #[cfg(feature = "bus")]
         let mut observed = Vec::new();
+        // Read once: the loop holds `surfaces` mutably.
+        let current_workspace = self.workspace_current();
         while let Some((id, ancestor_visible)) = stack.pop() {
             let Some(object) = self.surface_objects.get(&id).cloned() else {
                 continue;
@@ -10411,8 +10466,15 @@ impl WaylandState {
                 #[cfg(feature = "xwayland")]
                 SurfaceRole::X11(_) => true,
             };
+            // The own-buffer term: hidden = minimised OR off the current
+            // workspace (managed toplevels only; bands, layers, popups and
+            // locks are on every workspace). Both hide through this one
+            // funnel, so `visible:false, minimized:false` needs no reader
+            // change.
             let visible = effectively_visible(
-                record.mapped && !record.minimized,
+                record.mapped
+                    && !record.minimized
+                    && workspaces::on_workspace(record, current_workspace),
                 ancestor_visible,
                 association_visible,
             );
@@ -12207,6 +12269,79 @@ impl WaylandState {
                 debug_assert!(!action.needs_ecs());
                 self.restore_most_recently_minimized();
             }
+            // The chords share one implementation with the verbs: a refusal
+            // (index above `workspaces.count`, no output) is a no-op here,
+            // logged at debug — a key press has nobody to reply to.
+            BindingAction::WorkspaceJump(n) => {
+                debug_assert!(!action.needs_ecs());
+                if let Err(refusal) = self.switch_workspace(
+                    None,
+                    workspaces::WorkspaceTarget::Index(u32::from(n)),
+                    true,
+                ) {
+                    tracing::debug!(workspace = n, ?refusal, "workspace-jump chord refused");
+                }
+            }
+            BindingAction::WorkspaceStep { prev } => {
+                debug_assert!(!action.needs_ecs());
+                let target = if prev {
+                    workspaces::WorkspaceTarget::Prev
+                } else {
+                    workspaces::WorkspaceTarget::Next
+                };
+                if let Err(refusal) = self.switch_workspace(None, target, true) {
+                    tracing::debug!(prev, ?refusal, "workspace-step chord refused");
+                }
+            }
+            BindingAction::WorkspaceMove(n) => {
+                debug_assert!(!action.needs_ecs());
+                let Some(focused) = self
+                    .keyboard
+                    .current_focus()
+                    .and_then(|target| target.owned_surface())
+                else {
+                    tracing::debug!("workspace-move binding had no keyboard focus");
+                    return;
+                };
+                let root = canonical_root_surface(&self.popup_manager, &focused);
+                // D18, the same gate as `send_to_workspace {follow:true}`
+                // and every other switch-first path: a chord that will
+                // activate the window afterwards must not re-arrange the
+                // desktop under an exclusive layer (a lock never dispatches
+                // it), nor for a focus that is not a movable, presentable
+                // window. Arbitration hands the keyboard to an exclusive
+                // layer whenever one is on screen, so this arm is the guard
+                // that keeps the chord and the verb one policy rather than
+                // a state the seat reaches on its own.
+                if self.workspace_switch_allowed_for(&root.id()).is_none() {
+                    tracing::debug!(
+                        surface = ?root.id(),
+                        workspace = n,
+                        "workspace-move chord withheld: switch not allowed for the focus"
+                    );
+                    return;
+                }
+                // Move and switch in ONE settle (`move_window_and_follow`):
+                // a move then a switch, or a switch then a move, each
+                // settle the scene once with this window off it, and that
+                // settle hands the keyboard to whichever bystander is left
+                // highest — on the old workspace or the new one — for an
+                // enter + activated configure the activation below reverses
+                // at once. The primitive refuses (an index above
+                // `workspaces.count`) before anything changes, so a refused
+                // chord leaves the window, the workspace and the focus
+                // exactly where they were.
+                let target = workspaces::WorkspaceTarget::Index(u32::from(n));
+                match self.move_window_and_follow(&root.id(), target) {
+                    Ok(_) => self.activate_managed_window(&root),
+                    Err(refusal) => tracing::debug!(
+                        surface = ?root.id(),
+                        workspace = n,
+                        ?refusal,
+                        "workspace-move chord refused"
+                    ),
+                }
+            }
             BindingAction::CycleWindow { reverse } => self.cycle_window(reverse),
             BindingAction::ExitNestedCompositor => {
                 debug_assert!(action.needs_ecs());
@@ -13499,15 +13634,9 @@ impl WaylandState {
             self.finish_interactive_pointer(true);
         }
         // X11 windows also learn the state through EWMH so the client can
-        // stop rendering.
+        // stop rendering (D15: derived from the minimised flag just set).
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(&object)
-            .and_then(|record| record.role.x11())
-        {
-            let _ = role.surface.set_suspended(true);
-        }
+        self.sync_x11_suspended(&object);
         self.minimized_toplevels.retain(|entry| *entry != object);
         self.minimized_toplevels.push(object);
         #[cfg(feature = "bus")]
@@ -13517,21 +13646,56 @@ impl WaylandState {
         self.retarget_pointer_after_visibility_change();
     }
 
-    /// Pops the minimise LIFO until one entry restores; returns the
-    /// restored object, or `None` when nothing restorable was left.
+    /// Rule 8 (D14): the entry `restore {}` and the Super+Shift+M binding
+    /// restore — the most recently minimised window on the current
+    /// workspace, else the most recently minimised one anywhere (which then
+    /// switches to it through `restore_window`). Only entries that are still
+    /// mapped, minimised, managed toplevels count; the walk skips the rest
+    /// without discarding them. The ONE predicate for both the binding and
+    /// the verb's prediction (`next_lifo_restore`).
+    fn lifo_restore_candidate(&self) -> Option<(ObjectId, SurfaceId)> {
+        let current = self.workspace_current();
+        let restorable = || {
+            self.minimized_toplevels.iter().rev().filter_map(|object| {
+                self.surfaces
+                    .get(object)
+                    .filter(|record| lifo_restorable(record))
+                    .map(|record| (object, record))
+            })
+        };
+        restorable()
+            .find(|(_, record)| record.workspace == current)
+            .or_else(|| restorable().next())
+            .map(|(object, record)| (object.clone(), record.id))
+    }
+
+    /// Restores `lifo_restore_candidate` and prunes the LIFO of entries that
+    /// are no longer restorable (what the old pop discarded on its way
+    /// down); returns the restored object, or `None` when nothing
+    /// restorable was left.
     fn restore_most_recently_minimized(&mut self) -> Option<ObjectId> {
-        while let Some(object) = self.minimized_toplevels.pop() {
-            if self.restore_window(&object) {
-                return Some(object);
-            }
-        }
-        None
+        let restored = self
+            .lifo_restore_candidate()
+            .map(|(object, _)| object)
+            .filter(|object| self.restore_window(object));
+        let surfaces = &self.surfaces;
+        self.minimized_toplevels
+            .retain(|entry| surfaces.get(entry).is_some_and(lifo_restorable));
+        restored
     }
 
     /// The per-window half of a restore: un-minimise one mapped managed
-    /// toplevel, drop it from the LIFO, then raise, focus and retarget the
-    /// pointer. Returns `false` (and changes nothing but the LIFO entry) when
-    /// the object is not a mapped, minimised, managed toplevel.
+    /// toplevel, drop it from the LIFO, switch to its workspace when that is
+    /// allowed (F1.2 — never pulls the window across), then raise, focus
+    /// and retarget the pointer. Returns `false` (and changes nothing but
+    /// the LIFO entry) when the object is not a mapped, minimised, managed
+    /// toplevel. No lock guard of its own: `ensure_workspace_shown` is inert
+    /// under a session lock or an exclusive layer (D18), so a locked restore
+    /// un-minimises without switching and the window stays off screen — and
+    /// then it is NOT focused either: `arbitrate_keyboard_focus` has no
+    /// workspace term, so a restore whose switch was withheld (a lock, an
+    /// exclusive layer, the KMS input gate) leaves the keyboard where it
+    /// was rather than on a window that is off screen.
     fn restore_window(&mut self, object: &ObjectId) -> bool {
         self.minimized_toplevels.retain(|entry| entry != object);
         let restored = self.surfaces.get_mut(object).and_then(|record| {
@@ -13544,19 +13708,25 @@ impl WaylandState {
         let Some((surface, _id)) = restored else {
             return false;
         };
+        self.ensure_workspace_shown(object);
+        let shown = !self.window_off_current_workspace(object);
+        // D15: un-minimised is not the same as on screen — a window still
+        // off the current workspace (a restore the lock or an exclusive
+        // layer kept from switching) stays suspended.
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(object)
-            .and_then(|record| record.role.x11())
-        {
-            let _ = role.surface.set_suspended(false);
-        }
+        self.sync_x11_suspended(object);
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(_id, "wayland.focus");
         self.recompute_effective_visibility();
         self.raise_surface(&surface);
-        self.arbitrate_keyboard_focus(Some(surface), false, false);
+        if shown {
+            self.arbitrate_keyboard_focus(Some(surface), false, false);
+        } else {
+            tracing::debug!(
+                surface = ?object,
+                "restore could not show the window's workspace: un-minimised, not focused"
+            );
+        }
         self.retarget_pointer_after_visibility_change();
         true
     }
@@ -15300,6 +15470,7 @@ impl WaylandState {
                     );
                     #[cfg(feature = "bus")]
                     self.mark_surface_mapped(surface);
+                    let current_workspace = self.workspace_current();
                     let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                         #[cfg(test)]
                         {
@@ -15310,7 +15481,9 @@ impl WaylandState {
                         self.release_buffer_token(backing_retention_token);
                         return;
                     };
+                    let was_mapped = record.mapped;
                     record.mapped = commit_may_map_surface(record);
+                    workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                     let old_origin = (record.layout.x, record.layout.y);
                     if let Some(window_geometry) = window_geometry {
                         record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -15471,10 +15644,13 @@ impl WaylandState {
                 );
                 #[cfg(feature = "bus")]
                 self.mark_surface_mapped(surface);
+                let current_workspace = self.workspace_current();
                 let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                     return;
                 };
+                let was_mapped = record.mapped;
                 record.mapped = commit_may_map_surface(record);
+                workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                 let old_origin = (record.layout.x, record.layout.y);
                 if let Some(window_geometry) = window_geometry {
                     record.layout.x = record.window_origin.0 - window_geometry.x;
@@ -15757,6 +15933,7 @@ mod input_injection;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;
+pub(crate) mod workspaces;
 #[cfg(feature = "xwayland")]
 mod xwayland;
 

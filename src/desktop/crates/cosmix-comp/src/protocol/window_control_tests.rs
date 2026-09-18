@@ -1,6 +1,9 @@
 // `comp.window.*` and `comp.windows.list` (included from tests.rs).
 
-use crate::port::{LongOp, PlaceSpec, WaitSpec, WaitUntil, WindowMatch, WindowOp};
+use crate::port::{
+    LongOp, PlaceSpec, WaitSpec, WaitUntil, WindowMatch, WindowOp, WorkspaceIndex,
+};
+use workspaces::WorkspaceTarget;
 
 fn window_op(
     harness: &mut KeybindingHarness,
@@ -404,6 +407,12 @@ fn window_verbs_refuse_stale_targets_and_the_lock() {
                 x: Some(1.0),
                 ..place(id, generation)
             }),
+            WindowOp::SendToWorkspace {
+                id,
+                generation,
+                index: WorkspaceIndex::Absolute(2),
+                follow: true,
+            },
         ]
     };
     let origin = harness.server.state.surfaces[&alpha].window_origin;
@@ -440,7 +449,452 @@ fn window_verbs_refuse_stale_targets_and_the_lock() {
         assert_eq!((rc, body), (10, json!({"error": "locked"})), "{op:?}");
     }
     assert_eq!(harness.server.state.surfaces[&alpha].window_origin, origin);
+    // D12: a switch names no window, but it changes what is on screen, so
+    // the lock refuses it too and `current` stays where it was.
+    let current = harness.server.state.workspace_current();
+    for index in [WorkspaceIndex::Absolute(2), WorkspaceIndex::Next] {
+        let op = WindowOp::SwitchWorkspace {
+            output: None,
+            index,
+            wrap: true,
+        };
+        let (rc, body) = window_op(&mut harness, &ingress, &runtime, op.clone());
+        assert_eq!((rc, body), (10, json!({"error": "locked"})), "{op:?}");
+    }
+    assert_eq!(harness.server.state.workspace_current(), current);
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, current);
 }
+
+/// Rule 7 over the verb: `next`/`prev` wrap at the ends, `wrap:false`
+/// refuses `at_end` and leaves `current` alone, an index outside
+/// `1..=count` (0 included) and an unknown output are `invalid_value`, and
+/// a switch reaches the observation lane (the window rows' `visible`).
+#[test]
+fn workspace_switch_verb_wraps_and_refuses_at_end() {
+    let (mut harness, ingress, observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, _) = window_id_and_generation(&harness, &alpha);
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let switch = |index: WorkspaceIndex, wrap: bool| WindowOp::SwitchWorkspace {
+        output: None,
+        index,
+        wrap,
+    };
+    let output = "o_cosmix_nested_0";
+    assert_eq!(
+        harness.server.state.default_output_key().as_deref(),
+        Some(output)
+    );
+
+    for (from, to) in [(1, 2), (2, 3), (3, 4), (4, 1)] {
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            switch(WorkspaceIndex::Next, true),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body, json!({"output": output, "from": from, "to": to}));
+        assert_eq!(harness.server.state.workspace_current(), to);
+    }
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(harness.server.state.surfaces[&beta].layout.visible);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        switch(WorkspaceIndex::Prev, true),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"output": output, "from": 1, "to": 4}));
+    assert_eq!(harness.server.state.workspace_current(), 4);
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+    // D7: the switch marks the whole tree dirty with its own cause. The
+    // mark is not observable here — the verb is serviced inside the
+    // dispatch cycle's calloop turn and `service_observations` runs later
+    // in that same cycle, so by the time `window_op` returns the mark has
+    // been taken and diffed. What IS observable is the diff it scheduled:
+    // the row's `visible` flips with cause `workspace.switch`.
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    let alpha_visible = format!("windows.s{alpha_id}.visible");
+    assert!(
+        changed.iter().any(|record| matches!(
+            record,
+            port_observation::ObservationRecord::PropsChanged { path, new, cause, .. }
+                if *path == alpha_visible
+                    && new.wire_value() == json!(false)
+                    && *cause == "workspace.switch"
+        )),
+        "the switch re-diffs the whole tree with its own cause (D7): {changed:?}"
+    );
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        switch(WorkspaceIndex::Next, false),
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "at_end", "output": output, "from": 4, "count": 4})
+    );
+    assert_eq!(harness.server.state.workspace_current(), 4);
+    // Addressed by output NAME, the refusal still names the output by its
+    // key, as the success reply does — a caller keying replies by output
+    // sees one spelling on both paths.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SwitchWorkspace {
+            output: Some("cosmix-nested-0".into()),
+            index: WorkspaceIndex::Next,
+            wrap: false,
+        },
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "at_end", "output": output, "from": 4, "count": 4})
+    );
+
+    for (index, output) in [
+        (WorkspaceIndex::Absolute(5), None),
+        (WorkspaceIndex::Absolute(0), None),
+        (WorkspaceIndex::Absolute(1), Some("o_nope")),
+    ] {
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::SwitchWorkspace {
+                output: output.map(str::to_string),
+                index,
+                wrap: true,
+            },
+        );
+        assert_eq!(rc, 10, "{index:?} {output:?}: {body}");
+        assert_eq!(
+            body["error"], "invalid_value",
+            "{index:?} {output:?}: {body}"
+        );
+        assert_eq!(
+            body["path"],
+            if output.is_some() { "output" } else { "index" },
+            "{index:?} {output:?}: {body}"
+        );
+        assert_eq!(harness.server.state.workspace_current(), 4);
+    }
+    assert_eq!(
+        window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::SwitchWorkspace {
+                output: Some(output.into()),
+                index: WorkspaceIndex::Absolute(1),
+                wrap: true,
+            },
+        ),
+        (0, json!({"output": output, "from": 4, "to": 1})),
+        "the default output by its key"
+    );
+    let index_refusal = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        switch(WorkspaceIndex::Absolute(5), true),
+    )
+    .1;
+    assert_eq!(index_refusal["range"], "1..=4");
+}
+
+/// Rule 5 over the verb: a send without `follow` moves the window and
+/// leaves `current` alone; with `follow` it switches and activates it;
+/// `next`/`prev` are relative to the window's own workspace, not the
+/// current one.
+#[test]
+fn send_to_workspace_moves_and_follows() {
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let send = |id, generation, index, follow| WindowOp::SendToWorkspace {
+        id,
+        generation,
+        index,
+        follow,
+    };
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(beta_id, beta_generation, WorkspaceIndex::Absolute(3), false),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 3})
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 1);
+    assert_eq!(state.surfaces[&beta].workspace, 3);
+    assert!(!state.surfaces[&beta].layout.visible);
+    assert!(!state.surfaces[&beta].minimized);
+    assert!(state.surfaces[&alpha].layout.visible);
+    assert!(state.surfaces[&alpha].focused, "focus falls back to alpha");
+    assert_eq!(
+        window_id_and_generation(&harness, &beta),
+        (beta_id, beta_generation),
+        "a move never bumps the generation"
+    );
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(beta_id, beta_generation, WorkspaceIndex::Absolute(4), true),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 4, "followed": true})
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 4);
+    assert_eq!(state.surfaces[&beta].workspace, 4);
+    assert!(state.surfaces[&beta].layout.visible);
+    assert!(state.surfaces[&beta].focused, "follow activates the window");
+    assert!(!state.surfaces[&alpha].layout.visible);
+    assert!(!state.surfaces[&alpha].focused);
+    // A follow to the workspace the window is already current on is still
+    // a follow (it activates), and says so.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(beta_id, beta_generation, WorkspaceIndex::Absolute(4), true),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["followed"], true);
+    assert_eq!(harness.server.state.workspace_current(), 4);
+
+    // Alpha is on 1 while current is 4: `next` relative to the window's
+    // own workspace is 2 (relative to the current one it would wrap to 1).
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(alpha_id, alpha_generation, WorkspaceIndex::Next, false),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["index"], 2);
+    let state = &harness.server.state;
+    assert_eq!(state.surfaces[&alpha].workspace, 2);
+    assert_eq!(state.workspace_current(), 4);
+    assert!(!state.surfaces[&alpha].layout.visible);
+    // `prev` from 1 wraps to the last workspace.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(
+            alpha_id,
+            alpha_generation,
+            WorkspaceIndex::Absolute(1),
+            false,
+        ),
+    );
+    assert_eq!(rc, 0, "{body}");
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(alpha_id, alpha_generation, WorkspaceIndex::Prev, false),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["index"], 4);
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    // Out of range is `invalid_value` naming the count.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(
+            alpha_id,
+            alpha_generation,
+            WorkspaceIndex::Absolute(5),
+            false,
+        ),
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+    assert_eq!(body["path"], "index");
+    assert_eq!(body["range"], "1..=4");
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, 4);
+}
+
+/// D18 over the verb: under an exclusive layer `send_to_workspace
+/// {follow:true}` still moves the window, but the follow is inert — the
+/// screen is not re-arranged under the layer, `current` stays, the window
+/// is not activated, and the reply says `followed:false` rather than
+/// claiming a switch that did not happen.
+#[test]
+fn send_to_workspace_follow_is_inert_under_an_exclusive_layer() {
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+    );
+    let _ = harness.sync();
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(3),
+            follow: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 3, "followed": false})
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 1);
+    assert_eq!(state.surfaces[&beta].workspace, 3);
+    assert!(!state.surfaces[&beta].layout.visible);
+    assert!(!state.surfaces[&beta].focused);
+    assert!(state.surfaces[&alpha].layout.visible);
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()),
+        Some(layer_surface),
+        "the exclusive layer keeps the keyboard"
+    );
+}
+
+/// Rule 12 (F1.9): `wait {until:"visible"}` and `{until:"presented"}` on
+/// an off-workspace window time out rather than resolving, and resolve
+/// once a switch brings its workspace on screen.
+#[test]
+fn wait_until_visible_times_out_off_workspace_and_resolves_after_a_switch() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+
+    // Mapped regardless of workspace.
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Mapped, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 0, "mapped is workspace-blind: {body}");
+
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Visible, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "off-workspace is not visible: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["until"], "visible");
+
+    // A frame the renderer claims to have shown while the window is off
+    // its workspace is Hidden, never presented.
+    let (presentation, _) = bind_test_presentation(&mut harness);
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(
+        surface_id,
+        monotonic_micros(),
+        content_seq(&harness, &alpha),
+        true,
+    );
+    harness.server.state.frame_presented(frame, content);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "off-workspace is not presented: {body}");
+    assert_eq!(body["error"], "timeout");
+
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Visible, 5_000),
+        |harness| {
+            harness
+                .server
+                .state
+                .switch_workspace(None, WorkspaceTarget::Index(2), true)
+                .expect("switch to the window's workspace");
+        },
+    );
+    assert_eq!(rc, 0, "visible after the switch: {body}");
+    assert_eq!(body["until"], "visible");
+    assert_eq!(body["window"]["id"], id);
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+
+    let _feedback = request_presentation_feedback(&mut harness, presentation);
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
+        |harness| {
+            let (frame, content) = test_frame_report(
+                surface_id,
+                monotonic_micros(),
+                content_seq(harness, &alpha),
+                true,
+            );
+            harness.server.state.frame_presented(frame, content);
+        },
+    );
+    assert_eq!(rc, 0, "presented once its workspace is current: {body}");
+    assert_eq!(body["until"], "presented");
+}
+
 
 #[test]
 fn wait_resolves_now_on_an_edge_or_times_out() {
@@ -694,6 +1148,115 @@ fn windows_list_filters_rows_in_id_order() {
     let (rc, body) = list(json!({"visible": "yes"}));
     assert_eq!(rc, 10);
     assert_eq!(body["path"], "visible");
+}
+
+/// Rule 4: rows carry `workspace`; the `workspace` filter takes an index,
+/// `"current"` (resolved against the snapshot's own current workspace, so
+/// it follows a switch) or `"all"` (the default, every window), composes
+/// with the other filters, and a bad value names the field.
+#[test]
+fn windows_list_filters_by_workspace() {
+    use workspaces::WorkspaceTarget;
+    let (mut harness, _ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, _) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, _) = window_id_and_generation(&harness, &beta);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&beta, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let context = harness.server.state.port_context.clone().expect("context");
+    let snapshot = Arc::new(
+        port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot"),
+    );
+    let list = |snapshot: &Arc<port_snapshot::CompSnapshot>, args: Value| {
+        let (rc, body) = runtime.block_on(port_snapshot::dispatch_read(
+            Arc::clone(snapshot),
+            "comp.windows.list".into(),
+            args,
+        ));
+        (rc, serde_json::from_str::<Value>(&body).unwrap())
+    };
+    let ids = |body: &Value| {
+        body["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    let (rc, body) = list(&snapshot, Value::Null);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(ids(&body), [alpha_id, beta_id]);
+    assert_eq!(body["windows"][0]["workspace"], 1);
+    assert_eq!(body["windows"][1]["workspace"], 2);
+    assert_eq!(body["windows"][1]["visible"], false);
+    assert_eq!(body["windows"][1]["minimized"], false);
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "current"})).1),
+        [alpha_id]
+    );
+    assert_eq!(ids(&list(&snapshot, json!({"workspace": 2})).1), [beta_id]);
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "all"})).1),
+        [alpha_id, beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": null})).1),
+        [alpha_id, beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": 3})).1),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": 2, "visible": true})).1),
+        Vec::<u64>::new(),
+        "filters compose"
+    );
+    // An index above the count is "no such workspace", not an empty list
+    // (every other workspace input refuses it too); the u64 that does not
+    // fit a u32 is refused the same way rather than clamped.
+    for bad in [
+        json!("sideways"),
+        json!(0),
+        json!(-1),
+        json!(true),
+        json!(1.5),
+        json!(5),
+        json!(5_000_000_000_u64),
+    ] {
+        let (rc, body) = list(&snapshot, json!({"workspace": bad}));
+        assert_eq!(rc, 10, "{bad}: {body}");
+        assert_eq!(body["error"], "invalid_value");
+        assert_eq!(body["path"], "workspace");
+        assert_eq!(body["range"], "1..=count|current|all");
+    }
+
+    // "current" follows the snapshot's current workspace.
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let snapshot = Arc::new(
+        port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot"),
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "current"})).1),
+        [beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "current", "visible": true})).1),
+        [beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"visible": false})).1),
+        [alpha_id]
+    );
 }
 
 fn unmap_alpha(harness: &mut KeybindingHarness) {
@@ -1070,8 +1633,800 @@ fn refusals_carry_error_code() {
     assert_eq!(body["error"], "stale_target");
     assert_eq!(body["error_code"], "stale_target");
     assert_eq!(body["current"], generation);
+    let admission = ingress
+        .request_window(WindowOp::SwitchWorkspace {
+            output: None,
+            index: WorkspaceIndex::Prev,
+            wrap: false,
+        })
+        .expect("admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("cycle");
+    let body = runtime
+        .block_on(admission.receive())
+        .expect("reply")
+        .wire_json();
+    assert_eq!(body["error"], "at_end");
+    assert_eq!(body["error_code"], "at_end");
+    assert_eq!(body["from"], 1);
+    assert_eq!(body["count"], 4);
     let (rc, wire) = crate::port::with_error_code(10, Arc::from(r#"{"error":"busy"}"#));
     assert_eq!((rc, &*wire), (10, r#"{"error":"busy","error_code":"busy"}"#));
     let (_, untouched) = crate::port::with_error_code(0, Arc::from(r#"{"error":"x"}"#));
     assert_eq!(&*untouched, r#"{"error":"x"}"#);
+}
+
+/// Rule 6 (F1.2): `comp.window.focus` on a window that lives on another
+/// workspace switches to that workspace and focuses it — never pulls the
+/// window across — on both the raise and the focus-only path, and the
+/// reason ladder sees it as on-current (no `reason` key).
+#[test]
+fn focus_on_an_off_workspace_window_switches_and_focuses() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    for raise in [true, false] {
+        assert_eq!(harness.server.state.workspace_current(), 1);
+        assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+        assert!(harness.server.state.surfaces[&beta].layout.visible);
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::Focus {
+                id,
+                generation,
+                raise,
+            },
+        );
+        assert_eq!(rc, 0, "raise {raise}: {body}");
+        assert_eq!(body["focused"], true, "raise {raise}: {body}");
+        assert!(body.get("reason").is_none(), "raise {raise}: {body}");
+        assert_eq!(harness.server.state.workspace_current(), 2);
+        let state = &harness.server.state;
+        assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+        assert!(state.surfaces[&alpha].layout.visible);
+        assert!(state.surfaces[&alpha].focused);
+        assert!(!state.surfaces[&beta].layout.visible);
+        assert_eq!(
+            focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+            Some(alpha.clone())
+        );
+        // Back to 1 for the focus-only pass.
+        harness
+            .server
+            .state
+            .switch_workspace(None, WorkspaceTarget::Index(1), true)
+            .expect("back to 1");
+        let _ = harness.sync();
+    }
+}
+
+/// Rule 6's refusal half: a focus the reason ladder refuses must not change
+/// the desktop. Alpha minimised on workspace 2, the user on 1: `focus` on
+/// either path replies `reason: "minimized"`, and the current workspace,
+/// beta's visibility and the keyboard focus are exactly as they were — the
+/// switch is gated on the same terms as the ladder, so nothing switches
+/// and then refuses.
+#[test]
+fn focus_on_a_minimised_off_workspace_window_is_refused_without_switching() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&surface);
+    assert!(harness.server.state.surfaces[&alpha].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    for raise in [true, false] {
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::Focus {
+                id,
+                generation,
+                raise,
+            },
+        );
+        assert_eq!(rc, 0, "raise {raise}: {body}");
+        assert_eq!(body["focused"], false, "raise {raise}: {body}");
+        assert_eq!(body["reason"], "minimized", "raise {raise}: {body}");
+        let state = &harness.server.state;
+        assert_eq!(
+            state.workspace_current(),
+            1,
+            "raise {raise}: a refused focus does not switch"
+        );
+        assert!(state.surfaces[&alpha].minimized);
+        assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+        assert!(!state.surfaces[&alpha].layout.visible);
+        assert!(!state.surfaces[&alpha].focused);
+        assert!(state.surfaces[&beta].layout.visible);
+        assert_eq!(
+            focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+            Some(beta.clone())
+        );
+    }
+}
+
+/// `comp.window.raise` is stacking only, as the manual says: an
+/// off-workspace window is restacked in place without a switch, and a
+/// minimised one (on either workspace) stays minimised. `focus` and
+/// `restore` are the bring-into-view verbs; this pins that raise is not.
+#[test]
+fn raise_on_an_off_workspace_or_minimised_window_never_switches_or_unminimises() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(harness.server.state.surfaces[&beta].focused);
+
+    let raise = |harness: &mut KeybindingHarness, id: u64, generation: u64| {
+        let (rc, body) = window_op(
+            harness,
+            &ingress,
+            &runtime,
+            WindowOp::Raise { id, generation },
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["id"], id, "{body}");
+        assert_eq!(body["generation"], generation, "{body}");
+        assert!(body["raised"].is_boolean(), "{body}");
+        assert!(body.get("reason").is_none(), "raise has no reason ladder: {body}");
+    };
+    let unchanged = |harness: &KeybindingHarness, what: &str| {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 1, "{what}: raise never switches");
+        assert_eq!(state.surfaces[&alpha].workspace, 2, "{what}: never pulled across");
+        assert!(!state.surfaces[&alpha].layout.visible, "{what}");
+        assert!(!state.surfaces[&alpha].focused, "{what}");
+    };
+
+    // Off-workspace, not minimised: restacked in place, nothing comes on screen.
+    raise(&mut harness, alpha_id, alpha_generation);
+    unchanged(&harness, "off-workspace");
+    {
+        let state = &harness.server.state;
+        assert!(state.surfaces[&beta].layout.visible);
+        assert!(state.surfaces[&beta].focused, "focus stays where it was");
+    }
+
+    // Off-workspace AND minimised: still no switch, still minimised.
+    let alpha_surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&alpha_surface);
+    assert!(harness.server.state.surfaces[&alpha].minimized);
+    raise(&mut harness, alpha_id, alpha_generation);
+    unchanged(&harness, "off-workspace minimised");
+    assert!(
+        harness.server.state.surfaces[&alpha].minimized,
+        "raise never un-minimises"
+    );
+
+    // Minimised on the current workspace: raise leaves it minimised and
+    // unfocused; only restore/focus bring it back.
+    let beta_surface = harness.server.state.surfaces[&beta]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&beta_surface);
+    {
+        let state = &harness.server.state;
+        assert!(state.surfaces[&beta].minimized);
+        assert!(!state.surfaces[&beta].layout.visible);
+        assert!(!state.surfaces[&beta].focused);
+    }
+    raise(&mut harness, beta_id, beta_generation);
+    {
+        let state = &harness.server.state;
+        assert!(state.surfaces[&beta].minimized, "raise never un-minimises");
+        assert!(!state.surfaces[&beta].layout.visible);
+        assert!(!state.surfaces[&beta].focused);
+        assert_eq!(state.workspace_current(), 1);
+    }
+    // The discriminating half: restore is the verb that does bring it back.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Restore {
+            target: Some((beta_id, beta_generation)),
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["changed"], true, "{body}");
+    {
+        let state = &harness.server.state;
+        assert!(!state.surfaces[&beta].minimized);
+        assert!(state.surfaces[&beta].layout.visible);
+        assert!(state.surfaces[&beta].focused);
+    }
+}
+
+/// The other rule-6 refusal rungs, after the switch-first: an
+/// off-workspace target under an exclusive layer replies `exclusive_layer`,
+/// and one behind the KMS input gate (`normal_scene_restricted`: the VT is
+/// switched away) replies `not_presentable` — not `not_visible`, which is
+/// only what the withheld switch left it as — and neither changes the
+/// workspace. The KMS arm is base-discriminating: lifting the gate makes
+/// the same focus switch and succeed. The exclusive-layer arm is a guard
+/// (the layer's refusal predates the workspaces work); what it pins here
+/// is that the reason names the layer and the workspace is unchanged.
+#[test]
+fn focus_on_an_off_workspace_window_names_the_gate_that_held_the_switch() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    // Exclusive layer.
+    {
+        let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+        let (id, generation) = window_id_and_generation(&harness, &alpha);
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        const TOP_LEFT: u32 = 1 | 4;
+        let _ = map_test_layer_surface(
+            &mut harness,
+            0,
+            TestLayerSpec {
+                anchor: TOP_LEFT,
+                keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive
+                    as u32,
+                ..TestLayerSpec::default()
+            },
+        );
+        let _ = harness.sync();
+        assert!(harness.server.state.highest_exclusive_layer().is_some());
+        for raise in [true, false] {
+            let (rc, body) = window_op(
+                &mut harness,
+                &ingress,
+                &runtime,
+                WindowOp::Focus {
+                    id,
+                    generation,
+                    raise,
+                },
+            );
+            assert_eq!(rc, 0, "raise {raise}: {body}");
+            assert_eq!(body["focused"], false, "raise {raise}: {body}");
+            assert_eq!(body["reason"], "exclusive_layer", "raise {raise}: {body}");
+            let state = &harness.server.state;
+            assert_eq!(state.workspace_current(), 1, "raise {raise}: no switch");
+            assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+            assert!(!state.surfaces[&alpha].layout.visible);
+            assert!(!state.surfaces[&alpha].focused);
+            assert!(state.surfaces[&beta].layout.visible);
+        }
+    }
+    // The KMS input gate, then lifted.
+    {
+        let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+        let (id, generation) = window_id_and_generation(&harness, &alpha);
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        harness.server.state.kms_session_lock_gate.deferred_unlock = true;
+        {
+            let state = &harness.server.state;
+            assert!(state.kms_session_lock_gate.normal_scene_restricted());
+            assert!(!state.surface_is_input_presentable(&state.surfaces[&alpha]));
+        }
+        for raise in [true, false] {
+            let (rc, body) = window_op(
+                &mut harness,
+                &ingress,
+                &runtime,
+                WindowOp::Focus {
+                    id,
+                    generation,
+                    raise,
+                },
+            );
+            assert_eq!(rc, 0, "raise {raise}: {body}");
+            assert_eq!(body["focused"], false, "raise {raise}: {body}");
+            assert_eq!(body["reason"], "not_presentable", "raise {raise}: {body}");
+            let state = &harness.server.state;
+            assert_eq!(state.workspace_current(), 1, "raise {raise}: no switch");
+            assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+            assert!(!state.surfaces[&alpha].layout.visible);
+            assert!(!state.surfaces[&alpha].focused);
+            assert!(state.surfaces[&beta].layout.visible);
+        }
+        harness.server.state.kms_session_lock_gate.deferred_unlock = false;
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::Focus {
+                id,
+                generation,
+                raise: true,
+            },
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["focused"], true, "gate lifted: {body}");
+        assert!(body.get("reason").is_none(), "{body}");
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 2, "gate lifted: switched");
+        assert!(state.surfaces[&alpha].layout.visible);
+        assert!(state.surfaces[&alpha].focused);
+        assert!(!state.surfaces[&beta].layout.visible);
+    }
+}
+
+/// What a watcher sees of a cross-workspace focus. The switch plants a
+/// full-snapshot cause (D7: every row's visibility may change), and
+/// `service_observations` attributes the WHOLE diff to that cause and
+/// discards the per-surface marks — so the target's `focused` edge reports
+/// `workspace.switch`, not `comp.window`, whichever is marked first. The
+/// verb's mark-before-switch order matches its siblings; it cannot change
+/// this, and this test says so rather than letting the order look
+/// load-bearing.
+#[test]
+fn focus_on_an_off_workspace_window_reports_every_change_as_the_switch() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Focus {
+            id,
+            generation,
+            raise: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["focused"], true, "{body}");
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    let focused_path = format!("windows.s{id}.focused");
+    let props = changed
+        .iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged { path, cause, .. } => {
+                Some((path.as_str(), *cause))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        props.contains(&(focused_path.as_str(), "workspace.switch")),
+        "the target's focused edge is attributed to the switch: {props:?}"
+    );
+    assert!(
+        props.iter().all(|(_, cause)| *cause == "workspace.switch"),
+        "a full-snapshot diff carries one cause: {props:?}"
+    );
+}
+
+/// Admit `op` and, in the SAME service cycle behind it, a fenced
+/// `windows.s<id>.minimized = true` write on `id`; return the verb's reply
+/// and the cause the write's `minimized` edge was reported with.
+///
+/// A per-surface mark is read by the diff pass of the cycle that planted
+/// it and discarded with it (`service_property_diffs` takes
+/// `dirty_surfaces`), so `surface_dirty_cause` after a serviced verb reads
+/// `None` whatever the verb did — an assertion on it after `window_op`
+/// cannot fail. The one way a mark is observable is through the next edge
+/// on that surface in the same cycle, which reports the FIRST cause
+/// recorded. The write's own cause is `props.set`: that is what its edge
+/// reads when the verb left no mark behind, and `comp.window` when it did.
+fn minimized_edge_cause_behind(
+    harness: &mut KeybindingHarness,
+    ingress: &crate::port::PortIngress,
+    observations: &port_observation::ObservationOutbox,
+    runtime: &tokio::runtime::Runtime,
+    op: WindowOp,
+    id: u64,
+    generation: u64,
+) -> (u8, Value, &'static str) {
+    let path = format!("windows.s{id}.minimized");
+    let verb = ingress.request_window(op).expect("window verb admitted");
+    let write = ingress
+        .request_set_fenced(path.clone(), json!(true), Some(generation))
+        .expect("set admitted");
+    harness
+        .server
+        .dispatch_cycle(Some(Duration::ZERO))
+        .expect("control service cycle");
+    let (rc, body) = runtime
+        .block_on(verb.receive())
+        .expect("verb reply")
+        .into_wire();
+    let (set_rc, set_body) = runtime
+        .block_on(write.receive())
+        .expect("set reply")
+        .into_wire();
+    assert_eq!(set_rc, 0, "the write behind the verb is accepted: {set_body}");
+    let changed = drain_observations(observations);
+    let cause = changed
+        .iter()
+        .find_map(|record| match record {
+            port_observation::ObservationRecord::PropsChanged {
+                path: changed_path,
+                cause,
+                ..
+            } if *changed_path == path => Some(*cause),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the write's minimized edge is reported: {changed:?}"));
+    (rc, serde_json::from_str(&body).expect("verb reply JSON"), cause)
+}
+
+/// A focus refused `not_visible` past the `may_focus` terms attributes
+/// nothing: the verb plants `comp.window` first (so its cause beats the
+/// core's), and takes the mark back when it refuses, so the next edge on
+/// that surface keeps its own cause. Read through the next edge in the
+/// same cycle (`minimized_edge_cause_behind` says why nothing else can
+/// read it). The first half proves the detector fires: behind a focus that
+/// succeeds, the write's edge reads `comp.window` — the mark a success
+/// leaves is exactly what a refusal must not. The second reaches
+/// `not_visible` the one way production does: an off-workspace window
+/// with NO default output (the KMS port harness registers no client
+/// output), where `ensure_workspace_shown` runs, its switch is refused
+/// `UnknownOutput` (D3), and the window stays hidden — the state a
+/// hand-set `layout.visible = false` on the nested harness only imitated.
+/// There the write's edge reads `props.set`, which also rules out a
+/// planted `workspace.switch` (a full-snapshot cause would have replaced
+/// it). Falsified: with `unplant_surface_mark` removed from the refusal
+/// arm the second half reads `comp.window`.
+#[test]
+fn focus_refused_not_visible_attributes_nothing() {
+    let (mut harness, ingress, observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    assert!(harness.server.state.surfaces[&beta].focused, "precondition");
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body, cause) = minimized_edge_cause_behind(
+        &mut harness,
+        &ingress,
+        &observations,
+        &runtime,
+        WindowOp::Focus {
+            id: alpha_id,
+            generation: alpha_generation,
+            raise: true,
+        },
+        alpha_id,
+        alpha_generation,
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["focused"], true, "{body}");
+    assert_eq!(
+        cause, "comp.window",
+        "a focus that succeeds leaves its mark, and the next edge reports it"
+    );
+
+    let (mut harness, ingress, observations) =
+        KeybindingHarness::new_with_port_backend(BackendKind::Kms, "kms");
+    assert!(
+        harness.server.state.default_output_key().is_none(),
+        "precondition: the KMS port harness has no default output (D3: nothing to switch)"
+    );
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let (_, _, _, beta) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let beta_surface = harness.server.state.surfaces[&beta]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&beta_surface);
+    let _ = harness.sync();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body, cause) = minimized_edge_cause_behind(
+        &mut harness,
+        &ingress,
+        &observations,
+        &runtime,
+        WindowOp::Focus {
+            id: alpha_id,
+            generation: alpha_generation,
+            raise: true,
+        },
+        alpha_id,
+        alpha_generation,
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["focused"], false, "{body}");
+    assert_eq!(
+        body["reason"], "not_visible",
+        "the switch had no output to move, so the window is still hidden: {body}"
+    );
+    assert_eq!(
+        cause, "props.set",
+        "a refused focus attributes nothing: the next edge keeps its own cause"
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 1, "no default output: nothing switched");
+    assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+    assert!(!state.surfaces[&alpha].layout.visible);
+    assert!(state.surfaces[&alpha].minimized, "the write behind the verb took");
+    assert!(!state.surfaces[&alpha].focused);
+    assert!(state.surfaces[&beta].focused, "the keyboard stays where it was");
+}
+
+/// `send_to_workspace {follow:true}` moves and switches in ONE settle
+/// (`move_window_and_follow`): a window already on the target workspace,
+/// highest there, never gains the keyboard while the sent window arrives —
+/// no `wl_keyboard.enter` names it — and the sent window lands on top of
+/// it. (A move then a switch settled the target once with the sent window
+/// still hidden, and that bystander held focus for one round-trip.)
+#[test]
+fn send_to_workspace_follow_never_focuses_the_targets_bystander() {
+    let (mut harness, ingress, _observations, runtime, _alpha, beta) = two_mapped_windows();
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(3), true)
+        .expect("switch to 3");
+    let (gamma_id, _, _, gamma) =
+        map_named_test_toplevel(&mut harness, "Gamma", "dev.cosmix.Gamma");
+    assert_eq!(harness.server.state.surfaces[&gamma].workspace, 3);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let beta_surface = harness.server.state.surfaces[&beta]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&beta_surface);
+    let _ = harness.sync();
+    assert!(harness.server.state.surfaces[&beta].focused);
+    assert!(!harness.server.state.surfaces[&gamma].layout.visible);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(3),
+            follow: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 3, "followed": true})
+    );
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 3);
+        assert_eq!(state.surfaces[&beta].workspace, 3);
+        assert!(state.surfaces[&beta].layout.visible);
+        assert!(state.surfaces[&beta].focused, "follow activates the sent window");
+        assert!(state.surfaces[&gamma].layout.visible);
+        assert!(!state.surfaces[&gamma].focused);
+        assert!(
+            surface_stack_cmp(&state.surfaces[&beta], &state.surfaces[&gamma]).is_gt(),
+            "the sent window arrives on top of the target's bystander"
+        );
+    }
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(
+        !entered.contains(&gamma_id),
+        "the target's bystander never gains keyboard focus: {entered:?}"
+    );
+}
+
+/// `send_to_workspace` attributes nothing of its own. A refused send (an
+/// index above `workspaces.count`) and a send to the workspace the window
+/// is on both change nothing, and the next edge on that surface keeps its
+/// own cause — read through the next edge in the same cycle
+/// (`minimized_edge_cause_behind` says why nothing else can read it;
+/// `focus_refused_not_visible_attributes_nothing` proves that read sees a
+/// mark a verb leaves). An accepted send reports the core's cause: the
+/// move marks the full snapshot `workspace.move` (D7), which is what every
+/// edge of that cycle carries — a `comp.window` mark planted ahead of the
+/// move could never have been read, which is why the verb plants none.
+/// Falsified: a `mark_surface_dirty(id, "comp.window")` at the top of the
+/// verb turns both `props.set` readings into `comp.window`.
+#[test]
+fn send_to_workspace_refused_index_attributes_nothing() {
+    let (mut harness, ingress, observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body, cause) = minimized_edge_cause_behind(
+        &mut harness,
+        &ingress,
+        &observations,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(9),
+            follow: true,
+        },
+        beta_id,
+        beta_generation,
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+    assert_eq!(body["path"], "index");
+    assert_eq!(body["range"], "1..=4");
+    assert_eq!(
+        cause, "props.set",
+        "a refused send attributes nothing: the next edge keeps its own cause"
+    );
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.surfaces[&beta].workspace, 1, "a refused send moves nothing");
+        assert_eq!(state.workspace_current(), 1, "and switches nothing");
+        assert!(state.surfaces[&beta].minimized, "the write behind the verb took");
+    }
+
+    // A send to the workspace the window is on: accepted, nothing moved.
+    let (rc, body, cause) = minimized_edge_cause_behind(
+        &mut harness,
+        &ingress,
+        &observations,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: alpha_id,
+            generation: alpha_generation,
+            index: WorkspaceIndex::Absolute(1),
+            follow: false,
+        },
+        alpha_id,
+        alpha_generation,
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": alpha_id, "generation": alpha_generation, "index": 1})
+    );
+    assert_eq!(
+        cause, "props.set",
+        "a send that moves nothing attributes nothing either"
+    );
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, 1);
+
+    // An accepted move: every edge of the cycle is the core's full-snapshot
+    // cause, the verb's own mark (if it planted one) never being read.
+    let (_, _, _, gamma) = map_named_test_toplevel(&mut harness, "Gamma", "dev.cosmix.Gamma");
+    let (gamma_id, gamma_generation) = window_id_and_generation(&harness, &gamma);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let (rc, body, cause) = minimized_edge_cause_behind(
+        &mut harness,
+        &ingress,
+        &observations,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: gamma_id,
+            generation: gamma_generation,
+            index: WorkspaceIndex::Absolute(2),
+            follow: false,
+        },
+        gamma_id,
+        gamma_generation,
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["index"], 2, "{body}");
+    assert_eq!(
+        cause, "workspace.move",
+        "an accepted send reports the core's full-snapshot cause"
+    );
+    assert_eq!(harness.server.state.surfaces[&gamma].workspace, 2);
+}
+
+/// F1.2 at `comp.window.restore {id, generation}`: restoring a window that
+/// was minimised on another workspace switches to that workspace and shows
+/// it there.
+#[test]
+fn restore_by_id_switches_to_the_windows_workspace() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&surface);
+    assert!(harness.server.state.surfaces[&alpha].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Restore {
+            target: Some((id, generation)),
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["minimized"], false);
+    assert_eq!(body["changed"], true);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    let state = &harness.server.state;
+    assert!(!state.surfaces[&alpha].minimized);
+    assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+    assert!(state.surfaces[&alpha].layout.visible);
+    assert!(state.surfaces[&alpha].focused);
+    assert!(!state.surfaces[&beta].layout.visible);
+    assert!(state.minimized_toplevels.is_empty());
 }

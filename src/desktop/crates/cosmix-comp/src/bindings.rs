@@ -38,7 +38,7 @@ use smithay::input::keyboard::{Keycode, Keysym, ModifiersState, keysyms};
 /// leaves on for unrelated reasons, and a compositor binding that stops
 /// working because Num Lock is on is a bug report nobody diagnoses. They are
 /// governed by [`ModifierPattern::ignore_locks`] instead.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ModifierSet {
     pub ctrl: bool,
     pub alt: bool,
@@ -195,6 +195,10 @@ const PHASE1_TRIGGER: &str = "press";
 ///   runs inline on the protocol thread.
 /// * [`RestoreMostRecentlyMinimized`](Self::RestoreMostRecentlyMinimized)
 ///   mutates compositor scene policy and focus on the protocol thread.
+/// * [`WorkspaceJump`](Self::WorkspaceJump), [`WorkspaceMove`](Self::WorkspaceMove)
+///   and [`WorkspaceStep`](Self::WorkspaceStep) drive the workspace
+///   primitives (`protocol::workspaces`) on the protocol thread, exactly the
+///   path the `comp.workspace.switch` / `send_to_workspace` verbs take.
 /// * [`ExitNestedCompositor`](Self::ExitNestedCompositor) is ECS lifecycle and
 ///   is sent over a bounded channel for a Bevy system to execute.
 /// * [`ToggleInterception`](Self::ToggleInterception) mutates only this
@@ -208,6 +212,13 @@ pub enum BindingAction {
     RequestCloseFocused,
     /// Restore the most recently minimised live toplevel.
     RestoreMostRecentlyMinimized,
+    /// Switch the default output to workspace `n` (1..=9; Super+n).
+    WorkspaceJump(u8),
+    /// Move the focused window to workspace `n` and follow it
+    /// (Super+Shift+n).
+    WorkspaceMove(u8),
+    /// Switch to the previous/next workspace, wrapping (Super+[ / Super+]).
+    WorkspaceStep { prev: bool },
     /// Cycle mapped managed windows in stable creation order.
     CycleWindow { reverse: bool },
     /// Ask the Bevy app to exit. Nested-session lifecycle only — bare-metal
@@ -226,6 +237,10 @@ impl BindingAction {
         match self {
             Self::RequestCloseFocused => "RequestCloseFocused",
             Self::RestoreMostRecentlyMinimized => "RestoreMostRecentlyMinimized",
+            Self::WorkspaceJump(_) => "WorkspaceJump",
+            Self::WorkspaceMove(_) => "WorkspaceMove",
+            Self::WorkspaceStep { prev: false } => "WorkspaceNext",
+            Self::WorkspaceStep { prev: true } => "WorkspacePrev",
             Self::CycleWindow { reverse: false } => "CycleWindowForward",
             Self::CycleWindow { reverse: true } => "CycleWindowBackward",
             Self::ExitNestedCompositor => "ExitNestedCompositor",
@@ -337,7 +352,11 @@ impl BindingTable {
                     action: BindingAction::ToggleInterception,
                     reserved: true,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(workspace_bindings())
+            .chain([workspace_step_binding(false), workspace_step_binding(true)])
+            .collect(),
         }
     }
 
@@ -369,6 +388,8 @@ impl BindingTable {
             })
             .chain(std::iter::once(restore_minimized_binding()))
             .chain([cycle_window_binding(false), cycle_window_binding(true)])
+            .chain(workspace_bindings())
+            .chain([workspace_step_binding(false), workspace_step_binding(true)])
             .collect();
         Self { bindings }
     }
@@ -394,6 +415,127 @@ const fn restore_minimized_binding() -> Binding {
         keysym_name: "m",
         modifiers: ModifierPattern::exact(ModifierSet::logo().with_shift()),
         action: BindingAction::RestoreMostRecentlyMinimized,
+        reserved: false,
+    }
+}
+
+/// The digit row: `(n, keysym, keysym name, jump id, move id)`. Static id
+/// strings because `Binding::id` is `&'static str` (the ids are the stable
+/// names scripts and the F12 panel refer to).
+const WORKSPACE_KEYS: [(u8, u32, &str, &str, &str); 9] = [
+    (
+        1,
+        keysyms::KEY_1,
+        "1",
+        "workspace-jump-1",
+        "workspace-move-1",
+    ),
+    (
+        2,
+        keysyms::KEY_2,
+        "2",
+        "workspace-jump-2",
+        "workspace-move-2",
+    ),
+    (
+        3,
+        keysyms::KEY_3,
+        "3",
+        "workspace-jump-3",
+        "workspace-move-3",
+    ),
+    (
+        4,
+        keysyms::KEY_4,
+        "4",
+        "workspace-jump-4",
+        "workspace-move-4",
+    ),
+    (
+        5,
+        keysyms::KEY_5,
+        "5",
+        "workspace-jump-5",
+        "workspace-move-5",
+    ),
+    (
+        6,
+        keysyms::KEY_6,
+        "6",
+        "workspace-jump-6",
+        "workspace-move-6",
+    ),
+    (
+        7,
+        keysyms::KEY_7,
+        "7",
+        "workspace-jump-7",
+        "workspace-move-7",
+    ),
+    (
+        8,
+        keysyms::KEY_8,
+        "8",
+        "workspace-jump-8",
+        "workspace-move-8",
+    ),
+    (
+        9,
+        keysyms::KEY_9,
+        "9",
+        "workspace-jump-9",
+        "workspace-move-9",
+    ),
+];
+
+/// `workspace-jump-n` = Super+n and `workspace-move-n` = Super+Shift+n for
+/// n in 1..=9, in both profiles. The matcher sees the level-0 symbol
+/// (`raw_latin_sym_or_raw_current_sym`), so Super+Shift+1 still reads
+/// `KEY_1`, not `exclam`; on layouts whose level 0 is not the digit the
+/// chord does not fire (accepted for 0.59.0, TODO-cos).
+fn workspace_bindings() -> impl Iterator<Item = Binding> {
+    WORKSPACE_KEYS
+        .into_iter()
+        .flat_map(|(n, keysym, keysym_name, jump_id, move_id)| {
+            [
+                Binding {
+                    id: jump_id,
+                    keysym,
+                    keysym_name,
+                    modifiers: ModifierPattern::exact(ModifierSet::logo()),
+                    action: BindingAction::WorkspaceJump(n),
+                    reserved: false,
+                },
+                Binding {
+                    id: move_id,
+                    keysym,
+                    keysym_name,
+                    modifiers: ModifierPattern::exact(ModifierSet::logo().with_shift()),
+                    action: BindingAction::WorkspaceMove(n),
+                    reserved: false,
+                },
+            ]
+        })
+}
+
+/// `workspace-prev` = Super+[ and `workspace-next` = Super+], wrapping at
+/// the ends. The keysym names are xkb's (`bracketleft` / `bracketright`),
+/// which keeps `to_strict_data`'s vocabulary ASCII.
+const fn workspace_step_binding(prev: bool) -> Binding {
+    Binding {
+        id: if prev {
+            "workspace-prev"
+        } else {
+            "workspace-next"
+        },
+        keysym: if prev {
+            keysyms::KEY_bracketleft
+        } else {
+            keysyms::KEY_bracketright
+        },
+        keysym_name: if prev { "bracketleft" } else { "bracketright" },
+        modifiers: ModifierPattern::exact(ModifierSet::logo()),
+        action: BindingAction::WorkspaceStep { prev },
         reserved: false,
     }
 }
@@ -1049,6 +1191,9 @@ mod tests {
         assert!(!BindingAction::RestoreMostRecentlyMinimized.needs_ecs());
         assert!(!BindingAction::ToggleInterception.needs_ecs());
         assert!(!BindingAction::SwitchVt(1).needs_ecs());
+        assert!(!BindingAction::WorkspaceJump(1).needs_ecs());
+        assert!(!BindingAction::WorkspaceMove(1).needs_ecs());
+        assert!(!BindingAction::WorkspaceStep { prev: false }.needs_ecs());
     }
 
     #[test]
@@ -1143,7 +1288,162 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(table.bindings.len(), 6);
+        // 6 Phase 1 rows + 9 jump + 9 move + prev/next.
+        assert_eq!(table.bindings.len(), 26);
+    }
+
+    #[test]
+    fn both_profiles_bind_workspace_jump_move_next_prev() {
+        for profile in [BindingProfile::Nested, BindingProfile::KmsLive] {
+            let mut state = BindingState::for_profile(profile, true);
+            let listing = state.to_strict_data();
+            for n in 1..=9 {
+                assert!(listing.contains(&format!("\"id\": \"workspace-jump-{n}\"")));
+                assert!(listing.contains(&format!("\"id\": \"workspace-move-{n}\"")));
+            }
+            assert!(listing.contains("\"id\": \"workspace-next\""));
+            assert!(listing.contains("\"id\": \"workspace-prev\""));
+            assert!(listing.contains("\"keysym\": \"bracketright\""));
+
+            // Super+3 jumps; Super+Shift+3 moves (the matcher sees the level-0
+            // digit, not `numbersign`).
+            assert_eq!(
+                state.dispatch(
+                    code(12),
+                    true,
+                    sym(keysyms::KEY_3),
+                    &mods(true, false, false)
+                ),
+                KeyDisposition::Act(BindingAction::WorkspaceJump(3))
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(12),
+                    false,
+                    sym(keysyms::KEY_3),
+                    &mods(true, false, false)
+                ),
+                KeyDisposition::SwallowRelease
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(12),
+                    true,
+                    sym(keysyms::KEY_3),
+                    &mods(true, true, false)
+                ),
+                KeyDisposition::Act(BindingAction::WorkspaceMove(3))
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(12),
+                    false,
+                    sym(keysyms::KEY_3),
+                    &mods(true, true, false)
+                ),
+                KeyDisposition::SwallowRelease
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(35),
+                    true,
+                    sym(keysyms::KEY_bracketright),
+                    &mods(true, false, false)
+                ),
+                KeyDisposition::Act(BindingAction::WorkspaceStep { prev: false })
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(35),
+                    false,
+                    sym(keysyms::KEY_bracketright),
+                    &mods(true, false, false)
+                ),
+                KeyDisposition::SwallowRelease
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(34),
+                    true,
+                    sym(keysyms::KEY_bracketleft),
+                    &mods(true, false, false)
+                ),
+                KeyDisposition::Act(BindingAction::WorkspaceStep { prev: true })
+            );
+            assert_eq!(
+                state.dispatch(
+                    code(34),
+                    false,
+                    sym(keysyms::KEY_bracketleft),
+                    &mods(true, false, false)
+                ),
+                KeyDisposition::SwallowRelease
+            );
+            // Exact patterns: an extra Ctrl is not a workspace chord.
+            assert_eq!(
+                state.dispatch(
+                    code(10),
+                    true,
+                    sym(keysyms::KEY_1),
+                    &mods(true, false, true)
+                ),
+                KeyDisposition::Forward
+            );
+        }
+    }
+
+    /// `find` is first-match with no collision check, so two rows on one
+    /// keysym whose patterns can both match the same modifier state would
+    /// silently shadow one another. The check is on OVERLAP, not equality:
+    /// a loose row (`Super+1`, don't care about Shift) collides with an
+    /// exact `Super+Shift+1` even though the two patterns are unequal.
+    #[test]
+    fn chords_are_unique_across_both_profiles() {
+        fn shares_a_modifier(a: &ModifierSet, b: &ModifierSet) -> bool {
+            (a.ctrl && b.ctrl)
+                || (a.alt && b.alt)
+                || (a.shift && b.shift)
+                || (a.logo && b.logo)
+                || (a.iso_level3_shift && b.iso_level3_shift)
+                || (a.iso_level5_shift && b.iso_level5_shift)
+        }
+        // Some modifier state satisfies both patterns unless one requires a
+        // modifier the other forbids.
+        fn overlap(a: &ModifierPattern, b: &ModifierPattern) -> bool {
+            !shares_a_modifier(&a.required, &b.forbidden)
+                && !shares_a_modifier(&b.required, &a.forbidden)
+        }
+        for profile in [BindingProfile::Nested, BindingProfile::KmsLive] {
+            let state = BindingState::for_profile(profile, true);
+            let bindings = &state.table.bindings;
+            for (index, binding) in bindings.iter().enumerate() {
+                for earlier in &bindings[..index] {
+                    assert!(
+                        earlier.keysym != binding.keysym
+                            || !overlap(&earlier.modifiers, &binding.modifiers),
+                        "{:?} profile: {} is shadowed by the earlier {} on the same keysym",
+                        profile,
+                        binding.id,
+                        earlier.id
+                    );
+                }
+            }
+        }
+        // The guard itself can fail: a loose Super+1 beside the exact
+        // Super+Shift+1 is exactly the collision it exists to catch.
+        let loose = ModifierPattern {
+            required: ModifierSet::logo(),
+            forbidden: ModifierSet::NONE,
+            ignore_locks: true,
+        };
+        assert!(overlap(
+            &loose,
+            &ModifierPattern::exact(ModifierSet::logo().with_shift())
+        ));
+        assert!(!overlap(
+            &ModifierPattern::exact(ModifierSet::logo()),
+            &ModifierPattern::exact(ModifierSet::logo().with_shift())
+        ));
     }
 
     #[test]

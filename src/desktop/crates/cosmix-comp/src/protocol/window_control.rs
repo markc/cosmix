@@ -10,11 +10,24 @@ use smithay::reexports::calloop::{
 };
 use smithay::reexports::wayland_server::backend::DisconnectReason;
 
+use super::port_observation::SetValidationError;
 use super::presentation_stats::PresentationStats;
+use super::workspaces::{WorkspaceRefusal, WorkspaceTarget};
 use super::*;
 use crate::port::{
     ControlReply, PlaceSpec, StatsTarget, WaitSpec, WaitUntil, WindowMatch, WindowOp,
+    WorkspaceIndex,
 };
+
+impl From<WorkspaceIndex> for WorkspaceTarget {
+    fn from(index: WorkspaceIndex) -> Self {
+        match index {
+            WorkspaceIndex::Absolute(index) => Self::Index(index),
+            WorkspaceIndex::Next => Self::Next,
+            WorkspaceIndex::Prev => Self::Prev,
+        }
+    }
+}
 
 fn window_of(target: Option<&StatsTarget>) -> Option<(u64, u64)> {
     match target {
@@ -133,15 +146,12 @@ impl WaylandState {
             .count()
     }
 
-    /// The entry the LIFO pop will restore: the newest one that is still a
-    /// mapped, minimised, managed toplevel (the pop discards older invalid
-    /// entries on its way down).
+    /// The entry `restore {}` will restore: rule 8's candidate (the current
+    /// workspace's most recently minimised window, else the global one) —
+    /// the same predicate `restore_most_recently_minimized` uses, so the
+    /// prediction below and the restore cannot diverge.
     fn next_lifo_restore(&self) -> Option<(ObjectId, SurfaceId)> {
-        self.minimized_toplevels.iter().rev().find_map(|object| {
-            let record = self.surfaces.get(object)?;
-            (record.mapped && record.minimized && record.role.managed_toplevel())
-                .then(|| (object.clone(), record.id))
-        })
+        self.lifo_restore_candidate()
     }
 
     /// Every one-pass `comp.window.*` verb. A session lock refuses them all:
@@ -254,11 +264,15 @@ impl WaylandState {
     /// Every `comp.window.*` verb that answers in one pass. A session lock
     /// refuses every one that names or changes a window: the lock owns what
     /// is on screen until it ends. Source stats and a global stats reset do
-    /// not name a window, so they still answer.
+    /// not name a window, so they still answer. A workspace switch names no
+    /// window either but changes what is on screen, so it is refused too
+    /// (D12) — the arm is explicit so the reads above are not read as the
+    /// rule for it.
     pub(crate) fn service_window_op(&mut self, op: &WindowOp) -> ControlReply {
         let names_window = match op {
             WindowOp::Stats { target, .. } => window_of(Some(target)).is_some(),
             WindowOp::StatsReset { target } => window_of(target.as_ref()).is_some(),
+            WindowOp::SwitchWorkspace { .. } => true,
             _ => true,
         };
         if names_window && self.session_lock_active() {
@@ -282,6 +296,8 @@ impl WaylandState {
                 let (id, generation) = window_of(target.as_ref()).unwrap_or_default();
                 (8, id, generation)
             }
+            WindowOp::SwitchWorkspace { .. } => (9, 0, 0),
+            WindowOp::SendToWorkspace { id, generation, .. } => (10, *id, *generation),
         };
         crate::frame_trace::event("comp_window_control", || (id, code, generation));
         match op {
@@ -308,9 +324,166 @@ impl WaylandState {
             WindowOp::Place(spec) => self.service_window_place(spec),
             WindowOp::Stats { target, samples } => self.service_stats(target, *samples),
             WindowOp::StatsReset { target } => self.service_stats_reset(target.as_ref()),
+            WindowOp::SwitchWorkspace {
+                output,
+                index,
+                wrap,
+            } => self.service_workspace_switch(output.as_deref(), *index, *wrap),
+            WindowOp::SendToWorkspace {
+                id,
+                generation,
+                index,
+                follow,
+            } => self.service_send_to_workspace(*id, *generation, *index, *follow),
         }
     }
 
+    /// `comp.workspace.switch`: the contract's refusal vocabulary over the
+    /// core primitive — `invalid_value` for an index outside `1..=count`
+    /// or an unknown output (D13), `at_end` for `next`/`prev` at an end
+    /// without `wrap`.
+    fn service_workspace_switch(
+        &mut self,
+        output: Option<&str>,
+        index: WorkspaceIndex,
+        wrap: bool,
+    ) -> ControlReply {
+        match self.switch_workspace(output, index.into(), wrap) {
+            Ok(switched) => ControlReply::Body(json!({
+                "output": switched.output,
+                "from": switched.from,
+                "to": switched.to,
+            })),
+            Err(refusal) => {
+                // `at_end` names the output it was at by its `o_<slug>`
+                // KEY, as the success reply does — a request by output name
+                // resolved before the ring did, so the key is what a caller
+                // keying replies by output can match. Only an unknown
+                // output fails to resolve, and that refusal echoes nothing.
+                let output = self.resolve_workspace_output(output);
+                workspace_refusal(refusal, output.as_deref(), 0)
+            }
+        }
+    }
+
+    /// `comp.window.send_to_workspace`: the `{id, generation}` fence, then
+    /// the move; with `follow`, a switch to the window's new workspace and
+    /// its activation (D9). `next`/`prev` are relative to the window's own
+    /// workspace and always wrap. The follow is gated exactly as every
+    /// switch-first path is (`workspace_switch_allowed_for`: inert under an
+    /// exclusive layer, D18, for a minimised window and behind the KMS
+    /// input gate); when allowed, the move and the switch are ONE settle
+    /// (`move_window_and_follow`) so no bystander on either workspace
+    /// takes the keyboard in between, and when not, the move alone runs.
+    /// The reply's `followed` is `workspaces.current == index` READ BACK
+    /// after the attempt, not a claim about the switch: it is true with no
+    /// switch and no activation when the window was already on the current
+    /// workspace and the gate held (a minimised window sent to the
+    /// workspace it is on answers `followed:true` and stays minimised), and
+    /// with no default output `current` reads 1. The move has happened by
+    /// then and cannot be refused after the fact.
+    fn service_send_to_workspace(
+        &mut self,
+        id: u64,
+        generation: u64,
+        index: WorkspaceIndex,
+        follow: bool,
+    ) -> ControlReply {
+        let object = match self.resolve_window_target(id, Some(generation)) {
+            Ok(object) => object,
+            Err(error) => return ControlReply::WindowTarget { id, error },
+        };
+        // No `comp.window` mark, unlike the sibling verbs: every accepted
+        // move marks the FULL snapshot dirty (`workspace.move`, D7 — every
+        // row's visibility and the `workspaces.*` counts may change), and a
+        // full-snapshot diff carries that one cause and discards the
+        // per-surface marks, so a mark planted here could never be read.
+        // Where it could — a refused move (an index above `count`) or a
+        // send to the workspace the window is on, both of which change
+        // nothing — it would only blame `comp.window` for the next
+        // unrelated edge on this surface. `send_to_workspace_refused_index_
+        // attributes_nothing` pins both halves.
+        let follow_now = follow && self.workspace_switch_allowed_for(&object).is_some();
+        let moved = if follow_now {
+            self.move_window_and_follow(&object, index.into())
+        } else {
+            self.move_window_to_workspace(&object, index.into())
+        };
+        let (_, to) = match moved {
+            Ok(moved) => moved,
+            Err(refusal) => return workspace_refusal(refusal, None, id),
+        };
+        let mut body = json!({
+            "id": id,
+            "generation": generation,
+            "index": to,
+        });
+        if follow {
+            // Read back, not assumed: with no default output there was
+            // nothing to switch, and `current` reads 1 regardless.
+            let followed = self.workspace_current() == to;
+            if followed {
+                let surface = self.surfaces[&object].role.wl_surface().clone();
+                self.activate_managed_window(&surface);
+            }
+            body["followed"] = json!(followed);
+        }
+        ControlReply::Body(body)
+    }
+}
+
+/// The contract's wire form of a core refusal. `output` is the requested
+/// output, echoed on `at_end`; `id` the window a send named.
+fn workspace_refusal(refusal: WorkspaceRefusal, output: Option<&str>, id: u64) -> ControlReply {
+    match refusal {
+        WorkspaceRefusal::InvalidIndex { count } => {
+            ControlReply::Validation(SetValidationError::InvalidValue {
+                path: "index".into(),
+                expected: "unsigned integer",
+                range: workspace_index_range(count),
+            })
+        }
+        WorkspaceRefusal::AtEnd { from, count } => ControlReply::refused(
+            "at_end",
+            json!({"output": output, "from": from, "count": count}),
+        ),
+        WorkspaceRefusal::UnknownOutput => {
+            ControlReply::Validation(SetValidationError::InvalidValue {
+                path: "output".into(),
+                expected: "outputs.<key> key or output name",
+                range: "an existing output",
+            })
+        }
+        WorkspaceRefusal::InvalidCount { max: _ } => {
+            ControlReply::Validation(SetValidationError::InvalidValue {
+                path: "count".into(),
+                expected: "unsigned integer",
+                range: "1..=16",
+            })
+        }
+        // Unreachable after `resolve_window_target` (the record is a mapped
+        // managed toplevel with a stamped workspace), kept honest anyway.
+        WorkspaceRefusal::NotAWindow => ControlReply::WindowTarget {
+            id,
+            error: WindowTargetError::NotMapped,
+        },
+    }
+}
+
+/// `range` for an index refusal, as `1..=<count>`. `SetValidationError`
+/// carries `&'static str`, so the sixteen possible counts are spelled out.
+fn workspace_index_range(count: u32) -> &'static str {
+    const RANGES: [&str; 16] = [
+        "1..=1", "1..=2", "1..=3", "1..=4", "1..=5", "1..=6", "1..=7", "1..=8", "1..=9", "1..=10",
+        "1..=11", "1..=12", "1..=13", "1..=14", "1..=15", "1..=16",
+    ];
+    RANGES
+        .get(count.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("1..=workspaces.count")
+}
+
+impl WaylandState {
     fn service_minimize_op(&mut self, op: &WindowOp) -> ControlReply {
         let (target, minimized) = match *op {
             WindowOp::Minimize { id, generation } => ((id, generation), true),
@@ -320,6 +493,13 @@ impl WaylandState {
             WindowOp::Restore { target: None } => {
                 // Mark first: the first cause recorded for a surface wins,
                 // and the restore itself would record "wayland.focus".
+                // When rule 8's candidate is on another workspace the
+                // restore switches, and a switch is a full-snapshot cause
+                // (`workspace.switch`) that discards the per-surface marks
+                // — as `service_send_to_workspace` documents for its own
+                // accepted move — so the edges then read the larger
+                // change, not `comp.window`. Deliberate: the mark is only
+                // ever read when nothing bigger happened.
                 let expected = self.next_lifo_restore();
                 if let Some((_, id)) = &expected {
                     self.mark_surface_dirty(*id, "comp.window");
@@ -351,7 +531,9 @@ impl WaylandState {
             | WindowOp::Close { .. }
             | WindowOp::Place(_)
             | WindowOp::Stats { .. }
-            | WindowOp::StatsReset { .. } => {
+            | WindowOp::StatsReset { .. }
+            | WindowOp::SwitchWorkspace { .. }
+            | WindowOp::SendToWorkspace { .. } => {
                 unreachable!("only minimise and restore are routed here")
             }
         };
@@ -449,27 +631,73 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
-        let record = &self.surfaces[&object];
+        let Some(record) = self.surfaces.get(&object) else {
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
+        };
+        // Rule 6 (F1.2): an off-workspace window is brought on screen by
+        // switching to its workspace, never by pulling it across, so the
+        // ladder below sees it as on-current. Both the raise and the
+        // focus-only path inherit; `service_window_op` already refused a
+        // session lock before reaching here. The switch happens only for a
+        // window the ladder's workspace-independent rungs would let take
+        // focus (`ensure_workspace_shown` checks the same terms): a refused
+        // verb must not change the desktop. Mark first, as every sibling
+        // verb does: the first cause recorded for a surface wins, and the
+        // switch itself marks "workspace.switch".
+        let may_focus = self.highest_exclusive_layer().is_none()
+            && !record.minimized
+            && self.surface_is_input_presentable(record);
+        let mark = may_focus.then(|| {
+            let mark = self.plant_surface_mark(id, "comp.window");
+            self.ensure_workspace_shown(&object);
+            mark
+        });
+        // Re-fetched, not indexed: the switch settles the scene in between
+        // and the record's liveness across that is not an invariant the
+        // settle promises. A record gone here changed nothing the verb can
+        // own, so its planted mark goes with it.
+        let Some(record) = self.surfaces.get(&object) else {
+            if let Some(mark) = mark {
+                self.unplant_surface_mark(mark);
+            }
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
+        };
         let surface = record.role.wl_surface().clone();
         // The same candidacy Alt+Tab uses; a refusal says which gate held.
+        // The workspace-independent rungs (the `may_focus` terms) come
+        // before `not_visible`: they are what kept the switch from running,
+        // so an off-workspace window refused by one of them names that gate,
+        // not the visibility the switch would have given it.
         let reason = if self.highest_exclusive_layer().is_some() {
             Some("exclusive_layer")
         } else if record.minimized {
             Some("minimized")
-        } else if !record.layout.visible {
-            Some("not_visible")
         } else if !self.surface_is_input_presentable(record) {
             Some("not_presentable")
+        } else if !record.layout.visible {
+            Some("not_visible")
         } else {
             None
         };
         if reason.is_none() {
-            self.mark_surface_dirty(SurfaceId(id), "comp.window");
             if raise {
                 self.activate_managed_window(&surface);
             } else {
                 self.arbitrate_keyboard_focus(Some(surface), false, false);
             }
+        } else if let Some(mark) = mark {
+            // `not_visible` past the `may_focus` terms: the switch did not
+            // run (no default output) or did not make the window visible.
+            // Nothing changed, so the refusal attributes nothing — the
+            // mark planted above would otherwise blame `comp.window` for
+            // the next unrelated edge on this surface.
+            self.unplant_surface_mark(mark);
         }
         let focused = self
             .surfaces
@@ -482,6 +710,14 @@ impl WaylandState {
         ControlReply::Body(body)
     }
 
+    /// Stacking only: never a bring-into-view path. Rule 6 (F1.2) names
+    /// focus, restore and the activation requests; a raise of an
+    /// off-workspace (or minimised) window restacks it in place and replies
+    /// `raised` from the z delta, exactly as it would for a covered window
+    /// on the current workspace — the caller that wants it on screen uses
+    /// `focus` or `restore`. The manual says the same under
+    /// `comp.window.raise`; `raise_on_an_off_workspace_or_minimised_window_
+    /// never_switches_or_unminimises` pins it.
     fn service_window_raise(&mut self, id: u64, generation: u64) -> ControlReply {
         let object = match self.resolve_window_target(id, Some(generation)) {
             Ok(object) => object,
