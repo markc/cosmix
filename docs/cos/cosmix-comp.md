@@ -326,7 +326,11 @@ frame trace as `comp_window_control` (subject the id; detail 1 minimize,
   layer surface holds the keyboard), `minimized`, `not_visible`,
   `not_presentable`, or `refused`.
 - `comp.window.raise {id,generation}` raises the window within its band
-  without focusing it. The reply is `{id,generation,raised}`.
+  without focusing it. The reply is `{id,generation,raised}`. Raise is
+  stacking only: it never switches workspace and never un-minimises. An
+  off-workspace or minimised window is restacked in place and stays where it
+  is; `raised` reports the stacking change alone. `comp.window.focus` and
+  `comp.window.restore` are the verbs that bring a window into view.
 - `comp.window.close {id,generation}` asks the client to close (xdg `close`,
   or X11 `WM_DELETE_WINDOW`) and replies `{closed:"polite"}` at once.
   - With `force:true` (and optional `timeout_ms`, default 3000, at most

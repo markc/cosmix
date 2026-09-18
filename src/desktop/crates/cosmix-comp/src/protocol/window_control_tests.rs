@@ -1187,6 +1187,111 @@ fn focus_on_a_minimised_off_workspace_window_is_refused_without_switching() {
     }
 }
 
+/// `comp.window.raise` is stacking only, as the manual says: an
+/// off-workspace window is restacked in place without a switch, and a
+/// minimised one (on either workspace) stays minimised. `focus` and
+/// `restore` are the bring-into-view verbs; this pins that raise is not.
+#[test]
+fn raise_on_an_off_workspace_or_minimised_window_never_switches_or_unminimises() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(harness.server.state.surfaces[&beta].focused);
+
+    let raise = |harness: &mut KeybindingHarness, id: u64, generation: u64| {
+        let (rc, body) = window_op(
+            harness,
+            &ingress,
+            &runtime,
+            WindowOp::Raise { id, generation },
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["id"], id, "{body}");
+        assert_eq!(body["generation"], generation, "{body}");
+        assert!(body["raised"].is_boolean(), "{body}");
+        assert!(body.get("reason").is_none(), "raise has no reason ladder: {body}");
+    };
+    let unchanged = |harness: &KeybindingHarness, what: &str| {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 1, "{what}: raise never switches");
+        assert_eq!(state.surfaces[&alpha].workspace, 2, "{what}: never pulled across");
+        assert!(!state.surfaces[&alpha].layout.visible, "{what}");
+        assert!(!state.surfaces[&alpha].focused, "{what}");
+        assert_ne!(state.full_dirty_cause(), Some("workspace.switch"), "{what}");
+    };
+
+    // Off-workspace, not minimised: restacked in place, nothing comes on screen.
+    raise(&mut harness, alpha_id, alpha_generation);
+    unchanged(&harness, "off-workspace");
+    {
+        let state = &harness.server.state;
+        assert!(state.surfaces[&beta].layout.visible);
+        assert!(state.surfaces[&beta].focused, "focus stays where it was");
+    }
+
+    // Off-workspace AND minimised: still no switch, still minimised.
+    let alpha_surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&alpha_surface);
+    assert!(harness.server.state.surfaces[&alpha].minimized);
+    raise(&mut harness, alpha_id, alpha_generation);
+    unchanged(&harness, "off-workspace minimised");
+    assert!(
+        harness.server.state.surfaces[&alpha].minimized,
+        "raise never un-minimises"
+    );
+
+    // Minimised on the current workspace: raise leaves it minimised and
+    // unfocused; only restore/focus bring it back.
+    let beta_surface = harness.server.state.surfaces[&beta]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&beta_surface);
+    {
+        let state = &harness.server.state;
+        assert!(state.surfaces[&beta].minimized);
+        assert!(!state.surfaces[&beta].layout.visible);
+        assert!(!state.surfaces[&beta].focused);
+    }
+    raise(&mut harness, beta_id, beta_generation);
+    {
+        let state = &harness.server.state;
+        assert!(state.surfaces[&beta].minimized, "raise never un-minimises");
+        assert!(!state.surfaces[&beta].layout.visible);
+        assert!(!state.surfaces[&beta].focused);
+        assert_eq!(state.workspace_current(), 1);
+    }
+    // The discriminating half: restore is the verb that does bring it back.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Restore {
+            target: Some((beta_id, beta_generation)),
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["changed"], true, "{body}");
+    {
+        let state = &harness.server.state;
+        assert!(!state.surfaces[&beta].minimized);
+        assert!(state.surfaces[&beta].layout.visible);
+        assert!(state.surfaces[&beta].focused);
+    }
+}
+
 /// The other rule-6 refusal rungs, after the switch-first: an
 /// off-workspace target under an exclusive layer replies `exclusive_layer`,
 /// and one behind the KMS input gate (`normal_scene_restricted`: the VT is

@@ -518,7 +518,9 @@ impl WaylandState {
     /// off-workspace (or minimised) window restacks it in place and replies
     /// `raised` from the z delta, exactly as it would for a covered window
     /// on the current workspace — the caller that wants it on screen uses
-    /// `focus` or `restore`. (Manual wording is the docs slice's.)
+    /// `focus` or `restore`. The manual says the same under
+    /// `comp.window.raise`; `raise_on_an_off_workspace_or_minimised_window_
+    /// never_switches_or_unminimises` pins it.
     fn service_window_raise(&mut self, id: u64, generation: u64) -> ControlReply {
         let object = match self.resolve_window_target(id, Some(generation)) {
             Ok(object) => object,
