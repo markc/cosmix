@@ -103,7 +103,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bg-showcase` | 0.2.5 |
 | `cosmix-busviewer` | 0.1.1 |
 | `cosmix-capture` | 0.1.2 |
-| `cosmix-comp` | 0.58.0 |
+| `cosmix-comp` | 0.59.0 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
