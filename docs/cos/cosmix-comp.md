@@ -4,6 +4,26 @@
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.
 
+## KMS input dispatch fairness
+
+Live KMS input routing yields after 16 libinput events or 2 ms, whichever
+comes first. This keeps a batch well below a 60 Hz frame interval while
+allowing cheap events to drain promptly. The time bound is cooperative:
+one callback and libinput's own dispatch cannot be preempted.
+
+A small opt-in vendored Smithay patch retains remaining events in libinput
+in their original order. On budget exhaustion, its calloop `before_sleep`
+hook requests synthetic readiness and a nonblocking poll on the next turn.
+Real and synthetic readiness share one batch per turn. Each turn returns
+through normal frame-command service, client commit dispatch and socket
+flush; no input is dropped and no new fd edge is needed to finish a burst.
+
+Live acceptance: with the Boing wallpaper animating, sustain heavy pointer
+motion and bucket the frame trace at 200 ms. `comp_present`,
+`comp_pulse_sent_busy` and `comp_callback_done_queued` must continue advancing
+through the burst, with client buffers and frame callbacks serviced each
+vblank. Offline checks cannot establish real-KMS presentation cadence.
+
 ## KMS hardware cursor
 
 The `kms-live` build (with the default Bus, frame-capture and XWayland

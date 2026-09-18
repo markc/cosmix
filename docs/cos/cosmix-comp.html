@@ -445,6 +445,22 @@
 <p><code>cosmix-comp</code> is the Wayland compositor used by the Cosmix desktop. It can run
 nested inside an existing Wayland session with <code>cosmix-comp --nested</code>, or use
 the KMS backend on a system seat.</p>
+<h2 id="kms-input-dispatch-fairness">KMS input dispatch fairness</h2>
+<p>Live KMS input routing yields after 16 libinput events or 2 ms, whichever
+comes first. This keeps a batch well below a 60 Hz frame interval while
+allowing cheap events to drain promptly. The time bound is cooperative:
+one callback and libinput's own dispatch cannot be preempted.</p>
+<p>A small opt-in vendored Smithay patch retains remaining events in libinput
+in their original order. On budget exhaustion, its calloop <code>before_sleep</code>
+hook requests synthetic readiness and a nonblocking poll on the next turn.
+Real and synthetic readiness share one batch per turn. Each turn returns
+through normal frame-command service, client commit dispatch and socket
+flush; no input is dropped and no new fd edge is needed to finish a burst.</p>
+<p>Live acceptance: with the Boing wallpaper animating, sustain heavy pointer
+motion and bucket the frame trace at 200 ms. <code>comp_present</code>,
+<code>comp_pulse_sent_busy</code> and <code>comp_callback_done_queued</code> must continue advancing
+through the burst, with client buffers and frame callbacks serviced each
+vblank. Offline checks cannot establish real-KMS presentation cadence.</p>
 <h2 id="kms-hardware-cursor">KMS hardware cursor</h2>
 <p>The <code>kms-live</code> build (with the default Bus, frame-capture and XWayland
 features) uses an optional DRM cursor plane. <code>native-quoin</code> is not required.
