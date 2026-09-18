@@ -807,7 +807,11 @@ exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
 layer surface holds the keyboard), <code>minimized</code>, <code>not_visible</code>,
 <code>not_presentable</code>, or <code>refused</code>.</li>
 <li><code>comp.window.raise {id,generation}</code> raises the window within its band
-without focusing it. The reply is <code>{id,generation,raised}</code>.</li>
+without focusing it. The reply is <code>{id,generation,raised}</code>. Raise is
+stacking only: it never switches workspace and never un-minimises. An
+off-workspace or minimised window is restacked in place and stays where it
+is; <code>raised</code> reports the stacking change alone. <code>comp.window.focus</code> and
+<code>comp.window.restore</code> are the verbs that bring a window into view.</li>
 <li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
 or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
 <ul>

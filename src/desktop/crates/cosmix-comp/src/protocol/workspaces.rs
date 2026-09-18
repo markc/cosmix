@@ -185,16 +185,31 @@ impl WaylandState {
     pub(crate) fn workspace_current(&self) -> u32 {
         self.current_workspace_for(self.default_output_key().as_deref())
     }
+
+    /// D15 applied to one window: derive an X11 window's suspended flag from
+    /// what hides it (minimised OR off the current workspace) and set it.
+    /// Every `set_suspended` on a managed X11 window goes through here —
+    /// minimise, restore, the workspace switch and move halves — so no path
+    /// can resume a window that is still off screen. A no-op for every
+    /// other role.
+    #[cfg(feature = "xwayland")]
+    pub(super) fn sync_x11_suspended(&self, object: &ObjectId) {
+        let current = self.workspace_current();
+        if let Some(record) = self.surfaces.get(object)
+            && let Some(role) = record.role.x11()
+        {
+            let _ = role.surface.set_suspended(x11_suspended(record, current));
+        }
+    }
 }
 
 // The primitives. `switch_workspace` and `move_window_to_workspace` have a
 // non-bus production caller (the workspace chords, `handle_binding_action`),
-// so the block is NOT allowed dead: a genuinely dead helper trips the lint.
-// The two whose only callers are `cfg(bus)` — `set_workspace_count` (the
-// `workspaces.count` prop) and `ensure_workspace_shown` (the
-// `comp.window.send_to_workspace` verb) — read dead to the
-// `--no-default-features` gate (D20) and carry a per-item allow; drop each
-// with its first non-bus caller (slice 2 wires `ensure_workspace_shown`).
+// and `ensure_workspace_shown` is wired at every bring-into-view path (slice
+// 2), so the block is NOT allowed dead: a genuinely dead helper trips the
+// lint. The one whose only caller is `cfg(bus)` — `set_workspace_count` (the
+// `workspaces.count` prop) — reads dead to the `--no-default-features` gate
+// (D20) and carries a per-item allow; drop it with its first non-bus caller.
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
     /// `Some(k)` must be the default output's key or name (D3). Any other
@@ -236,15 +251,10 @@ impl WaylandState {
             self.finish_interactive_pointer(true);
         }
         // X11 windows learn the state through EWMH so the client can stop
-        // rendering.
+        // rendering. Derived, not written as `true`: the caller has already
+        // moved the window (or `current`) so the rule reads "off screen".
         #[cfg(feature = "xwayland")]
-        if let Some(role) = self
-            .surfaces
-            .get(object)
-            .and_then(|record| record.role.x11())
-        {
-            let _ = role.surface.set_suspended(true);
-        }
+        self.sync_x11_suspended(object);
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(id, cause);
         #[cfg(not(feature = "bus"))]
@@ -258,14 +268,7 @@ impl WaylandState {
             return;
         };
         #[cfg(feature = "xwayland")]
-        {
-            let current = self.workspace_current();
-            if let Some(record) = self.surfaces.get(object)
-                && let Some(role) = record.role.x11()
-            {
-                let _ = role.surface.set_suspended(x11_suspended(record, current));
-            }
-        }
+        self.sync_x11_suspended(object);
         #[cfg(feature = "bus")]
         self.mark_surface_dirty(id, cause);
         #[cfg(not(feature = "bus"))]
@@ -333,10 +336,13 @@ impl WaylandState {
             (leaving, arriving)
         };
         self.titlebar_click_candidate = None;
+        // `current` moves first: the per-window halves derive the X11
+        // suspended flag from it (`sync_x11_suspended`), so a leaving window
+        // must already read as off the current workspace.
+        self.workspaces.current.insert(output.clone(), to);
         for object in &leaving {
             self.withdraw_window_for_workspace(object, "workspace.switch");
         }
-        self.workspaces.current.insert(output.clone(), to);
         for object in &arriving {
             self.present_window_for_workspace(object, "workspace.switch");
         }
@@ -350,6 +356,8 @@ impl WaylandState {
     /// `Next`/`Prev` are relative to the window's own workspace and always
     /// wrap. Returns `(from, to)`; never touches the window's generation
     /// (the object is the same window, only placed elsewhere).
+    // No production caller until the prop/verb/binding slices land.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn move_window_to_workspace(
         &mut self,
         object: &ObjectId,
@@ -452,7 +460,13 @@ impl WaylandState {
     /// all — under a session lock or an exclusive layer (D18): the lock or
     /// the layer owns what is on screen, and a client-driven X11 path has no
     /// guard of its own.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// Equally inert for a window that could not take focus once shown — a
+    /// minimised one, or one that is not input-presentable (the KMS gate
+    /// while the VT is switched away): every caller refuses or no-ops on
+    /// those, and a refused activation must not change the desktop. The
+    /// terms are `window_switch_candidate`'s minus `layout.visible`, which
+    /// is what the switch itself sets.
     pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
         if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
             return false;
@@ -461,7 +475,12 @@ impl WaylandState {
             .surfaces
             .get(object)
             .filter(|record| {
-                record.mapped && record.role.managed_toplevel() && record.workspace != 0
+                record.mapped
+                    && !record.minimized
+                    && record.role.managed_toplevel()
+                    && record.role.wl_surface().is_alive()
+                    && record.workspace != 0
+                    && self.surface_is_input_presentable(record)
             })
             .map(|record| record.workspace)
         else {

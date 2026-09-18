@@ -146,15 +146,12 @@ impl WaylandState {
             .count()
     }
 
-    /// The entry the LIFO pop will restore: the newest one that is still a
-    /// mapped, minimised, managed toplevel (the pop discards older invalid
-    /// entries on its way down).
+    /// The entry `restore {}` will restore: rule 8's candidate (the current
+    /// workspace's most recently minimised window, else the global one) —
+    /// the same predicate `restore_most_recently_minimized` uses, so the
+    /// prediction below and the restore cannot diverge.
     fn next_lifo_restore(&self) -> Option<(ObjectId, SurfaceId)> {
-        self.minimized_toplevels.iter().rev().find_map(|object| {
-            let record = self.surfaces.get(object)?;
-            (record.mapped && record.minimized && record.role.managed_toplevel())
-                .then(|| (object.clone(), record.id))
-        })
+        self.lifo_restore_candidate()
     }
 
     /// Every one-pass `comp.window.*` verb. A session lock refuses them all:
@@ -609,22 +606,56 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
-        let record = &self.surfaces[&object];
+        let Some(record) = self.surfaces.get(&object) else {
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
+        };
+        // Rule 6 (F1.2): an off-workspace window is brought on screen by
+        // switching to its workspace, never by pulling it across, so the
+        // ladder below sees it as on-current. Both the raise and the
+        // focus-only path inherit; `service_window_op` already refused a
+        // session lock before reaching here. The switch happens only for a
+        // window the ladder's workspace-independent rungs would let take
+        // focus (`ensure_workspace_shown` checks the same terms): a refused
+        // verb must not change the desktop. Mark first, as every sibling
+        // verb does: the first cause recorded for a surface wins, and the
+        // switch itself marks "workspace.switch".
+        let may_focus = self.highest_exclusive_layer().is_none()
+            && !record.minimized
+            && self.surface_is_input_presentable(record);
+        if may_focus {
+            self.mark_surface_dirty(SurfaceId(id), "comp.window");
+            self.ensure_workspace_shown(&object);
+        }
+        // Re-fetched, not indexed: the switch settles the scene in between
+        // and the record's liveness across that is not an invariant the
+        // settle promises.
+        let Some(record) = self.surfaces.get(&object) else {
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
+        };
         let surface = record.role.wl_surface().clone();
         // The same candidacy Alt+Tab uses; a refusal says which gate held.
+        // The workspace-independent rungs (the `may_focus` terms) come
+        // before `not_visible`: they are what kept the switch from running,
+        // so an off-workspace window refused by one of them names that gate,
+        // not the visibility the switch would have given it.
         let reason = if self.highest_exclusive_layer().is_some() {
             Some("exclusive_layer")
         } else if record.minimized {
             Some("minimized")
-        } else if !record.layout.visible {
-            Some("not_visible")
         } else if !self.surface_is_input_presentable(record) {
             Some("not_presentable")
+        } else if !record.layout.visible {
+            Some("not_visible")
         } else {
             None
         };
         if reason.is_none() {
-            self.mark_surface_dirty(SurfaceId(id), "comp.window");
             if raise {
                 self.activate_managed_window(&surface);
             } else {
@@ -642,6 +673,14 @@ impl WaylandState {
         ControlReply::Body(body)
     }
 
+    /// Stacking only: never a bring-into-view path. Rule 6 (F1.2) names
+    /// focus, restore and the activation requests; a raise of an
+    /// off-workspace (or minimised) window restacks it in place and replies
+    /// `raised` from the z delta, exactly as it would for a covered window
+    /// on the current workspace — the caller that wants it on screen uses
+    /// `focus` or `restore`. The manual says the same under
+    /// `comp.window.raise`; `raise_on_an_off_workspace_or_minimised_window_
+    /// never_switches_or_unminimises` pins it.
     fn service_window_raise(&mut self, id: u64, generation: u64) -> ControlReply {
         let object = match self.resolve_window_target(id, Some(generation)) {
             Ok(object) => object,

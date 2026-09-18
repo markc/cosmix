@@ -2680,26 +2680,15 @@ impl WaylandState {
         let Some(object) = self.xwayland.surfaces_by_xid.get(&xid).cloned() else {
             return;
         };
-        let restored = self.surfaces.get_mut(&object).and_then(|record| {
-            (record.mapped && record.minimized).then(|| {
-                record.minimized = false;
-                record.role.wl_surface().clone()
-            })
-        });
-        let Some(surface) = restored else {
-            return;
-        };
-        self.minimized_toplevels.retain(|entry| *entry != object);
-        // D15: still suspended while off the current workspace.
-        let current = self.workspace_current();
-        if let Some(record) = self.surfaces.get(&object) {
-            let _ = window.set_suspended(workspaces::x11_suspended(record, current));
+        // One restore path (D5): `restore_window` drops the LIFO entry,
+        // switches to the window's workspace where allowed (F1.2; inert
+        // under a lock, D18), derives the suspended flag (D15), marks the
+        // surface dirty, recomputes, raises, arbitrates and retargets. The
+        // hand copy this replaced skipped the dirty mark and re-derived the
+        // rest.
+        if self.restore_window(&object) {
+            self.sync_xwm_stacking();
         }
-        self.recompute_effective_visibility();
-        self.raise_surface(&surface);
-        self.sync_xwm_stacking();
-        self.arbitrate_keyboard_focus(Some(surface), false, false);
-        self.retarget_pointer_after_visibility_change();
     }
 
     pub(super) fn x11_resize_request(
