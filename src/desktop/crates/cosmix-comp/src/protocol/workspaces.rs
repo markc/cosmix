@@ -47,7 +47,6 @@ impl Default for WorkspaceState {
 // `--no-default-features` gate (D20) reports them never constructed. Drop
 // it with the first non-bus constructor (the chords, slice 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {
     /// A 1-based workspace index.
     Index(u32),
@@ -179,32 +178,23 @@ impl WaylandState {
     }
 
     /// The default output's current workspace (the single-output rule).
+    /// Per-event callers (the `windows.list` filter, the rows) and per-frame
+    /// loops alike read this once and call `on_workspace` with the value;
+    /// the `on_current_workspace(record)` convenience the core reserved for
+    /// slices 3-4 was never taken up and is gone.
     pub(crate) fn workspace_current(&self) -> u32 {
         self.current_workspace_for(self.default_output_key().as_deref())
     }
-
-    /// Whether `record` is on the current workspace (`on_workspace` against
-    /// the default output's current). Per-event callers only (the
-    /// `windows.list` filter and the rows, slices 3-4); a per-frame loop
-    /// reads `workspace_current()` once and calls `on_workspace`.
-    // Unconditional: the test target has no caller either (a
-    // `cfg_attr(not(test))` allow is inert exactly there), and the first
-    // production caller is slice 3/4. Remove the allow with that caller.
-    #[allow(dead_code)]
-    pub(crate) fn on_current_workspace(&self, record: &SurfaceRecord) -> bool {
-        on_workspace(record, self.workspace_current())
-    }
 }
 
-// The primitives: `switch_workspace`, `move_window_to_workspace` and
-// `ensure_workspace_shown` have their production caller (the
-// `comp.workspace.switch` / `comp.window.send_to_workspace` verbs, which
-// are `cfg(bus)` — so they still read dead to the `--no-default-features`
-// gate, D20); `set_workspace_count` waits for the prop slice. The block
-// stays allowed dead outside tests until a non-bus caller exists for every
-// primitive. The readers above are NOT — they have callers on the frame
-// path — so a genuinely dead helper there still trips the lint.
-#[cfg_attr(not(test), allow(dead_code))]
+// The primitives. `switch_workspace` and `move_window_to_workspace` have a
+// non-bus production caller (the workspace chords, `handle_binding_action`),
+// so the block is NOT allowed dead: a genuinely dead helper trips the lint.
+// The two whose only callers are `cfg(bus)` — `set_workspace_count` (the
+// `workspaces.count` prop) and `ensure_workspace_shown` (the
+// `comp.window.send_to_workspace` verb) — read dead to the
+// `--no-default-features` gate (D20) and carry a per-item allow; drop each
+// with its first non-bus caller (slice 2 wires `ensure_workspace_shown`).
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
     /// `Some(k)` must be the default output's key or name (D3). Any other
@@ -412,6 +402,7 @@ impl WaylandState {
     /// side effect added to `present_window_for_workspace` later must be
     /// added to `sync_x11_suspended_for_workspaces` too (or the shrink path
     /// switched to the per-window halves).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_workspace_count(
         &mut self,
         count: u32,
@@ -461,6 +452,7 @@ impl WaylandState {
     /// all — under a session lock or an exclusive layer (D18): the lock or
     /// the layer owns what is on screen, and a client-driven X11 path has no
     /// guard of its own.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
         if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
             return false;
