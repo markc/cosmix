@@ -14899,6 +14899,148 @@ fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuse
     );
 }
 
+/// The no-bystander guarantee holds ACROSS bands: `raise_surface` raises
+/// within the window's own `StackBand`, so a bottom-band window (the game
+/// convention) moved to a workspace whose bystander is normal-band is never
+/// the highest visible toplevel there — a settle that fell back to the
+/// highest one would hand that bystander the keyboard for one enter +
+/// activated round-trip. The settle prefers the moved window instead, so
+/// it keeps the keyboard while sitting BELOW the bystander in the stack
+/// (asserted: this is what makes the arm discriminating — the same-band
+/// test above passes on a raise alone).
+#[cfg(feature = "bus")]
+#[test]
+fn workspace_move_chord_keeps_the_keyboard_on_a_bottom_band_window_below_a_normal_bystander() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let (bystander_id, _, _, bystander) =
+        map_named_test_toplevel(&mut harness, "Normal band", "dev.cosmix.NormalBand");
+    assert_eq!(harness.server.state.surfaces[&bystander].workspace, 2);
+    assert_eq!(
+        harness.server.state.surfaces[&bystander].layout.z.band,
+        StackBand::Normal
+    );
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let id = harness.server.state.surfaces[&object].id;
+    assert!(
+        harness
+            .server
+            .state
+            .set_window_band(id, StackBand::Bottom, "test")
+            .is_some()
+    );
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "precondition: the bottom-band window holds the keyboard on workspace 1"
+    );
+
+    harness.chord(&[125, 42, 3]);
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 2);
+    assert_eq!(state.surfaces[&object].workspace, 2);
+    assert!(state.surfaces[&object].layout.visible);
+    assert_eq!(state.surfaces[&object].layout.z.band, StackBand::Bottom);
+    assert!(
+        surface_stack_cmp(&state.surfaces[&object], &state.surfaces[&bystander]).is_lt(),
+        "the moved window stays BELOW the normal-band bystander (a band raise is not a stack raise)"
+    );
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "and still holds the keyboard"
+    );
+    assert!(!state.surfaces[&bystander].focused);
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(
+        !entered.contains(&bystander_id),
+        "the higher-band bystander never gains keyboard focus: {entered:?}"
+    );
+}
+
+/// D18 at the chord: Super+Shift+n is gated by `workspace_switch_allowed_
+/// for`, the same predicate as `send_to_workspace {follow:true}`, so with an
+/// exclusive layer on screen it neither moves the window nor switches. The
+/// keyboard is forced onto the toplevel by hand: arbitration hands it to an
+/// exclusive layer whenever one is on screen, so the seat never reaches
+/// this state on its own and the chord's movable term would refuse the
+/// layer as the focus. Forcing it is what makes the gate itself the thing
+/// under test — the base (no gate) moves the window and switches here.
+#[test]
+fn workspace_move_chord_is_withheld_under_an_exclusive_layer() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+    );
+    let _ = harness.sync();
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(layer_surface),
+        "precondition: the exclusive layer takes the keyboard"
+    );
+    assert!(harness.server.state.highest_exclusive_layer().is_some());
+    let keyboard = harness.server.state.keyboard.clone();
+    keyboard.set_focus(
+        &mut harness.server.state,
+        Some(SeatFocusTarget::Wayland(surface.clone())),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let _ = harness.sync();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "precondition: the toplevel holds the keyboard under the layer (forced)"
+    );
+
+    harness.chord(&[125, 42, 3]);
+    let state = &harness.server.state;
+    assert_eq!(
+        state.workspace_current(),
+        1,
+        "the chord does not re-arrange the desktop under an exclusive layer"
+    );
+    assert_eq!(
+        state.surfaces[&object].workspace, 1,
+        "and does not move the window"
+    );
+    assert!(state.surfaces[&object].layout.visible);
+}
+
 #[test]
 fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
     let assert_profile = |harness: &mut KeybindingHarness| {

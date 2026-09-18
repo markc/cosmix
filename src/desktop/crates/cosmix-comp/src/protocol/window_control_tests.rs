@@ -2058,15 +2058,17 @@ fn focus_on_an_off_workspace_window_reports_every_change_as_the_switch() {
 /// nothing: the verb plants `comp.window` first (so its cause beats the
 /// core's), and takes the mark back when it refuses, so the next unrelated
 /// edge on that surface keeps its own cause. The first half proves the
-/// marks are live (a focus that succeeds leaves `comp.window` planted); the
-/// second fakes the one state the ladder answers `not_visible` for — on the
-/// current workspace (nothing for the switch to do) yet not visible — which
-/// no recompute would leave a mapped, non-minimised toplevel in, so it is
-/// set by hand; the verb runs its ladder without recomputing.
+/// marks are live (a focus that succeeds leaves `comp.window` planted). The
+/// second reaches `not_visible` the one way production does: an
+/// off-workspace window with NO default output (the KMS port harness
+/// registers no client output), where `ensure_workspace_shown` runs, its
+/// switch is refused `UnknownOutput` (D3), and the window stays hidden —
+/// the state a hand-set `layout.visible = false` on the nested harness
+/// only imitated. The unplant is verified against that path, switch marks
+/// and all.
 #[test]
 fn focus_refused_not_visible_attributes_nothing() {
-    let (mut harness, ingress, observations, runtime, alpha, beta) = two_mapped_windows();
-    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (mut harness, ingress, observations, runtime, _alpha, beta) = two_mapped_windows();
     let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
     let watch = ingress.request_watch().expect("watch admitted");
     serviced_watch(&mut harness, &runtime, watch);
@@ -2091,14 +2093,37 @@ fn focus_refused_not_visible_attributes_nothing() {
         "a focus that succeeds leaves its mark"
     );
 
-    harness
-        .server
-        .state
-        .surfaces
-        .get_mut(&alpha)
-        .expect("alpha exists")
-        .layout
-        .visible = false;
+    let (mut harness, ingress, observations) =
+        KeybindingHarness::new_with_port_backend(BackendKind::Kms, "kms");
+    assert!(
+        harness.server.state.default_output_key().is_none(),
+        "precondition: the KMS port harness has no default output (D3: nothing to switch)"
+    );
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let (_, _, _, beta) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let beta_surface = harness.server.state.surfaces[&beta]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&beta_surface);
+    let _ = harness.sync();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert!(!harness.server.state.surfaces[&alpha].minimized);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
     let (rc, body) = window_op(
         &mut harness,
         &ingress,
@@ -2111,8 +2136,14 @@ fn focus_refused_not_visible_attributes_nothing() {
     );
     assert_eq!(rc, 0, "{body}");
     assert_eq!(body["focused"], false, "{body}");
-    assert_eq!(body["reason"], "not_visible", "{body}");
+    assert_eq!(
+        body["reason"], "not_visible",
+        "the switch had no output to move, so the window is still hidden: {body}"
+    );
     let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 1, "no default output: nothing switched");
+    assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+    assert!(!state.surfaces[&alpha].layout.visible);
     assert_eq!(
         state.surface_dirty_cause(alpha_id),
         None,
@@ -2120,6 +2151,7 @@ fn focus_refused_not_visible_attributes_nothing() {
     );
     assert_ne!(state.full_dirty_cause(), Some("workspace.switch"));
     assert!(!state.surfaces[&alpha].focused);
+    assert!(state.surfaces[&beta].focused, "the keyboard stays where it was");
 }
 
 /// `send_to_workspace {follow:true}` moves and switches in ONE settle
@@ -2187,6 +2219,66 @@ fn send_to_workspace_follow_never_focuses_the_targets_bystander() {
     assert!(
         !entered.contains(&gamma_id),
         "the target's bystander never gains keyboard focus: {entered:?}"
+    );
+}
+
+/// A refused `send_to_workspace` (an index above `workspaces.count`)
+/// attributes nothing: the verb plants `comp.window` ahead of the move so
+/// its cause beats the core's, and takes the mark back on refusal — the
+/// next unrelated edge on that surface keeps its own cause, exactly as a
+/// refused `focus` and a refused props write already do. The accepted
+/// send that follows proves the mark is live.
+#[test]
+fn send_to_workspace_refused_index_attributes_nothing() {
+    let (mut harness, ingress, observations, runtime, _alpha, beta) = two_mapped_windows();
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(9),
+            follow: true,
+        },
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+    assert_eq!(body["path"], "index");
+    assert_eq!(body["range"], "1..=4");
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.surfaces[&beta].workspace, 1, "a refused send moves nothing");
+        assert_eq!(state.workspace_current(), 1, "and switches nothing");
+        assert_eq!(
+            state.surface_dirty_cause(beta_id),
+            None,
+            "a refused send plants nothing"
+        );
+    }
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(2),
+            follow: false,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        harness.server.state.surface_dirty_cause(beta_id),
+        Some("comp.window"),
+        "an accepted send leaves its mark, ahead of the core's workspace.move"
     );
 }
 

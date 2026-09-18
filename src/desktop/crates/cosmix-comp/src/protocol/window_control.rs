@@ -375,9 +375,13 @@ impl WaylandState {
     /// input gate); when allowed, the move and the switch are ONE settle
     /// (`move_window_and_follow`) so no bystander on either workspace
     /// takes the keyboard in between, and when not, the move alone runs.
-    /// The reply's `followed` says whether the window's new workspace is
-    /// now the current one — the move has happened by then and cannot be
-    /// refused after the fact.
+    /// The reply's `followed` is `workspaces.current == index` READ BACK
+    /// after the attempt, not a claim about the switch: it is true with no
+    /// switch and no activation when the window was already on the current
+    /// workspace and the gate held (a minimised window sent to the
+    /// workspace it is on answers `followed:true` and stays minimised), and
+    /// with no default output `current` reads 1. The move has happened by
+    /// then and cannot be refused after the fact.
     fn service_send_to_workspace(
         &mut self,
         id: u64,
@@ -389,8 +393,11 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
-        // Mark first: the first cause recorded for a surface wins.
-        self.mark_surface_dirty(SurfaceId(id), "comp.window");
+        // Mark first: the first cause recorded for a surface wins. Planted,
+        // not just marked: a refused move (an index above `count`) changes
+        // nothing and must not leave `comp.window` blamed for the next
+        // unrelated edge on this surface.
+        let mark = self.plant_surface_mark(id, "comp.window");
         let follow_now = follow && self.workspace_switch_allowed_for(&object).is_some();
         let moved = if follow_now {
             self.move_window_and_follow(&object, index.into())
@@ -399,7 +406,10 @@ impl WaylandState {
         };
         let (_, to) = match moved {
             Ok(moved) => moved,
-            Err(refusal) => return workspace_refusal(refusal, None, id),
+            Err(refusal) => {
+                self.unplant_surface_mark(mark);
+                return workspace_refusal(refusal, None, id);
+            }
         };
         let mut body = json!({
             "id": id,
@@ -638,8 +648,12 @@ impl WaylandState {
         });
         // Re-fetched, not indexed: the switch settles the scene in between
         // and the record's liveness across that is not an invariant the
-        // settle promises.
+        // settle promises. A record gone here changed nothing the verb can
+        // own, so its planted mark goes with it.
         let Some(record) = self.surfaces.get(&object) else {
+            if let Some(mark) = mark {
+                self.unplant_surface_mark(mark);
+            }
             return ControlReply::WindowTarget {
                 id,
                 error: WindowTargetError::UnknownWindow,

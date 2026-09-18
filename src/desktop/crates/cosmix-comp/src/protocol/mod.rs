@@ -12283,16 +12283,33 @@ impl WaylandState {
                     return;
                 };
                 let root = canonical_root_surface(&self.popup_manager, &focused);
+                // D18, the same gate as `send_to_workspace {follow:true}`
+                // and every other switch-first path: a chord that will
+                // activate the window afterwards must not re-arrange the
+                // desktop under an exclusive layer (a lock never dispatches
+                // it), nor for a focus that is not a movable, presentable
+                // window. Arbitration hands the keyboard to an exclusive
+                // layer whenever one is on screen, so this arm is the guard
+                // that keeps the chord and the verb one policy rather than
+                // a state the seat reaches on its own.
+                if self.workspace_switch_allowed_for(&root.id()).is_none() {
+                    tracing::debug!(
+                        surface = ?root.id(),
+                        workspace = n,
+                        "workspace-move chord withheld: switch not allowed for the focus"
+                    );
+                    return;
+                }
                 // Move and switch in ONE settle (`move_window_and_follow`):
                 // a move then a switch, or a switch then a move, each
                 // settle the scene once with this window off it, and that
                 // settle hands the keyboard to whichever bystander is left
                 // highest — on the old workspace or the new one — for an
                 // enter + activated configure the activation below reverses
-                // at once. The primitive refuses (a focus that is not a
-                // movable window; an index above `workspaces.count`) before
-                // anything changes, so a refused chord leaves the window,
-                // the workspace and the focus exactly where they were.
+                // at once. The primitive refuses (an index above
+                // `workspaces.count`) before anything changes, so a refused
+                // chord leaves the window, the workspace and the focus
+                // exactly where they were.
                 let target = workspaces::WorkspaceTarget::Index(u32::from(n));
                 match self.move_window_and_follow(&root.id(), target) {
                     Ok(_) => self.activate_managed_window(&root),

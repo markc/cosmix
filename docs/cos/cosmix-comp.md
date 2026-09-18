@@ -136,7 +136,11 @@ the level-0 symbol, so Super+Shift+1 is still the digit, not `exclam`; on a
 layout whose level 0 is not the digit the chord does not fire. A jump above
 `workspaces.count` is a silent no-op (a key press has nobody to reply to; the
 verb answers `invalid_value`). Under a session lock the chords reach the lock
-surface, never the compositor.
+surface, never the compositor. Under an exclusive layer the move chord is
+withheld whole (no move, no switch) by the same gate as `send_to_workspace
+{follow:true}` — a chord that will activate the window must not re-arrange
+the desktop under a layer that owns the screen — while the jump and step
+chords, like `comp.workspace.switch`, still switch.
 
 X11 `_NET_ACTIVE_WINDOW` requests use the same managed-window admission and
 focus path. Local automation is accepted without timestamp-based focus-stealing
@@ -408,17 +412,24 @@ drive the workspaces:
   becomes `visible:false, minimized:false` if it leaves the current
   workspace. With `follow:true` comp also switches to that workspace and
   activates the window — move and switch settle once, so no other window
-  on either workspace takes the keyboard in between — and the reply gains
-  `followed`, read back after the attempt: `true` when the window's new
-  workspace is the current one, `false` when it is not because the switch
-  was withheld (an exclusive layer owns the screen, the window is
-  minimised, or it is not presentable while the VT is switched away). The
-  move has happened either way. With no default output there is nothing
-  to switch and `current` reads 1, so a send to workspace 1 still answers
-  `followed:true`. The reply is `{id,generation,index}` (plus `followed`
-  with `follow:true`). A move never changes the window's `generation`.
-  Out-of-range indices are `invalid_value`; the usual `{id,generation}`
-  fence applies.
+  on either workspace takes the keyboard in between, whatever stacking
+  band it is in — unless the switch is withheld by the same gate every
+  bring-into-view path has: an exclusive layer owns the screen, the
+  window is minimised, or it is not presentable while the VT is switched
+  away. Then the move alone runs and nothing is activated. The reply
+  gains `followed`, which is simply `workspaces.current == index` READ
+  BACK after the attempt, not a claim that a switch or an activation
+  happened: it is `false` when the gate held and the window's new
+  workspace is not the current one, and it is `true` whenever the new
+  workspace is the current one — including with no switch and no
+  activation, when the window was already there and the gate held (a
+  minimised window sent to the workspace it is on answers `followed:true`
+  and stays minimised). With no default output there is nothing to switch
+  and `current` reads 1, so a send to workspace 1 answers `followed:true`.
+  The move has happened either way. The reply is `{id,generation,index}`
+  (plus `followed` with `follow:true`). A move never changes the window's
+  `generation`. Out-of-range indices are `invalid_value` and change
+  nothing; the usual `{id,generation}` fence applies.
 - `comp.window.focus {id,generation,raise?}` gives the window keyboard focus.
   With `raise` (the default) it also raises it and re-targets the pointer,
   exactly like Alt+Tab. The reply is `{id,generation,focused}`. When

@@ -299,13 +299,39 @@ impl WaylandState {
     }
 
     /// The one visibility settle every workspace change ends in: the same
-    /// sequence `minimize_toplevel` runs, plus the X stacking sync.
-    fn settle_workspace_visibility(&mut self) {
+    /// sequence `minimize_toplevel` runs, plus the X stacking sync. The
+    /// keyboard goes to `prefer` when a caller names a window it is about
+    /// to activate anyway (`move_window_and_follow`), else to the highest
+    /// visible toplevel — the same arbitration, the same lock and
+    /// exclusive-layer arms (under either, the request is ignored and the
+    /// lock or layer keeps the keyboard). Preferring is what keeps a moved
+    /// window's arrival from handing the keyboard to a bystander in a
+    /// higher band for one round-trip: `raise_surface` raises within the
+    /// window's own `StackBand`, so a bottom-band window is never the
+    /// highest visible toplevel while a normal one shares the workspace.
+    fn settle_workspace_visibility(&mut self, prefer: Option<WlSurface>) {
         self.recompute_effective_visibility();
-        self.focus_highest_visible_toplevel();
+        self.arbitrate_keyboard_focus(prefer, true, false);
         self.retarget_pointer_after_visibility_change();
         #[cfg(feature = "xwayland")]
         self.sync_xwm_stacking();
+    }
+
+    /// THE per-window relabel every move goes through (`move_window_to_
+    /// workspace` and `move_window_and_follow`): the record's workspace and
+    /// the surface's dirty mark, nothing else — the caller runs the
+    /// withdraw/present half and the settle. One site, so the per-move
+    /// `_NET_WM_DESKTOP` publication slice 6 adds (D19) lands on every path.
+    fn relabel_workspace(&mut self, object: &ObjectId, to: u32) {
+        let Some(record) = self.surfaces.get_mut(object) else {
+            return;
+        };
+        record.workspace = to;
+        #[cfg(feature = "bus")]
+        {
+            let id = record.id;
+            self.mark_surface_dirty(id, "workspace.move");
+        }
     }
 
     /// Switch the output `key` (`None` = default) to `target`. Refuses an
@@ -318,6 +344,19 @@ impl WaylandState {
         key: Option<&str>,
         target: WorkspaceTarget,
         wrap: bool,
+    ) -> Result<WorkspaceSwitch, WorkspaceRefusal> {
+        self.switch_workspace_focusing(key, target, wrap, None)
+    }
+
+    /// `switch_workspace` with the settle's keyboard preference (see
+    /// `settle_workspace_visibility`); `move_window_and_follow` names the
+    /// window it is bringing along so the settle lands on it.
+    fn switch_workspace_focusing(
+        &mut self,
+        key: Option<&str>,
+        target: WorkspaceTarget,
+        wrap: bool,
+        prefer: Option<WlSurface>,
     ) -> Result<WorkspaceSwitch, WorkspaceRefusal> {
         let output = self
             .resolve_workspace_output(key)
@@ -356,7 +395,7 @@ impl WaylandState {
         }
         #[cfg(feature = "bus")]
         self.mark_workspaces_dirty("workspace.switch");
-        self.settle_workspace_visibility();
+        self.settle_workspace_visibility(prefer);
         Ok(WorkspaceSwitch { output, from, to })
     }
 
@@ -368,6 +407,18 @@ impl WaylandState {
         &mut self,
         object: &ObjectId,
         target: WorkspaceTarget,
+    ) -> Result<(u32, u32), WorkspaceRefusal> {
+        self.move_window_to_workspace_focusing(object, target, None)
+    }
+
+    /// `move_window_to_workspace` with the settle's keyboard preference
+    /// (see `settle_workspace_visibility`); only a move that leaves or
+    /// arrives on the current workspace settles at all.
+    fn move_window_to_workspace_focusing(
+        &mut self,
+        object: &ObjectId,
+        target: WorkspaceTarget,
+        prefer: Option<WlSurface>,
     ) -> Result<(u32, u32), WorkspaceRefusal> {
         let count = self.workspaces.count;
         let from = self
@@ -381,47 +432,50 @@ impl WaylandState {
             return Ok((from, to));
         }
         let current = self.workspace_current();
-        if let Some(record) = self.surfaces.get_mut(object) {
-            record.workspace = to;
-        }
+        self.relabel_workspace(object, to);
         if from == current {
             self.withdraw_window_for_workspace(object, "workspace.move");
         } else if to == current {
             self.present_window_for_workspace(object, "workspace.move");
-        } else {
-            #[cfg(feature = "bus")]
-            if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
-                self.mark_surface_dirty(id, "workspace.move");
-            }
         }
         // `workspaces.list` window counts change on every move.
         #[cfg(feature = "bus")]
         self.mark_workspaces_dirty("workspace.move");
         if from == current || to == current {
-            self.settle_workspace_visibility();
+            self.settle_workspace_visibility(prefer);
         }
         Ok((from, to))
     }
 
     /// Move one window to `target` AND make that workspace the default
-    /// output's current one, in ONE settle, with the window on screen and
-    /// on top throughout — so no bystander on either workspace takes the
-    /// keyboard in between (the Super+Shift+n chord and
-    /// `send_to_workspace {follow:true}`). Doing it as a move then a switch
-    /// (or a switch then a move) hands focus to whichever window is left
-    /// highest on the workspace being shown at the settle — an enter plus
-    /// an activated configure the caller's activation immediately reverses.
-    /// Here the record is relabelled first, so the switch sees the window
-    /// ARRIVING rather than leaving (never withdrawn, never suspended), and
-    /// it is raised before the settle so the focus fallback lands on it.
+    /// output's current one, in ONE settle, with the window on screen, on
+    /// top of its band and holding the keyboard throughout — so no
+    /// bystander on either workspace takes the keyboard in between (the
+    /// Super+Shift+n chord and `send_to_workspace {follow:true}`). Doing it
+    /// as a move then a switch (or a switch then a move) hands focus to
+    /// whichever window is left highest on the workspace being shown at
+    /// the settle — an enter plus an activated configure the caller's
+    /// activation immediately reverses. Here the record is relabelled
+    /// first, so the switch sees the window ARRIVING rather than leaving
+    /// (never withdrawn, never suspended), and the settle is told to
+    /// prefer it, so the keyboard lands on it whatever band it is in
+    /// (`raise_surface` raises within the band only, so being on top of a
+    /// bottom-band window's band is not being the highest visible
+    /// toplevel).
     ///
     /// Refuses exactly what `move_window_to_workspace` refuses, before
     /// anything changes; with no default output the switch has nothing to
     /// move and this is the plain move. Returns `(from, to)`; a window
     /// already on the current workspace is only moved when `to` differs.
-    /// The caller activates afterwards (this raises but does not focus a
-    /// window the settle's fallback would not — under a lock or an
-    /// exclusive layer the fallback owns the keyboard, as it should).
+    ///
+    /// The primitive does not gate on D18 — both callers do, with
+    /// `workspace_switch_allowed_for`, the one predicate every switch-first
+    /// path shares — but its keyboard preference does: a window that gate
+    /// would not let a switch bring into focus (minimised, not presentable,
+    /// a lock or an exclusive layer on screen) is moved and raised, and the
+    /// settle's fallback keeps the keyboard where the lock or layer says.
+    /// The caller activates afterwards; for a window already preferred that
+    /// is a no-op, so there is exactly one enter.
     pub(crate) fn move_window_and_follow(
         &mut self,
         object: &ObjectId,
@@ -440,26 +494,40 @@ impl WaylandState {
         let to = resolve_workspace_target(from, count, target, true)?;
         let current = self.current_workspace_for(Some(&output));
         let surface = self.surfaces[object].role.wl_surface().clone();
-        // On top first: a move onto the current workspace settles through
-        // the same focus fallback a switch does, and it must find this
-        // window highest.
+        let prefer = self
+            .workspace_switch_allowed_for(object)
+            .map(|_| surface.clone());
+        // Nothing below can refuse: `to` came from the ring and `output`
+        // from `resolve_workspace_output`, which round-trips its own key.
+        // On top of its band first, so the arrival is also a raise.
         self.raise_surface(&surface);
         if to == current {
-            return self.move_window_to_workspace(object, target);
+            return self.move_window_to_workspace_focusing(object, target, prefer);
         }
         if from != to {
-            if let Some(record) = self.surfaces.get_mut(object) {
-                record.workspace = to;
-            }
-            #[cfg(feature = "bus")]
-            if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
-                self.mark_surface_dirty(id, "workspace.move");
+            self.relabel_workspace(object, to);
+        }
+        // The window is on `to` already, so the switch presents it.
+        match self.switch_workspace_focusing(
+            Some(&output),
+            WorkspaceTarget::Index(to),
+            true,
+            prefer,
+        ) {
+            Ok(_) => Ok((from, to)),
+            Err(refusal) => {
+                // Unreachable by construction (see above); if it ever were
+                // not, the move is undone rather than reported alongside a
+                // refusal — a refusal must mean nothing changed.
+                if cfg!(debug_assertions) {
+                    unreachable!("move_window_and_follow: switch refused {refusal:?}");
+                }
+                if from != to {
+                    self.relabel_workspace(object, from);
+                }
+                Err(refusal)
             }
         }
-        // Cannot refuse: the output resolved and `to` came from the ring.
-        // The window is on `to` already, so the switch presents it.
-        self.switch_workspace(Some(&output), WorkspaceTarget::Index(to), true)?;
-        Ok((from, to))
     }
 
     /// Set the workspace count. Shrinking strands: every window above the
@@ -513,7 +581,7 @@ impl WaylandState {
         }
         #[cfg(feature = "xwayland")]
         self.sync_x11_suspended_for_workspaces();
-        self.settle_workspace_visibility();
+        self.settle_workspace_visibility(None);
         Ok((old, count))
     }
 
