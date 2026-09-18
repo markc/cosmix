@@ -781,3 +781,48 @@ fn x11_desktop_request_ignores_an_override_redirect_window() {
     assert_eq!(menu.desktop(), None);
     assert_eq!(harness.server.state.workspace_current(), 1);
 }
+
+/// A pager's `_NET_CURRENT_DESKTOP` root message (`wmctrl -s`, `xdotool
+/// set_desktop`) is a SWITCH of the default output, 0-based, with the same
+/// effect as `comp.workspace.switch`: a mapped X11 window on the workspace
+/// being left goes EWMH-hidden, and the root pair the switch publishes is
+/// the live gate's to read. An index at or above the count (including
+/// `0xFFFFFFFF`), a repeat of the current desktop and a request under a
+/// session lock leave the workspace alone.
+#[test]
+fn x11_current_desktop_request_switches_the_workspace() {
+    let mut harness = KeybindingHarness::new(true);
+    let (id, _surface, window, object) = associate_normal_window(&mut harness, 917);
+    commit_dmabuf(&mut harness, id, 32, 24);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+
+    harness.server.state.x11_current_desktop_request(1);
+    assert_eq!(harness.server.state.workspace_current(), 2, "0-based: desktop 1 is workspace 2");
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.workspace, 1, "a switch moves no window");
+    assert!(!record.layout.visible);
+    assert!(window.is_minimized(), "left behind: EWMH hidden (D15)");
+    assert_eq!(window.desktop(), Some(0), "its own desktop is unchanged");
+
+    // Ignored: a repeat, at/above the count, all-desktops.
+    let count = harness.server.state.workspaces.count;
+    for desktop in [1, count, u32::MAX] {
+        harness.server.state.x11_current_desktop_request(desktop);
+        assert_eq!(harness.server.state.workspace_current(), 2, "desktop {desktop}");
+    }
+
+    harness.server.state.x11_current_desktop_request(0);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.layout.visible);
+    assert!(!window.is_minimized(), "back on screen: resumed");
+
+    // Under a session lock the request is inert, like the `_NET_WM_DESKTOP`
+    // arm and the `workspaces.current` write.
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    assert!(harness.server.state.session_lock_active());
+    harness.server.state.x11_current_desktop_request(2);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+}

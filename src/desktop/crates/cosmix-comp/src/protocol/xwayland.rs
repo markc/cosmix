@@ -674,7 +674,12 @@ impl WaylandState {
     /// Re-publish `_NET_WM_DESKTOP` on every mapped managed X11 window from
     /// its record (the mass re-derivation for a count shrink and for XWM
     /// start). The per-window edges — the stamp at map and a move — write
-    /// their own value at the site that changes the record.
+    /// their own value at the site that changes the record. Debug, not
+    /// warn, on failure, like those edges and the suspend sweep beside
+    /// this one: an `Err` from a property write is a dead connection (the
+    /// X protocol reports per-request errors asynchronously, never through
+    /// this `Result`), which is the offline fakes' normal state and, live,
+    /// a dying generation `disconnected` cleans up.
     pub(super) fn sync_x11_desktops(&self) {
         for record in self.surfaces.values() {
             if !record.mapped || record.workspace == 0 {
@@ -684,8 +689,35 @@ impl WaylandState {
                 && !role.override_redirect
                 && let Err(error) = role.surface.set_desktop(record.workspace - 1)
             {
-                tracing::warn!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP");
+                tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP");
             }
+        }
+    }
+
+    /// A pager's `_NET_CURRENT_DESKTOP` root message: switch the default
+    /// output to the 0-based `desktop`, exactly like `comp.workspace.switch
+    /// {index: desktop + 1}` (no wrap; a switch to the current workspace is
+    /// a no-op). Refused, with a debug log: an index at or above the count
+    /// and a session lock (a client-driven path must not change the desktop
+    /// under the lock surface — the same gate as the `_NET_WM_DESKTOP`
+    /// arm and the props write). The switch itself publishes the new value.
+    pub(super) fn x11_current_desktop_request(&mut self, desktop: u32) {
+        let count = self.workspaces.count;
+        if desktop >= count {
+            tracing::debug!(desktop, count, "ignored _NET_CURRENT_DESKTOP above the workspace count");
+            return;
+        }
+        if self.session_lock_active() {
+            tracing::debug!(desktop, "ignored _NET_CURRENT_DESKTOP under a session lock");
+            return;
+        }
+        match self.switch_workspace(None, workspaces::WorkspaceTarget::Index(desktop + 1), false) {
+            Ok(switched) => tracing::debug!(
+                from = switched.from,
+                to = switched.to,
+                "switched workspace on _NET_CURRENT_DESKTOP"
+            ),
+            Err(refusal) => tracing::debug!(desktop, ?refusal, "refused _NET_CURRENT_DESKTOP switch"),
         }
     }
 
@@ -703,14 +735,10 @@ impl WaylandState {
             tracing::debug!(xid, "ignored _NET_WM_DESKTOP 0xFFFFFFFF: no sticky windows in 0.59");
             return;
         }
-        if desktop >= count {
-            tracing::debug!(xid, desktop, count, "ignored _NET_WM_DESKTOP above the workspace count");
-            return;
-        }
-        if self.session_lock_active() {
-            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP under a session lock");
-            return;
-        }
+        // The identity gate first, so the log names the reason a request
+        // that fails several gates was actually refused for: an
+        // override-redirect menu asking for a desktop above the count is
+        // refused because it is a menu, not because of the count.
         let Some(surface) = window.wl_surface() else {
             tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP for an unassociated window");
             return;
@@ -731,6 +759,14 @@ impl WaylandState {
                 desktop,
                 "ignored _NET_WM_DESKTOP for an override-redirect window or a stale identity"
             );
+            return;
+        }
+        if desktop >= count {
+            tracing::debug!(xid, desktop, count, "ignored _NET_WM_DESKTOP above the workspace count");
+            return;
+        }
+        if self.session_lock_active() {
+            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP under a session lock");
             return;
         }
         match self.move_window_to_workspace(&object, workspaces::WorkspaceTarget::Index(desktop + 1)) {
@@ -3051,6 +3087,13 @@ impl XwmHandler for WaylandState {
             return;
         }
         self.x11_desktop_request(window, desktop);
+    }
+
+    fn current_desktop_request(&mut self, xwm: XwmId, desktop: u32, _timestamp: u32) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
+        self.x11_current_desktop_request(desktop);
     }
 
     fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {

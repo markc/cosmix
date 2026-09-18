@@ -370,7 +370,10 @@ impl WaylandState {
     /// `Next`/`Prev` are relative to the window's own workspace and always
     /// wrap. Returns `(from, to)`; never touches the window's generation
     /// (the object is the same window, only placed elsewhere).
-    // No production caller until the prop/verb/binding slices land.
+    // Every production caller is behind a feature (`bus`: the
+    // `windows.s<id>.workspace` write and `comp.window.send_to_workspace`;
+    // `xwayland`: the `_NET_WM_DESKTOP` request), so `--no-default-features`
+    // still has none.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn move_window_to_workspace(
         &mut self,

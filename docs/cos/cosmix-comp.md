@@ -164,10 +164,22 @@ takes it off screen; `_NET_ACTIVE_WINDOW` remains the request that brings a
 window on screen. Ignored, with a debug log: `0xFFFFFFFF` (all desktops —
 comp has no sticky windows in 0.59.0), a desktop at or above the count, a
 request while a session lock is active, and one for an override-redirect
-window or a stale identity. `xprop -root _NET_CURRENT_DESKTOP` via
-`xwayland.display` is the live check (the nested workspace gate's rule 10);
-the offline suite pins the atoms, the callback and the values the
-compositor asks the XWM to write, never the X property itself.
+window or a stale identity. A pager's `_NET_CURRENT_DESKTOP` root message
+(`wmctrl -s N`, `xdotool set_desktop N`) is honoured as a switch of the
+default output, exactly like `comp.workspace.switch {index: N + 1}`
+without wrap; a desktop at or above the count and a request under a
+session lock are ignored with a debug log. The root pair is also
+republished after a KMS topology change, because `workspaces.current` is
+the default output's and a replaced output reads as workspace 1 with no
+switch having run. `xprop -root _NET_CURRENT_DESKTOP` /
+`_NET_NUMBER_OF_DESKTOPS` and `xprop -id <xid> _NET_WM_DESKTOP` via
+`xwayland.display` are the live checks (the nested workspace gate's rule
+10, which also drives both client messages through `xdotool`); the offline
+suite pins the atoms, the callbacks and the values the compositor asks the
+XWM to write, never the X property itself. Note that a property write can
+only fail with a dead X connection (the X protocol reports per-request
+errors asynchronously): a failed write is a dying Xwayland generation, not
+a stale property on a live window.
 
 Initial X11 placement, including size-only configure requests before mapping,
 respects reserved panel space. Reserved-area changes reflow managed X11 windows;
@@ -368,9 +380,10 @@ that unmaps and remaps joins the current workspace again. X11 clients see
 the same model through EWMH: the root `_NET_NUMBER_OF_DESKTOPS` and
 `_NET_CURRENT_DESKTOP` (0-based, so workspace 1 is desktop 0) follow every
 switch and count change, every managed X11 window carries `_NET_WM_DESKTOP`
-from the moment it maps, and a client's own `_NET_WM_DESKTOP` message moves
-its window exactly like a `windows.s<id>.workspace` write (see Window
-switching and X11 placement). A refused or
+from the moment it maps, a client's own `_NET_WM_DESKTOP` message moves
+its window exactly like a `windows.s<id>.workspace` write, and a pager's
+`_NET_CURRENT_DESKTOP` root message switches exactly like
+`comp.workspace.switch` (see Window switching and X11 placement). A refused or
 no-op write publishes nothing and attributes nothing: the next unrelated
 change keeps its own cause. All of these are watchable; the
 changed events of a switch, move or count change carry the cause of the
@@ -1652,8 +1665,10 @@ pair written as `1`/`0` at WM start), `X11Wm::set_number_of_desktops` /
 for the per-window property (with a `desktop()` read-back of the last value
 asked for, so the offline tests can see it through a dead connection), and
 an `XwmHandler::desktop_request` callback dispatched for 32-bit
-`_NET_WM_DESKTOP` client messages, a no-op by default: the compositor owns
-the desktop model and decides whether a request becomes a move.
+`_NET_WM_DESKTOP` client messages and an `XwmHandler::current_desktop_request`
+callback for 32-bit `_NET_CURRENT_DESKTOP` root messages, both no-ops by
+default: the compositor owns the desktop model and decides whether a
+request becomes a move or a switch.
 
 The vendored session-lock implementation also carries five marked fixes:
 

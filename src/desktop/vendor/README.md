@@ -677,8 +677,16 @@ desktop_request(xwm, window, desktop, source)` is dispatched for 32-bit
 `_NET_WM_DESKTOP` client messages (the window found by XID, data[0] the
 desktop or `0xFFFFFFFF`, data[1] the source); the default is a no-op and the
 arm writes nothing: the compositor owns the desktop model and publishes the
-property itself if it honours the request. Property delivery is a live-gate
-obligation (`xprop -root _NET_CURRENT_DESKTOP` in the nested workspace gate).
+property itself if it honours the request. `XwmHandler::
+current_desktop_request(xwm, desktop, timestamp)` is dispatched the same way
+for 32-bit `_NET_CURRENT_DESKTOP` root messages (a pager's switch request:
+no window lookup, data[0] the desktop, data[1] the timestamp), a no-op by
+default, nothing written by the arm — added in review because both root
+atoms are advertised in `_NET_SUPPORTED`, so a pager that reads it and sends
+the standard message must be answered. Property delivery is a live-gate
+obligation (`xprop -root _NET_CURRENT_DESKTOP` / `_NET_NUMBER_OF_DESKTOPS`,
+`xprop -id <xid> _NET_WM_DESKTOP`, and both messages through `xdotool`, in
+the nested workspace gate).
 
 `X11Wm::begin_shutdown` and `XWaylandClientData::begin_shutdown` mark a live
 generation before deliberate disconnection. Only marked EOF/reset and child

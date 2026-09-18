@@ -292,6 +292,14 @@ pub trait XwmHandler {
     /// `source` (0 legacy, 1 application, 2 pager) is not authentication.
     /// The default deliberately does nothing.
     fn desktop_request(&mut self, _xwm: XwmId, _window: X11Surface, _desktop: u32, _source: u32) {}
+    /// An EWMH `_NET_CURRENT_DESKTOP` root client message: a pager asks
+    /// for the 0-based `desktop` to become the current one (`timestamp`
+    /// is the request's, possibly zero). Nothing is written here; the
+    /// compositor decides whether the request becomes a switch and then
+    /// publishes the root property itself through
+    /// [`X11Wm::set_current_desktop`]. The default deliberately does
+    /// nothing.
+    fn current_desktop_request(&mut self, _xwm: XwmId, _desktop: u32, _timestamp: u32) {}
     /// A new X11 window with the override redirect flag.
     ///
     /// New override_redirect windows are not mapped yet, but can become any time.
@@ -2374,6 +2382,15 @@ where
                         drop(_guard);
                         state.desktop_request(xwm_id, surface, data[0], data[1]);
                     }
+                }
+                // Downstream (cosmix): a pager asking for a desktop to
+                // become current (data[0] 0-based, data[1] timestamp). A
+                // root message: no window to look up. Policy lives in the
+                // handler; nothing is written here.
+                x if x == xwm.atoms._NET_CURRENT_DESKTOP && msg.format == 32 => {
+                    let data = msg.data.as_data32();
+                    drop(_guard);
+                    state.current_desktop_request(xwm_id, data[0], data[1]);
                 }
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];

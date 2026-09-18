@@ -69,6 +69,35 @@ fn vendored_desktop_dispatch_keeps_format_and_policy_callback() {
     let delegate = delegate.split("fn xwm_state").next().unwrap();
     assert!(delegate.contains("if !self.xwm_event_is_live(xwm) {"));
     assert!(delegate.contains("self.x11_desktop_request(window, desktop);"));
+
+    // The root `_NET_CURRENT_DESKTOP` arm (a pager's switch request): no
+    // window lookup, data[0] the desktop and data[1] the timestamp, the
+    // same no-op default and the same generation-gated delegate. Both
+    // root atoms are advertised in `_NET_SUPPORTED`, so a pager that reads
+    // it and sends the standard message must be answered.
+    let root_arm = source
+        .split("x if x == xwm.atoms._NET_CURRENT_DESKTOP && msg.format == 32 => {")
+        .nth(1)
+        .expect("32-bit current-desktop dispatch");
+    let root_arm = root_arm
+        .split("x if x == xwm.atoms.WL_SURFACE_ID")
+        .next()
+        .unwrap();
+    assert!(!root_arm.contains("surface.window_id() == msg.window"), "a root message: no window");
+    assert!(root_arm.contains("state.current_desktop_request(xwm_id, data[0], data[1]);"));
+    assert!(
+        source.contains(
+            "fn current_desktop_request(&mut self, _xwm: XwmId, _desktop: u32, _timestamp: u32) {}"
+        ),
+        "the trait default is a no-op: policy is the compositor's"
+    );
+    let delegate = comp
+        .split("fn current_desktop_request(&mut self, xwm: XwmId, desktop: u32, _timestamp: u32) {")
+        .nth(1)
+        .expect("comp delegate for the root message");
+    let delegate = delegate.split("fn xwm_state").next().unwrap();
+    assert!(delegate.contains("if !self.xwm_event_is_live(xwm) {"));
+    assert!(delegate.contains("self.x11_current_desktop_request(desktop);"));
 }
 
 /// EWMH desktops: the three atoms are advertised in `_NET_SUPPORTED`, the
@@ -161,6 +190,24 @@ fn supported_atoms_list_desktop_atoms() {
         .unwrap();
     assert!(ready.contains("self.publish_x11_desktops();"));
     assert!(ready.contains("self.sync_x11_desktops();"));
+    // A KMS topology change can replace the default output, whose current
+    // workspace `_NET_CURRENT_DESKTOP` mirrors (D3): the apply site
+    // republishes the root pair after the output bindings are reconciled,
+    // or the property keeps the retired output's index until the next
+    // switch. A source pin: the site is KMS event plumbing the offline
+    // harness cannot drive.
+    let protocol = std::fs::read_to_string(root.join("src/protocol/mod.rs")).unwrap();
+    let topology = protocol
+        .split("state.reconcile_output_after_topology_change_if_needed(")
+        .nth(1)
+        .expect("topology apply site")
+        .split("state.end_pointer_hit_test_batch();")
+        .next()
+        .unwrap();
+    assert!(
+        topology.contains("state.publish_x11_desktops();"),
+        "a topology change republishes the root pair"
+    );
 }
 
 #[test]
