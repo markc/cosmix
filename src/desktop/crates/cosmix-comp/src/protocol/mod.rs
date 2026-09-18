@@ -3741,6 +3741,17 @@ impl ProtocolServer {
                                     previous_output,
                                     previous_usable,
                                 );
+                                // `workspaces.current` is the DEFAULT
+                                // output's (D3) and a topology change can
+                                // replace that output — a new key reads as
+                                // workspace 1 with no switch having run —
+                                // so the EWMH root pair is republished
+                                // here, or `_NET_CURRENT_DESKTOP` keeps
+                                // the retired output's index until the
+                                // next switch. Two property writes per
+                                // hotplug; a no-op without an XWM.
+                                #[cfg(feature = "xwayland")]
+                                state.publish_x11_desktops();
                                 state.end_pointer_hit_test_batch();
                             }
                             for command in commands {

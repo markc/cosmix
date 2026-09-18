@@ -148,6 +148,39 @@ focus clears it to zero; delayed X focus events cannot replace it with a root
 or ancestor window ID. This keeps `xdotool windowactivate --sync` and
 `getactivewindow` consistent with compositor focus.
 
+Workspaces reach X11 clients as EWMH virtual desktops (comp 0.59.0). The
+root `_NET_NUMBER_OF_DESKTOPS` and `_NET_CURRENT_DESKTOP` are rewritten on
+every workspace switch and count change (and once when the XWM starts, over
+the `1`/`0` the XWM writes at startup so `xprop -root` never sees them
+absent); EWMH desktops are 0-based, so `workspaces.current` 3 reads as
+`_NET_CURRENT_DESKTOP = 2`. Every managed X11 window carries
+`_NET_WM_DESKTOP`, written at the moment it maps (the same edge that stamps
+its workspace — a window that has only sent its MapRequest has no
+workspace and no property yet), rewritten by every move and by a count
+shrink that strands it. A client's `_NET_WM_DESKTOP` message is honoured as
+a move — the window goes to that desktop WITHOUT switching, exactly like a
+`windows.s<id>.workspace` write, and gets `_NET_WM_STATE_HIDDEN` if that
+takes it off screen; `_NET_ACTIVE_WINDOW` remains the request that brings a
+window on screen. Ignored, with a debug log: `0xFFFFFFFF` (all desktops —
+comp has no sticky windows in 0.59.0), a desktop at or above the count, a
+request while a session lock is active, and one for an override-redirect
+window or a stale identity. A pager's `_NET_CURRENT_DESKTOP` root message
+(`wmctrl -s N`, `xdotool set_desktop N`) is honoured as a switch of the
+default output, exactly like `comp.workspace.switch {index: N + 1}`
+without wrap; a desktop at or above the count and a request under a
+session lock are ignored with a debug log. The root pair is also
+republished after a KMS topology change, because `workspaces.current` is
+the default output's and a replaced output reads as workspace 1 with no
+switch having run. `xprop -root _NET_CURRENT_DESKTOP` /
+`_NET_NUMBER_OF_DESKTOPS` and `xprop -id <xid> _NET_WM_DESKTOP` via
+`xwayland.display` are the live checks (the nested workspace gate's rule
+10, which also drives both client messages through `xdotool`); the offline
+suite pins the atoms, the callbacks and the values the compositor asks the
+XWM to write, never the X property itself. Note that a property write can
+only fail with a dead X connection (the X protocol reports per-request
+errors asynchronously): a failed write is a dying Xwayland generation, not
+a stale property on a live window.
+
 Initial X11 placement, including size-only configure requests before mapping,
 respects reserved panel space. Reserved-area changes reflow managed X11 windows;
 maximised windows use the usable area and fullscreen windows use the full
@@ -343,7 +376,14 @@ for the user's minimise state). A move never changes the window's
 generation. `surfaces.s<id>.workspace` carries the same value for every
 mapped managed toplevel, X11 windows included (they have no `windows.*`
 row), and null for every other surface and for an unmapped one. A window
-that unmaps and remaps joins the current workspace again. A refused or
+that unmaps and remaps joins the current workspace again. X11 clients see
+the same model through EWMH: the root `_NET_NUMBER_OF_DESKTOPS` and
+`_NET_CURRENT_DESKTOP` (0-based, so workspace 1 is desktop 0) follow every
+switch and count change, every managed X11 window carries `_NET_WM_DESKTOP`
+from the moment it maps, a client's own `_NET_WM_DESKTOP` message moves
+its window exactly like a `windows.s<id>.workspace` write, and a pager's
+`_NET_CURRENT_DESKTOP` root message switches exactly like
+`comp.workspace.switch` (see Window switching and X11 placement). A refused or
 no-op write publishes nothing and attributes nothing: the next unrelated
 change keeps its own cause. All of these are watchable; the
 changed events of a switch, move or count change carry the cause of the
@@ -403,9 +443,14 @@ drive that:
 - `comp.window.focus {id,generation,raise?}` gives the window keyboard focus.
   With `raise` (the default) it also raises it and re-targets the pointer,
   exactly like Alt+Tab. The reply is `{id,generation,focused}`. When
-  `focused` is false, `reason` says why: `exclusive_layer` (an exclusive
-  layer surface holds the keyboard), `minimized`, `not_visible`,
-  `not_presentable`, or `refused`.
+  `focused` is false, `reason` says why, and the order is the order the
+  gates are asked: `exclusive_layer` (an exclusive layer surface holds the
+  keyboard), then `minimized`, then `not_presentable`, then `not_visible`,
+  or `refused`. `not_presentable` comes before `not_visible` because the
+  workspace-independent gates are what kept the switch from running: an
+  off-workspace window refused by one of them names that gate, not the
+  visibility the switch would have given it, and a window that is merely
+  off its workspace is switched to and focused rather than refused.
 - `comp.window.raise {id,generation}` raises the window within its band
   without focusing it. The reply is `{id,generation,raised}`. Raise is
   stacking only: it never switches workspace and never un-minimises. An
@@ -1122,9 +1167,11 @@ record, the map grant makes it eligible, and its first committed buffer
 renders through exactly the renderer path a Wayland toplevel uses — the
 renderer has no X11 branch. Title/class metadata, focus (including the X
 `SetInputFocus`/`WM_TAKE_FOCUS` half), interactive and client-requested
-move/resize, maximise/minimise/fullscreen, EWMH state mirroring, close via
-`WM_DELETE_WINDOW`, and cross-protocol stacking in the normal band are
-supported.
+move/resize, maximise/minimise/fullscreen, EWMH state mirroring (including
+the virtual-desktop trio `_NET_NUMBER_OF_DESKTOPS` / `_NET_CURRENT_DESKTOP`
+/ `_NET_WM_DESKTOP`, described under Window switching and X11 placement),
+close via `WM_DELETE_WINDOW`, and cross-protocol stacking in the normal
+band are supported.
 
 `DISPLAY` is never set globally. After the XWM owns `WM_S0`, the compositor
 atomically publishes a mode-0600 per-socket descriptor at
@@ -1609,6 +1656,19 @@ The xwayland-shell serial handshake owns the real association; the setter
 exists only so the compositor's deterministic tests can fabricate offline
 X11 surfaces whose focus forwarding and metadata lookups still reach a real
 `wl_surface`.
+
+The vendored XWM also carries the EWMH virtual-desktop additions (comp
+0.59.0): the `_NET_NUMBER_OF_DESKTOPS`, `_NET_CURRENT_DESKTOP` and
+`_NET_WM_DESKTOP` atoms (interned, advertised in `_NET_SUPPORTED`, the root
+pair written as `1`/`0` at WM start), `X11Wm::set_number_of_desktops` /
+`X11Wm::set_current_desktop` for the root pair, `X11Surface::set_desktop`
+for the per-window property (with a `desktop()` read-back of the last value
+asked for, so the offline tests can see it through a dead connection), and
+an `XwmHandler::desktop_request` callback dispatched for 32-bit
+`_NET_WM_DESKTOP` client messages and an `XwmHandler::current_desktop_request`
+callback for 32-bit `_NET_CURRENT_DESKTOP` root messages, both no-ops by
+default: the compositor owns the desktop model and decides whether a
+request becomes a move or a switch.
 
 The vendored session-lock implementation also carries five marked fixes:
 
