@@ -72,6 +72,21 @@ try
   expect_raise(fn() = $x.portal_color_scheme("blue"), "THEME_COLOR",
     "unknown mode accepted")
 
+  -- ── stamped headers: ownership is a hash, not a claim ────────────────
+  $body = "\n[General]\nfoo=1\n"
+  check($x.is_generated($x.stamp($x.ini_header(), $body), $x.ini_header()),
+    "stamped ini content not recognised as generated")
+  check($x.is_generated($x.stamp($x.css_header(), "a{color:red}\n"),
+    $x.css_header()), "stamped css content not recognised as generated")
+  check(not $x.is_generated($x.ini_header() .. "\n" .. $body, $x.ini_header()),
+    "a header line without a hash still counts as generated")
+  $stamped_line = split($x.stamp($x.ini_header(), $body), "\n")[0]
+  check(not $x.is_generated($stamped_line .. "\n" .. "\n[General]\nfoo=2\n",
+    $x.ini_header()), "a body swapped under the recorded hash passes")
+  check(not $x.is_generated($x.stamp($x.ini_header(), $body), $x.css_header()),
+    "the wrong-format prefix passes")
+  check(not $x.is_generated("", $x.ini_header()), "empty content passes")
+
   -- ── px -> pt and font strings ────────────────────────────────────────
   check($x.px_to_pt(13.333) == 10, "13.333px should round to 10pt")
   check($x.px_to_pt(16) == 12, "16px should be 12pt")
@@ -165,9 +180,10 @@ try
 
   $kg = read_file($out .. "/kdeglobals")
   $kg_lines = split($kg, "\n")
-  check($kg_lines[0] == $x.ini_header() and $kg_lines[2] == "[General]" and
-    contains($kg, "ColorScheme=Cosmix"),
-    "kdeglobals generated-by header/[General] wrong")
+  check(starts_with($kg_lines[0], $x.ini_header() .. " sha256=") and
+    $kg_lines[2] == "[General]" and contains($kg, "ColorScheme=Cosmix") and
+    $x.is_generated($kg, $x.ini_header()),
+    "kdeglobals generated-by stamp/[General] wrong")
   check(contains($kg, "font=Noto Sans,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
     "kdeglobals font line wrong")
   check(contains($kg, "contrast=4"), "kdeglobals contrast wrong")
@@ -190,16 +206,16 @@ try
 
   for each $ver in ["gtk-3.0", "gtk-4.0"]
     $ini = read_file($out .. "/" .. $ver .. "/settings.ini")
-    check(split($ini, "\n")[0] == $x.ini_header(),
-      $ver .. "/settings.ini missing generated-by header")
+    check($x.is_generated($ini, $x.ini_header()),
+      $ver .. "/settings.ini missing a matching generated-by stamp")
     check(contains($ini, "gtk-application-prefer-dark-theme=false"),
       $ver .. " light mode should not prefer dark")
     check(contains($ini, "gtk-font-name=Noto Sans 10"), $ver .. " font name wrong")
     check(contains($ini, "gtk-icon-theme-name=breeze"), $ver .. " icon theme default wrong")
     check_no_empty_values(split($ini, "\n"), $ver .. "/settings.ini")
     $css = read_file($out .. "/" .. $ver .. "/gtk.css")
-    check(split($css, "\n")[0] == $x.css_header(),
-      $ver .. "/gtk.css missing generated-by header")
+    check($x.is_generated($css, $x.css_header()),
+      $ver .. "/gtk.css missing a matching generated-by stamp")
     $defines = 0
     for each $line in split($css, "\n")
       if starts_with(trim($line), "@define-color") then $defines = $defines + 1 end
@@ -296,8 +312,8 @@ try
     "installed Cosmix.colors differs from the exported one")
   check(contains($r.stdout, "apply with: plasma-apply-colorscheme Cosmix"),
     "plasma-apply-colorscheme hint not printed")
-  check(split(read_file($cfg_a .. "/gtk-3.0/settings.ini"), "\n")[0] ==
-    $x.ini_header(), "installed settings.ini lacks the generated-by header")
+  check($x.is_generated(read_file($cfg_a .. "/gtk-3.0/settings.ini"),
+    $x.ini_header()), "installed settings.ini lacks a matching stamp")
 
   -- (b) a foreign existing settings.ini is refused, byte-identical, exit 1
   $env_b = install_env($tmp, "i-b")
@@ -332,7 +348,7 @@ try
     "backup name is not <file>.cosmix-bak-<YYYYmmdd-HHMMSS>: " .. $baks[0])
   check(read_file($baks[0]) == $foreign_ini, "backup does not hold the foreign content")
   $forced_ini = read_file($cfg_c .. "/gtk-3.0/settings.ini")
-  check(split($forced_ini, "\n")[0] == $x.ini_header(),
+  check($x.is_generated($forced_ini, $x.ini_header()),
     "forced settings.ini not replaced with generated content")
   check($forced_ini == read_file($tmp .. "/i-c-out/gtk-3.0/settings.ini"),
     "forced settings.ini differs from the exported one")
@@ -360,7 +376,203 @@ try
   check($r.ok and contains($r.stdout, "unchanged " .. $ini_d),
     "identical content should be reported unchanged")
 
-  print("PASS theme-export: hex/alpha conversion, color-scheme mapping, px->pt fonts, overlay semantics, validation, path candidates, defaults + dark-override end-to-end exports, install safety (kdeglobals untouched, refuse/backup/force/unchanged)")
+  -- (f) a symlinked install target is refused with AND without --force,
+  --      and the out-of-tree target is never touched
+  $env_f = install_env($tmp, "i-f")
+  $cfg_f = $env_f["XDG_CONFIG_HOME"]
+  mkdir($cfg_f .. "/gtk-3.0")
+  $precious = $tmp .. "/i-f-precious.ini"
+  write_file($precious, "precious content\n")
+  symlink($precious, $cfg_f .. "/gtk-3.0/settings.ini")
+  for each $ff in [false, true]
+    $argv = [$mix, $script, "--defaults", $defaults,
+      "--out", $tmp .. "/i-f-out", "--install"]
+    if $ff then push($argv, "--force") end
+    $r = run_argv($argv, {timeout: 60, env: $env_f})
+    check(not $r.ok and $r.exit_code == 1,
+      "a symlinked target should be refused with exit 1 (force=" ..
+      to_string($ff) .. ")")
+    check(contains($r.stderr, "refused " .. $cfg_f .. "/gtk-3.0/settings.ini") and
+      contains($r.stderr, "symlink to " .. $precious),
+      "the refusal must name the link and its target (force=" ..
+      to_string($ff) .. ")")
+    check(read_file($precious) == "precious content\n",
+      "the out-of-tree symlink target was modified (force=" ..
+      to_string($ff) .. ")")
+    check(stat($cfg_f .. "/gtk-3.0/settings.ini",
+        {follow_symlinks: false}).is_symlink,
+      "the symlink itself was replaced (force=" .. to_string($ff) .. ")")
+    check(len(glob($cfg_f .. "/gtk-3.0/settings.ini.cosmix-bak-*")) == 0,
+      "a refused symlink left a backup beside it")
+  end
+
+  -- (g) a hand-edited previously generated file is foreign → refused
+  $env_g = install_env($tmp, "i-g")
+  $ini_g = $env_g["XDG_CONFIG_HOME"] .. "/gtk-3.0/settings.ini"
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $tmp .. "/i-g-out", "--install"], {timeout: 60, env: $env_g})
+  check($r.ok, "install before the hand-edit failed: " .. $r.stderr)
+  $edited = read_file($ini_g) .. "gtk-theme-name=MyHandEdit\n"
+  write_file($ini_g, $edited)
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $tmp .. "/i-g-out", "--install"], {timeout: 60, env: $env_g})
+  check(not $r.ok and $r.exit_code == 1,
+    "a hand-edited generated file should be refused with exit 1")
+  check(contains($r.stderr, "refused " .. $ini_g),
+    "the hand-edit refusal is not on stderr")
+  check(read_file($ini_g) == $edited, "the hand-edited file was modified")
+  check(len(glob($ini_g .. ".cosmix-bak-*")) == 0,
+    "refusing a hand-edit must not leave a backup")
+
+  -- (h) --out goes through the same guard: a foreign file is refused (and
+  --      --force backs it up); a re-export with a new theme overwrites the
+  --      stamped files, but portal-settings.json — no stamp possible — is
+  --      foreign on any difference
+  $out_h = $tmp .. "/out-h"
+  mkdir($out_h .. "/gtk-4.0")
+  $user_ini = "[Settings]\ngtk-theme-name=UserOwn\n"
+  write_file($out_h .. "/gtk-4.0/settings.ini", $user_ini)
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--out", $out_h],
+    {timeout: 60, env: $scrub})
+  check(not $r.ok and $r.exit_code == 1,
+    "--out onto a foreign file should exit 1")
+  check(contains($r.stderr, "refused " .. $out_h .. "/gtk-4.0/settings.ini"),
+    "the foreign --out refusal is not on stderr")
+  check(read_file($out_h .. "/gtk-4.0/settings.ini") == $user_ini,
+    "the foreign --out file was modified")
+  check(is_file($out_h .. "/kdeglobals"),
+    "an --out refusal must not stop the remaining files")
+  check(contains($r.stdout, "summary: "),
+    "the run must end with a summary line")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--out", $out_h,
+    "--force"], {timeout: 60, env: $scrub})
+  check($r.ok, "--force over the foreign --out file failed: " .. $r.stderr)
+  $h_baks = glob($out_h .. "/gtk-4.0/settings.ini.cosmix-bak-*")
+  check(len($h_baks) == 1,
+    "--force on --out should leave exactly one backup, got " ..
+    to_string(len($h_baks)))
+  check(read_file($h_baks[0]) == $user_ini,
+    "the --out backup does not hold the foreign content")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--theme",
+    $tmp .. "/dark.conf.mix", "--out", $out_h], {timeout: 60, env: $scrub})
+  check(not $r.ok and $r.exit_code == 1,
+    "re-export with a new theme: the unstampable portal file should refuse")
+  check(contains($r.stderr, "refused " .. $out_h .. "/portal-settings.json"),
+    "portal-settings.json should be the only refusal of the dark re-export")
+  check(contains($r.stdout, "(previously generated — overwritten)"),
+    "the stamped files should still overwrite cleanly")
+  check(contains(read_file($out_h .. "/gtk-4.0/settings.ini"),
+    "gtk-application-prefer-dark-theme=true"),
+    "the stamped settings.ini was not regenerated for the dark theme")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--theme",
+    $tmp .. "/dark.conf.mix", "--out", $out_h, "--force"],
+    {timeout: 60, env: $scrub})
+  check($r.ok, "the forced dark re-export failed: " .. $r.stderr)
+  check(len(glob($out_h .. "/portal-settings.json.cosmix-bak-*")) == 1,
+    "the forced portal overwrite should leave one backup")
+
+  -- (i) --out resolving to HOME / XDG_CONFIG_HOME / XDG_DATA_HOME is a
+  --      usage error (exit 2), before anything is written
+  $env_i = install_env($tmp, "i-i")
+  mkdir($env_i["XDG_CONFIG_HOME"])
+  for each $victim in [$env_i["XDG_CONFIG_HOME"],
+      $env_i["XDG_DATA_HOME"] .. "/", $env_i["HOME"]]
+    $r = run_argv([$mix, $script, "--defaults", $defaults, "--out", $victim],
+      {timeout: 60, env: $env_i})
+    check(not $r.ok and $r.exit_code == 2,
+      "--out at a protected root should exit 2: " .. $victim)
+    check(contains($r.stderr, "--install"),
+      "the root refusal must point at --install: " .. $victim)
+  end
+  check(not is_file($env_i["XDG_CONFIG_HOME"] .. "/kdeglobals") and
+    not is_file($env_i["HOME"] .. "/kdeglobals"),
+    "an --out root refusal must not write any file")
+  $link_i = $tmp .. "/i-i-link"
+  symlink($env_i["XDG_CONFIG_HOME"], $link_i)
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--out", $link_i],
+    {timeout: 60, env: $env_i})
+  check(not $r.ok and $r.exit_code == 2,
+    "a symlinked --out resolving to a protected root should exit 2")
+  $r = run_argv([$mix, $script, "--defaults", $defaults,
+    "--out", $env_i["HOME"] .. "/theme-export-out"], {timeout: 60, env: $env_i})
+  check($r.ok, "--out inside HOME (not HOME itself) must stay allowed: " ..
+    $r.stderr)
+
+  -- (j) a backup-name collision within the same second gets a numeric
+  --      suffix instead of overwriting the earlier backup
+  $env_j = install_env($tmp, "i-j")
+  $cfg_j = $env_j["XDG_CONFIG_HOME"]
+  mkdir($cfg_j .. "/gtk-3.0")
+  $tgt_j = $cfg_j .. "/gtk-3.0/settings.ini"
+  $collided = false
+  $try = 0
+  while $try < 8 and not $collided
+    $try = $try + 1
+    write_file($tgt_j, $foreign_ini)
+    for each $stale in glob($tgt_j .. ".cosmix-bak-*")
+      remove($stale)
+    end
+    -- occupy the exact name the child computes when it runs this second
+    $occupied = $tgt_j .. ".cosmix-bak-" .. date_format(time(), "%Y%m%d-%H%M%S")
+    write_file($occupied, "occupied")
+    $r = run_argv([$mix, $script, "--defaults", $defaults,
+      "--out", $tmp .. "/i-j-out", "--install", "--force"],
+      {timeout: 60, env: $env_j})
+    check($r.ok, "forced install (collision try " .. to_string($try) ..
+      ") failed: " .. $r.stderr)
+    $fresh = []
+    for each $b in glob($tgt_j .. ".cosmix-bak-*")
+      if $b != $occupied then push($fresh, $b) end
+    end
+    if (len($fresh) == 1 and ends_with($fresh[0], "-1") and
+        read_file($occupied) == "occupied" and
+        read_file($fresh[0]) == $foreign_ini) then
+      $collided = true
+    end
+  end
+  check($collided,
+    "a same-second backup collision never produced a -1 suffix in 8 tries")
+
+  -- (k) a symlink sitting at the computed backup name is refused too: the
+  --      old file stays, the link is never written through
+  $env_k = install_env($tmp, "i-k")
+  $cfg_k = $env_k["XDG_CONFIG_HOME"]
+  mkdir($cfg_k .. "/gtk-3.0")
+  $tgt_k = $cfg_k .. "/gtk-3.0/settings.ini"
+  $sinkhole = $tmp .. "/i-k-sinkhole"
+  $hit = false
+  $try = 0
+  while $try < 8 and not $hit
+    $try = $try + 1
+    write_file($tgt_k, $foreign_ini)
+    for each $stale in glob($tgt_k .. ".cosmix-bak-*")
+      remove($stale)
+    end
+    -- a symlink at the exact backup name the child computes this second
+    $trap = $tgt_k .. ".cosmix-bak-" .. date_format(time(), "%Y%m%d-%H%M%S")
+    symlink($sinkhole, $trap)
+    $r = run_argv([$mix, $script, "--defaults", $defaults,
+      "--out", $tmp .. "/i-k-out", "--install", "--force"],
+      {timeout: 60, env: $env_k})
+    if (contains($r.stderr, "backup path " .. $trap) and
+        contains($r.stderr, "symlink to " .. $sinkhole)) then
+      $hit = true
+      check(not $r.ok and $r.exit_code == 1,
+        "refusing the symlinked backup path should exit 1")
+      check(read_file($tgt_k) == $foreign_ini,
+        "the old file was modified despite the backup refusal")
+      check(not exists($sinkhole, {follow_symlinks: false}),
+        "the symlinked backup target was created")
+    else
+      -- the second ticked and the child chose a fresh name; retry
+      check($r.ok, "forced install (backup-trap try " .. to_string($try) ..
+        ") failed: " .. $r.stderr)
+    end
+    if exists($trap, {follow_symlinks: false}) then remove($trap) end
+  end
+  check($hit, "the symlinked backup name was never hit in 8 tries")
+
+  print("PASS theme-export: hex/alpha conversion, color-scheme mapping, px->pt fonts, stamped-header ownership, overlay semantics, validation, path candidates, defaults + dark-override end-to-end exports, install safety (kdeglobals untouched, refuse/backup/force/unchanged, symlink + backup-name symlink refusal, hand-edit refusal, backup collision suffix), --out guard (foreign refused, protected roots exit 2)")
 finally
   if starts_with($tmp, "/tmp/cosmix-theme-export-test.") then
     $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
