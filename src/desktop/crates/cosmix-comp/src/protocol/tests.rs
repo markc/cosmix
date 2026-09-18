@@ -15460,12 +15460,24 @@ fn a_replaced_default_output_keeps_its_workspace_and_a_changed_one_settles() {
         .switch_workspace(None, WorkspaceTarget::Index(3), true)
         .expect("switch to 3");
     let third = map_test_undecorated_toplevel(&mut harness);
+    let third_surface = harness.server.state.surfaces[&third]
+        .role
+        .wl_surface()
+        .clone();
+    // Mapping does not focus; put the keyboard on the window on screen so
+    // the carry-over's "nothing changed" has a focus to keep.
+    harness.server.state.activate_managed_window(&third_surface);
     let _ = harness.sync();
     let state = &mut harness.server.state;
     assert_eq!(state.surfaces[&third].workspace, 3);
     assert!(state.surfaces[&third].layout.visible);
     assert!(!state.surfaces[&second].layout.visible);
     assert!(!state.surfaces[&first].layout.visible);
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(third.clone()),
+        "precondition: the keyboard is on the window on screen"
+    );
     let key = state
         .default_output_key()
         .expect("the nested harness has a default output");

@@ -771,12 +771,15 @@ fn x11_desktop_request_ignores_an_override_redirect_window() {
     commit_dmabuf(&mut harness, sid, 32, 24);
     let record = &harness.server.state.surfaces[&object];
     assert!(record.mapped);
-    assert_eq!(record.workspace, 0, "an OR window is on every workspace");
+    // Stamped with the workspace it mapped on (it hides with it — see
+    // `x11_override_redirect_windows_hide_with_the_workspace_they_mapped_on`),
+    // but never movable and never published: no `_NET_WM_DESKTOP`.
+    assert_eq!(record.workspace, 1, "an OR window carries the workspace it mapped on");
     assert_eq!(menu.desktop(), None, "no _NET_WM_DESKTOP for an OR window");
 
     harness.server.state.x11_desktop_request(menu.clone(), 1);
     let record = &harness.server.state.surfaces[&object];
-    assert_eq!(record.workspace, 0);
+    assert_eq!(record.workspace, 1, "the request moved nothing");
     assert!(record.layout.visible);
     assert_eq!(menu.desktop(), None);
     assert_eq!(harness.server.state.workspace_current(), 1);
