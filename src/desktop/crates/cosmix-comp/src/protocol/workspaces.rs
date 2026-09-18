@@ -19,10 +19,10 @@
 use super::*;
 
 /// The most workspaces `set_workspace_count` accepts.
-// The primitives below have no production caller until the verb, prop and
-// binding slices land on top of this one; the tests drive them directly. The
-// allow is per item so a genuinely dead helper still trips the lint; drop
-// each once its first caller is wired.
+// Items with no production caller yet (the verb and prop slices land theirs)
+// carry a per-item allow, so a genuinely dead helper still trips the lint;
+// drop each once its first caller is wired. `switch_workspace` and
+// `move_window_to_workspace` already have one (the workspace chords).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const WORKSPACE_COUNT_MAX: u32 = 16;
 

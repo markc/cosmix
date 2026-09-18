@@ -12275,25 +12275,48 @@ impl WaylandState {
                     return;
                 };
                 let root = canonical_root_surface(&self.popup_manager, &focused);
+                // Switch FIRST, then move. Moving first withdraws the window
+                // while its old workspace is still on screen, and that
+                // settle hands keyboard focus to whichever bystander is
+                // left there — an enter + activated configure the switch
+                // immediately reverses. Switching first leaves the old
+                // workspace's other windows untouched; the move then lands
+                // the window on the now-current workspace and the activate
+                // returns focus to it. The predicate is the move's own (a
+                // mapped managed toplevel on a real workspace), checked up
+                // front so a refused move never leaves a stray switch behind.
+                let movable = self.surfaces.get(&root.id()).is_some_and(|record| {
+                    record.mapped && record.role.managed_toplevel() && record.workspace != 0
+                });
+                if !movable {
+                    tracing::debug!(
+                        surface = ?root.id(),
+                        workspace = n,
+                        "workspace-move chord refused: focus is not a movable window"
+                    );
+                    return;
+                }
                 let target = workspaces::WorkspaceTarget::Index(u32::from(n));
+                if let Err(refusal) = self.switch_workspace(None, target, true) {
+                    tracing::debug!(
+                        surface = ?root.id(),
+                        workspace = n,
+                        ?refusal,
+                        "workspace-move chord refused"
+                    );
+                    return;
+                }
                 match self.move_window_to_workspace(&root.id(), target) {
-                    Ok(_) => {
-                        if let Err(refusal) = self.switch_workspace(None, target, true) {
-                            tracing::debug!(
-                                workspace = n,
-                                ?refusal,
-                                "workspace-move chord moved but could not follow"
-                            );
-                            return;
-                        }
-                        self.activate_managed_window(&root);
-                    }
+                    Ok(_) => self.activate_managed_window(&root),
                     Err(refusal) => {
+                        // Unreachable after the predicate and the switch
+                        // both passed; logged rather than asserted because a
+                        // key press has nobody to reply to.
                         tracing::debug!(
                             surface = ?root.id(),
                             workspace = n,
                             ?refusal,
-                            "workspace-move chord refused"
+                            "workspace-move chord switched but could not move"
                         );
                     }
                 }

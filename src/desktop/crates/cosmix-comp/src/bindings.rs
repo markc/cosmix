@@ -1392,23 +1392,58 @@ mod tests {
         }
     }
 
-    /// `find` is first-match with no collision check, so two rows sharing a
-    /// keysym and an exact modifier set would silently shadow one another.
+    /// `find` is first-match with no collision check, so two rows on one
+    /// keysym whose patterns can both match the same modifier state would
+    /// silently shadow one another. The check is on OVERLAP, not equality:
+    /// a loose row (`Super+1`, don't care about Shift) collides with an
+    /// exact `Super+Shift+1` even though the two patterns are unequal.
     #[test]
     fn chords_are_unique_across_both_profiles() {
+        fn shares_a_modifier(a: &ModifierSet, b: &ModifierSet) -> bool {
+            (a.ctrl && b.ctrl)
+                || (a.alt && b.alt)
+                || (a.shift && b.shift)
+                || (a.logo && b.logo)
+                || (a.iso_level3_shift && b.iso_level3_shift)
+                || (a.iso_level5_shift && b.iso_level5_shift)
+        }
+        // Some modifier state satisfies both patterns unless one requires a
+        // modifier the other forbids.
+        fn overlap(a: &ModifierPattern, b: &ModifierPattern) -> bool {
+            !shares_a_modifier(&a.required, &b.forbidden)
+                && !shares_a_modifier(&b.required, &a.forbidden)
+        }
         for profile in [BindingProfile::Nested, BindingProfile::KmsLive] {
             let state = BindingState::for_profile(profile, true);
-            let mut seen = HashSet::new();
-            for binding in &state.table.bindings {
-                let chord = (binding.keysym, binding.modifiers.required);
-                assert!(
-                    seen.insert(chord),
-                    "{:?} profile: {} duplicates the chord of an earlier binding",
-                    profile,
-                    binding.id
-                );
+            let bindings = &state.table.bindings;
+            for (index, binding) in bindings.iter().enumerate() {
+                for earlier in &bindings[..index] {
+                    assert!(
+                        earlier.keysym != binding.keysym
+                            || !overlap(&earlier.modifiers, &binding.modifiers),
+                        "{:?} profile: {} is shadowed by the earlier {} on the same keysym",
+                        profile,
+                        binding.id,
+                        earlier.id
+                    );
+                }
             }
         }
+        // The guard itself can fail: a loose Super+1 beside the exact
+        // Super+Shift+1 is exactly the collision it exists to catch.
+        let loose = ModifierPattern {
+            required: ModifierSet::logo(),
+            forbidden: ModifierSet::NONE,
+            ignore_locks: true,
+        };
+        assert!(overlap(
+            &loose,
+            &ModifierPattern::exact(ModifierSet::logo().with_shift())
+        ));
+        assert!(!overlap(
+            &ModifierPattern::exact(ModifierSet::logo()),
+            &ModifierPattern::exact(ModifierSet::logo().with_shift())
+        ));
     }
 
     #[test]

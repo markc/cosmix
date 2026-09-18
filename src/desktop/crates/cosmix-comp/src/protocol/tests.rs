@@ -14745,6 +14745,89 @@ fn workspace_jump_chord_switches_and_never_reaches_the_client() {
     );
 }
 
+/// The `wl_keyboard.enter` surfaces in one drain: which surfaces gained
+/// keyboard focus, in order.
+fn keyboard_enter_surfaces(events: &[(u32, u16, Vec<u8>)]) -> Vec<u32> {
+    events
+        .iter()
+        .filter(|(object, opcode, body)| {
+            *object == TEST_KEYBOARD_ID && *opcode == 1 && body.len() >= 8
+        })
+        .map(|(_, _, body)| u32::from_ne_bytes(body[4..8].try_into().expect("entered surface")))
+        .collect()
+}
+
+/// Super+Shift+n switches FIRST and moves second, so the other windows on
+/// the workspace it leaves never gain keyboard focus: no `wl_keyboard.enter`
+/// names the bystander, and it sees no activated/deactivated round-trip.
+/// The two silent arms are whole: with no keyboard focus the chord does
+/// nothing (not even the switch), and a refused index (Super+Shift+9 with
+/// count 4) leaves the window, the workspace and the focus where they were.
+#[test]
+fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
+    // No keyboard focus at all: nothing switches, nothing panics.
+    let mut harness = KeybindingHarness::new(true);
+    assert!(harness.server.state.keyboard.current_focus().is_none());
+    harness.chord(&[125, 42, 3]);
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        1,
+        "a move chord with nothing to move does not switch"
+    );
+
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    let (bystander_id, _, _, bystander) =
+        map_named_test_toplevel(&mut harness, "Bystander", "dev.cosmix.Bystander");
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone())
+    );
+    assert_eq!(harness.server.state.surfaces[&bystander].workspace, 1);
+
+    // Super+Shift+9 with count 4: refused before anything moves or switches.
+    harness.chord(&[125, 42, 10]);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert!(harness.server.state.surfaces[&bystander].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "a refused move leaves focus alone"
+    );
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(
+        entered.is_empty(),
+        "a refused move re-focuses nobody: {entered:?}"
+    );
+
+    // Super+Shift+2: the window moves and is followed; the bystander stays
+    // on 1, hidden, and never held the keyboard in between.
+    harness.chord(&[125, 42, 3]);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 2);
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert_eq!(harness.server.state.surfaces[&bystander].workspace, 1);
+    assert!(!harness.server.state.surfaces[&bystander].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone())
+    );
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(
+        !entered.contains(&bystander_id),
+        "the bystander never gains keyboard focus during a move: {entered:?}"
+    );
+}
+
 #[test]
 fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
     let assert_profile = |harness: &mut KeybindingHarness| {
