@@ -287,7 +287,7 @@ struct KmsExpectation {
 
 impl KmsExpectation {
     /// VSYNC | HW_CLOCK | HW_COMPLETION.
-    const FLAGS: u32 = 0x1 | 0x2 | 0x4;
+    const FLAGS: u32 = VSYNC | HW_CLOCK | HW_COMPLETION;
 
     fn check(presented: &[PresentedCommit], refresh_ns: Option<u32>, interval_p50_us: u64) -> Self {
         let refresh_ns = refresh_ns.filter(|refresh| *refresh > 0);
@@ -349,11 +349,140 @@ impl KmsExpectation {
     }
 }
 
+/// wp_presentation `kind` bits.
+const VSYNC: u32 = 0x1;
+const HW_CLOCK: u32 = 0x2;
+const HW_COMPLETION: u32 = 0x4;
+
+/// Every presented timestamp must lie inside the probe's own
+/// `CLOCK_MONOTONIC` window `[started, finished]`, where `finished` is read
+/// after the LAST feedback event resolved. A `HW_CLOCK` timestamp with a
+/// refresh is allowed to LEAD `finished` by less than HALF a refresh period:
+/// a DRM flip event is delivered from the vblank interrupt carrying the
+/// vblank-edge time computed from the scanout position, which sits a few
+/// scanlines ahead of the interrupt (measured 42–65 µs on i915 at 60 Hz,
+/// 2026-09-18) and can never approach a full period. Half a period is the
+/// widest bound that still rejects a compositor stamping the NEXT vblank for
+/// a completed flip: that stamp leads by one period minus the same few
+/// scanlines, and no other check sees a uniform one-period shift
+/// (`increasing`, the seq/tv steps and the refresh all survive it, and a
+/// future stamp cannot trip `tv_before_commit`). Samples without `HW_CLOCK`
+/// or without a refresh get no allowance: they are stamped before the event
+/// is sent and cannot lead. Returns the verdict and the largest lead over
+/// EVERY sample (no short-circuit), which the report prints as
+/// `window_lead_us`; a stamp before `started` fails and counts no lead.
+fn window_check(
+    presented: &[PresentedCommit],
+    started: Duration,
+    finished: Duration,
+) -> (bool, u64) {
+    presented.iter().fold(
+        (true, 0_u64),
+        |(ok, max_lead), (time, refresh, _, flags)| {
+            if *time < started {
+                return (false, max_lead);
+            }
+            let lead = time.saturating_sub(finished).as_nanos() as u64;
+            let allowed = if *flags & HW_CLOCK != 0 {
+                u64::from(*refresh) / 2
+            } else {
+                0
+            };
+            (ok && lead < allowed.max(1), max_lead.max(lead))
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const R: u32 = 16_666_667;
+
+    #[test]
+    fn hardware_timestamps_may_lead_the_window_by_under_half_a_refresh() {
+        let started = Duration::from_secs(100);
+        let finished = started + Duration::from_millis(50);
+        let flip = |lead_ns: u64, flags: u32| {
+            vec![(finished + Duration::from_nanos(lead_ns), R, 7_u64, flags)]
+        };
+        let half = u64::from(R) / 2;
+        let (ok, lead) = window_check(&flip(65_000, KmsExpectation::FLAGS), started, finished);
+        assert!(ok, "65 µs lead under HW_CLOCK passes");
+        assert_eq!(lead, 65_000);
+        let (ok, _) = window_check(&flip(half - 1, KmsExpectation::FLAGS), started, finished);
+        assert!(ok, "just under half a refresh is still a vblank edge");
+        let (ok, lead) = window_check(&flip(half, KmsExpectation::FLAGS), started, finished);
+        assert!(!ok, "half a refresh is the bound (exclusive)");
+        assert_eq!(lead, half);
+        // A compositor stamping the NEXT vblank for a completed flip leads by
+        // one period minus the few scanlines the edge sits ahead of the IRQ.
+        let next_vblank = u64::from(R) - 65_000;
+        let (ok, _) = window_check(&flip(next_vblank, KmsExpectation::FLAGS), started, finished);
+        assert!(!ok, "a next-vblank stamp must not pass as a vblank edge");
+    }
+
+    #[test]
+    fn the_reported_lead_is_the_maximum_over_every_sample() {
+        let started = Duration::from_secs(100);
+        let finished = started + Duration::from_millis(50);
+        let at = |lead_ns: u64| {
+            (
+                finished + Duration::from_nanos(lead_ns),
+                R,
+                7_u64,
+                KmsExpectation::FLAGS,
+            )
+        };
+        // Fails at the second sample; the largest lead is the third.
+        let train = vec![at(10_000), at(u64::from(R)), at(20_000_000)];
+        let (ok, lead) = window_check(&train, started, finished);
+        assert!(!ok);
+        assert_eq!(lead, 20_000_000, "no short-circuit at the first failure");
+        let passing = vec![at(0), at(40_000), at(65_000), at(12_000)];
+        assert_eq!(window_check(&passing, started, finished), (true, 65_000));
+    }
+
+    #[test]
+    fn software_timestamps_get_no_lead_allowance() {
+        let started = Duration::from_secs(100);
+        let finished = started + Duration::from_millis(50);
+        let one_us_late = vec![(finished + Duration::from_micros(1), R, 7_u64, 0x1)];
+        assert!(
+            !window_check(&one_us_late, started, finished).0,
+            "no HW_CLOCK: 1 µs lead fails"
+        );
+        let no_refresh = vec![(
+            finished + Duration::from_micros(1),
+            0,
+            7_u64,
+            KmsExpectation::FLAGS,
+        )];
+        assert!(
+            !window_check(&no_refresh, started, finished).0,
+            "HW_CLOCK without a refresh: no allowance"
+        );
+        let inside = vec![(finished, R, 7_u64, 0x1), (started, R, 8_u64, 0x1)];
+        assert!(
+            window_check(&inside, started, finished).0,
+            "the closed window itself passes"
+        );
+    }
+
+    #[test]
+    fn timestamps_before_the_window_fail_regardless_of_flags() {
+        let started = Duration::from_secs(100);
+        let finished = started + Duration::from_millis(50);
+        let early = vec![(
+            started - Duration::from_nanos(1),
+            R,
+            7_u64,
+            KmsExpectation::FLAGS,
+        )];
+        let (ok, lead) = window_check(&early, started, finished);
+        assert!(!ok);
+        assert_eq!(lead, 0, "an early stamp is not a lead");
+    }
 
     /// Flips `periods[i]` refresh periods after the previous one, with the
     /// sequence advancing by the same amount.
@@ -378,9 +507,18 @@ mod tests {
     #[test]
     fn each_kms_claim_is_checked() {
         let steady = train(&[1, 1, 1]);
-        assert!(!KmsExpectation::check(&steady, None, 16_666).pass(), "unknown refresh");
-        assert!(!KmsExpectation::check(&steady, Some(R * 2), 16_666).pass(), "wrong refresh");
-        assert!(!KmsExpectation::check(&steady, Some(R), 33_333).pass(), "slow cadence");
+        assert!(
+            !KmsExpectation::check(&steady, None, 16_666).pass(),
+            "unknown refresh"
+        );
+        assert!(
+            !KmsExpectation::check(&steady, Some(R * 2), 16_666).pass(),
+            "wrong refresh"
+        );
+        assert!(
+            !KmsExpectation::check(&steady, Some(R), 33_333).pass(),
+            "slow cadence"
+        );
 
         let mut flags = steady.clone();
         flags[1].3 = 0x1 | 0x4;
@@ -617,9 +755,7 @@ fn run() -> Result<bool, String> {
         }
     }
     let increasing = presented.windows(2).all(|pair| pair[1].0 > pair[0].0);
-    let in_window = presented
-        .iter()
-        .all(|(time, ..)| *time >= started && *time <= finished);
+    let (in_window, window_lead_ns) = window_check(&presented, started, finished);
     let flags_zero = presented.iter().all(|(.., flags)| *flags == 0);
     let seq_zero = presented.iter().all(|(_, _, seq, _)| *seq == 0);
     let refresh_zero = presented.iter().all(|(_, refresh, ..)| *refresh == 0);
@@ -700,8 +836,8 @@ fn run() -> Result<bool, String> {
          superseded_presented_early={} superseded_presented_late={} \
          min_presented={} clock_id={} outputs={} unsynced={} tv_before_commit={} \
          tv_first_us={} tv_last_us={} window_start_us={} commits_done_us={} \
-         window_end_us={} increasing={} in_window={} flags_zero={} seq_zero={} \
-         refresh_zero={} interval_p50_us={} interval_p99_us={} interval_max_us={}",
+         window_end_us={} increasing={} in_window={} window_lead_us={} flags_zero={} \
+         seq_zero={} refresh_zero={} interval_p50_us={} interval_p99_us={} interval_max_us={}",
         if pass { "PASS" } else { "FAIL" },
         options.frames,
         burst,
@@ -726,6 +862,7 @@ fn run() -> Result<bool, String> {
         finished.as_micros(),
         increasing,
         in_window,
+        window_lead_ns / 1000,
         flags_zero,
         seq_zero,
         refresh_zero,
@@ -821,7 +958,11 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, usize> for Probe
         };
         let outcome = match event {
             wp_presentation_feedback::Event::SyncOutput { output } => {
-                if let Some(index) = state.outputs.iter().position(|bound| bound.id() == output.id()) {
+                if let Some(index) = state
+                    .outputs
+                    .iter()
+                    .position(|bound| bound.id() == output.id())
+                {
                     slot.synced = Some(index);
                 }
                 return;
