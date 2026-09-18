@@ -1,0 +1,493 @@
+-- theme-export.mix — one cosmix theme, foreign apps follow (proof 1).
+--
+-- Reads the cosmix theme (built-in defaults overlaid field-by-field by the
+-- shared theme.conf.mix, mirroring ctk theme.rs resolve_theme) and GENERATES
+-- theme files for Qt/KDE and GTK applications:
+--
+--   kdeglobals + Cosmix.colors   KDE colour scheme (r,g,b triplets + font)
+--   gtk-3.0/settings.ini         GTK3 dark mode, font, icon theme
+--   gtk-4.0/settings.ini         GTK4 ditto
+--   gtk-3.0/gtk.css              libadwaita/GTK named-colour overrides
+--   gtk-4.0/gtk.css              ditto
+--   portal-settings.json         what a future cosmix-dbusd Settings portal
+--                                would serve (org.freedesktop.appearance)
+--   README.txt                   file list, install targets, mapping table
+--
+-- Dry-run by design: everything lands in --out (default ./theme-export-out).
+-- --install additionally copies the set into the real XDG locations; without
+-- it the script never touches ~/.config.
+--
+-- usage: mix theme-export.mix [--theme FILE] [--defaults FILE] [--out DIR]
+--                              [--icon-theme NAME] [--install]
+--
+-- The colour conversion and mapping functions are pure and live at the top,
+-- so tests/theme-export-test.mix can require() this file and exercise them
+-- without running the export; the main body is guarded by $0 (nil under
+-- require, the script path when run directly) and does not execute then.
+--
+-- NEXT STEP: this version reads only the flat legacy hex fields. A shared
+-- theme that changes scheme/mode without per-token overrides therefore still
+-- exports the DEFAULT palette's flat fields — evaluating the OKLCH design:
+-- block (and the scheme/mode palette reselection it drives) is the next step.
+
+-- ============================ pure conversion ============================
+
+-- Parse "#rrggbb" or "#rrggbbaa" into {r, g, b, a} channel numbers (a
+-- defaults to 255). Anything else raises THEME_COLOR; callers add the field
+-- name when they have it.
+fn hex_rgb($hex)
+  if type($hex) != "string" or not starts_with($hex, "#") then
+    raise("THEME_COLOR", "expected #rrggbb[aa] hex, got: " .. json_encode($hex))
+  end
+  $digits = slice($hex, 1, len($hex))
+  if len($digits) != 6 and len($digits) != 8 then
+    raise("THEME_COLOR", "hex colour must have 6 or 8 digits, got: " .. $hex)
+  end
+  try
+    $b = bytes_from_hex($digits)
+  catch $err
+    raise("THEME_COLOR", "hex colour has a non-hex digit: " .. $hex)
+  end
+  return {r: $b[0], g: $b[1], b: $b[2], a: len($digits) == 8 ? $b[3] : 255}
+end
+
+-- "#rrggbb[aa]" -> KDE INI "r,g,b" decimal triplet. Alpha has no KDE INI
+-- representation, so it is dropped rather than misrendered.
+fn rgb_triplet($hex)
+  $c = hex_rgb($hex)
+  return fmt("%d,%d,%d", $c.r, $c.g, $c.b)
+end
+
+-- XDG portal color-scheme preference: 1 = prefer dark, 2 = prefer light.
+fn portal_color_scheme($mode)
+  if $mode == "dark" then return 1 end
+  if $mode == "light" then return 2 end
+  raise("THEME_COLOR", "mode must be \"dark\" or \"light\", got: " .. json_encode($mode))
+end
+
+-- CSS pixels to points at the 96 dpi reference (Qt/KDE assumption).
+fn px_to_pt($px)
+  return round($px * 72 / 96)
+end
+
+-- Qt font string: family, point size, then the fixed weight/style fields
+-- KDE writes for a regular-weight, unstyled face.
+fn qt_font($family, $body_px)
+  return $family .. "," .. to_string(px_to_pt($body_px)) ..
+    ",-1,5,400,0,0,0,0,0,0,0,0,0,0,1"
+end
+
+-- GTK font name: "Family size" (size in points).
+fn gtk_font_name($family, $body_px)
+  return $family .. " " .. to_string(px_to_pt($body_px))
+end
+
+-- ========================= theme overlay + mapping ========================
+
+-- The flat legacy fields a theme.conf.mix may override, mirroring the
+-- ThemeFile keys in ctk theme.rs (design: excluded by design, see header).
+fn theme_fields()
+  return ["mode", "surface", "panel", "master_panel", "track", "control",
+    "control_active", "thumb", "meter_green", "meter_amber", "meter_red",
+    "text", "text_dim", "border", "row_hover", "row_selected",
+    "row_selected_text", "row_selected_text_dim", "scrim", "danger_surface",
+    "corner_radius", "control_gap", "fader_width", "fader_height",
+    "knob_size", "meter_width"]
+end
+
+-- Overlay $over's present fields onto a copy of $base; absent fields keep
+-- the base value (partial override is the point of the cascade). Maps are
+-- value-semantic, so the copy-and-mutate here never touches the caller's
+-- maps. typography overlays field-by-field like every other field; scheme
+-- is accepted but ignored in this version (header NEXT STEP).
+fn overlay_theme($base, $over)
+  $merged = $base
+  for each $field in theme_fields()
+    if $over[$field] != nil then $merged[$field] = $over[$field] end
+  end
+  if $over["typography"] != nil then
+    for each $key in ["family", "body_px"]
+      if $over.typography[$key] != nil then
+        $merged.typography[$key] = $over.typography[$key]
+      end
+    end
+  end
+  return $merged
+end
+
+-- The colour fields the generators actually consume. Validating them up
+-- front gives a complete diagnosis in one pass instead of a raise per file.
+fn colour_fields()
+  return ["surface", "panel", "master_panel", "control", "control_active",
+    "text", "text_dim", "row_selected", "row_selected_text",
+    "row_selected_text_dim", "danger_surface", "meter_green", "meter_amber",
+    "meter_red"]
+end
+
+-- Return a list of problems with a resolved theme (empty = usable).
+fn validate_theme($t)
+  $problems = []
+  try
+    $_ = portal_color_scheme($t["mode"])
+  catch $msg
+    push($problems, "mode: " .. $msg)
+  end
+  for each $field in colour_fields()
+    try
+      $_ = rgb_triplet($t[$field])
+    catch $msg
+      push($problems, $field .. ": " .. $msg)
+    end
+  end
+  $family = $t["typography"] != nil ? $t.typography.family : nil
+  if type($family) != "string" or trim($family) == "" then
+    push($problems, "typography.family: must be a non-empty string")
+  end
+  $px = $t["typography"] != nil ? $t.typography.body_px : nil
+  if type($px) != "number" or $px < 6 or $px > 96 then
+    push($problems, "typography.body_px: must be a number in 6..96")
+  end
+  return $problems
+end
+
+-- One [Colors:<group>] block. $roles picks the cosmix field for each role;
+-- the status colours and decorations are theme-wide constants of the map.
+fn kde_color_group($t, $roles)
+  $lines = [
+    "BackgroundNormal=" .. rgb_triplet($t[$roles.bg]),
+    "BackgroundAlternate=" .. rgb_triplet($t[$roles.bg_alt]),
+    "ForegroundNormal=" .. rgb_triplet($t[$roles.fg]),
+    "ForegroundInactive=" .. rgb_triplet($t[$roles.fg_inactive]),
+    "ForegroundActive=" .. rgb_triplet($t[$roles.fg_active]),
+    "ForegroundLink=" .. rgb_triplet($t[$roles.fg_active]),
+    "ForegroundNegative=" .. rgb_triplet($t.meter_red),
+    "ForegroundNeutral=" .. rgb_triplet($t.meter_amber),
+    "ForegroundPositive=" .. rgb_triplet($t.meter_green),
+    "DecorationFocus=" .. rgb_triplet($t.control_active),
+    "DecorationHover=" .. rgb_triplet($t.control_active)
+  ]
+  return join($lines, "\n")
+end
+
+-- The kdeglobals fragment / Cosmix.colors scheme (identical content; KDE
+-- just files the latter under ~/.local/share/color-schemes/).
+fn kdeglobals($t)
+  $groups = [
+    ["Colors:Window", {bg: "surface", bg_alt: "panel", fg: "text",
+      fg_inactive: "text_dim", fg_active: "control_active"}],
+    ["Colors:View", {bg: "panel", bg_alt: "surface", fg: "text",
+      fg_inactive: "text_dim", fg_active: "control_active"}],
+    ["Colors:Button", {bg: "control", bg_alt: "panel", fg: "text",
+      fg_inactive: "text_dim", fg_active: "control_active"}],
+    ["Colors:Selection", {bg: "row_selected", bg_alt: "row_selected",
+      fg: "row_selected_text", fg_inactive: "row_selected_text_dim",
+      fg_active: "row_selected_text"}],
+    ["Colors:Tooltip", {bg: "panel", bg_alt: "surface", fg: "text",
+      fg_inactive: "text_dim", fg_active: "control_active"}],
+    ["Colors:Header", {bg: "master_panel", bg_alt: "panel", fg: "text",
+      fg_inactive: "text_dim", fg_active: "control_active"}]
+  ]
+  $parts = [
+    "[General]",
+    "ColorScheme=Cosmix",
+    "font=" .. qt_font($t.typography.family, $t.typography.body_px),
+    "",
+    "[KDE]",
+    "contrast=4"
+  ]
+  for each $group in $groups
+    push($parts, "")
+    push($parts, "[" .. $group[0] .. "]")
+    push($parts, kde_color_group($t, $group[1]))
+  end
+  return join($parts, "\n") .. "\n"
+end
+
+-- libadwaita/GTK named-colour overrides. Values stay the theme's own hex
+-- (alpha included), so GTK sees exactly what cosmix paints.
+fn gtk_css($t)
+  $defs = [
+    ["accent_color", $t.control_active],
+    ["accent_bg_color", $t.control_active],
+    ["accent_fg_color", $t.row_selected_text],
+    ["window_bg_color", $t.surface],
+    ["window_fg_color", $t.text],
+    ["view_bg_color", $t.panel],
+    ["view_fg_color", $t.text],
+    ["headerbar_bg_color", $t.master_panel],
+    ["headerbar_fg_color", $t.text],
+    ["card_bg_color", $t.master_panel],
+    ["destructive_bg_color", $t.danger_surface],
+    ["success_color", $t.meter_green],
+    ["warning_color", $t.meter_amber],
+    ["error_color", $t.meter_red]
+  ]
+  $lines = ["/* Generated by theme-export.mix — cosmix theme -> GTK named colours. */"]
+  for each $def in $defs
+    $_ = hex_rgb($def[1])
+    push($lines, "@define-color " .. $def[0] .. " " .. $def[1] .. ";")
+  end
+  return join($lines, "\n") .. "\n"
+end
+
+fn gtk_settings_ini($t, $icon_theme)
+  return join([
+    "[Settings]",
+    "gtk-application-prefer-dark-theme=" .. ($t.mode == "dark" ? "true" : "false"),
+    "gtk-font-name=" .. gtk_font_name($t.typography.family, $t.typography.body_px),
+    "gtk-icon-theme-name=" .. $icon_theme,
+    ""
+  ], "\n")
+end
+
+-- The org.freedesktop.appearance namespace a cosmix-dbusd Settings adapter
+-- would serve: color-scheme 1|2, accent as 0..1 floats, contrast 0.
+fn portal_settings_json($t)
+  $accent = hex_rgb($t.control_active)
+  return json_encode({"org.freedesktop.appearance": {
+    "color-scheme": portal_color_scheme($t.mode),
+    "accent-color": [round($accent.r / 255, 5), round($accent.g / 255, 5),
+      round($accent.b / 255, 5)],
+    "contrast": 0}}) .. "\n"
+end
+
+fn readme_text()
+  return join([
+    "cosmix theme export",
+    "===================",
+    "",
+    "Generated by theme-export.mix from the cosmix theme. Dry-run output;",
+    "nothing here is installed unless the script is run with --install.",
+    "",
+    "Files and where they would install:",
+    "",
+    "  kdeglobals               ~/.config/kdeglobals",
+    "  Cosmix.colors            ~/.local/share/color-schemes/Cosmix.colors",
+    "  gtk-3.0/settings.ini     ~/.config/gtk-3.0/settings.ini",
+    "  gtk-3.0/gtk.css          ~/.config/gtk-3.0/gtk.css",
+    "  gtk-4.0/settings.ini     ~/.config/gtk-4.0/settings.ini",
+    "  gtk-4.0/gtk.css          ~/.config/gtk-4.0/gtk.css",
+    "  portal-settings.json     not installed; served by a future",
+    "                           cosmix-dbusd portal Settings adapter",
+    "",
+    "The cosmix theme itself is resolved built-in defaults <- shared",
+    "theme.conf.mix (COSMIX_ETC, else \$COSMIX/etc, else the XDG config",
+    "dir), the same chain ctk uses.",
+    "",
+    "Mapping table (cosmix field -> generated value):",
+    "",
+    "  KDE [Colors:Window]    BackgroundNormal=surface BackgroundAlternate=panel",
+    "  KDE [Colors:View]      BackgroundNormal=panel BackgroundAlternate=surface",
+    "  KDE [Colors:Button]    BackgroundNormal=control BackgroundAlternate=panel",
+    "  KDE [Colors:Selection] Background*=row_selected ForegroundNormal=",
+    "                        row_selected_text ForegroundInactive=",
+    "                        row_selected_text_dim",
+    "  KDE [Colors:Tooltip]   BackgroundNormal=panel BackgroundAlternate=surface",
+    "  KDE [Colors:Header]    BackgroundNormal=master_panel BackgroundAlternate=panel",
+    "  KDE all groups         ForegroundNormal=text ForegroundInactive=text_dim",
+    "                         ForegroundActive/Link=control_active",
+    "                         Negative/Neutral/Positive=meter_red/amber/green",
+    "                         DecorationFocus/Hover=control_active",
+    "  KDE [General]          ColorScheme=Cosmix font=typography (px -> pt",
+    "                         at 96 dpi)",
+    "  KDE [KDE]              contrast=4",
+    "  GTK settings.ini       gtk-application-prefer-dark-theme from mode,",
+    "                         gtk-font-name=typography, gtk-icon-theme-name",
+    "                         from --icon-theme (default breeze)",
+    "  GTK gtk.css            accent_color/accent_bg_color=control_active",
+    "                         accent_fg_color=row_selected_text",
+    "                         window_bg_color=surface window_fg_color=text",
+    "                         view_bg_color=panel view_fg_color=text",
+    "                         headerbar_bg_color=master_panel",
+    "                         headerbar_fg_color=text card_bg_color=",
+    "                         master_panel destructive_bg_color=",
+    "                         danger_surface success_color=meter_green",
+    "                         warning_color=meter_amber error_color=meter_red",
+    "  portal-settings.json   color-scheme 1 (dark) / 2 (light) from mode,",
+    "                         accent-color=control_active as 0..1 floats,",
+    "                         contrast=0",
+    ""
+  ], "\n")
+end
+
+-- ============================ path resolution ============================
+
+-- Built-in defaults candidates: a checkout root via \$COSMIX, else next to
+-- this script (the in-tree defaults of the same checkout).
+fn defaults_candidates($argv0, $cosmix_env)
+  $paths = []
+  if $cosmix_env != "" then
+    push($paths, $cosmix_env ..
+      "/src/desktop/crates/cosmix-design/src/defaults/revision-1.theme.conf.mix")
+  end
+  push($paths, dirname($argv0) ..
+    "/../crates/cosmix-design/src/defaults/revision-1.theme.conf.mix")
+  return $paths
+end
+
+-- Shared theme.conf.mix candidates, mirroring shared_theme_path(): COSMIX_ETC,
+-- else \$COSMIX/etc, else the XDG config home's cosmix dir.
+fn shared_theme_candidates($etc_env, $cosmix_env, $xdg_config_home, $home)
+  $paths = []
+  if $etc_env != "" then push($paths, $etc_env .. "/theme.conf.mix") end
+  if $cosmix_env != "" then push($paths, $cosmix_env .. "/etc/theme.conf.mix") end
+  $xdg = $xdg_config_home
+  if $xdg == "" and $home != "" then $xdg = $home .. "/.config" end
+  if $xdg != "" then push($paths, $xdg .. "/cosmix/theme.conf.mix") end
+  return $paths
+end
+
+-- Parse the option vocabulary by hand: getopt's long names cannot carry
+-- the hyphen in --icon-theme, and the option set is small enough that a
+-- flat walk over args() (the desktop-scripts idiom) stays clearer than a
+-- spec map. Accepts both "--opt value" and "--opt=value"; any positional
+-- or unknown option raises THEME_ARGS.
+fn parse_args($argv)
+  $opts = {theme: nil, defaults: nil, out: nil, "icon-theme": nil, install: false}
+  $i = 0
+  while $i < len($argv)
+    $arg = $argv[$i]
+    $name = $arg
+    $value = nil
+    if starts_with($arg, "--") and contains($arg, "=") then
+      $name = before($arg, "=")
+      $value = after($arg, "=")
+    end
+    if $name == "--install" and $value == nil then
+      $opts.install = true
+    elif contains(["--theme", "--defaults", "--out", "--icon-theme"], $name) then
+      if $value == nil then
+        $i = $i + 1
+        if $i >= len($argv) then
+          raise("THEME_ARGS", "missing value for " .. $name)
+        end
+        $value = $argv[$i]
+      end
+      $opts[slice($name, 2)] = $value
+    else
+      raise("THEME_ARGS", "unknown or malformed option: " .. $arg ..
+        " — usage: theme-export.mix [--theme FILE] [--defaults FILE]" ..
+        " [--out DIR] [--icon-theme NAME] [--install]")
+    end
+    $i = $i + 1
+  end
+  return $opts
+end
+
+-- ================================ main ===================================
+
+if $0 != nil then
+  $opt = parse_args(args())
+
+  $defaults_path = $opt.defaults
+  if $defaults_path == nil or $defaults_path == "" then
+    $defaults_path = nil
+    for each $cand in defaults_candidates($0, env("COSMIX"))
+      if is_file($cand) then
+        $defaults_path = $cand
+        break
+      end
+    end
+  end
+  if $defaults_path == nil or not is_file($defaults_path) then
+    raise("THEME_CONFIG", "built-in defaults not found — set COSMIX to the" ..
+      " checkout root or pass --defaults revision-1.theme.conf.mix")
+  end
+
+  $theme_path = nil
+  if $opt.theme != nil and $opt.theme != "" then
+    $theme_path = $opt.theme
+    if not is_file($theme_path) then
+      raise("THEME_ARGS", "--theme file not found: " .. $theme_path)
+    end
+  else
+    for each $cand in shared_theme_candidates(env("COSMIX_ETC"), env("COSMIX"),
+        env("XDG_CONFIG_HOME"), env("HOME"))
+      if is_file($cand) then
+        $theme_path = $cand
+        break
+      end
+    end
+  end
+
+  $theme = load_data($defaults_path)
+  $explicit_theme = $opt.theme != nil and $opt.theme != ""
+  if $theme_path != nil then
+    -- An explicit --theme that fails to load, overlay or validate is the
+    -- operator's problem: raise. An auto-discovered shared theme that
+    -- fails any of those is skipped with a warning and the defaults stand —
+    -- a broken theme never bricks the export, the contract of ctk's
+    -- resolve_theme. The candidate is validated before adoption so a bad
+    -- overlay never poisons $theme.
+    try
+      $candidate = overlay_theme($theme, load_data($theme_path))
+      $bad = validate_theme($candidate)
+      if len($bad) > 0 then raise("THEME_INVALID", join($bad, "; ")) end
+      $theme = $candidate
+    catch $msg
+      if $explicit_theme then
+        raise("THEME_INVALID", "--theme " .. $theme_path .. ": " .. $msg)
+      end
+      eprint("theme-export: skipping " .. $theme_path .. ": " .. $msg)
+    end
+  end
+  $problems = validate_theme($theme)
+  if len($problems) > 0 then
+    raise("THEME_INVALID", "resolved theme is not exportable: " ..
+      join($problems, "; "))
+  end
+
+  $icon_theme = $opt["icon-theme"]
+  if $icon_theme == nil or $icon_theme == "" then $icon_theme = "breeze" end
+  $out = $opt.out
+  if $out == nil or $out == "" then $out = "./theme-export-out" end
+
+  $scheme = kdeglobals($theme)
+  $ini = gtk_settings_ini($theme, $icon_theme)
+  $css = gtk_css($theme)
+  $files = {
+    "kdeglobals": $scheme,
+    "Cosmix.colors": $scheme,
+    "gtk-3.0/settings.ini": $ini,
+    "gtk-3.0/gtk.css": $css,
+    "gtk-4.0/settings.ini": $ini,
+    "gtk-4.0/gtk.css": $css,
+    "portal-settings.json": portal_settings_json($theme),
+    "README.txt": readme_text()
+  }
+  mkdir($out)
+  mkdir($out .. "/gtk-3.0")
+  mkdir($out .. "/gtk-4.0")
+  for each $name in keys($files)
+    write_file($out .. "/" .. $name, $files[$name])
+    print("wrote " .. $out .. "/" .. $name)
+  end
+
+  if $opt.install then
+    $cfg = env("XDG_CONFIG_HOME")
+    if $cfg == "" or not starts_with($cfg, "/") then
+      $cfg = env("HOME") .. "/.config"
+    end
+    $data = env("XDG_DATA_HOME")
+    if $data == "" or not starts_with($data, "/") then
+      $data = env("HOME") .. "/.local/share"
+    end
+    $targets = {
+      "kdeglobals": $cfg .. "/kdeglobals",
+      "Cosmix.colors": $data .. "/color-schemes/Cosmix.colors",
+      "gtk-3.0/settings.ini": $cfg .. "/gtk-3.0/settings.ini",
+      "gtk-3.0/gtk.css": $cfg .. "/gtk-3.0/gtk.css",
+      "gtk-4.0/settings.ini": $cfg .. "/gtk-4.0/settings.ini",
+      "gtk-4.0/gtk.css": $cfg .. "/gtk-4.0/gtk.css"
+    }
+    for each $name in keys($targets)
+      $dir = dirname($targets[$name])
+      if not is_dir($dir) then mkdir($dir) end
+      write_file($targets[$name], $files[$name])
+      print("installed " .. $targets[$name])
+    end
+    print("portal-settings.json has no install target — a future cosmix-dbusd serves it")
+  else
+    print("dry run — pass --install to copy into ~/.config and ~/.local/share")
+  end
+end

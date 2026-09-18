@@ -1,0 +1,262 @@
+-- theme-export-test.mix — pure-function and end-to-end tests for
+-- theme-export.mix. The script is require()d as a module (its main body is
+-- $0-guarded and does not run); the export itself is exercised through a
+-- scrubbed-environment child so the operator's real shared theme can never
+-- leak into the result.
+-- usage: mix tests/theme-export-test.mix
+$x = require("../theme-export.mix")
+
+fn check($condition, $message)
+  if not $condition then raise("THEME_TEST", $message) end
+end
+
+-- Assert $f() raises with the given code.
+fn expect_raise($f, $want_code, $message)
+  $raised = false
+  try
+    $_ = $f()
+  catch $msg, $err
+    $raised = true
+    check($err.code == $want_code,
+      $message .. " (want code " .. $want_code .. ", got " .. $err.code .. ")")
+  end
+  check($raised, $message .. " (no raise)")
+end
+
+-- No INI/CSS line may carry an empty value: every "=" line has text after
+-- the "=", every @define-color has a hex between name and ";".
+fn check_no_empty_values($lines, $file)
+  for each $line in $lines
+    $t = trim($line)
+    if $t == "" or starts_with($t, "/*") then continue end
+    if contains($t, "=") then
+      check(after($t, "=") != "" and trim(after($t, "=")) != "",
+        $file .. " has an empty value: " .. $t)
+    end
+    if starts_with($t, "@define-color") then
+      check(re_match($t, "^@define-color [a-z_]+ #[0-9a-fA-F]{6,8};$"),
+        $file .. " has a malformed define: " .. $t)
+    end
+  end
+end
+
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-theme-export-test.XXXXXXXX"]))
+try
+  -- ── hex -> channels / r,g,b ───────────────────────────────────────────
+  check(deep_eq($x.hex_rgb("#006f87"), {r: 0, g: 111, b: 135, a: 255}),
+    "hex_rgb 6-digit parse wrong")
+  check(deep_eq($x.hex_rgb("#00000000"), {r: 0, g: 0, b: 0, a: 0}),
+    "hex_rgb 8-digit alpha wrong")
+  check($x.hex_rgb("#10203080").a == 128, "hex_rgb explicit alpha wrong")
+  check($x.hex_rgb("#ffFFff").g == 255, "hex_rgb uppercase digits wrong")
+  check($x.rgb_triplet("#006f87") == "0,111,135", "rgb_triplet wrong")
+  check($x.rgb_triplet("#ffffffff") == "255,255,255", "rgb_triplet alpha not dropped")
+  check($x.rgb_triplet("#00000080") == "0,0,0", "rgb_triplet alpha bled into rgb")
+  expect_raise(fn() = $x.hex_rgb("006f87"), "THEME_COLOR", "hex without # accepted")
+  expect_raise(fn() = $x.hex_rgb("#006f8"), "THEME_COLOR", "5-digit hex accepted")
+  expect_raise(fn() = $x.hex_rgb("#006f8z"), "THEME_COLOR", "non-hex digit accepted")
+  expect_raise(fn() = $x.hex_rgb(42), "THEME_COLOR", "non-string colour accepted")
+
+  -- ── mode -> portal color-scheme ───────────────────────────────────────
+  check($x.portal_color_scheme("dark") == 1, "dark should map to 1")
+  check($x.portal_color_scheme("light") == 2, "light should map to 2")
+  expect_raise(fn() = $x.portal_color_scheme("blue"), "THEME_COLOR",
+    "unknown mode accepted")
+
+  -- ── px -> pt and font strings ────────────────────────────────────────
+  check($x.px_to_pt(13.333) == 10, "13.333px should round to 10pt")
+  check($x.px_to_pt(16) == 12, "16px should be 12pt")
+  check($x.px_to_pt(20) == 15, "20px should be 15pt")
+  check($x.qt_font("Noto Sans", 13.333) ==
+    "Noto Sans,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1", "qt font string wrong")
+  check($x.gtk_font_name("Noto Sans", 13.333) == "Noto Sans 10",
+    "gtk font name wrong")
+
+  -- ── overlay semantics ────────────────────────────────────────────────
+  $base = {mode: "light", surface: "#111111", control_active: "#222222",
+    typography: {family: "Noto Sans", body_px: 13.333}}
+  $merged = $x.overlay_theme($base, {mode: "dark", typography: {family: "Other"}})
+  check($merged.mode == "dark", "overlay did not apply a present field")
+  check($merged.surface == "#111111", "overlay clobbered an absent field")
+  check($merged.typography.family == "Other", "overlay missed typography.family")
+  check($merged.typography.body_px == 13.333, "overlay clobbered typography.body_px")
+  check($base.mode == "light" and $base.typography.family == "Noto Sans",
+    "overlay mutated the base map")
+  $_ = $x.overlay_theme($base, {design: {noise: true}})
+  check(true, "overlay with a design: block did not explode (ignored by design)")
+
+  -- ── validation ───────────────────────────────────────────────────────
+  $good = {mode: "light", surface: "#f3fafc", panel: "#e9f4f7",
+    master_panel: "#d8e8ed", control: "#d8f4fd", control_active: "#006f87",
+    text: "#002631", text_dim: "#386b7b", row_selected: "#1d5869",
+    row_selected_text: "#e9f4f7", row_selected_text_dim: "#e9f4f7",
+    danger_surface: "#c21725", meter_green: "#006818", meter_amber: "#c79600",
+    meter_red: "#c21725", typography: {family: "Noto Sans", body_px: 13.333}}
+  check(len($x.validate_theme($good)) == 0, "valid theme reported problems")
+  $bad = $good
+  $bad.surface = "wat"
+  $problems = $x.validate_theme($bad)
+  check(len($problems) == 1 and contains($problems[0], "surface"),
+    "bad surface not reported exactly once")
+  $bad.mode = "dusk"
+  $bad.typography.body_px = 1000
+  check(len($x.validate_theme($bad)) == 3, "mode/body_px problems not reported")
+
+  -- ── path candidates ──────────────────────────────────────────────────
+  $cands = $x.defaults_candidates("somewhere/theme-export.mix", "")
+  check(len($cands) == 1 and ends_with($cands[0],
+    "/../crates/cosmix-design/src/defaults/revision-1.theme.conf.mix"),
+    "script-relative defaults candidate wrong")
+  $cands = $x.defaults_candidates("theme-export.mix", "/checkout")
+  check($cands[0] == "/checkout/src/desktop/crates/cosmix-design/src/defaults/revision-1.theme.conf.mix",
+    "COSMIX defaults candidate wrong")
+  check(deep_eq(
+    $x.shared_theme_candidates("/etc/x", "/checkout", "", "/home/u"),
+    ["/etc/x/theme.conf.mix", "/checkout/etc/theme.conf.mix",
+     "/home/u/.config/cosmix/theme.conf.mix"]),
+    "shared theme candidates wrong")
+  check(deep_eq($x.shared_theme_candidates("", "", "/xdg", ""),
+    ["/xdg/cosmix/theme.conf.mix"]), "XDG shared candidate wrong")
+  check(len($x.shared_theme_candidates("", "", "", "")) == 0,
+    "no-environment candidates should be empty")
+
+  -- ── option parsing (getopt long names cannot carry the hyphen) ───────
+  $opts = $x.parse_args(["--theme", "/t.mix", "--out=/o", "--icon-theme", "adwaita",
+    "--install"])
+  check($opts.theme == "/t.mix" and $opts.out == "/o" and
+    $opts["icon-theme"] == "adwaita" and $opts.install == true and
+    $opts.defaults == nil, "parse_args values wrong: " .. json_encode($opts))
+  check($x.parse_args([]).install == false, "install should default to false")
+  expect_raise(fn() = $x.parse_args(["--nope"]), "THEME_ARGS", "unknown option accepted")
+  expect_raise(fn() = $x.parse_args(["extra"]), "THEME_ARGS", "positional accepted")
+  expect_raise(fn() = $x.parse_args(["--theme"]), "THEME_ARGS", "missing value accepted")
+
+  -- ── end-to-end against the built-in defaults ─────────────────────────
+  $mix = "/proc/" .. to_string(pid()) .. "/exe"
+  $here = dirname($0)
+  $script = $here .. "/../theme-export.mix"
+  $defaults = $here ..
+    "/../../crates/cosmix-design/src/defaults/revision-1.theme.conf.mix"
+  check(is_file($script) and is_file($defaults), "script or defaults not found")
+  -- The child env pins every root the shared-theme chain consults, so the
+  -- export below is exactly built-in-defaults + the explicit --theme.
+  $scrub = {HOME: $tmp .. "/home", COSMIX: "", COSMIX_ETC: "",
+    XDG_CONFIG_HOME: $tmp .. "/xdg"}
+  $out = $tmp .. "/out"
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--out", $out],
+    {timeout: 60, env: $scrub})
+  check($r.ok, "export run failed: " .. $r.stderr)
+  for each $name in ["kdeglobals", "Cosmix.colors", "gtk-3.0/settings.ini",
+    "gtk-3.0/gtk.css", "gtk-4.0/settings.ini", "gtk-4.0/gtk.css",
+    "portal-settings.json", "README.txt"]
+    check(is_file($out .. "/" .. $name), "missing output: " .. $name)
+  end
+
+  $kg = read_file($out .. "/kdeglobals")
+  $kg_lines = split($kg, "\n")
+  check($kg_lines[0] == "[General]" and contains($kg, "ColorScheme=Cosmix"),
+    "kdeglobals [General] wrong")
+  check(contains($kg, "font=Noto Sans,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1"),
+    "kdeglobals font line wrong")
+  check(contains($kg, "contrast=4"), "kdeglobals contrast wrong")
+  for each $group in ["Colors:Window", "Colors:View", "Colors:Button",
+    "Colors:Selection", "Colors:Tooltip", "Colors:Header"]
+    check(contains($kg, "[" .. $group .. "]"), "kdeglobals missing " .. $group)
+  end
+  for each $key in ["BackgroundNormal", "BackgroundAlternate", "ForegroundNormal",
+    "ForegroundInactive", "ForegroundActive", "ForegroundLink",
+    "ForegroundNegative", "ForegroundNeutral", "ForegroundPositive",
+    "DecorationFocus", "DecorationHover"]
+    check(len(split($kg, $key .. "=")) == 7, $key .. " not present in all 6 groups")
+  end
+  check(contains($kg, "BackgroundNormal=243,250,252"), "surface not first Window background")
+  check(contains($kg, "BackgroundNormal=29,88,105"), "row_selected not Selection background")
+  check_no_empty_values($kg_lines, "kdeglobals")
+
+  check(read_file($out .. "/Cosmix.colors") == $kg,
+    "Cosmix.colors differs from kdeglobals")
+
+  for each $ver in ["gtk-3.0", "gtk-4.0"]
+    $ini = read_file($out .. "/" .. $ver .. "/settings.ini")
+    check(contains($ini, "gtk-application-prefer-dark-theme=false"),
+      $ver .. " light mode should not prefer dark")
+    check(contains($ini, "gtk-font-name=Noto Sans 10"), $ver .. " font name wrong")
+    check(contains($ini, "gtk-icon-theme-name=breeze"), $ver .. " icon theme default wrong")
+    check_no_empty_values(split($ini, "\n"), $ver .. "/settings.ini")
+    $css = read_file($out .. "/" .. $ver .. "/gtk.css")
+    $defines = 0
+    for each $line in split($css, "\n")
+      if starts_with(trim($line), "@define-color") then $defines = $defines + 1 end
+    end
+    check($defines == 14, $ver .. "/gtk.css should define 14 colours, got " .. to_string($defines))
+    for each $name in ["accent_color", "accent_bg_color", "accent_fg_color",
+      "window_bg_color", "window_fg_color", "view_bg_color", "view_fg_color",
+      "headerbar_bg_color", "headerbar_fg_color", "card_bg_color",
+      "destructive_bg_color", "success_color", "warning_color", "error_color"]
+      check(contains($css, "@define-color " .. $name .. " "),
+        $ver .. "/gtk.css missing " .. $name)
+    end
+    check(contains($css, "@define-color accent_color #006f87;"),
+      $ver .. " accent is not control_active")
+    check(contains($css, "@define-color view_bg_color #e9f4f7;"),
+      $ver .. " view is not panel")
+    check(contains($css, "@define-color headerbar_bg_color #d8e8ed;"),
+      $ver .. " headerbar is not master_panel")
+    check_no_empty_values(split($css, "\n"), $ver .. "/gtk.css")
+  end
+
+  $portal = json_parse(read_file($out .. "/portal-settings.json"))
+  $appearance = $portal["org.freedesktop.appearance"]
+  check($appearance["color-scheme"] == 2, "light defaults should serve color-scheme 2")
+  check(deep_eq($appearance["accent-color"], [0, 0.43529, 0.52941]),
+    "accent floats wrong: " .. json_encode($appearance["accent-color"]))
+  check($appearance["contrast"] == 0, "portal contrast should be 0")
+
+  -- ── end-to-end with a dark override theme via --theme ────────────────
+  write_file($tmp .. "/dark.conf.mix",
+    "mode: \"dark\"\ncontrol_active: \"#ff0000\"\ndanger_surface: \"#c2172580\"\n")
+  $out2 = $tmp .. "/out2"
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--theme",
+    $tmp .. "/dark.conf.mix", "--out", $out2, "--icon-theme", "test-icons"],
+    {timeout: 60, env: $scrub})
+  check($r.ok, "dark export run failed: " .. $r.stderr)
+  $ini2 = read_file($out2 .. "/gtk-4.0/settings.ini")
+  check(contains($ini2, "gtk-application-prefer-dark-theme=true"),
+    "dark mode should prefer dark")
+  check(contains($ini2, "gtk-icon-theme-name=test-icons"),
+    "--icon-theme not honoured")
+  $css2 = read_file($out2 .. "/gtk-4.0/gtk.css")
+  check(contains($css2, "@define-color accent_color #ff0000;"),
+    "--theme control_active override not applied")
+  check(contains($css2, "@define-color destructive_bg_color #c2172580;"),
+    "8-digit alpha hex not passed through verbatim")
+  $portal2 = json_parse(read_file($out2 .. "/portal-settings.json"))
+  check($portal2["org.freedesktop.appearance"]["color-scheme"] == 1,
+    "dark mode should serve color-scheme 1")
+  check(deep_eq($portal2["org.freedesktop.appearance"]["accent-color"], [1, 0, 0]),
+    "accent override floats wrong")
+
+  -- ── a malformed --theme is a hard error, not a silent defaults run ───
+  write_file($tmp .. "/broken.conf.mix", "surface: \"nope\"\n")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--theme",
+    $tmp .. "/broken.conf.mix", "--out", $tmp .. "/out3"], {timeout: 60, env: $scrub})
+  check(not $r.ok and contains($r.stderr, "THEME_INVALID"),
+    "broken explicit theme should fail with THEME_INVALID")
+
+  -- ── a broken AUTO-DISCOVERED shared theme is skipped, not fatal ──────
+  mkdir($tmp .. "/xdg/cosmix")
+  write_file($tmp .. "/xdg/cosmix/theme.conf.mix", "mode: \"dusk\"\n")
+  $r = run_argv([$mix, $script, "--defaults", $defaults, "--out", $tmp .. "/out4"],
+    {timeout: 60, env: $scrub})
+  check($r.ok, "broken shared theme should be skipped, run failed: " .. $r.stderr)
+  check(contains($r.stderr, "skipping"), "skip warning not emitted")
+  check(contains(read_file($tmp .. "/out4/gtk-4.0/settings.ini"),
+    "gtk-application-prefer-dark-theme=false"),
+    "skipped broken theme should leave the defaults in force")
+
+  print("PASS theme-export: hex/alpha conversion, color-scheme mapping, px->pt fonts, overlay semantics, validation, path candidates, defaults + dark-override end-to-end exports")
+finally
+  if starts_with($tmp, "/tmp/cosmix-theme-export-test.") then
+    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end
