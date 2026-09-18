@@ -621,8 +621,11 @@ title-bar button. Both fields are required.</li>
 <li><code>comp.window.restore {id?,generation?}</code> with no arguments restores the most
 recently minimised window, exactly like the <code>Super+Shift+M</code> binding; with
 <code>{id,generation}</code> (both required together) it restores that window. If the
-window is minimised, either form un-minimises, raises and focuses it; if it
-is not, nothing happens and the reply says <code>changed:false</code>.</li>
+window is minimised, either form un-minimises it, switches to its
+workspace if that is not the current one, raises and focuses it (where
+the switch is not allowed — an exclusive layer, the VT switched away — it
+un-minimises without switching or focusing); if it is not minimised,
+nothing happens and the reply says <code>changed:false</code>.</li>
 <li><code>comp.window.stats {id,generation | source}</code> and
 <code>comp.window.stats.reset {id,generation | source | nothing}</code> read and zero
 presentation statistics (see Presentation statistics below).</li>
@@ -771,8 +774,19 @@ frame trace as <code>comp_window_control</code> (subject the id; detail 1 minimi
 9 workspace switch, 10 send to workspace; <code>comp.window.stats</code> and
 <code>.stats.reset</code> reuse 7 and 8, a collision kept until 0.60 renumbers them).</p>
 <p>Every mapped window is on one workspace and each output has a current one;
-a window off its output's current workspace reads <code>visible:false, minimized:false</code>, gets no frame callbacks and is never presented. Two verbs
-drive that:</p>
+a window off its output's current workspace reads <code>visible:false, minimized:false</code>, gets no frame callbacks and is never presented. Every
+path that brings a window into view — <code>comp.window.focus</code>,
+<code>comp.window.restore</code>, a client's xdg-activation, an X11
+<code>_NET_ACTIVE_WINDOW</code> or un-minimise — switches to the window's workspace
+first and never pulls the window across; where the switch is not allowed
+(a session lock, an exclusive layer, the VT switched away) the window is
+not focused either, so the keyboard never lands on a window that is off
+screen: <code>focus</code> replies with the reason, an activation request is ignored,
+and a restore un-minimises without switching or focusing. Activation
+requests (xdg-activation and <code>_NET_ACTIVE_WINDOW</code>) of a MINIMISED window
+are a no-op in 0.59.0 — un-minimising is the restore path, not an
+activation; a GNOME-style restore-on-activation is a later call. Two verbs
+drive the workspaces:</p>
 <ul>
 <li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
 current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
@@ -793,19 +807,28 @@ window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</c
 window's own workspace, always wrapping) without switching; the window
 becomes <code>visible:false, minimized:false</code> if it leaves the current
 workspace. With <code>follow:true</code> comp also switches to that workspace and
-activates the window, and the reply gains <code>followed</code>: <code>true</code> when that
-workspace is now the current one, <code>false</code> when the switch was inert
-(an exclusive layer owns the screen, or there is no default output) —
-the move has happened either way. The reply is <code>{id,generation,index}</code>
-(plus <code>followed</code> with <code>follow:true</code>). A move never changes the window's
-<code>generation</code>. Out-of-range indices are <code>invalid_value</code>; the usual
-<code>{id,generation}</code> fence applies.</li>
+activates the window — move and switch settle once, so no other window
+on either workspace takes the keyboard in between — and the reply gains
+<code>followed</code>, read back after the attempt: <code>true</code> when the window's new
+workspace is the current one, <code>false</code> when it is not because the switch
+was withheld (an exclusive layer owns the screen, the window is
+minimised, or it is not presentable while the VT is switched away). The
+move has happened either way. With no default output there is nothing
+to switch and <code>current</code> reads 1, so a send to workspace 1 still answers
+<code>followed:true</code>. The reply is <code>{id,generation,index}</code> (plus <code>followed</code>
+with <code>follow:true</code>). A move never changes the window's <code>generation</code>.
+Out-of-range indices are <code>invalid_value</code>; the usual <code>{id,generation}</code>
+fence applies.</li>
 <li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
-<code>focused</code> is false, <code>reason</code> says why: <code>exclusive_layer</code> (an exclusive
-layer surface holds the keyboard), <code>minimized</code>, <code>not_visible</code>,
-<code>not_presentable</code>, or <code>refused</code>.</li>
+<code>focused</code> is false, <code>reason</code> says why, the first that holds in this
+order: <code>exclusive_layer</code> (an exclusive layer surface holds the keyboard),
+<code>minimized</code>, <code>not_presentable</code> (the VT is switched away), <code>not_visible</code>,
+or <code>refused</code>. The first three are what keep an off-workspace window's
+switch from running, so such a window names the gate that held it, not
+the visibility the switch would have given it; a refusal changes nothing
+and attributes nothing to the window.</li>
 <li><code>comp.window.raise {id,generation}</code> raises the window within its band
 without focusing it. The reply is <code>{id,generation,raised}</code>. Raise is
 stacking only: it never switches workspace and never un-minimises. An

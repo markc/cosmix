@@ -816,6 +816,13 @@ impl WaylandState {
         self.observations.full_dirty
     }
 
+    /// The pending per-surface cause, for tests that assert a refusal
+    /// attributed nothing.
+    #[cfg(test)]
+    pub(crate) fn surface_dirty_cause(&self, id: u64) -> Option<&'static str> {
+        self.observations.dirty_surfaces.get(&id).copied()
+    }
+
     /// A workspace switch, move or count change: `workspaces.*` and every
     /// window row's visibility may have changed, so the next observation
     /// diffs a full snapshot (D7).
@@ -2720,19 +2727,42 @@ fn workspace_value(
 /// change (another client's map, say) to a write that never took effect.
 /// `restore` puts back exactly what was there — a cause planted earlier
 /// by someone else was never overwritten, so it survives either way.
+/// One surface mark planted ahead of an operation that may still refuse
+/// (the verbs mark first so their cause wins over the core's), with enough
+/// remembered to take it back: a mark that was already there stays.
+pub(super) struct PlantedSurfaceMark {
+    id: u64,
+    had_entry: bool,
+}
+
+impl WaylandState {
+    pub(super) fn plant_surface_mark(
+        &mut self,
+        id: u64,
+        cause: &'static str,
+    ) -> PlantedSurfaceMark {
+        let had_entry = self.observations.dirty_surfaces.contains_key(&id);
+        self.mark_surface_dirty(SurfaceId(id), cause);
+        PlantedSurfaceMark { id, had_entry }
+    }
+
+    /// The operation changed nothing: the mark goes unless it predates it.
+    pub(super) fn unplant_surface_mark(&mut self, mark: PlantedSurfaceMark) {
+        if !mark.had_entry {
+            self.observations.dirty_surfaces.remove(&mark.id);
+        }
+    }
+}
+
 struct PlantedWorkspaceMarks {
     full: Option<&'static str>,
-    surface: Option<(u64, bool)>,
+    surface: Option<PlantedSurfaceMark>,
 }
 
 impl PlantedWorkspaceMarks {
     fn plant(state: &mut WaylandState, surface: Option<u64>) -> Self {
         let full = state.observations.full_dirty;
-        let surface = surface.map(|id| {
-            let had_entry = state.observations.dirty_surfaces.contains_key(&id);
-            state.mark_surface_dirty(SurfaceId(id), "props.set");
-            (id, had_entry)
-        });
+        let surface = surface.map(|id| state.plant_surface_mark(id, "props.set"));
         state.mark_workspaces_dirty("props.set");
         Self { full, surface }
     }
@@ -2740,8 +2770,8 @@ impl PlantedWorkspaceMarks {
     /// The write changed nothing: back to the marks as they were.
     fn restore(self, state: &mut WaylandState) {
         state.observations.full_dirty = self.full;
-        if let Some((id, false)) = self.surface {
-            state.observations.dirty_surfaces.remove(&id);
+        if let Some(mark) = self.surface {
+            state.unplant_surface_mark(mark);
         }
     }
 

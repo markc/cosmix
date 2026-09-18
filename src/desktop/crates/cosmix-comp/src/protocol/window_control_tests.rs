@@ -1879,8 +1879,10 @@ fn raise_on_an_off_workspace_or_minimised_window_never_switches_or_unminimises()
 /// and one behind the KMS input gate (`normal_scene_restricted`: the VT is
 /// switched away) replies `not_presentable` — not `not_visible`, which is
 /// only what the withheld switch left it as — and neither changes the
-/// workspace. Each arm is base-discriminating: lifting the gate makes the
-/// same focus switch and succeed.
+/// workspace. The KMS arm is base-discriminating: lifting the gate makes
+/// the same focus switch and succeed. The exclusive-layer arm is a guard
+/// (the layer's refusal predates the workspaces work); what it pins here
+/// is that the reason names the layer and the workspace is unchanged.
 #[test]
 fn focus_on_an_off_workspace_window_names_the_gate_that_held_the_switch() {
     use crate::protocol::workspaces::WorkspaceTarget;
@@ -2049,6 +2051,142 @@ fn focus_on_an_off_workspace_window_reports_every_change_as_the_switch() {
     assert!(
         props.iter().all(|(_, cause)| *cause == "workspace.switch"),
         "a full-snapshot diff carries one cause: {props:?}"
+    );
+}
+
+/// A focus refused `not_visible` past the `may_focus` terms attributes
+/// nothing: the verb plants `comp.window` first (so its cause beats the
+/// core's), and takes the mark back when it refuses, so the next unrelated
+/// edge on that surface keeps its own cause. The first half proves the
+/// marks are live (a focus that succeeds leaves `comp.window` planted); the
+/// second fakes the one state the ladder answers `not_visible` for — on the
+/// current workspace (nothing for the switch to do) yet not visible — which
+/// no recompute would leave a mapped, non-minimised toplevel in, so it is
+/// set by hand; the verb runs its ladder without recomputing.
+#[test]
+fn focus_refused_not_visible_attributes_nothing() {
+    let (mut harness, ingress, observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Focus {
+            id: beta_id,
+            generation: beta_generation,
+            raise: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["focused"], true, "{body}");
+    assert_eq!(
+        harness.server.state.surface_dirty_cause(beta_id),
+        Some("comp.window"),
+        "a focus that succeeds leaves its mark"
+    );
+
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&alpha)
+        .expect("alpha exists")
+        .layout
+        .visible = false;
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Focus {
+            id: alpha_id,
+            generation: alpha_generation,
+            raise: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["focused"], false, "{body}");
+    assert_eq!(body["reason"], "not_visible", "{body}");
+    let state = &harness.server.state;
+    assert_eq!(
+        state.surface_dirty_cause(alpha_id),
+        None,
+        "a refused focus plants nothing"
+    );
+    assert_ne!(state.full_dirty_cause(), Some("workspace.switch"));
+    assert!(!state.surfaces[&alpha].focused);
+}
+
+/// `send_to_workspace {follow:true}` moves and switches in ONE settle
+/// (`move_window_and_follow`): a window already on the target workspace,
+/// highest there, never gains the keyboard while the sent window arrives —
+/// no `wl_keyboard.enter` names it — and the sent window lands on top of
+/// it. (A move then a switch settled the target once with the sent window
+/// still hidden, and that bystander held focus for one round-trip.)
+#[test]
+fn send_to_workspace_follow_never_focuses_the_targets_bystander() {
+    let (mut harness, ingress, _observations, runtime, _alpha, beta) = two_mapped_windows();
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(3), true)
+        .expect("switch to 3");
+    let (gamma_id, _, _, gamma) =
+        map_named_test_toplevel(&mut harness, "Gamma", "dev.cosmix.Gamma");
+    assert_eq!(harness.server.state.surfaces[&gamma].workspace, 3);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let beta_surface = harness.server.state.surfaces[&beta]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&beta_surface);
+    let _ = harness.sync();
+    assert!(harness.server.state.surfaces[&beta].focused);
+    assert!(!harness.server.state.surfaces[&gamma].layout.visible);
+
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(3),
+            follow: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 3, "followed": true})
+    );
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 3);
+        assert_eq!(state.surfaces[&beta].workspace, 3);
+        assert!(state.surfaces[&beta].layout.visible);
+        assert!(state.surfaces[&beta].focused, "follow activates the sent window");
+        assert!(state.surfaces[&gamma].layout.visible);
+        assert!(!state.surfaces[&gamma].focused);
+        assert!(
+            surface_stack_cmp(&state.surfaces[&beta], &state.surfaces[&gamma]).is_gt(),
+            "the sent window arrives on top of the target's bystander"
+        );
+    }
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(
+        !entered.contains(&gamma_id),
+        "the target's bystander never gains keyboard focus: {entered:?}"
     );
 }
 
