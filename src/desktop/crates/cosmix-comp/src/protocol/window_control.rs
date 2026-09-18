@@ -349,7 +349,9 @@ impl WaylandState {
             WindowOp::Focus { .. }
             | WindowOp::Raise { .. }
             | WindowOp::Close { .. }
-            | WindowOp::Place(_) => {
+            | WindowOp::Place(_)
+            | WindowOp::Stats { .. }
+            | WindowOp::StatsReset { .. } => {
                 unreachable!("only minimise and restore are routed here")
             }
         };
