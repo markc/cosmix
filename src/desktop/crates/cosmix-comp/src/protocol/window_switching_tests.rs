@@ -128,8 +128,9 @@ fn switching_skips_minimised_and_unmapped_windows() {
 }
 
 /// F1.7: Alt+Tab scoping is automatic — a window moved off the current
-/// workspace drops out of the cycle exactly as a minimised one does, and
-/// activating it directly is refused the same way.
+/// workspace drops out of the cycle exactly as a minimised one does. Unlike
+/// a minimised one, activating it directly is NOT refused: F1.2 switches
+/// to its workspace first (never pulls it across) and then focuses it.
 #[test]
 fn switching_skips_off_workspace_windows() {
     use workspaces::WorkspaceTarget;
@@ -164,10 +165,15 @@ fn switching_skips_off_workspace_windows() {
         .role
         .wl_surface()
         .clone();
+    assert_eq!(harness.server.state.workspace_current(), 1);
     harness.server.state.activate_managed_window(&elsewhere);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&second].workspace, 2);
+    assert!(harness.server.state.surfaces[&second].layout.visible);
+    assert!(!harness.server.state.surfaces[&first.id()].layout.visible);
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
-        Some(first)
+        Some(elsewhere)
     );
 }
 

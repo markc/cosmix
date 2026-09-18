@@ -14700,11 +14700,20 @@ fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
 /// Rule 8 through the Super+Shift+M chord, in both binding profiles: the
 /// current workspace's most recently minimised window comes back first
 /// even though a window elsewhere was minimised later; the next press
-/// restores that one and switches to its workspace (F1.2).
+/// restores that one and switches to its workspace (F1.2). The switch needs
+/// a default output (D3): the nested harness has one, the KMS binding
+/// harness registers no client output, so there the restore still
+/// un-minimises but cannot switch and the window stays off screen — asserted
+/// as such, not skipped.
 #[test]
 fn both_binding_profiles_restore_the_current_workspaces_minimized_toplevel_first() {
     use workspaces::WorkspaceTarget;
-    let assert_profile = |harness: &mut KeybindingHarness| {
+    let assert_profile = |harness: &mut KeybindingHarness, can_switch: bool| {
+        assert_eq!(
+            harness.server.state.default_output_key().is_some(),
+            can_switch,
+            "the profile's output setup is what the switch expectation is derived from"
+        );
         let configure = test_toplevel_record(harness)
             .required_configure
             .expect("initial configure exists");
@@ -14745,26 +14754,36 @@ fn both_binding_profiles_restore_the_current_workspaces_minimized_toplevel_first
         );
         harness.chord(&[125, 42, 50]);
         assert!(!harness.server.state.surfaces[&second.id()].minimized);
-        assert_eq!(
-            harness.server.state.workspace_current(),
-            2,
-            "the global fallback switches to the window's workspace"
-        );
         assert_eq!(harness.server.state.surfaces[&second.id()].workspace, 2);
-        assert!(harness.server.state.surfaces[&second.id()].layout.visible);
-        assert!(!harness.server.state.surfaces[&first.id()].layout.visible);
-        assert_eq!(
-            focused_surface(harness.server.state.keyboard.current_focus()),
-            Some(second.clone())
-        );
         assert!(harness.server.state.minimized_toplevels.is_empty());
+        if can_switch {
+            assert_eq!(
+                harness.server.state.workspace_current(),
+                2,
+                "the global fallback switches to the window's workspace"
+            );
+            assert!(harness.server.state.surfaces[&second.id()].layout.visible);
+            assert!(!harness.server.state.surfaces[&first.id()].layout.visible);
+            assert_eq!(
+                focused_surface(harness.server.state.keyboard.current_focus()),
+                Some(second.clone())
+            );
+        } else {
+            assert_eq!(
+                harness.server.state.workspace_current(),
+                1,
+                "no default output: nothing to switch (D3)"
+            );
+            assert!(!harness.server.state.surfaces[&second.id()].layout.visible);
+            assert!(harness.server.state.surfaces[&first.id()].layout.visible);
+        }
     };
 
     let mut nested = KeybindingHarness::new(true);
-    assert_profile(&mut nested);
+    assert_profile(&mut nested, true);
     let (vt_requests, _) = mpsc::channel();
     let mut kms_live = KeybindingHarness::new_with_kms_live_bindings(vt_requests);
-    assert_profile(&mut kms_live);
+    assert_profile(&mut kms_live, false);
 }
 
 /// F1.2 at xdg-activation: activating a window that lives on another
