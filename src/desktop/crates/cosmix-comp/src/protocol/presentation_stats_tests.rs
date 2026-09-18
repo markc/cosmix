@@ -125,7 +125,11 @@ fn input_to_present_takes_the_first_update_committed_after_the_mark() {
 fn input_marks_expire() {
     let mut stats = PresentationStats::new(0);
     stats.mark_input(mark(1, 1_000));
-    stats.record_present(present(1_000 + INPUT_MARK_TTL_US + 1, 2_000, None));
+    // The age that matters is the client's (round 2): a mark expires when
+    // the answering COMMIT is more than a TTL after the input, so a late
+    // commit misses it while a slow present of a prompt commit would not.
+    let late_commit = 1_000 + INPUT_MARK_TTL_US + 1;
+    stats.record_present(present(late_commit + 500, late_commit, None));
     assert!(stats.input_to_present_us.newest(4).is_empty(), "too late");
     stats.record_present(present(3_000_000, 2_900_000, None));
     assert!(stats.input_to_present_us.newest(4).is_empty(), "and gone");
@@ -163,8 +167,17 @@ fn reset_zeroes_and_restarts_the_window() {
         }
     );
     // S5: a frame shown before the reset but reported after it is ignored.
+    // Compared through the observable leaves: the drop is logged once, and
+    // that private flag is not part of what a reader can see.
     stats.record_present(present(50, 10, Some(R)));
-    assert_eq!(stats, PresentationStats::new(99));
+    assert_eq!(
+        stats.leaves(),
+        PresentationLeaves {
+            since_us: 99,
+            ..PresentationLeaves::default()
+        }
+    );
+    assert_eq!(stats.clock_base_mismatches, 0);
 }
 
 /// S7: counts saturate instead of overflowing.
