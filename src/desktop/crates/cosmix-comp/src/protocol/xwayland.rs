@@ -240,6 +240,11 @@ pub(super) struct XwaylandRuntime {
     /// `DISPLAY` descriptor so nested compositors never race one global file.
     pub(super) socket_name: String,
     pub(super) descriptor_path: Option<PathBuf>,
+    /// The display number of the READY generation (`xwayland.display`
+    /// reads `:N`): set with the descriptor once the XWM owns WM_S0 and
+    /// publication succeeded, cleared with it at teardown. `None` while no
+    /// generation serves X clients.
+    pub(super) display_number: Option<u32>,
     pub(super) pending_windows: HashMap<X11Window, PendingX11Window>,
     /// XID → associated `wl_surface` object for normal managed windows.
     pub(super) surfaces_by_xid: HashMap<X11Window, ObjectId>,
@@ -328,6 +333,7 @@ impl XwaylandRuntime {
             retry: XwaylandRetryPolicy::new(),
             socket_name,
             descriptor_path: None,
+            display_number: None,
             pending_windows: HashMap::new(),
             surfaces_by_xid: HashMap::new(),
             xids_by_object: HashMap::new(),
@@ -794,6 +800,11 @@ impl WaylandState {
                     return;
                 }
                 self.xwayland.descriptor_path = path;
+                // `xwayland.display` follows the descriptor: published only
+                // for a generation X clients can actually reach.
+                self.xwayland.display_number = Some(display_number);
+                #[cfg(feature = "bus")]
+                self.mark_xwayland_dirty("xwayland.ready");
                 let stability_timer = match self.capture_loop_handle.insert_source(
                     Timer::from_duration(XWAYLAND_STABILITY_WINDOW),
                     move |_, (), state: &mut WaylandState| {
@@ -924,6 +935,10 @@ impl WaylandState {
     fn teardown_xwayland_generation(&mut self) {
         remove_xwayland_descriptor(self.xwayland.descriptor_path.as_ref());
         self.xwayland.descriptor_path = None;
+        if self.xwayland.display_number.take().is_some() {
+            #[cfg(feature = "bus")]
+            self.mark_xwayland_dirty("xwayland.down");
+        }
         let lifecycle = mem::replace(&mut self.xwayland.lifecycle, XwaylandLifecycle::Inert);
         match lifecycle {
             // Removing `token` drops the `XWayland` source, whose `Drop`

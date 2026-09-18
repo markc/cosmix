@@ -18,12 +18,8 @@
 
 use super::*;
 
-/// The most workspaces `set_workspace_count` accepts.
-// The primitives below have no production caller until the verb, prop and
-// binding slices land on top of this one; the tests drive them directly. The
-// allow is per item so a genuinely dead helper still trips the lint; drop
-// each once its first caller is wired.
-#[cfg_attr(not(test), allow(dead_code))]
+/// The most workspaces `set_workspace_count` accepts (the props surface
+/// pins its `range` string to this value).
 pub(crate) const WORKSPACE_COUNT_MAX: u32 = 16;
 
 /// Per-compositor workspace state.
@@ -46,6 +42,8 @@ impl Default for WorkspaceState {
 }
 
 /// Where a switch or a move is aimed.
+// The props slice constructs `Index` only; `Next`/`Prev` get their first
+// production constructor with the verbs (slice 4) — the allow goes then.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {

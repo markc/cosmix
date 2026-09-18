@@ -696,6 +696,104 @@ fn windows_list_filters_rows_in_id_order() {
     assert_eq!(body["path"], "visible");
 }
 
+/// Rule 4: rows carry `workspace`; the `workspace` filter takes an index,
+/// `"current"` (resolved against the snapshot's own current workspace, so
+/// it follows a switch) or `"all"` (the default, every window), composes
+/// with the other filters, and a bad value names the field.
+#[test]
+fn windows_list_filters_by_workspace() {
+    use workspaces::WorkspaceTarget;
+    let (mut harness, _ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (alpha_id, _) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, _) = window_id_and_generation(&harness, &beta);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&beta, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let context = harness.server.state.port_context.clone().expect("context");
+    let snapshot = Arc::new(
+        port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot"),
+    );
+    let list = |snapshot: &Arc<port_snapshot::CompSnapshot>, args: Value| {
+        let (rc, body) = runtime.block_on(port_snapshot::dispatch_read(
+            Arc::clone(snapshot),
+            "comp.windows.list".into(),
+            args,
+        ));
+        (rc, serde_json::from_str::<Value>(&body).unwrap())
+    };
+    let ids = |body: &Value| {
+        body["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    let (rc, body) = list(&snapshot, Value::Null);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(ids(&body), [alpha_id, beta_id]);
+    assert_eq!(body["windows"][0]["workspace"], 1);
+    assert_eq!(body["windows"][1]["workspace"], 2);
+    assert_eq!(body["windows"][1]["visible"], false);
+    assert_eq!(body["windows"][1]["minimized"], false);
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "current"})).1),
+        [alpha_id]
+    );
+    assert_eq!(ids(&list(&snapshot, json!({"workspace": 2})).1), [beta_id]);
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "all"})).1),
+        [alpha_id, beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": null})).1),
+        [alpha_id, beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": 3})).1),
+        Vec::<u64>::new()
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": 2, "visible": true})).1),
+        Vec::<u64>::new(),
+        "filters compose"
+    );
+    for bad in [json!("sideways"), json!(0), json!(-1), json!(true), json!(1.5)] {
+        let (rc, body) = list(&snapshot, json!({"workspace": bad}));
+        assert_eq!(rc, 10, "{bad}: {body}");
+        assert_eq!(body["error"], "invalid_value");
+        assert_eq!(body["path"], "workspace");
+        assert_eq!(body["range"], "<n>|current|all");
+    }
+
+    // "current" follows the snapshot's current workspace.
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let snapshot = Arc::new(
+        port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot"),
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "current"})).1),
+        [beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"workspace": "current", "visible": true})).1),
+        [beta_id]
+    );
+    assert_eq!(
+        ids(&list(&snapshot, json!({"visible": false})).1),
+        [alpha_id]
+    );
+}
+
 fn unmap_alpha(harness: &mut KeybindingHarness) {
     send_request(
         &mut harness.client,

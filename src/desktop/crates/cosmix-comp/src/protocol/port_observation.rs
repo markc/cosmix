@@ -30,10 +30,12 @@ use super::{
     pointer_observation::{LEASE, PointerLease, PointerPosition, PointerSample},
     port_snapshot::{
         BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
-        SurfaceSnapshot, WindowSnapshot, project_focus, project_output, project_outputs,
-        project_stack, project_surface_by_id, project_window_row, snapshot, volatile_path,
+        SurfaceSnapshot, WindowSnapshot, WorkspaceRowSnapshot, project_focus, project_output,
+        project_outputs, project_stack, project_surface_by_id, project_window_row, snapshot,
+        volatile_path,
     },
     window_control::WindowTargetError,
+    workspaces::{WORKSPACE_COUNT_MAX, WorkspaceRefusal, WorkspaceTarget},
 };
 
 pub(crate) const PROPS_TOPIC_SUFFIX: &str = "props.changed";
@@ -67,6 +69,7 @@ pub(crate) enum PropValue {
     String(String),
     U64List(Vec<u64>),
     BindingRows(Vec<BindingRowSnapshot>),
+    WorkspaceRows(Vec<WorkspaceRowSnapshot>),
     OutputRow(Box<OutputSnapshot>),
     SurfaceRow(Box<SurfaceSnapshot>),
     WindowRow(Box<WindowSnapshot>),
@@ -817,6 +820,13 @@ impl WaylandState {
     /// window row's visibility may have changed, so the next observation
     /// diffs a full snapshot (D7).
     pub(crate) fn mark_workspaces_dirty(&mut self, cause: &'static str) {
+        self.observations.full_dirty.get_or_insert(cause);
+    }
+
+    /// `xwayland.display` changed (a generation came up or went down): the
+    /// leaf lives on the full snapshot, so the next observation diffs one.
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn mark_xwayland_dirty(&mut self, cause: &'static str) {
         self.observations.full_dirty.get_or_insert(cause);
     }
 
@@ -1636,6 +1646,66 @@ fn collect_snapshot_diff(
         cause,
     );
     diff_corners(old, new, cause, pending);
+    diff_workspaces(old, new, cause, pending);
+    #[cfg(feature = "xwayland")]
+    queue_prop_change(
+        pending,
+        "xwayland.display".into(),
+        prop_opt_string(old.xwayland.display.as_deref()),
+        prop_opt_string(new.xwayland.display.as_deref()),
+        cause,
+    );
+}
+
+/// `workspaces.*`: the scalar leaves, one `o_<key>.current` per output in
+/// either snapshot (an output that left reads null, like an output row),
+/// and the row list as one value (the `bindings.table` precedent).
+fn diff_workspaces(
+    old: &CompSnapshot,
+    new: &CompSnapshot,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    let (old, new) = (&old.workspaces, &new.workspaces);
+    queue_prop_change(
+        pending,
+        "workspaces.count".into(),
+        PropValue::U32(old.count),
+        PropValue::U32(new.count),
+        cause,
+    );
+    queue_prop_change(
+        pending,
+        "workspaces.current".into(),
+        PropValue::U32(old.current),
+        PropValue::U32(new.current),
+        cause,
+    );
+    let keys = old
+        .outputs
+        .keys()
+        .chain(new.outputs.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        let current = |row: Option<&super::port_snapshot::OutputWorkspaceSnapshot>| {
+            row.map_or_else(PropValue::null, |row| PropValue::U32(row.current))
+        };
+        queue_prop_change(
+            pending,
+            format!("workspaces.{key}.current"),
+            current(old.outputs.get(&key)),
+            current(new.outputs.get(&key)),
+            cause,
+        );
+    }
+    queue_prop_change(
+        pending,
+        "workspaces.list".into(),
+        PropValue::WorkspaceRows(old.list.clone()),
+        PropValue::WorkspaceRows(new.list.clone()),
+        cause,
+    );
 }
 
 fn diff_corners(
@@ -1881,6 +1951,11 @@ fn diff_surface_row(
             PropValue::Bool(new.minimized),
         ),
         (
+            "workspace",
+            prop_opt_u32(old.workspace),
+            prop_opt_u32(new.workspace),
+        ),
+        (
             "decoration",
             prop_opt_string(old.decoration),
             prop_opt_string(new.decoration),
@@ -2049,6 +2124,11 @@ fn diff_window_row(
             PropValue::Bool(new.visible),
         ),
         ("pid", prop_opt_u64(old.pid), prop_opt_u64(new.pid)),
+        (
+            "workspace",
+            PropValue::U32(old.workspace),
+            PropValue::U32(new.workspace),
+        ),
     ] {
         queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
     }
@@ -2112,6 +2192,10 @@ fn prop_opt_string(value: Option<&str>) -> PropValue {
 
 fn prop_opt_u64(value: Option<u64>) -> PropValue {
     value.map_or_else(PropValue::null, PropValue::U64)
+}
+
+fn prop_opt_u32(value: Option<u32>) -> PropValue {
+    value.map_or_else(PropValue::null, PropValue::U32)
 }
 
 fn queue_prop_change(
@@ -2318,6 +2402,7 @@ fn service_set(
         match leaf {
             "band" => service_set_window_band(state, request, window),
             "minimized" => service_set_window_minimized(state, request, window),
+            "workspace" => service_set_window_workspace(state, request, window),
             _ => {
                 if let Some(reply) = request.reply.take() {
                     let _ = reply.send(ControlReply::Validation(read_only_or_unknown(&path)));
@@ -2334,6 +2419,10 @@ fn service_set(
                 "generation applies to windows.s<id>.* paths only",
             )));
         }
+        return;
+    }
+    if let Some(target) = parse_workspaces_set_path(&path) {
+        service_set_workspaces(state, request, target);
         return;
     }
     if path == HOST_PASSTHROUGH_PATH {
@@ -2568,6 +2657,149 @@ fn missing_window(path: &str) -> ControlReply {
     ))
 }
 
+/// The `range` a workspace index refusal reports; the live bound is the
+/// count, which the core checks.
+const WORKSPACE_INDEX_RANGE: &str = "1..=count";
+/// The `range` a count refusal reports — the same bound as the core's
+/// `WORKSPACE_COUNT_MAX`, pinned so the two cannot drift.
+const WORKSPACE_COUNT_RANGE: &str = "1..=16";
+const _: () = assert!(
+    WORKSPACE_COUNT_MAX == 16,
+    "WORKSPACE_COUNT_RANGE names the core's cap"
+);
+
+/// Where a `workspaces.*` write is aimed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WorkspacesSetTarget {
+    Count,
+    /// `workspaces.current` (`None`: the default output) or
+    /// `workspaces.o_<slug>.current` (`Some(key)`; the core refuses a key
+    /// that is not the default output's in 0.59, D3).
+    Current(Option<String>),
+}
+
+/// Parse the three writable `workspaces.*` shapes. Everything else under
+/// the subtree is read-only (`workspaces`, `workspaces.list`) or unknown.
+pub(crate) fn parse_workspaces_set_path(path: &str) -> Option<WorkspacesSetTarget> {
+    match path {
+        "workspaces.count" => Some(WorkspacesSetTarget::Count),
+        "workspaces.current" => Some(WorkspacesSetTarget::Current(None)),
+        _ => {
+            let key = path.strip_prefix("workspaces.")?.strip_suffix(".current")?;
+            (key.starts_with("o_") && key.len() > 2 && !key.contains('.'))
+                .then(|| WorkspacesSetTarget::Current(Some(key.to_string())))
+        }
+    }
+}
+
+/// A workspace index or count on the wire: an unsigned integer >= 1 that
+/// fits a `u32`. The live upper bound (`count`, or the cap) is the core's
+/// check, reported through the same `range`.
+fn workspace_value(
+    path: &str,
+    value: &Value,
+    range: &'static str,
+) -> Result<u32, SetValidationError> {
+    value
+        .as_u64()
+        .filter(|value| *value >= 1)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| invalid_value(path, "integer", range))
+}
+
+/// The `windows.s<id>.workspace` set: move THIS window to the workspace
+/// without switching (rule 5). The changed events come from the full
+/// snapshot diff the core's dirty mark schedules, attributed to
+/// `props.set` because the cause is planted before the core runs
+/// (`full_dirty` keeps the first cause). A move never bumps the
+/// generation, so a fenced retry after the move still resolves.
+fn service_set_window_workspace(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    window: u64,
+) {
+    let path = request.path.clone();
+    let reply_value = match workspace_value(&path, &request.value, WORKSPACE_INDEX_RANGE) {
+        Err(error) => ControlReply::Validation(error),
+        Ok(_) if state.session_lock_active() => ControlReply::Locked,
+        Ok(index) => match state.resolve_window_target(window, request.generation) {
+            Ok(object) => {
+                state.mark_surface_dirty(SurfaceId(window), "props.set");
+                state.mark_workspaces_dirty("props.set");
+                match state.move_window_to_workspace(&object, WorkspaceTarget::Index(index)) {
+                    Ok((old, new)) => ControlReply::Set {
+                        path,
+                        old: PropValue::U32(old),
+                        new: PropValue::U32(new),
+                        persisted: None,
+                    },
+                    Err(WorkspaceRefusal::NotAWindow) => missing_window(&path),
+                    Err(_) => ControlReply::Validation(invalid_value(
+                        &path,
+                        "integer",
+                        WORKSPACE_INDEX_RANGE,
+                    )),
+                }
+            }
+            Err(error @ WindowTargetError::StaleTarget { .. }) => {
+                ControlReply::WindowTarget { id: window, error }
+            }
+            Err(_) => missing_window(&path),
+        },
+    };
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(reply_value);
+    }
+}
+
+/// The `workspaces.count` / `workspaces.current` /
+/// `workspaces.o_<slug>.current` sets, each a direct call into the core
+/// (`set_workspace_count`, `switch_workspace`). `Locked` under a session
+/// lock like the window verbs (D12). No explicit change queueing: the
+/// core marks the full snapshot dirty and the next observation diffs
+/// `workspaces.*` and every window row (D7); the cause is planted first so
+/// it reads `props.set`.
+fn service_set_workspaces(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    target: WorkspacesSetTarget,
+) {
+    let path = request.path.clone();
+    let range = match target {
+        WorkspacesSetTarget::Count => WORKSPACE_COUNT_RANGE,
+        WorkspacesSetTarget::Current(_) => WORKSPACE_INDEX_RANGE,
+    };
+    let reply_value =
+        match workspace_value(&path, &request.value, range) {
+            Err(error) => ControlReply::Validation(error),
+            Ok(_) if state.session_lock_active() => ControlReply::Locked,
+            Ok(value) => {
+                state.mark_workspaces_dirty("props.set");
+                let outcome = match &target {
+                    WorkspacesSetTarget::Count => state.set_workspace_count(value),
+                    WorkspacesSetTarget::Current(key) => state
+                        .switch_workspace(key.as_deref(), WorkspaceTarget::Index(value), true)
+                        .map(|switch| (switch.from, switch.to)),
+                };
+                match outcome {
+                    Ok((old, new)) => ControlReply::Set {
+                        path,
+                        old: PropValue::U32(old),
+                        new: PropValue::U32(new),
+                        persisted: None,
+                    },
+                    Err(WorkspaceRefusal::UnknownOutput) => ControlReply::Validation(
+                        invalid_value(&path, "output key", "an existing outputs.o_<slug>"),
+                    ),
+                    Err(_) => ControlReply::Validation(invalid_value(&path, "integer", range)),
+                }
+            }
+        };
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(reply_value);
+    }
+}
+
 fn flush_set_changes(state: &mut WaylandState, changes: PendingPropChanges) {
     flush_prop_changes(state, changes);
     let host = state.host_input_snapshot();
@@ -2664,6 +2896,21 @@ pub(crate) fn validate_set_request(path: &str, value: &Value) -> Result<(), SetV
         } else {
             Err(invalid_value(path, "bool", "true|false"))
         };
+    }
+    // Workspace leaves: an integer >= 1 passes the gate; the live upper
+    // bound (the count, or the cap) is the service's, reported through
+    // the same range strings.
+    if parse_window_leaf_path(path).is_some_and(|(_, leaf)| leaf == "workspace") {
+        return workspace_value(path, value, WORKSPACE_INDEX_RANGE).map(|_| ());
+    }
+    match parse_workspaces_set_path(path) {
+        Some(WorkspacesSetTarget::Count) => {
+            return workspace_value(path, value, WORKSPACE_COUNT_RANGE).map(|_| ());
+        }
+        Some(WorkspacesSetTarget::Current(_)) => {
+            return workspace_value(path, value, WORKSPACE_INDEX_RANGE).map(|_| ());
+        }
+        None => {}
     }
     validate_corner_value(path, value).map(|_| ())
 }
@@ -2771,6 +3018,12 @@ fn known_read_only_path(path: &str) -> bool {
         // routed before validation ever runs.
         return true;
     }
+    // The subtree object and the row list; the three writable leaves are
+    // routed before validation ever reaches here, and any other
+    // `workspaces.*` spelling is unknown, not read-only.
+    if path == "workspaces" || path == "workspaces.list" {
+        return true;
+    }
     path == "input"
         || path == "input.corners"
         || path == "input.host"
@@ -2839,6 +3092,64 @@ mod tests {
                 validate_set_request("nonsense.path", &json!(true)),
                 Err(SetValidationError::UnknownPath)
             ));
+            // 0.59.0: the four workspace leaves admit an integer >= 1 (the
+            // count/live bound is the service's), refuse 0 and non-integers
+            // with invalid_value naming the range, and the row list and the
+            // subtree object are read-only.
+            for path in [
+                "windows.s7.workspace",
+                "workspaces.count",
+                "workspaces.current",
+                "workspaces.o_dp_1.current",
+            ] {
+                assert!(validate_set_request(path, &json!(2)).is_ok(), "{path}");
+                for refused in [json!(0), json!("2"), json!(2.5), json!(-1), json!(true)] {
+                    assert!(
+                        matches!(
+                            validate_set_request(path, &refused),
+                            Err(SetValidationError::InvalidValue {
+                                expected: "integer",
+                                ..
+                            })
+                        ),
+                        "{path} refuses {refused}"
+                    );
+                }
+            }
+            assert!(matches!(
+                validate_set_request("workspaces.count", &json!(0)),
+                Err(SetValidationError::InvalidValue {
+                    range: "1..=16",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                validate_set_request("workspaces.current", &json!(0)),
+                Err(SetValidationError::InvalidValue {
+                    range: "1..=count",
+                    ..
+                })
+            ));
+            for path in ["workspaces.list", "workspaces"] {
+                assert!(
+                    matches!(
+                        validate_set_request(path, &json!([])),
+                        Err(SetValidationError::ReadOnly)
+                    ),
+                    "{path}"
+                );
+            }
+            assert!(matches!(
+                validate_set_request("workspaces.o_dp_1", &json!(1)),
+                Err(SetValidationError::UnknownPath)
+            ));
+            assert_eq!(
+                parse_workspaces_set_path("workspaces.o_dp_1.current"),
+                Some(WorkspacesSetTarget::Current(Some("o_dp_1".into())))
+            );
+            assert_eq!(parse_workspaces_set_path("workspaces.o_.current"), None);
+            assert_eq!(parse_workspaces_set_path("workspaces.o_a.b.current"), None);
+            assert_eq!(parse_workspaces_set_path("workspaces.dp_1.current"), None);
         }
 
         /// The regression this gate refactor fixed: `xwayland.enabled` had a

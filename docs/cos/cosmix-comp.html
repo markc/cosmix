@@ -591,7 +591,9 @@ only for a caller that subscribed to that topic before calling <code>watch</code
 remains subscribed.</li>
 <li><code>comp.props.set {path,value,generation?}</code> mutates the four corner
 properties, <code>windows.s&lt;id&gt;.band</code>, <code>windows.s&lt;id&gt;.minimized</code>,
-<code>input.host.passthrough</code>, or <code>xwayland.enabled</code> and returns <code>{path,old,new}</code>; for the file-persisted
+<code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>, <code>workspaces.current</code>,
+<code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>, or
+<code>xwayland.enabled</code> and returns <code>{path,old,new}</code>; for the file-persisted
 <code>xwayland.enabled</code> the reply also carries <code>persisted</code> — <code>false</code> means the
 in-memory change and the changed event stand but the write to disk failed
 and the value will not survive restart. The optional <code>generation</code> fences a
@@ -640,12 +642,12 @@ outputs.o_&lt;slug&gt;.{name,default,x,y,width,height,scale,refresh_mhz,
                     interval_p50_us,interval_p99_us,since_us}}  (presentation: volatile)
 surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 tree_index,parent,output,title,app_id,focused,activated,
-                maximized,fullscreen,minimized,decoration,
+                maximized,fullscreen,minimized,workspace,decoration,
                 layer.{stratum,interactivity,exclusive_zone,binding},foreign_id,
                 generation}
 windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid,
+               window_x,window_y,visible,pid,workspace,
                presentation.{presented,discarded,last_presented_us,
                  interval_p50_us,interval_p99_us,interval_max_us,
                  commit_to_present_p50_us,commit_to_present_p99_us,
@@ -655,6 +657,7 @@ sources.&lt;id&gt;.{output,registered_at_us,revision,registration,
               presentation.{&lt;the window leaves&gt;,upload_bytes_total,
                 damage_px_total,upload_bytes_p50,upload_bytes_p99,
                 damage_px_p50,damage_px_p99}}          (volatile)
+workspaces.{count,current,o_&lt;slug&gt;.current,list}
 stack
 focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
@@ -662,7 +665,7 @@ decoration.{enabled,style}
 bindings.{enabled,profile,table}
 input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
 input.host.passthrough            (nested backend only)
-xwayland.{enabled,persist_path}
+xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
       slug_collisions,broker}
 </code></pre>
@@ -709,6 +712,27 @@ takes it out of the restore order, and raises and focuses it. X11 windows are
 accepted too and get the EWMH hidden state cleared. A write to a window that
 does not exist or is not a mapped managed window replies <code>invalid_value</code>, like
 the band leaf.</p>
+<p>Workspaces (virtual desktops) are 1-based. <code>workspaces.count</code> (default 4,
+<code>1..=16</code>) is the number of workspaces; shrinking it moves every window on a
+removed workspace to the last remaining one and clamps every current.
+<code>workspaces.current</code> is the default output's current workspace and
+<code>workspaces.o_&lt;slug&gt;.current</code> the same value under the output's key (one
+output today, so they mirror each other; a key that is not the default
+output's is refused with <code>invalid_value</code>). Writing either switches, exactly
+like <code>comp.workspace.switch</code>. <code>workspaces.list</code> is read-only: one
+<code>{index,windows}</code> row per workspace, <code>windows</code> counting the <code>windows.*</code> rows
+on it. <code>windows.s&lt;id&gt;.workspace</code> is the window's workspace; writing it moves
+the window there WITHOUT switching, so a window moved off the current
+workspace reads <code>visible:false, minimized:false</code> (use <code>visible</code> for
+on-screen, <code>minimized</code> for the user's minimise state). A move never changes
+the window's generation. <code>surfaces.s&lt;id&gt;.workspace</code> carries the same value
+for every mapped managed toplevel, X11 windows included (they have no
+<code>windows.*</code> row), and null for every other surface. A window that unmaps and
+remaps joins the current workspace again. All of these are watchable; the
+changed events of a switch, move or count change carry the cause of the
+write (<code>props.set</code>) or the verb. Values outside <code>1..=count</code> (0 included) and
+non-integers are <code>invalid_value</code>; every write is <code>locked</code> while a session
+lock is active.</p>
 <p>Window band writes accept <code>bottom</code> or <code>normal</code>. They move the complete window
 tree, including popups, behind normal windows or back into their normal band.
 Assignments last for the current session. Use the canonical ID returned by
@@ -802,9 +826,10 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 <code>comp.input.sequence</code>.</li>
 </ul>
 </li>
-<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?}</code> returns
-<code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field (text
-filters at most 4096 bytes). The
+<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
+returns <code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field
+(text filters at most 4096 bytes; <code>workspace</code> is an index, <code>"current"</code> for
+the current workspace, or <code>"all"</code>, the default). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
 windows and is empty while a session lock is active.</li>
 </ul>
@@ -1098,8 +1123,9 @@ ranges are:</p>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
 </tbody></table>
 <p>The mutable leaves are the four corner leaves, <code>windows.s&lt;id&gt;.band</code>,
-<code>windows.s&lt;id&gt;.minimized</code>, <code>input.host.passthrough</code> (nested only) and
-<code>xwayland.enabled</code>. The corner and window
+<code>windows.s&lt;id&gt;.minimized</code>, <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>,
+<code>workspaces.current</code>, <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>
+(nested only) and <code>xwayland.enabled</code>. The corner, window and workspace
 descriptors say <code>mutable:true</code> and
 <code>persistence:"none"</code> (numeric leaves also carry the range above) and those
 values live for the compositor process only. <code>xwayland.enabled</code> is the one
@@ -1377,7 +1403,11 @@ supervises one rootless Xwayland instance and acts as its X11 window
 manager. The runtime control is the <code>xwayland.enabled</code> property described
 above (startup-read, file-persisted per socket) with the
 <code>COSMIX_COMP_XWAYLAND</code> environment variable as the launch-time override —
-the cargo feature is no longer the switch. Normal X11 windows become managed toplevels on the existing
+the cargo feature is no longer the switch. The read-only <code>xwayland.display</code>
+leaf reports the X display (<code>:N</code>) of the ready generation — the Bus-side
+equivalent of the per-socket <code>DISPLAY</code> descriptor file, published at the
+same moment and null while no generation serves X clients (watch it to know
+when <code>xprop</code>/<code>xdotool</code> can connect). Normal X11 windows become managed toplevels on the existing
 scene, buffer, focus, stacking and server-side-decoration paths: association
 (via the xwayland-shell serial handshake) creates the window's surface
 record, the map grant makes it eligible, and its first committed buffer

@@ -90,6 +90,7 @@ pub(crate) struct CompSnapshot {
     pub(crate) outputs: BTreeMap<String, OutputSnapshot>,
     pub(crate) surfaces: BTreeMap<String, SurfaceSnapshot>,
     pub(crate) windows: BTreeMap<String, WindowSnapshot>,
+    pub(crate) workspaces: WorkspacesSnapshot,
     pub(crate) sources: BTreeMap<String, SourceSnapshot>,
     pub(crate) stack: Vec<u64>,
     pub(crate) focus: FocusSnapshot,
@@ -166,6 +167,10 @@ pub(crate) struct SurfaceSnapshot {
     pub(crate) maximized: bool,
     pub(crate) fullscreen: bool,
     pub(crate) minimized: bool,
+    /// The 1-based workspace of a mapped managed toplevel (X11 included —
+    /// the one place an X11 window's workspace is legible, D11); null for
+    /// every other role and before the first map.
+    pub(crate) workspace: Option<u32>,
     pub(crate) decoration: Option<&'static str>,
     pub(crate) layer: Option<LayerSnapshot>,
     pub(crate) foreign_id: Option<String>,
@@ -181,6 +186,32 @@ pub(crate) struct WindowExtras {
     pub(crate) window_x: f32,
     pub(crate) window_y: f32,
     pub(crate) pid: Option<u64>,
+    pub(crate) workspace: u32,
+}
+
+/// `workspaces.*`: the count, the default output's current workspace
+/// (`current`), one `o_<slug>.current` per output (the same keys as
+/// `outputs.*`) and the per-workspace window counts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkspacesSnapshot {
+    pub(crate) count: u32,
+    pub(crate) current: u32,
+    #[serde(flatten)]
+    pub(crate) outputs: BTreeMap<String, OutputWorkspaceSnapshot>,
+    pub(crate) list: Vec<WorkspaceRowSnapshot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OutputWorkspaceSnapshot {
+    pub(crate) current: u32,
+}
+
+/// One `workspaces.list` entry: the 1-based index and how many mapped
+/// managed windows (the `windows.*` rows) are on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkspaceRowSnapshot {
+    pub(crate) index: u32,
+    pub(crate) windows: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -212,6 +243,8 @@ pub(crate) struct WindowSnapshot {
     pub(crate) window_y: f32,
     pub(crate) visible: bool,
     pub(crate) pid: Option<u64>,
+    /// The window's 1-based workspace (writable; a move never switches).
+    pub(crate) workspace: u32,
     /// Volatile; filled only in read snapshots (never in diffed rows).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) presentation: Option<PresentationLeaves>,
@@ -323,6 +356,11 @@ pub(crate) struct HostInputSnapshot {
 pub(crate) struct XwaylandSnapshot {
     pub(crate) enabled: bool,
     pub(crate) persist_path: Arc<str>,
+    /// The X display this compositor's Xwayland serves (`:N`), null until
+    /// the generation is ready (XWM started, descriptor published) and
+    /// again after it goes down. Read it rather than the descriptor file
+    /// when the caller already speaks Bus.
+    pub(crate) display: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -376,6 +414,7 @@ impl CompSnapshot {
             "outputs" => select_map(&self.outputs, tail, OutputSnapshot::select),
             "surfaces" => select_map(&self.surfaces, tail, SurfaceSnapshot::select),
             "windows" => select_map(&self.windows, tail, WindowSnapshot::select),
+            "workspaces" => self.workspaces.select(tail),
             "sources" => select_map(&self.sources, tail, select_serialised::<SourceSnapshot>),
             "stack" if tail.is_empty() => serialise_selected(&self.stack),
             "focus" => self.focus.select(tail),
@@ -398,6 +437,7 @@ impl CompSnapshot {
             "outputs" => map_node_kind(&self.outputs, tail, OutputSnapshot::node_kind),
             "surfaces" => map_node_kind(&self.surfaces, tail, SurfaceSnapshot::node_kind),
             "windows" => map_node_kind(&self.windows, tail, WindowSnapshot::node_kind),
+            "workspaces" => self.workspaces.node_kind(tail),
             "sources" => map_node_kind(&self.sources, tail, serialised_node_kind::<SourceSnapshot>),
             "stack" if tail.is_empty() => Some(SnapshotNodeKind::Leaf),
             "focus" => self.focus.node_kind(tail),
@@ -528,7 +568,29 @@ flat_snapshot!(
     explicit_sync_healthy,
 );
 #[cfg(feature = "xwayland")]
-flat_snapshot!(XwaylandSnapshot, enabled, persist_path);
+flat_snapshot!(XwaylandSnapshot, enabled, persist_path, display);
+flat_snapshot!(OutputWorkspaceSnapshot, current);
+
+impl WorkspacesSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        match path {
+            [] => serialise_selected(self),
+            ["count"] => serialise_selected(&self.count),
+            ["current"] => serialise_selected(&self.current),
+            ["list"] => serialise_selected(&self.list),
+            _ => select_map(&self.outputs, path, OutputWorkspaceSnapshot::select),
+        }
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        match path {
+            [] => Some(SnapshotNodeKind::Object),
+            ["count" | "current" | "list"] => Some(SnapshotNodeKind::Leaf),
+            _ => map_node_kind(&self.outputs, path, OutputWorkspaceSnapshot::node_kind),
+        }
+    }
+}
+
 macro_rules! window_snapshot {
     ($($field:ident),+ $(,)?) => {
         impl WindowSnapshot {
@@ -559,7 +621,7 @@ macro_rules! window_snapshot {
 
 window_snapshot!(
     id, foreign_id, title, app_id, x, y, width, height, focused, maximized, fullscreen, minimized,
-    output, band, generation, window_x, window_y, visible, pid,
+    output, band, generation, window_x, window_y, visible, pid, workspace,
 );
 flat_snapshot!(FocusWindowSnapshot, id, generation);
 
@@ -697,6 +759,7 @@ impl SurfaceSnapshot {
             ["maximized"] => serialise_selected(&self.maximized),
             ["fullscreen"] => serialise_selected(&self.fullscreen),
             ["minimized"] => serialise_selected(&self.minimized),
+            ["workspace"] => serialise_selected(&self.workspace),
             ["decoration"] => serialise_selected(&self.decoration),
             ["layer"] => serialise_selected(&self.layer),
             ["layer", tail @ ..] => self.layer.as_ref()?.select(tail),
@@ -712,8 +775,8 @@ impl SurfaceSnapshot {
             [
                 "id" | "role" | "mapped" | "visible" | "x" | "y" | "width" | "height" | "band"
                 | "sequence" | "tree_index" | "parent" | "output" | "title" | "app_id" | "focused"
-                | "activated" | "maximized" | "fullscreen" | "minimized" | "decoration"
-                | "foreign_id" | "generation",
+                | "activated" | "maximized" | "fullscreen" | "minimized" | "workspace"
+                | "decoration" | "foreign_id" | "generation",
             ] => Some(SnapshotNodeKind::Leaf),
             ["layer"] => Some(if self.layer.is_some() {
                 SnapshotNodeKind::Object
@@ -860,6 +923,11 @@ fn project_surface_row(
         maximized: record.committed_maximized,
         fullscreen: record.committed_fullscreen,
         minimized: record.minimized,
+        // Stamped at the first map (rule 2): 0 until then, and only managed
+        // toplevels have one. X11 toplevels have no `windows.*` row, so
+        // this leaf is where their workspace is read (D11).
+        workspace: (record.role.managed_toplevel() && record.workspace >= 1)
+            .then_some(record.workspace),
         decoration: matches!(record.role, SurfaceRole::Toplevel(_))
             .then_some(decoration_name(record.committed_decoration)),
         layer,
@@ -881,6 +949,7 @@ fn project_surface_row(
                 })
                 .flatten()
                 .and_then(|credentials| u64::try_from(credentials.pid).ok()),
+            workspace: record.workspace,
         },
     }
 }
@@ -906,7 +975,49 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         window_y: surface.window.window_y,
         visible: surface.visible,
         pid: surface.window.pid,
+        workspace: surface.window.workspace,
         presentation: None,
+    }
+}
+
+/// `workspaces.*` from the workspace state and the window rows already
+/// projected for this snapshot: per-workspace counts are counts of
+/// `windows.*` rows, so under a session lock (where that map is empty)
+/// they read 0, like every other window-derived leaf.
+fn project_workspaces(
+    state: &WaylandState,
+    output_keys: &[(Output, String)],
+    windows: &BTreeMap<String, WindowSnapshot>,
+) -> WorkspacesSnapshot {
+    let count = state.workspaces.count;
+    let outputs = output_keys
+        .iter()
+        .map(|(_, key)| {
+            (
+                key.clone(),
+                OutputWorkspaceSnapshot {
+                    current: state.current_workspace_for(Some(key)),
+                },
+            )
+        })
+        .collect();
+    let mut list = (1..=count)
+        .map(|index| WorkspaceRowSnapshot { index, windows: 0 })
+        .collect::<Vec<_>>();
+    for row in windows.values() {
+        if let Some(slot) = row
+            .workspace
+            .checked_sub(1)
+            .and_then(|index| list.get_mut(index as usize))
+        {
+            slot.windows += 1;
+        }
+    }
+    WorkspacesSnapshot {
+        count,
+        current: state.workspace_current(),
+        outputs,
+        list,
     }
 }
 
@@ -1006,6 +1117,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
             .collect()
     };
 
+    let workspaces = project_workspaces(state, &output_keys, &windows);
     let stack = project_stack(state);
 
     let bindings = state.bindings.port_snapshot();
@@ -1022,6 +1134,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
         outputs,
         surfaces,
         windows,
+        workspaces,
         sources: BTreeMap::new(),
         stack,
         focus: project_focus(state),
@@ -1053,6 +1166,10 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                     .display()
                     .to_string(),
             ),
+            display: state
+                .xwayland
+                .display_number
+                .map(|number| Arc::from(format!(":{number}"))),
         },
         port: PortSnapshot {
             level: "L2",
@@ -1619,6 +1736,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         Bool,
         "Compositor minimized state"
     ),
+    descriptor!(
+        &[L("surfaces"), S, L("workspace")],
+        Number,
+        "1-based workspace of a mapped managed toplevel (X11 included), else null; write windows.s<id>.workspace to move"
+    ),
     descriptor!(&[L("surfaces"), S, L("decoration")], String, "Committed decoration mode or null", enum = &["server", "client", "unbound"]),
     descriptor!(
         &[L("surfaces"), S, L("layer")],
@@ -1750,6 +1872,39 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Process id of the client socket peer (a proxy or sandbox may report its own), or null"
     ),
     descriptor!(
+        &[L("windows"), S, L("workspace")],
+        Number,
+        "1-based workspace of this window; a write moves it there without switching (off the current workspace it reads visible:false, minimized:false)",
+        mutable,
+        range = "1..=count"
+    ),
+    descriptor!(
+        &[L("workspaces"), L("count")],
+        Number,
+        "Number of workspaces; shrinking moves stranded windows to the last one and clamps every current",
+        mutable,
+        range = "1..=16"
+    ),
+    descriptor!(
+        &[L("workspaces"), L("current")],
+        Number,
+        "The default output's current workspace (1-based); a write switches",
+        mutable,
+        range = "1..=count"
+    ),
+    descriptor!(
+        &[L("workspaces"), O, L("current")],
+        Number,
+        "This output's current workspace (1-based); a write switches it (only the default output is switchable in 0.59)",
+        mutable,
+        range = "1..=count"
+    ),
+    descriptor!(
+        &[L("workspaces"), L("list")],
+        List,
+        "One {index, windows} row per workspace; windows counts the windows.* rows on it"
+    ),
+    descriptor!(
         &[L("stack")],
         List,
         "Mapped root surface ids from top to bottom",
@@ -1859,6 +2014,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         String,
         "Resolved per-socket file xwayland.enabled persists to (root- and \
          socket-dependent; read-only so the governing file is visible, not deduced)"
+    ),
+    #[cfg(feature = "xwayland")]
+    descriptor!(
+        &[L("xwayland"), L("display")],
+        String,
+        "The X display this compositor's Xwayland serves (\":N\"); null until the \
+         generation is ready and again after it goes down"
     ),
     // Presentation statistics are volatile: served by get/list/describe,
     // never diffed into props.changed (a watched 60 Hz client would flood
@@ -2329,10 +2491,12 @@ fn list_argument(path: &str, expected: &'static str, range: &'static str) -> (u8
     .into_wire()
 }
 
-/// `comp.windows.list {app_id?, title?, title_contains?, visible?}`: the
-/// window rows matching every given filter, in id order.
+/// `comp.windows.list {app_id?, title?, title_contains?, visible?,
+/// workspace?}`: the window rows matching every given filter, in id order.
+/// `workspace` is an index, `"current"` (this snapshot's current workspace)
+/// or `"all"` (the default: no filter, so 0.58 callers see the same set).
 fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
-    const ALLOWED: &[&str] = &["app_id", "title", "title_contains", "visible"];
+    const ALLOWED: &[&str] = &["app_id", "title", "title_contains", "visible", "workspace"];
     let empty = serde_json::Map::new();
     let object = match args {
         Value::Null => &empty,
@@ -2360,6 +2524,22 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
         Some(Value::Bool(visible)) => Some(*visible),
         Some(_) => return list_argument("visible", "bool", "true|false"),
     };
+    // Rule 4: `"current"` is resolved against this snapshot's current
+    // workspace, so the reply is consistent with the rows it lists.
+    let workspace = match object.get("workspace") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(word)) if word == "all" => None,
+        Some(Value::String(word)) if word == "current" => Some(snapshot.workspaces.current),
+        Some(Value::Number(number)) => match number.as_u64() {
+            Some(index) if index >= 1 => Some(u32::try_from(index).unwrap_or(u32::MAX)),
+            _ => {
+                return list_argument("workspace", "unsigned integer or string", "<n>|current|all");
+            }
+        },
+        Some(_) => {
+            return list_argument("workspace", "unsigned integer or string", "<n>|current|all");
+        }
+    };
     let mut rows = snapshot
         .windows
         .values()
@@ -2372,6 +2552,7 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
                         .is_some_and(|title| title.contains(needle))
                 })
                 && visible.is_none_or(|visible| row.visible == visible)
+                && workspace.is_none_or(|workspace| row.workspace == workspace)
         })
         .collect::<Vec<_>>();
     rows.sort_by_key(|row| row.id);
@@ -2635,6 +2816,7 @@ mod tests {
             maximized: false,
             fullscreen: false,
             minimized: false,
+            workspace: None,
             decoration: None,
             layer: Some(LayerSnapshot {
                 stratum: "top",
@@ -2667,6 +2849,7 @@ mod tests {
             maximized: false,
             fullscreen: false,
             minimized: false,
+            workspace: Some(1),
             decoration: Some("server"),
             layer: None,
             foreign_id: Some("foreign-2".into()),
@@ -2675,6 +2858,7 @@ mod tests {
                 window_x: 52.0,
                 window_y: 72.0,
                 pid: Some(4242),
+                workspace: 1,
             },
         };
         let mut surfaces = BTreeMap::new();
@@ -2690,6 +2874,7 @@ mod tests {
         popup.activated = false;
         popup.decoration = None;
         popup.foreign_id = None;
+        popup.workspace = None;
         surfaces.insert("s3".into(), popup);
         let mut subsurface = toplevel.clone();
         subsurface.id = 4;
@@ -2703,6 +2888,7 @@ mod tests {
         subsurface.activated = false;
         subsurface.decoration = None;
         subsurface.foreign_id = None;
+        subsurface.workspace = None;
         surfaces.insert("s4".into(), subsurface);
         let mut lock = toplevel.clone();
         lock.id = 5;
@@ -2714,6 +2900,7 @@ mod tests {
         lock.activated = false;
         lock.decoration = None;
         lock.foreign_id = None;
+        lock.workspace = None;
         surfaces.insert("s5".into(), lock);
         let mut windows = BTreeMap::new();
         windows.insert(
@@ -2738,6 +2925,7 @@ mod tests {
                 window_y: toplevel.window.window_y,
                 visible: toplevel.visible,
                 pid: toplevel.window.pid,
+                workspace: toplevel.window.workspace,
                 presentation: Some(PresentationLeaves {
                     presented: 3,
                     interval_p50_us: Some(16_000),
@@ -2746,6 +2934,23 @@ mod tests {
                 }),
             },
         );
+        let mut workspace_outputs = BTreeMap::new();
+        workspace_outputs.insert(output.clone(), OutputWorkspaceSnapshot { current: 1 });
+        let workspaces = WorkspacesSnapshot {
+            count: 2,
+            current: 1,
+            outputs: workspace_outputs,
+            list: vec![
+                WorkspaceRowSnapshot {
+                    index: 1,
+                    windows: 1,
+                },
+                WorkspaceRowSnapshot {
+                    index: 2,
+                    windows: 0,
+                },
+            ],
+        };
         let mut sources = BTreeMap::new();
         sources.insert(
             "scene".to_string(),
@@ -2773,6 +2978,7 @@ mod tests {
             outputs,
             surfaces,
             windows,
+            workspaces,
             sources,
             stack: vec![1, 2],
             focus: FocusSnapshot {
@@ -2806,6 +3012,7 @@ mod tests {
             xwayland: XwaylandSnapshot {
                 enabled: true,
                 persist_path: Arc::from("/tmp/fixture/etc/comp/xwayland-enabled.comp-nested"),
+                display: Some(Arc::from(":3")),
             },
             port: PortSnapshot {
                 level: "L2",
@@ -2833,10 +3040,13 @@ mod tests {
         // surface's ONE file-persisted mutable leaf (startup-read — a
         // non-persisted startup switch would be unreachable from its own
         // surface).
+        // 0.59.0 adds the four workspace leaves: the window's workspace,
+        // the count, and the current workspace by default output and by
+        // output key.
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 8);
+        assert_eq!(mutable.len(), 12);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 7);
+        assert_eq!(mutable.len(), 11);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
@@ -2845,6 +3055,10 @@ mod tests {
             "input.host.passthrough",
             "windows.s2.band",
             "windows.s2.minimized",
+            "windows.s2.workspace",
+            "workspaces.count",
+            "workspaces.current",
+            "workspaces.o_dp_1.current",
         ] {
             let path = PropPath::new(path).unwrap();
             let body = describe(&snapshot, &path).expect("mutable descriptor");
@@ -2865,6 +3079,33 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Value>(&dwell).unwrap()["range"],
             "0..=5000"
+        );
+        // The workspace rows and per-output object are read-only; the
+        // per-output current is a leaf under an object keyed like outputs.
+        let list = describe(&snapshot, &PropPath::new("workspaces.list").unwrap()).unwrap();
+        let list = serde_json::from_str::<Value>(&list).unwrap();
+        assert_eq!(list["mutable"], false);
+        assert_eq!(list["type"], "list");
+        assert_eq!(
+            snapshot.select(&["workspaces", "list"]),
+            Some(json!([{"index": 1, "windows": 1}, {"index": 2, "windows": 0}]))
+        );
+        assert_eq!(
+            snapshot.select(&["workspaces", "o_dp_1", "current"]),
+            Some(json!(1))
+        );
+        assert_eq!(
+            snapshot.node_kind(&["workspaces", "o_dp_1"]),
+            Some(SnapshotNodeKind::Object)
+        );
+        assert_eq!(snapshot.node_kind(&["workspaces", "o_nope"]), None);
+        assert_eq!(
+            snapshot.select(&["surfaces", "s3", "workspace"]),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            snapshot.select(&["windows", "s2", "workspace"]),
+            Some(json!(1))
         );
     }
 
