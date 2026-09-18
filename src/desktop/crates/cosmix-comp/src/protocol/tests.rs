@@ -35921,7 +35921,10 @@ fn session_lock_forwards_the_restore_chord_and_restores_nothing() {
         Ok((1, 2))
     );
     harness.server.state.minimize_toplevel(&surface);
-    assert_eq!(harness.server.state.minimized_toplevels, [object.clone()]);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        std::slice::from_ref(&object)
+    );
     let lock = begin_test_session_lock(&mut harness);
     ack_and_map_test_lock_surface(&mut harness, lock);
     let _ = harness.sync();
@@ -35937,7 +35940,10 @@ fn session_lock_forwards_the_restore_chord_and_restores_nothing() {
     assert_eq!(record.workspace, 2);
     assert!(!record.layout.visible);
     assert_eq!(harness.server.state.workspace_current(), 1, "locked: no switch");
-    assert_eq!(harness.server.state.minimized_toplevels, [object.clone()]);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        std::slice::from_ref(&object)
+    );
 
     present_test_security_epoch(&mut harness, lock.lock);
     let _ = unlock_test_session(&mut harness, lock);
