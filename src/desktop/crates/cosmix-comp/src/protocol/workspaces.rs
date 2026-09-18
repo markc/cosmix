@@ -548,7 +548,10 @@ impl WaylandState {
     /// side effect added to `present_window_for_workspace` later must be
     /// added to `sync_x11_suspended_for_workspaces` too (or the shrink path
     /// switched to the per-window halves).
-    #[cfg_attr(not(test), allow(dead_code))]
+    // The one production caller is the `workspaces.count` props write
+    // (`port_observation`, a bus-only module), as the crate's other
+    // bus-only entry points say it.
+    #[cfg_attr(not(feature = "bus"), allow(dead_code))]
     pub(crate) fn set_workspace_count(
         &mut self,
         count: u32,
