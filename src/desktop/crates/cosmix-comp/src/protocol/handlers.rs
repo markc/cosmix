@@ -2408,15 +2408,20 @@ impl XdgActivationHandler for WaylandState {
             tracing::debug!("xdg-activation for a surface this compositor does not know");
             return;
         };
-        // A minimised window is not activated: neither the raise nor the
-        // arbitration below would bring it on screen (`arbitrate_keyboard_focus`
-        // has no minimised term, so without this gate the keyboard focus moved
-        // to a hidden window), and `minimize_toplevel` moves focus OFF a window
-        // as it hides it. The same refusal `_NET_ACTIVE_WINDOW` gives through
-        // `window_switch_candidate`; un-minimising is the restore path, not an
-        // activation.
+        // 0.59.1, KWin/GNOME parity: an activation of a MINIMISED window
+        // RESTORES it — the same per-surface restore path `comp.window.restore`
+        // and the writable `windows.s<id>.minimized=false` use (`restore_window`),
+        // not a duplicate: un-minimise, leave the minimise LIFO, switch to its
+        // workspace where the activation path is allowed to switch, raise and
+        // focus — one settle. The lock guard above still refuses first, and
+        // `restore_window` withholds the switch and the focus on exactly the
+        // terms the non-minimised path below withholds them (an exclusive
+        // layer, the KMS input gate), so the keyboard never lands on a window
+        // that is off screen. `minimize_toplevel` still moves focus OFF a
+        // window as it hides it; only the refusal changed.
         if record.minimized {
-            tracing::debug!("xdg-activation for a minimised window: not activated");
+            tracing::debug!("xdg-activation for a minimised window: restoring it");
+            self.restore_window(&surface.id());
             return;
         }
         // F1.2: an activation of a window on another workspace switches to

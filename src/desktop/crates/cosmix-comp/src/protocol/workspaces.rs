@@ -12,7 +12,10 @@
 //! and follows it through the same funnel: hidden, no frame callbacks,
 //! never presented while its workspace is not current. It is still not a
 //! managed toplevel: never movable, never suspended, no `_NET_WM_DESKTOP`,
-//! no `windows.*` or `surfaces.s<id>.workspace` value.
+//! no `windows.*` or `surfaces.s<id>.workspace` value. A move of its
+//! owner relabels it with the owner (0.59.1, `relabel_workspace` walks
+//! the `WM_TRANSIENT_FOR` children), so an open menu is never stranded on
+//! the workspace the owner left.
 //! No `ext-workspace-v1`; the Bus props, verbs and bindings live in their
 //! own modules and call the `pub(crate)` primitives here.
 //!
@@ -362,13 +365,36 @@ impl WaylandState {
     /// withdraw/present half and the settle. One site, so the per-move
     /// publication lands on every path (including the release-arm revert
     /// in `move_window_and_follow`, which relabels back to `from`).
+    ///
+    /// 0.59.1: the moved window's override-redirect children follow it. An
+    /// OR record (a menu, tooltip) carries the workspace it mapped on and
+    /// `workspace_movable` excludes it, so no path of its own could move it
+    /// — a move of the owner (the Super+Shift+n chord,
+    /// `send_to_workspace`, a `windows.s<id>.workspace` write) stranded an
+    /// open menu on the old workspace, invisible beside its on-screen
+    /// owner. A child resolves through X11 `WM_TRANSIENT_FOR` naming the
+    /// moved window's XID; it gets the label, the dirty mark and no
+    /// `_NET_WM_DESKTOP` (EWMH gives the property to managed windows — the
+    /// same skip as `stamp_workspace_at_map`) and never walks children of
+    /// its own (an OR record is not an owner here), so the walk is one
+    /// level. No withdraw/present half and no suspend for a child: an OR
+    /// window is never suspended, and the caller's settle hides or shows
+    /// it with the workspace crossing through the same visibility funnel
+    /// that stamped it.
     fn relabel_workspace(&mut self, object: &ObjectId, to: u32) {
         let Some(record) = self.surfaces.get_mut(object) else {
             return;
         };
         record.workspace = to;
         #[cfg(feature = "xwayland")]
+        let owner_xid = record
+            .role
+            .x11()
+            .filter(|role| !role.override_redirect)
+            .map(|role| role.xid);
+        #[cfg(feature = "xwayland")]
         if let Some(role) = record.role.x11()
+            && !role.override_redirect
             && let Err(error) = role.surface.set_desktop(to - 1)
         {
             tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP on move");
@@ -377,6 +403,22 @@ impl WaylandState {
         {
             let id = record.id;
             self.mark_surface_dirty(id, "workspace.move");
+        }
+        #[cfg(feature = "xwayland")]
+        if let Some(owner_xid) = owner_xid {
+            let children: Vec<ObjectId> = self
+                .surfaces
+                .iter()
+                .filter(|(_, record)| {
+                    record.role.x11().is_some_and(|role| {
+                        role.override_redirect && role.surface.is_transient_for() == Some(owner_xid)
+                    })
+                })
+                .map(|(child, _)| child.clone())
+                .collect();
+            for child in children {
+                self.relabel_workspace(&child, to);
+            }
         }
     }
 

@@ -2511,7 +2511,10 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
         Value::Object(object) => object,
         _ => return list_argument("args", "JSON object", "filter object"),
     };
-    if let Some(field) = object.keys().find(|field| !ALLOWED.contains(&field.as_str())) {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED.contains(&field.as_str()))
+    {
         return ControlReply::InvalidArgs {
             field: field.clone(),
             allowed: ALLOWED,

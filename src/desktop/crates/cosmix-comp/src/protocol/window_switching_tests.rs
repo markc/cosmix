@@ -83,7 +83,10 @@ fn vendored_desktop_dispatch_keeps_format_and_policy_callback() {
         .split("x if x == xwm.atoms.WL_SURFACE_ID")
         .next()
         .unwrap();
-    assert!(!root_arm.contains("surface.window_id() == msg.window"), "a root message: no window");
+    assert!(
+        !root_arm.contains("surface.window_id() == msg.window"),
+        "a root message: no window"
+    );
     assert!(root_arm.contains("state.current_desktop_request(xwm_id, data[0], data[1]);"));
     assert!(
         source.contains(
@@ -119,17 +122,33 @@ fn supported_atoms_list_desktop_atoms() {
         .split("],")
         .next()
         .unwrap();
-    for atom in ["_NET_NUMBER_OF_DESKTOPS", "_NET_CURRENT_DESKTOP", "_NET_WM_DESKTOP"] {
-        assert!(supported.contains(&format!("atoms.{atom},")), "{atom} advertised");
+    for atom in [
+        "_NET_NUMBER_OF_DESKTOPS",
+        "_NET_CURRENT_DESKTOP",
+        "_NET_WM_DESKTOP",
+    ] {
+        assert!(
+            supported.contains(&format!("atoms.{atom},")),
+            "{atom} advertised"
+        );
     }
     let compact: String = source.split_whitespace().collect();
     assert!(compact.contains("atoms._NET_NUMBER_OF_DESKTOPS,AtomEnum::CARDINAL,&[1],"));
     assert!(compact.contains("atoms._NET_CURRENT_DESKTOP,AtomEnum::CARDINAL,&[0],"));
-    assert!(source.contains("pub fn set_number_of_desktops(&self, count: u32) -> Result<(), ConnectionError>"));
-    assert!(source.contains("pub fn set_current_desktop(&self, index: u32) -> Result<(), ConnectionError>"));
+    assert!(source.contains(
+        "pub fn set_number_of_desktops(&self, count: u32) -> Result<(), ConnectionError>"
+    ));
+    assert!(
+        source.contains(
+            "pub fn set_current_desktop(&self, index: u32) -> Result<(), ConnectionError>"
+        )
+    );
     let surface =
-        std::fs::read_to_string(root.join("../../vendor/smithay/src/xwayland/xwm/surface.rs")).unwrap();
-    assert!(surface.contains("pub fn set_desktop(&self, desktop: u32) -> Result<(), ConnectionError>"));
+        std::fs::read_to_string(root.join("../../vendor/smithay/src/xwayland/xwm/surface.rs"))
+            .unwrap();
+    assert!(
+        surface.contains("pub fn set_desktop(&self, desktop: u32) -> Result<(), ConnectionError>")
+    );
     let surface_compact: String = surface.split_whitespace().collect();
     assert!(surface_compact.contains("self.atoms._NET_WM_DESKTOP,AtomEnum::CARDINAL,&[desktop],"));
 
@@ -238,7 +257,10 @@ fn supported_atoms_list_desktop_atoms() {
     let settled = helper
         .find("self.settle_workspace_visibility(None);")
         .expect("a changed current settles");
-    assert!(resynced < settled, "flags before the settle, as the shrink does it");
+    assert!(
+        resynced < settled,
+        "flags before the settle, as the shrink does it"
+    );
 }
 
 #[test]

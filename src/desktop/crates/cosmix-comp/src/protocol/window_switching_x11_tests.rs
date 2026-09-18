@@ -102,13 +102,16 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
     ));
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
-        Some(surface)
+        Some(surface.clone())
     );
     harness.server.state.cycle_window(false);
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
         Some(native.clone())
     );
+    // 0.59.1: a `_NET_ACTIVE_WINDOW` for a MINIMISED window restores it
+    // (`restore_window`), so the activation moves the keyboard to it —
+    // no longer the 0.59.0 no-op the candidate terms gave it.
     harness
         .server
         .state
@@ -119,15 +122,17 @@ fn x11_activation_and_cycle_use_x11_focus_and_reject_unmapped_target() {
     harness.server.state.x11_activate_request(window.clone());
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone())
+    );
+    assert!(
+        !harness.server.state.surfaces[&object].minimized,
+        "restored, not merely focused"
+    );
+    harness.server.state.activate_managed_window(&native);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
         Some(native.clone())
     );
-    harness
-        .server
-        .state
-        .surfaces
-        .get_mut(&object)
-        .unwrap()
-        .minimized = false;
     if let SurfaceRole::X11(role) =
         &mut harness.server.state.surfaces.get_mut(&object).unwrap().role
     {
@@ -326,20 +331,20 @@ fn locked_x11_activation_and_unminimise_do_not_switch_workspace() {
     assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 
-/// The refusal half of F1.2 on the client-driven paths: a
+/// 0.59.1, the restore half of F1.2 on the client-driven paths: a
 /// `_NET_ACTIVE_WINDOW` or an xdg-activation for a MINIMISED window on
-/// another workspace is a no-op — nothing is focused, and because the
-/// switch is gated on the same terms it does not change the workspace
-/// either. `_NET_ACTIVE_WINDOW` always refused a minimised target
-/// (`window_switch_candidate`); xdg-activation did NOT on the base tree —
-/// `arbitrate_keyboard_focus` has no minimised term, so the keyboard focus
-/// moved to the hidden window — and now refuses at `request_activation`.
-/// A switch that then focuses nothing would be a client-driven, unreported
-/// change of the user's desktop. (The unminimise request is the restore
-/// path and does switch:
+/// another workspace RESTORES it — the `restore_window` path
+/// `comp.window.restore` uses — switching to its workspace (never pulling
+/// the window across), un-minimising, resuming (D15), raising and focusing
+/// it, and leaving the minimise LIFO empty. 0.59.0 refused both requests
+/// whole (xdg-activation at `request_activation`, `_NET_ACTIVE_WINDOW`
+/// through `window_switch_candidate`); every other gate (the session lock
+/// ahead of the restore, the KMS input gate's withheld switch inside it)
+/// holds on the same terms as for a non-minimised off-workspace
+/// activation. (The unminimise request is the other restore path:
 /// `x11_unminimise_of_an_off_workspace_window_switches_first`.)
 #[test]
-fn x11_activation_of_a_minimised_off_workspace_window_does_not_switch() {
+fn x11_activation_of_a_minimised_off_workspace_window_restores_it() {
     use crate::protocol::workspaces::WorkspaceTarget;
     let mut harness = KeybindingHarness::new(true);
     map_initial_test_toplevel(&mut harness);
@@ -362,21 +367,31 @@ fn x11_activation_of_a_minimised_off_workspace_window_does_not_switch() {
     harness.server.state.x11_activate_request(window.clone());
     assert_eq!(
         harness.server.state.workspace_current(),
-        1,
-        "_NET_ACTIVE_WINDOW for a minimised window does not switch"
+        2,
+        "_NET_ACTIVE_WINDOW for a minimised window switches to its workspace"
     );
     let record = &harness.server.state.surfaces[&object];
-    assert!(record.minimized);
+    assert!(!record.minimized, "and restores it");
     assert_eq!(record.workspace, 2, "never pulled across");
-    assert!(!record.layout.visible);
-    assert!(!record.focused);
-    assert!(window.is_minimized(), "still off screen: still suspended");
-    assert!(harness.server.state.surfaces[&native.id()].layout.visible);
+    assert!(record.layout.visible);
+    assert!(record.focused);
+    assert!(!window.is_minimized(), "on screen: resumed (D15)");
+    assert!(!harness.server.state.surfaces[&native.id()].layout.visible);
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
-        Some(native.clone())
+        Some(surface.clone())
     );
+    assert!(harness.server.state.minimized_toplevels.is_empty());
 
+    // The same window minimised on 2 again while 1 is current, for the
+    // same assertion through xdg-activation.
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    harness.server.state.minimize_toplevel(&surface);
+    harness.server.state.activate_managed_window(&native);
     XdgActivationHandler::request_activation(
         &mut harness.server.state,
         XdgActivationToken::from(String::from("test-token")),
@@ -385,16 +400,16 @@ fn x11_activation_of_a_minimised_off_workspace_window_does_not_switch() {
     );
     assert_eq!(
         harness.server.state.workspace_current(),
-        1,
-        "xdg-activation for a minimised window does not switch"
+        2,
+        "xdg-activation for a minimised window switches to its workspace"
     );
     let record = &harness.server.state.surfaces[&object];
-    assert!(record.minimized && !record.layout.visible && !record.focused);
+    assert!(!record.minimized && record.layout.visible && record.focused);
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
-        Some(native)
+        Some(surface)
     );
-    assert_eq!(harness.server.state.minimized_toplevels, vec![object]);
+    assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 
 /// D15 at the switch halves: switching away suspends an X11 window left

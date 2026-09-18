@@ -3411,7 +3411,11 @@ mod tests {
         assert_eq!(list("windows"), Some("windows".to_string()));
         assert_eq!(list("windows.s3"), Some("windows.s3".to_string()));
         assert_eq!(list("windows.s"), Some("windows.s".to_string()));
-        assert_eq!(read_scope("comp.props.list", &json!({})), None, "no prefix: whole tree");
+        assert_eq!(
+            read_scope("comp.props.list", &json!({})),
+            None,
+            "no prefix: whole tree"
+        );
         assert_eq!(
             read_scope("comp.props.get", &json!({ "path": "windows.s3.visible" })),
             Some("windows.s3.visible".to_string())
@@ -3420,7 +3424,10 @@ mod tests {
             read_scope("comp.props.describe", &json!({ "path": "windows.s3" })),
             Some("windows.s3".to_string())
         );
-        assert_eq!(read_scope("comp.info", &json!({})), Some("info".to_string()));
+        assert_eq!(
+            read_scope("comp.info", &json!({})),
+            Some("info".to_string())
+        );
         assert_eq!(read_scope("comp.windows.list", &json!({})), None);
         // A scope reaches its own subtree and no sibling; a mid-segment
         // prefix scopes nothing, exactly as the list itself matches nothing.

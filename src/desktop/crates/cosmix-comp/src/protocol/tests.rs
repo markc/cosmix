@@ -1883,9 +1883,7 @@ impl KeybindingHarness {
             .state
             .surfaces
             .values_mut()
-            .find(|record| {
-                record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID
-            })
+            .find(|record| record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
             .expect("real toplevel exists");
         toplevel.layout.x = 0.0;
         toplevel.layout.y = 0.0;
@@ -13425,9 +13423,7 @@ fn click_inside_a_grabbing_popup_survives_fractional_scale() {
             .state
             .surfaces
             .values_mut()
-            .find(|record| {
-                record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID
-            })
+            .find(|record| record.role.wl_surface().id().protocol_id() == TEST_TOPLEVEL_SURFACE_ID)
             .expect("real toplevel exists");
         record.mapped = true;
         // Faked past the commit edge: stamp the workspace as the edge would.
@@ -15223,6 +15219,112 @@ fn xdg_activation_switches_workspace_first() {
     );
 }
 
+/// 0.59.1, KWin/GNOME parity: an xdg-activation of a MINIMISED window
+/// RESTORES it — the same `restore_window` path `comp.window.restore` and
+/// the writable `windows.s<id>.minimized=false` use (un-minimise, raise,
+/// focus, one settle) — and the window leaves the minimise LIFO, so
+/// `minimized_toplevels` stays truthful. 0.59.0 refused here: un-minimising
+/// was the restore path, not an activation.
+#[test]
+fn xdg_activation_of_a_minimised_window_restores_it() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().clone();
+    let second = map_test_undecorated_toplevel(&mut harness);
+    let second_surface = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&second_surface);
+    assert!(harness.server.state.surfaces[&second].minimized);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        std::slice::from_ref(&second)
+    );
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(first.clone()),
+        "precondition: minimise moved the keyboard off the hidden window"
+    );
+
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("test-token")),
+        XdgActivationTokenData::default(),
+        second_surface.clone(),
+    );
+    let state = &harness.server.state;
+    assert!(!state.surfaces[&second].minimized, "un-minimised");
+    assert!(
+        state.minimized_toplevels.is_empty(),
+        "the restored window leaves the minimise LIFO"
+    );
+    assert!(state.surfaces[&second].layout.visible);
+    assert!(
+        state.surfaces[&second].layout.z > state.surfaces[&first.id()].layout.z,
+        "raised above the window that took its focus"
+    );
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()),
+        Some(second_surface)
+    );
+}
+
+/// 0.59.1 at F1.2: activating a window that is minimised on ANOTHER
+/// workspace switches to that workspace and restores it — one settle,
+/// the keyboard on the restored window, never pulled across. The lock
+/// and exclusive-layer guards ahead of the restore are unchanged (D18).
+#[test]
+fn xdg_activation_of_a_minimised_window_on_another_workspace_switches_and_restores() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let second = map_test_undecorated_toplevel(&mut harness);
+    assert_eq!(harness.server.state.surfaces[&second].workspace, 2);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let second_surface = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&second_surface);
+    assert_eq!(
+        harness.server.state.minimized_toplevels,
+        std::slice::from_ref(&second)
+    );
+
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("test-token")),
+        XdgActivationTokenData::default(),
+        second_surface.clone(),
+    );
+    let state = &harness.server.state;
+    assert_eq!(
+        state.workspace_current(),
+        2,
+        "switched to the minimised window's workspace"
+    );
+    assert_eq!(state.surfaces[&second].workspace, 2, "never pulled across");
+    assert!(!state.surfaces[&second].minimized, "restored");
+    assert!(state.surfaces[&second].layout.visible);
+    assert!(!state.surfaces[&first].layout.visible);
+    assert!(state.minimized_toplevels.is_empty());
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+        Some(second.clone())
+    );
+}
+
 /// The presentable term at the two callers that focus after
 /// `ensure_workspace_shown` without re-checking Alt+Tab's candidate: behind
 /// the KMS input gate (`normal_scene_restricted` while unlocked — the VT is
@@ -15384,7 +15486,11 @@ fn bringing_a_window_into_view_never_focuses_the_arriving_workspaces_bystander()
     };
     let assert_one_enter_on_the_target = |harness: &mut KeybindingHarness, path: &str| {
         let state = &harness.server.state;
-        assert_eq!(state.workspace_current(), 2, "{path}: switched to the target's workspace");
+        assert_eq!(
+            state.workspace_current(),
+            2,
+            "{path}: switched to the target's workspace"
+        );
         assert!(state.surfaces[&target].layout.visible, "{path}");
         assert!(state.surfaces[&bystander].layout.visible, "{path}");
         assert_eq!(
@@ -15426,7 +15532,10 @@ fn bringing_a_window_into_view_never_focuses_the_arriving_workspaces_bystander()
 
     // `activate_managed_window`.
     back_to_one(&mut harness);
-    harness.server.state.activate_managed_window(&target_surface);
+    harness
+        .server
+        .state
+        .activate_managed_window(&target_surface);
     assert_one_enter_on_the_target(&mut harness, "activate_managed_window");
 }
 
@@ -15487,7 +15596,11 @@ fn a_replaced_default_output_keeps_its_workspace_and_a_changed_one_settles() {
     // stale read the review found — `workspace_current()` already says 1
     // while the scene still describes 3.
     state.workspaces.current.remove(&key);
-    assert_eq!(state.workspace_current(), 1, "precondition: a fresh key reads as 1");
+    assert_eq!(
+        state.workspace_current(),
+        1,
+        "precondition: a fresh key reads as 1"
+    );
     assert!(
         state.surfaces[&third].layout.visible,
         "precondition: the scene still describes workspace 3"
@@ -29161,9 +29274,7 @@ fn port_observation_coalesces_map_unmap_and_preserves_foreign_id() {
                 foreign_id,
                 window,
                 event_seq,
-            } if role == "toplevel" => {
-                Some((*id, foreign_id.clone(), *event_seq, window.clone()))
-            }
+            } if role == "toplevel" => Some((*id, foreign_id.clone(), *event_seq, window.clone())),
             _ => None,
         })
         .expect("one converged toplevel map edge");
@@ -32037,7 +32148,11 @@ fn kms_frame_reports_name_their_own_output() {
         .get("scene")
         .expect("registered source");
     assert_eq!(
-        (scene.upload_bytes_total, scene.damage_px_total, scene.frames),
+        (
+            scene.upload_bytes_total,
+            scene.damage_px_total,
+            scene.frames
+        ),
         (64, 16, 1)
     );
 
@@ -41645,7 +41760,10 @@ mod x11 {
         let state = &mut harness.server.state;
         let record = &state.surfaces[&object];
         assert!(record.mapped && record.layout.visible);
-        assert_eq!(record.workspace, 1, "stamped with the workspace it mapped on");
+        assert_eq!(
+            record.workspace, 1,
+            "stamped with the workspace it mapped on"
+        );
         assert!(!record.role.managed_toplevel());
         assert_eq!(
             window.desktop(),
@@ -41709,6 +41827,123 @@ mod x11 {
         let record = &state.surfaces[&surface_two.id()];
         assert_eq!(record.workspace, 1, "stranded onto the last workspace");
         assert!(record.layout.visible, "and on screen there");
+    }
+
+    #[test]
+    fn x11_or_children_follow_their_owner_across_a_workspace_move() {
+        // 0.59.1: `relabel_workspace` relabelled only the object a move
+        // named and `workspace_movable` excludes OR records, so a move of
+        // the owner (the Super+Shift+n chord, `send_to_workspace`, a
+        // `windows.s<id>.workspace` write) left an open menu on the old
+        // workspace — invisible beside its on-screen owner after a follow
+        // move. The owner's OR children, resolved through WM_TRANSIENT_FOR
+        // naming the moved window's XID, now carry the same label; the
+        // move's settle hides and shows them with the crossing, and they
+        // still get none of the managed publication (no `_NET_WM_DESKTOP`).
+        // An OR window transient for something else does not follow.
+        use crate::protocol::workspaces::WorkspaceTarget;
+        let mut harness = KeybindingHarness::new(true);
+        map_initial_test_toplevel(&mut harness);
+        let (sid_owner, _owner_surface, _owner_window, owner) =
+            associate_normal_window(&mut harness, 62);
+        commit_dmabuf(&mut harness, sid_owner, 32, 24);
+        // An open menu over the owner, transient for it, and an unrelated
+        // OR window (transient for nothing), both mapped on workspace 1.
+        let (sid_menu, menu_surface) = roleless_wl_surface(&mut harness);
+        let menu = fake_x11_window(63, true, Rectangle::new((10, 10).into(), (80, 40).into()));
+        menu.set_transient_for_offline(Some(62));
+        menu.set_wl_surface_offline(Some(menu_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(menu.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(menu.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(menu_surface.clone(), menu.clone());
+        commit_dmabuf(&mut harness, sid_menu, 32, 24);
+        let (sid_other, other_surface) = roleless_wl_surface(&mut harness);
+        let other = fake_x11_window(64, true, Rectangle::new((500, 10).into(), (80, 40).into()));
+        other.set_wl_surface_offline(Some(other_surface.clone()));
+        harness
+            .server
+            .state
+            .x11_new_override_redirect_window(other.clone());
+        harness
+            .server
+            .state
+            .x11_mapped_override_redirect_window(other.clone());
+        harness
+            .server
+            .state
+            .x11_associate_window(other_surface.clone(), other);
+        commit_dmabuf(&mut harness, sid_other, 32, 24);
+        let menu_object = menu_surface.id();
+        assert_eq!(harness.server.state.surfaces[&owner].workspace, 1);
+        assert_eq!(
+            harness.server.state.surfaces[&menu_object].workspace, 1,
+            "the menu is stamped with the workspace it mapped on"
+        );
+        assert!(harness.server.state.surfaces[&menu_object].layout.visible);
+
+        // A plain move (the `windows.s<id>.workspace` write): the label
+        // follows; both owner and menu are off screen while 1 stays
+        // current, and the unrelated OR window keeps workspace 1.
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_to_workspace(&owner, WorkspaceTarget::Index(2)),
+            Ok((1, 2))
+        );
+        assert_eq!(
+            harness.server.state.surfaces[&menu_object].workspace, 2,
+            "the menu's label follows its owner's move"
+        );
+        assert!(!harness.server.state.surfaces[&menu_object].layout.visible);
+        assert_eq!(
+            menu.desktop(),
+            None,
+            "an OR window still gets no _NET_WM_DESKTOP across a move"
+        );
+        assert_eq!(
+            harness.server.state.surfaces[&other_surface.id()].workspace,
+            1,
+            "an OR window transient for nothing does not follow"
+        );
+        assert!(
+            harness.server.state.surfaces[&other_surface.id()]
+                .layout
+                .visible
+        );
+
+        // The follow move (the Super+Shift+n chord): the menu is visible
+        // with its owner on the arriving workspace, never stranded on 1.
+        assert_eq!(
+            harness
+                .server
+                .state
+                .move_window_and_follow(&owner, WorkspaceTarget::Index(3)),
+            Ok((2, 3))
+        );
+        assert_eq!(harness.server.state.workspace_current(), 3);
+        assert_eq!(harness.server.state.surfaces[&owner].workspace, 3);
+        assert!(harness.server.state.surfaces[&owner].layout.visible);
+        assert_eq!(
+            harness.server.state.surfaces[&menu_object].workspace, 3,
+            "the label follows the follow move too"
+        );
+        assert!(
+            harness.server.state.surfaces[&menu_object].layout.visible,
+            "the open menu is on screen with its owner, not stranded on 1"
+        );
+        let other_record = &harness.server.state.surfaces[&other_surface.id()];
+        assert_eq!(other_record.workspace, 1);
+        assert!(!other_record.layout.visible, "left behind, hidden");
     }
 
     #[test]

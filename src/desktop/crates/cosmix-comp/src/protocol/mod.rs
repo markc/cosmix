@@ -3479,7 +3479,9 @@ impl ProtocolServer {
                     }
                     ChannelEvent::Msg(PortCommand::Input(request)) => {
                         if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
-                            state.pending_port_controls.push(PortControl::Input(request));
+                            state
+                                .pending_port_controls
+                                .push(PortControl::Input(request));
                         }
                     }
                     ChannelEvent::Msg(PortCommand::Long(request)) => {
@@ -15925,11 +15927,11 @@ mod explicit_sync;
 mod focus;
 mod handlers;
 mod input;
+#[cfg(feature = "bus")]
+mod input_injection;
 pub(crate) mod presentation;
 pub(crate) mod presentation_stats;
 mod release_use;
-#[cfg(feature = "bus")]
-mod input_injection;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;

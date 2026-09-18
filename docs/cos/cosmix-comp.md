@@ -395,8 +395,10 @@ row), and null for every other surface and for an unmapped one. A window
 that unmaps and remaps joins the current workspace again. An
 override-redirect X11 window (a menu, tooltip, dropdown, DND icon) is not a
 window — no row, no workspace value, never movable — but it hides with the
-workspace it mapped on, so an open menu does not outlive the switch that
-hid its owner; it is back, still open, when that workspace is. X11 clients see
+workspace it mapped on and follows its owner's workspace moves (where its
+`WM_TRANSIENT_FOR` names the owner), so an open menu neither outlives the
+switch that hid its owner nor stays behind on the workspace the owner was
+sent to; it is back, still open, when that workspace is. X11 clients see
 the same model through EWMH: the root `_NET_NUMBER_OF_DESKTOPS` and
 `_NET_CURRENT_DESKTOP` (0-based, so workspace 1 is desktop 0) follow every
 switch and count change, every managed X11 window carries `_NET_WM_DESKTOP`
@@ -445,8 +447,11 @@ not focused either, so the keyboard never lands on a window that is off
 screen: `focus` replies with the reason, an activation request is ignored,
 and a restore un-minimises without switching or focusing. Activation
 requests (xdg-activation and `_NET_ACTIVE_WINDOW`) of a MINIMISED window
-are a no-op in 0.59.0 — un-minimising is the restore path, not an
-activation; a GNOME-style restore-on-activation is a later call. Two verbs
+restore it (since 0.59.1; in 0.59.0 they were a no-op) — exactly what
+`comp.window.restore {id}` does for that window: un-minimise, leave the
+minimise LIFO, switch to its workspace where the switch is allowed, raise
+and focus, one settle; a locked session still refuses the activation
+whole. Two verbs
 drive the workspaces:
 
 - `comp.workspace.switch {index,output?,wrap?}` makes `index` the output's

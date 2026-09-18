@@ -160,7 +160,15 @@ fn canvas(
         .set_len(bytes as u64)
         .map_err(|error| error.to_string())?;
     let pool = shm.create_pool(backing.as_fd(), bytes as i32, qh, ());
-    let buffer = pool.create_buffer(0, width, height, width * 4, wl_shm::Format::Xrgb8888, qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width,
+        height,
+        width * 4,
+        wl_shm::Format::Xrgb8888,
+        qh,
+        (),
+    );
     pool.destroy();
     Ok(Canvas {
         backing,
@@ -290,7 +298,8 @@ fn run() -> Result<(), String> {
         {
             frame = frame.wrapping_add(1);
             let shade = (frame % 256) as u8;
-            let pixels = [shade, 0x80, 255 - shade, 0xff].repeat((canvas.width * canvas.height) as usize);
+            let pixels =
+                [shade, 0x80, 255 - shade, 0xff].repeat((canvas.width * canvas.height) as usize);
             canvas
                 .backing
                 .write_all_at(&pixels, 0)
@@ -414,10 +423,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Probe {
                 state: button_state,
                 ..
             } => {
-                let pressed = matches!(
-                    button_state,
-                    WEnum::Value(wl_pointer::ButtonState::Pressed)
-                );
+                let pressed =
+                    matches!(button_state, WEnum::Value(wl_pointer::ButtonState::Pressed));
                 say(&format!(
                     "button {button} {} {} {}",
                     u8::from(pressed),
@@ -443,7 +450,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Probe {
             wl_keyboard::Event::Enter { .. } => say("keyboard_enter"),
             wl_keyboard::Event::Leave { .. } => say("keyboard_leave"),
             wl_keyboard::Event::Key {
-                key, state: pressed, ..
+                key,
+                state: pressed,
+                ..
             } => {
                 let pressed = matches!(pressed, WEnum::Value(wl_keyboard::KeyState::Pressed));
                 say(&format!("key {key} {}", u8::from(pressed)));

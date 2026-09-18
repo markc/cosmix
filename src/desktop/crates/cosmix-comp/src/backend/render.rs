@@ -4142,16 +4142,17 @@ impl LiveAtomicOwnership {
                         drop(trace);
                         if matches!(outcome, Ok(PresentOutcome::Displayed)) {
                             let refresh_nanos = state.presenter.refresh_nanos().unwrap_or(0);
-                            let timestamp = state.presenter.take_displayed_timestamp().map(
-                                |flip| KmsPresentationTimestamp {
-                                    seconds: flip.seconds,
-                                    nanoseconds: flip.nanoseconds,
-                                    sequence: u64::from(flip.sequence),
-                                    hw_clock: flip.hw_clock,
-                                    vblank: flip.vblank,
-                                    refresh_nanos,
-                                },
-                            );
+                            let timestamp =
+                                state.presenter.take_displayed_timestamp().map(|flip| {
+                                    KmsPresentationTimestamp {
+                                        seconds: flip.seconds,
+                                        nanoseconds: flip.nanoseconds,
+                                        sequence: u64::from(flip.sequence),
+                                        hw_clock: flip.hw_clock,
+                                        vblank: flip.vblank,
+                                        refresh_nanos,
+                                    }
+                                });
                             *reported_timestamp
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = timestamp;
@@ -9806,9 +9807,10 @@ pub(crate) mod tests {
         targets
             .sources
             .insert(key.clone(), flip_source(91, PresentOutcome::Displayed));
-        targets
-            .sources
-            .insert(second_key.clone(), flip_source(92, PresentOutcome::Displayed));
+        targets.sources.insert(
+            second_key.clone(),
+            flip_source(92, PresentOutcome::Displayed),
+        );
         present_selected_output_frames(
             &mut targets,
             &[written_view(&key, 91), written_view(&second_key, 92)],

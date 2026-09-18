@@ -12579,10 +12579,7 @@ mod tests {
             |_| reports.set(reports.get() + 1),
         )
         .expect_err("a flip from another generation is refused");
-        assert!(
-            error.to_string().contains("kms-live-stale"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("kms-live-stale"), "{error}");
         assert_eq!(reports.get(), 0);
     }
 

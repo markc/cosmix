@@ -704,7 +704,11 @@ impl WaylandState {
     pub(super) fn x11_current_desktop_request(&mut self, desktop: u32) {
         let count = self.workspaces.count;
         if desktop >= count {
-            tracing::debug!(desktop, count, "ignored _NET_CURRENT_DESKTOP above the workspace count");
+            tracing::debug!(
+                desktop,
+                count,
+                "ignored _NET_CURRENT_DESKTOP above the workspace count"
+            );
             return;
         }
         if self.session_lock_active() {
@@ -717,7 +721,9 @@ impl WaylandState {
                 to = switched.to,
                 "switched workspace on _NET_CURRENT_DESKTOP"
             ),
-            Err(refusal) => tracing::debug!(desktop, ?refusal, "refused _NET_CURRENT_DESKTOP switch"),
+            Err(refusal) => {
+                tracing::debug!(desktop, ?refusal, "refused _NET_CURRENT_DESKTOP switch")
+            }
         }
     }
 
@@ -732,7 +738,10 @@ impl WaylandState {
         let xid = window.window_id();
         let count = self.workspaces.count;
         if desktop == u32::MAX {
-            tracing::debug!(xid, "ignored _NET_WM_DESKTOP 0xFFFFFFFF: no sticky windows in 0.59");
+            tracing::debug!(
+                xid,
+                "ignored _NET_WM_DESKTOP 0xFFFFFFFF: no sticky windows in 0.59"
+            );
             return;
         }
         // The identity gate first, so the log names the reason a request
@@ -740,7 +749,11 @@ impl WaylandState {
         // override-redirect menu asking for a desktop above the count is
         // refused because it is a menu, not because of the count.
         let Some(surface) = window.wl_surface() else {
-            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP for an unassociated window");
+            tracing::debug!(
+                xid,
+                desktop,
+                "ignored _NET_WM_DESKTOP for an unassociated window"
+            );
             return;
         };
         // The same identity gate as `_NET_ACTIVE_WINDOW`: a stale association
@@ -762,14 +775,21 @@ impl WaylandState {
             return;
         }
         if desktop >= count {
-            tracing::debug!(xid, desktop, count, "ignored _NET_WM_DESKTOP above the workspace count");
+            tracing::debug!(
+                xid,
+                desktop,
+                count,
+                "ignored _NET_WM_DESKTOP above the workspace count"
+            );
             return;
         }
         if self.session_lock_active() {
             tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP under a session lock");
             return;
         }
-        match self.move_window_to_workspace(&object, workspaces::WorkspaceTarget::Index(desktop + 1)) {
+        match self
+            .move_window_to_workspace(&object, workspaces::WorkspaceTarget::Index(desktop + 1))
+        {
             Ok((from, to)) => tracing::debug!(xid, from, to, "moved X11 window on _NET_WM_DESKTOP"),
             Err(refusal) => tracing::debug!(xid, desktop, ?refusal, "refused _NET_WM_DESKTOP move"),
         }
@@ -781,13 +801,29 @@ impl WaylandState {
         };
         // Reject stale associations and override-redirect windows before the
         // common managed-window gate; an XID alone is not a live identity.
-        if self.surfaces.get(&surface.id()).is_some_and(|record| {
+        // 0.59.1, KWin/GNOME parity (and the same restore xdg-activation
+        // gives): a `_NET_ACTIVE_WINDOW` for a MINIMISED window restores it
+        // through `restore_window` — the path `comp.window.restore` uses —
+        // instead of the no-op the managed activation's candidate terms gave
+        // it (`window_switch_candidate` has no minimised arm).
+        if let Some(minimized) = self.surfaces.get(&surface.id()).and_then(|record| {
             record
                 .role
                 .x11()
-                .is_some_and(|role| !role.override_redirect && role.surface == window)
+                .filter(|role| !role.override_redirect && role.surface == window)
+                .map(|_| record.minimized)
         }) {
-            self.activate_managed_window(&surface);
+            if minimized {
+                // The same guards `activate_managed_window` makes: a locked
+                // or layer-covered activation changes nothing, restore
+                // included.
+                if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
+                    return;
+                }
+                self.restore_window(&surface.id());
+            } else {
+                self.activate_managed_window(&surface);
+            }
         }
     }
 

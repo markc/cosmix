@@ -1238,13 +1238,8 @@ fn service_surface_edges(state: &mut WaylandState) {
         if old.mapped == final_mapped && !replaced {
             continue;
         }
-        let previous = replaced.then(|| {
-            (
-                old.role.clone(),
-                old.foreign_id.clone(),
-                old.window.clone(),
-            )
-        });
+        let previous =
+            replaced.then(|| (old.role.clone(), old.foreign_id.clone(), old.window.clone()));
         let role = if final_mapped {
             final_record
                 .map(|record| record.role.kind().to_string())

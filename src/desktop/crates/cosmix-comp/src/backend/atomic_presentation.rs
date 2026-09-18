@@ -644,9 +644,10 @@ impl<I: AtomicIo> AtomicPresenter<I> {
 
     fn place_flip(&mut self, stamp: Duration, sequence: u32) -> DisplayedFlip {
         let vblank = self.classify_sequence(sequence);
-        let (Some(realtime_now), Some(monotonic_now)) =
-            (clock_now(libc::CLOCK_REALTIME), clock_now(libc::CLOCK_MONOTONIC))
-        else {
+        let (Some(realtime_now), Some(monotonic_now)) = (
+            clock_now(libc::CLOCK_REALTIME),
+            clock_now(libc::CLOCK_MONOTONIC),
+        ) else {
             // No clock to place the stamp against: report what the kernel
             // said and judge nothing, rather than inventing a skew.
             tracing::warn!(
@@ -2601,7 +2602,9 @@ mod tests {
         // vblank helpers stamp the start of scanout, which the event can
         // precede by a blanking interval: ~1 ms ahead is the kernel's answer.
         for sequence in 1..=5 {
-            let stamp = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_millis(1);
+            let stamp = clock_now(libc::CLOCK_MONOTONIC)
+                .expect("the test host has a readable clock")
+                + Duration::from_millis(1);
             let flip = present_flip_at(&mut presenter, stamp, sequence);
             assert!(flip.hw_clock, "flip {sequence}");
             assert_eq!(
@@ -2615,23 +2618,35 @@ mod tests {
     #[test]
     fn a_gross_monotonic_skew_demotes_the_clock() {
         let mut presenter = presenter(FakeAtomicIo::default());
-        let ahead = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_secs(5);
+        let ahead = clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock")
+            + Duration::from_secs(5);
         let flip = present_flip_at(&mut presenter, ahead, 1);
         assert!(!flip.hw_clock);
         assert!(stamp_of(flip) < ahead, "reported at read time");
         assert_eq!(presenter.flip_clock, PageFlipClock::Unknown);
-        let later = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"), 2);
+        let later = present_flip_at(
+            &mut presenter,
+            clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"),
+            2,
+        );
         assert!(!later.hw_clock, "no longer trusted");
     }
 
     #[test]
     fn one_modest_skew_is_forgiven_but_a_run_demotes() {
         // 100 ms is beyond the 16.7 ms period but not gross.
-        let modest = || clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock") + Duration::from_millis(100);
+        let modest = || {
+            clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock")
+                + Duration::from_millis(100)
+        };
         let mut presenter = presenter(FakeAtomicIo::default());
         assert!(!present_flip_at(&mut presenter, modest(), 1).hw_clock);
         assert_eq!(presenter.flip_clock, PageFlipClock::Monotonic);
-        let good = present_flip_at(&mut presenter, clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"), 2);
+        let good = present_flip_at(
+            &mut presenter,
+            clock_now(libc::CLOCK_MONOTONIC).expect("the test host has a readable clock"),
+            2,
+        );
         assert!(good.hw_clock, "a plausible stamp after one skew is trusted");
         for sequence in 3..=5 {
             assert!(!present_flip_at(&mut presenter, modest(), sequence).hw_clock);
@@ -2698,7 +2713,8 @@ mod tests {
         // EOPNOTSUPP is the one answer that settles it for good.
         let mut io = FakeAtomicIo::default();
         io.vblank_probes.push_back(VblankSupport::Unsupported);
-        let mut absent = presenter_with_cancellation(io, AtomicCancellation::new().expect("eventfd"));
+        let mut absent =
+            presenter_with_cancellation(io, AtomicCancellation::new().expect("eventfd"));
         absent.set_vblank_support(VblankSupport::Unknown);
         assert!(!present_flip_at(&mut absent, now(), 4).vblank);
         assert_eq!(absent.vblank, VblankSupport::Unsupported);
