@@ -46,7 +46,12 @@ impl Default for WorkspaceState {
 }
 
 /// Where a switch or a move is aimed.
+// `Next`/`Prev` are only constructed by the verbs' `From<WorkspaceIndex>`,
+// and `window_control` is `cfg(bus)`: without the allow the
+// `--no-default-features` gate (D20) reports them never constructed. Drop
+// it with the first non-bus constructor (the chords, slice 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {
     /// A 1-based workspace index.
     Index(u32),
@@ -195,13 +200,14 @@ impl WaylandState {
     }
 }
 
-// The primitives: `switch_workspace` and `move_window_to_workspace` have
-// their production caller (the `comp.workspace.switch` /
-// `comp.window.send_to_workspace` verbs); `set_workspace_count` and
-// `ensure_workspace_shown` wait for the prop and switch-first slices, so
-// the block stays allowed dead outside tests until those land. The readers above are NOT — they have callers
-// on the frame path — so a genuinely dead helper there still trips the lint.
-// Drop the attribute with the first wired caller.
+// The primitives: `switch_workspace`, `move_window_to_workspace` and
+// `ensure_workspace_shown` have their production caller (the
+// `comp.workspace.switch` / `comp.window.send_to_workspace` verbs, which
+// are `cfg(bus)` — so they still read dead to the `--no-default-features`
+// gate, D20); `set_workspace_count` waits for the prop slice. The block
+// stays allowed dead outside tests until a non-bus caller exists for every
+// primitive. The readers above are NOT — they have callers on the frame
+// path — so a genuinely dead helper there still trips the lint.
 #[cfg_attr(not(test), allow(dead_code))]
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
@@ -210,7 +216,7 @@ impl WaylandState {
     /// visibility term reads the default output's, so windows would be
     /// withdrawn (suspended, feedback discarded, drags ended) while staying
     /// on screen. The refusal goes when records carry an output binding.
-    fn resolve_workspace_output(&self, key: Option<&str>) -> Option<String> {
+    pub(super) fn resolve_workspace_output(&self, key: Option<&str>) -> Option<String> {
         let output = self.backend.default_output()?;
         let name = output.name();
         let key_of_default = output_key(&name);

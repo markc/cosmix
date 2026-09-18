@@ -324,34 +324,37 @@ frame trace as `comp_window_control` (subject the id; detail 1 minimize,
 9 workspace switch, 10 send to workspace; `comp.window.stats` and
 `.stats.reset` reuse 7 and 8, a collision kept until 0.60 renumbers them).
 
-Every window is on one workspace (`windows.s<id>.workspace`, joined at map),
-and each output has a current one (`workspaces.current`); a window off its
-output's current workspace reads `visible:false, minimized:false`, gets no
-frame callbacks and is never presented. `comp.window.focus`,
-`comp.window.restore` and xdg-activation switch to the window's workspace
-first when it is not the current one — the window is never pulled across.
-That switch does not happen under a session lock or an exclusive layer.
+Every mapped window is on one workspace and each output has a current one;
+a window off its output's current workspace reads `visible:false,
+minimized:false`, gets no frame callbacks and is never presented. Two verbs
+drive that:
 
 - `comp.workspace.switch {index,output?,wrap?}` makes `index` the output's
   current workspace: a 1-based number, or `"next"` / `"prev"` relative to
   the current one, which wrap at the ends unless `wrap:false`, when they are
-  refused with `{"error":"at_end",output,from,count}`. `output` is an
-  `outputs` key or output name and defaults to the default output (in
-  0.59.0 the only output with a switchable workspace; any other is
-  `invalid_value`). A number outside `1..=workspaces.count` (0 included) is
-  `invalid_value` naming `index`. The reply is `{output,from,to}`; a switch
-  to the current workspace replies with `from == to` and does nothing.
-  Minimise state is untouched: a minimised window on the arriving workspace
-  stays minimised. The verb names no window but changes what is on screen,
-  so a session lock refuses it (`locked`).
+  refused with `{"error":"at_end",output,from,count}` (`output` there is the
+  `outputs` key, as in the success reply, whichever spelling the request
+  used). `output` is an `outputs` key or output name and defaults to the
+  default output (in 0.59.0 the only output with a switchable workspace;
+  any other is `invalid_value`). A number outside `1..=count` (0 included)
+  is `invalid_value` naming `index` with the range. The reply is
+  `{output,from,to}`; a switch to the current workspace replies with
+  `from == to` and does nothing. Minimise state is untouched: a minimised
+  window on the arriving workspace stays minimised. The verb names no
+  window but changes what is on screen, so a session lock refuses it
+  (`locked`).
 - `comp.window.send_to_workspace {id,generation,index,follow?}` moves the
   window to `index` (a number, or `"next"` / `"prev"` relative to the
   window's own workspace, always wrapping) without switching; the window
   becomes `visible:false, minimized:false` if it leaves the current
   workspace. With `follow:true` comp also switches to that workspace and
-  activates the window. The reply is `{id,generation,index}`. A move never
-  changes the window's `generation`. Out-of-range indices are
-  `invalid_value`; the usual `{id,generation}` fence applies.
+  activates the window, and the reply gains `followed`: `true` when that
+  workspace is now the current one, `false` when the switch was inert
+  (an exclusive layer owns the screen, or there is no default output) —
+  the move has happened either way. The reply is `{id,generation,index}`
+  (plus `followed` with `follow:true`). A move never changes the window's
+  `generation`. Out-of-range indices are `invalid_value`; the usual
+  `{id,generation}` fence applies.
 - `comp.window.focus {id,generation,raise?}` gives the window keyboard focus.
   With `raise` (the default) it also raises it and re-targets the pointer,
   exactly like Alt+Tab. The reply is `{id,generation,focused}`. When

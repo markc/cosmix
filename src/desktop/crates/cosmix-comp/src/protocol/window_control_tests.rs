@@ -449,6 +449,20 @@ fn window_verbs_refuse_stale_targets_and_the_lock() {
         assert_eq!((rc, body), (10, json!({"error": "locked"})), "{op:?}");
     }
     assert_eq!(harness.server.state.surfaces[&alpha].window_origin, origin);
+    // D12: a switch names no window, but it changes what is on screen, so
+    // the lock refuses it too and `current` stays where it was.
+    let current = harness.server.state.workspace_current();
+    for index in [WorkspaceIndex::Absolute(2), WorkspaceIndex::Next] {
+        let op = WindowOp::SwitchWorkspace {
+            output: None,
+            index,
+            wrap: true,
+        };
+        let (rc, body) = window_op(&mut harness, &ingress, &runtime, op.clone());
+        assert_eq!((rc, body), (10, json!({"error": "locked"})), "{op:?}");
+    }
+    assert_eq!(harness.server.state.workspace_current(), current);
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, current);
 }
 
 /// Rule 7 over the verb: `next`/`prev` wrap at the ends, `wrap:false`
@@ -528,6 +542,24 @@ fn workspace_switch_verb_wraps_and_refuses_at_end() {
         json!({"error": "at_end", "output": output, "from": 4, "count": 4})
     );
     assert_eq!(harness.server.state.workspace_current(), 4);
+    // Addressed by output NAME, the refusal still names the output by its
+    // key, as the success reply does — a caller keying replies by output
+    // sees one spelling on both paths.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SwitchWorkspace {
+            output: Some("cosmix-nested-0".into()),
+            index: WorkspaceIndex::Next,
+            wrap: false,
+        },
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(
+        body,
+        json!({"error": "at_end", "output": output, "from": 4, "count": 4})
+    );
 
     for (index, output) in [
         (WorkspaceIndex::Absolute(5), None),
@@ -629,7 +661,7 @@ fn send_to_workspace_moves_and_follows() {
     assert_eq!(rc, 0, "{body}");
     assert_eq!(
         body,
-        json!({"id": beta_id, "generation": beta_generation, "index": 4})
+        json!({"id": beta_id, "generation": beta_generation, "index": 4, "followed": true})
     );
     let state = &harness.server.state;
     assert_eq!(state.workspace_current(), 4);
@@ -638,6 +670,17 @@ fn send_to_workspace_moves_and_follows() {
     assert!(state.surfaces[&beta].focused, "follow activates the window");
     assert!(!state.surfaces[&alpha].layout.visible);
     assert!(!state.surfaces[&alpha].focused);
+    // A follow to the workspace the window is already current on is still
+    // a follow (it activates), and says so.
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        send(beta_id, beta_generation, WorkspaceIndex::Absolute(4), true),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["followed"], true);
+    assert_eq!(harness.server.state.workspace_current(), 4);
 
     // Alpha is on 1 while current is 4: `next` relative to the window's
     // own workspace is 2 (relative to the current one it would wrap to 1).
@@ -692,6 +735,58 @@ fn send_to_workspace_moves_and_follows() {
     assert_eq!(body["path"], "index");
     assert_eq!(body["range"], "1..=4");
     assert_eq!(harness.server.state.surfaces[&alpha].workspace, 4);
+}
+
+/// D18 over the verb: under an exclusive layer `send_to_workspace
+/// {follow:true}` still moves the window, but the follow is inert — the
+/// screen is not re-arranged under the layer, `current` stays, the window
+/// is not activated, and the reply says `followed:false` rather than
+/// claiming a switch that did not happen.
+#[test]
+fn send_to_workspace_follow_is_inert_under_an_exclusive_layer() {
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+    );
+    let _ = harness.sync();
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::SendToWorkspace {
+            id: beta_id,
+            generation: beta_generation,
+            index: WorkspaceIndex::Absolute(3),
+            follow: true,
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"id": beta_id, "generation": beta_generation, "index": 3, "followed": false})
+    );
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 1);
+    assert_eq!(state.surfaces[&beta].workspace, 3);
+    assert!(!state.surfaces[&beta].layout.visible);
+    assert!(!state.surfaces[&beta].focused);
+    assert!(state.surfaces[&alpha].layout.visible);
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()),
+        Some(layer_surface),
+        "the exclusive layer keeps the keyboard"
+    );
 }
 
 /// Rule 12 (F1.9): `wait {until:"visible"}` and `{until:"presented"}` on

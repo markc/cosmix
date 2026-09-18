@@ -727,34 +727,36 @@ frame trace as <code>comp_window_control</code> (subject the id; detail 1 minimi
 2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close,
 9 workspace switch, 10 send to workspace; <code>comp.window.stats</code> and
 <code>.stats.reset</code> reuse 7 and 8, a collision kept until 0.60 renumbers them).</p>
-<p>Every window is on one workspace (<code>windows.s&lt;id&gt;.workspace</code>, joined at map),
-and each output has a current one (<code>workspaces.current</code>); a window off its
-output's current workspace reads <code>visible:false, minimized:false</code>, gets no
-frame callbacks and is never presented. <code>comp.window.focus</code>,
-<code>comp.window.restore</code> and xdg-activation switch to the window's workspace
-first when it is not the current one — the window is never pulled across.
-That switch does not happen under a session lock or an exclusive layer.</p>
+<p>Every mapped window is on one workspace and each output has a current one;
+a window off its output's current workspace reads <code>visible:false, minimized:false</code>, gets no frame callbacks and is never presented. Two verbs
+drive that:</p>
 <ul>
 <li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
 current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
 the current one, which wrap at the ends unless <code>wrap:false</code>, when they are
-refused with <code>{"error":"at_end",output,from,count}</code>. <code>output</code> is an
-<code>outputs</code> key or output name and defaults to the default output (in
-0.59.0 the only output with a switchable workspace; any other is
-<code>invalid_value</code>). A number outside <code>1..=workspaces.count</code> (0 included) is
-<code>invalid_value</code> naming <code>index</code>. The reply is <code>{output,from,to}</code>; a switch
-to the current workspace replies with <code>from == to</code> and does nothing.
-Minimise state is untouched: a minimised window on the arriving workspace
-stays minimised. The verb names no window but changes what is on screen,
-so a session lock refuses it (<code>locked</code>).</li>
+refused with <code>{"error":"at_end",output,from,count}</code> (<code>output</code> there is the
+<code>outputs</code> key, as in the success reply, whichever spelling the request
+used). <code>output</code> is an <code>outputs</code> key or output name and defaults to the
+default output (in 0.59.0 the only output with a switchable workspace;
+any other is <code>invalid_value</code>). A number outside <code>1..=count</code> (0 included)
+is <code>invalid_value</code> naming <code>index</code> with the range. The reply is
+<code>{output,from,to}</code>; a switch to the current workspace replies with
+<code>from == to</code> and does nothing. Minimise state is untouched: a minimised
+window on the arriving workspace stays minimised. The verb names no
+window but changes what is on screen, so a session lock refuses it
+(<code>locked</code>).</li>
 <li><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
 window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</code> relative to the
 window's own workspace, always wrapping) without switching; the window
 becomes <code>visible:false, minimized:false</code> if it leaves the current
 workspace. With <code>follow:true</code> comp also switches to that workspace and
-activates the window. The reply is <code>{id,generation,index}</code>. A move never
-changes the window's <code>generation</code>. Out-of-range indices are
-<code>invalid_value</code>; the usual <code>{id,generation}</code> fence applies.</li>
+activates the window, and the reply gains <code>followed</code>: <code>true</code> when that
+workspace is now the current one, <code>false</code> when the switch was inert
+(an exclusive layer owns the screen, or there is no default output) —
+the move has happened either way. The reply is <code>{id,generation,index}</code>
+(plus <code>followed</code> with <code>follow:true</code>). A move never changes the window's
+<code>generation</code>. Out-of-range indices are <code>invalid_value</code>; the usual
+<code>{id,generation}</code> fence applies.</li>
 <li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When

@@ -267,11 +267,15 @@ impl WaylandState {
     /// Every `comp.window.*` verb that answers in one pass. A session lock
     /// refuses every one that names or changes a window: the lock owns what
     /// is on screen until it ends. Source stats and a global stats reset do
-    /// not name a window, so they still answer.
+    /// not name a window, so they still answer. A workspace switch names no
+    /// window either but changes what is on screen, so it is refused too
+    /// (D12) — the arm is explicit so the reads above are not read as the
+    /// rule for it.
     pub(crate) fn service_window_op(&mut self, op: &WindowOp) -> ControlReply {
         let names_window = match op {
             WindowOp::Stats { target, .. } => window_of(Some(target)).is_some(),
             WindowOp::StatsReset { target } => window_of(target.as_ref()).is_some(),
+            WindowOp::SwitchWorkspace { .. } => true,
             _ => true,
         };
         if names_window && self.session_lock_active() {
@@ -354,11 +358,12 @@ impl WaylandState {
                 "to": switched.to,
             })),
             Err(refusal) => {
-                // `at_end` names the output it was at: the requested one,
-                // else the default the switch would have addressed.
-                let output = output
-                    .map(str::to_string)
-                    .or_else(|| self.default_output_key());
+                // `at_end` names the output it was at by its `o_<slug>`
+                // KEY, as the success reply does — a request by output name
+                // resolved before the ring did, so the key is what a caller
+                // keying replies by output can match. Only an unknown
+                // output fails to resolve, and that refusal echoes nothing.
+                let output = self.resolve_workspace_output(output);
                 workspace_refusal(refusal, output.as_deref(), 0)
             }
         }
@@ -367,7 +372,11 @@ impl WaylandState {
     /// `comp.window.send_to_workspace`: the `{id, generation}` fence, then
     /// the move; with `follow`, a switch to the window's new workspace and
     /// its activation (D9). `next`/`prev` are relative to the window's own
-    /// workspace and always wrap.
+    /// workspace and always wrap. The follow goes through
+    /// `ensure_workspace_shown`, so it is inert under an exclusive layer
+    /// exactly as the switch-first paths are (D18); the reply's `followed`
+    /// says whether the workspace is now the current one, because the move
+    /// has happened by then and cannot be refused after the fact.
     fn service_send_to_workspace(
         &mut self,
         id: u64,
@@ -385,18 +394,26 @@ impl WaylandState {
             Ok(moved) => moved,
             Err(refusal) => return workspace_refusal(refusal, None, id),
         };
-        if follow {
-            // Not a refusal: `to` came from the move, so it is in range
-            // and the default output is the only one there is (D3).
-            let _ = self.switch_workspace(None, WorkspaceTarget::Index(to), true);
-            let surface = self.surfaces[&object].role.wl_surface().clone();
-            self.activate_managed_window(&surface);
-        }
-        ControlReply::Body(json!({
+        let mut body = json!({
             "id": id,
             "generation": generation,
             "index": to,
-        }))
+        });
+        if follow {
+            // `to` is in range (it came from the move), so the switch only
+            // declines under an exclusive layer (D18) or with no default
+            // output at all; either way the window is off screen and the
+            // reply says so rather than claiming a follow that did not
+            // happen. Activation has the same guards, so it is skipped too.
+            self.ensure_workspace_shown(&object);
+            let followed = self.workspace_current() == to;
+            if followed {
+                let surface = self.surfaces[&object].role.wl_surface().clone();
+                self.activate_managed_window(&surface);
+            }
+            body["followed"] = json!(followed);
+        }
+        ControlReply::Body(body)
     }
 }
 
