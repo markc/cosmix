@@ -303,11 +303,14 @@ fn a_stalled_upload_is_a_miss_not_a_hide() {
 /// clock base instead of freezing the row.
 #[test]
 fn a_frame_older_than_the_reset_is_dropped_whole_unless_its_clock_differs() {
-    let mut stats = PresentationStats::new(1_000_000);
-    stats.record_discarded(3, Some(999_000));
+    // The reset sits above the pre-reset bound so "far older" is reachable
+    // without underflowing (the bound is 10 s; a 1 s base cannot express it).
+    const RESET_US: u64 = 2 * PRE_RESET_BOUND_US;
+    let mut stats = PresentationStats::new(RESET_US);
+    stats.record_discarded(3, Some(RESET_US - 1_000));
     assert_eq!((stats.presented, stats.discarded), (0, 0));
     stats.record_present(PresentSample {
-        tv_us: 999_000,
+        tv_us: RESET_US - 1_000,
         discarded: 2,
         ..PresentSample::default()
     });
@@ -315,7 +318,7 @@ fn a_frame_older_than_the_reset_is_dropped_whole_unless_its_clock_differs() {
     assert_eq!(stats.clock_base_mismatches, 0);
     // Far older than the reset: a different clock base, counted and flagged.
     stats.record_present(PresentSample {
-        tv_us: 1_000_000 - PRE_RESET_BOUND_US - 1,
+        tv_us: RESET_US - PRE_RESET_BOUND_US - 1,
         discarded: 1,
         ..PresentSample::default()
     });
