@@ -14342,10 +14342,7 @@ fn workspace_switch_hides_the_tree_without_a_configure_and_withholds_frames() {
     );
     let _ = harness.sync();
     harness.server.state.handle_frame(Vec::new());
-    assert_eq!(
-        completions(&harness.sync(), &[callback, popup_callback]),
-        2
-    );
+    assert_eq!(completions(&harness.sync(), &[callback, popup_callback]), 2);
 }
 
 /// Rule 2 (D4): a managed toplevel reads `workspace == 0` until its first
@@ -14578,7 +14575,10 @@ fn presentation_feedback_is_discarded_for_off_workspace_surfaces() {
 
 /// D18: `ensure_workspace_shown` switches to the window's workspace when it
 /// may, and is inert — returns false, changes nothing — under a session
-/// lock or an exclusive layer.
+/// lock or an exclusive layer. The two inert arms are regression GUARDS of
+/// the guard the core shipped with (slice 1), not discriminators of the
+/// switch-first wiring: they pass on that base. The unlocked arm is what
+/// discriminates the helper switching at all.
 #[test]
 fn ensure_workspace_shown_is_inert_under_a_session_lock_and_an_exclusive_layer() {
     use workspaces::WorkspaceTarget;
@@ -14757,14 +14757,21 @@ fn keyboard_enter_surfaces(events: &[(u32, u16, Vec<u8>)]) -> Vec<u32> {
         .collect()
 }
 
-/// Super+Shift+n switches FIRST and moves second, so the other windows on
-/// the workspace it leaves never gain keyboard focus: no `wl_keyboard.enter`
-/// names the bystander, and it sees no activated/deactivated round-trip.
-/// The two silent arms are whole: with no keyboard focus the chord does
-/// nothing (not even the switch), and a refused index (Super+Shift+9 with
-/// count 4) leaves the window, the workspace and the focus where they were.
+/// Super+Shift+n moves and switches in ONE settle
+/// (`move_window_and_follow`), so no other window gains keyboard focus in
+/// between — neither the bystander left on the workspace it leaves nor the
+/// one already on the workspace it arrives at: no `wl_keyboard.enter` names
+/// either, and the moved window keeps the keyboard throughout. (A switch
+/// then a move settled the target workspace once with the moved window
+/// still absent, and the target's bystander took focus for one round-trip;
+/// the arriving-bystander half is what this test adds.) The two silent arms
+/// are whole: with no keyboard focus, or a focus that is not a movable
+/// window, the chord does nothing (not even the switch, and no enter), and
+/// a refused index (Super+Shift+9 with count 4) leaves the window, the
+/// workspace and the focus where they were.
 #[test]
-fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
+fn workspace_move_chord_never_focuses_a_bystander_on_either_workspace_and_refuses_whole() {
+    use workspaces::WorkspaceTarget;
     // Focus on something that is not a movable window: a fresh harness
     // parks keyboard focus on the initial toplevel's subsurface while that
     // toplevel is still unmapped (`workspace == 0`), so the move's own
@@ -14774,12 +14781,20 @@ fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
         harness.server.state.keyboard.current_focus().is_some(),
         "precondition: the harness parks focus on the unmapped initial toplevel"
     );
+    let unmapped = test_toplevel_record(&harness).role.wl_surface().id();
+    assert_eq!(harness.server.state.surfaces[&unmapped].workspace, 0);
     harness.chord(&[125, 42, 3]);
     assert_eq!(
         harness.server.state.workspace_current(),
         1,
         "a move chord on an unmapped focus does not switch"
     );
+    assert_eq!(
+        harness.server.state.surfaces[&unmapped].workspace, 0,
+        "and does not stamp or move the unmapped window"
+    );
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(entered.is_empty(), "nothing re-focused: {entered:?}");
 
     // No keyboard focus at all: nothing switches, nothing panics.
     harness
@@ -14796,6 +14811,12 @@ fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
         1,
         "a move chord with nothing to move does not switch"
     );
+    assert!(
+        harness.server.state.keyboard.current_focus().is_none(),
+        "and hands the keyboard to nobody"
+    );
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(entered.is_empty(), "nothing re-focused: {entered:?}");
 
     let mut harness = KeybindingHarness::new(true);
     map_initial_test_toplevel(&mut harness);
@@ -14804,22 +14825,39 @@ fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
         .role
         .wl_surface()
         .clone();
-    let (bystander_id, _, _, bystander) =
-        map_named_test_toplevel(&mut harness, "Bystander", "dev.cosmix.Bystander");
+    let (leaving_id, _, _, leaving) =
+        map_named_test_toplevel(&mut harness, "Left behind", "dev.cosmix.LeftBehind");
+    // A bystander already on the TARGET workspace: mapped while 2 is
+    // current (rule 2), so it is the highest window there when the moved
+    // one arrives.
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let (arriving_id, _, _, arriving) =
+        map_named_test_toplevel(&mut harness, "Already there", "dev.cosmix.AlreadyThere");
+    assert_eq!(harness.server.state.surfaces[&arriving].workspace, 2);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
     harness.server.state.activate_managed_window(&surface);
     let _ = harness.sync();
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
         Some(surface.clone())
     );
-    assert_eq!(harness.server.state.surfaces[&bystander].workspace, 1);
+    assert_eq!(harness.server.state.surfaces[&leaving].workspace, 1);
+    assert!(!harness.server.state.surfaces[&arriving].layout.visible);
 
     // Super+Shift+9 with count 4: refused before anything moves or switches.
     harness.chord(&[125, 42, 10]);
     assert_eq!(harness.server.state.workspace_current(), 1);
     assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
     assert!(harness.server.state.surfaces[&object].layout.visible);
-    assert!(harness.server.state.surfaces[&bystander].layout.visible);
+    assert!(harness.server.state.surfaces[&leaving].layout.visible);
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
         Some(surface.clone()),
@@ -14831,23 +14869,176 @@ fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
         "a refused move re-focuses nobody: {entered:?}"
     );
 
-    // Super+Shift+2: the window moves and is followed; the bystander stays
-    // on 1, hidden, and never held the keyboard in between.
+    // Super+Shift+2: the window moves and is followed; the bystander on 1
+    // stays there, hidden; the one on 2 stays visible below it; neither
+    // held the keyboard in between.
     harness.chord(&[125, 42, 3]);
     assert_eq!(harness.server.state.workspace_current(), 2);
     assert_eq!(harness.server.state.surfaces[&object].workspace, 2);
     assert!(harness.server.state.surfaces[&object].layout.visible);
-    assert_eq!(harness.server.state.surfaces[&bystander].workspace, 1);
-    assert!(!harness.server.state.surfaces[&bystander].layout.visible);
+    assert_eq!(harness.server.state.surfaces[&leaving].workspace, 1);
+    assert!(!harness.server.state.surfaces[&leaving].layout.visible);
+    assert_eq!(harness.server.state.surfaces[&arriving].workspace, 2);
+    assert!(harness.server.state.surfaces[&arriving].layout.visible);
+    assert!(
+        surface_stack_cmp(
+            &harness.server.state.surfaces[&object],
+            &harness.server.state.surfaces[&arriving]
+        )
+        .is_gt(),
+        "the moved window arrives on top of the target's bystander"
+    );
     assert_eq!(
         focused_surface(harness.server.state.keyboard.current_focus()),
         Some(surface.clone())
     );
     let entered = keyboard_enter_surfaces(&harness.sync());
     assert!(
-        !entered.contains(&bystander_id),
-        "the bystander never gains keyboard focus during a move: {entered:?}"
+        !entered.contains(&leaving_id) && !entered.contains(&arriving_id),
+        "no bystander gains keyboard focus during a move: {entered:?}"
     );
+}
+
+/// The no-bystander guarantee holds ACROSS bands: `raise_surface` raises
+/// within the window's own `StackBand`, so a bottom-band window (the game
+/// convention) moved to a workspace whose bystander is normal-band is never
+/// the highest visible toplevel there — a settle that fell back to the
+/// highest one would hand that bystander the keyboard for one enter +
+/// activated round-trip. The settle prefers the moved window instead, so
+/// it keeps the keyboard while sitting BELOW the bystander in the stack
+/// (asserted: this is what makes the arm discriminating — the same-band
+/// test above passes on a raise alone).
+#[cfg(feature = "bus")]
+#[test]
+fn workspace_move_chord_keeps_the_keyboard_on_a_bottom_band_window_below_a_normal_bystander() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let (bystander_id, _, _, bystander) =
+        map_named_test_toplevel(&mut harness, "Normal band", "dev.cosmix.NormalBand");
+    assert_eq!(harness.server.state.surfaces[&bystander].workspace, 2);
+    assert_eq!(
+        harness.server.state.surfaces[&bystander].layout.z.band,
+        StackBand::Normal
+    );
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let id = harness.server.state.surfaces[&object].id;
+    assert!(
+        harness
+            .server
+            .state
+            .set_window_band(id, StackBand::Bottom, "test")
+            .is_some()
+    );
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "precondition: the bottom-band window holds the keyboard on workspace 1"
+    );
+
+    harness.chord(&[125, 42, 3]);
+    let state = &harness.server.state;
+    assert_eq!(state.workspace_current(), 2);
+    assert_eq!(state.surfaces[&object].workspace, 2);
+    assert!(state.surfaces[&object].layout.visible);
+    assert_eq!(state.surfaces[&object].layout.z.band, StackBand::Bottom);
+    assert!(
+        surface_stack_cmp(&state.surfaces[&object], &state.surfaces[&bystander]).is_lt(),
+        "the moved window stays BELOW the normal-band bystander (a band raise is not a stack raise)"
+    );
+    assert_eq!(
+        focused_surface(state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "and still holds the keyboard"
+    );
+    assert!(!state.surfaces[&bystander].focused);
+    let entered = keyboard_enter_surfaces(&harness.sync());
+    assert!(
+        !entered.contains(&bystander_id),
+        "the higher-band bystander never gains keyboard focus: {entered:?}"
+    );
+}
+
+/// D18 at the chord: Super+Shift+n is gated by `workspace_switch_allowed_
+/// for`, the same predicate as `send_to_workspace {follow:true}`, so with an
+/// exclusive layer on screen it neither moves the window nor switches. The
+/// keyboard is forced onto the toplevel by hand: arbitration hands it to an
+/// exclusive layer whenever one is on screen, so the seat never reaches
+/// this state on its own and the chord's movable term would refuse the
+/// layer as the focus. Forcing it is what makes the gate itself the thing
+/// under test — the base (no gate) moves the window and switches here.
+#[test]
+fn workspace_move_chord_is_withheld_under_an_exclusive_layer() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+    );
+    let _ = harness.sync();
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(layer_surface),
+        "precondition: the exclusive layer takes the keyboard"
+    );
+    assert!(harness.server.state.highest_exclusive_layer().is_some());
+    let keyboard = harness.server.state.keyboard.clone();
+    keyboard.set_focus(
+        &mut harness.server.state,
+        Some(SeatFocusTarget::Wayland(surface.clone())),
+        SERIAL_COUNTER.next_serial(),
+    );
+    let _ = harness.sync();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "precondition: the toplevel holds the keyboard under the layer (forced)"
+    );
+
+    harness.chord(&[125, 42, 3]);
+    let state = &harness.server.state;
+    assert_eq!(
+        state.workspace_current(),
+        1,
+        "the chord does not re-arrange the desktop under an exclusive layer"
+    );
+    assert_eq!(
+        state.surfaces[&object].workspace, 1,
+        "and does not move the window"
+    );
+    assert!(state.surfaces[&object].layout.visible);
 }
 
 #[test]
@@ -15030,6 +15221,126 @@ fn xdg_activation_switches_workspace_first() {
         focused_surface(harness.server.state.keyboard.current_focus()).map(|surface| surface.id()),
         Some(second.clone())
     );
+}
+
+/// The presentable term at the two callers that focus after
+/// `ensure_workspace_shown` without re-checking Alt+Tab's candidate: behind
+/// the KMS input gate (`normal_scene_restricted` while unlocked — the VT is
+/// switched away; on the winit backend it is not a session lock, so the
+/// callers' lock guards do not fire) the switch is withheld, and
+/// `arbitrate_keyboard_focus` has no presentable or workspace term of its
+/// own. So xdg-activation of an off-workspace window refuses whole (no
+/// switch, no focus) and a restore of one un-minimises without focusing,
+/// exactly as a locked restore does. Both halves are base-discriminating:
+/// on the base tree the keyboard landed on the hidden window. Lifting the
+/// gate, the same two requests switch and focus.
+#[test]
+fn a_withheld_switch_withholds_the_focus_at_xdg_activation_and_restore() {
+    use workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let first = test_toplevel_record(&harness).role.wl_surface().id();
+    let first_surface = harness.server.state.surfaces[&first]
+        .role
+        .wl_surface()
+        .clone();
+    let second = map_test_undecorated_toplevel(&mut harness);
+    let second_surface = harness.server.state.surfaces[&second]
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&second, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    harness.server.state.activate_managed_window(&first_surface);
+    let _ = harness.sync();
+    harness.server.state.kms_session_lock_gate.deferred_unlock = true;
+    {
+        let state = &harness.server.state;
+        assert!(
+            !state.session_lock_active(),
+            "winit: the gate is not a session lock, so only the presentable term holds"
+        );
+        assert!(!state.surface_is_input_presentable(&state.surfaces[&second]));
+    }
+
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("gated-token")),
+        XdgActivationTokenData::default(),
+        second_surface.clone(),
+    );
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 1, "activation: no switch");
+        assert_eq!(state.surfaces[&second].workspace, 2, "never pulled across");
+        assert!(!state.surfaces[&second].layout.visible);
+        assert!(
+            !state.surfaces[&second].focused,
+            "and not focused off screen"
+        );
+        assert_eq!(
+            focused_surface(state.keyboard.current_focus()),
+            Some(first_surface.clone())
+        );
+    }
+
+    harness.server.state.minimize_toplevel(&second_surface);
+    assert!(harness.server.state.surfaces[&second].minimized);
+    assert!(harness.server.state.restore_window(&second));
+    {
+        let state = &harness.server.state;
+        assert!(!state.surfaces[&second].minimized, "restore: un-minimised");
+        assert!(state.minimized_toplevels.is_empty());
+        assert_eq!(state.workspace_current(), 1, "restore: no switch");
+        assert!(!state.surfaces[&second].layout.visible);
+        assert!(
+            !state.surfaces[&second].focused,
+            "and not focused off screen"
+        );
+        assert_eq!(
+            focused_surface(state.keyboard.current_focus()),
+            Some(first_surface.clone())
+        );
+    }
+
+    // Gate lifted: the same activation switches and focuses.
+    harness.server.state.kms_session_lock_gate.deferred_unlock = false;
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("lifted-token")),
+        XdgActivationTokenData::default(),
+        second_surface.clone(),
+    );
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 2, "gate lifted: switched");
+        assert!(state.surfaces[&second].layout.visible);
+        assert!(state.surfaces[&second].focused);
+    }
+    // And the same restore, from workspace 1 again.
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    harness.server.state.minimize_toplevel(&second_surface);
+    assert!(harness.server.state.restore_window(&second));
+    {
+        let state = &harness.server.state;
+        assert_eq!(
+            state.workspace_current(),
+            2,
+            "gate lifted: restore switched"
+        );
+        assert!(!state.surfaces[&second].minimized);
+        assert!(state.surfaces[&second].layout.visible);
+        assert!(state.surfaces[&second].focused);
+    }
 }
 
 #[test]
@@ -36636,13 +36947,20 @@ fn session_lock_forwards_the_restore_chord_and_restores_nothing() {
     harness.chord(&[125, 42, 50]);
     let traffic = harness.sync();
     let keys = keyboard_key_events(&traffic);
-    assert!(keys.contains(&(50, 1)), "forwarded to the lock surface: {keys:?}");
+    assert!(
+        keys.contains(&(50, 1)),
+        "forwarded to the lock surface: {keys:?}"
+    );
     assert!(keys.contains(&(50, 0)));
     let record = &harness.server.state.surfaces[&object];
     assert!(record.minimized, "locked: nothing restored");
     assert_eq!(record.workspace, 2);
     assert!(!record.layout.visible);
-    assert_eq!(harness.server.state.workspace_current(), 1, "locked: no switch");
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        1,
+        "locked: no switch"
+    );
     assert_eq!(
         harness.server.state.minimized_toplevels,
         std::slice::from_ref(&object)
@@ -36657,7 +36975,11 @@ fn session_lock_forwards_the_restore_chord_and_restores_nothing() {
     assert!(!record.minimized, "unlocked: restored");
     assert_eq!(record.workspace, 2, "never pulled across");
     assert!(record.layout.visible);
-    assert_eq!(harness.server.state.workspace_current(), 2, "unlocked: switched (F1.2)");
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        2,
+        "unlocked: switched (F1.2)"
+    );
     assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 

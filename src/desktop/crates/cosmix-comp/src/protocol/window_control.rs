@@ -369,11 +369,19 @@ impl WaylandState {
     /// `comp.window.send_to_workspace`: the `{id, generation}` fence, then
     /// the move; with `follow`, a switch to the window's new workspace and
     /// its activation (D9). `next`/`prev` are relative to the window's own
-    /// workspace and always wrap. The follow goes through
-    /// `ensure_workspace_shown`, so it is inert under an exclusive layer
-    /// exactly as the switch-first paths are (D18); the reply's `followed`
-    /// says whether the workspace is now the current one, because the move
-    /// has happened by then and cannot be refused after the fact.
+    /// workspace and always wrap. The follow is gated exactly as every
+    /// switch-first path is (`workspace_switch_allowed_for`: inert under an
+    /// exclusive layer, D18, for a minimised window and behind the KMS
+    /// input gate); when allowed, the move and the switch are ONE settle
+    /// (`move_window_and_follow`) so no bystander on either workspace
+    /// takes the keyboard in between, and when not, the move alone runs.
+    /// The reply's `followed` is `workspaces.current == index` READ BACK
+    /// after the attempt, not a claim about the switch: it is true with no
+    /// switch and no activation when the window was already on the current
+    /// workspace and the gate held (a minimised window sent to the
+    /// workspace it is on answers `followed:true` and stays minimised), and
+    /// with no default output `current` reads 1. The move has happened by
+    /// then and cannot be refused after the fact.
     fn service_send_to_workspace(
         &mut self,
         id: u64,
@@ -385,9 +393,23 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
-        // Mark first: the first cause recorded for a surface wins.
-        self.mark_surface_dirty(SurfaceId(id), "comp.window");
-        let (_, to) = match self.move_window_to_workspace(&object, index.into()) {
+        // No `comp.window` mark, unlike the sibling verbs: every accepted
+        // move marks the FULL snapshot dirty (`workspace.move`, D7 — every
+        // row's visibility and the `workspaces.*` counts may change), and a
+        // full-snapshot diff carries that one cause and discards the
+        // per-surface marks, so a mark planted here could never be read.
+        // Where it could — a refused move (an index above `count`) or a
+        // send to the workspace the window is on, both of which change
+        // nothing — it would only blame `comp.window` for the next
+        // unrelated edge on this surface. `send_to_workspace_refused_index_
+        // attributes_nothing` pins both halves.
+        let follow_now = follow && self.workspace_switch_allowed_for(&object).is_some();
+        let moved = if follow_now {
+            self.move_window_and_follow(&object, index.into())
+        } else {
+            self.move_window_to_workspace(&object, index.into())
+        };
+        let (_, to) = match moved {
             Ok(moved) => moved,
             Err(refusal) => return workspace_refusal(refusal, None, id),
         };
@@ -397,12 +419,8 @@ impl WaylandState {
             "index": to,
         });
         if follow {
-            // `to` is in range (it came from the move), so the switch only
-            // declines under an exclusive layer (D18) or with no default
-            // output at all; either way the window is off screen and the
-            // reply says so rather than claiming a follow that did not
-            // happen. Activation has the same guards, so it is skipped too.
-            self.ensure_workspace_shown(&object);
+            // Read back, not assumed: with no default output there was
+            // nothing to switch, and `current` reads 1 regardless.
             let followed = self.workspace_current() == to;
             if followed {
                 let surface = self.surfaces[&object].role.wl_surface().clone();
@@ -625,14 +643,19 @@ impl WaylandState {
         let may_focus = self.highest_exclusive_layer().is_none()
             && !record.minimized
             && self.surface_is_input_presentable(record);
-        if may_focus {
-            self.mark_surface_dirty(SurfaceId(id), "comp.window");
+        let mark = may_focus.then(|| {
+            let mark = self.plant_surface_mark(id, "comp.window");
             self.ensure_workspace_shown(&object);
-        }
+            mark
+        });
         // Re-fetched, not indexed: the switch settles the scene in between
         // and the record's liveness across that is not an invariant the
-        // settle promises.
+        // settle promises. A record gone here changed nothing the verb can
+        // own, so its planted mark goes with it.
         let Some(record) = self.surfaces.get(&object) else {
+            if let Some(mark) = mark {
+                self.unplant_surface_mark(mark);
+            }
             return ControlReply::WindowTarget {
                 id,
                 error: WindowTargetError::UnknownWindow,
@@ -661,6 +684,13 @@ impl WaylandState {
             } else {
                 self.arbitrate_keyboard_focus(Some(surface), false, false);
             }
+        } else if let Some(mark) = mark {
+            // `not_visible` past the `may_focus` terms: the switch did not
+            // run (no default output) or did not make the window visible.
+            // Nothing changed, so the refusal attributes nothing — the
+            // mark planted above would otherwise blame `comp.window` for
+            // the next unrelated edge on this surface.
+            self.unplant_surface_mark(mark);
         }
         let focused = self
             .surfaces

@@ -2423,8 +2423,18 @@ impl XdgActivationHandler for WaylandState {
         // that workspace first (the lock above and the exclusive-layer rule
         // inside the helper keep it inert where a switch is not allowed, and
         // the helper's candidacy terms keep it inert for a non-presentable
-        // window, which the arbitration below would not focus either).
+        // window). A window the helper could not bring on screen is then
+        // NOT activated: `arbitrate_keyboard_focus` has no presentable or
+        // workspace term, so without this refusal the keyboard would move
+        // to a window that is off screen (0.59.0 answers a withheld switch
+        // with a refusal, never with a focus the user cannot see).
         self.ensure_workspace_shown(&surface.id());
+        if self.window_off_current_workspace(&surface.id()) {
+            tracing::debug!(
+                "xdg-activation for a window whose workspace cannot be shown: not activated"
+            );
+            return;
+        }
         self.raise_for_focus_interaction(&surface);
         self.arbitrate_keyboard_focus(Some(surface), false, false);
     }

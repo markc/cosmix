@@ -12294,50 +12294,42 @@ impl WaylandState {
                     return;
                 };
                 let root = canonical_root_surface(&self.popup_manager, &focused);
-                // Switch FIRST, then move. Moving first withdraws the window
-                // while its old workspace is still on screen, and that
-                // settle hands keyboard focus to whichever bystander is
-                // left there — an enter + activated configure the switch
-                // immediately reverses. Switching first leaves the old
-                // workspace's other windows untouched; the move then lands
-                // the window on the now-current workspace and the activate
-                // returns focus to it. The predicate is the move's own (a
-                // mapped managed toplevel on a real workspace), checked up
-                // front so a refused move never leaves a stray switch behind.
-                let movable = self.surfaces.get(&root.id()).is_some_and(|record| {
-                    record.mapped && record.role.managed_toplevel() && record.workspace != 0
-                });
-                if !movable {
+                // D18, the same gate as `send_to_workspace {follow:true}`
+                // and every other switch-first path: a chord that will
+                // activate the window afterwards must not re-arrange the
+                // desktop under an exclusive layer (a lock never dispatches
+                // it), nor for a focus that is not a movable, presentable
+                // window. Arbitration hands the keyboard to an exclusive
+                // layer whenever one is on screen, so this arm is the guard
+                // that keeps the chord and the verb one policy rather than
+                // a state the seat reaches on its own.
+                if self.workspace_switch_allowed_for(&root.id()).is_none() {
                     tracing::debug!(
                         surface = ?root.id(),
                         workspace = n,
-                        "workspace-move chord refused: focus is not a movable window"
+                        "workspace-move chord withheld: switch not allowed for the focus"
                     );
                     return;
                 }
+                // Move and switch in ONE settle (`move_window_and_follow`):
+                // a move then a switch, or a switch then a move, each
+                // settle the scene once with this window off it, and that
+                // settle hands the keyboard to whichever bystander is left
+                // highest — on the old workspace or the new one — for an
+                // enter + activated configure the activation below reverses
+                // at once. The primitive refuses (an index above
+                // `workspaces.count`) before anything changes, so a refused
+                // chord leaves the window, the workspace and the focus
+                // exactly where they were.
                 let target = workspaces::WorkspaceTarget::Index(u32::from(n));
-                if let Err(refusal) = self.switch_workspace(None, target, true) {
-                    tracing::debug!(
+                match self.move_window_and_follow(&root.id(), target) {
+                    Ok(_) => self.activate_managed_window(&root),
+                    Err(refusal) => tracing::debug!(
                         surface = ?root.id(),
                         workspace = n,
                         ?refusal,
                         "workspace-move chord refused"
-                    );
-                    return;
-                }
-                match self.move_window_to_workspace(&root.id(), target) {
-                    Ok(_) => self.activate_managed_window(&root),
-                    Err(refusal) => {
-                        // Unreachable after the predicate and the switch
-                        // both passed; logged rather than asserted because a
-                        // key press has nobody to reply to.
-                        tracing::debug!(
-                            surface = ?root.id(),
-                            workspace = n,
-                            ?refusal,
-                            "workspace-move chord switched but could not move"
-                        );
-                    }
+                    ),
                 }
             }
             BindingAction::CycleWindow { reverse } => self.cycle_window(reverse),
@@ -13689,7 +13681,11 @@ impl WaylandState {
     /// the LIFO entry) when the object is not a mapped, minimised, managed
     /// toplevel. No lock guard of its own: `ensure_workspace_shown` is inert
     /// under a session lock or an exclusive layer (D18), so a locked restore
-    /// un-minimises without switching and the window stays off screen.
+    /// un-minimises without switching and the window stays off screen — and
+    /// then it is NOT focused either: `arbitrate_keyboard_focus` has no
+    /// workspace term, so a restore whose switch was withheld (a lock, an
+    /// exclusive layer, the KMS input gate) leaves the keyboard where it
+    /// was rather than on a window that is off screen.
     fn restore_window(&mut self, object: &ObjectId) -> bool {
         self.minimized_toplevels.retain(|entry| entry != object);
         let restored = self.surfaces.get_mut(object).and_then(|record| {
@@ -13703,6 +13699,7 @@ impl WaylandState {
             return false;
         };
         self.ensure_workspace_shown(object);
+        let shown = !self.window_off_current_workspace(object);
         // D15: un-minimised is not the same as on screen — a window still
         // off the current workspace (a restore the lock or an exclusive
         // layer kept from switching) stays suspended.
@@ -13712,7 +13709,14 @@ impl WaylandState {
         self.mark_surface_dirty(_id, "wayland.focus");
         self.recompute_effective_visibility();
         self.raise_surface(&surface);
-        self.arbitrate_keyboard_focus(Some(surface), false, false);
+        if shown {
+            self.arbitrate_keyboard_focus(Some(surface), false, false);
+        } else {
+            tracing::debug!(
+                surface = ?object,
+                "restore could not show the window's workspace: un-minimised, not focused"
+            );
+        }
         self.retarget_pointer_after_visibility_change();
         true
     }

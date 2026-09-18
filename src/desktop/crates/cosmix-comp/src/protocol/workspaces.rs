@@ -41,11 +41,9 @@ impl Default for WorkspaceState {
     }
 }
 
-/// Where a switch or a move is aimed.
-// `Next`/`Prev` are only constructed by the verbs' `From<WorkspaceIndex>`,
-// and `window_control` is `cfg(bus)`: without the allow the
-// `--no-default-features` gate (D20) reports them never constructed. Drop
-// it with the first non-bus constructor (the chords, slice 5).
+/// Where a switch or a move is aimed. `Next`/`Prev` have a non-bus
+/// constructor (the `workspace-next` / `workspace-prev` chords), so the
+/// `--no-default-features` gate (D20) sees every variant constructed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkspaceTarget {
     /// A 1-based workspace index.
@@ -131,6 +129,15 @@ pub(super) fn on_workspace(record: &SurfaceRecord, current: u32) -> bool {
     !record.role.managed_toplevel() || record.workspace == current
 }
 
+/// THE movable term: what `move_window_to_workspace` (and so every move —
+/// the `windows.s<id>.workspace` write, `send_to_workspace`, the
+/// Super+Shift+n chord) accepts. A mapped managed toplevel on a real
+/// workspace; a record between its MapRequest and first commit still reads
+/// `workspace == 0` and is not movable yet.
+pub(super) fn workspace_movable(record: &SurfaceRecord) -> bool {
+    record.mapped && record.role.managed_toplevel() && record.workspace != 0
+}
+
 /// D15's rule for an X11 window's `_NET_WM_STATE_HIDDEN` / suspended flag:
 /// hidden when minimised OR off the current workspace. Every site that
 /// sets the flag derives it from here, so no path can un-suspend a window
@@ -213,13 +220,14 @@ impl WaylandState {
     }
 }
 
-// The primitives. `switch_workspace` and `move_window_to_workspace` have a
-// non-bus production caller (the workspace chords, `handle_binding_action`),
-// and `ensure_workspace_shown` is wired at every bring-into-view path (slice
-// 2), so the block is NOT allowed dead: a genuinely dead helper trips the
-// lint. The one whose only caller is `cfg(bus)` — `set_workspace_count` (the
-// `workspaces.count` prop) — reads dead to the `--no-default-features` gate
-// (D20) and carries a per-item allow; drop it with its first non-bus caller.
+// The primitives. `switch_workspace`, `move_window_to_workspace` and
+// `move_window_and_follow` have non-bus production callers (the workspace
+// chords, `handle_binding_action`), and `ensure_workspace_shown` is wired at
+// every bring-into-view path (slice 2), so the block is NOT allowed dead: a
+// genuinely dead helper trips the lint. The one whose only caller is
+// `cfg(bus)` — `set_workspace_count` (the `workspaces.count` prop) — reads
+// dead to the `--no-default-features` gate (D20) and carries a per-item
+// allow; drop it with its first non-bus caller.
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
     /// `Some(k)` must be the default output's key or name (D3). Any other
@@ -301,13 +309,48 @@ impl WaylandState {
     }
 
     /// The one visibility settle every workspace change ends in: the same
-    /// sequence `minimize_toplevel` runs, plus the X stacking sync.
-    fn settle_workspace_visibility(&mut self) {
+    /// sequence `minimize_toplevel` runs, plus the X stacking sync. The
+    /// keyboard goes to `prefer` when a caller names a window it is about
+    /// to activate anyway (`move_window_and_follow`), else to the highest
+    /// visible toplevel — the same arbitration, the same lock and
+    /// exclusive-layer arms (under either, the request is ignored and the
+    /// lock or layer keeps the keyboard). Preferring is what keeps a moved
+    /// window's arrival from handing the keyboard to a bystander in a
+    /// higher band for one round-trip: `raise_surface` raises within the
+    /// window's own `StackBand`, so a bottom-band window is never the
+    /// highest visible toplevel while a normal one shares the workspace.
+    fn settle_workspace_visibility(&mut self, prefer: Option<WlSurface>) {
         self.recompute_effective_visibility();
-        self.focus_highest_visible_toplevel();
+        self.arbitrate_keyboard_focus(prefer, true, false);
         self.retarget_pointer_after_visibility_change();
         #[cfg(feature = "xwayland")]
         self.sync_xwm_stacking();
+    }
+
+    /// THE per-window relabel every move goes through (`move_window_to_
+    /// workspace` and `move_window_and_follow`): the record's workspace,
+    /// the EWMH per-window `_NET_WM_DESKTOP` (D19, beside the record write —
+    /// the suspend sync the caller runs derives from the same record) and
+    /// the surface's dirty mark, nothing else — the caller runs the
+    /// withdraw/present half and the settle. One site, so the per-move
+    /// publication lands on every path (including the release-arm revert
+    /// in `move_window_and_follow`, which relabels back to `from`).
+    fn relabel_workspace(&mut self, object: &ObjectId, to: u32) {
+        let Some(record) = self.surfaces.get_mut(object) else {
+            return;
+        };
+        record.workspace = to;
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = record.role.x11()
+            && let Err(error) = role.surface.set_desktop(to - 1)
+        {
+            tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP on move");
+        }
+        #[cfg(feature = "bus")]
+        {
+            let id = record.id;
+            self.mark_surface_dirty(id, "workspace.move");
+        }
     }
 
     /// Switch the output `key` (`None` = default) to `target`. Refuses an
@@ -320,6 +363,19 @@ impl WaylandState {
         key: Option<&str>,
         target: WorkspaceTarget,
         wrap: bool,
+    ) -> Result<WorkspaceSwitch, WorkspaceRefusal> {
+        self.switch_workspace_focusing(key, target, wrap, None)
+    }
+
+    /// `switch_workspace` with the settle's keyboard preference (see
+    /// `settle_workspace_visibility`); `move_window_and_follow` names the
+    /// window it is bringing along so the settle lands on it.
+    fn switch_workspace_focusing(
+        &mut self,
+        key: Option<&str>,
+        target: WorkspaceTarget,
+        wrap: bool,
+        prefer: Option<WlSurface>,
     ) -> Result<WorkspaceSwitch, WorkspaceRefusal> {
         let output = self
             .resolve_workspace_output(key)
@@ -362,7 +418,7 @@ impl WaylandState {
         // so it reads the new value.
         #[cfg(feature = "xwayland")]
         self.publish_x11_desktops();
-        self.settle_workspace_visibility();
+        self.settle_workspace_visibility(prefer);
         Ok(WorkspaceSwitch { output, from, to })
     }
 
@@ -370,23 +426,28 @@ impl WaylandState {
     /// `Next`/`Prev` are relative to the window's own workspace and always
     /// wrap. Returns `(from, to)`; never touches the window's generation
     /// (the object is the same window, only placed elsewhere).
-    // Every production caller is behind a feature (`bus`: the
-    // `windows.s<id>.workspace` write and `comp.window.send_to_workspace`;
-    // `xwayland`: the `_NET_WM_DESKTOP` request), so `--no-default-features`
-    // still has none.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn move_window_to_workspace(
         &mut self,
         object: &ObjectId,
         target: WorkspaceTarget,
     ) -> Result<(u32, u32), WorkspaceRefusal> {
+        self.move_window_to_workspace_focusing(object, target, None)
+    }
+
+    /// `move_window_to_workspace` with the settle's keyboard preference
+    /// (see `settle_workspace_visibility`); only a move that leaves or
+    /// arrives on the current workspace settles at all.
+    fn move_window_to_workspace_focusing(
+        &mut self,
+        object: &ObjectId,
+        target: WorkspaceTarget,
+        prefer: Option<WlSurface>,
+    ) -> Result<(u32, u32), WorkspaceRefusal> {
         let count = self.workspaces.count;
         let from = self
             .surfaces
             .get(object)
-            .filter(|record| {
-                record.mapped && record.role.managed_toplevel() && record.workspace != 0
-            })
+            .filter(|record| workspace_movable(record))
             .map(|record| record.workspace)
             .ok_or(WorkspaceRefusal::NotAWindow)?;
         let to = resolve_workspace_target(from, count, target, true)?;
@@ -394,34 +455,109 @@ impl WaylandState {
             return Ok((from, to));
         }
         let current = self.workspace_current();
-        if let Some(record) = self.surfaces.get_mut(object) {
-            record.workspace = to;
-            // EWMH per-window `_NET_WM_DESKTOP` beside the record write
-            // (the suspend sync below derives from the same record).
-            #[cfg(feature = "xwayland")]
-            if let Some(role) = record.role.x11()
-                && let Err(error) = role.surface.set_desktop(to - 1)
-            {
-                tracing::debug!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP on move");
-            }
-        }
+        self.relabel_workspace(object, to);
         if from == current {
             self.withdraw_window_for_workspace(object, "workspace.move");
         } else if to == current {
             self.present_window_for_workspace(object, "workspace.move");
-        } else {
-            #[cfg(feature = "bus")]
-            if let Some(id) = self.surfaces.get(object).map(|record| record.id) {
-                self.mark_surface_dirty(id, "workspace.move");
-            }
         }
         // `workspaces.list` window counts change on every move.
         #[cfg(feature = "bus")]
         self.mark_workspaces_dirty("workspace.move");
         if from == current || to == current {
-            self.settle_workspace_visibility();
+            self.settle_workspace_visibility(prefer);
         }
         Ok((from, to))
+    }
+
+    /// Move one window to `target` AND make that workspace the default
+    /// output's current one, in ONE settle, with the window on screen, on
+    /// top of its band and holding the keyboard throughout — so no
+    /// bystander on either workspace takes the keyboard in between (the
+    /// Super+Shift+n chord and `send_to_workspace {follow:true}`). Doing it
+    /// as a move then a switch (or a switch then a move) hands focus to
+    /// whichever window is left highest on the workspace being shown at
+    /// the settle — an enter plus an activated configure the caller's
+    /// activation immediately reverses. Here the record is relabelled
+    /// first, so the switch sees the window ARRIVING rather than leaving
+    /// (never withdrawn, never suspended), and the settle is told to
+    /// prefer it, so the keyboard lands on it whatever band it is in
+    /// (`raise_surface` raises within the band only, so being on top of a
+    /// bottom-band window's band is not being the highest visible
+    /// toplevel).
+    ///
+    /// Refuses exactly what `move_window_to_workspace` refuses, before
+    /// anything changes; with no default output the switch has nothing to
+    /// move and this is the plain move. Returns `(from, to)`; a window
+    /// already on the current workspace is only moved when `to` differs.
+    ///
+    /// The primitive does not gate on D18 — both callers do, with
+    /// `workspace_switch_allowed_for`, the one predicate every switch-first
+    /// path shares — but its keyboard preference does: a window that gate
+    /// would not let a switch bring into focus (minimised, not presentable,
+    /// a lock or an exclusive layer on screen) is moved and raised, and the
+    /// settle's fallback keeps the keyboard where the lock or layer says.
+    /// The caller activates afterwards; for a window already preferred that
+    /// is a no-op, so there is exactly one enter.
+    pub(crate) fn move_window_and_follow(
+        &mut self,
+        object: &ObjectId,
+        target: WorkspaceTarget,
+    ) -> Result<(u32, u32), WorkspaceRefusal> {
+        let Some(output) = self.resolve_workspace_output(None) else {
+            return self.move_window_to_workspace(object, target);
+        };
+        let count = self.workspaces.count;
+        let from = self
+            .surfaces
+            .get(object)
+            .filter(|record| workspace_movable(record))
+            .map(|record| record.workspace)
+            .ok_or(WorkspaceRefusal::NotAWindow)?;
+        let to = resolve_workspace_target(from, count, target, true)?;
+        let current = self.current_workspace_for(Some(&output));
+        let surface = self.surfaces[object].role.wl_surface().clone();
+        let prefer = self
+            .workspace_switch_allowed_for(object)
+            .map(|_| surface.clone());
+        // Nothing below can refuse: `to` came from the ring and `output`
+        // from `resolve_workspace_output`, which round-trips its own key.
+        // On top of its band first, so the arrival is also a raise.
+        self.raise_surface(&surface);
+        if to == current {
+            return self.move_window_to_workspace_focusing(object, target, prefer);
+        }
+        if from != to {
+            self.relabel_workspace(object, to);
+        }
+        // The window is on `to` already, so the switch presents it.
+        match self.switch_workspace_focusing(
+            Some(&output),
+            WorkspaceTarget::Index(to),
+            true,
+            prefer,
+        ) {
+            Ok(_) => Ok((from, to)),
+            Err(refusal) => {
+                // Unreachable by construction (see above), and a debug
+                // build says so. The release arm puts the label back so a
+                // refusal is not reported alongside a half-done move; it
+                // is NOT a full undo — the raise above stays (there is no
+                // un-raise), and the `workspace.move` mark the first
+                // relabel planted stays on the surface (the second relabel
+                // only re-marks it). Both are accepted for a branch no
+                // caller can reach, rather than carrying restore state for
+                // it; if `switch_workspace_focusing` ever grows a refusal
+                // this can hit, this arm needs a real undo.
+                if cfg!(debug_assertions) {
+                    unreachable!("move_window_and_follow: switch refused {refusal:?}");
+                }
+                if from != to {
+                    self.relabel_workspace(object, from);
+                }
+                Err(refusal)
+            }
+        }
     }
 
     /// Set the workspace count. Shrinking strands: every window above the
@@ -435,7 +571,10 @@ impl WaylandState {
     /// side effect added to `present_window_for_workspace` later must be
     /// added to `sync_x11_suspended_for_workspaces` too (or the shrink path
     /// switched to the per-window halves).
-    #[cfg_attr(not(test), allow(dead_code))]
+    // The one production caller is the `workspaces.count` props write
+    // (`port_observation`, a bus-only module), as the crate's other
+    // bus-only entry points say it.
+    #[cfg_attr(not(feature = "bus"), allow(dead_code))]
     pub(crate) fn set_workspace_count(
         &mut self,
         count: u32,
@@ -487,29 +626,33 @@ impl WaylandState {
             self.sync_x11_desktops();
             self.publish_x11_desktops();
         }
-        self.settle_workspace_visibility();
+        self.settle_workspace_visibility(None);
         Ok((old, count))
     }
 
-    /// Bring a window's workspace on screen before activating it (focus,
-    /// restore, xdg-activation, X11 activate/unminimise all go through
-    /// this). Returns `true` when it switched. Inert — no side effects at
-    /// all — under a session lock or an exclusive layer (D18): the lock or
-    /// the layer owns what is on screen, and a client-driven X11 path has no
-    /// guard of its own.
+    /// The one gate on a bring-into-view switch: `Some(workspace)` when a
+    /// switch to `object`'s workspace may run, `None` when it must not.
+    /// `None` under a session lock or an exclusive layer (D18: the lock or
+    /// the layer owns what is on screen, and a client-driven X11 path has
+    /// no guard of its own), and for a window that could not take focus
+    /// once shown — a minimised one, or one that is not input-presentable
+    /// (the KMS gate while the VT is switched away): a refused activation
+    /// must not change the desktop. The terms are `window_switch_candidate`'s
+    /// minus `layout.visible`, which is what the switch itself sets.
     ///
-    /// Equally inert for a window that could not take focus once shown — a
-    /// minimised one, or one that is not input-presentable (the KMS gate
-    /// while the VT is switched away): every caller refuses or no-ops on
-    /// those, and a refused activation must not change the desktop. The
-    /// terms are `window_switch_candidate`'s minus `layout.visible`, which
-    /// is what the switch itself sets.
-    pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
+    /// Every caller that goes on to focus must either see the switch run or
+    /// refuse: `activate_managed_window` re-checks the candidate after,
+    /// `service_window_focus` gates on the same terms before, and
+    /// `restore_window` / xdg-activation withhold the focus when
+    /// `window_off_current_workspace` is still true after the attempt.
+    /// `arbitrate_keyboard_focus` has no presentable or workspace term of
+    /// its own, so a caller that skipped that would focus an off-screen
+    /// window.
+    pub(super) fn workspace_switch_allowed_for(&self, object: &ObjectId) -> Option<u32> {
         if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
-            return false;
+            return None;
         }
-        let Some(workspace) = self
-            .surfaces
+        self.surfaces
             .get(object)
             .filter(|record| {
                 record.mapped
@@ -520,7 +663,29 @@ impl WaylandState {
                     && self.surface_is_input_presentable(record)
             })
             .map(|record| record.workspace)
-        else {
+    }
+
+    /// Whether `object` is a mapped managed toplevel whose workspace is NOT
+    /// the default output's current one — the check a focus-after-switch
+    /// caller makes once `ensure_workspace_shown` has had its say. False
+    /// for everything that has no workspace of its own (an unstamped or
+    /// non-toplevel surface is on every workspace, as `on_workspace`
+    /// reads it), so a caller refusing on `true` refuses exactly the
+    /// windows the switch would have shown.
+    pub(super) fn window_off_current_workspace(&self, object: &ObjectId) -> bool {
+        let current = self.workspace_current();
+        self.surfaces
+            .get(object)
+            .is_some_and(|record| workspace_movable(record) && record.workspace != current)
+    }
+
+    /// Bring a window's workspace on screen before activating it (focus,
+    /// restore, xdg-activation, X11 activate/unminimise all go through
+    /// this). Returns `true` when it switched; inert — no side effects at
+    /// all — whenever `workspace_switch_allowed_for` says no, or the window
+    /// is already on the current workspace.
+    pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
+        let Some(workspace) = self.workspace_switch_allowed_for(object) else {
             return false;
         };
         if workspace == self.workspace_current() {
