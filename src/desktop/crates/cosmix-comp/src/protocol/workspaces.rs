@@ -47,7 +47,6 @@ impl Default for WorkspaceState {
 
 /// Where a switch or a move is aimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {
     /// A 1-based workspace index.
     Index(u32),
@@ -57,7 +56,6 @@ pub(crate) enum WorkspaceTarget {
 
 /// Why a workspace primitive changed nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceRefusal {
     /// An index outside `1..=count`.
     InvalidIndex { count: u32 },
@@ -74,7 +72,6 @@ pub(crate) enum WorkspaceRefusal {
 
 /// What a switch did.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WorkspaceSwitch {
     pub(crate) output: String,
     pub(crate) from: u32,
@@ -134,7 +131,6 @@ pub(super) fn x11_suspended(record: &SurfaceRecord, current: u32) -> bool {
 }
 
 /// Resolve a target against the workspace `from` on a `count`-wide ring.
-#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_workspace_target(
     from: u32,
     count: u32,
@@ -199,9 +195,11 @@ impl WaylandState {
     }
 }
 
-// The primitives: no production caller until the verb, prop and binding
-// slices land on this one (the tests drive them directly), so the block is
-// allowed dead outside tests. The readers above are NOT — they have callers
+// The primitives: `switch_workspace` and `move_window_to_workspace` have
+// their production caller (the `comp.workspace.switch` /
+// `comp.window.send_to_workspace` verbs); `set_workspace_count` and
+// `ensure_workspace_shown` wait for the prop and switch-first slices, so
+// the block stays allowed dead outside tests until those land. The readers above are NOT — they have callers
 // on the frame path — so a genuinely dead helper there still trips the lint.
 // Drop the attribute with the first wired caller.
 #[cfg_attr(not(test), allow(dead_code))]
