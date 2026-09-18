@@ -78,6 +78,11 @@ pub(crate) struct SharedSurfaceState {
     net_state: HashSet<Atom>,
     motif_hints: Vec<u32>,
     window_type: Vec<Atom>,
+    // Downstream (cosmix): the last `_NET_WM_DESKTOP` the WM published for
+    // this window (0-based), mirrored so `desktop()` reads it back without
+    // a round trip — and so the offline compositor tests, whose connection
+    // is dead, can still see what the WM asked for.
+    desktop: Option<u32>,
 }
 
 pub(super) type Protocols = Vec<WMProtocol>;
@@ -193,6 +198,7 @@ impl X11Surface {
                 net_state: HashSet::new(),
                 motif_hints: vec![0; 5],
                 window_type: Vec::new(),
+                desktop: None,
             })),
             user_data: Arc::new(UserDataMap::new()),
         }
@@ -597,6 +603,35 @@ impl X11Surface {
             self.change_net_state(&[], &[self.atoms._NET_WM_STATE_HIDDEN])?;
         }
         Ok(())
+    }
+
+    /// Publish the window's 0-based virtual desktop as its `_NET_WM_DESKTOP`
+    /// property. Downstream (cosmix): the compositor owns the desktop model
+    /// and calls this whenever the window's workspace is stamped or moved;
+    /// a client's own request arrives as `XwmHandler::desktop_request` and
+    /// is honoured, or not, by the compositor calling this. A single
+    /// property write: no server grab. The value is mirrored before the
+    /// connection is touched so `desktop()` reads back what was asked for
+    /// even when the write fails (a dead connection is the offline tests'
+    /// normal state).
+    pub fn set_desktop(&self, desktop: u32) -> Result<(), ConnectionError> {
+        self.state.lock().unwrap().desktop = Some(desktop);
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        conn.change_property32(
+            PropMode::REPLACE,
+            self.window,
+            self.atoms._NET_WM_DESKTOP,
+            AtomEnum::CARDINAL,
+            &[desktop],
+        )?;
+        conn.flush()
+    }
+
+    /// The last 0-based virtual desktop published for this window through
+    /// [`set_desktop`](Self::set_desktop), or `None` before the first
+    /// publication. Downstream (cosmix).
+    pub fn desktop(&self) -> Option<u32> {
+        self.state.lock().unwrap().desktop
     }
 
     /// Sets the window as activated or not.

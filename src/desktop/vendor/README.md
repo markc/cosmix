@@ -661,6 +661,25 @@ authority. The compositor calls the setter for every seat focus change;
 offline tests cover target selection and pin the event/source routing, while
 property delivery and `xdotool --sync` remain live-test obligations.
 
+EWMH virtual desktops (2026-09-18, comp 0.59.0 workspaces, slice 6), in the
+same policy-in-the-compositor style: the `_NET_NUMBER_OF_DESKTOPS`,
+`_NET_CURRENT_DESKTOP` and `_NET_WM_DESKTOP` atoms are interned, advertised
+in `_NET_SUPPORTED`, and the root pair is written as `1`/`0` in `start_wm` so
+a reader never sees the property absent before the compositor's first
+publication. `X11Wm::set_number_of_desktops` and `X11Wm::set_current_desktop`
+write the root pair (`CARDINAL`, 0-based current) and flush;
+`X11Surface::set_desktop` writes the per-window `_NET_WM_DESKTOP` (a single
+property, no server grab) and mirrors the value into the shared state first,
+so `X11Surface::desktop()` reads back the last value asked for even when the
+connection is dead — which is how `cosmix-comp`'s offline tests pin the
+0-based stamp-at-map and move values without a wire. `XwmHandler::
+desktop_request(xwm, window, desktop, source)` is dispatched for 32-bit
+`_NET_WM_DESKTOP` client messages (the window found by XID, data[0] the
+desktop or `0xFFFFFFFF`, data[1] the source); the default is a no-op and the
+arm writes nothing: the compositor owns the desktop model and publishes the
+property itself if it honours the request. Property delivery is a live-gate
+obligation (`xprop -root _NET_CURRENT_DESKTOP` in the nested workspace gate).
+
 `X11Wm::begin_shutdown` and `XWaylandClientData::begin_shutdown` mark a live
 generation before deliberate disconnection. Only marked EOF/reset and child
 exit code 1 are classified as expected teardown; already-exited children,

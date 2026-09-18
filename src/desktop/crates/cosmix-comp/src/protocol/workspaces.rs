@@ -102,6 +102,14 @@ pub(crate) fn output_key(name: &str) -> String {
 pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: bool, current: u32) {
     if !was_mapped && record.mapped && record.role.managed_toplevel() {
         record.workspace = current;
+        // EWMH: the window's `_NET_WM_DESKTOP` is written HERE, at the
+        // stamping edge, never at MapRequest (D19). `let _` like
+        // `set_suspended`: the offline fakes have a dead connection, and a
+        // live failure is a dying generation `disconnected` cleans up.
+        #[cfg(feature = "xwayland")]
+        if let Some(role) = record.role.x11() {
+            let _ = role.surface.set_desktop(current.saturating_sub(1));
+        }
     }
 }
 
@@ -348,6 +356,10 @@ impl WaylandState {
         }
         #[cfg(feature = "bus")]
         self.mark_workspaces_dirty("workspace.switch");
+        // EWMH root `_NET_CURRENT_DESKTOP`: after `current` moved (above)
+        // so it reads the new value.
+        #[cfg(feature = "xwayland")]
+        self.publish_x11_desktops();
         self.settle_workspace_visibility();
         Ok(WorkspaceSwitch { output, from, to })
     }
@@ -379,6 +391,12 @@ impl WaylandState {
         let current = self.workspace_current();
         if let Some(record) = self.surfaces.get_mut(object) {
             record.workspace = to;
+            // EWMH per-window `_NET_WM_DESKTOP` beside the record write
+            // (the suspend sync below derives from the same record).
+            #[cfg(feature = "xwayland")]
+            if let Some(role) = record.role.x11() {
+                let _ = role.surface.set_desktop(to - 1);
+            }
         }
         if from == current {
             self.withdraw_window_for_workspace(object, "workspace.move");
@@ -428,6 +446,9 @@ impl WaylandState {
         #[cfg(feature = "bus")]
         self.mark_workspaces_dirty("workspace.count");
         if count > old {
+            // A grow strands nothing: only the root count changes.
+            #[cfg(feature = "xwayland")]
+            self.publish_x11_desktops();
             return Ok((old, count));
         }
         #[cfg(feature = "bus")]
@@ -449,7 +470,13 @@ impl WaylandState {
             }
         }
         #[cfg(feature = "xwayland")]
-        self.sync_x11_suspended_for_workspaces();
+        {
+            self.sync_x11_suspended_for_workspaces();
+            // Both the count and (possibly) `current` changed, and stranded
+            // windows moved: republish the root pair and every window.
+            self.publish_x11_desktops();
+            self.sync_x11_desktops();
+        }
         self.settle_workspace_visibility();
         Ok((old, count))
     }

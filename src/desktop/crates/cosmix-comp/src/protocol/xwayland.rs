@@ -652,6 +652,85 @@ impl WaylandState {
         }
     }
 
+    /// Publish the workspace model to the X root: `_NET_NUMBER_OF_DESKTOPS`
+    /// and the 0-based `_NET_CURRENT_DESKTOP`. Called on every switch and
+    /// count change and once at XWM start; a no-op without a live
+    /// generation. Property delivery is a live-gate obligation (the offline
+    /// suite never reaches `Ready`).
+    pub(super) fn publish_x11_desktops(&self) {
+        let XwaylandLifecycle::Ready { wm, .. } = &self.xwayland.lifecycle else {
+            return;
+        };
+        let count = self.workspaces.count;
+        let current = self.workspace_current().saturating_sub(1);
+        if let Err(error) = wm.set_number_of_desktops(count) {
+            tracing::warn!(%error, count, "failed to publish _NET_NUMBER_OF_DESKTOPS");
+        }
+        if let Err(error) = wm.set_current_desktop(current) {
+            tracing::warn!(%error, current, "failed to publish _NET_CURRENT_DESKTOP");
+        }
+    }
+
+    /// Re-publish `_NET_WM_DESKTOP` on every mapped managed X11 window from
+    /// its record (the mass re-derivation for a count shrink and for XWM
+    /// start). The per-window edges — the stamp at map and a move — write
+    /// their own value at the site that changes the record.
+    pub(super) fn sync_x11_desktops(&self) {
+        for record in self.surfaces.values() {
+            if !record.mapped || record.workspace == 0 {
+                continue;
+            }
+            if let Some(role) = record.role.x11()
+                && !role.override_redirect
+                && let Err(error) = role.surface.set_desktop(record.workspace - 1)
+            {
+                tracing::warn!(%error, xid = role.surface.window_id(), "failed to publish _NET_WM_DESKTOP");
+            }
+        }
+    }
+
+    /// A client's `_NET_WM_DESKTOP` message: move its window to the 0-based
+    /// `desktop` without switching (the EWMH request is a placement, not an
+    /// activation; `_NET_ACTIVE_WINDOW` is the one that brings a window on
+    /// screen). Refused, with a debug log: `0xFFFFFFFF` (all desktops — no
+    /// sticky windows in 0.59.0), an index at or above the count, a session
+    /// lock (the props write refuses the same way), and any window that is
+    /// not a live managed one. The move itself publishes the new value.
+    pub(super) fn x11_desktop_request(&mut self, window: X11Surface, desktop: u32) {
+        let xid = window.window_id();
+        let count = self.workspaces.count;
+        if desktop == u32::MAX {
+            tracing::debug!(xid, "ignored _NET_WM_DESKTOP 0xFFFFFFFF: no sticky windows in 0.59");
+            return;
+        }
+        if desktop >= count {
+            tracing::debug!(xid, desktop, count, "ignored _NET_WM_DESKTOP above the workspace count");
+            return;
+        }
+        if self.session_lock_active() {
+            tracing::debug!(xid, desktop, "ignored _NET_WM_DESKTOP under a session lock");
+            return;
+        }
+        let Some(surface) = window.wl_surface() else {
+            return;
+        };
+        // The same identity gate as `_NET_ACTIVE_WINDOW`: a stale association
+        // or an override-redirect window is not a live managed identity.
+        let object = surface.id();
+        if !self.surfaces.get(&object).is_some_and(|record| {
+            record
+                .role
+                .x11()
+                .is_some_and(|role| !role.override_redirect && role.surface == window)
+        }) {
+            return;
+        }
+        match self.move_window_to_workspace(&object, workspaces::WorkspaceTarget::Index(desktop + 1)) {
+            Ok((from, to)) => tracing::debug!(xid, from, to, "moved X11 window on _NET_WM_DESKTOP"),
+            Err(refusal) => tracing::debug!(xid, desktop, ?refusal, "refused _NET_WM_DESKTOP move"),
+        }
+    }
+
     pub(super) fn x11_activate_request(&mut self, window: X11Surface) {
         let Some(surface) = window.wl_surface() else {
             return;
@@ -838,6 +917,14 @@ impl WaylandState {
                     wm: Box::new(wm),
                     stability_timer,
                 };
+                // The workspace model exists before any X client does:
+                // publish it now so the root pair reads the real count and
+                // current from the first `xprop` (start_wm wrote 1/0). The
+                // per-window sync is the same mass re-derivation a count
+                // shrink runs; at Ready it finds no X11 record of this
+                // generation and is a no-op kept for symmetry.
+                self.publish_x11_desktops();
+                self.sync_x11_desktops();
             }
             Err(error) => {
                 tracing::warn!(generation, %error, "failed to start XWM");
@@ -2949,6 +3036,13 @@ impl XwmHandler for WaylandState {
             return;
         }
         self.x11_activate_request(window);
+    }
+
+    fn desktop_request(&mut self, xwm: XwmId, window: X11Surface, desktop: u32, _source: u32) {
+        if !self.xwm_event_is_live(xwm) {
+            return;
+        }
+        self.x11_desktop_request(window, desktop);
     }
 
     fn xwm_state(&mut self, xwm: XwmId) -> &mut X11Wm {

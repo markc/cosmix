@@ -623,3 +623,123 @@ fn x11_window_workspace_is_readable_on_the_surfaces_row() {
     assert_eq!(moved.workspaces.current, 1);
     assert_eq!(counts(&moved), [0, 0, 1, 0]);
 }
+
+/// EWMH (slice 6): a client `_NET_WM_DESKTOP` message is a MOVE, never a
+/// switch — `_NET_ACTIVE_WINDOW` is the request that brings a window on
+/// screen. The offline connection is dead, so property delivery is the live
+/// gate's (rule 10); what the fake can show is the value the WM was asked to
+/// write (`X11Surface::desktop`, mirrored before the wire): 0-based, stamped
+/// at the map edge, rewritten by the move. `0xFFFFFFFF` (all desktops), an
+/// index at or above the count, a stale identity for the same wl_surface and
+/// a session lock are all ignored, leaving the record and the mirror alone.
+#[test]
+fn x11_desktop_request_moves_the_window_without_switching() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let native = test_toplevel_record(&harness).role.wl_surface().clone();
+    let (id, surface, window, object) = associate_normal_window(&mut harness, 912);
+    assert_eq!(window.desktop(), None, "nothing published before the map edge");
+    commit_dmabuf(&mut harness, id, 32, 24);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert_eq!(window.desktop(), Some(0), "stamped at the map edge, 0-based");
+
+    harness.server.state.x11_desktop_request(window.clone(), 1);
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.workspace, 2);
+    assert!(!record.layout.visible);
+    assert!(!record.minimized, "moved, not minimised");
+    assert!(window.is_minimized(), "off-workspace: EWMH hidden (D15)");
+    assert_eq!(window.desktop(), Some(1));
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        1,
+        "a move never switches"
+    );
+    assert!(harness.server.state.surfaces[&native.id()].layout.visible);
+
+    // Ignored: all-desktops, at/above the count, a stale identity.
+    let count = harness.server.state.workspaces.count;
+    let stale = fake_x11_window(913, false, Rectangle::new((0, 0).into(), (200, 150).into()));
+    stale.set_wl_surface_offline(Some(surface.clone()));
+    for (target, desktop) in [(&window, u32::MAX), (&window, count), (&stale, 0)] {
+        harness
+            .server
+            .state
+            .x11_desktop_request(target.clone(), desktop);
+        assert_eq!(harness.server.state.surfaces[&object].workspace, 2);
+        assert_eq!(window.desktop(), Some(1));
+        assert_eq!(stale.desktop(), None);
+    }
+
+    // Back onto the current workspace: on screen again, resumed, 0 published.
+    harness.server.state.x11_desktop_request(window.clone(), 0);
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.workspace, 1);
+    assert!(record.layout.visible);
+    assert!(!window.is_minimized(), "on screen: resumed");
+    assert_eq!(window.desktop(), Some(0));
+    assert_eq!(harness.server.state.workspace_current(), 1);
+
+    // Under a session lock the request is inert, like the props write.
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    assert!(harness.server.state.session_lock_active());
+    harness.server.state.x11_desktop_request(window.clone(), 2);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert_eq!(window.desktop(), Some(0));
+}
+
+/// D19: after a MapRequest a first-map X11 record is still unmapped and has
+/// no workspace (0) and no `_NET_WM_DESKTOP`; the stamp — and the property —
+/// come at the first buffer commit, onto the workspace current THEN. A
+/// `set_desktop` at MapRequest would have written `0 - 1`.
+#[test]
+fn x11_window_maps_onto_the_current_workspace() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    // `associate_normal_window` sends the MapRequest before association.
+    let (id, _surface, window, object) = associate_normal_window(&mut harness, 914);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.mapped);
+    assert_eq!(record.workspace, 0, "unmapped: on no workspace");
+    assert_eq!(window.desktop(), None, "no desktop before the stamping edge");
+
+    commit_dmabuf(&mut harness, id, 32, 24);
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.mapped);
+    assert_eq!(record.workspace, 2, "joins the workspace current at the map edge");
+    assert!(record.layout.visible);
+    assert!(!window.is_minimized());
+    assert_eq!(window.desktop(), Some(1), "0-based");
+}
+
+/// A count shrink strands the window onto the last workspace and republishes
+/// its `_NET_WM_DESKTOP` (the mass re-derivation, not the per-move write).
+#[test]
+fn shrinking_the_count_republishes_x11_desktops() {
+    let mut harness = KeybindingHarness::new(true);
+    let (id, _surface, window, object) = associate_normal_window(&mut harness, 915);
+    commit_dmabuf(&mut harness, id, 32, 24);
+    harness.server.state.x11_desktop_request(window.clone(), 3);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 4);
+    assert_eq!(window.desktop(), Some(3));
+    assert!(window.is_minimized(), "off-workspace: hidden");
+
+    assert_eq!(harness.server.state.set_workspace_count(2), Ok((4, 2)));
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.workspace, 2, "stranded onto the last workspace");
+    assert_eq!(window.desktop(), Some(1));
+    assert!(window.is_minimized(), "still off the current workspace (1)");
+
+    assert_eq!(harness.server.state.set_workspace_count(1), Ok((2, 1)));
+    let record = &harness.server.state.surfaces[&object];
+    assert_eq!(record.workspace, 1);
+    assert!(record.layout.visible);
+    assert_eq!(window.desktop(), Some(0));
+    assert!(!window.is_minimized(), "on the only workspace: resumed");
+}

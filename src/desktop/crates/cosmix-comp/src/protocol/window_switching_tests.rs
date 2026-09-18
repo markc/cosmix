@@ -35,6 +35,127 @@ fn vendored_active_window_dispatch_keeps_format_and_policy_callback() {
     assert!(branch.contains("state.activate_request(xwm_id, surface, data[0], data[1]);"));
 }
 
+/// EWMH desktops (workspaces 0.59.0, slice 6): the vendored
+/// `_NET_WM_DESKTOP` ClientMessage arm hands the client's request to the
+/// policy callback unchanged (32-bit only, the window found by XID, data[0]
+/// desktop and data[1] source), and comp's delegate is 1:1 and
+/// generation-gated. Source pins: the XWM handshake is unavailable offline.
+#[test]
+fn vendored_desktop_dispatch_keeps_format_and_policy_callback() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        std::fs::read_to_string(root.join("../../vendor/smithay/src/xwayland/xwm/mod.rs")).unwrap();
+    let branch = source
+        .split("x if x == xwm.atoms._NET_WM_DESKTOP && msg.format == 32 => {")
+        .nth(1)
+        .expect("32-bit desktop dispatch");
+    let branch = branch
+        .split("x if x == xwm.atoms.WL_SURFACE_ID")
+        .next()
+        .unwrap();
+    assert!(branch.contains("surface.window_id() == msg.window"));
+    assert!(branch.contains("state.desktop_request(xwm_id, surface, data[0], data[1]);"));
+    assert!(
+        source.contains(
+            "fn desktop_request(&mut self, _xwm: XwmId, _window: X11Surface, _desktop: u32, _source: u32) {}"
+        ),
+        "the trait default is a no-op: policy is the compositor's"
+    );
+    let comp = std::fs::read_to_string(root.join("src/protocol/xwayland.rs")).unwrap();
+    let delegate = comp
+        .split("fn desktop_request(&mut self, xwm: XwmId, window: X11Surface, desktop: u32, _source: u32) {")
+        .nth(1)
+        .expect("comp delegate");
+    let delegate = delegate.split("fn xwm_state").next().unwrap();
+    assert!(delegate.contains("if !self.xwm_event_is_live(xwm) {"));
+    assert!(delegate.contains("self.x11_desktop_request(window, desktop);"));
+}
+
+/// EWMH desktops: the three atoms are advertised in `_NET_SUPPORTED`, the
+/// root pair is written at WM start (1 desktop, current 0) so `xprop` never
+/// sees it absent, the root setters exist, and comp republishes the pair
+/// 0-based after every switch and count change — after `current` moved, so
+/// the property reads the new value. The property writes themselves are the
+/// live gate's (rule 10, `xprop -root _NET_CURRENT_DESKTOP`); the offline
+/// suite has no XWM.
+#[test]
+fn supported_atoms_list_desktop_atoms() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source =
+        std::fs::read_to_string(root.join("../../vendor/smithay/src/xwayland/xwm/mod.rs")).unwrap();
+    let supported = source
+        .split("atoms._NET_SUPPORTED,")
+        .nth(1)
+        .expect("_NET_SUPPORTED write in start_wm")
+        .split("],")
+        .next()
+        .unwrap();
+    for atom in ["_NET_NUMBER_OF_DESKTOPS", "_NET_CURRENT_DESKTOP", "_NET_WM_DESKTOP"] {
+        assert!(supported.contains(&format!("atoms.{atom},")), "{atom} advertised");
+    }
+    let compact: String = source.split_whitespace().collect();
+    assert!(compact.contains("atoms._NET_NUMBER_OF_DESKTOPS,AtomEnum::CARDINAL,&[1],"));
+    assert!(compact.contains("atoms._NET_CURRENT_DESKTOP,AtomEnum::CARDINAL,&[0],"));
+    assert!(source.contains("pub fn set_number_of_desktops(&self, count: u32) -> Result<(), ConnectionError>"));
+    assert!(source.contains("pub fn set_current_desktop(&self, index: u32) -> Result<(), ConnectionError>"));
+    let surface =
+        std::fs::read_to_string(root.join("../../vendor/smithay/src/xwayland/xwm/surface.rs")).unwrap();
+    assert!(surface.contains("pub fn set_desktop(&self, desktop: u32) -> Result<(), ConnectionError>"));
+    let surface_compact: String = surface.split_whitespace().collect();
+    assert!(surface_compact.contains("self.atoms._NET_WM_DESKTOP,AtomEnum::CARDINAL,&[desktop],"));
+
+    let comp = std::fs::read_to_string(root.join("src/protocol/xwayland.rs")).unwrap();
+    let publish = comp
+        .split("pub(super) fn publish_x11_desktops(&self) {")
+        .nth(1)
+        .expect("publish_x11_desktops")
+        .split("pub(super) fn sync_x11_desktops")
+        .next()
+        .unwrap();
+    assert!(publish.contains("wm.set_number_of_desktops(count)"));
+    assert!(publish.contains("let current = self.workspace_current().saturating_sub(1);"));
+    assert!(publish.contains("wm.set_current_desktop(current)"));
+
+    let workspaces = std::fs::read_to_string(root.join("src/protocol/workspaces.rs")).unwrap();
+    let switch = workspaces
+        .split("pub(crate) fn switch_workspace(")
+        .nth(1)
+        .expect("switch_workspace")
+        .split("pub(crate) fn move_window_to_workspace(")
+        .next()
+        .unwrap();
+    let moved = switch
+        .find("self.workspaces.current.insert(output.clone(), to);")
+        .expect("current moves in switch_workspace");
+    let published = switch
+        .find("self.publish_x11_desktops();")
+        .expect("switch_workspace publishes the root pair");
+    assert!(moved < published, "published AFTER current moved");
+    let count = workspaces
+        .split("pub(crate) fn set_workspace_count(")
+        .nth(1)
+        .expect("set_workspace_count")
+        .split("pub(crate) fn ensure_workspace_shown(")
+        .next()
+        .unwrap();
+    assert_eq!(
+        count.matches("self.publish_x11_desktops();").count(),
+        2,
+        "both the grow and the shrink arm publish the count"
+    );
+    assert!(count.contains("self.sync_x11_desktops();"), "a shrink republishes every window");
+    // The XWM start publishes the real model over start_wm's 1/0.
+    let ready = comp
+        .split("\"XWayland ready; XWM started\"")
+        .nth(1)
+        .expect("ready log")
+        .split("Err(error) =>")
+        .next()
+        .unwrap();
+    assert!(ready.contains("self.publish_x11_desktops();"));
+    assert!(ready.contains("self.sync_x11_desktops();"));
+}
+
 #[test]
 fn alt_tab_cycles_three_windows_and_reverse_uses_real_xkb() {
     for profile in [BindingProfile::Nested, BindingProfile::KmsLive] {
