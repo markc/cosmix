@@ -14677,10 +14677,14 @@ fn workspace_jump_chord_switches_and_never_reaches_the_client() {
     assert_eq!(harness.server.state.workspace_current(), 2);
     assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
     assert!(!harness.server.state.surfaces[&object].layout.visible);
+    // The Super press reached the client while it was focused; the switch
+    // hid it and took keyboard focus with it, so the Super release has no
+    // client to go to. The digit is intercepted both ways.
+    let keys = keyboard_key_events(&harness.sync());
     assert_eq!(
-        keyboard_key_events(&harness.sync()),
-        [(125, 1), (125, 0)],
-        "only Super reaches the client; the digit is intercepted both ways"
+        keys,
+        [(125, 1)],
+        "Super press delivered, digit intercepted, release after focus left"
     );
 
     // Super+1: back; the window is visible again and re-takes focus.
