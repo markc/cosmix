@@ -14765,9 +14765,31 @@ fn keyboard_enter_surfaces(events: &[(u32, u16, Vec<u8>)]) -> Vec<u32> {
 /// count 4) leaves the window, the workspace and the focus where they were.
 #[test]
 fn workspace_move_chord_never_focuses_a_bystander_and_refuses_whole() {
-    // No keyboard focus at all: nothing switches, nothing panics.
+    // Focus on something that is not a movable window: a fresh harness
+    // parks keyboard focus on the initial toplevel's subsurface while that
+    // toplevel is still unmapped (`workspace == 0`), so the move's own
+    // predicate refuses and nothing switches.
     let mut harness = KeybindingHarness::new(true);
-    assert!(harness.server.state.keyboard.current_focus().is_none());
+    assert!(
+        harness.server.state.keyboard.current_focus().is_some(),
+        "precondition: the harness parks focus on the unmapped initial toplevel"
+    );
+    harness.chord(&[125, 42, 3]);
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        1,
+        "a move chord on an unmapped focus does not switch"
+    );
+
+    // No keyboard focus at all: nothing switches, nothing panics.
+    harness
+        .server
+        .state
+        .arbitrate_keyboard_focus(None, false, true);
+    assert!(
+        harness.server.state.keyboard.current_focus().is_none(),
+        "precondition: no keyboard focus held"
+    );
     harness.chord(&[125, 42, 3]);
     assert_eq!(
         harness.server.state.workspace_current(),

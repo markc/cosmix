@@ -513,21 +513,24 @@ fn workspace_switch_verb_wraps_and_refuses_at_end() {
     assert_eq!(harness.server.state.workspace_current(), 4);
     assert!(!harness.server.state.surfaces[&alpha].layout.visible);
     assert!(!harness.server.state.surfaces[&alpha].minimized);
-    assert_eq!(
-        harness.server.state.full_dirty_cause(),
-        Some("workspace.switch"),
-        "a switch re-diffs the whole tree (D7)"
-    );
+    // D7: the switch marks the whole tree dirty with its own cause. The
+    // mark is not observable here — the verb is serviced inside the
+    // dispatch cycle's calloop turn and `service_observations` runs later
+    // in that same cycle, so by the time `window_op` returns the mark has
+    // been taken and diffed. What IS observable is the diff it scheduled:
+    // the row's `visible` flips with cause `workspace.switch`.
     port_observation::service_observations(&mut harness.server.state);
     let changed = drain_observations(&observations);
     let alpha_visible = format!("windows.s{alpha_id}.visible");
     assert!(
         changed.iter().any(|record| matches!(
             record,
-            port_observation::ObservationRecord::PropsChanged { path, new, .. }
-                if *path == alpha_visible && new.wire_value() == json!(false)
+            port_observation::ObservationRecord::PropsChanged { path, new, cause, .. }
+                if *path == alpha_visible
+                    && new.wire_value() == json!(false)
+                    && *cause == "workspace.switch"
         )),
-        "the switch reaches props.changed: {changed:?}"
+        "the switch re-diffs the whole tree with its own cause (D7): {changed:?}"
     );
 
     let (rc, body) = window_op(
