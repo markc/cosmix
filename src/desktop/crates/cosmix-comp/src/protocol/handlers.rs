@@ -2411,7 +2411,10 @@ impl XdgActivationHandler for WaylandState {
         }
         // F1.2: an activation of a window on another workspace switches to
         // that workspace first (the lock above and the exclusive-layer rule
-        // inside the helper keep it inert where a switch is not allowed).
+        // inside the helper keep it inert where a switch is not allowed, and
+        // the helper's candidacy terms keep it inert for a minimised or
+        // non-presentable window, which the raise and arbitration below
+        // would not bring into view either).
         self.ensure_workspace_shown(&surface.id());
         self.raise_for_focus_interaction(&surface);
         self.arbitrate_keyboard_focus(Some(surface), false, false);

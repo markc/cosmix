@@ -471,6 +471,13 @@ impl WaylandState {
     /// all — under a session lock or an exclusive layer (D18): the lock or
     /// the layer owns what is on screen, and a client-driven X11 path has no
     /// guard of its own.
+    ///
+    /// Equally inert for a window that could not take focus once shown — a
+    /// minimised one, or one that is not input-presentable (the KMS gate
+    /// while the VT is switched away): every caller refuses or no-ops on
+    /// those, and a refused activation must not change the desktop. The
+    /// terms are `window_switch_candidate`'s minus `layout.visible`, which
+    /// is what the switch itself sets.
     pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
         if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
             return false;
@@ -479,7 +486,12 @@ impl WaylandState {
             .surfaces
             .get(object)
             .filter(|record| {
-                record.mapped && record.role.managed_toplevel() && record.workspace != 0
+                record.mapped
+                    && !record.minimized
+                    && record.role.managed_toplevel()
+                    && record.role.wl_surface().is_alive()
+                    && record.workspace != 0
+                    && self.surface_is_input_presentable(record)
             })
             .map(|record| record.workspace)
         else {

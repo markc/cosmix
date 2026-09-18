@@ -289,6 +289,111 @@ fn locked_x11_activation_and_unminimise_do_not_switch_workspace() {
     assert!(harness.server.state.minimized_toplevels.is_empty());
 }
 
+/// The refusal half of F1.2 on the client-driven paths: a
+/// `_NET_ACTIVE_WINDOW` or an xdg-activation for a MINIMISED window on
+/// another workspace is a no-op — the candidate check focuses nothing, and
+/// because the switch is gated on the same terms it does not change the
+/// workspace either. On the base tree both were silent no-ops; a switch
+/// that then focuses nothing would be a client-driven, unreported change
+/// of the user's desktop. (The unminimise request is the restore path and
+/// does switch: `x11_unminimise_of_an_off_workspace_window_switches_first`.)
+#[test]
+fn x11_activation_of_a_minimised_off_workspace_window_does_not_switch() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let native = test_toplevel_record(&harness).role.wl_surface().clone();
+    let (id, surface, window, object) = associate_normal_window(&mut harness, 910);
+    commit_dmabuf(&mut harness, id, 32, 24);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&object, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    harness.server.state.minimize_toplevel(&surface);
+    harness.server.state.activate_managed_window(&native);
+    let _ = harness.sync();
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(!harness.server.state.session_lock_active());
+
+    harness.server.state.x11_activate_request(window.clone());
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        1,
+        "_NET_ACTIVE_WINDOW for a minimised window does not switch"
+    );
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.minimized);
+    assert_eq!(record.workspace, 2, "never pulled across");
+    assert!(!record.layout.visible);
+    assert!(!record.focused);
+    assert!(window.is_minimized(), "still off screen: still suspended");
+    assert!(harness.server.state.surfaces[&native.id()].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(native.clone())
+    );
+
+    XdgActivationHandler::request_activation(
+        &mut harness.server.state,
+        XdgActivationToken::from(String::from("test-token")),
+        XdgActivationTokenData::default(),
+        surface.clone(),
+    );
+    assert_eq!(
+        harness.server.state.workspace_current(),
+        1,
+        "xdg-activation for a minimised window does not switch"
+    );
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.minimized && !record.layout.visible && !record.focused);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(native)
+    );
+    assert_eq!(harness.server.state.minimized_toplevels, vec![object]);
+}
+
+/// D15 at the switch halves: switching away suspends an X11 window left
+/// behind, switching back resumes it. This pins `current` moving BEFORE
+/// the leaving loop in `switch_workspace`: the withdraw half derives the
+/// flag from `current` (`sync_x11_suspended`), so a leaving window must
+/// already read as off the current workspace — with the old order every
+/// leaving X11 window kept rendering after a switch and no other test
+/// noticed.
+#[test]
+fn switching_workspace_suspends_leaving_x11_windows_and_resumes_them_on_return() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let mut harness = KeybindingHarness::new(true);
+    let (id, _surface, window, object) = associate_normal_window(&mut harness, 911);
+    commit_dmabuf(&mut harness, id, 32, 24);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert!(!window.is_minimized(), "on screen: not suspended");
+
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(2), true)
+        .expect("switch to 2");
+    let record = &harness.server.state.surfaces[&object];
+    assert!(!record.minimized, "left behind, not minimised");
+    assert_eq!(record.workspace, 1);
+    assert!(!record.layout.visible);
+    assert!(window.is_minimized(), "left behind: suspended (D15)");
+
+    harness
+        .server
+        .state
+        .switch_workspace(None, WorkspaceTarget::Index(1), true)
+        .expect("back to 1");
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.layout.visible);
+    assert!(!window.is_minimized(), "back on screen: resumed");
+}
+
 /// X11 windows have no `windows.*` row, so their fence comes from
 /// `surfaces.s<id>.generation`; the id form of the window verbs then works
 /// on them, and `focus.window` names a focused X11 window.

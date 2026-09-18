@@ -446,13 +446,38 @@ impl WaylandState {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
         };
+        let Some(record) = self.surfaces.get(&object) else {
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
+        };
         // Rule 6 (F1.2): an off-workspace window is brought on screen by
         // switching to its workspace, never by pulling it across, so the
         // ladder below sees it as on-current. Both the raise and the
         // focus-only path inherit; `service_window_op` already refused a
-        // session lock before reaching here.
-        self.ensure_workspace_shown(&object);
-        let record = &self.surfaces[&object];
+        // session lock before reaching here. The switch happens only for a
+        // window the ladder's workspace-independent rungs would let take
+        // focus (`ensure_workspace_shown` checks the same terms): a refused
+        // verb must not change the desktop. Mark first, as every sibling
+        // verb does: the first cause recorded for a surface wins, and the
+        // switch itself marks "workspace.switch".
+        let may_focus = self.highest_exclusive_layer().is_none()
+            && !record.minimized
+            && self.surface_is_input_presentable(record);
+        if may_focus {
+            self.mark_surface_dirty(SurfaceId(id), "comp.window");
+            self.ensure_workspace_shown(&object);
+        }
+        // Re-fetched, not indexed: the switch settles the scene in between
+        // and the record's liveness across that is not an invariant the
+        // settle promises.
+        let Some(record) = self.surfaces.get(&object) else {
+            return ControlReply::WindowTarget {
+                id,
+                error: WindowTargetError::UnknownWindow,
+            };
+        };
         let surface = record.role.wl_surface().clone();
         // The same candidacy Alt+Tab uses; a refusal says which gate held.
         let reason = if self.highest_exclusive_layer().is_some() {
@@ -467,7 +492,6 @@ impl WaylandState {
             None
         };
         if reason.is_none() {
-            self.mark_surface_dirty(SurfaceId(id), "comp.window");
             if raise {
                 self.activate_managed_window(&surface);
             } else {

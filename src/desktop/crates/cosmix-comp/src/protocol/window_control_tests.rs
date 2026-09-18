@@ -1129,6 +1129,64 @@ fn focus_on_an_off_workspace_window_switches_and_focuses() {
     }
 }
 
+/// Rule 6's refusal half: a focus the reason ladder refuses must not change
+/// the desktop. Alpha minimised on workspace 2, the user on 1: `focus` on
+/// either path replies `reason: "minimized"`, and the current workspace,
+/// beta's visibility and the keyboard focus are exactly as they were — the
+/// switch is gated on the same terms as the ladder, so nothing switches
+/// and then refuses.
+#[test]
+fn focus_on_a_minimised_off_workspace_window_is_refused_without_switching() {
+    use crate::protocol::workspaces::WorkspaceTarget;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.minimize_toplevel(&surface);
+    assert!(harness.server.state.surfaces[&alpha].minimized);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    for raise in [true, false] {
+        let (rc, body) = window_op(
+            &mut harness,
+            &ingress,
+            &runtime,
+            WindowOp::Focus {
+                id,
+                generation,
+                raise,
+            },
+        );
+        assert_eq!(rc, 0, "raise {raise}: {body}");
+        assert_eq!(body["focused"], false, "raise {raise}: {body}");
+        assert_eq!(body["reason"], "minimized", "raise {raise}: {body}");
+        let state = &harness.server.state;
+        assert_eq!(
+            state.workspace_current(),
+            1,
+            "raise {raise}: a refused focus does not switch"
+        );
+        assert!(state.surfaces[&alpha].minimized);
+        assert_eq!(state.surfaces[&alpha].workspace, 2, "never pulled across");
+        assert!(!state.surfaces[&alpha].layout.visible);
+        assert!(!state.surfaces[&alpha].focused);
+        assert!(state.surfaces[&beta].layout.visible);
+        assert_eq!(
+            focused_surface(state.keyboard.current_focus()).map(|surface| surface.id()),
+            Some(beta.clone())
+        );
+        assert_ne!(state.full_dirty_cause(), Some("workspace.switch"));
+    }
+}
+
 /// F1.2 at `comp.window.restore {id, generation}`: restoring a window that
 /// was minimised on another workspace switches to that workspace and shows
 /// it there.

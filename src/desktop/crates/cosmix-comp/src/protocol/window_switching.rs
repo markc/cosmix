@@ -20,7 +20,10 @@ impl WaylandState {
     /// to that workspace first (never by pulling it across). The guard runs
     /// BEFORE the switch so an X11 `_NET_ACTIVE_WINDOW` cannot change
     /// workspace under a lock, and the candidate check runs AFTER it, because
-    /// it reads `layout.visible`, which the switch's recompute sets.
+    /// it reads `layout.visible`, which the switch's recompute sets. The
+    /// helper applies the candidate's other terms itself (minimised, dead,
+    /// not presentable → no switch), so a request the check below refuses
+    /// has not changed the workspace.
     pub(super) fn activate_managed_window(&mut self, surface: &WlSurface) {
         if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
             return;
