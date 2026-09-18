@@ -1,0 +1,26 @@
+# Example user unit for the desktop application registry citizen.
+# Not installed by default. Copy to ~/.config/systemd/user/ and enable with
+#   systemctl --user enable --now cosmix-desk-apps.service
+# A user session unit (no User=): apps.launch spawns GUI programs, which need
+# the session's WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS, so the citizen
+# runs as the desktop user inside graphical-session.target.
+#
+# Paths show an installed tree (/opt/cosmix); from a checkout point
+# ExecStart at $COSMIX/src/desktop/scripts/apps.mix instead.
+[Unit]
+Description=CosMix desktop application registry (apps citizen)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/desktop/apps.mix --name apps
+Environment=MIX_STATS=off
+# Launched applications are detached into their own sessions and must survive
+# a registry restart, so stop kills only the citizen process.
+KillMode=process
+Restart=on-failure
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target

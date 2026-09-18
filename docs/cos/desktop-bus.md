@@ -103,6 +103,53 @@ topics or included in notifications by these scripts. Runtime-reserved verbs
 (including `QUIT`) and lifecycle properties are provided by Mix and do not
 pass through the desktop handler checks.
 
+## Application registry citizen (`apps`)
+
+A second desktop citizen, `src/desktop/scripts/apps.mix`, is the data
+foundation for the desktop launcher and the taskbar's app icons. It scans
+the freedesktop desktop-entry directories (`$XDG_DATA_HOME/applications`,
+then each `$XDG_DATA_DIRS` entry's `applications`, subdirectories folded
+into the id with `-`), keeps `[Desktop Entry]`-group `Type=Application`
+entries that pass `NoDisplay`/`Hidden`, `OnlyShowIn`/`NotShowIn` (against
+the desktop name `COSMIX`) and `TryExec`, and resolves icons through the
+freedesktop icon-theme spec (exact size match, then closest by
+`DirectorySizeDistance`, `Inherits` depth-first, `hicolor`, then
+`/usr/share/pixmaps`; parsed `index.theme` files are cached in memory).
+Start it like the session provider:
+
+```text
+mix --serve /path/to/cosmix/src/desktop/scripts/apps.mix
+```
+
+It is event-driven: the tree is scanned once at start and again only on
+`apps.reload`. There is no timer or poll loop; a future inotify wake is the
+intended rescan trigger. `src/desktop/scripts/cosmix-desk-apps.service` is
+an example user unit bound to `graphical-session.target`.
+
+| Verb | JSON request | Successful response |
+|---|---|---|
+| `apps.list` | `{category?, query?}` | array of `{id,name,generic_name,comment,icon,categories,exec,terminal,path}` sorted by name |
+| `apps.get` | `{id}` | the entry with all parsed fields (adds `keywords`, `try_exec`, `workdir`, `only_show_in`, `not_show_in`) |
+| `apps.icon` | `{name, size?, scale?, theme?}` | `{path,size,scale,theme,kind}` — `kind` is `svg`, `png` or `xpm`; `name` may be an absolute path |
+| `apps.launch` | `{id, uris?}` | `{id,pid,argv}` — spawned detached via argv, never a shell |
+| `apps.reload` | `{}` | `{count}` |
+
+`query` is a case-insensitive substring over name, generic name, comment and
+keywords. `uris` feed the Exec field codes: `%f`/`%F` take `file://` URIs
+decoded to local paths, `%u`/`%U` take the URIs, `%i` becomes `--icon ICON`,
+`%c` the name, `%k` the desktop-file path; deprecated `%d %D %n %N %v %m`
+are dropped and Exec quoting is parsed into argv per the spec.
+`Terminal=true` entries are prefixed with the terminal property. Unknown ids
+answer `{error:"not_found"}` with rc 14; malformed requests rc 10.
+
+Properties publish through `apps.props.watch` (snapshot read; optionally
+`{path}` for one leaf) and `apps.props.set` (`{path, value}`): `apps.count`
+(read-only), `apps.icon_theme` (default: `[Icons] Theme` from
+`~/.config/kdeglobals`, else `breeze` when installed, else `hicolor`) and
+`apps.terminal` (default `foot`). Mix 0.89.0 reserves
+`apps.props.{get,list,describe}` for the runtime-owned lifecycle tree, so
+the author properties ride the SPEC-12 fall-through verbs instead.
+
 ## Verification
 
 `tests/desktop-test.mix` exercises production request validation and result
@@ -114,3 +161,8 @@ The noded suite covers reply connection ownership, spoofed identity stripping,
 proof/registration/membership gates and reload while delivery is waiting.
 Deployment acceptance still requires bidirectional transfer over the actual
 admitted nodes and their Wayland sessions; unit gates do not prove that result.
+
+`tests/apps-test.mix` exercises the apps citizen's desktop-entry parser and
+icon resolver against a fixture tree it creates under a temp dir (no Bus,
+nothing launched). The pure functions live in `src/desktop/scripts/lib/apps.mix`
+so the test can require them directly.

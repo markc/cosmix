@@ -1,0 +1,180 @@
+-- Deterministic parser and icon-resolver tests against a fixture tree under
+-- a temp dir; no Bus, no desktop effects, no fixture app is ever launched.
+$a = require("../lib/apps.mix")
+$tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-apps-lib-test.XXXXXXXX"]))
+fn check($condition, $message)
+  if not $condition then raise("APPS_TEST", $message) end
+end
+fn fixture($path, $content)
+  mkdir(dirname($tmp .. "/" .. $path))
+  write_file($tmp .. "/" .. $path, $content)
+end
+fn touch($path)
+  mkdir(dirname($tmp .. "/" .. $path))
+  write_file($tmp .. "/" .. $path, "")
+end
+try
+  -- ── Desktop-entry fixtures ──────────────────────────────────────────
+  fixture("data/applications/plain.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Plain\nGenericName=Plain App\nComment=A plain application\n" ..
+    "Icon=plain-icon\nExec=plain-run %f\nTerminal=false\nCategories=Utility;Test;\nKeywords=plain;simple;\n")
+  fixture("data/applications/nodisplay.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=NoDisplay App\nExec=nd-run\nNoDisplay=true\n")
+  fixture("data/applications/hidden.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Hidden App\nExec=hidden-run\nHidden=true\n")
+  fixture("data/applications/only-cosmix.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Only Cosmix\nExec=oc-run\nOnlyShowIn=COSMIX;Other;\n")
+  fixture("data/applications/only-other.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Only Other\nExec=oo-run\nOnlyShowIn=GNOME;\n")
+  fixture("data/applications/not-cosmix.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Not Cosmix\nExec=nc-run\nNotShowIn=COSMIX;\n")
+  fixture("data/applications/tryexec-miss.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=TryExec Miss\nExec=te-run\nTryExec=definitely-not-a-real-binary-xyz\n")
+  fixture("data/applications/quoted.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Quoted\nExec=quoted \"a b\" c\\ d \"say \\\"hi\\\"\" $x %U\n")
+  fixture("data/applications/localized.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Localized\nName[xx]=Base Local\nName[xx_YY]=Full Local\nExec=localized-run\n")
+  fixture("data/applications/subdir/nested.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Nested\nExec=nested-run\n")
+  fixture("data/applications/override.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=User Override\nExec=user-override-run\n")
+  fixture("sys/applications/override.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=System Override\nExec=system-override-run\n")
+  fixture("sys/applications/system-only.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=System Only\nExec=system-only-run\n")
+
+  -- ── Icon-theme fixtures ─────────────────────────────────────────────
+  fixture("icons/fixture/index.theme", "[Icon Theme]\n" ..
+    "Name=Fixture\nDirectories=fixed48,scalable\nScaledDirectories=scaled96\nInherits=parent\n\n" ..
+    "[fixed48]\nSize=48\nType=Fixed\n\n" ..
+    "[scalable]\nSize=128\nType=Scalable\nMinSize=16\nMaxSize=512\n\n" ..
+    "[scaled96]\nSize=48\nScale=2\nType=Fixed\n")
+  fixture("icons/parent/index.theme", "[Icon Theme]\n" ..
+    "Name=Parent\nDirectories=parent32\n\n" ..
+    "[parent32]\nSize=32\nType=Fixed\n")
+  fixture("icons/hicolor/index.theme", "[Icon Theme]\n" ..
+    "Name=Hicolor\nDirectories=22x22\n\n" ..
+    "[22x22]\nSize=22\nType=Fixed\n")
+  touch("icons/fixture/fixed48/fix.png")
+  touch("icons/fixture/scalable/vec.svg")
+  touch("icons/fixture/scaled96/svec.svg")
+  touch("icons/parent/parent32/fpar.png")
+  touch("icons/hicolor/22x22/hic.png")
+  touch("pixmaps/pixmap.xpm")
+
+  -- ── Scan: visibility filters, localised keys, subdir IDs, precedence ──
+  $dirs = [$tmp .. "/data/applications", $tmp .. "/sys/applications"]
+  $apps = $a.scan_apps($dirs, "xx_YY", "COSMIX")
+  $ids = []
+  for each $e in $apps
+    $ids = concat($ids, [$e.id])
+  end
+  for each $want in ["plain", "only-cosmix", "quoted", "localized", "subdir-nested", "override", "system-only"]
+    check(contains($ids, $want), "visible id missing from scan: " .. $want)
+  end
+  for each $hidden in ["nodisplay", "hidden", "only-other", "not-cosmix", "tryexec-miss"]
+    check(not contains($ids, $hidden), "invisible id leaked into scan: " .. $hidden)
+  end
+  check(len($ids) == 7, "scan returned " .. to_string(len($ids)) .. " entries, expected 7")
+  $localized = $a.find_app($apps, "localized")
+  check($localized.name == "Full Local", "Name[xx_YY] locale not preferred")
+  check($a.parse_entry($tmp .. "/data/applications/localized.desktop", "localized", "xx", "COSMIX").name == "Base Local", "Name[xx] language fallback not used")
+  check($a.parse_entry($tmp .. "/data/applications/localized.desktop", "localized", "zz", "COSMIX").name == "Localized", "unlocalised Name fallback not used")
+  $override = $a.find_app($apps, "override")
+  check($override.name == "User Override" and $override.exec == "user-override-run", "earlier data dir did not win for the same id")
+  $plain = $a.find_app($apps, "plain")
+  check($plain.generic_name == "Plain App" and $plain.comment == "A plain application" and $plain.icon == "plain-icon", "parsed fields wrong")
+  check(deep_eq($plain.categories, ["Utility", "Test"]) and deep_eq($plain.keywords, ["plain", "simple"]), "semicolon lists not split")
+  check($plain.path == $tmp .. "/data/applications/plain.desktop" and $plain.terminal == false, "path or terminal wrong")
+  -- Sorted by name.
+  $sorted = true
+  for each $i in range(1, len($apps) - 1)
+    if lower($apps[$i - 1].name) > lower($apps[$i].name) then $sorted = false end
+  end
+  check($sorted, "scan output not sorted by name")
+
+  -- ── Query and category projection ───────────────────────────────────
+  check($a.match_query($plain, "PLAIN"), "query not case-insensitive over name")
+  check($a.match_query($plain, "plain app"), "query missed generic_name")
+  check($a.match_query($plain, "a plain app"), "query missed comment")
+  check($a.match_query($plain, "SIMPLE"), "query missed keywords")
+  check(not $a.match_query($plain, "nothing-matches-this"), "query invented a match")
+  check(contains($plain.categories, "Utility") and not contains($plain.categories, "Network"), "category membership wrong")
+  $listed = $a.project_list($plain)
+  check(len(keys($listed)) == 9, "list projection field count wrong")
+  check($listed.id == "plain" and $listed.name == "Plain" and $listed.icon == "plain-icon", "list projection values wrong")
+
+  -- ── Exec quoting ────────────────────────────────────────────────────
+  check(deep_eq($a.parse_exec("quoted \"a b\" c\\ d \"say \\\"hi\\\"\" $x %U"),
+    ["quoted", "a b", "c d", "say \"hi\"", "$x", "%U"]), "Exec quoting/escape parse wrong")
+  check(deep_eq($a.parse_exec("empty \"\" arg"), ["empty", "", "arg"]), "quoted empty argument lost")
+  check(deep_eq($a.parse_exec("  spaced  out  "), ["spaced", "out"]), "leading/trailing/duplicate separators wrong")
+
+  -- ── Field-code expansion ────────────────────────────────────────────
+  check(deep_eq($a.expand_exec("plain-run %f", $plain, ["file:///tmp/a%20b.txt"]),
+    ["plain-run", "/tmp/a b.txt"]), "%f not decoded to a local path")
+  check(deep_eq($a.expand_exec("plain-run %F", $plain, ["file:///tmp/one", "file:///tmp/two"]),
+    ["plain-run", "/tmp/one", "/tmp/two"]), "%F did not take every local path")
+  check(deep_eq($a.expand_exec("plain-run %u", $plain, ["https://example.invalid/x"]),
+    ["plain-run", "https://example.invalid/x"]), "%u did not pass the URI through")
+  check(deep_eq($a.expand_exec("plain-run %f", $plain, nil), ["plain-run"]), "%f without uris was not dropped")
+  check(deep_eq($a.expand_exec("plain-run", $plain, ["https://example.invalid/x"]),
+    ["plain-run", "https://example.invalid/x"]), "uris not appended when no file field code")
+  check(deep_eq($a.expand_exec("run %i name %c %k", $plain, nil),
+    ["run", "--icon", "plain-icon", "name", "Plain", $tmp .. "/data/applications/plain.desktop"]), "%i/%c/%k expansion wrong")
+  check(deep_eq($a.expand_exec("run --icon=%i", $plain, nil), ["run", "--icon=plain-icon"]), "embedded %i expansion wrong")
+  check(deep_eq($a.expand_exec("run %% %d %D %n %N %v %m", $plain, nil), ["run", "%"]), "%% and deprecated codes wrong")
+  check(deep_eq($a.expand_exec("quoted \"a b\" %U", $plain, ["u://1", "u://2"]),
+    ["quoted", "a b", "u://1", "u://2"]), "quoted Exec with %U wrong")
+
+  -- ── Icon resolution ─────────────────────────────────────────────────
+  $ctx = {icon_dirs: [$tmp .. "/icons"], pixmaps: $tmp .. "/pixmaps", cache: {}}
+  $hit = $a.resolve_icon($ctx, "fix", 48, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/fixture/fixed48/fix.png", "exact fixed-size match failed")
+  check($hit.hit.kind == "png" and $hit.hit.size == 48 and $hit.hit.scale == 1 and $hit.hit.theme == "fixture", "hit metadata wrong")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "fix", 24, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/fixture/fixed48/fix.png", "closest-match pass failed")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "vec", 128, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/fixture/scalable/vec.svg" and $hit.hit.kind == "svg", "scalable exact match failed")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "vec", 64, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/fixture/scalable/vec.svg", "scalable range match failed")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "svec", 48, 2, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/fixture/scaled96/svec.svg", "ScaledDirectories scale-2 match failed")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "fpar", 32, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/parent/parent32/fpar.png" and $hit.hit.theme == "parent", "Inherits chain not followed depth-first")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "hic", 22, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/hicolor/22x22/hic.png" and $hit.hit.theme == "hicolor", "hicolor fallback failed")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "pixmap", 48, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/pixmaps/pixmap.xpm" and $hit.hit.kind == "xpm" and $hit.hit.theme == "", "pixmaps last-resort failed")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, $tmp .. "/pixmaps/pixmap.xpm", 48, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/pixmaps/pixmap.xpm", "absolute icon path not returned verbatim")
+  $ctx = $hit.ctx
+  $hit = $a.resolve_icon($ctx, "no-such-icon-anywhere", 48, 1, "fixture")
+  check($hit.hit == nil, "missing icon invented a hit")
+  $ctx = $hit.ctx
+  -- The parsed index.theme files are cached, including themes that do not
+  -- exist, and a second lookup round still resolves from the cache.
+  check(has_key($ctx.cache, "fixture") and has_key($ctx.cache, "parent") and has_key($ctx.cache, "hicolor"), "parsed themes not cached")
+  check($ctx.cache["no-such-theme"] == nil or $ctx.cache["no-such-theme"] == false, "cache stored a bogus theme")
+  $hit = $a.resolve_icon($ctx, "fix", 48, 1, "fixture")
+  check($hit.hit != nil and $hit.hit.path == $tmp .. "/icons/fixture/fixed48/fix.png", "cached second lookup failed")
+  $ctx = $hit.ctx
+  -- A theme with no index.theme anywhere still falls through to hicolor.
+  $hit = $a.resolve_icon($ctx, "hic", 22, 1, "absent-theme")
+  check($hit.hit != nil and $hit.hit.theme == "hicolor", "absent theme did not fall through to hicolor")
+  $ctx = $hit.ctx
+
+  print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache")
+finally
+  if starts_with($tmp, "/tmp/cosmix-apps-lib-test.") then
+    $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
+  end
+end

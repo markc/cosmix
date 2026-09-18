@@ -1,0 +1,560 @@
+-- Application registry library for the apps citizen: freedesktop desktop-entry
+-- scanning and icon-theme lookup as pure functions (no `on` handlers, no Bus).
+-- The citizen (../apps.mix) and the unit test (../tests/apps-test.mix) both
+-- require this module; state (the icon-theme cache) is threaded in and out
+-- because Mix functions cannot mutate globals and maps/lists pass by value.
+--
+-- Specs implemented (both freedesktop):
+--   - Desktop Entry Specification: [Desktop Entry] group only, Type=Application,
+--     NoDisplay/Hidden, OnlyShowIn/NotShowIn, TryExec, localised keys.
+--   - Icon Theme Specification: index.theme Directories/ScaledDirectories,
+--     exact match then DirectorySizeDistance, Inherits depth-first, then
+--     hicolor, then /usr/share/pixmaps.
+
+-- ── small shared helpers ────────────────────────────────────────────────
+
+fn is_int($v)
+  return type($v) == "number" and $v == floor($v)
+end
+
+fn to_bool($v)
+  -- Desktop-entry booleans are the case-insensitive strings true/false.
+  return type($v) == "string" and lower(trim($v)) == "true"
+end
+
+fn split_semis($value)
+  -- "Network;Web;" -> ["Network", "Web"] (empty segments dropped)
+  $out = []
+  for each $part in split($value, ";")
+    if $part != "" then $out = concat($out, [$part]) end
+  end
+  return $out
+end
+
+fn split_theme_list($value)
+  -- index.theme lists are comma-separated but files in the wild also use
+  -- spaces or semicolons; accept any run of them.
+  $out = []
+  for each $part in split(replace(replace($value, ";", ","), " ", ","), ",")
+    if trim($part) != "" then $out = concat($out, [trim($part)]) end
+  end
+  return $out
+end
+
+fn locale_id()
+  -- The desktop-entry locale from LANG: "en_AU.UTF-8" -> "en_AU" (encoding
+  -- and @modifier stripped). "" or the C/POSIX locales mean "unlocalised".
+  $lang = env("LANG")
+  $stripped = before($lang, ".")
+  if $stripped != nil then $lang = $stripped end
+  $stripped = before($lang, "@")
+  if $stripped != nil then $lang = $stripped end
+  if $lang == "C" or $lang == "POSIX" then return "" end
+  return $lang
+end
+
+fn loc_key($group, $key, $locale)
+  -- Localised key lookup: Key[lang_CT], then Key[lang], then Key.
+  if $locale != "" then
+    if has_key($group, $key .. "[" .. $locale .. "]") then
+      return $group[$key .. "[" .. $locale .. "]"]
+    end
+    $base = before($locale, "_")
+    if $base != nil and $base != $locale and has_key($group, $key .. "[" .. $base .. "]") then
+      return $group[$key .. "[" .. $base .. "]"]
+    end
+  end
+  return get_or($group, $key, "")
+end
+
+-- ── desktop-entry scan ──────────────────────────────────────────────────
+
+fn data_dirs()
+  -- $XDG_DATA_HOME (default ~/.local/share), then each $XDG_DATA_DIRS entry
+  -- (default /usr/local/share:/usr/share), in priority order.
+  $home = env("HOME")
+  $data_home = env("XDG_DATA_HOME")
+  if $data_home == "" then $data_home = $home .. "/.local/share" end
+  $out = [$data_home]
+  $dirs = env("XDG_DATA_DIRS")
+  if $dirs == "" then $dirs = "/usr/local/share:/usr/share" end
+  for each $dir in split($dirs, ":")
+    if $dir != "" then $out = concat($out, [$dir]) end
+  end
+  return $out
+end
+
+fn application_dirs()
+  $out = []
+  for each $dir in data_dirs()
+    $out = concat($out, [$dir .. "/applications"])
+  end
+  return $out
+end
+
+fn icon_dirs()
+  -- Icon-theme base directories in priority order (Icon Theme spec):
+  -- ~/.local/share/icons (or $XDG_DATA_HOME/icons), then each
+  -- $XDG_DATA_DIRS/icons. /usr/share/pixmaps is the last-resort fallback
+  -- and is carried separately in the icon context.
+  $out = []
+  for each $dir in data_dirs()
+    $out = concat($out, [$dir .. "/icons"])
+  end
+  return $out
+end
+
+fn icon_ctx()
+  -- Threaded lookup context: base dirs plus the parsed-index.theme cache so
+  -- repeated icon lookups never rescan the tree.
+  return {icon_dirs: icon_dirs(), pixmaps: "/usr/share/pixmaps", cache: {}}
+end
+
+fn tryexec_ok($value)
+  -- TryExec must resolve: an absolute path that exists, or a name on PATH.
+  if starts_with($value, "/") then return is_file($value) end
+  return which($value) != nil
+end
+
+fn default_theme()
+  -- The default icon theme: kdeglobals [Icons] Theme if present, else
+  -- breeze when installed, else hicolor.
+  $kg = env("HOME") .. "/.config/kdeglobals"
+  if is_file($kg) then
+    $cfg = nil
+    try
+      $cfg = ini_parse(read_file($kg))
+    catch $err
+      $cfg = nil
+    end
+    if type($cfg) == "map" and has_key($cfg, "Icons") then
+      $theme = trim(get_or($cfg["Icons"], "Theme", ""))
+      if $theme != "" then return $theme end
+    end
+  end
+  if is_dir("/usr/share/icons/breeze") then return "breeze" end
+  return "hicolor"
+end
+
+fn parse_entry($path, $id, $locale, $desktop_name)
+  -- Parse one .desktop file; nil unless it is a visible Type=Application
+  -- entry. Only the [Desktop Entry] group is read.
+  $ini = nil
+  try
+    $ini = ini_parse(read_file($path))
+  catch $err
+    $ini = nil
+  end
+  if type($ini) != "map" or not has_key($ini, "Desktop Entry") then return nil end
+  $g = $ini["Desktop Entry"]
+  if get_or($g, "Type", "") != "Application" then return nil end
+  if to_bool(get_or($g, "NoDisplay", "false")) then return nil end
+  if to_bool(get_or($g, "Hidden", "false")) then return nil end
+  -- OnlyShowIn limits the entry to listed desktops; NotShowIn excludes.
+  -- Entries with neither are always acceptable.
+  $only = split_semis(get_or($g, "OnlyShowIn", ""))
+  $not = split_semis(get_or($g, "NotShowIn", ""))
+  if len($only) > 0 and not contains($only, $desktop_name) then return nil end
+  if contains($not, $desktop_name) then return nil end
+  $try_exec = get_or($g, "TryExec", "")
+  if $try_exec != "" and not tryexec_ok($try_exec) then return nil end
+  $name = loc_key($g, "Name", $locale)
+  $exec = get_or($g, "Exec", "")
+  if $name == "" or $exec == "" then return nil end
+  return {
+    id: $id,
+    name: $name,
+    generic_name: loc_key($g, "GenericName", $locale),
+    comment: loc_key($g, "Comment", $locale),
+    icon: get_or($g, "Icon", ""),
+    keywords: split_semis(loc_key($g, "Keywords", $locale)),
+    categories: split_semis(get_or($g, "Categories", "")),
+    exec: $exec,
+    try_exec: $try_exec,
+    terminal: to_bool(get_or($g, "Terminal", "false")),
+    path: $path,
+    workdir: get_or($g, "Path", ""),
+    only_show_in: $only,
+    not_show_in: $not
+  }
+end
+
+fn scan_apps($dirs, $locale, $desktop_name)
+  -- Walk each applications dir in priority order; earlier dirs win for the
+  -- same desktop-file ID (subdir "/" becomes "-" in the ID; the .desktop
+  -- suffix is dropped). Returns the visible entries sorted by name.
+  $by_id = {}
+  for each $dir in $dirs
+    if is_dir($dir) then
+      for each $path in walk($dir, {})
+        if ends_with($path, ".desktop") then
+          $rel = substr($path, len($dir) + 1, len($path))
+          $id = strip_suffix(replace($rel, "/", "-"), ".desktop")
+          if $by_id[$id] == nil then $by_id[$id] = $path end
+        end
+      end
+    end
+  end
+  $apps = []
+  for each $id in keys($by_id)
+    $entry = parse_entry($by_id[$id], $id, $locale, $desktop_name)
+    if $entry != nil then $apps = concat($apps, [$entry]) end
+  end
+  return sort_by($apps, fn($e) = lower($e.name) .. "|" .. $e.id)
+end
+
+fn find_app($apps, $id)
+  for each $entry in $apps
+    if $entry.id == $id then return $entry end
+  end
+  return nil
+end
+
+fn project_list($entry)
+  -- The apps.list projection: the launcher/taskbar fields.
+  return {
+    id: $entry.id,
+    name: $entry.name,
+    generic_name: $entry.generic_name,
+    comment: $entry.comment,
+    icon: $entry.icon,
+    categories: $entry.categories,
+    exec: $entry.exec,
+    terminal: $entry.terminal,
+    path: $entry.path
+  }
+end
+
+fn match_query($entry, $query)
+  -- Case-insensitive substring over name/generic_name/comment/keywords.
+  if $query == "" then return true end
+  $q = lower($query)
+  if contains(lower($entry.name), $q) then return true end
+  if contains(lower($entry.generic_name), $q) then return true end
+  if contains(lower($entry.comment), $q) then return true end
+  for each $word in $entry.keywords
+    if contains(lower($word), $q) then return true end
+  end
+  return false
+end
+
+-- ── Exec parsing and field-code expansion ───────────────────────────────
+
+fn parse_exec($exec)
+  -- Split an Exec string into argv per the Desktop Entry quoting rules:
+  -- double-quoted segments (in which only " ` $ \ are escapable), backslash
+  -- escaping any character outside quotes, space/tab argument separators.
+  -- Never hand this to a shell.
+  $cs = chars($exec)
+  $args = []
+  $cur = ""
+  $have = false
+  $in_quotes = false
+  $i = 0
+  $n = len($cs)
+  while $i < $n
+    $c = $cs[$i]
+    if $c == "\\" and $i + 1 < $n then
+      $next = $cs[$i + 1]
+      if not $in_quotes or contains(["\"", "`", "$", "\\"], $next) then
+        $cur = $cur .. $next
+        $i = $i + 2
+      else
+        -- Inside quotes a backslash before any other character stays literal.
+        $cur = $cur .. $c
+        $i = $i + 1
+      end
+    elif $c == "\"" then
+      $in_quotes = not $in_quotes
+      $have = true
+      $i = $i + 1
+    elif not $in_quotes and ($c == " " or $c == "\t") then
+      if $have then $args = concat($args, [$cur]) end
+      $cur = ""
+      $have = false
+      $i = $i + 1
+    else
+      $cur = $cur .. $c
+      $have = true
+      $i = $i + 1
+    end
+  end
+  if $have then $args = concat($args, [$cur]) end
+  return $args
+end
+
+fn uri_to_path($uri)
+  -- file:// URIs become decoded local paths; anything else passes through.
+  if starts_with($uri, "file://") then return url_decode(substr($uri, 7, len($uri))) end
+  return $uri
+end
+
+fn expand_codes($arg, $entry, $uris, $paths)
+  -- Expand the field codes in ONE argv element (already unquoted). Returns
+  -- {argv: replacement elements, file_code: whether a %f/%F/%u/%U was seen}.
+  -- An argument that is exactly one field code is replaced whole (and is
+  -- dropped when its value is absent); embedded codes substitute in place.
+  if $arg == "%f" then
+    if len($paths) == 0 then return {argv: [], file_code: true} end
+    return {argv: [$paths[0]], file_code: true}
+  end
+  if $arg == "%F" then return {argv: $paths, file_code: true} end
+  if $arg == "%u" then
+    if len($uris) == 0 then return {argv: [], file_code: true} end
+    return {argv: [$uris[0]], file_code: true}
+  end
+  if $arg == "%U" then return {argv: $uris, file_code: true} end
+  if $arg == "%i" then
+    if $entry.icon == "" then return {argv: [], file_code: false} end
+    return {argv: ["--icon", $entry.icon], file_code: false}
+  end
+  $out = ""
+  $file_code = false
+  $cs = chars($arg)
+  $i = 0
+  $n = len($cs)
+  while $i < $n
+    $c = $cs[$i]
+    if $c == "%" and $i + 1 < $n then
+      $code = $cs[$i + 1]
+      $i = $i + 2
+      if $code == "%" then
+        $out = $out .. "%"
+      elif $code == "f" then
+        $file_code = true
+        if len($paths) > 0 then $out = $out .. $paths[0] end
+      elif $code == "F" then
+        $file_code = true
+        $out = $out .. join($paths, " ")
+      elif $code == "u" then
+        $file_code = true
+        if len($uris) > 0 then $out = $out .. $uris[0] end
+      elif $code == "U" then
+        $file_code = true
+        $out = $out .. join($uris, " ")
+      elif $code == "i" then
+        if $entry.icon != "" then $out = $out .. $entry.icon end
+      elif $code == "c" then
+        $out = $out .. $entry.name
+      elif $code == "k" then
+        $out = $out .. $entry.path
+      end
+      -- %d %D %n %N %v %m are deprecated legacy codes: removed, no output.
+    else
+      $out = $out .. $c
+      $i = $i + 1
+    end
+  end
+  -- An argument whose every code expanded to nothing is dropped outright,
+  -- the same as an absent %f (the spec removes absent field codes).
+  if $out == "" then return {argv: [], file_code: $file_code} end
+  return {argv: [$out], file_code: $file_code}
+end
+
+fn expand_exec($exec, $entry, $uris)
+  -- Full Exec expansion into argv. %f/%F take local paths decoded from
+  -- file:// URIs, %u/%U take the URIs. When the Exec line carries no
+  -- file/URI field code at all and uris were supplied, they are appended
+  -- as extra arguments per the spec.
+  $u = type($uris) == "list" ? $uris : []
+  $paths = []
+  for each $uri in $u
+    $paths = concat($paths, [uri_to_path($uri)])
+  end
+  $argv = []
+  $saw_file_code = false
+  for each $arg in parse_exec($exec)
+    $exp = expand_codes($arg, $entry, $u, $paths)
+    if $exp.file_code then $saw_file_code = true end
+    $argv = concat($argv, $exp.argv)
+  end
+  if not $saw_file_code and len($u) > 0 then $argv = concat($argv, $u) end
+  return $argv
+end
+
+-- ── icon-theme lookup ───────────────────────────────────────────────────
+
+fn icon_kind($path)
+  $ext = lower(extname($path))
+  if $ext == ".svg" then return "svg" end
+  if $ext == ".png" then return "png" end
+  if $ext == ".xpm" then return "xpm" end
+  return nil
+end
+
+fn load_theme($ctx, $theme)
+  -- Parse (once, cached) the first index.theme for $theme across the base
+  -- dirs. Returns {ctx, meta}; meta is nil when the theme has no readable
+  -- index.theme (also cached, so absent themes cost one stat per base dir).
+  if has_key($ctx.cache, $theme) then
+    $cached = $ctx.cache[$theme]
+    return {ctx: $ctx, meta: $cached == false ? nil : $cached}
+  end
+  $meta = nil
+  for each $base in $ctx.icon_dirs
+    $index_path = $base .. "/" .. $theme .. "/index.theme"
+    if is_file($index_path) then
+      $ini = nil
+      try
+        $ini = ini_parse(read_file($index_path))
+      catch $err
+        $ini = nil
+      end
+      if type($ini) == "map" and has_key($ini, "Icon Theme") then
+        $header = $ini["Icon Theme"]
+        -- Hidden= means "do not list in selection UIs" (Arch ships hicolor
+        -- with Hidden=true), not "unusable": the fallback chain and explicit
+        -- Inherits still search a hidden theme, so it is not skipped here.
+        $dirs = []
+        $seen = {}
+        for each $list_key in ["Directories", "ScaledDirectories"]
+          for each $sub in split_theme_list(get_or($header, $list_key, ""))
+            if $seen[$sub] == nil and has_key($ini, $sub) then
+              $seen[$sub] = true
+              $sec = $ini[$sub]
+              if has_key($sec, "Size") then
+                $size = to_number(get_or($sec, "Size", "0"))
+                $dirs = concat($dirs, [{
+                  name: $sub,
+                  size: $size,
+                  scale: to_number(get_or($sec, "Scale", "1")),
+                  type: get_or($sec, "Type", "Threshold"),
+                  min: to_number(get_or($sec, "MinSize", get_or($sec, "Size", "0"))),
+                  max: to_number(get_or($sec, "MaxSize", get_or($sec, "Size", "0"))),
+                  threshold: to_number(get_or($sec, "Threshold", "2"))
+                }])
+              end
+            end
+          end
+        end
+        $meta = {name: $theme, dirs: $dirs, inherits: split_theme_list(get_or($header, "Inherits", ""))}
+      end
+      -- The first index.theme found wins, even when unusable.
+      break
+    end
+  end
+  $ctx.cache[$theme] = $meta == nil ? false : $meta
+  return {ctx: $ctx, meta: $meta}
+end
+
+fn dir_match($d, $size, $scale)
+  -- DirectoryMatchesSize from the Icon Theme spec: scale must be exact,
+  -- then the size must fall inside the directory's window by Type.
+  if $d.scale != $scale then return false end
+  if $d.type == "Fixed" then return $d.size == $size end
+  if $d.type == "Scalable" then return $d.min <= $size and $size <= $d.max end
+  return $d.size - $d.threshold <= $size and $size <= $d.size + $d.threshold
+end
+
+fn dir_distance($d, $size, $scale)
+  -- DirectorySizeDistance from the Icon Theme spec (scale folded in by
+  -- comparing Size*Scale against iconsize*iconscale). The spec's Threshold
+  -- arm garbles its bounds; the threshold window is the evident intent.
+  $icon = $size * $scale
+  if $d.type == "Fixed" then return abs($d.size * $d.scale - $icon) end
+  if $d.type == "Scalable" then
+    if $icon < $d.min * $d.scale then return $d.min * $d.scale - $icon end
+    if $icon > $d.max * $d.scale then return $icon - $d.max * $d.scale end
+    return 0
+  end
+  $lo = ($d.size - $d.threshold) * $d.scale
+  $hi = ($d.size + $d.threshold) * $d.scale
+  if $icon < $lo then return $lo - $icon end
+  if $icon > $hi then return $icon - $hi end
+  return 0
+end
+
+fn icon_file($ctx, $theme, $sub, $name)
+  -- First existing <base>/<theme>/<sub>/<name>.<ext>; the spec's extension
+  -- order is png, svg, xpm within each base directory.
+  for each $base in $ctx.icon_dirs
+    for each $ext in ["png", "svg", "xpm"]
+      $path = $base .. "/" .. $theme .. "/" .. $sub .. "/" .. $name .. "." .. $ext
+      if is_file($path) then return {path: $path, kind: $ext} end
+    end
+  end
+  return nil
+end
+
+fn lookup_theme($ctx, $meta, $name, $size, $scale)
+  -- LookupIcon for one theme: exact DirectoryMatchesSize pass, then the
+  -- closest match by DirectorySizeDistance (strictly-less comparison, so
+  -- the earlier directory wins ties).
+  for each $d in $meta.dirs
+    if dir_match($d, $size, $scale) then
+      $hit = icon_file($ctx, $meta.name, $d.name, $name)
+      if $hit != nil then return $hit end
+    end
+  end
+  $best = nil
+  $best_dist = nil
+  for each $d in $meta.dirs
+    $hit = icon_file($ctx, $meta.name, $d.name, $name)
+    if $hit != nil then
+      $dist = dir_distance($d, $size, $scale)
+      if $best_dist == nil or $dist < $best_dist then
+        $best = $hit
+        $best_dist = $dist
+      end
+    end
+  end
+  return $best
+end
+
+fn theme_chain($ctx, $theme)
+  -- Depth-first Inherits expansion with cycle cutting, hicolor appended
+  -- last when absent. Returns {ctx, chain: [theme names in lookup order]}.
+  $chain = []
+  $seen = {}
+  $stack = [$theme]
+  while len($stack) > 0
+    $t = pop($stack)
+    if $seen[$t] == nil then
+      $seen[$t] = true
+      $chain = concat($chain, [$t])
+      $r = load_theme($ctx, $t)
+      $ctx = $r.ctx
+      if $r.meta != nil then
+        for each $parent in reverse($r.meta.inherits)
+          if $seen[$parent] == nil then $stack = concat($stack, [$parent]) end
+        end
+      end
+    end
+  end
+  if $seen["hicolor"] == nil then $chain = concat($chain, ["hicolor"]) end
+  return {ctx: $ctx, chain: $chain}
+end
+
+fn resolve_icon($ctx, $name, $size, $scale, $theme)
+  -- Resolve an icon name to a file. $name may be an absolute path (Icon=
+  -- allows it): it is returned verbatim when it exists. Otherwise the theme
+  -- chain is searched (exact then closest, Inherits depth-first, hicolor,
+  -- then /usr/share/pixmaps). Returns {hit: map-or-nil, ctx} -- always
+  -- rebind the caller's context from ctx to keep the cache.
+  if starts_with($name, "/") then
+    $kind = icon_kind($name)
+    if $kind != nil and is_file($name) then
+      return {hit: {path: $name, size: $size, scale: $scale, theme: $theme, kind: $kind}, ctx: $ctx}
+    end
+    return {hit: nil, ctx: $ctx}
+  end
+  $r = theme_chain($ctx, $theme)
+  $ctx = $r.ctx
+  for each $t in $r.chain
+    $loaded = load_theme($ctx, $t)
+    $ctx = $loaded.ctx
+    if $loaded.meta != nil then
+      $hit = lookup_theme($ctx, $loaded.meta, $name, $size, $scale)
+      if $hit != nil then
+        return {hit: {path: $hit.path, size: $size, scale: $scale, theme: $t, kind: $hit.kind}, ctx: $ctx}
+      end
+    end
+  end
+  for each $ext in ["png", "svg", "xpm"]
+    $path = $ctx.pixmaps .. "/" .. $name .. "." .. $ext
+    if is_file($path) then
+      return {hit: {path: $path, size: $size, scale: $scale, theme: "", kind: $ext}, ctx: $ctx}
+    end
+  end
+  return {hit: nil, ctx: $ctx}
+end

@@ -519,6 +519,45 @@ real clipboard data. No payload is deliberately written to disk, retained on
 topics or included in notifications by these scripts. Runtime-reserved verbs
 (including <code>QUIT</code>) and lifecycle properties are provided by Mix and do not
 pass through the desktop handler checks.</p>
+<h2 id="application-registry-citizen-apps">Application registry citizen (<code>apps</code>)</h2>
+<p>A second desktop citizen, <code>src/desktop/scripts/apps.mix</code>, is the data
+foundation for the desktop launcher and the taskbar's app icons. It scans
+the freedesktop desktop-entry directories (<code>$XDG_DATA_HOME/applications</code>,
+then each <code>$XDG_DATA_DIRS</code> entry's <code>applications</code>, subdirectories folded
+into the id with <code>-</code>), keeps <code>[Desktop Entry]</code>-group <code>Type=Application</code>
+entries that pass <code>NoDisplay</code>/<code>Hidden</code>, <code>OnlyShowIn</code>/<code>NotShowIn</code> (against
+the desktop name <code>COSMIX</code>) and <code>TryExec</code>, and resolves icons through the
+freedesktop icon-theme spec (exact size match, then closest by
+<code>DirectorySizeDistance</code>, <code>Inherits</code> depth-first, <code>hicolor</code>, then
+<code>/usr/share/pixmaps</code>; parsed <code>index.theme</code> files are cached in memory).
+Start it like the session provider:</p>
+<pre><code class="language-text">mix --serve /path/to/cosmix/src/desktop/scripts/apps.mix
+</code></pre>
+<p>It is event-driven: the tree is scanned once at start and again only on
+<code>apps.reload</code>. There is no timer or poll loop; a future inotify wake is the
+intended rescan trigger. <code>src/desktop/scripts/cosmix-desk-apps.service</code> is
+an example user unit bound to <code>graphical-session.target</code>.</p>
+<table><thead><tr><th>Verb</th><th>JSON request</th><th>Successful response</th></tr></thead><tbody>
+<tr><td><code>apps.list</code></td><td><code>{category?, query?}</code></td><td>array of <code>{id,name,generic_name,comment,icon,categories,exec,terminal,path}</code> sorted by name</td></tr>
+<tr><td><code>apps.get</code></td><td><code>{id}</code></td><td>the entry with all parsed fields (adds <code>keywords</code>, <code>try_exec</code>, <code>workdir</code>, <code>only_show_in</code>, <code>not_show_in</code>)</td></tr>
+<tr><td><code>apps.icon</code></td><td><code>{name, size?, scale?, theme?}</code></td><td><code>{path,size,scale,theme,kind}</code> — <code>kind</code> is <code>svg</code>, <code>png</code> or <code>xpm</code>; <code>name</code> may be an absolute path</td></tr>
+<tr><td><code>apps.launch</code></td><td><code>{id, uris?}</code></td><td><code>{id,pid,argv}</code> — spawned detached via argv, never a shell</td></tr>
+<tr><td><code>apps.reload</code></td><td><code>{}</code></td><td><code>{count}</code></td></tr>
+</tbody></table>
+<p><code>query</code> is a case-insensitive substring over name, generic name, comment and
+keywords. <code>uris</code> feed the Exec field codes: <code>%f</code>/<code>%F</code> take <code>file://</code> URIs
+decoded to local paths, <code>%u</code>/<code>%U</code> take the URIs, <code>%i</code> becomes <code>--icon ICON</code>,
+<code>%c</code> the name, <code>%k</code> the desktop-file path; deprecated <code>%d %D %n %N %v %m</code>
+are dropped and Exec quoting is parsed into argv per the spec.
+<code>Terminal=true</code> entries are prefixed with the terminal property. Unknown ids
+answer <code>{error:"not_found"}</code> with rc 14; malformed requests rc 10.</p>
+<p>Properties publish through <code>apps.props.watch</code> (snapshot read; optionally
+<code>{path}</code> for one leaf) and <code>apps.props.set</code> (<code>{path, value}</code>): <code>apps.count</code>
+(read-only), <code>apps.icon_theme</code> (default: <code>[Icons] Theme</code> from
+<code>~/.config/kdeglobals</code>, else <code>breeze</code> when installed, else <code>hicolor</code>) and
+<code>apps.terminal</code> (default <code>foot</code>). Mix 0.89.0 reserves
+<code>apps.props.{get,list,describe}</code> for the runtime-owned lifecycle tree, so
+the author properties ride the SPEC-12 fall-through verbs instead.</p>
 <h2 id="verification">Verification</h2>
 <p><code>tests/desktop-test.mix</code> exercises production request validation and result
 handling without desktop effects. <code>tests/desktop-bus-test.mix</code> uses a real,
@@ -528,7 +567,11 @@ It does not read or replace the user's clipboard or open a real browser.
 The noded suite covers reply connection ownership, spoofed identity stripping,
 proof/registration/membership gates and reload while delivery is waiting.
 Deployment acceptance still requires bidirectional transfer over the actual
-admitted nodes and their Wayland sessions; unit gates do not prove that result.</p></div></div>
+admitted nodes and their Wayland sessions; unit gates do not prove that result.</p>
+<p><code>tests/apps-test.mix</code> exercises the apps citizen's desktop-entry parser and
+icon resolver against a fixture tree it creates under a temp dir (no Bus,
+nothing launched). The pure functions live in <code>src/desktop/scripts/lib/apps.mix</code>
+so the test can require them directly.</p></div></div>
     </div>
 
 </main>

@@ -1,0 +1,159 @@
+-- apps -- the application-registry citizen: the data foundation for the
+-- desktop launcher and the taskbar's app icons. It scans the freedesktop
+-- desktop-entry directories, resolves icons through the icon-theme spec and
+-- launches applications detached, never handing an Exec string to a shell.
+--
+-- Run: mix --serve apps.mix          (Bus service name "apps")
+-- The parse/lookup logic lives in lib/apps.mix (pure, unit-tested); this
+-- file is only the Bus surface.
+--
+-- Event-driven by design: the tree is scanned once here and again only when
+-- apps.reload arrives. There is deliberately no timer and no sleep loop --
+-- backends are woken by events, never poll. A future inotify watch on the
+-- applications directories (CREATE/MOVED_TO/DELETE wakes apps.reload) would
+-- make rescans automatic; that is out of scope for now.
+$a = require("lib/apps.mix")
+
+$apps = $a.scan_apps($a.application_dirs(), $a.locale_id(), "COSMIX")
+$icon_ctx = $a.icon_ctx()
+$icon_theme = $a.default_theme()
+$terminal_cmd = "foot"
+
+fn event_args()
+  -- Structured args when the caller sent a JSON map body, else an empty map.
+  return type($event.args) == "map" ? $event.args : {}
+end
+
+on "apps.list" desc "list visible applications sorted by name (category, query optional)"
+  $args = event_args()
+  $category = get_or($args, "category", "")
+  $query = get_or($args, "query", "")
+  if type($category) != "string" or type($query) != "string" then
+    reply(10, json_encode({error: "invalid_request"}))
+  else
+    $out = []
+    for each $e in $apps
+      if ($category == "" or contains($e.categories, $category)) and $a.match_query($e, $query) then
+        $out = concat($out, [$a.project_list($e)])
+      end
+    end
+    reply(0, json_encode($out))
+  end
+end
+
+on "apps.get" desc "one application entry (all parsed fields) by id"
+  $args = event_args()
+  $id = get_or($args, "id", "")
+  if type($id) != "string" or $id == "" then
+    reply(10, json_encode({error: "invalid_request"}))
+  else
+    $e = $a.find_app($apps, $id)
+    if $e == nil then
+      reply(14, json_encode({error: "not_found"}))
+    else
+      reply(0, json_encode($e))
+    end
+  end
+end
+
+on "apps.icon" desc "resolve an icon name (or absolute path) to a themed icon file"
+  $args = event_args()
+  $name = get_or($args, "name", "")
+  $size = get_or($args, "size", 48)
+  $scale = get_or($args, "scale", 1)
+  $theme_arg = get_or($args, "theme", "")
+  if type($name) != "string" or $name == "" then
+    reply(10, json_encode({error: "invalid_request"}))
+  elif not $a.is_int($size) or $size < 1 or $size > 4096 then
+    reply(10, json_encode({error: "invalid_request"}))
+  elif not $a.is_int($scale) or $scale < 1 or $scale > 4 then
+    reply(10, json_encode({error: "invalid_request"}))
+  elif $theme_arg != "" and type($theme_arg) != "string" then
+    reply(10, json_encode({error: "invalid_request"}))
+  else
+    $r = $a.resolve_icon($icon_ctx, $name, $size, $scale, $theme_arg == "" ? $icon_theme : $theme_arg)
+    -- Whole rebind: keeps the parsed index.theme cache across calls.
+    $icon_ctx = $r.ctx
+    if $r.hit == nil then
+      reply(14, json_encode({error: "not_found"}))
+    else
+      reply(0, json_encode($r.hit))
+    end
+  end
+end
+
+on "apps.launch" desc "launch an application by id, detached (uris optional)"
+  $args = event_args()
+  $id = get_or($args, "id", "")
+  $uris = get_or($args, "uris", nil)
+  $uris_ok = $uris == nil or type($uris) == "list"
+  if $uris_ok and $uris != nil then
+    for each $u in $uris
+      if type($u) != "string" then $uris_ok = false end
+    end
+  end
+  if type($id) != "string" or $id == "" or not $uris_ok then
+    reply(10, json_encode({error: "invalid_request"}))
+  else
+    $e = $a.find_app($apps, $id)
+    if $e == nil then
+      reply(14, json_encode({error: "not_found"}))
+    else
+      $argv = $a.expand_exec($e.exec, $e, $uris)
+      if $e.terminal then $argv = concat([$terminal_cmd], $argv) end
+      $opts = {detach: true}
+      if $e.workdir != "" and is_dir($e.workdir) then $opts.cwd = $e.workdir end
+      try
+        $pid = spawn($argv, $opts)
+        reply(0, json_encode({id: $id, pid: $pid, argv: $argv}))
+      catch $err
+        reply(11, json_encode({error: "spawn_failed", id: $id}))
+      end
+    end
+  end
+end
+
+on "apps.reload" desc "rescan the desktop-entry directories now"
+  $apps = $a.scan_apps($a.application_dirs(), $a.locale_id(), "COSMIX")
+  reply(0, json_encode({count: len($apps)}))
+end
+
+-- ── Properties ──────────────────────────────────────────────────────────
+-- mix 0.89.0 reserves <svc>.props.{get,list,describe} for the runtime-owned
+-- lifecycle tree, so the author properties publish through the SPEC-12 verbs
+-- that fall through to author handlers: watch (snapshot read) and set.
+
+on "apps.props.watch" desc "read citizen properties: apps.count, apps.icon_theme, apps.terminal"
+  $args = event_args()
+  $path = get_or($args, "path", "")
+  if $path == "" then
+    reply(0, json_encode({"apps.count": len($apps), "apps.icon_theme": $icon_theme, "apps.terminal": $terminal_cmd}))
+  elif $path == "apps.count" then
+    reply(0, json_encode({path: $path, value: len($apps)}))
+  elif $path == "apps.icon_theme" then
+    reply(0, json_encode({path: $path, value: $icon_theme}))
+  elif $path == "apps.terminal" then
+    reply(0, json_encode({path: $path, value: $terminal_cmd}))
+  else
+    reply(14, json_encode({error: "not_found"}))
+  end
+end
+
+on "apps.props.set" desc "set a citizen property (icon_theme, terminal; count is read-only)"
+  $args = event_args()
+  $path = get_or($args, "path", "")
+  $value = get_or($args, "value", nil)
+  if type($path) != "string" or $path == "" or type($value) != "string" or trim($value) == "" then
+    reply(10, json_encode({error: "invalid_request"}))
+  elif $path == "apps.icon_theme" then
+    $icon_theme = trim($value)
+    reply(0, json_encode({path: $path, value: $icon_theme}))
+  elif $path == "apps.terminal" then
+    $terminal_cmd = trim($value)
+    reply(0, json_encode({path: $path, value: $terminal_cmd}))
+  elif $path == "apps.count" then
+    reply(10, json_encode({error: "read_only"}))
+  else
+    reply(14, json_encode({error: "not_found"}))
+  end
+end
