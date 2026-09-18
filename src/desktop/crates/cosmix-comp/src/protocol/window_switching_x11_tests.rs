@@ -315,3 +315,68 @@ fn x11_forced_close_is_refused_immediately() {
     assert!(harness.server.state.window_waiters.waiters.is_empty());
     harness.assert_client_connected("the X11 refusal kills nothing");
 }
+
+/// D11: an X11 toplevel has no `windows.*` row (P2), so its workspace is
+/// read from `surfaces.s<id>.workspace` — null before its first map,
+/// stamped with the current workspace at the map (rule 2), and following a
+/// move like any managed window.
+#[cfg(feature = "bus")]
+#[test]
+fn x11_window_workspace_is_readable_on_the_surfaces_row() {
+    use workspaces::WorkspaceTarget;
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let (surface_id, _surface, _window, object) = associate_normal_window(&mut harness, 905);
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+    let key = format!("s{}", harness.server.state.surfaces[&object].id.0);
+    let before = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert!(!before.surfaces[&key].mapped);
+    assert_eq!(
+        before.surfaces[&key].workspace, None,
+        "no workspace before the first map"
+    );
+
+    commit_dmabuf(&mut harness, surface_id, 32, 24);
+    let current = harness.server.state.workspace_current();
+    assert_eq!(current, 1);
+    let mapped = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    let row = &mapped.surfaces[&key];
+    assert!(row.mapped);
+    assert_eq!(row.role, "x11-toplevel");
+    assert_eq!(row.workspace, Some(current));
+    assert!(row.visible);
+    assert!(
+        !mapped.windows.contains_key(&key),
+        "X11 rows are not windows.* rows in 0.59"
+    );
+    // ...but `workspaces.list` counts it: the pager reading that leaf must
+    // not show the workspace empty while the X11 window is on it.
+    let counts = |snapshot: &port_snapshot::CompSnapshot| {
+        snapshot
+            .workspaces
+            .list
+            .iter()
+            .map(|row| row.windows)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(counts(&before), [0, 0, 0, 0], "unmapped: on no workspace");
+    assert_eq!(counts(&mapped), [1, 0, 0, 0]);
+
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&object, WorkspaceTarget::Index(3)),
+        Ok((1, 3))
+    );
+    let moved = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert_eq!(moved.surfaces[&key].workspace, Some(3));
+    assert!(!moved.surfaces[&key].visible);
+    assert!(!moved.surfaces[&key].minimized);
+    assert_eq!(moved.workspaces.current, 1);
+    assert_eq!(counts(&moved), [0, 0, 1, 0]);
+}

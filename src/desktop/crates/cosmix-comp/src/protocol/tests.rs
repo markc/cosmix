@@ -29630,6 +29630,512 @@ fn minimized_prop_round_trips_and_restores_that_window() {
     assert_eq!(snapshot.focus.window.generation, Some(alpha_generation));
 }
 
+/// One `props.changed` record's `(old, new, cause)` by path, or `None`
+/// when the path did not change in this drain.
+#[cfg(feature = "bus")]
+fn changed_leaf(
+    changed: &[port_observation::ObservationRecord],
+    path: &str,
+) -> Option<(Value, Value, &'static str)> {
+    changed.iter().find_map(|record| match record {
+        port_observation::ObservationRecord::PropsChanged {
+            path: changed_path,
+            old,
+            new,
+            cause,
+            ..
+        } if changed_path == path => Some((old.wire_value(), new.wire_value(), *cause)),
+        _ => None,
+    })
+}
+
+/// Rule 5 on the props surface: writing `windows.s<id>.workspace` moves
+/// THAT window without switching — its row reads `visible:false,
+/// minimized:false`, its generation is untouched, `workspaces.current`
+/// stays — and the changed events (workspace, visible, the surfaces row, the
+/// `workspaces.list` counts) carry cause `props.set`. A no-op write
+/// publishes nothing; 0, a numeric string and an index above the count are
+/// `invalid_value`; a stale generation is `stale_target` before any leaf
+/// logic runs.
+#[cfg(feature = "bus")]
+#[test]
+fn workspace_prop_round_trips_and_moves_without_switching() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let (_, _, _, beta) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let (alpha_id, alpha_generation) = window_id_and_generation(&harness, &alpha);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+
+    let alpha_path = format!("windows.s{alpha_id}.workspace");
+    let admission = ingress
+        .request_set_fenced(alpha_path.clone(), json!(2), Some(alpha_generation))
+        .expect("move admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"path": alpha_path, "old": 1, "new": 2}));
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.workspace_current(), 1, "a move never switches");
+        let record = &state.surfaces[&alpha];
+        assert_eq!(record.workspace, 2);
+        assert!(!record.layout.visible);
+        assert!(!record.minimized);
+        assert_eq!(
+            record.generation, alpha_generation,
+            "a move never bumps the generation"
+        );
+        assert!(state.surfaces[&beta].layout.visible);
+    }
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert_eq!(
+        changed_leaf(&changed, &alpha_path),
+        Some((json!(1), json!(2), "props.set")),
+        "{changed:?}"
+    );
+    assert_eq!(
+        changed_leaf(&changed, &format!("windows.s{alpha_id}.visible")),
+        Some((json!(true), json!(false), "props.set"))
+    );
+    assert_eq!(
+        changed_leaf(&changed, &format!("windows.s{alpha_id}.minimized")),
+        None,
+        "off-workspace is not minimised"
+    );
+    assert_eq!(
+        changed_leaf(&changed, &format!("surfaces.s{alpha_id}.workspace")),
+        Some((json!(1), json!(2), "props.set"))
+    );
+    assert_eq!(changed_leaf(&changed, "workspaces.current"), None);
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.list"),
+        Some((
+            json!([
+                {"index": 1, "windows": 2},
+                {"index": 2, "windows": 0},
+                {"index": 3, "windows": 0},
+                {"index": 4, "windows": 0}
+            ]),
+            json!([
+                {"index": 1, "windows": 1},
+                {"index": 2, "windows": 1},
+                {"index": 3, "windows": 0},
+                {"index": 4, "windows": 0}
+            ]),
+            "props.set"
+        ))
+    );
+
+    // A no-op write replies normally and publishes nothing.
+    let admission = ingress
+        .request_set(alpha_path.clone(), json!(2))
+        .expect("no-op admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body, json!({"path": alpha_path, "old": 2, "new": 2}));
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+
+    // Refusals: the gate's (0, a numeric string), the core's (above the
+    // count), an unknown window, and the fence. Each leaves the window
+    // where it is.
+    for refused in [json!(0), json!("2"), json!(9)] {
+        let admission = ingress
+            .request_set(alpha_path.clone(), refused.clone())
+            .expect("bad value reaches the service");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 10, "{refused}: {body}");
+        assert_eq!(body["error"], "invalid_value", "{refused}");
+        assert_eq!(body["path"], alpha_path);
+        assert_eq!(body["expected"], "integer");
+        assert_eq!(body["range"], "1..=count");
+    }
+    let admission = ingress
+        .request_set("windows.s999999.workspace".into(), json!(1))
+        .expect("missing window reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10);
+    assert_eq!(body["range"], "a live toplevel window");
+    let admission = ingress
+        .request_set_fenced(alpha_path.clone(), json!(3), Some(alpha_generation + 1))
+        .expect("stale fence reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "stale_target");
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, 2);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        None,
+        "the no-op and the refusals leave no cause planted"
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+
+    // The rows read the workspace back.
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    let row = &snapshot.windows[&format!("s{alpha_id}")];
+    assert_eq!(row.workspace, 2);
+    assert!(!row.visible);
+    assert!(!row.minimized);
+    assert_eq!(
+        snapshot.surfaces[&format!("s{alpha_id}")].workspace,
+        Some(2)
+    );
+    assert_eq!(snapshot.workspaces.current, 1);
+}
+
+/// Rules 1 and 11 on the props surface: the defaults (count 4, current 1,
+/// one `o_<slug>.current` mirroring `current`), writing `current` switches
+/// and publishes both current leaves plus every window's `visible`, writing
+/// by output key switches the same output (an unknown key is refused naming
+/// the expected shape), and shrinking the count strands windows onto the
+/// last workspace, clamps current and publishes count/current/list. 0, a
+/// numeric string, above the cap and above the count are `invalid_value`;
+/// the row list and the subtree are `read_only`; a generation on a
+/// `workspaces.*` path is refused.
+#[cfg(feature = "bus")]
+#[test]
+fn workspaces_current_and_count_props_write_and_watch() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let alpha = test_toplevel_record(&harness).role.wl_surface().id();
+    let (_, _, _, beta) = map_named_test_toplevel(&mut harness, "Beta", "dev.cosmix.Beta");
+    let (alpha_id, _) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, _) = window_id_and_generation(&harness, &beta);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+
+    // Rule 1: the defaults, and a new window joined the current workspace.
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert_eq!(snapshot.workspaces.count, 4);
+    assert_eq!(snapshot.workspaces.current, 1);
+    assert_eq!(snapshot.workspaces.outputs.len(), 1);
+    assert_eq!(snapshot.workspaces.outputs["o_cosmix_nested_0"].current, 1);
+    assert_eq!(
+        snapshot.workspaces.list,
+        [(1, 2), (2, 0), (3, 0), (4, 0)]
+            .map(|(index, windows)| { port_snapshot::WorkspaceRowSnapshot { index, windows } })
+    );
+    for id in [alpha_id, beta_id] {
+        assert_eq!(snapshot.windows[&format!("s{id}")].workspace, 1);
+    }
+
+    // Writing `current` switches: both windows leave the screen and the two
+    // current leaves change together, all attributed to the write.
+    let admission = ingress
+        .request_set("workspaces.current".into(), json!(2))
+        .expect("switch admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"path": "workspaces.current", "old": 1, "new": 2})
+    );
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.current"),
+        Some((json!(1), json!(2), "props.set")),
+        "{changed:?}"
+    );
+    // A no-op switch (the core's `to == from` early return) replies
+    // normally, publishes nothing and leaves no full-snapshot cause
+    // planted for the next unrelated change to be attributed to.
+    let admission = ingress
+        .request_set("workspaces.current".into(), json!(2))
+        .expect("no-op switch admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"path": "workspaces.current", "old": 2, "new": 2})
+    );
+    assert_eq!(harness.server.state.full_dirty_cause(), None);
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.o_cosmix_nested_0.current"),
+        Some((json!(1), json!(2), "props.set"))
+    );
+    assert_eq!(changed_leaf(&changed, "workspaces.count"), None);
+    assert_eq!(changed_leaf(&changed, "workspaces.list"), None);
+    for id in [alpha_id, beta_id] {
+        assert_eq!(
+            changed_leaf(&changed, &format!("windows.s{id}.visible")),
+            Some((json!(true), json!(false), "props.set")),
+            "s{id}"
+        );
+        assert_eq!(
+            changed_leaf(&changed, &format!("windows.s{id}.minimized")),
+            None
+        );
+        assert_eq!(
+            changed_leaf(&changed, &format!("windows.s{id}.workspace")),
+            None,
+            "a switch moves no window"
+        );
+    }
+
+    // By output key: the same output; an unknown key names the shape.
+    let admission = ingress
+        .request_set("workspaces.o_cosmix_nested_0.current".into(), json!(3))
+        .expect("keyed switch admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"path": "workspaces.o_cosmix_nested_0.current", "old": 2, "new": 3})
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    assert_eq!(
+        changed_leaf(&drain_observations(&observations), "workspaces.current"),
+        Some((json!(2), json!(3), "props.set"))
+    );
+    let admission = ingress
+        .request_set("workspaces.o_nope.current".into(), json!(1))
+        .expect("unknown key reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+    assert_eq!(body["expected"], "output key");
+    // The range names the real constraint (D3: only the default output
+    // switches), not "an existing key" — a second output's key exists
+    // under outputs.* and is refused all the same.
+    assert_eq!(
+        body["range"],
+        "the default output's o_<slug> (the only switchable output; workspaces.current addresses it)"
+    );
+    assert_eq!(harness.server.state.workspace_current(), 3);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        None,
+        "a refused write leaves no cause planted"
+    );
+
+    // Rule 11: alpha on 4, current 4, then count 2 — alpha lands on 2 (the
+    // last workspace), current clamps to 2, the list shrinks with its
+    // counts, and count/current/list/alpha's workspace all reach the topic.
+    for (path, value) in [
+        (format!("windows.s{alpha_id}.workspace"), 4),
+        ("workspaces.current".to_string(), 4),
+    ] {
+        let admission = ingress
+            .request_set(path, json!(value))
+            .expect("setup write admitted");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 0, "{body}");
+    }
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    assert!(harness.server.state.surfaces[&alpha].layout.visible);
+    let admission = ingress
+        .request_set("workspaces.count".into(), json!(2))
+        .expect("shrink admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        body,
+        json!({"path": "workspaces.count", "old": 4, "new": 2})
+    );
+    {
+        let state = &harness.server.state;
+        assert_eq!(state.workspaces.count, 2);
+        assert_eq!(state.workspace_current(), 2);
+        assert_eq!(state.surfaces[&alpha].workspace, 2);
+        assert!(state.surfaces[&alpha].layout.visible);
+        assert_eq!(state.surfaces[&beta].workspace, 1);
+        assert!(!state.surfaces[&beta].layout.visible);
+    }
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.count"),
+        Some((json!(4), json!(2), "props.set")),
+        "{changed:?}"
+    );
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.current"),
+        Some((json!(4), json!(2), "props.set"))
+    );
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.o_cosmix_nested_0.current"),
+        Some((json!(4), json!(2), "props.set"))
+    );
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.list"),
+        Some((
+            json!([
+                {"index": 1, "windows": 1},
+                {"index": 2, "windows": 0},
+                {"index": 3, "windows": 0},
+                {"index": 4, "windows": 1}
+            ]),
+            json!([{"index": 1, "windows": 1}, {"index": 2, "windows": 1}]),
+            "props.set"
+        ))
+    );
+    assert_eq!(
+        changed_leaf(&changed, &format!("windows.s{alpha_id}.workspace")),
+        Some((json!(4), json!(2), "props.set"))
+    );
+    assert_eq!(
+        changed_leaf(&changed, &format!("windows.s{alpha_id}.visible")),
+        None,
+        "alpha was on screen before and after"
+    );
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert_eq!(snapshot.workspaces.list.len(), 2);
+
+    // Refusals leave the state alone and publish nothing.
+    for (path, value, range) in [
+        ("workspaces.count", json!(0), "1..=16"),
+        ("workspaces.count", json!("4"), "1..=16"),
+        ("workspaces.count", json!(17), "1..=16"),
+        ("workspaces.current", json!(0), "1..=count"),
+        ("workspaces.current", json!("4"), "1..=count"),
+        ("workspaces.current", json!(3), "1..=count"),
+        (
+            "workspaces.o_cosmix_nested_0.current",
+            json!(3),
+            "1..=count",
+        ),
+    ] {
+        let admission = ingress
+            .request_set(path.into(), value.clone())
+            .expect("bad value reaches the service");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 10, "{path} {value}: {body}");
+        assert_eq!(body["error"], "invalid_value", "{path} {value}");
+        assert_eq!(body["path"], path);
+        assert_eq!(body["expected"], "integer");
+        assert_eq!(body["range"], range, "{path} {value}");
+    }
+    for path in ["workspaces.list", "workspaces"] {
+        let admission = ingress
+            .request_set(path.into(), json!([]))
+            .expect("read-only path reaches the service");
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 10, "{path}: {body}");
+        assert_eq!(body["error"], "read_only", "{path}");
+    }
+    let admission = ingress
+        .request_set_fenced("workspaces.current".into(), json!(1), Some(1))
+        .expect("fenced workspaces write reaches the service");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "invalid_value");
+    assert_eq!(body["path"], "generation");
+    assert_eq!(harness.server.state.workspaces.count, 2);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(
+        harness.server.state.full_dirty_cause(),
+        None,
+        "refused writes leave no cause planted"
+    );
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(drain_observations(&observations).is_empty());
+
+    // Growing back publishes count and list only.
+    let admission = ingress
+        .request_set("workspaces.count".into(), json!(3))
+        .expect("grow admitted");
+    let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+    assert_eq!(rc, 0, "{body}");
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.count"),
+        Some((json!(2), json!(3), "props.set"))
+    );
+    assert_eq!(changed_leaf(&changed, "workspaces.current"), None);
+    assert_eq!(
+        changed_leaf(&changed, "workspaces.list").map(|(_, new, _)| new),
+        Some(json!([
+            {"index": 1, "windows": 1},
+            {"index": 2, "windows": 1},
+            {"index": 3, "windows": 0}
+        ]))
+    );
+}
+
+/// `xwayland.display` is null until a generation is ready, reads `:N`
+/// while one serves X clients, and goes back to null (with a changed
+/// event) when it is torn down. Offline there is no Xwayland to reach
+/// readiness, so the ready arm's one effect is applied by hand; the
+/// teardown half runs the real path.
+#[cfg(all(feature = "bus", feature = "xwayland"))]
+#[test]
+fn xwayland_display_prop_is_null_until_ready() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().expect("watch admitted");
+    serviced_watch(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    let context = harness
+        .server
+        .state
+        .port_context
+        .clone()
+        .expect("port context");
+
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert_eq!(snapshot.xwayland.display, None);
+    // Served as an explicit null, not an absent leaf: a reader can watch it.
+    let (rc, body) = runtime.block_on(port_snapshot::dispatch_read(
+        Arc::new(snapshot),
+        "comp.props.get".into(),
+        json!({"path": "xwayland.display"}),
+    ));
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body.as_ref(), "null");
+
+    harness.server.state.xwayland.display_number = Some(7);
+    harness.server.state.mark_xwayland_dirty("xwayland.ready");
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert_eq!(snapshot.xwayland.display.as_deref(), Some(":7"));
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert_eq!(
+        changed_leaf(&changed, "xwayland.display"),
+        Some((Value::Null, json!(":7"), "xwayland.ready")),
+        "{changed:?}"
+    );
+
+    harness.server.state.shutdown_xwayland();
+    assert_eq!(harness.server.state.xwayland.display_number, None);
+    let snapshot = port_snapshot::snapshot(&harness.server.state, &context).expect("snapshot");
+    assert_eq!(snapshot.xwayland.display, None);
+    port_observation::service_observations(&mut harness.server.state);
+    let changed = drain_observations(&observations);
+    assert_eq!(
+        changed_leaf(&changed, "xwayland.display"),
+        Some((json!(":7"), Value::Null, "xwayland.down")),
+        "{changed:?}"
+    );
+}
+
 /// `comp.window.restore` without an id is exactly the Super+Shift+M
 /// binding (LIFO pop); with nothing left it answers not_found, and every
 /// named form is fenced.
