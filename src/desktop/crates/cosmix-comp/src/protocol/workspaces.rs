@@ -116,7 +116,11 @@ pub(super) fn stamp_workspace_at_map(record: &mut SurfaceRecord, was_mapped: boo
 /// frame instead of once per surface — `workspace_current` clones an
 /// `Output` and builds a key `String`, which is per-frame churn of exactly
 /// the kind 0.56.1 removed.
-pub(crate) fn on_workspace(record: &SurfaceRecord, current: u32) -> bool {
+// `pub(super)`, not `pub(crate)`: `SurfaceRecord` is private to `protocol`,
+// and a free fn is not visibility-capped the way a method on the private
+// `WaylandState` is (rustc private_interfaces under -D warnings). Every
+// caller lives inside `protocol`.
+pub(super) fn on_workspace(record: &SurfaceRecord, current: u32) -> bool {
     !record.role.managed_toplevel() || record.workspace == current
 }
 
@@ -125,7 +129,7 @@ pub(crate) fn on_workspace(record: &SurfaceRecord, current: u32) -> bool {
 /// sets the flag derives it from here, so no path can un-suspend a window
 /// that is still off screen.
 #[cfg(feature = "xwayland")]
-pub(crate) fn x11_suspended(record: &SurfaceRecord, current: u32) -> bool {
+pub(super) fn x11_suspended(record: &SurfaceRecord, current: u32) -> bool {
     record.minimized || !on_workspace(record, current)
 }
 
@@ -186,7 +190,10 @@ impl WaylandState {
     /// the default output's current). Per-event callers only (the
     /// `windows.list` filter and the rows, slices 3-4); a per-frame loop
     /// reads `workspace_current()` once and calls `on_workspace`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    // Unconditional: the test target has no caller either (a
+    // `cfg_attr(not(test))` allow is inert exactly there), and the first
+    // production caller is slice 3/4. Remove the allow with that caller.
+    #[allow(dead_code)]
     pub(crate) fn on_current_workspace(&self, record: &SurfaceRecord) -> bool {
         on_workspace(record, self.workspace_current())
     }
