@@ -616,6 +616,8 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
+    /// Whole-tree snapshot; production reads go through the scoped form.
+    #[cfg(test)]
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
         self.request_snapshot_scoped(None)
     }
@@ -1738,17 +1740,9 @@ fn dispatch_incoming(
             return;
         }
     };
-    // The read's own path (get/describe) or prefix (list) scopes the
-    // snapshot; info and windows.list read the whole tree.
-    let scope_key = match command.command.as_str() {
-        "comp.props.get" | "comp.props.describe" => Some("path"),
-        "comp.props.list" => Some("prefix"),
-        _ => None,
-    };
-    let scope = scope_key
-        .and_then(|key| command.args.get(key))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+    // The read's own subtree scopes the snapshot (`read_scope`: info,
+    // list's prefix, get/describe's path; windows.list has none = whole tree).
+    let scope = read_scope(command.command.as_str(), &command.args);
     let admission = match ingress.request_snapshot_scoped(scope) {
         Ok(admission) => admission,
         Err(()) => {
