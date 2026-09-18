@@ -2788,12 +2788,10 @@ fn parse_stats_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
 
 /// The tree path a read verb can reach; `None` for the whole tree.
 ///
-/// A `list` prefix is a raw string prefix (`"windows.s"` matches `s3` and
-/// `s30`), but `ReadScopes::wants` relates scopes to paths at segment
-/// boundaries, so a mid-segment prefix is widened to its segment-aligned
-/// ancestor (`"windows.s"` → `"windows"`, `"windows.s3.pres"` →
-/// `"windows.s3"`). Widening only computes more, never less; an empty
-/// or dot-less prefix reads the whole tree.
+/// A `list` prefix and a scope relate to paths the same way: at segment
+/// boundaries (`PropPath::starts_with`, `ReadScopes::wants`). A mid-segment
+/// prefix such as `"windows.s"` therefore lists nothing and scopes nothing,
+/// consistently, so the raw prefix is the scope.
 fn read_scope(verb: &str, args: &Value) -> Option<String> {
     // Explicit per verb: a verb added to `needs_snapshot` later must say
     // what its scope is, rather than inherit "path" and be mis-scoped by a
@@ -2804,28 +2802,7 @@ fn read_scope(verb: &str, args: &Value) -> Option<String> {
         "comp.props.get" | "comp.props.describe" => "path",
         _ => return None,
     };
-    let raw = args.get(key).and_then(Value::as_str)?;
-    if key != "prefix" {
-        return Some(raw.to_string());
-    }
-    Some(segment_aligned_prefix(raw)?.to_string())
-}
-
-/// The longest segment-aligned ancestor of a raw prefix, or `None` when no
-/// full segment is named (the whole tree must then be read).
-fn segment_aligned_prefix(raw: &str) -> Option<&str> {
-    let raw = raw.trim_end_matches('.');
-    if raw.is_empty() {
-        return None;
-    }
-    // A prefix that ends exactly on a segment name keeps that segment; a
-    // partial last segment is dropped so the scope is an ancestor of every
-    // path the raw prefix matches.
-    let aligned = match raw.rfind('.') {
-        Some(dot) => &raw[..dot],
-        None => return None,
-    };
-    if aligned.is_empty() { None } else { Some(aligned) }
+    args.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
 fn invalid_set_shape(path: Option<&str>) -> (u8, Arc<str>) {
@@ -3347,30 +3324,35 @@ mod tests {
         sync::atomic::{AtomicBool, AtomicUsize},
     };
 
-    /// A `list` prefix is a raw string prefix; the snapshot scope must be a
-    /// segment-aligned ancestor of everything it matches, never narrower
-    /// (a mid-segment scope silently dropped the volatile leaves: review
-    /// round 1 of the 0.58.0 integration).
+    /// The verb-to-scope mapping is the only production path into the
+    /// scoped snapshot (round 1 of the 0.58.0 integration review): pin it,
+    /// and pin that a list prefix and its scope agree at segment boundaries.
     #[test]
-    fn list_prefix_scope_widens_to_a_segment_boundary() {
+    fn read_scope_names_each_snapshot_verbs_subtree() {
         let list = |prefix: &str| read_scope("comp.props.list", &json!({ "prefix": prefix }));
-        assert_eq!(list("windows.s"), Some("windows".to_string()));
-        assert_eq!(list("windows.s3.pres"), Some("windows.s3".to_string()));
-        assert_eq!(list("windows.s3."), Some("windows".to_string()));
-        assert_eq!(list("windows"), None, "a single segment may be partial: whole tree");
-        assert_eq!(list(""), None);
-        // get/describe scope on the exact path; info on its subtree.
+        assert_eq!(list("windows"), Some("windows".to_string()));
+        assert_eq!(list("windows.s3"), Some("windows.s3".to_string()));
+        assert_eq!(list("windows.s"), Some("windows.s".to_string()));
+        assert_eq!(read_scope("comp.props.list", &json!({})), None, "no prefix: whole tree");
         assert_eq!(
             read_scope("comp.props.get", &json!({ "path": "windows.s3.visible" })),
             Some("windows.s3.visible".to_string())
         );
+        assert_eq!(
+            read_scope("comp.props.describe", &json!({ "path": "windows.s3" })),
+            Some("windows.s3".to_string())
+        );
         assert_eq!(read_scope("comp.info", &json!({})), Some("info".to_string()));
         assert_eq!(read_scope("comp.windows.list", &json!({})), None);
-        // The widened scope reaches every leaf the raw prefix matches.
+        // A scope reaches its own subtree and no sibling; a mid-segment
+        // prefix scopes nothing, exactly as the list itself matches nothing.
         let mut scopes = crate::protocol::port_snapshot::ReadScopes::Paths(Vec::new());
-        scopes.add(list("windows.s").as_deref());
+        scopes.add(list("windows.s3").as_deref());
         assert!(scopes.wants("windows.s3.presentation"));
-        assert!(scopes.wants("windows.s30.presentation"));
+        assert!(!scopes.wants("windows.s30.presentation"));
+        let mut partial = crate::protocol::port_snapshot::ReadScopes::Paths(Vec::new());
+        partial.add(list("windows.s").as_deref());
+        assert!(!partial.wants("windows.s3.presentation"));
     }
 
     type PublishedMessages = Arc<Mutex<Vec<(BTreeMap<String, String>, String)>>>;
