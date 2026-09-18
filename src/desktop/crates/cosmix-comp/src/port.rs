@@ -80,6 +80,9 @@ pub(crate) enum PortCommand {
 
 pub(crate) struct PortRequest {
     pub(crate) reply: tokio::sync::oneshot::Sender<Arc<CompSnapshot>>,
+    /// The read's own path or prefix, so the snapshot can be scoped to it
+    /// (`ReadScopes`); `None` asks for the whole tree.
+    pub(crate) scope: Option<String>,
 }
 
 pub(crate) struct PortReply {
@@ -614,8 +617,18 @@ pub(crate) struct PortIngress {
 
 impl PortIngress {
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
+        self.request_snapshot_scoped(None)
+    }
+
+    /// A snapshot request that names the read's own path or prefix, so the
+    /// merged `ReadScopes` can skip subtrees nobody asked for; `None` reads
+    /// the whole tree.
+    pub(crate) fn request_snapshot_scoped(
+        &self,
+        scope: Option<String>,
+    ) -> Result<SnapshotAdmission, ()> {
         let (reply, receive) = tokio::sync::oneshot::channel();
-        self.admit(PortCommand::Snapshot(PortRequest { reply }), receive)
+        self.admit(PortCommand::Snapshot(PortRequest { reply, scope }), receive)
             .map(SnapshotAdmission)
     }
 
@@ -1725,7 +1738,18 @@ fn dispatch_incoming(
             return;
         }
     };
-    let admission = match ingress.request_snapshot() {
+    // The read's own path (get/describe) or prefix (list) scopes the
+    // snapshot; info and windows.list read the whole tree.
+    let scope_key = match command.command.as_str() {
+        "comp.props.get" | "comp.props.describe" => Some("path"),
+        "comp.props.list" => Some("prefix"),
+        _ => None,
+    };
+    let scope = scope_key
+        .and_then(|key| command.args.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let admission = match ingress.request_snapshot_scoped(scope) {
         Ok(admission) => admission,
         Err(()) => {
             queue_reply(
