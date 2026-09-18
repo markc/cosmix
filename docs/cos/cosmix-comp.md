@@ -124,6 +124,20 @@ switcher or a visual switcher overlay. Both nested and KMS profiles support
 these bindings when interception is enabled. Session locking and exclusive
 keyboard layers retain priority.
 
+Workspace chords (comp 0.59.0) live in both profiles beside
+`restore-recent-minimized` and share one implementation with the
+`comp.workspace.switch` / `comp.window.send_to_workspace` verbs:
+`workspace-jump-<n>` (Super+`<n>`, n in 1..9) switches to workspace n;
+`workspace-move-<n>` (Super+Shift+`<n>`) moves the focused window to n and
+follows it; `workspace-next` / `workspace-prev` (Super+`]` / Super+`[`) step
+by one and wrap at the ends. `bindings.table` lists them with xkb keysym
+names: `Super+1`, `Super+Shift+1`, `Super+bracketright`. The matcher reads
+the level-0 symbol, so Super+Shift+1 is still the digit, not `exclam`; on a
+layout whose level 0 is not the digit the chord does not fire. A jump above
+`workspaces.count` is a silent no-op (a key press has nobody to reply to; the
+verb answers `invalid_value`). Under a session lock the chords reach the lock
+surface, never the compositor.
+
 X11 `_NET_ACTIVE_WINDOW` requests use the same managed-window admission and
 focus path. Local automation is accepted without timestamp-based focus-stealing
 prevention; source identifiers are not authentication. Unmapped, minimised and

@@ -2,6 +2,8 @@
 
 use crate::port::{BTN_LEFT, InputOp, KeySpec, PointerMoveTarget, PressAction, ScrollSource};
 
+const KEY_2: u32 = 3;
+const KEY_RIGHTBRACE: u32 = 27;
 const KEY_A: u32 = 30;
 const KEY_B: u32 = 48;
 const KEY_C: u32 = 46;
@@ -349,6 +351,61 @@ fn injected_binding_chord_is_consumed_by_the_binding() {
         json!({"error": "unknown_key", "key": "NoSuchKeyName"})
     );
     assert!(keyboard_key_events(&harness.sync()).is_empty());
+}
+
+/// An injected workspace chord is consumed like a real one: Super+2 switches
+/// and Super+bracketright steps, and the client never sees the digit or the
+/// bracket.
+#[test]
+fn injected_workspace_chord_is_consumed() {
+    let (mut harness, ingress, runtime, _pointer, alpha, _beta) = two_windows();
+    let surface = harness.server.state.surfaces[&alpha]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    assert_eq!(harness.server.state.workspace_current(), 1);
+
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        InputOp::Key {
+            key: KeySpec::Name("2".into()),
+            action: PressAction::Both,
+            modifiers: vec![KeySpec::Name("Super_L".into())],
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert!(!harness.server.state.surfaces[&alpha].layout.visible);
+    assert_eq!(harness.server.state.surfaces[&alpha].workspace, 1);
+    let keys = keyboard_key_events(&harness.sync());
+    assert!(
+        keys.iter().all(|(key, _)| *key != KEY_2),
+        "the binding swallowed the digit: {keys:?}"
+    );
+
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        InputOp::Key {
+            key: KeySpec::Name("bracketright".into()),
+            action: PressAction::Both,
+            modifiers: vec![KeySpec::Name("Super_L".into())],
+        },
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(harness.server.state.workspace_current(), 3);
+    let keys = keyboard_key_events(&harness.sync());
+    assert!(
+        keys.iter().all(|(key, _)| *key != KEY_RIGHTBRACE),
+        "the binding swallowed the bracket: {keys:?}"
+    );
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(harness.server.state.injection.held.is_empty());
 }
 
 #[test]

@@ -47,7 +47,6 @@ impl Default for WorkspaceState {
 
 /// Where a switch or a move is aimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {
     /// A 1-based workspace index.
     Index(u32),
@@ -134,7 +133,6 @@ pub(super) fn x11_suspended(record: &SurfaceRecord, current: u32) -> bool {
 }
 
 /// Resolve a target against the workspace `from` on a `count`-wide ring.
-#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_workspace_target(
     from: u32,
     count: u32,
@@ -199,12 +197,12 @@ impl WaylandState {
     }
 }
 
-// The primitives: no production caller until the verb, prop and binding
-// slices land on this one (the tests drive them directly), so the block is
-// allowed dead outside tests. The readers above are NOT — they have callers
-// on the frame path — so a genuinely dead helper there still trips the lint.
-// Drop the attribute with the first wired caller.
-#[cfg_attr(not(test), allow(dead_code))]
+// The primitives. `switch_workspace` and `move_window_to_workspace` have a
+// production caller (the workspace chords, `handle_binding_action`); the
+// two that do not yet — `set_workspace_count` (the prop slice) and
+// `ensure_workspace_shown` (the switch-first slice) — carry their own
+// per-item allow, so a genuinely dead helper still trips the lint. Drop each
+// with its first wired caller.
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
     /// `Some(k)` must be the default output's key or name (D3). Any other
@@ -412,6 +410,7 @@ impl WaylandState {
     /// side effect added to `present_window_for_workspace` later must be
     /// added to `sync_x11_suspended_for_workspaces` too (or the shrink path
     /// switched to the per-window halves).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_workspace_count(
         &mut self,
         count: u32,
@@ -461,6 +460,7 @@ impl WaylandState {
     /// all — under a session lock or an exclusive layer (D18): the lock or
     /// the layer owns what is on screen, and a client-driven X11 path has no
     /// guard of its own.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn ensure_workspace_shown(&mut self, object: &ObjectId) -> bool {
         if self.session_lock_active() || self.highest_exclusive_layer().is_some() {
             return false;

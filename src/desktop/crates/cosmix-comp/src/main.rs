@@ -479,6 +479,8 @@ Options:
   --no-ssd           Disable server-side decorations
   --chrome <style>   Select mac, win11 or cosmix chrome (default mac; enables SSD)
                      Minimise restore is Super+Shift+M until a shell task switcher exists
+                     Workspaces: Super+1..9 jumps, Super+Shift+1..9 moves the focused window
+                     and follows, Super+[ / Super+] step prev/next (wrapping)
   --list-bindings    Print the Mix strict-data binding table and exit
   --binding-profile  Select the binding profile to list (default: nested)
   --kms-probe        Run read-only Rung B KMS probes and print strict-data

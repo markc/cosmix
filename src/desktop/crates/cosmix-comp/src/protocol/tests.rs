@@ -14653,6 +14653,94 @@ fn ensure_workspace_shown_is_inert_under_a_session_lock_and_an_exclusive_layer()
     );
 }
 
+/// The workspace chords through the real Smithay keyboard path: Super+2
+/// switches and the client sees only Super (the intercepted digit is
+/// swallowed, press and release); Super+Shift+2 moves the focused window and
+/// follows it; Super+] / Super+[ step with wrap. A jump above
+/// `workspaces.count` is a no-op, not a panic.
+#[test]
+fn workspace_jump_chord_switches_and_never_reaches_the_client() {
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let surface = harness.server.state.surfaces[&object]
+        .role
+        .wl_surface()
+        .clone();
+    harness.server.state.activate_managed_window(&surface);
+    let _ = harness.sync();
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+
+    // Super+2: switch; the window stays on 1 and is hidden.
+    harness.chord(&[125, 3]);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 1);
+    assert!(!harness.server.state.surfaces[&object].layout.visible);
+    assert_eq!(
+        keyboard_key_events(&harness.sync()),
+        [(125, 1), (125, 0)],
+        "only Super reaches the client; the digit is intercepted both ways"
+    );
+
+    // Super+1: back; the window is visible again and re-takes focus.
+    harness.chord(&[125, 2]);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone())
+    );
+    let _ = harness.sync();
+
+    // Super+Shift+2: move the focused window to 2 and follow it.
+    harness.chord(&[125, 42, 3]);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    assert_eq!(harness.server.state.surfaces[&object].workspace, 2);
+    assert!(harness.server.state.surfaces[&object].layout.visible);
+    assert!(!harness.server.state.surfaces[&object].minimized);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(surface.clone()),
+        "the moved window keeps focus on its new workspace"
+    );
+    let keys = keyboard_key_events(&harness.sync());
+    assert!(
+        keys.iter().all(|(key, _)| *key != 3),
+        "the digit never reaches the client: {keys:?}"
+    );
+    assert!(
+        keys.contains(&(42, 1)),
+        "Shift itself is forwarded: {keys:?}"
+    );
+
+    // Super+] steps to 3, Super+[ back to 2; wrap from 4 to 1.
+    harness.chord(&[125, 27]);
+    assert_eq!(harness.server.state.workspace_current(), 3);
+    harness.chord(&[125, 26]);
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    harness.chord(&[125, 5]);
+    assert_eq!(harness.server.state.workspace_current(), 4);
+    harness.chord(&[125, 27]);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(!harness.server.state.surfaces[&object].layout.visible);
+    let keys = keyboard_key_events(&harness.sync());
+    assert!(
+        keys.iter().all(|(key, _)| !matches!(key, 27 | 26 | 5)),
+        "step and jump keys are intercepted: {keys:?}"
+    );
+
+    // Super+9 with count 4: refused inside the core, nothing changes.
+    harness.chord(&[125, 10]);
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    assert!(
+        keyboard_key_events(&harness.sync())
+            .iter()
+            .all(|(key, _)| *key != 10),
+        "a refused jump still consumes its chord"
+    );
+}
+
 #[test]
 fn both_binding_profiles_restore_the_most_recently_minimized_toplevel() {
     let assert_profile = |harness: &mut KeybindingHarness| {

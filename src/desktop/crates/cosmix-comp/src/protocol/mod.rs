@@ -12240,6 +12240,64 @@ impl WaylandState {
                 debug_assert!(!action.needs_ecs());
                 self.restore_most_recently_minimized();
             }
+            // The chords share one implementation with the verbs: a refusal
+            // (index above `workspaces.count`, no output) is a no-op here,
+            // logged at debug — a key press has nobody to reply to.
+            BindingAction::WorkspaceJump(n) => {
+                debug_assert!(!action.needs_ecs());
+                if let Err(refusal) = self.switch_workspace(
+                    None,
+                    workspaces::WorkspaceTarget::Index(u32::from(n)),
+                    true,
+                ) {
+                    tracing::debug!(workspace = n, ?refusal, "workspace-jump chord refused");
+                }
+            }
+            BindingAction::WorkspaceStep { prev } => {
+                debug_assert!(!action.needs_ecs());
+                let target = if prev {
+                    workspaces::WorkspaceTarget::Prev
+                } else {
+                    workspaces::WorkspaceTarget::Next
+                };
+                if let Err(refusal) = self.switch_workspace(None, target, true) {
+                    tracing::debug!(prev, ?refusal, "workspace-step chord refused");
+                }
+            }
+            BindingAction::WorkspaceMove(n) => {
+                debug_assert!(!action.needs_ecs());
+                let Some(focused) = self
+                    .keyboard
+                    .current_focus()
+                    .and_then(|target| target.owned_surface())
+                else {
+                    tracing::debug!("workspace-move binding had no keyboard focus");
+                    return;
+                };
+                let root = canonical_root_surface(&self.popup_manager, &focused);
+                let target = workspaces::WorkspaceTarget::Index(u32::from(n));
+                match self.move_window_to_workspace(&root.id(), target) {
+                    Ok(_) => {
+                        if let Err(refusal) = self.switch_workspace(None, target, true) {
+                            tracing::debug!(
+                                workspace = n,
+                                ?refusal,
+                                "workspace-move chord moved but could not follow"
+                            );
+                            return;
+                        }
+                        self.activate_managed_window(&root);
+                    }
+                    Err(refusal) => {
+                        tracing::debug!(
+                            surface = ?root.id(),
+                            workspace = n,
+                            ?refusal,
+                            "workspace-move chord refused"
+                        );
+                    }
+                }
+            }
             BindingAction::CycleWindow { reverse } => self.cycle_window(reverse),
             BindingAction::ExitNestedCompositor => {
                 debug_assert!(action.needs_ecs());
