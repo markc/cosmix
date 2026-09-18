@@ -42,8 +42,10 @@ impl Default for WorkspaceState {
 }
 
 /// Where a switch or a move is aimed.
-// The props slice constructs `Index` only; `Next`/`Prev` get their first
-// production constructor with the verbs (slice 4) — the allow goes then.
+// `Next`/`Prev` are only constructed by the verbs' `From<WorkspaceIndex>`,
+// and `window_control` is `cfg(bus)`: without the allow the
+// `--no-default-features` gate (D20) reports them never constructed. Drop
+// it with the first non-bus constructor (the chords, slice 5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceTarget {
@@ -55,7 +57,6 @@ pub(crate) enum WorkspaceTarget {
 
 /// Why a workspace primitive changed nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum WorkspaceRefusal {
     /// An index outside `1..=count`.
     InvalidIndex { count: u32 },
@@ -72,7 +73,6 @@ pub(crate) enum WorkspaceRefusal {
 
 /// What a switch did.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WorkspaceSwitch {
     pub(crate) output: String,
     pub(crate) from: u32,
@@ -132,7 +132,6 @@ pub(super) fn x11_suspended(record: &SurfaceRecord, current: u32) -> bool {
 }
 
 /// Resolve a target against the workspace `from` on a `count`-wide ring.
-#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_workspace_target(
     from: u32,
     count: u32,
@@ -197,11 +196,14 @@ impl WaylandState {
     }
 }
 
-// The primitives: no production caller until the verb, prop and binding
-// slices land on this one (the tests drive them directly), so the block is
-// allowed dead outside tests. The readers above are NOT — they have callers
-// on the frame path — so a genuinely dead helper there still trips the lint.
-// Drop the attribute with the first wired caller.
+// The primitives: `switch_workspace`, `move_window_to_workspace` and
+// `ensure_workspace_shown` have their production caller (the
+// `comp.workspace.switch` / `comp.window.send_to_workspace` verbs, which
+// are `cfg(bus)` — so they still read dead to the `--no-default-features`
+// gate, D20); `set_workspace_count` waits for the prop slice. The block
+// stays allowed dead outside tests until a non-bus caller exists for every
+// primitive. The readers above are NOT — they have callers on the frame
+// path — so a genuinely dead helper there still trips the lint.
 #[cfg_attr(not(test), allow(dead_code))]
 impl WaylandState {
     /// The output key a request addresses: `None` = the default output;
@@ -210,7 +212,7 @@ impl WaylandState {
     /// visibility term reads the default output's, so windows would be
     /// withdrawn (suspended, feedback discarded, drags ended) while staying
     /// on screen. The refusal goes when records carry an output binding.
-    fn resolve_workspace_output(&self, key: Option<&str>) -> Option<String> {
+    pub(super) fn resolve_workspace_output(&self, key: Option<&str>) -> Option<String> {
         let output = self.backend.default_output()?;
         let name = output.name();
         let key_of_default = output_key(&name);
