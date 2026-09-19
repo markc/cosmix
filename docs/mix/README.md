@@ -50,6 +50,7 @@ there. The same files render everywhere:
 - **[serving as a citizen](serve.md)** — `mix --serve service.mix`, the supervised runtime.
 - **[remote execution (ssh)](remote.md)** — `ssh_run`/`ssh_must`/`ssh_mix`, env transports.
 - **[capabilities & embedding](capabilities.md)** — the capability classes + sandbox model.
+- **[expression evaluation mode](expr-eval.md)** — `eval_expr_string()`, the single-expression rule, the static deny walk.
 
 ## Reference
 

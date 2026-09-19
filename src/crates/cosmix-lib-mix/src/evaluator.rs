@@ -2783,7 +2783,9 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
 /// error; the default (no policy installed) is fully permissive, so
 /// every existing caller is unaffected. The seam governs the builtin
 /// table (`read_file`/`write_file`/`http_get`/`ssh_run`/`run`/…);
-/// `send`/`emit`/`sh` are separately gated by their own handler seams.
+/// `sh`/`$()`/pipes are gated [`CapabilityClass::Process`] and the bare
+/// `send`/`emit` broker forms [`crate::builtins::CapabilityClass::Bus`]
+/// at their exec sites (since 0.89.0).
 ///
 /// A policy typically classifies `name` via
 /// [`crate::builtins::capability_category`] and allows/denies by class.
@@ -2859,6 +2861,403 @@ impl Default for EvalLimits {
             max_map_len: None,
             max_string_len: None,
         }
+    }
+}
+
+/// Maximum `Expr` tree depth accepted by [`eval_expr_string`]'s static
+/// deny walk. A deeper tree is a clean pre-execution error, never a
+/// stack overflow inside the walk. Distinct from the parser's own
+/// nesting cap (`MAX_NESTING_DEPTH`, which bounds parse *recursion*):
+/// a left-associative operator chain parses iteratively but still
+/// builds a deep tree, so this walk carries its own cap.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
+/// Evaluate exactly one Mix expression with preset globals, an optional
+/// capability policy and eval limits — the expression evaluation mode
+/// embedding hosts (e.g. scene hosts) use for small pure expressions.
+///
+/// `source` must be a single expression statement; anything else
+/// (assignment, control flow, multiple statements, lambdas, shell/Bus
+/// constructs) is rejected BEFORE execution — including in untaken
+/// branches (deterministic compile semantics). The static deny walk
+/// additionally rejects `send`/`sh`/`$(…)` expressions, function
+/// literals, first-class calls (`ValueCall`) and dynamic method calls
+/// (`MethodCall`; method-syntax-on-a-builtin like `$s.upper()` desugars
+/// to a bareword `FunctionCall` at parse time and stays allowed), and
+/// any string interpolation part beyond literals and Mix variables
+/// (env-var expansion, in-string command substitution). The walk is
+/// depth-capped at [`MAX_EXPR_DEPTH`]. Ordinary builtins stay allowed
+/// and are gated by `policy` at dispatch, as usual.
+///
+/// Synchronous: the evaluator's async expression path is driven on a
+/// fresh current-thread tokio runtime inside this call (a pure-policy
+/// program never pends on a handler — the Db/Jmap/Bus seam builtins
+/// raise "not available" when no handler is registered), so it must
+/// not be called from within an async execution context. This is a
+/// robustness/fuel boundary, NOT a security sandbox — see
+/// [`CapabilityPolicy`]'s scope note.
+pub fn eval_expr_string(
+    source: &str,
+    globals: &[(&str, Value)],
+    policy: Option<Rc<dyn CapabilityPolicy>>,
+    limits: EvalLimits,
+) -> MixResult<Value> {
+    let mut lexer = crate::lexer::Lexer::new(source);
+    let tokens = lexer.tokenize()?;
+    let mut parser = crate::parser::Parser::new(tokens, source);
+    let stmts = parser.parse_program()?;
+
+    if stmts.len() != 1 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "eval_expr_string: expected exactly one expression statement, \
+                 found {} statements",
+                stmts.len()
+            ),
+        });
+    }
+    let expr = match &stmts[0].kind {
+        StmtKind::Expression(expr) => expr,
+        kind => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "eval_expr_string: not an expression: {}",
+                    expr_mode_construct_name(kind)
+                ),
+            });
+        }
+    };
+
+    expr_mode_deny_walk(expr, 0)?;
+
+    let mut eval = Evaluator::new();
+    if let Some(policy) = policy {
+        eval.set_capability_policy(policy);
+    }
+    eval.set_limits(limits);
+    for (name, value) in globals {
+        eval.set_global(name, value.clone());
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: {}", e),
+        })?;
+    rt.block_on(eval.eval_expr(expr))
+}
+
+/// Human name for a statement kind, for [`eval_expr_string`]'s
+/// single-expression rule. Exhaustive by design so a new `StmtKind`
+/// variant fails compilation here rather than slipping through
+/// un-named.
+fn expr_mode_construct_name(kind: &StmtKind) -> &'static str {
+    match kind {
+        StmtKind::Expression(_) => "expression",
+        StmtKind::Assignment { .. } => "assignment",
+        StmtKind::FieldAssignment { .. } => "field assignment",
+        StmtKind::IndexAssignment { .. } => "index assignment",
+        StmtKind::PathAssignment { .. } => "path assignment",
+        StmtKind::If { .. } => "if statement",
+        StmtKind::For { .. } => "for loop",
+        StmtKind::ForEach { .. } => "for-each loop",
+        StmtKind::While { .. } => "while loop",
+        StmtKind::Loop { .. } => "loop statement",
+        StmtKind::Break(_) => "break statement",
+        StmtKind::Continue(_) => "continue statement",
+        StmtKind::BreakIf(..) => "break-if statement",
+        StmtKind::ContinueIf(..) => "continue-if statement",
+        StmtKind::FunctionDef { .. } => "function definition",
+        StmtKind::Return(_) => "return statement",
+        StmtKind::Select { .. } => "select statement",
+        StmtKind::Print { .. } => "print statement",
+        StmtKind::Parse { .. } => "parse statement",
+        StmtKind::Die(_) => "die statement",
+        StmtKind::TryCatch { .. } => "try statement",
+        StmtKind::Export { .. } => "export statement",
+        StmtKind::Alias { .. } => "alias statement",
+        StmtKind::Send { .. } => "send statement",
+        StmtKind::Address { .. } => "address block",
+        StmtKind::Emit { .. } => "emit statement",
+        StmtKind::On { .. } => "on handler registration",
+        StmtKind::Source { .. } => "source statement",
+        StmtKind::Include { .. } => "include statement",
+        StmtKind::Sh { .. } => "sh statement",
+        StmtKind::PipeToExternal { .. } => "pipe statement",
+        StmtKind::Chain { .. } => "chained statements",
+    }
+}
+
+/// Static deny walk for [`eval_expr_string`]: reject the
+/// non-expression constructs BEFORE execution, untaken branches
+/// included. Depth-capped at [`MAX_EXPR_DEPTH`] so a deep tree is a
+/// clean error, not a stack overflow in the walk.
+fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(expr_mode_depth_error());
+    }
+    let denied = |what: &str| {
+        MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: {what} is not allowed in expression mode"),
+        }
+    };
+    match expr {
+        // No Bus / shell authority, no lambdas, no first-class calls.
+        Expr::Send { .. } => return Err(denied("send expression")),
+        Expr::Sh(_) => return Err(denied("sh expression")),
+        Expr::CommandSub(_) => return Err(denied("command substitution $()")),
+        Expr::FunctionLiteral { .. } => return Err(denied("function literal")),
+        Expr::ValueCall { .. } => return Err(denied("function-value call")),
+        Expr::MethodCall { .. } => return Err(denied("method call")),
+
+        // Interpolation: only literals and Mix variables. Env-var
+        // expansion and command substitution inside strings are out.
+        Expr::InterpolatedString(parts) | Expr::Heredoc(parts) => {
+            for part in parts {
+                match part {
+                    StringPart::Literal(_) | StringPart::Variable(_) => {}
+                    StringPart::CommandSub(_) => {
+                        return Err(denied("command substitution in string"));
+                    }
+                    StringPart::EnvVar(_) => {
+                        return Err(denied("environment-variable interpolation in string"));
+                    }
+                }
+            }
+        }
+
+        Expr::BinaryOp { left, right, .. } => {
+            expr_mode_deny_walk(left, depth + 1)?;
+            expr_mode_deny_walk(right, depth + 1)?;
+        }
+        Expr::UnaryOp { operand, .. } => expr_mode_deny_walk(operand, depth + 1)?,
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_mode_deny_walk(cond, depth + 1)?;
+            expr_mode_deny_walk(then_branch, depth + 1)?;
+            expr_mode_deny_walk(else_branch, depth + 1)?;
+        }
+        Expr::If(if_expr) => {
+            let IfExpr {
+                condition,
+                then_body,
+                else_ifs,
+                else_body,
+            } = &**if_expr;
+            expr_mode_deny_walk(condition, depth + 1)?;
+            expr_mode_deny_stmts(then_body, depth + 1)?;
+            for (cond, body) in else_ifs {
+                expr_mode_deny_walk(cond, depth + 1)?;
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = else_body {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                expr_mode_deny_walk(arg, depth + 1)?;
+            }
+        }
+        Expr::Index { object, index } => {
+            expr_mode_deny_walk(object, depth + 1)?;
+            expr_mode_deny_walk(index, depth + 1)?;
+        }
+        Expr::FieldAccess { object, .. } => expr_mode_deny_walk(object, depth + 1)?,
+        Expr::ListLiteral(items) => {
+            for item in items {
+                expr_mode_deny_walk(item, depth + 1)?;
+            }
+        }
+        Expr::MapLiteral(entries) => {
+            for (_, value) in entries {
+                expr_mode_deny_walk(value, depth + 1)?;
+            }
+        }
+
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::EscapedQuoteStringLiteral(_)
+        | Expr::BoolLiteral(_)
+        | Expr::NilLiteral
+        | Expr::Variable(_) => {}
+    }
+    Ok(())
+}
+
+/// Statement-level companion of [`expr_mode_deny_walk`] for the only
+/// statement bodies an expression can contain (an if-expression's
+/// branches): deny the statement forms of the denied expression
+/// constructs — plus handler registration and file execution, which
+/// are runtime-mode constructs, not expressions — and recurse into
+/// every other statement's expressions.
+fn expr_mode_deny_stmts(stmts: &[Stmt], depth: usize) -> MixResult<()> {
+    for stmt in stmts {
+        expr_mode_deny_stmt(stmt, depth)?;
+    }
+    Ok(())
+}
+
+fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(expr_mode_depth_error());
+    }
+    let denied = |what: &str| {
+        MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: {what} is not allowed in expression mode"),
+        }
+    };
+    match &stmt.kind {
+        StmtKind::FunctionDef { .. } => return Err(denied("function definition")),
+        StmtKind::Send { .. } => return Err(denied("send statement")),
+        StmtKind::Emit { .. } => return Err(denied("emit statement")),
+        StmtKind::Sh { .. } => return Err(denied("sh statement")),
+        StmtKind::On { .. } => return Err(denied("on handler registration")),
+        StmtKind::Source { .. } => return Err(denied("source statement")),
+        StmtKind::Include { .. } => return Err(denied("include statement")),
+        StmtKind::PipeToExternal { .. } => return Err(denied("pipe statement")),
+
+        StmtKind::Assignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
+        StmtKind::FieldAssignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
+        StmtKind::IndexAssignment { index, value, .. } => {
+            expr_mode_deny_walk(index, depth + 1)?;
+            expr_mode_deny_walk(value, depth + 1)?;
+        }
+        StmtKind::PathAssignment { path, value, .. } => {
+            for seg in path {
+                if let PathSeg::Index(index) = seg {
+                    expr_mode_deny_walk(index, depth + 1)?;
+                }
+            }
+            expr_mode_deny_walk(value, depth + 1)?;
+        }
+        StmtKind::If {
+            condition,
+            then_body,
+            else_ifs,
+            else_body,
+        } => {
+            expr_mode_deny_walk(condition, depth + 1)?;
+            expr_mode_deny_stmts(then_body, depth + 1)?;
+            for (cond, body) in else_ifs {
+                expr_mode_deny_walk(cond, depth + 1)?;
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = else_body {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        StmtKind::For {
+            start,
+            end,
+            step,
+            body,
+            ..
+        } => {
+            expr_mode_deny_walk(start, depth + 1)?;
+            expr_mode_deny_walk(end, depth + 1)?;
+            if let Some(step) = step {
+                expr_mode_deny_walk(step, depth + 1)?;
+            }
+            expr_mode_deny_stmts(body, depth + 1)?;
+        }
+        StmtKind::ForEach {
+            iterable,
+            body,
+            ..
+        } => {
+            expr_mode_deny_walk(iterable, depth + 1)?;
+            expr_mode_deny_stmts(body, depth + 1)?;
+        }
+        StmtKind::While {
+            condition,
+            body,
+            ..
+        } => {
+            expr_mode_deny_walk(condition, depth + 1)?;
+            expr_mode_deny_stmts(body, depth + 1)?;
+        }
+        StmtKind::Loop { body, .. } => expr_mode_deny_stmts(body, depth + 1)?,
+        StmtKind::Break(_) | StmtKind::Continue(_) => {}
+        StmtKind::BreakIf(cond, _) | StmtKind::ContinueIf(cond, _) => {
+            expr_mode_deny_walk(cond, depth + 1)?
+        }
+        StmtKind::Return(value) => {
+            if let Some(value) = value {
+                expr_mode_deny_walk(value, depth + 1)?;
+            }
+        }
+        StmtKind::Select {
+            value,
+            cases,
+            otherwise,
+        } => {
+            expr_mode_deny_walk(value, depth + 1)?;
+            for (when, body) in cases {
+                expr_mode_deny_walk(when, depth + 1)?;
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = otherwise {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        StmtKind::Print { args, .. } => {
+            for arg in args {
+                expr_mode_deny_walk(arg, depth + 1)?;
+            }
+        }
+        StmtKind::Parse { source, .. } => expr_mode_deny_walk(source, depth + 1)?,
+        StmtKind::Die(expr) => expr_mode_deny_walk(expr, depth + 1)?,
+        StmtKind::TryCatch {
+            try_body,
+            catch,
+            finally_body,
+        } => {
+            expr_mode_deny_stmts(try_body, depth + 1)?;
+            if let Some(CatchClause { body, .. }) = catch {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = finally_body {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        StmtKind::Export { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
+        StmtKind::Alias { name, command } => {
+            if let Some(name) = name {
+                expr_mode_deny_walk(name, depth + 1)?;
+            }
+            if let Some(command) = command {
+                expr_mode_deny_walk(command, depth + 1)?;
+            }
+        }
+        StmtKind::Address { target, body } => {
+            expr_mode_deny_walk(target, depth + 1)?;
+            expr_mode_deny_stmts(body, depth + 1)?;
+        }
+        StmtKind::Chain { left, right, .. } => {
+            expr_mode_deny_stmt(left, depth + 1)?;
+            expr_mode_deny_stmt(right, depth + 1)?;
+        }
+        StmtKind::Expression(expr) => expr_mode_deny_walk(expr, depth + 1)?,
+    }
+    Ok(())
+}
+
+fn expr_mode_depth_error() -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: format!(
+            "eval_expr_string: expression nesting exceeds MAX_EXPR_DEPTH ({MAX_EXPR_DEPTH})"
+        ),
     }
 }
 
@@ -13399,6 +13798,12 @@ impl Evaluator {
         args: &'a [(String, Expr)],
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            // Gate before evaluating anything: the bare broker form reaches
+            // Bus authority without a builtin name, so a policy that
+            // withholds the class must short-circuit here — mirroring the
+            // sh/`$()` Process gates (0.89.0; `bus_call` gates separately
+            // as a named builtin).
+            self.check_capability_class(crate::builtins::CapabilityClass::Bus, "send")?;
             let target_str = self.eval_expr(target).await?.to_mix_string();
             let command_str = self.eval_expr(command).await?.to_mix_string();
             if command_str.is_empty() {
@@ -13592,6 +13997,9 @@ impl Evaluator {
         args: &'a [(String, Expr)],
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            // Gate before evaluating anything, as `exec_send` does above —
+            // the fire-and-forget form holds the same Bus authority.
+            self.check_capability_class(crate::builtins::CapabilityClass::Bus, "emit")?;
             let target_str = self.eval_expr(target).await?.to_mix_string();
             let command_str = self.eval_expr(command).await?.to_mix_string();
             if command_str.is_empty() {
