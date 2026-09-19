@@ -421,12 +421,26 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
             continue;
         }
         let fresh = !mounted.nodes.contains_key(id);
+        // A fill text's cross-axis stretch depends on its PARENT column, so a
+        // changed parent re-updates it; an unchanged text is otherwise left
+        // alone -- re-inserting its Text components forces a re-layout that
+        // blanks the label for a frame on every revision (a visible flicker
+        // on a panel that re-renders each minute). Images still re-update on
+        // every apply: that is how a missing icon file is retried on the next
+        // revision, and a cache hit re-inserts the same handle (no flicker).
+        let text_parent_changed = node.family == "text"
+            && flag(node, "fill")
+            && tree.nodes.iter().any(|(parent_id, parent)| {
+                children(parent).any(|child| child == id)
+                    && mounted.tree.nodes.get(parent_id) != Some(parent)
+            });
         let view = mounted
             .nodes
             .entry(id.clone())
             .or_insert_with(|| spawn(world, tree, id, node));
         let changed = fresh
-            || matches!(node.family.as_str(), "text" | "image")
+            || node.family == "image"
+            || text_parent_changed
             || mounted.tree.nodes.get(id) != Some(node)
             || ops.iter().any(|op| matches!(op, Op::SetScene { .. }));
         if changed {
@@ -1173,6 +1187,35 @@ mod tests {
             }
         }
         assert!(checked > 30, "only {checked} clearable ports tested");
+    }
+
+    #[test]
+    fn unchanged_text_is_not_reinserted_when_a_sibling_changes() {
+        // A panel re-renders every minute (the clock) and on every window
+        // event; re-inserting unchanged Text components re-lays them out and
+        // blanks every label for a frame. Only the text that changed may be
+        // touched.
+        let doc = |clock: &str| {
+            format!(
+                "---\nscene: 1\nname: panel\ncitizen: test\n---\n```mix\nroot: {{widget: \"row\", align: \"center\", children: [\"label\", \"clock\"]}}\nlabel: {{widget: \"text\", text: \"foot\"}}\nclock: {{widget: \"text\", text: \"{clock}\"}}\n```\n"
+            )
+        };
+        let first = cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:05 pm")).unwrap()).unwrap();
+        let second = cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:06 pm")).unwrap()).unwrap();
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &first);
+        apply(&mut world, &mut mounted, &first);
+        let label = mounted.nodes["label"].label.unwrap();
+        let clock = mounted.nodes["clock"].label.unwrap();
+        let label_tick = world.entity(label).get_ref::<Text>().unwrap().last_changed();
+        world.increment_change_tick();
+        apply(&mut world, &mut mounted, &second);
+        assert_eq!(
+            world.entity(label).get_ref::<Text>().unwrap().last_changed(),
+            label_tick,
+            "the unchanged label must not be re-inserted"
+        );
+        assert_eq!(world.get::<Text>(clock).unwrap().0, "09:06 pm");
     }
 
     #[test]
