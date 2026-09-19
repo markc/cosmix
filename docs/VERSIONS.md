@@ -38,7 +38,7 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.88.0 |
+| `cosmix-lib-mix` | 0.89.0 |
 | `cosmix-mix` | 0.89.0 |
 | `mix-bench` | 0.1.0 |
 
