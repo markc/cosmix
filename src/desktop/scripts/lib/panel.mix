@@ -149,3 +149,24 @@ end
 fn sort_windows($windows)
   return sort_by($windows, function ($w) = $w.id)
 end
+
+-- ── launcher categories ────────────────────────────────────────────────
+-- freedesktop main category -> chip label ("" = everything)
+$CATEGORY_LABELS = {"": "All", Network: "Internet", Office: "Office", Development: "Development",
+  Graphics: "Graphics", AudioVideo: "Media", Game: "Games", System: "System",
+  Utility: "Utilities", Settings: "Settings"}
+
+fn category_label($cat)
+  return $CATEGORY_LABELS[$cat] ?? $cat
+end
+
+-- Chip node ids are "cat-<lowercase category>" ("cat-all" = everything);
+-- map one back to its freedesktop category name.
+fn category_from_node($node)
+  $key = replace($node, "cat-", "")
+  if $key == "all" then return "" end
+  for each $cat, $label in $CATEGORY_LABELS
+    if lower($cat) == $key then return $cat end
+  end
+  return ""
+end

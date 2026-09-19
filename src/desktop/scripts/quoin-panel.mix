@@ -48,7 +48,7 @@ $state = {
   net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
   notes: [], notes_open: false, peeked: [],
   launcher_open: false, calendar_open: false,
-  query: "", apps: [], apps_loaded: false,
+  query: "", category: "", apps: [], apps_loaded: false,
   cal_offset: 0, icons: {},
   dirty: false, scheduled: false
 }
@@ -74,7 +74,7 @@ fn rpc($target, $verb, $payload)
   return $result
 end
 
--- Load a document; returns the host`s revision for it (0 = refused or no
+-- Load a document; returns the host's revision for it (0 = refused or no
 -- host). Revisions only restart at 1 when the HOST restarts, so revision 1
 -- is how the panel notices a Quoin restart and re-pins itself.
 fn load_scene($doc)
@@ -98,6 +98,20 @@ fn panel_verb($verb, $edge, $id)
     send $HOST $verb edge=$edge id=$id timeout=3
   end
   return $rc
+end
+
+-- Select a scene page on its edge and pin that edge open. scene.load replies
+-- before the host's next frame mounts a NEW page, so the first select can
+-- race the mount ("unknown page id"); retry it briefly -- a bounded wait on
+-- the effect of our own command, not a poll of anyone's state.
+fn show_page($edge, $page)
+  $tries = 0
+  while $tries < 20
+    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then break end
+    $tries = $tries + 1
+    sleep(0.05)
+  end
+  panel_verb("shell.panel.pin", $edge, nil)
 end
 
 -- ── icons (the apps citizen resolves themes; cached here) ───────────────
@@ -227,7 +241,7 @@ fn fetch_status()
 end
 
 fn fetch_apps()
-  $r = rpc($APPS, "apps.list", {query: $state.query})
+  $r = rpc($APPS, "apps.list", {query: $state.query, category: $state.category})
   if $r == nil or type($r) != "list" then
     $state.apps = []
     return
@@ -365,7 +379,7 @@ fn panel_doc()
   $clock = {widget: "row", height: 44, radius: 8, padding: 10, align: "center", hover: $C.hover, on_click: "calendar", children: ["clock_col"]}
   if $state.calendar_open then $clock.background = $C.accent_bg end
   push($nodes, ["clock", $clock])
-  push($nodes, ["clock_col", {widget: "column", gap: 0, children: ["clock_time", "clock_date"]}])
+  push($nodes, ["clock_col", {widget: "column", gap: 0, align: "center", children: ["clock_time", "clock_date"]}])
   push($nodes, ["clock_time", {widget: "text", text: $p.clock_text($now), size: 19, bold: true, color: $C.fg}])
   push($nodes, ["clock_date", {widget: "text", text: $p.date_text($now), size: 11, color: $C.dim}])
 
@@ -375,7 +389,7 @@ fn panel_doc()
   push($nodes, ["peek", $peek])
   push($nodes, ["peek_i", status_icon("user-desktop", "desktop")])
 
-  return $p.document({scene: "1", name: "panel", citizen: $ME, window: {kind: "edge", edge: "bottom", title: "Panel", h: 52}}, $nodes)
+  return $p.document({scene: "1", name: "panel", citizen: $ME, window: {kind: "edge", edge: "bottom", title: "Panel", h: 52, chrome: false}}, $nodes)
 end
 
 -- ── the launcher scene ──────────────────────────────────────────────────
@@ -388,7 +402,7 @@ fn launcher_doc()
   end
   $count = to_string(length($rows)) .. (length($rows) == 1 ? " application" : " applications")
   $nodes = [
-    ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: ["head", "search", "list"]}],
+    ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: ["head", "search", "cats1", "cats2", "list"]}],
     ["head", {widget: "row", gap: 8, align: "center", children: ["head_t", "head_fill", "head_n"]}],
     ["head_t", {widget: "text", text: "Applications", size: 18, bold: true, color: $C.fg}],
     ["head_fill", {widget: "spacer"}],
@@ -401,6 +415,23 @@ fn launcher_doc()
     ["app_name", {widget: "text", text: "{cells[0]}", size: 14, color: $C.fg, elide: true}],
     ["app_sub", {widget: "text", text: "{cells[1]}", size: 11, color: $C.dim, elide: true}]
   ]
+  -- Kickoff-style category chips (freedesktop main categories), two rows
+  $rows_of = [["", "Network", "Office", "Development", "Graphics"], ["AudioVideo", "Game", "System", "Utility", "Settings"]]
+  $r = 0
+  for each $cats in $rows_of
+    $r = $r + 1
+    $ids = []
+    for each $cat in $cats
+      push($ids, "cat-" .. ($cat == "" ? "all" : lower($cat)))
+    end
+    push($nodes, ["cats" .. to_string($r), {widget: "row", gap: 6, align: "center", children: $ids}])
+    for each $cat in $cats
+      $id = "cat-" .. ($cat == "" ? "all" : lower($cat))
+      $on = $cat == $state.category
+      push($nodes, [$id, {widget: "row", height: 28, radius: 14, padding: 10, align: "center", hover: $C.hover, background: $on ? $C.accent : $C.task_bg, on_click: "cat", children: [$id .. "_t"]}])
+      push($nodes, [$id .. "_t", {widget: "text", text: $p.category_label($cat), size: 12, bold: $on, color: $on ? "#0b1f2b" : $C.fg}])
+    end
+  end
   return $p.document({scene: "1", name: "launcher", citizen: $ME, window: {kind: "edge", edge: "left", title: "Applications", w: 440}}, $nodes)
 end
 
@@ -438,7 +469,7 @@ fn calendar_doc()
   end
   push($nodes, ["wk_h", {widget: "row", gap: 4, children: $hdr}])
   for $c = 0 to 6
-    push($nodes, ["wh_" .. to_string($c), {widget: "text", text: $p.WEEKDAYS_SHORT[$c], size: 11, bold: true, width: 40, color: $C.faint}])
+    push($nodes, ["wh_" .. to_string($c), {widget: "text", text: $p.WEEKDAYS_SHORT[$c], size: 11, bold: true, width: 38, align: "center", color: $C.faint}])
   end
   -- six weeks
   for $w = 0 to 5
@@ -455,7 +486,7 @@ fn calendar_doc()
       push($nodes, [$id, $box])
       $fg = $cell.in_month ? ($cell.weekend ? $C.weekend : $C.fg) : $C.faint
       if $cell.today then $fg = $C.today_fg end
-      push($nodes, [$id .. "_t", {widget: "text", text: lpad(to_string($cell.day), 2), size: 13, bold: $cell.today, width: 40, color: $fg}])
+      push($nodes, [$id .. "_t", {widget: "text", text: to_string($cell.day), size: 13, bold: $cell.today, width: 38, align: "center", color: $fg}])
     end
   end
   push($nodes, ["cal_fill", {widget: "spacer"}])
@@ -497,8 +528,7 @@ end
 -- ── rebuilds ────────────────────────────────────────────────────────────
 fn render_panel()
   if load_scene(panel_doc()) == 1 then
-    panel_verb("shell.panel.page.set", "bottom", "panel")
-    panel_verb("shell.panel.pin", "bottom", nil)
+    show_page("bottom", "scene-panel")
   end
 end
 
@@ -506,25 +536,29 @@ fn render_launcher()
   if $state.launcher_open then
     fetch_apps()
     load_scene(launcher_doc())
-    panel_verb("shell.panel.page.set", "left", "launcher")
-    panel_verb("shell.panel.pin", "left", nil)
+    show_page("left", "scene-launcher")
   end
 end
 
 fn render_calendar()
   if $state.calendar_open then
     load_scene(calendar_doc())
-    panel_verb("shell.panel.page.set", "right", "calendar")
-    panel_verb("shell.panel.pin", "right", nil)
+    show_page("right", "scene-calendar")
   end
 end
 
 fn render_notes()
   if $state.notes_open then
     fetch_notes()
-    load_scene(notes_doc())
-    panel_verb("shell.panel.page.set", "right", "notes")
-    panel_verb("shell.panel.pin", "right", nil)
+    $doc = ""
+    try
+      $doc = notes_doc()
+    catch $e
+      note("notes_doc failed: " .. to_string($e))
+      return
+    end
+    load_scene($doc)
+    show_page("right", "scene-notes")
   end
 end
 
@@ -593,6 +627,7 @@ on launcher desc "toggle the application launcher"
     close_popups()
     $state.launcher_open = true
     $state.query = ""
+    $state.category = ""
     render_launcher()
   end
   render_panel()
@@ -602,6 +637,14 @@ on filter desc "launcher search text changed"
   reply(0, "")
   $a = $event.args
   if $a != nil and type($a) == "map" then $state.query = slice(to_string($a.value ?? ""), 0, 128) end
+  render_launcher()
+end
+
+on cat desc "launcher: filter by the clicked category chip"
+  reply(0, "")
+  $node = node_of()
+  $node = before($node, "_t") ?? $node
+  $state.category = $p.category_from_node($node)
   render_launcher()
 end
 
@@ -783,29 +826,29 @@ on panel.refresh desc "rebuild every open scene now"
   render_calendar()
 end
 
--- Compositor state changes (windows opening/closing/focusing/minimising,
--- workspace switches) and tray property diffs both arrive with the inner
--- verb props.changed -- a handler matches the publisher`s inner verb, not
--- the topic name.
+-- Compositor state (windows opening/closing/focusing/minimising, workspace
+-- switches), tray items and notifications all publish property diffs with
+-- the inner verb props.changed -- a handler matches the publisher's inner
+-- verb, not the topic name -- so this one handler drives every rebuild.
+-- The adapters' named events are wired too, in case a diff is coalesced
+-- away; schedule() refetches everything either way.
 on props.changed async
   schedule()
 end
 
-on item.added async
-  schedule()
-end
-
-on item.removed async
-  schedule()
-end
-
 on tray.item.added async
-  fetch_tray()
   schedule()
 end
 
 on tray.item.removed async
-  fetch_tray()
+  schedule()
+end
+
+on notification.created async
+  schedule()
+end
+
+on notification.closed async
   schedule()
 end
 
