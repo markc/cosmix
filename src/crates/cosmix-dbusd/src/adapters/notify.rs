@@ -29,6 +29,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+
 use anyhow::{Result, anyhow};
 use cosmix_client::IncomingCommand;
 use cosmix_props_core::publish::{build_props_changed_message, props_changed_topic};
@@ -208,6 +211,10 @@ pub struct Notification {
     /// never expires.
     pub expires_mono: Option<Instant>,
     pub created_at: SystemTime,
+    /// Monotonic insertion sequence (the core's `event_seq` at the
+    /// moment this record was inserted): eviction order is THIS, not
+    /// the wall-clock `created_at`, which a clock step can reorder.
+    pub seq: u64,
     /// The `resident` hint: action activation does not close it.
     pub resident: bool,
     /// The `transient` hint, passed through for the display side.
@@ -346,7 +353,11 @@ pub struct NotifyCore {
 /// unrelated notification. `0` is the "unseeded" value; the first
 /// allocation seeds from the wall clock, so a daemon restart does not
 /// reuse recent ids either. Ids are never 0 (`0` is Notify's
-/// "no replaces_id").
+/// "no replaces_id"). Caller-supplied `replaces_id`s (live or dead) are
+/// reserved against this clock with `fetch_max`, so an id one app
+/// adopted can never be allocated to another — but an id the clock
+/// itself never issued is only ever seen by adoption, which is the
+/// caller's explicit request.
 static ID_CLOCK: AtomicU32 = AtomicU32::new(0);
 
 impl NotifyCore {
@@ -386,7 +397,9 @@ impl NotifyCore {
     }
 
     /// Fresh id from the process-wide [`ID_CLOCK`]: never 0, skipping
-    /// any id still live (possible only after a u32 wrap).
+    /// any id still live (possible only after a u32 wrap). The wrap
+    /// continues from 1 (`max(1)`), never a re-seed — a wall-clock
+    /// re-seed could jump back to ids handed out moments ago.
     fn allocate_id(&mut self) -> u32 {
         loop {
             let id = ID_CLOCK
@@ -394,7 +407,7 @@ impl NotifyCore {
                     Some(if current == 0 {
                         id_seed()
                     } else {
-                        current.wrapping_add(1)
+                        current.wrapping_add(1).max(1)
                     })
                 })
                 .expect("the closure always proposes a value");
@@ -407,11 +420,17 @@ impl NotifyCore {
     /// Apply a creation. `replaces_id` semantics per spec: a live id is
     /// reused and its record replaced (no Closed event — the id simply
     /// carries on); a non-zero id that is NOT live is created under
-    /// that very id (safe: this process never reuses ids); 0 allocates
-    /// a fresh one. A fresh insert that would pass the live cap or the
+    /// that very id (the caller's explicit request; the adopted id is
+    /// reserved against [`ID_CLOCK`] so the clock never hands it to
+    /// another app while it is live); 0 allocates a fresh one. Any
+    /// insert — fresh OR replace — that would pass the live cap or the
     /// stored-bytes budget first evicts the oldest notification —
-    /// non-critical first, else the oldest critical — with reason 1:
-    /// no caller, mesh or D-Bus, may grow the live set without bound.
+    /// non-critical first, else the oldest critical — with reason 1: no
+    /// caller, mesh or D-Bus, may grow the live set without bound. A
+    /// replace counts its size delta against the budget (the outgoing
+    /// record is excluded from eviction — its slot is being refilled,
+    /// not grown); the record being replaced is never chosen as a
+    /// victim.
     pub fn create(
         &mut self,
         args: &CreateArgs,
@@ -420,12 +439,13 @@ impl NotifyCore {
     ) -> (u32, Vec<NotifyEvent>) {
         let replacing = args.replaces_id != 0 && self.notifications.contains_key(&args.replaces_id);
         let id = if args.replaces_id != 0 {
+            ID_CLOCK.fetch_max(args.replaces_id, Ordering::SeqCst);
             args.replaces_id
         } else {
             self.allocate_id()
         };
         let ttl = resolve_expiry(args.timeout, args.urgency);
-        let record = Notification {
+        let mut record = Notification {
             id,
             app: cap_string(&args.app),
             icon: cap_string(&args.icon),
@@ -444,6 +464,7 @@ impl NotifyCore {
             expires_at: ttl.map(|ttl| now + ttl),
             expires_mono: ttl.map(|ttl| mono + ttl),
             created_at: now,
+            seq: 0,
             resident: args.resident,
             transient: args.transient,
             desktop_entry: args.desktop_entry.as_deref().map(cap_string),
@@ -452,35 +473,54 @@ impl NotifyCore {
             origin: args.origin,
         };
         let mut events = Vec::new();
-        if !replacing {
-            let prospective = notification_bytes(&record);
-            while self.notifications.len() >= self.cap
-                || self.stored_bytes() + prospective > self.max_stored_bytes
-            {
-                let victim = self
-                    .notifications
-                    .iter()
-                    .filter(|(live, _)| **live != id)
-                    .min_by_key(|(live, record)| {
-                        (
-                            record.urgency == Urgency::Critical,
-                            record.created_at,
-                            **live,
-                        )
-                    })
-                    .map(|(live, _)| *live);
-                let Some(victim) = victim else {
-                    break;
-                };
-                self.notifications.remove(&victim);
-                events.push(self.stamp(
-                    victim,
-                    NotifyEventKind::Closed {
-                        reason: CloseReason::Expired,
-                    },
-                ));
+        // Budget and cap, replace or not. `replaced_bytes` is what the
+        // id being re-inserted currently occupies: its slot is
+        // refilled, so only the delta counts, and the eviction below
+        // never picks the id itself as a victim.
+        let prospective = notification_bytes(&record);
+        let replaced_bytes = self
+            .notifications
+            .get(&id)
+            .map_or(0, |outgoing| notification_bytes(outgoing));
+        loop {
+            let count_ok = replacing || self.notifications.len() < self.cap;
+            let bytes_ok =
+                self.stored_bytes() - replaced_bytes + prospective <= self.max_stored_bytes;
+            if count_ok && bytes_ok {
+                break;
             }
+            let victim = self
+                .notifications
+                .iter()
+                .filter(|(live, _)| **live != id)
+                .min_by_key(|(live, record)| {
+                    // Insertion order, not wall clock: a clock step must
+                    // never reorder eviction.
+                    (
+                        record.urgency == Urgency::Critical,
+                        record.seq,
+                        **live,
+                    )
+                })
+                .map(|(live, _)| *live);
+            let Some(victim) = victim else {
+                // Only the incoming record itself is left (or the map
+                // holds nothing else): insert it — a single record may
+                // exceed a small budget, same as a single record at the
+                // count cap of 1.
+                break;
+            };
+            self.notifications.remove(&victim);
+            events.push(self.stamp(
+                victim,
+                NotifyEventKind::Closed {
+                    reason: CloseReason::Expired,
+                },
+            ));
         }
+        // The insertion sequence: the seq the Created event below will
+        // carry, after any eviction stamps above have moved the counter.
+        record.seq = self.event_seq.saturating_add(1);
         self.notifications.insert(id, record.clone());
         events.push(self.stamp(
             id,
@@ -818,9 +858,28 @@ pub(crate) struct NotifyShared {
     /// One live expiry timer per expiring notification, by id. A timer
     /// is aborted the moment its notification is replaced, closed or
     /// evicted, and every timer dies with the run — replace spam can
-    /// never accumulate detached sleepers.
+    /// never accumulate detached sleepers. Every arm/disarm happens
+    /// under the CORE lock (never the timers lock alone): arm order
+    /// then always matches record-mutation order, so a concurrent
+    /// create/replace on one id can never leave the live record with a
+    /// timer for the wrong deadline — or none at all.
     timers: Mutex<HashMap<u32, AbortHandle>>,
+    /// Test hook: panic the publisher loop on its next event, to prove
+    /// the run ends when the publisher task dies.
+    #[cfg(test)]
+    panic_publisher: AtomicBool,
+    /// Test visibility: how many timer tasks this server started have
+    /// finished (aborted superseds included) — proves superseded timers
+    /// really are cancelled, not just overwritten in the map.
+    #[cfg(test)]
+    timers_finished: Arc<AtomicUsize>,
 }
+
+/// Test hooks at module scope: a yield before every NotificationClosed
+/// emission (an expiry task that aborts itself dies exactly there,
+/// deterministically, instead of racing on the socket's first Pending).
+#[cfg(test)]
+static YIELD_BEFORE_EMIT: AtomicBool = AtomicBool::new(false);
 
 impl NotifyShared {
     fn new(
@@ -834,6 +893,10 @@ impl NotifyShared {
             events,
             emitter,
             timers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            panic_publisher: AtomicBool::new(false),
+            #[cfg(test)]
+            timers_finished: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -851,10 +914,22 @@ impl NotifyShared {
 
     /// Abort and forget the timer for `id`, if any (the notification
     /// was closed, evicted, or replaced by a never-expiring record).
+    /// Must be called with the CORE lock held — see [`Self::timers`].
     fn disarm_timer(&self, id: u32) {
         if let Some(handle) = self.lock_timers().remove(&id) {
             handle.abort();
         }
+    }
+
+    /// Remove the timer entry for `id` WITHOUT aborting it. This is the
+    /// expiry path's own disarm: the task registered under `id` is the
+    /// one running, and aborting it would cancel the very
+    /// NotificationClosed emission it is about to make. The entry must
+    /// still go — under the same core lock as the close, so a
+    /// concurrent create adopting `id` arms its timer fresh instead of
+    /// aborting this task as "superseded".
+    fn take_timer(&self, id: u32) {
+        self.lock_timers().remove(&id);
     }
 
     /// Abort every live timer: the run is ending.
@@ -869,6 +944,13 @@ impl NotifyShared {
     #[cfg(test)]
     fn timer_count(&self) -> usize {
         self.lock_timers().len()
+    }
+
+    /// Test visibility: timer tasks started by this server that have
+    /// finished (aborted or run to completion).
+    #[cfg(test)]
+    fn timers_finished(&self) -> usize {
+        self.timers_finished.load(Ordering::SeqCst)
     }
 
     /// Stamp-ordered enqueue: called with the lock held, so two
@@ -901,24 +983,29 @@ impl NotifyShared {
     }
 
     /// Create a notification (the Notify method or `notify.send`):
-    /// apply under the lock, (re)arm the per-notification timer, then
-    /// disarm and emit NotificationClosed for any cap-evicted
-    /// predecessor. Returns the id — exactly what Notify replies with.
+    /// apply under the lock, arm/disarm the per-notification timer under
+    /// that SAME lock (see [`Self::timers`]), disarm evicted
+    /// predecessors under it too, then emit NotificationClosed for the
+    /// evictions outside the lock. Returns the id — exactly what Notify
+    /// replies with.
     pub async fn create(shared: &Arc<Self>, args: CreateArgs) -> u32 {
-        let (id, expires_mono, events) = {
+        let (id, events) = {
             let mut core = shared.lock();
             let (id, events) = core.create(&args, SystemTime::now(), Instant::now());
-            let expires_mono = core.get(id).and_then(|record| record.expires_mono);
+            match core.get(id).and_then(|record| record.expires_mono) {
+                Some(deadline) => arm_timer(shared, id, deadline),
+                None => shared.disarm_timer(id),
+            }
+            for event in &events {
+                if matches!(event.kind, NotifyEventKind::Closed { .. }) {
+                    shared.disarm_timer(event.id);
+                }
+            }
             shared.enqueue(&events);
-            (id, expires_mono, events)
+            (id, events)
         };
-        match expires_mono {
-            Some(deadline) => arm_timer(shared, id, deadline),
-            None => shared.disarm_timer(id),
-        }
         for event in &events {
             if let NotifyEventKind::Closed { reason } = event.kind {
-                shared.disarm_timer(event.id);
                 shared.emit_closed(event.id, reason).await;
             }
         }
@@ -935,11 +1022,11 @@ impl NotifyShared {
             let event = core.close(id, reason);
             if let Some(event) = &event {
                 self.enqueue(std::slice::from_ref(event));
+                self.disarm_timer(id);
             }
             event.is_some()
         };
         if closed {
-            self.disarm_timer(id);
             self.emit_closed(id, reason).await;
         }
         closed
@@ -953,6 +1040,9 @@ impl NotifyShared {
             let mut core = self.lock();
             let (events, closed) = core.invoke(id, action)?;
             self.enqueue(&events);
+            if closed {
+                self.disarm_timer(id);
+            }
             (events, closed)
         };
         for event in &events {
@@ -961,7 +1051,6 @@ impl NotifyShared {
                     self.emit_invoked(id, action).await;
                 }
                 NotifyEventKind::Closed { reason } => {
-                    self.disarm_timer(event.id);
                     self.emit_closed(id, *reason).await;
                 }
                 NotifyEventKind::Created { .. } => {}
@@ -972,23 +1061,32 @@ impl NotifyShared {
 
     /// The expiry timer's callback: close with reason 1 only if still
     /// due (a replace may have pushed the deadline out, or the record
-    /// is already gone).
+    /// is already gone). The disarm is [`Self::take_timer`], NOT an
+    /// abort: the task running this IS the timer being removed, and
+    /// aborting it would silently drop the NotificationClosed signal
+    /// about to be emitted.
     pub async fn expire(&self, id: u32) {
         let closed = {
             let mut core = self.lock();
             let event = core.expire_if_due(id, Instant::now());
             if let Some(event) = &event {
                 self.enqueue(std::slice::from_ref(event));
+                self.take_timer(id);
             }
             event.is_some()
         };
         if closed {
-            self.disarm_timer(id);
             self.emit_closed(id, CloseReason::Expired).await;
         }
     }
 
     async fn emit_closed(&self, id: u32, reason: CloseReason) {
+        // Test hook: one yield before the emission — an expiry task
+        // that disarm-aborts itself dies exactly here, deterministically.
+        #[cfg(test)]
+        if YIELD_BEFORE_EMIT.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
         let Some(emitter) = self.emitter.upgrade() else {
             eprintln!(
                 "cosmix-dbusd notify: NotificationClosed({id}, {}) dropped — adapter shutting down",
@@ -1020,10 +1118,18 @@ impl NotifyShared {
 /// a replace, close, eviction or the run's end can abort it; any timer
 /// it supersedes is aborted here and gone for good. The timer holds
 /// only a weak pointer: it must never keep the adapter alive, and a
-/// dropped adapter's late fire finds nothing to close.
+/// dropped adapter's late fire finds nothing to close. Called with the
+/// CORE lock held — see [`NotifyShared::timers`].
 fn arm_timer(shared: &Arc<NotifyShared>, id: u32, deadline: Instant) {
     let weak: Weak<NotifyShared> = Arc::downgrade(shared);
+    #[cfg(test)]
+    let finished = Arc::clone(&shared.timers_finished);
     let handle = tokio::spawn(async move {
+        // Dropped when this task finishes for ANY reason — aborted
+        // mid-sleep (a superseded timer) or run to completion — so a
+        // test can see that superseded timers really were cancelled.
+        #[cfg(test)]
+        let _done = TimerDone(finished);
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
         if let Some(shared) = weak.upgrade() {
             shared.expire(id).await;
@@ -1032,6 +1138,18 @@ fn arm_timer(shared: &Arc<NotifyShared>, id: u32, deadline: Instant) {
     let mut timers = shared.lock_timers();
     if let Some(superseded) = timers.insert(id, handle.abort_handle()) {
         superseded.abort();
+    }
+}
+
+/// Drop guard for [`NotifyShared::timers_finished`] (test visibility
+/// only).
+#[cfg(test)]
+struct TimerDone(Arc<AtomicUsize>);
+
+#[cfg(test)]
+impl Drop for TimerDone {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -1245,6 +1363,16 @@ struct BusSession {
     close: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
+/// The run's current Bus client, stamped with the session generation it
+/// belongs to. The publisher reports this generation when a publish
+/// faults, so a fault left over from a superseded session is recognised
+/// and ignored instead of tearing down the healthy one serving now.
+#[derive(Clone)]
+struct BusClientSlot {
+    generation: u64,
+    client: Arc<dyn BusClient>,
+}
+
 /// How the run obtains Bus sessions — reconnectable by design. The
 /// production connector dials through the adapter context; tests
 /// script it.
@@ -1295,13 +1423,14 @@ impl BusConnector for CtxBusConnector<'_> {
 /// tree, so the run's very first change publishes its diff too. Events
 /// stamped under one core lock arrive as a batch; the batch's
 /// coalesced diff is stamped with the LAST `event_seq` it covers. A
-/// publish failure hands the run a fault (it reconnects the Bus
-/// client) rather than losing the baseline.
+/// publish failure hands the run a fault stamped with the client's
+/// session GENERATION (the run reconnects that Bus client) rather than
+/// losing the baseline.
 async fn run_publisher(
     shared: Weak<NotifyShared>,
     mut events: mpsc::Receiver<NotifyEvent>,
-    mut clients: watch::Receiver<Option<Arc<dyn BusClient>>>,
-    faults: mpsc::Sender<()>,
+    mut clients: watch::Receiver<Option<BusClientSlot>>,
+    faults: mpsc::Sender<u64>,
 ) -> Result<()> {
     let mut baseline = NotifyProps::new(&BTreeMap::new()).snapshot();
     loop {
@@ -1311,6 +1440,11 @@ async fn run_publisher(
         let Some(shared) = shared.upgrade() else {
             return Err(anyhow!("notify: adapter state dropped"));
         };
+        // Test hook: prove the run ends when the publisher task dies.
+        #[cfg(test)]
+        if shared.panic_publisher.load(Ordering::SeqCst) {
+            panic!("scripted publisher panic (test hook)");
+        }
         // Drain the rest of the batch (every event stamped under the
         // same core lock) so the diff covers the batch's whole effect.
         let mut batch = Vec::new();
@@ -1322,8 +1456,8 @@ async fn run_publisher(
             };
         }
         let last_seq = batch.last().expect("a batch has one event").seq;
-        let client = match wait_for_client(&mut clients).await {
-            Ok(client) => client,
+        let slot = match wait_for_client(&mut clients).await {
+            Ok(slot) => slot,
             Err(error) => return Err(error),
         };
         let snapshot = shared.props().snapshot();
@@ -1332,7 +1466,7 @@ async fn run_publisher(
             let mut message =
                 build_props_changed_message(&path, &old_value, &new_value, "notify.event");
             message.set("event_seq", &last_seq.to_string());
-            if publish_with_timeout(&*client, &props_changed_topic(BUS_SERVICE), message)
+            if publish_with_timeout(&*slot.client, &props_changed_topic(BUS_SERVICE), message)
                 .await
                 .is_err()
             {
@@ -1346,7 +1480,7 @@ async fn run_publisher(
                 message.set("command", event.kind.name());
                 message.set("event_seq", &event.seq.to_string());
                 message.body = event_body(event).to_string();
-                if publish_with_timeout(&*client, TOPIC_NOTIFY_CHANGED, message)
+                if publish_with_timeout(&*slot.client, TOPIC_NOTIFY_CHANGED, message)
                     .await
                     .is_err()
                 {
@@ -1356,8 +1490,11 @@ async fn run_publisher(
             }
         }
         if failed {
-            eprintln!("cosmix-dbusd notify: event publish failed; faulting the Bus client");
-            let _ = faults.try_send(());
+            eprintln!(
+                "cosmix-dbusd notify: event publish failed; faulting the Bus client (generation {})",
+                slot.generation
+            );
+            let _ = faults.try_send(slot.generation);
             // The baseline survives the failure AND the reconnect it
             // triggers: a subscriber that stayed connected through the
             // outage has seen exactly up to the baseline and needs the
@@ -1384,11 +1521,11 @@ async fn publish_with_timeout(
 /// The publisher's view of the run's Bus client: park while the run is
 /// between Bus connections (initial dial or reconnect).
 async fn wait_for_client(
-    clients: &mut watch::Receiver<Option<Arc<dyn BusClient>>>,
-) -> Result<Arc<dyn BusClient>> {
+    clients: &mut watch::Receiver<Option<BusClientSlot>>,
+) -> Result<BusClientSlot> {
     loop {
-        if let Some(client) = clients.borrow_and_update().clone() {
-            return Ok(client);
+        if let Some(slot) = clients.borrow_and_update().clone() {
+            return Ok(slot);
         }
         // No Bus connection right now: park until one appears. Events
         // buffer in the bounded channel meanwhile; overflow is dropped
@@ -1769,10 +1906,12 @@ fn resolve_args(command: &IncomingCommand) -> Option<Value> {
 // ──────────────────── server assembly and the adapter ─────────────────
 
 /// A started notify server: the shared state, the strong signal
-/// emitter and the publisher task. Dropping it (or ending the run)
-/// drops the last strong reference to the emitter — and with it the
-/// zbus connection's last reason to stay alive — so the interface, the
-/// bus name and every expiry timer go too.
+/// emitter and the publisher task. The run watches the publisher's
+/// JoinHandle (a panic or early exit ends the run with an error);
+/// dropping the server (or ending the run) aborts it and drops the
+/// last strong reference to the emitter — and with it the zbus
+/// connection's last reason to stay alive — so the interface, the bus
+/// name and every expiry timer go too.
 #[derive(Debug)]
 pub(crate) struct NotifyServer {
     pub shared: Arc<NotifyShared>,
@@ -1799,10 +1938,10 @@ impl Drop for NotifyServer {
 /// (`None` while the Bus side is down).
 async fn start_server(
     connection: &zbus::Connection,
-    clients: watch::Receiver<Option<Arc<dyn BusClient>>>,
+    clients: watch::Receiver<Option<BusClientSlot>>,
     cap: usize,
     max_stored_bytes: usize,
-) -> Result<(NotifyServer, mpsc::Receiver<()>)> {
+) -> Result<(NotifyServer, mpsc::Receiver<u64>)> {
     let emitter = Arc::new(SignalEmitter::new(connection, DBUS_PATH)?);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
     let shared = Arc::new(NotifyShared::new(
@@ -1836,7 +1975,7 @@ async fn start_server(
             return Err(anyhow!("cannot claim {DBUS_NAME}: {error}"));
         }
     }
-    let (fault_tx, fault_rx) = mpsc::channel(1);
+    let (fault_tx, fault_rx) = mpsc::channel::<u64>(8);
     let publisher_task = tokio::spawn(run_publisher(
         Arc::downgrade(&shared),
         events_rx,
@@ -1864,27 +2003,46 @@ enum ServeOutcome {
     Stopped,
 }
 
-/// Serve incoming Bus commands on one session. Every dispatch and
-/// reply is raced against shutdown, so a stop is honoured mid-flight
-/// without waiting out a wedged dispatch or the reply budget.
+/// Serve incoming Bus commands on one session. Publish faults are
+/// acted on only here, BETWEEN commands: a fault must never cancel a
+/// dispatch mid-flight (its state changes may already be applied while
+/// the D-Bus signal or the reply has not gone out). A fault stamped
+/// with an older session's generation is a leftover from a superseded
+/// session and is ignored outright. Every dispatch and reply is raced
+/// against shutdown, so a stop is honoured mid-flight without waiting
+/// out a wedged dispatch or the reply budget.
 async fn serve_bus(
     session: &mut BusSession,
     shared: &Arc<NotifyShared>,
+    faults: &mut mpsc::Receiver<u64>,
+    generation: u64,
     shutdown: &mut watch::Receiver<bool>,
-) -> ServeOutcome {
+) -> Result<ServeOutcome> {
     loop {
         let command = tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 match changed {
                     Ok(_) if !*shutdown.borrow_and_update() => continue,
-                    _ => return ServeOutcome::Stopped,
+                    _ => return Ok(ServeOutcome::Stopped),
+                }
+            }
+            fault = faults.recv() => {
+                match fault {
+                    // The publisher task is gone (its sender dropped);
+                    // the run's watch on the publisher reports why.
+                    None => return Err(anyhow!("notify: publisher fault channel ended")),
+                    Some(seen) if seen != generation => {
+                        // A stale fault from a superseded session.
+                        continue;
+                    }
+                    Some(_) => return Ok(ServeOutcome::Reconnect),
                 }
             }
             command = session.incoming.recv() => {
                 match command {
                     Some(command) => command,
-                    None => return ServeOutcome::Reconnect,
+                    None => return Ok(ServeOutcome::Reconnect),
                 }
             }
         };
@@ -1893,7 +2051,7 @@ async fn serve_bus(
             changed = shutdown.changed() => {
                 match changed {
                     Ok(_) if !*shutdown.borrow_and_update() => None,
-                    _ => return ServeOutcome::Stopped,
+                    _ => return Ok(ServeOutcome::Stopped),
                 }
             }
             handled = handle_command(&*session.client, shared, &command) => Some(handled),
@@ -1905,7 +2063,7 @@ async fn serve_bus(
         };
         if let Err(error) = outcome {
             eprintln!("cosmix-dbusd notify: {error:#}; reconnecting the Bus client");
-            return ServeOutcome::Reconnect;
+            return Ok(ServeOutcome::Reconnect);
         }
     }
 }
@@ -1942,16 +2100,20 @@ async fn sleep_or_stop(shutdown: &mut watch::Receiver<bool>, delay: Duration) ->
 /// timeout, a failed dial) close the client and re-dial after
 /// `reconnect_delay`. The notify server, its state and the session
 /// connection all survive — only the Bus client is replaced, and the
-/// publisher's props baseline survives with it. Ok is returned only on
-/// shutdown; Err is an internal fault.
+/// publisher's props baseline survives with it. Each installed client
+/// carries the next session GENERATION and publish faults are stamped
+/// with the generation that faulted, so a stale fault from a superseded
+/// session can never tear down the healthy one serving now. Ok is
+/// returned only on shutdown; Err is an internal fault.
 async fn run_bus<C: BusConnector>(
     mut connector: C,
-    clients: watch::Sender<Option<Arc<dyn BusClient>>>,
-    mut faults: mpsc::Receiver<()>,
+    clients: watch::Sender<Option<BusClientSlot>>,
+    mut faults: mpsc::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
     shared: Arc<NotifyShared>,
     reconnect_delay: Duration,
 ) -> Result<()> {
+    let mut generation: u64 = 0;
     loop {
         let mut session = tokio::select! {
             biased;
@@ -1975,26 +2137,21 @@ async fn run_bus<C: BusConnector>(
                 }
             },
         };
-        let _ = clients.send(Some(Arc::clone(&session.client)));
-        let outcome = tokio::select! {
-            biased;
-            fault = faults.recv() => {
-                if fault.is_none() {
-                    return Err(anyhow!("notify: publisher fault channel ended"));
-                }
-                eprintln!("cosmix-dbusd notify: event publish faulted; reconnecting the Bus client");
-                ServeOutcome::Reconnect
-            }
-            outcome = serve_bus(&mut session, &shared, &mut shutdown) => outcome,
-        };
+        generation += 1;
+        let _ = clients.send(Some(BusClientSlot {
+            generation,
+            client: Arc::clone(&session.client),
+        }));
+        // Faults are consumed inside serve_bus, between commands; any
+        // fault left in the channel belongs to THIS generation or a
+        // older one, and stale ones are filtered by generation there.
+        let outcome =
+            serve_bus(&mut session, &shared, &mut faults, generation, &mut shutdown).await;
         let _ = clients.send(None);
         if let Some(close) = session.close.take() {
             close.await;
         }
-        // A fault that raced the new session must not tear it down:
-        // drop stale faults before serving again.
-        while faults.try_recv().is_ok() {}
-        match outcome {
+        match outcome? {
             ServeOutcome::Stopped => return Ok(()),
             ServeOutcome::Reconnect => {
                 eprintln!("cosmix-dbusd notify: Bus disconnected; retrying in {reconnect_delay:?}");
@@ -2013,9 +2170,9 @@ async fn run_bus<C: BusConnector>(
 /// and the D-Bus name intact.
 async fn notify_run<C: BusConnector>(
     session: zbus::Connection,
-    server: NotifyServer,
-    clients: watch::Sender<Option<Arc<dyn BusClient>>>,
-    faults: mpsc::Receiver<()>,
+    mut server: NotifyServer,
+    clients: watch::Sender<Option<BusClientSlot>>,
+    faults: mpsc::Receiver<u64>,
     connector: C,
     mut shutdown: watch::Receiver<bool>,
     reconnect_delay: Duration,
@@ -2053,6 +2210,19 @@ async fn notify_run<C: BusConnector>(
                 break match result {
                     Ok(()) => Err(anyhow!("notify: Bus driver stopped unexpectedly")),
                     Err(error) => Err(anyhow!("notify: Bus driver failed: {error:#}")),
+                };
+            }
+            joined = &mut server.publisher => {
+                // The publisher is watched: a panic or an early exit
+                // ends the run with an error instead of silently
+                // halting publishing while everything else looks
+                // healthy.
+                break match joined {
+                    Ok(Ok(())) => Err(anyhow!("notify: publisher task stopped unexpectedly")),
+                    Ok(Err(error)) => Err(anyhow!("notify: publisher task failed: {error:#}")),
+                    Err(error) => Err(anyhow!(
+                        "notify: publisher task ended without finishing: {error}"
+                    )),
                 };
             }
         }
@@ -2188,13 +2358,27 @@ mod tests {
     }
 
     /// Records every publication and reply; can be scripted to fail
-    /// publishes or hang replies.
+    /// publishes, hang replies, or hold a failing publish / a reply
+    /// until the test releases it (deterministic mid-flight staging for
+    /// the fault-race tests).
     #[derive(Default)]
     struct FakePublisher {
         published: Mutex<Vec<(String, cosmix_bus::bus::BusMessage)>>,
         replies: Mutex<Vec<(String, u8, String)>>,
         fail_next: AtomicUsize,
         hang_replies: AtomicBool,
+        /// When set, the next scripted failure first parks until
+        /// `release_held_publish` — the fault exists but is not
+        /// delivered until the test says so.
+        hold_next: AtomicBool,
+        held_publishes: AtomicUsize,
+        held: tokio::sync::Notify,
+        /// When set, every reply first parks until
+        /// `release_held_replies` — a dispatch that is provably
+        /// in-flight when a fault arrives.
+        hold_replies: AtomicBool,
+        held_replies: AtomicUsize,
+        respond_gate: tokio::sync::Notify,
     }
 
     impl FakePublisher {
@@ -2253,6 +2437,33 @@ mod tests {
         fn hang_replies(&self) {
             self.hang_replies.store(true, Ordering::SeqCst);
         }
+
+        /// The next scripted publish failure parks until released.
+        fn hold_next_failure(&self) {
+            self.hold_next.store(true, Ordering::SeqCst);
+        }
+
+        fn release_held_publish(&self) {
+            self.held.notify_one();
+        }
+
+        fn held_publishes(&self) -> usize {
+            self.held_publishes.load(Ordering::SeqCst)
+        }
+
+        /// Every reply parks until released (a provably in-flight
+        /// dispatch).
+        fn hold_replies_at_gate(&self) {
+            self.hold_replies.store(true, Ordering::SeqCst);
+        }
+
+        fn release_held_replies(&self) {
+            self.respond_gate.notify_one();
+        }
+
+        fn held_replies(&self) -> usize {
+            self.held_replies.load(Ordering::SeqCst)
+        }
     }
 
     impl BusClient for FakePublisher {
@@ -2265,6 +2476,10 @@ mod tests {
             Box::pin(async move {
                 let pending = self.fail_next.load(Ordering::SeqCst);
                 if pending > 0 {
+                    if self.hold_next.swap(false, Ordering::SeqCst) {
+                        self.held_publishes.fetch_add(1, Ordering::SeqCst);
+                        self.held.notified().await;
+                    }
                     self.fail_next.store(pending - 1, Ordering::SeqCst);
                     return Err(anyhow!("scripted publish failure"));
                 }
@@ -2284,7 +2499,12 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
             let recorded = (command.command.clone(), rc, body.to_string());
             let hang = self.hang_replies.load(Ordering::SeqCst);
+            let gate = self.hold_replies.load(Ordering::SeqCst);
             Box::pin(async move {
+                if gate {
+                    self.held_replies.fetch_add(1, Ordering::SeqCst);
+                    self.respond_gate.notified().await;
+                }
                 if hang {
                     return std::future::pending().await;
                 }
@@ -2381,11 +2601,11 @@ mod tests {
         publisher: Arc<FakePublisher>,
         /// Held for liveness only: dropping it would end the publisher's
         /// client channel.
-        _clients_tx: watch::Sender<Option<Arc<dyn BusClient>>>,
+        _clients_tx: watch::Sender<Option<BusClientSlot>>,
         _session: zbus::Connection,
     }
 
-    async fn wired(bus: &PrivateBus) -> (Wired, mpsc::Receiver<()>) {
+    async fn wired(bus: &PrivateBus) -> (Wired, mpsc::Receiver<u64>) {
         wired_with_cap(bus, MAX_LIVE, MAX_STORED_BYTES).await
     }
 
@@ -2393,7 +2613,7 @@ mod tests {
         bus: &PrivateBus,
         cap: usize,
         max_stored_bytes: usize,
-    ) -> (Wired, mpsc::Receiver<()>) {
+    ) -> (Wired, mpsc::Receiver<u64>) {
         let session = bus.connect().await;
         let publisher = Arc::new(FakePublisher::default());
         let (clients_tx, clients_rx) = watch::channel(None);
@@ -2401,7 +2621,10 @@ mod tests {
             .await
             .expect("notify server starts and claims the name");
         clients_tx
-            .send(Some(Arc::clone(&publisher) as Arc<dyn BusClient>))
+            .send(Some(BusClientSlot {
+                generation: 0,
+                client: Arc::clone(&publisher) as Arc<dyn BusClient>,
+            }))
             .expect("the publisher channel is alive");
         (
             Wired {
@@ -2496,6 +2719,25 @@ mod tests {
                 .is_err(),
             "no NotificationClosed may arrive"
         );
+    }
+
+    /// Poll `probe` until it returns Some, panicking after `budget`.
+    async fn poll_until<T>(
+        budget: Duration,
+        mut probe: impl FnMut() -> Option<T>,
+        what: &str,
+    ) -> T {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if let Some(value) = probe() {
+                return value;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn urgency_hint(byte: u8) -> HashMap<String, OwnedValue> {
@@ -2707,6 +2949,136 @@ mod tests {
         );
         assert!(core.get(id_first).is_none());
         assert!(core.get(id_second).is_some());
+    }
+
+    #[test]
+    fn replaces_are_subject_to_the_stored_bytes_budget() {
+        // A full live set of tiny records, then every one replaced with
+        // a max-size record: the budget must hold on replace too —
+        // each replace counts its size delta and evicts the oldest
+        // others as expired, never the record being replaced.
+        let now = SystemTime::now();
+        let mono = Instant::now();
+        let mut huge = create_args("m");
+        huge.app = "a".repeat(MAX_TEXT_BYTES);
+        huge.icon = "i".repeat(MAX_TEXT_BYTES);
+        huge.summary = "s".repeat(MAX_TEXT_BYTES);
+        huge.body = "b".repeat(MAX_TEXT_BYTES);
+        huge.desktop_entry = Some("d".repeat(MAX_TEXT_BYTES));
+        huge.image_path = Some("p".repeat(MAX_TEXT_BYTES));
+        huge.actions = (0..MAX_ACTIONS)
+            .map(|index| Action {
+                key: format!("k{index}"),
+                label: "l".repeat(MAX_TEXT_BYTES),
+            })
+            .collect();
+
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
+        let mut ids = Vec::new();
+        for index in 0..MAX_LIVE {
+            let (id, _) = core.create(&create_args(&format!("tiny {index}")), now, mono);
+            ids.push(id);
+        }
+        assert_eq!(core.count(), MAX_LIVE);
+        assert!(
+            core.stored_bytes() <= MAX_STORED_BYTES,
+            "{} tiny records are within the budget",
+            core.count()
+        );
+
+        for (round, id) in ids.into_iter().enumerate() {
+            let mut args = huge.clone();
+            args.replaces_id = id;
+            let (returned, events) = core.create(&args, now, mono);
+            assert_eq!(returned, id, "the live id is reused");
+            assert!(created(&events, true), "round {round}: {events:?}");
+            assert!(
+                core.get(id).is_some(),
+                "round {round}: the replaced record survives — it is never a victim"
+            );
+            assert!(
+                core.stored_bytes() <= MAX_STORED_BYTES,
+                "round {round}: the budget holds on replace too ({} > {})",
+                core.stored_bytes(),
+                MAX_STORED_BYTES
+            );
+        }
+        assert!(core.count() <= MAX_LIVE, "the count cap holds too");
+    }
+
+    #[test]
+    fn an_adopted_id_is_reserved_against_the_id_clock() {
+        // Adopting a dead caller-supplied id must reserve it: the
+        // clock can never hand that id to another app later. The id is
+        // far past anything the clock reaches during this test — the
+        // margin absorbs ids other tests allocate in parallel.
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
+        let hot = ID_CLOCK
+            .load(Ordering::SeqCst)
+            .saturating_add(2_000_000)
+            .max(1);
+        let mut args = create_args("adopted");
+        args.replaces_id = hot;
+        let (id, _) = core.create(&args, SystemTime::now(), Instant::now());
+        assert_eq!(id, hot, "a dead replaces_id is adopted under that id");
+        assert!(
+            ID_CLOCK.load(Ordering::SeqCst) >= hot,
+            "adopting an id reserves it against the clock (clock at {})",
+            ID_CLOCK.load(Ordering::SeqCst)
+        );
+        let (fresh, _) = core.create(&create_args("fresh"), SystemTime::now(), Instant::now());
+        assert_ne!(fresh, hot, "the clock never hands an adopted id out");
+    }
+
+    #[test]
+    fn id_clock_wraps_to_one_without_a_wall_clock_reseed() {
+        // At the top of the u32 range the clock wraps to 1 and carries
+        // on — a wall-clock re-seed would jump BACK to recent ids and
+        // re-issue them.
+        ID_CLOCK.store(u32::MAX, Ordering::SeqCst);
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
+        let (id, _) = core.create(&create_args("wrap"), SystemTime::now(), Instant::now());
+        assert!(
+            id > 0 && id < 1_000_000,
+            "the wrap continues from 1, not a wall-clock re-seed: {id}"
+        );
+    }
+
+    #[test]
+    fn eviction_follows_insertion_order_not_the_wall_clock() {
+        // The second record is created with an EARLIER wall clock (an
+        // NTP step back): eviction still takes the first-INSERTED
+        // record, because the order is the monotonic insertion
+        // sequence, not created_at.
+        let mut core = NotifyCore::new(2, MAX_STORED_BYTES);
+        let mono = Instant::now();
+        let late = SystemTime::now();
+        let early = late - Duration::from_secs(3600);
+        let (first, _) = core.create(&create_args("first"), late, mono);
+        let (second, _) = core.create(&create_args("second"), early, mono);
+        assert!(
+            core.get(second)
+                .expect("live")
+                .created_at
+                < core.get(first).expect("live").created_at,
+            "precondition: second's wall clock is an hour earlier"
+        );
+
+        let (_, events) = core.create(&create_args("third"), early, mono);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.id == first
+                    && matches!(
+                        event.kind,
+                        NotifyEventKind::Closed {
+                            reason: CloseReason::Expired
+                        }
+                    )),
+            "the first-INSERTED record is evicted: {events:?}"
+        );
+        assert!(core.get(first).is_none());
+        assert!(core.get(second).is_some(), "the skewed clock bought nothing");
     }
 
     #[test]
@@ -3238,6 +3610,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiry_emits_closed_even_when_the_emission_must_wait() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        // Every NotificationClosed emission first yields once. If the
+        // expiry path still aborts its own timer task on disarm, the
+        // abort lands exactly at that yield and the signal is silently
+        // lost — deterministically, no socket contention needed.
+        YIELD_BEFORE_EMIT.store(true, Ordering::SeqCst);
+        let (wired, _faults) = wired(&bus).await;
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+        let mut closed_stream = client.receive_notification_closed().await.expect("stream");
+
+        let id = client
+            .notify(
+                "app",
+                0,
+                "",
+                "expiring under contention",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                250,
+            )
+            .await
+            .expect("Notify");
+        assert_eq!(next_closed(&mut closed_stream).await, (id, 1));
+
+        // CloseNotification's emission goes through the same yield and
+        // still arrives.
+        client
+            .notify("app", 0, "", "closing", "", Vec::new(), HashMap::new(), 0)
+            .await
+            .expect("Notify");
+        YIELD_BEFORE_EMIT.store(false, Ordering::SeqCst);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invoke_round_trips_action_invoked_and_closes_unless_resident() {
         let Some(bus) = PrivateBus::spawn().await else {
             return;
@@ -3664,6 +4077,316 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_session_fault_does_not_tear_down_the_next_session() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let session = bus.connect().await;
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, faults) = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES)
+            .await
+            .expect("notify server starts and claims the name");
+        let shared = Arc::clone(&server.shared);
+        let scripted = ScriptedBus::default();
+        // The connector hands sessions out LIFO, so the session added
+        // LAST is served FIRST.
+        let second = scripted.add();
+        let first = scripted.add();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let run_task = tokio::spawn(notify_run(
+            session,
+            server,
+            clients_tx,
+            faults,
+            scripted,
+            stop_rx,
+            Duration::from_millis(50),
+        ));
+        let poll_conn = bus.connect().await;
+        wait_name_owned(&poll_conn).await;
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+
+        // A notification whose event publish is HELD: it will fail, but
+        // the fault is only delivered when the test releases it.
+        first.publisher.fail_next(1);
+        first.publisher.hold_next_failure();
+        client
+            .notify(
+                "app",
+                0,
+                "",
+                "held publish",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                0,
+            )
+            .await
+            .expect("Notify");
+        poll_until(
+            Duration::from_secs(5),
+            || (first.publisher.held_publishes() == 1).then_some(()),
+            "the publish to park on the hold",
+        )
+        .await;
+
+        // The Bus outage: the command stream ends, the run reconnects —
+        // with the held fault still pending.
+        drop(first.sender);
+        second
+            .sender
+            .send(command("notify.ping", Value::Null))
+            .expect("command reaches the run");
+        poll_until(
+            Duration::from_secs(5),
+            || (!second.publisher.replies_for("notify.ping").is_empty()).then_some(()),
+            "session 2 to be installed and serving",
+        )
+        .await;
+
+        // NOW the held publish fails: a fault stamped with session 1's
+        // generation, arriving while session 2 is healthy. It must be
+        // ignored — session 2 keeps serving.
+        first.publisher.release_held_publish();
+        second
+            .sender
+            .send(command("notify.ping", Value::Null))
+            .expect("command reaches the run");
+        poll_until(
+            Duration::from_secs(5),
+            || (second.publisher.replies_for("notify.ping").len() >= 2).then_some(()),
+            "session 2 to still be serving after the stale fault",
+        )
+        .await;
+        assert!(
+            !run_task.is_finished(),
+            "the run itself is untouched by the stale fault"
+        );
+
+        stop_tx.send(true).expect("stop signal");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("the run ends on stop")
+            .expect("run task alive");
+        assert!(outcome.is_ok(), "clean stop: {outcome:?}");
+        assert_eq!(shared.status().0, 1, "the held-event notification is live");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publish_fault_does_not_cancel_an_in_flight_dispatch() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let session = bus.connect().await;
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, faults) = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES)
+            .await
+            .expect("notify server starts and claims the name");
+        let shared = Arc::clone(&server.shared);
+        let scripted = ScriptedBus::default();
+        let second = scripted.add();
+        let first = scripted.add();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let run_task = tokio::spawn(notify_run(
+            session,
+            server,
+            clients_tx,
+            faults,
+            scripted,
+            stop_rx,
+            Duration::from_millis(50),
+        ));
+        let poll_conn = bus.connect().await;
+        wait_name_owned(&poll_conn).await;
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+
+        // Reserve a fault: an event publish that parks, then fails.
+        first.publisher.fail_next(1);
+        first.publisher.hold_next_failure();
+        client
+            .notify("app", 0, "", "held event", "", Vec::new(), HashMap::new(), 0)
+            .await
+            .expect("Notify");
+        poll_until(
+            Duration::from_secs(5),
+            || (first.publisher.held_publishes() == 1).then_some(()),
+            "the publish to park on the hold",
+        )
+        .await;
+
+        // A notify.send whose reply is held at a gate: the dispatch is
+        // provably in flight (state applied, reply not yet sent).
+        first.publisher.hold_replies_at_gate();
+        first
+            .sender
+            .send(command("notify.send", json!({"summary": "mid-dispatch"})))
+            .expect("command reaches the run");
+        poll_until(
+            Duration::from_secs(5),
+            || (first.publisher.held_replies() == 1).then_some(()),
+            "the dispatch to park at the reply gate",
+        )
+        .await;
+        assert_eq!(
+            shared.status().0,
+            2,
+            "the dispatched create is applied before its reply goes out"
+        );
+
+        // The fault lands MID-dispatch. The dispatch must complete: the
+        // reply is not cancelled by the fault.
+        first.publisher.release_held_publish();
+        first.publisher.release_held_replies();
+        poll_until(
+            Duration::from_secs(5),
+            || (!first.publisher.replies_for("notify.send").is_empty()).then_some(()),
+            "the in-flight dispatch to finish and reply",
+        )
+        .await;
+        assert_eq!(
+            first.publisher.replies_for("notify.send")[0].0,
+            0,
+            "the reply went out, not a cancellation"
+        );
+
+        // The fault is acted on BETWEEN commands: the run reconnects to
+        // session 2 and keeps serving.
+        second
+            .sender
+            .send(command("notify.ping", Value::Null))
+            .expect("command reaches the run");
+        poll_until(
+            Duration::from_secs(5),
+            || (!second.publisher.replies_for("notify.ping").is_empty()).then_some(()),
+            "the run to reconnect and keep serving",
+        )
+        .await;
+
+        stop_tx.send(true).expect("stop signal");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("the run ends on stop")
+            .expect("run task alive");
+        assert!(outcome.is_ok(), "clean stop: {outcome:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_publisher_ends_the_run() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let session = bus.connect().await;
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, faults) = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES)
+            .await
+            .expect("notify server starts and claims the name");
+        let shared = Arc::clone(&server.shared);
+        let scripted = ScriptedBus::default();
+        scripted.add();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let run_task = tokio::spawn(notify_run(
+            session,
+            server,
+            clients_tx,
+            faults,
+            scripted,
+            stop_rx,
+            Duration::from_millis(50),
+        ));
+        let poll_conn = bus.connect().await;
+        wait_name_owned(&poll_conn).await;
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+
+        // The publisher task dies (a panic). The run must end with a
+        // clear error instead of silently carrying on with publishing
+        // halted.
+        shared.panic_publisher.store(true, Ordering::SeqCst);
+        client
+            .notify(
+                "app",
+                0,
+                "",
+                "panic trigger",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                0,
+            )
+            .await
+            .expect("Notify");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("the run ends when the publisher dies")
+            .expect("run task alive");
+        let error = outcome.expect_err("a dead publisher ends the run with Err");
+        assert!(
+            format!("{error:#}").contains("publisher"),
+            "the error names the publisher: {error:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_replaces_keep_an_expiring_record_expirable() {
+        // No D-Bus needed: this races NotifyShared::create itself.
+        // Concurrent replaces of one id alternate long (60 s) and short
+        // (1 s) deadlines; every task ENDS on the short form, so the
+        // record's final deadline is always 1 s. If arm/disarm could
+        // happen outside the record lock (an arm landing out of
+        // mutation order), the live record could be left with a 60 s
+        // timer — or none at all — and would still be live long past
+        // its 1 s deadline.
+        let (events_tx, mut events_rx) = mpsc::channel(EVENT_CAPACITY);
+        tokio::spawn(async move {
+            while events_rx.recv().await.is_some() {}
+        });
+        let shared = Arc::new(NotifyShared::new(
+            MAX_LIVE,
+            MAX_STORED_BYTES,
+            Weak::new(),
+            events_tx,
+        ));
+        let mut start = create_args("start");
+        start.timeout = ExpireTimeout::Millis(1000);
+        let id = NotifyShared::create(&shared, start).await;
+
+        let mut hammer = Vec::new();
+        for round in 0..8 {
+            let shared = Arc::clone(&shared);
+            hammer.push(tokio::spawn(async move {
+                for index in 0..10_000 {
+                    let mut long = create_args(&format!("long {round}.{index}"));
+                    long.replaces_id = id;
+                    long.timeout = ExpireTimeout::Millis(60_000);
+                    NotifyShared::create(&shared, long).await;
+                    let mut short = create_args(&format!("short {round}.{index}"));
+                    short.replaces_id = id;
+                    short.timeout = ExpireTimeout::Millis(1000);
+                    NotifyShared::create(&shared, short).await;
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        for task in hammer {
+            task.await.expect("hammer task");
+        }
+        poll_until(
+            Duration::from_secs(6),
+            || (shared.status().0 == 0).then_some(()),
+            "the record to expire on its 1 s deadline after the hammer",
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_bus_death_ends_the_run_promptly() {
         let Some(mut bus) = PrivateBus::spawn().await else {
             return;
@@ -3745,6 +4468,16 @@ mod tests {
                 .expect("replace Notify");
         }
         assert_eq!(shared.timer_count(), 1, "one live timer after 50 replaces");
+        // And the 50 superseded timer tasks are actually FINISHED
+        // (aborted mid-sleep), not just overwritten in the map: every
+        // superseded timer's drop guard has fired (the 51st, current
+        // timer is still sleeping).
+        poll_until(
+            Duration::from_secs(5),
+            || (shared.timers_finished() >= 50).then_some(()),
+            "the 50 superseded timer tasks to finish",
+        )
+        .await;
 
         // Close: the last timer goes too.
         client
@@ -3752,6 +4485,12 @@ mod tests {
             .await
             .expect("CloseNotification");
         assert_eq!(shared.timer_count(), 0, "close cancels the timer");
+        poll_until(
+            Duration::from_secs(5),
+            || (shared.timers_finished() >= 51).then_some(()),
+            "the close-cancelled timer task to finish",
+        )
+        .await;
 
         // Re-arm once more, then end the run: every timer dies with it.
         client
@@ -3770,6 +4509,12 @@ mod tests {
         assert_eq!(shared.timer_count(), 1);
         drop(wired);
         assert_eq!(shared.timer_count(), 0, "all timers die with the run");
+        poll_until(
+            Duration::from_secs(5),
+            || (shared.timers_finished() >= 52).then_some(()),
+            "the run-end-aborted timer task to finish",
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
