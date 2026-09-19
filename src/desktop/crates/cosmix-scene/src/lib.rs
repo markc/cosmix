@@ -239,7 +239,9 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         pnd("gap", "0", None),
         pnd("padding", "0", None),
         p("fill", "bool", false, Some("false")),
-        pe("align", "\"start\"", ALIGN),
+        // A column stretched its children before `align` existed; the
+        // default keeps every v0 document laying out exactly as it did.
+        pe("align", "\"stretch\"", ALIGN),
     ];
     static ROW: [Port; 10] = [
         p("children", "list", true, None),
@@ -1163,7 +1165,7 @@ mod tests {
             (
                 "column",
                 "children: []",
-                "start",
+                "stretch",
                 vec!["start", "center", "end", "stretch"],
             ),
             (
