@@ -21,8 +21,10 @@
 //!   capability. This covers builtins *and* Mix's shell syntax (`sh "…"`,
 //!   `$(…)` substitution, `… | cmd` pipes), which spawn `/bin/sh` and
 //!   are gated as `Process` (requires `cosmix-lib-mix ≥ 0.14.1` — see
-//!   `CapabilityPolicy::check_class`). No Bus handler is installed, so
-//!   `send`/`emit` are inert.
+//!   `CapabilityPolicy::check_class`), and — since cosmix-lib-mix 0.89.0 —
+//!   the bare `send`/`emit` broker forms too, gated `Bus` (Bus is not in
+//!   the allowlist and no handler is installed): a catchable
+//!   `CAPABILITY_DENIED`, not the pre-0.89 silent no-op.
 //! * **Recursion cap** — `DEFAULT_RECURSION_LIMIT` (16). webd handlers
 //!   run on tokio's ~2 MB blocking threads; the async call path burns
 //!   tens of KB/level, so 16 is the reliably-safe default — do NOT

@@ -1040,8 +1040,10 @@ async fn run_inbound_filter(
             // A routing filter inspects metadata and returns a mailbox
             // name; it legitimately may read a file (e.g. a denylist), so
             // allow Pure + FsRead and deny FsWrite/Network/Process/Env
-            // (and the shell syntax they gate). No Bus handler installed →
-            // send/emit inert.
+            // (and the shell syntax they gate). Bus is not in the allowlist
+            // and no Bus handler is installed, so send/emit are denied by
+            // class (cosmix-lib-mix ≥ 0.89.0) — a catchable
+            // CAPABILITY_DENIED, not the pre-0.89 silent no-op.
             eval.set_capability_policy(std::rc::Rc::new(cosmix_mix::CategoryAllowList::new(&[
                 cosmix_mix::CapabilityClass::FsRead,
             ])));
