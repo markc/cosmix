@@ -18,13 +18,16 @@
 //! `--remap-once-ms N` the first such hide is undone after N ms
 //! (`PROBE remapped`).
 //! `--translucent` uses premultiplied half-alpha ARGB with no opaque region;
-//! the default XRGB buffer is opaque. Both modes retain compositor SSD.
+//! the default XRGB buffer is opaque. `--ssd` requests server decorations.
 
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::{
     wp_presentation, wp_presentation_feedback,
 };
 use smithay::reexports::wayland_protocols::xdg::shell::client::{
     xdg_surface, xdg_toplevel, xdg_wm_base,
+};
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use std::{
     env,
@@ -53,6 +56,7 @@ struct Probe {
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     seat: Option<wl_seat::WlSeat>,
     presentation: Option<wp_presentation::WpPresentation>,
+    decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// The latest unacknowledged configure: `(serial, width, height)`.
@@ -79,6 +83,7 @@ struct Options {
     hide_on_close: bool,
     remap_once: Option<Duration>,
     translucent: bool,
+    ssd: bool,
 }
 
 fn options() -> Result<Options, String> {
@@ -91,6 +96,7 @@ fn options() -> Result<Options, String> {
         hide_on_close: false,
         remap_once: None,
         translucent: false,
+        ssd: false,
     };
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -119,6 +125,7 @@ fn options() -> Result<Options, String> {
             }
             "--hide-on-close" => options.hide_on_close = true,
             "--translucent" => options.translucent = true,
+            "--ssd" => options.ssd = true,
             "--remap-once-ms" => {
                 options.remap_once = Some(Duration::from_millis(
                     value()?
@@ -239,6 +246,17 @@ fn run() -> Result<(), String> {
     let toplevel = xdg.get_toplevel(&qh, ());
     toplevel.set_title(options.title.clone());
     toplevel.set_app_id(options.app_id.clone());
+    let _decoration = if options.ssd {
+        let decoration = probe
+            .decoration_manager
+            .as_ref()
+            .ok_or("--ssd requires zxdg_decoration_manager_v1")?
+            .get_toplevel_decoration(&toplevel, &qh, ());
+        decoration.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        Some(decoration)
+    } else {
+        None
+    };
     surface.commit();
 
     let deadline = Instant::now() + options.duration;
@@ -365,6 +383,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
             }
             "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
             "xdg_wm_base" => state.wm_base = Some(registry.bind(name, 1, qh, ())),
+            "zxdg_decoration_manager_v1" => {
+                state.decoration_manager = Some(registry.bind(name, 1, qh, ()));
+            }
             "wl_seat" => state.seat = Some(registry.bind(name, version.min(7), qh, ())),
             "wp_presentation" => {
                 state.presentation = Some(registry.bind(name, version.min(2), qh, ()));
@@ -576,4 +597,6 @@ ignore_events!(
     wl_buffer::WlBuffer,
     wl_surface::WlSurface,
     wp_presentation::WpPresentation,
+    zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+    zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
 );
