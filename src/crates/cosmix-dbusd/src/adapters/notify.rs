@@ -496,11 +496,7 @@ impl NotifyCore {
                 .min_by_key(|(live, record)| {
                     // Insertion order, not wall clock: a clock step must
                     // never reorder eviction.
-                    (
-                        record.urgency == Urgency::Critical,
-                        record.seq,
-                        **live,
-                    )
+                    (record.urgency == Urgency::Critical, record.seq, **live)
                 })
                 .map(|(live, _)| *live);
             let Some(victim) = victim else {
@@ -2145,8 +2141,14 @@ async fn run_bus<C: BusConnector>(
         // Faults are consumed inside serve_bus, between commands; any
         // fault left in the channel belongs to THIS generation or a
         // older one, and stale ones are filtered by generation there.
-        let outcome =
-            serve_bus(&mut session, &shared, &mut faults, generation, &mut shutdown).await;
+        let outcome = serve_bus(
+            &mut session,
+            &shared,
+            &mut faults,
+            generation,
+            &mut shutdown,
+        )
+        .await;
         let _ = clients.send(None);
         if let Some(close) = session.close.take() {
             close.await;
@@ -3057,28 +3059,26 @@ mod tests {
         let (first, _) = core.create(&create_args("first"), late, mono);
         let (second, _) = core.create(&create_args("second"), early, mono);
         assert!(
-            core.get(second)
-                .expect("live")
-                .created_at
-                < core.get(first).expect("live").created_at,
+            core.get(second).expect("live").created_at < core.get(first).expect("live").created_at,
             "precondition: second's wall clock is an hour earlier"
         );
 
         let (_, events) = core.create(&create_args("third"), early, mono);
         assert!(
-            events
-                .iter()
-                .any(|event| event.id == first
-                    && matches!(
-                        event.kind,
-                        NotifyEventKind::Closed {
-                            reason: CloseReason::Expired
-                        }
-                    )),
+            events.iter().any(|event| event.id == first
+                && matches!(
+                    event.kind,
+                    NotifyEventKind::Closed {
+                        reason: CloseReason::Expired
+                    }
+                )),
             "the first-INSERTED record is evicted: {events:?}"
         );
         assert!(core.get(first).is_none());
-        assert!(core.get(second).is_some(), "the skewed clock bought nothing");
+        assert!(
+            core.get(second).is_some(),
+            "the skewed clock bought nothing"
+        );
     }
 
     #[test]
@@ -4210,7 +4210,16 @@ mod tests {
         first.publisher.fail_next(1);
         first.publisher.hold_next_failure();
         client
-            .notify("app", 0, "", "held event", "", Vec::new(), HashMap::new(), 0)
+            .notify(
+                "app",
+                0,
+                "",
+                "held event",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                0,
+            )
             .await
             .expect("Notify");
         poll_until(
@@ -4345,9 +4354,7 @@ mod tests {
         // timer — or none at all — and would still be live long past
         // its 1 s deadline.
         let (events_tx, mut events_rx) = mpsc::channel(EVENT_CAPACITY);
-        tokio::spawn(async move {
-            while events_rx.recv().await.is_some() {}
-        });
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
         let shared = Arc::new(NotifyShared::new(
             MAX_LIVE,
             MAX_STORED_BYTES,

@@ -120,7 +120,12 @@ connection survive a Bus outage: the Bus client is reconnected inside
 the run (the `dbusd` citizen's reconnect doctrine, 60 s between
 attempts) and the props-diff baseline survives the outage, so no live
 notification is lost and `org.freedesktop.Notifications` is never
-released for an activatable daemon to grab. The run ends — and the
+released for an activatable daemon to grab. A failed event publish
+faults only the Bus session it failed on — publish faults carry a
+session generation, and a stale fault from a superseded session is
+ignored — and faults are acted on between commands, never
+mid-dispatch; the publisher task is watched, and its death ends the
+run with a clear error. The run ends — and the
 supervisor backs off and re-dials — only when the session bus dies,
 the adapter is stopped, or an internal fault makes progress
 impossible.
@@ -131,8 +136,9 @@ fails with a clear error — never a replacement: the supervisor backs
 off and retries, and a human uses `dbusd.adapter.disable`/`enable` (or
 stops the other daemon) to hand the name over. Methods: `Notify`
 (with `replaces_id` semantics — a live id is reused and replaced; a
-non-zero id that is not live is created under that very id, which is
-safe because ids are process-monotonic and never reused),
+non-zero id that is not live is created under that very id, and the
+adoption reserves that id against the id clock, so the clock never
+hands it to another app),
 `CloseNotification` (→ `NotificationClosed` reason 3; an unknown id is
 an error reply per spec 1.2 — the caller may be acting on stale
 state), `GetCapabilities` (`actions`, `body` — only what is
@@ -141,16 +147,22 @@ implemented; persistence is not claimed), `GetServerInformation`
 `NotificationClosed(id, reason)` (1 expired, 2 dismissed, 3 closed by
 call) and `ActionInvoked(id, action_key)`. Notification ids come from
 a process-wide clock seeded from the wall clock: never 0, never
-reused, and fresh across adapter and daemon restarts — one app's
-`replaces_id`/`CloseNotification` can never hit another app's
-notification after a restart. Expiry follows the pinned policy:
+re-issued by the clock (on the u32 wrap it continues from 1, still
+skipping live ids), and fresh across adapter and daemon restarts —
+one app's `replaces_id`/`CloseNotification` can never hit another
+app's notification after a restart. An id repeats only when an app
+explicitly adopts one via a non-live `replaces_id`. Expiry follows the pinned policy:
 `expire_timeout` −1 means the server default — 8 s for low/normal
 urgency, never for critical — and 0 means never; any finite expiry is
 clamped to at least 1 s so a notification cannot close before the
 client has received its id; every notification gets its own timer on
 the monotonic clock (a wall-clock step can never delay or hasten it),
 and a timer is cancelled the moment its notification is replaced,
-closed or evicted. Hints honoured: `urgency` (byte, plus the int32 /
+closed or evicted. Timers are armed and cancelled under the same lock
+as the state change (a concurrent replace can never leave a live
+notification with the wrong timer — or none), and the expiry path
+removes its own timer without aborting itself, so the closing
+`NotificationClosed` signal is never lost to its own cleanup. Hints honoured: `urgency` (byte, plus the int32 /
 uint32 forms non-conforming clients send), `resident`, `transient`,
 `desktop-entry`, `image-path`; an `image-data` pixel payload is only
 recorded as present (a `n<id>.image_data` prop) — raw pixels never
@@ -184,8 +196,11 @@ on any verb):
   `notify.props.get` is the truth.
 
 **Bounds.** At most 256 live notifications and at most 16 MiB of
-stored notification text in total: a fresh insert past either bound
-expires the oldest notification first — non-critical before critical,
-but an all-critical set is capped too (critical buys priority, not
-unbounded growth). Stored strings are capped (8 KiB, truncated at a
+stored notification text in total: any insert — a fresh one or a
+replace — that would pass either bound first expires the oldest
+notification (oldest by insertion order, not wall clock; non-critical
+before critical, but an all-critical set is capped too — critical
+buys priority, not unbounded growth). A replace counts only its size
+delta against the bytes bound and never evicts the record it
+replaces. Stored strings are capped (8 KiB, truncated at a
 char boundary and marked) and at most 32 actions are kept.
