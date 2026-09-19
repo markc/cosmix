@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/</title>
+    <title>CosMix — cos/dbusd</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,54 +441,103 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/README.md"><div class="prose"><h1 id="cos--component-docs">cos — component docs</h1>
-<p>Summary documentation for the <strong>cos</strong> daemon family, one page per component. The
-canonical home of these pages is
-<a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> in the public
-<a href="https://github.com/markc/cosmix">markc/cos</a> repo; add a page by dropping
-<code>COMPONENT.md</code> there. The same files render three ways:</p>
+        <div id="content-doc" data-prerendered="cos/dbusd.md"><div class="prose"><h1 id="cosmix-dbusd--the-d-bus-boundary-daemon">cosmix-dbusd — the D-Bus boundary daemon</h1>
+<p><strong><code>cosmix-dbusd</code> is the one cosmix process that speaks D-Bus.</strong> Per the
+ADR <em>D-Bus is a foreign protocol — only <code>cosmix-dbusd</code> adapters speak it</em>
+(2026-09-18), every other cosmix app and daemon talks ABP on the Bus; the
+D-Bus world is reached — in both directions — through per-domain adapters
+hosted here, the same way IMAP and HTTP live at the edge.</p>
+<h2 id="what-it-does">What it does</h2>
 <ul>
-<li><strong>Web</strong> — <a href="https://markc.github.io/cos/">markc.github.io/cos</a> serves this manual in the site's left-hand <strong>Components</strong> pane; any page deep-links as <code>#_man/PAGE.md</code>.</li>
-<li><strong>GitHub</strong> — browse <a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> directly; this file doubles as the directory README.</li>
-<li><strong>Local clone</strong> — plain markdown with relative links; any editor or viewer works.</li>
+<li>Hosts one adapter per D-Bus domain. An adapter owns exactly one Bus
+service (registered under its domain name: <code>notify</code>, <code>tray</code>, …) and one
+zbus connection for its whole run — both locals of its <code>run</code>, so an
+adapter that returns, fails or panics drops them and withdraws its
+names. Fault containment falls out of ownership: one adapter's death
+never touches another adapter or the daemon. One language limit: a
+panic inside <code>Drop</code> during a panic unwind aborts the whole process —
+containment covers one fault, not a second one during cleanup.</li>
+<li>Supervises every adapter in its own tokio task, observing the
+JoinHandle: a panic (<code>JoinError::is_panic</code>), an <code>Err</code> return, or an
+unexpected <code>Ok</code> return all record a failure, put the adapter in
+<code>backoff</code>, and relaunch it after an exponential schedule (1 s doubling
+to a 60 s cap; five healthy minutes reset the escalation). A
+consistently failing adapter stays in <code>backoff</code> forever — it never
+takes the daemon down. A run that never yields cannot be preempted:
+it is reported <code>stuck</code>, its Bus service and D-Bus names may stay held
+until the process restarts, and its lifecycle keeps answering
+commands.</li>
+<li>Dials the desktop session bus from <code>DBUS_SESSION_BUS_ADDRESS</code> per
+adapter. Unset or unreachable means that adapter sits in <code>backoff</code>
+with that reason; the daemon stays up and keeps answering <code>dbusd.*</code>.</li>
+<li>Serves the <code>dbusd</code> Bus control service (mesh-open; no caller
+authorization on any verb):
+<ul>
+<li><code>dbusd.adapters</code> — every adapter's <code>{name, service, state, restarts, leaked_runs, last_error, since}</code> and the session-bus endpoint state.</li>
+<li><code>dbusd.adapter.restart {name}</code> / <code>dbusd.adapter.enable {name}</code> /
+<code>dbusd.adapter.disable {name}</code> — disable stops the adapter and
+releases its names (how a human hands, say, the Notifications name
+back to another daemon); enable and restart relaunch it. Unknown
+names get a refusal reply, never a panic.</li>
+<li><code>dbusd.props.{get,list,describe,watch}</code> — the uniform props surface
+over <code>dbusd.adapters.&lt;name&gt;.state|restarts|leaked_runs|last_error</code>.</li>
+<li><code>dbusd.ping</code>, <code>dbusd.info</code>.</li>
 </ul>
-<p>These are <strong>summaries</strong> — what each component is and how to use it — not
-exhaustive manpages. For the language that drives these daemons, see the
-<a href="https://markc.github.io/mix/">mix manual</a>.</p>
-<h2 id="start-here">Start here</h2>
-<ul>
-<li><strong><a href="/cos/overview">overview</a></strong> — what cos is, how the workspace is laid out, how it fits with bus and mix.</li>
+</li>
+<li>Publishes state changes as they happen — one <code>dbusd.adapter.changed</code>
+event plus <code>dbusd.props.changed</code> diffs per transition, both stamped
+with a per-daemon-session monotonic <code>event_seq</code>. Events can be
+dropped under backlog: a gap in <code>event_seq</code> says so, and the props
+(<code>dbusd.props.get</code>) are the truth. No polling anywhere: supervision
+is JoinHandle- and signal-driven.</li>
 </ul>
-<h2 id="daemons">Daemons</h2>
-<ul>
-<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker; every node runs one.</li>
-<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP + spam).</li>
-<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS + ACME; server-rendered web UI.</li>
-<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS.</li>
-<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base / indexer.</li>
-<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps.</li>
-<li><strong><a href="/cos/cosmix-comp">cosmix-comp</a></strong> — Wayland compositor and supported protocol globals.</li>
-<li><strong><a href="/cos/quoin">quoin</a></strong> — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.</li>
-<li><strong><a href="/cos/cosmix-bg-showcase">cosmix-bg-showcase</a></strong> — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.</li>
-<li><strong><a href="/cos/cosmix-capture">cosmix-capture</a></strong> — native Wayland screenshots and full-output MP4 recording controlled through Bus.</li>
-<li><strong><a href="/cos/cosmix-media">cosmix-media</a></strong> — native CTK MP3/MP4 player with PipeWire-compatible audio and Bus playback controls.</li>
-<li><strong><a href="/cos/cosmix-wallpaper">cosmix-wallpaper</a></strong> — GPU-rendered flocking background with window avoidance, pointer repulsion and native Bus preferences.</li>
-<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
-<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power state.</li>
-<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
-<li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon: hosts the per-domain D-Bus adapters.</li>
-</ul>
-<h2 id="bridge--libraries">Bridge &amp; libraries</h2>
-<ul>
-<li><strong><a href="/cos/foreman">foreman</a></strong> — task runner, policy gate, verifier, and refinery operator runbook.</li>
-<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge.</li>
-<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
-</ul>
-<h2 id="see-also">See also</h2>
-<ul>
-<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
-<li>The <a href="https://markc.github.io/mix/">mix manual</a> — the language and shell used to operate these daemons.</li>
-</ul></div></div>
+<p>Configuration is <code>~/.config/cosmix/dbusd.conf.mix</code>
+(<code>enabled: ["notify", "tray"]</code>); an absent <code>enabled</code> means every
+built-in adapter, an empty list means none. An absent file materialises
+the defaults on disk; a file that exists but cannot be read or parsed
+is fatal — the daemon exits rather than silently guessing the adapter
+set. Unknown names are logged and ignored. Enable/disable verbs are
+runtime-only — the config file is the persistent source.</p>
+<h2 id="adapter-status">Adapter status</h2>
+<table><thead><tr><th>state</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>starting</code></td><td>launched; has not yet reported serving</td></tr>
+<tr><td><code>running</code></td><td>serving its domain</td></tr>
+<tr><td><code>backoff</code></td><td>failed (error/panic/exit); waiting out the schedule</td></tr>
+<tr><td><code>disabled</code></td><td>stopped by config or verb; names released</td></tr>
+<tr><td><code>stuck</code></td><td>the run did not stop within the abort window — it may be CPU-bound or never yielding; its names may stay held until the process restarts</td></tr>
+</tbody></table>
+<p><code>restarts</code> counts every relaunch in this daemon process (backoff
+restarts, the restart verb, enable-after-disable). <code>last_error</code> is the
+most recent failure reason, cleared when the adapter runs healthy
+again. <code>leaked_runs</code> counts runs detached as <code>stuck</code> in this daemon
+process and never resets: the next healthy run clears <code>last_error</code>,
+but the leaked spinner may still be holding names and burning a
+worker — the count is its visible trace.</p>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">/opt/cosmix/bin/cosmix-dbusd serve
+</code></pre>
+<p>The supplied <code>cosmix-dbusd.service</code> is a systemd user unit: the Bus
+citizen belongs to the graphical session, and the adapters dial the
+desktop session bus (<code>unix:path=/run/cosmix-desk-dbus/bus</code>, set
+explicitly because systemd user units do not inherit the session
+environment). SIGTERM stops every adapter (releasing its D-Bus names)
+and exits 0.</p>
+<h2 id="writing-an-adapter">Writing an adapter</h2>
+<p>An adapter implements the <code>Adapter</code> trait — <code>name()</code>, <code>bus_service()</code>,
+and <code>async run(ctx)</code> — and registers as one line in
+<code>citizen::builtin_adapters()</code>:</p>
+<pre><code class="language-rust,ignore">adapter_spec::&lt;NotifyAdapter&gt;(),
+</code></pre>
+<p>The context carries the session-bus endpoint, a per-launch stop signal,
+a ready channel, and (under the <code>cosmix</code> feature) helpers that open the
+adapter's own Bus connection and its own zbus connection. Keeping both
+as locals of <code>run</code> is the whole containment story. The crate's core
+(supervisor, backoff, registry, config) builds without the <code>cosmix</code>
+feature and is unit-tested with a scripted fault adapter compiled only
+under <code>cfg(test)</code>.</p>
+<p>The first adapters (notify, tray, settings, then folding mprisd and
+powerd) land in later jobs; J1 ships the host, the control service and
+the supervision guarantees.</p></div></div>
     </div>
 
 </main>

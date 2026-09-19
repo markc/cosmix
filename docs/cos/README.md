@@ -35,6 +35,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[agentd](agentd.md)** — agent supervision.
 - **[powerd](powerd.md)** — event-driven UPower battery and power state.
 - **[mprisd](mprisd.md)** — event-driven MPRIS2 media-player state and delegated controls.
+- **[dbusd](dbusd.md)** — the D-Bus boundary daemon: hosts the per-domain D-Bus adapters.
 
 ## Bridge & libraries
 
