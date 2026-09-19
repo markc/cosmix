@@ -637,39 +637,47 @@ pub(crate) fn menu_node_json(value: &Value<'_>, budget: &mut usize) -> Option<Js
     }))
 }
 
-fn dict_str(dict: &Dict<'_, '_>, key: &str) -> Option<String> {
-    let mut value = None;
+/// Lookup in a sparse dbusmenu property dict. Values in an `a{sv}` ride
+/// the wire (and zvariant's builders) as variants — unwrap one level,
+/// and accept the bare form too.
+fn dict_with<T>(
+    dict: &Dict<'_, '_>,
+    key: &str,
+    extract: impl Fn(&Value<'_>) -> Option<T>,
+) -> Option<T> {
     for (candidate, entry) in dict.iter() {
-        if let (Value::Str(name), Value::Str(text)) = (candidate, entry)
+        if let Value::Str(name) = candidate
             && name.as_str() == key
         {
-            value = Some(text.to_string());
-            break;
+            let entry = match entry {
+                Value::Value(inner) => inner.as_ref(),
+                value => value,
+            };
+            return extract(entry);
         }
     }
-    value
+    None
+}
+
+fn dict_str(dict: &Dict<'_, '_>, key: &str) -> Option<String> {
+    dict_with(dict, key, |value| match value {
+        Value::Str(text) => Some(text.to_string()),
+        _ => None,
+    })
 }
 
 fn dict_bool(dict: &Dict<'_, '_>, key: &str) -> Option<bool> {
-    for (candidate, entry) in dict.iter() {
-        if let (Value::Str(name), Value::Bool(flag)) = (candidate, entry)
-            && name.as_str() == key
-        {
-            return Some(*flag);
-        }
-    }
-    None
+    dict_with(dict, key, |value| match value {
+        Value::Bool(flag) => Some(*flag),
+        _ => None,
+    })
 }
 
 fn dict_i32(dict: &Dict<'_, '_>, key: &str) -> Option<i32> {
-    for (candidate, entry) in dict.iter() {
-        if let (Value::Str(name), Value::I32(number)) = (candidate, entry)
-            && name.as_str() == key
-        {
-            return Some(*number);
-        }
-    }
-    None
+    dict_with(dict, key, |value| match value {
+        Value::I32(number) => Some(*number),
+        _ => None,
+    })
 }
 
 // ===========================================================================
@@ -2785,14 +2793,13 @@ mod tests {
         .expect("string array");
         assert!(items.contains(&"org.kde.StatusNotifierItem-test-1".to_string()));
         assert!(items.iter().any(|item| item.starts_with(':')));
-        assert_eq!(
+        assert!(
             bool::try_from(
                 all.get("IsStatusNotifierHostRegistered")
                     .expect("property present")
                     .clone()
             )
-            .expect("bool"),
-            true
+            .expect("bool")
         );
         assert_eq!(
             i32::try_from(
@@ -2997,7 +3004,9 @@ mod tests {
         .await;
         assert_eq!(rc, 0);
 
-        let calls = app.calls.lock().expect("calls");
+        // Snapshot, don't bind the guard: this lint cannot see through
+        // an explicit drop before the awaits below.
+        let calls = app.calls.lock().expect("calls").clone();
         assert!(calls.contains(&"Activate(5,7)".to_string()), "{calls:?}");
         assert!(
             calls.contains(&"SecondaryActivate(0,0)".to_string()),
@@ -3008,7 +3017,6 @@ mod tests {
             calls.contains(&"Scroll(-3,vertical)".to_string()),
             "{calls:?}"
         );
-        drop(calls);
 
         // Refusals, never panics: unknown id, missing id, bad orientation.
         let (rc, body) = verb(
