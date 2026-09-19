@@ -41,6 +41,8 @@ pub mod supervisor;
 pub(crate) mod fault;
 
 #[cfg(feature = "cosmix")]
+pub mod adapters;
+#[cfg(feature = "cosmix")]
 pub mod citizen;
 #[cfg(feature = "cosmix")]
 pub mod props;

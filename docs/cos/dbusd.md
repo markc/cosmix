@@ -105,6 +105,102 @@ as locals of `run` is the whole containment story. The crate's core
 feature and is unit-tested with a scripted fault adapter compiled only
 under `cfg(test)`.
 
-The first adapters (notify, tray, settings, then folding mprisd and
-powerd) land in later jobs; J1 ships the host, the control service and
-the supervision guarantees.
+The `notify` adapter ships; the rest (tray, settings, then folding
+mprisd and powerd) land in later jobs.
+
+## The notify adapter
+
+Inbound `org.freedesktop.Notifications` (spec 1.2) on the session bus,
+bridged to the `notify` Bus service — how foreign apps' notifications
+become legible on the Bus, and how any mesh node posts to this
+desktop.
+
+**Lifetime.** The D-Bus server, the notification state and the session
+connection survive a Bus outage: the Bus client is reconnected inside
+the run (the `dbusd` citizen's reconnect doctrine, 60 s between
+attempts) and the props-diff baseline survives the outage, so no live
+notification is lost and `org.freedesktop.Notifications` is never
+released for an activatable daemon to grab. A failed event publish
+faults only the Bus session it failed on — publish faults carry a
+session generation, and a stale fault from a superseded session is
+ignored — and faults are acted on between commands, never
+mid-dispatch; the publisher task is watched, and its death ends the
+run with a clear error. The run ends — and the
+supervisor backs off and re-dials — only when the session bus dies,
+the adapter is stopped, or an internal fault makes progress
+impossible.
+
+**D-Bus side.** Owns `org.freedesktop.Notifications` at
+`/org/freedesktop/Notifications`. If the name is already owned the run
+fails with a clear error — never a replacement: the supervisor backs
+off and retries, and a human uses `dbusd.adapter.disable`/`enable` (or
+stops the other daemon) to hand the name over. Methods: `Notify`
+(with `replaces_id` semantics — a live id is reused and replaced; a
+non-zero id that is not live is created under that very id, and the
+adoption reserves that id against the id clock, so the clock never
+hands it to another app),
+`CloseNotification` (→ `NotificationClosed` reason 3; an unknown id is
+an error reply per spec 1.2 — the caller may be acting on stale
+state), `GetCapabilities` (`actions`, `body` — only what is
+implemented; persistence is not claimed), `GetServerInformation`
+(`cosmix`, `cosmix`, crate version, `1.2`). Signals:
+`NotificationClosed(id, reason)` (1 expired, 2 dismissed, 3 closed by
+call) and `ActionInvoked(id, action_key)`. Notification ids come from
+a process-wide clock seeded from the wall clock: never 0, never
+re-issued by the clock (on the u32 wrap it continues from 1, still
+skipping live ids), and fresh across adapter and daemon restarts —
+one app's `replaces_id`/`CloseNotification` can never hit another
+app's notification after a restart. An id repeats only when an app
+explicitly adopts one via a non-live `replaces_id`. Expiry follows the pinned policy:
+`expire_timeout` −1 means the server default — 8 s for low/normal
+urgency, never for critical — and 0 means never; any finite expiry is
+clamped to at least 1 s so a notification cannot close before the
+client has received its id; every notification gets its own timer on
+the monotonic clock (a wall-clock step can never delay or hasten it),
+and a timer is cancelled the moment its notification is replaced,
+closed or evicted. Timers are armed and cancelled under the same lock
+as the state change (a concurrent replace can never leave a live
+notification with the wrong timer — or none), and the expiry path
+removes its own timer without aborting itself, so the closing
+`NotificationClosed` signal is never lost to its own cleanup. Hints honoured: `urgency` (byte, plus the int32 /
+uint32 forms non-conforming clients send), `resident`, `transient`,
+`desktop-entry`, `image-path`; an `image-data` pixel payload is only
+recorded as present (a `n<id>.image_data` prop) — raw pixels never
+enter props.
+
+**Bus side** (the `notify` service; mesh-open, no caller authorization
+on any verb):
+
+- Verbs: `notify.ping`, `notify.info`, `notify.list`,
+  `notify.close {id}` (→ `NotificationClosed` reason 2),
+  `notify.invoke {id, action}` (→ `ActionInvoked`, then close with
+  reason 2 unless the `resident` hint is set), and
+  `notify.send {summary, body?, app?, icon?, urgency?, timeout?,
+  actions?, resident?, transient?, desktop_entry?, image_path?}` —
+  creates a notification exactly as if `Notify` had been called (any
+  mesh node may post to this desktop). Unknown ids, actions and verbs
+  are refusal replies (rc 10), never panics.
+- Props: `notify.count` and one subtree per live notification —
+  `notify.n<id>.{app,summary,body,icon,urgency,actions,expires_at,
+  created_at,resident,transient,origin}` plus `desktop_entry` /
+  `image_path` / `image_data` when present. The subtree vanishes when
+  the notification closes. `expires_at` is null for never-expiring.
+- Events: `notify.changed` carries `notification.created`,
+  `notification.replaced`, `notification.closed` (with reason code and
+  name) and `notification.action_invoked`; `notify.props.changed`
+  carries leaf diffs, and the run's first change publishes a diff too
+  (the baseline is the empty tree). Events stamped under one state
+  lock arrive as a batch; the batch's coalesced diff is stamped with
+  the last `event_seq` it covers. Both topics carry a per-run
+  monotonic `event_seq` — a gap means events were dropped, and
+  `notify.props.get` is the truth.
+
+**Bounds.** At most 256 live notifications and at most 16 MiB of
+stored notification text in total: any insert — a fresh one or a
+replace — that would pass either bound first expires the oldest
+notification (oldest by insertion order, not wall clock; non-critical
+before critical, but an all-critical set is capped too — critical
+buys priority, not unbounded growth). A replace counts only its size
+delta against the bytes bound and never evicts the record it
+replaces. Stored strings are capped (8 KiB, truncated at a
+char boundary and marked) and at most 32 actions are kept.
