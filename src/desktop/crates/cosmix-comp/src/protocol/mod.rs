@@ -17118,7 +17118,9 @@ fn send_frames_surface_tree_limited(
                 });
                 batch.delivered += 1;
             }
-            batch.retained.extend(callbacks.iter().map(Resource::id));
+            batch
+                .retained
+                .extend(callbacks.iter().map(|callback| callback.id()));
         },
         |_, _, &()| true,
     );
