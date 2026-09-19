@@ -785,7 +785,7 @@ impl NotifyShared {
             let mut core = self.lock();
             let event = core.close(id, reason);
             if let Some(event) = &event {
-                self.enqueue(&[event.clone()]);
+                self.enqueue(std::slice::from_ref(event));
             }
             event.is_some()
         };
@@ -827,7 +827,7 @@ impl NotifyShared {
             let mut core = self.lock();
             let event = core.expire_if_due(id, SystemTime::now());
             if let Some(event) = &event {
-                self.enqueue(&[event.clone()]);
+                self.enqueue(std::slice::from_ref(event));
             }
             event.is_some()
         };
@@ -955,6 +955,7 @@ impl Notifications {
 }
 
 impl CreateArgs {
+    #[allow(clippy::too_many_arguments)] // the signature is fixed by spec
     fn from_dbus(
         app: &str,
         replaces_id: u32,
@@ -1478,7 +1479,10 @@ fn resolve_args(command: &IncomingCommand) -> Option<Value> {
 #[derive(Debug)]
 pub(crate) struct NotifyServer {
     pub shared: Arc<NotifyShared>,
-    emitter: Arc<SignalEmitter<'static>>,
+    /// The strong emitter reference — held for liveness only (it owns
+    /// the zbus connection; the shared state reaches it weakly), which
+    /// is exactly why nothing reads it.
+    _emitter: Arc<SignalEmitter<'static>>,
     publisher: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -1540,7 +1544,7 @@ async fn start_server<P: EventPublisher + 'static>(
     Ok((
         NotifyServer {
             shared,
-            emitter,
+            _emitter: emitter,
             publisher: publisher_task,
         },
         fault_rx,
@@ -1581,7 +1585,7 @@ impl Adapter for NotifyAdapter {
                 .incoming_async()
                 .await
                 .ok_or_else(|| anyhow!("notify: incoming Bus channel already taken"))?;
-            let exit = loop {
+            loop {
                 tokio::select! {
                     biased;
                     changed = shutdown.changed() => {
@@ -1641,8 +1645,7 @@ impl Adapter for NotifyAdapter {
                         };
                     }
                 }
-            };
-            exit
+            }
         })
     }
 }
