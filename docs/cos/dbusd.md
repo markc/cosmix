@@ -105,6 +105,75 @@ as locals of `run` is the whole containment story. The crate's core
 feature and is unit-tested with a scripted fault adapter compiled only
 under `cfg(test)`.
 
-The first adapters (notify, tray, settings, then folding mprisd and
-powerd) land in later jobs; J1 ships the host, the control service and
-the supervision guarantees.
+The `tray` adapter (`src/adapters/tray.rs`, documented above) is the
+worked example; `notify` and `settings` follow, then folding mprisd and
+powerd.
+
+## The tray adapter
+
+Cosmix is the system-tray **host**. The `tray` adapter owns
+`org.kde.StatusNotifierWatcher` at `/StatusNotifierWatcher` on the
+desktop session bus and turns StatusNotifierItems into an ABP domain.
+If the watcher name is already owned when the adapter starts, the run
+**fails with a clear error rather than replacing the owner** — a human
+hands the name over by `dbusd.adapter.disable {name: "tray"}` on this
+side and `enable` once the other owner has released it.
+
+D-Bus side (inbound, per the SNI convention):
+
+- `RegisterStatusNotifierItem` accepts both forms: a bus name (item at
+  `/StatusNotifierItem`) or an object path (item on the caller's own
+  connection — resolved the way KDE/libappindicator do). Re-registering
+  a service replaces its item. Past 64 tracked items, registration is
+  refused with `LimitsExceeded`.
+- `RegisterStatusNotifierHost` records the host (cosmix itself already
+  registered as host at startup, which is what makes
+  `IsStatusNotifierHostRegistered` true the whole time the adapter
+  runs). `ProtocolVersion` is 0.
+- `RegisteredStatusNotifierItems` lists the bus names items registered
+  under — for path-form items, the caller's unique name.
+- `StatusNotifierItemRegistered` / `StatusNotifierItemUnregistered` /
+  `StatusNotifierHostRegistered` signals accompany every change.
+- Item lifetime is tracked by `NameOwnerChanged`: an item whose
+  connection vanishes (or whose registered bus name loses or moves its
+  owner) is removed. No polling anywhere.
+- Item properties (`Id`, `Title`, `Category`, `Status`, `IconName`,
+  `IconThemePath`, `AttentionIconName`, `ToolTip`, `Menu`,
+  `ItemIsMenu`, `IconPixmap`) are read once at registration and
+  refreshed on the item's `New*` signals. `Status` defaults to `Active`
+  when an item does not implement it. Every D-Bus call to an item runs
+  under a timeout (2 s verbs, 3 s menu reads, 3 s property refresh), so
+  a hung app surfaces as a refusal and never wedges the adapter.
+
+ABP side — the `tray` Bus service (mesh-open; no caller authorization):
+
+- Props `tray.i<n>.{id,title,category,status,icon_name,icon_theme_path,
+  attention_icon_name,tooltip,has_menu,item_is_menu,service,path}` plus
+  `tray.count`. Keys `i<n>` are ordinals, stable for an item's lifetime
+  and never reused; the leaves vanish with the item. `tooltip` is the
+  ToolTip title (the description rides `tray.list`); the full per-item
+  detail (tooltip text, menu path, pixmap size) is in `tray.list`.
+- `IconPixmap` pixels never ride the props: `tray.i<n>.pixmap_width`
+  and `pixmap_height` record the largest available size, and the
+  `tray.icon {id}` verb serves the pixels as
+  `{width, height, encoding: "argb32-network-order", argb_b64}` — the
+  raw SNI bytes (ARGB32, network byte order, row-major, no padding),
+  base64-encoded.
+- Verbs: `tray.list`; `tray.activate {id, x?, y?}`,
+  `tray.secondary_activate`, `tray.context_menu`, `tray.scroll {id,
+  delta, orientation}` (horizontal|vertical); `tray.icon {id}`;
+  `tray.menu {id}` → the item's com.canonical.dbusmenu layout
+  (`GetLayout(0, -1)`) as a JSON tree of
+  `{id, label, enabled, visible, type, toggle-type, toggle-state,
+  children}` nodes (absent `enabled`/`visible` are the dbusmenu default
+  `true`; the tree is capped at 512 nodes); `tray.menu.click {id, item}`
+  → dbusmenu `Event(item, "clicked")`. Unknown ids and bad arguments
+  are refusals (rc 10), never panics.
+- Events `tray.item.added` / `tray.item.changed` / `tray.item.removed`
+  plus `tray.props.changed` diffs, each stamped with a per-adapter-run
+  monotonic `event_seq` — a gap means events were dropped; re-read
+  `tray.props.get`. `tray.info` carries the current counter, the host
+  list and a bounded ring of recent events.
+
+Bounds: 64 items, 4096 chars per string, 1 MiB per stored pixmap
+(largest wins), 512 menu nodes per layout read.

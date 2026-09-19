@@ -17,7 +17,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
-use crate::adapter::{AdapterSpec, SessionBus};
+use crate::adapter::{AdapterSpec, SessionBus, adapter_spec};
+use crate::adapters::tray::TrayAdapter;
 use crate::state::AdapterEvent;
 use crate::supervisor::{
     ABORT_STOP, GRACEFUL_STOP, LifecycleCmd, StartedSupervisor, SupervisorHandle,
@@ -54,14 +55,13 @@ const _: () = assert!(
 // main.rs) — worst case ~55 s, with margin, never a sum that just
 // touches the unit limit.
 
-/// The built-in adapter registry. J1 ships the host only — adding an
-/// adapter later is one line here:
+/// The built-in adapter registry. Adding an adapter is one line here:
 ///
 /// ```ignore
 /// adapter_spec::<NotifyAdapter>(),
 /// ```
 pub fn builtin_adapters() -> Vec<AdapterSpec> {
-    Vec::new()
+    vec![adapter_spec::<TrayAdapter>()]
 }
 
 type LifecycleDone = (String, std::result::Result<(), tokio::task::JoinError>);

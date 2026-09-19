@@ -535,9 +535,72 @@ as locals of <code>run</code> is the whole containment story. The crate's core
 (supervisor, backoff, registry, config) builds without the <code>cosmix</code>
 feature and is unit-tested with a scripted fault adapter compiled only
 under <code>cfg(test)</code>.</p>
-<p>The first adapters (notify, tray, settings, then folding mprisd and
-powerd) land in later jobs; J1 ships the host, the control service and
-the supervision guarantees.</p></div></div>
+<p>The <code>tray</code> adapter (<code>src/adapters/tray.rs</code>, documented above) is the
+worked example; <code>notify</code> and <code>settings</code> follow, then folding mprisd and
+powerd.</p>
+<h2 id="the-tray-adapter">The tray adapter</h2>
+<p>Cosmix is the system-tray <strong>host</strong>. The <code>tray</code> adapter owns
+<code>org.kde.StatusNotifierWatcher</code> at <code>/StatusNotifierWatcher</code> on the
+desktop session bus and turns StatusNotifierItems into an ABP domain.
+If the watcher name is already owned when the adapter starts, the run
+<strong>fails with a clear error rather than replacing the owner</strong> — a human
+hands the name over by <code>dbusd.adapter.disable {name: "tray"}</code> on this
+side and <code>enable</code> once the other owner has released it.</p>
+<p>D-Bus side (inbound, per the SNI convention):</p>
+<ul>
+<li><code>RegisterStatusNotifierItem</code> accepts both forms: a bus name (item at
+<code>/StatusNotifierItem</code>) or an object path (item on the caller's own
+connection — resolved the way KDE/libappindicator do). Re-registering
+a service replaces its item. Past 64 tracked items, registration is
+refused with <code>LimitsExceeded</code>.</li>
+<li><code>RegisterStatusNotifierHost</code> records the host (cosmix itself already
+registered as host at startup, which is what makes
+<code>IsStatusNotifierHostRegistered</code> true the whole time the adapter
+runs). <code>ProtocolVersion</code> is 0.</li>
+<li><code>RegisteredStatusNotifierItems</code> lists the bus names items registered
+under — for path-form items, the caller's unique name.</li>
+<li><code>StatusNotifierItemRegistered</code> / <code>StatusNotifierItemUnregistered</code> /
+<code>StatusNotifierHostRegistered</code> signals accompany every change.</li>
+<li>Item lifetime is tracked by <code>NameOwnerChanged</code>: an item whose
+connection vanishes (or whose registered bus name loses or moves its
+owner) is removed. No polling anywhere.</li>
+<li>Item properties (<code>Id</code>, <code>Title</code>, <code>Category</code>, <code>Status</code>, <code>IconName</code>,
+<code>IconThemePath</code>, <code>AttentionIconName</code>, <code>ToolTip</code>, <code>Menu</code>,
+<code>ItemIsMenu</code>, <code>IconPixmap</code>) are read once at registration and
+refreshed on the item's <code>New*</code> signals. <code>Status</code> defaults to <code>Active</code>
+when an item does not implement it. Every D-Bus call to an item runs
+under a timeout (2 s verbs, 3 s menu reads, 3 s property refresh), so
+a hung app surfaces as a refusal and never wedges the adapter.</li>
+</ul>
+<p>ABP side — the <code>tray</code> Bus service (mesh-open; no caller authorization):</p>
+<ul>
+<li>Props <code>tray.i&lt;n&gt;.{id,title,category,status,icon_name,icon_theme_path, attention_icon_name,tooltip,has_menu,item_is_menu,service,path}</code> plus
+<code>tray.count</code>. Keys <code>i&lt;n&gt;</code> are ordinals, stable for an item's lifetime
+and never reused; the leaves vanish with the item. <code>tooltip</code> is the
+ToolTip title (the description rides <code>tray.list</code>); the full per-item
+detail (tooltip text, menu path, pixmap size) is in <code>tray.list</code>.</li>
+<li><code>IconPixmap</code> pixels never ride the props: <code>tray.i&lt;n&gt;.pixmap_width</code>
+and <code>pixmap_height</code> record the largest available size, and the
+<code>tray.icon {id}</code> verb serves the pixels as
+<code>{width, height, encoding: "argb32-network-order", argb_b64}</code> — the
+raw SNI bytes (ARGB32, network byte order, row-major, no padding),
+base64-encoded.</li>
+<li>Verbs: <code>tray.list</code>; <code>tray.activate {id, x?, y?}</code>,
+<code>tray.secondary_activate</code>, <code>tray.context_menu</code>, <code>tray.scroll {id, delta, orientation}</code> (horizontal|vertical); <code>tray.icon {id}</code>;
+<code>tray.menu {id}</code> → the item's com.canonical.dbusmenu layout
+(<code>GetLayout(0, -1)</code>) as a JSON tree of
+<code>{id, label, enabled, visible, type, toggle-type, toggle-state, children}</code> nodes (absent <code>enabled</code>/<code>visible</code> are the dbusmenu default
+<code>true</code>; the tree is capped at 512 nodes); <code>tray.menu.click {id, item}</code>
+→ dbusmenu <code>Event(item, "clicked")</code>. Unknown ids and bad arguments
+are refusals (rc 10), never panics.</li>
+<li>Events <code>tray.item.added</code> / <code>tray.item.changed</code> / <code>tray.item.removed</code>
+plus <code>tray.props.changed</code> diffs, each stamped with a per-adapter-run
+monotonic <code>event_seq</code> — a gap means events were dropped; re-read
+<code>tray.props.get</code>. <code>tray.info</code> carries the current counter, the host
+list and a bounded ring of recent events.</li>
+</ul>
+<p>Bounds: 64 items, 4096 chars per string, 1 MiB per stored pixmap
+(largest wins), 512 menu nodes per layout read.</p></div></div>
     </div>
 
 </main>
