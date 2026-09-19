@@ -3121,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.89.0"
+version = "0.89.1"
 dependencies = [
  "futures-util",
  "indexmap",

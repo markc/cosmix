@@ -2938,6 +2938,17 @@ pub fn eval_expr_string(
     policy: Option<Rc<dyn CapabilityPolicy>>,
     limits: EvalLimits,
 ) -> MixResult<Value> {
+    let expr = checked_mode_expr(source)?;
+
+    eval_checked_expr(&expr, globals, policy, limits)
+}
+
+/// Check the single-expression rule and static deny/depth walk without execution.
+pub fn expr_mode_check(source: &str) -> MixResult<()> {
+    checked_mode_expr(source).map(|_| ())
+}
+
+fn checked_mode_expr(source: &str) -> MixResult<Expr> {
     let mut lexer = crate::lexer::Lexer::new(source);
     let tokens = lexer.tokenize()?;
     let mut parser = crate::parser::Parser::new(tokens, source);
@@ -2967,7 +2978,15 @@ pub fn eval_expr_string(
     };
 
     expr_mode_deny_walk(expr, 0)?;
+    Ok(expr.clone())
+}
 
+fn eval_checked_expr(
+    expr: &Expr,
+    globals: &[(&str, Value)],
+    policy: Option<Rc<dyn CapabilityPolicy>>,
+    limits: EvalLimits,
+) -> MixResult<Value> {
     let mut eval = Evaluator::new();
     if let Some(policy) = policy {
         eval.set_capability_policy(policy);

@@ -10,6 +10,12 @@ eval limits, rejecting everything that isn't a pure expression shape
 **before execution**. It landed in lib-mix 0.89.0 together with the
 `send`/`emit` capability-gate fix.
 
+`expr_mode_check(source) -> MixResult<()>` (lib-mix 0.89.1) performs the same
+single-expression, static deny and depth checks without evaluation. Hosts
+can reject invalid bindings at compile time without constructing an evaluator
+or running builtins. Runtime errors such as division by zero remain evaluation
+errors; this check does not predict values or enforce a host capability policy.
+
 ```rust
 use cosmix_lib_mix::{
     eval_expr_string, CategoryAllowList, EvalLimits, IndexMap, Value,

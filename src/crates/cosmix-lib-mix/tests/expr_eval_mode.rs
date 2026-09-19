@@ -9,6 +9,20 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[test]
+fn static_check_matches_expression_mode_without_evaluation() {
+    use cosmix_mix::expr_mode_check;
+    for source in ["$model.x", "1 / 0", "true ? 1 : $missing"] {
+        expr_mode_check(source).unwrap();
+    }
+    for source in ["(function ($x) = 1)", "sleep(1)", "$(id)", "$x = 1", "1; 2",
+        "true ? 1 : sleep(1)"] {
+        assert!(expr_mode_check(source).is_err(), "{source}");
+    }
+    let deep = std::iter::repeat_n("'a'", MAX_EXPR_DEPTH + 2).collect::<Vec<_>>().join(" .. ");
+    assert!(expr_mode_check(&deep).unwrap_err().to_string().contains("MAX_EXPR_DEPTH"));
+}
+
 use cosmix_mix::evaluator::{BusFuture, BusHandler, Evaluator, IncomingEvent, SharedBuf};
 use cosmix_mix::lexer::Lexer;
 use cosmix_mix::parser::Parser;

@@ -3,11 +3,20 @@ use cosmix_mix::ast::{Expr, StmtKind};
 use cosmix_mix::lexer::Lexer;
 use cosmix_mix::parser::Parser;
 use cosmix_mix::value::Value;
-use cosmix_mix::{eval_expr_string, CategoryAllowList, EvalLimits, MAX_EXPR_DEPTH};
+use cosmix_mix::{eval_expr_string, expr_mode_check, CategoryAllowList, EvalLimits};
+use cosmix_mix::token::{StringPart, Token};
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub(crate) const EVALUATION_BUDGET: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static COMPILE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static EVALUATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledBinding {
@@ -19,8 +28,8 @@ pub struct CompiledBinding {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BindingSet {
     pub bindings: BTreeMap<String, CompiledBinding>,
-    pub model: JsonValue,
     pub order: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -54,10 +63,12 @@ pub(crate) fn escaped_literal(value: &JsonValue) -> Option<JsonValue> {
 }
 
 pub fn compile(doc: &SceneDocument) -> Result<BindingSet, Vec<Diagnostic>> {
+    #[cfg(test)]
+    COMPILE_COUNT.with(|n| n.set(n.get() + 1));
     let mut set = BindingSet {
         bindings: BTreeMap::new(),
-        model: doc.model.clone().unwrap_or_else(|| json!({})),
         order: Vec::new(),
+        diagnostics: Vec::new(),
     };
     let mut errors = Vec::new();
     let templates = template_ids(doc);
@@ -76,9 +87,21 @@ pub fn compile(doc: &SceneDocument) -> Result<BindingSet, Vec<Diagnostic>> {
                 ));
                 continue;
             }
-            let parsed = parse_expression(&source);
-            let Ok(expr) = parsed else {
-                let code = if source.trim_start().starts_with("send ") {
+            if let Err(error) = expr_mode_check(&source) {
+                let message = error.to_string();
+                // A leading anonymous function is parsed as a statement by
+                // Mix; classify this denied construct from tokens, not text.
+                let function = Lexer::new(&source).tokenize().is_ok_and(|tokens| {
+                    tokens.first().is_some_and(|t| matches!(t.token, Token::Function))
+                });
+                let code = if message.contains("not allowed in expression mode")
+                    || function
+                    || message.contains("not an expression: send")
+                    || message.contains("not an expression: sh")
+                    || message.contains("not an expression: for")
+                    || message.contains("not an expression: while")
+                    || message.contains("not an expression: loop")
+                    || message.contains("not an expression: print") {
                     "binding-policy"
                 } else {
                     "invalid-binding"
@@ -86,10 +109,11 @@ pub fn compile(doc: &SceneDocument) -> Result<BindingSet, Vec<Diagnostic>> {
                 errors.push(Diagnostic::error(
                     code,
                     node.line,
-                    format!("invalid binding on {path}"),
+                    format!("invalid binding on {path}: {message}"),
                 ));
                 continue;
             };
+            let expr = parse_expression(&source).expect("static check accepted expression");
             let mut deps = BTreeSet::new();
             let mut reads_item = false;
             let mut bad_root = false;
@@ -115,13 +139,6 @@ pub fn compile(doc: &SceneDocument) -> Result<BindingSet, Vec<Diagnostic>> {
                     format!("binding on {path} calls time()"),
                 ));
             }
-            if expr_depth(&expr, 0) > MAX_EXPR_DEPTH {
-                errors.push(Diagnostic::error(
-                    "invalid-binding",
-                    node.line,
-                    format!("binding on {path} is too deep"),
-                ));
-            }
             set.bindings.insert(
                 path,
                 CompiledBinding {
@@ -135,6 +152,7 @@ pub fn compile(doc: &SceneDocument) -> Result<BindingSet, Vec<Diagnostic>> {
     if errors.iter().any(|d| d.severity == Severity::Error) {
         Err(errors)
     } else {
+        set.diagnostics = errors;
         Ok(set)
     }
 }
@@ -145,6 +163,9 @@ pub fn reevaluate(
     path: &str,
     value: &JsonValue,
 ) -> Result<ReEval, Vec<Diagnostic>> {
+    if serde_json::to_vec(value).map_or(true, |v| v.len() > crate::MAX_DOCUMENT_BYTES) {
+        return Err(vec![Diagnostic::error("model-path", 1, "patch value too large")]);
+    }
     let parts: Vec<_> = path.split('.').collect();
     if parts.is_empty() || parts.iter().any(|p| p.is_empty()) || parts[0] != "model" {
         return Err(vec![Diagnostic::error(
@@ -164,6 +185,7 @@ pub fn reevaluate(
     let old = tree.clone();
     let mut diagnostics = Vec::new();
     let mut evaluated = Vec::new();
+    let started = Instant::now();
     for path in &set.order {
         let Some(binding) = set.bindings.get(path) else {
             continue;
@@ -176,30 +198,24 @@ pub fn reevaluate(
         {
             continue;
         }
-        evaluated.push(path.clone());
         let Some((id, port)) = path.split_once('.') else {
             continue;
         };
         let Some(node) = next.nodes.get_mut(id) else {
             continue;
         };
-        let authored = node.ports.get(port).cloned();
-        let result = evaluate(binding, &next.model, None)
-            .map_err(|_| "binding-eval".to_string())
+        let result = evaluate_budgeted(binding, &next.model, None, started, || evaluated.push(path.clone()))
             .and_then(|v| coerce_port(&v, crate::port_for(&node.family, port)));
         match result {
             Ok(v) => {
-                node.ports.insert(port.into(), v);
+                set_port(&mut node.ports, port, v);
             }
             Err(code) => {
                 diagnostics.push(Diagnostic::warning(
-                    code.clone(),
+                    if code == "binding-type" { "binding-type" } else { "binding-eval" },
                     node.line,
-                    format!("binding evaluation failed for {path}"),
+                    format!("binding evaluation failed for {path}: {code}"),
                 ));
-                if let Some(v) = authored {
-                    node.ports.insert(port.into(), v);
-                }
             }
         }
     }
@@ -213,33 +229,29 @@ pub fn reevaluate(
 }
 
 pub fn template_instantiate(
+    id: &str,
     node: &Node,
     set: &BindingSet,
+    model: &JsonValue,
     item: &JsonValue,
 ) -> Result<Node, Diagnostic> {
     let mut out = node.clone();
+    let started = Instant::now();
     for (path, binding) in &set.bindings {
-        let Some((_id, port)) = path.split_once('.') else {
+        let Some(port) = path.strip_prefix(&format!("{id}.")) else {
             continue;
         };
-        if !binding.reads_item {
-            continue;
-        }
-        if !node.ports.contains_key(port) {
-            continue;
-        }
-        let value = evaluate(binding, &set.model, Some(item))
+        let value = evaluate_budgeted(binding, model, Some(item), started, || {})
             .and_then(|v| coerce_port(&v, crate::port_for(&node.family, port)))
             .map_err(|code| {
                 Diagnostic::warning(
-                    code,
+                    if code == "binding-type" { "binding-type" } else { "binding-eval" },
                     node.line,
-                    format!("template binding failed for {path}"),
+                    format!("template binding failed for {path}: {code}"),
                 )
             })?;
-        out.ports.insert(port.into(), value);
+        set_port(&mut out.ports, port, value);
     }
-    out.ports.shift_remove("__model");
     Ok(out)
 }
 
@@ -263,22 +275,19 @@ fn parse_expression(source: &str) -> Result<Expr, cosmix_mix::MixError> {
     }
 }
 
-pub(crate) fn evaluate(
+pub(crate) fn evaluate_budgeted(
     binding: &CompiledBinding,
     model: &JsonValue,
     item: Option<&JsonValue>,
+    started: Instant,
+    on_evaluate: impl FnOnce(),
 ) -> Result<Value, String> {
-    if binding
-        .source
-        .chars()
-        .any(|c| matches!(c, '+' | '-' | '*' | '/'))
-        && binding
-            .deps
-            .iter()
-            .any(|dep| lookup_path(model, dep).is_none())
-    {
-        return Err("binding-eval".into());
-    }
+    let remaining = EVALUATION_BUDGET.checked_sub(started.elapsed())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| "evaluation budget exhausted".to_string())?;
+    on_evaluate();
+    #[cfg(test)]
+    EVALUATE_COUNT.with(|n| n.set(n.get() + 1));
     let mut globals = vec![("model", to_mix(model))];
     if let Some(item) = item {
         globals.push(("item", to_mix(item)));
@@ -291,33 +300,19 @@ pub(crate) fn evaluate(
             max_string_len: Some(1 << 20),
             max_list_len: Some(MAX_ROWS),
             max_map_len: Some(1024),
-            time_limit: Some(Duration::from_millis(50)),
+            time_limit: Some(remaining.min(Duration::from_millis(50))),
             ..Default::default()
         },
     )
     .map_err(|e| e.to_string())
 }
 
-fn lookup_path<'a>(model: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
-    let mut value = model;
-    for part in path.strip_prefix("model.").unwrap_or("").split('.') {
-        if part.is_empty() {
-            return Some(value);
-        }
-        value = value.get(part)?;
-    }
-    Some(value)
-}
-
-pub(crate) fn coerce_port(value: &Value, port: Option<Port>) -> Result<JsonValue, String> {
+pub(crate) fn coerce_port(value: &Value, port: Option<Port>) -> Result<Option<JsonValue>, String> {
     let Some(port) = port else {
         return Err("binding-type".into());
     };
     if matches!(value, Value::Nil) {
-        return Ok(port
-            .default
-            .map(|x| serde_json::from_str(x).unwrap_or(JsonValue::Null))
-            .unwrap_or(JsonValue::Null));
+        return Ok(port.default.and_then(|x| serde_json::from_str(x).ok()).map(crate::normalize_number));
     }
     let ok = matches!(
         (port.ty, value),
@@ -336,7 +331,7 @@ pub(crate) fn coerce_port(value: &Value, port: Option<Port>) -> Result<JsonValue
     if ds.iter().any(|d| d.severity == Severity::Error) {
         Err("binding-type".into())
     } else {
-        Ok(crate::normalize_number(j))
+        Ok(Some(crate::normalize_number(j)))
     }
 }
 
@@ -376,9 +371,18 @@ pub(crate) fn evaluate_for_resolve(
     binding: &CompiledBinding,
     model: &JsonValue,
     port: Port,
-) -> Result<JsonValue, String> {
-    let value = evaluate(binding, model, None)?;
+    started: Instant,
+) -> Result<Option<JsonValue>, String> {
+    let value = evaluate_budgeted(binding, model, None, started, || {})?;
     coerce_port(&value, Some(port))
+}
+
+pub(crate) fn set_port(ports: &mut indexmap::IndexMap<String, JsonValue>, port: &str, value: Option<JsonValue>) {
+    if let Some(value) = value {
+        ports.insert(port.into(), value);
+    } else {
+        ports.shift_remove(port);
+    }
 }
 
 fn apply_model_patch(model: &mut JsonValue, parts: &[&str], value: &JsonValue) -> bool {
@@ -393,6 +397,9 @@ fn apply_model_patch(model: &mut JsonValue, parts: &[&str], value: &JsonValue) -
         let Some(map) = current.as_object_mut() else {
             return false;
         };
+        if value.is_null() && !map.contains_key(*part) {
+            return true;
+        }
         current = map.entry(*part).or_insert_with(|| json!({}));
         if !current.is_object() {
             return false;
@@ -414,13 +421,16 @@ fn related(dep: &str, patch: &str) -> bool {
         || dep.starts_with(&(patch.to_owned() + "."))
         || patch.starts_with(&(dep.to_owned() + "."))
 }
-fn template_ids(doc: &SceneDocument) -> BTreeSet<String> {
+pub(crate) fn template_ids(doc: &SceneDocument) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     fn visit(id: &str, doc: &SceneDocument, ids: &mut BTreeSet<String>) {
         if !ids.insert(id.into()) {
             return;
         }
         if let Some(node) = doc.nodes.get(id) {
+            if node.widget == "list" && let Some(row) = node.ports.get("row").and_then(JsonValue::as_str) {
+                visit(row, doc, ids);
+            }
             if let Some(children) = node.ports.get("children").and_then(JsonValue::as_array) {
                 for child in children.iter().filter_map(JsonValue::as_str) {
                     visit(child, doc, ids);
@@ -562,7 +572,35 @@ fn walk_expr(
                 }
             }
         },
-        _ => {}
+        Expr::InterpolatedString(parts) | Expr::Heredoc(parts) => {
+            for part in parts {
+                match part {
+                    StringPart::Literal(_) => {}
+                    StringPart::EnvVar(_) | StringPart::CommandSub(_) => *bad_root = true,
+                    StringPart::Variable(spec) => {
+                        // lib-mix's split_interp_coalesce is private. The first
+                        // ?? / ?: separates the dotted head from a Mix payload.
+                        let split = spec.as_bytes().windows(2).position(|w| w == b"??" || w == b"?:");
+                        let head = split.map_or(spec.as_str(), |i| spec[..i].trim());
+                        match head.split('.').next() {
+                            Some("model") => { deps.insert(head.into()); }
+                            Some("item") => *reads_item = true,
+                            _ => *bad_root = true,
+                        }
+                        if let Some(i) = split {
+                            let payload = spec[i + 2..].trim();
+                            if !payload.is_empty() {
+                                let expr = parse_expression(payload).expect("static check accepted interpolation");
+                                walk_expr(&expr, deps, reads_item, bad_root, nondeterministic);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Expr::CommandSub(_) => *bad_root = true,
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::EscapedQuoteStringLiteral(_)
+        | Expr::BoolLiteral(_) | Expr::NilLiteral => {}
     }
 }
 fn walk_stmt(
@@ -572,8 +610,61 @@ fn walk_stmt(
     b: &mut bool,
     n: &mut bool,
 ) {
-    if let StmtKind::Expression(e) = &s.kind {
-        walk_expr(e, d, i, b, n);
+    match &s.kind {
+        StmtKind::Expression(e) | StmtKind::Assignment { value: e, .. }
+        | StmtKind::FieldAssignment { value: e, .. } | StmtKind::Die(e)
+        | StmtKind::Parse { source: e, .. } | StmtKind::BreakIf(e, _)
+        | StmtKind::ContinueIf(e, _) => walk_expr(e, d, i, b, n),
+        StmtKind::IndexAssignment { index, value, .. } => {
+            walk_expr(index, d, i, b, n);
+            walk_expr(value, d, i, b, n);
+        }
+        StmtKind::PathAssignment { path, value, .. } => {
+            for seg in path {
+                if let cosmix_mix::ast::PathSeg::Index(e) = seg {
+                    walk_expr(e, d, i, b, n);
+                }
+            }
+            walk_expr(value, d, i, b, n);
+        }
+        StmtKind::If { condition, then_body, else_ifs, else_body } => {
+            walk_expr(condition, d, i, b, n);
+            for s in then_body { walk_stmt(s, d, i, b, n); }
+            for (condition, body) in else_ifs {
+                walk_expr(condition, d, i, b, n);
+                for s in body { walk_stmt(s, d, i, b, n); }
+            }
+            if let Some(body) = else_body {
+                for s in body { walk_stmt(s, d, i, b, n); }
+            }
+        }
+        StmtKind::Return(value) => {
+            if let Some(e) = value { walk_expr(e, d, i, b, n); }
+        }
+        StmtKind::TryCatch { try_body, catch, finally_body } => {
+            for s in try_body { walk_stmt(s, d, i, b, n); }
+            if let Some(catch) = catch {
+                for s in &catch.body { walk_stmt(s, d, i, b, n); }
+            }
+            if let Some(body) = finally_body {
+                for s in body { walk_stmt(s, d, i, b, n); }
+            }
+        }
+        StmtKind::Alias { name, command } => {
+            for e in name.iter().chain(command.iter()) { walk_expr(e, d, i, b, n); }
+        }
+        StmtKind::Chain { left, right, .. } => {
+            walk_stmt(left, d, i, b, n);
+            walk_stmt(right, d, i, b, n);
+        }
+        StmtKind::Break(_) | StmtKind::Continue(_) => {}
+        // These are rejected by expr_mode_check before this walk.
+        StmtKind::FunctionDef { .. } | StmtKind::Send { .. } | StmtKind::Emit { .. }
+        | StmtKind::Sh { .. } | StmtKind::On { .. } | StmtKind::Source { .. }
+        | StmtKind::Include { .. } | StmtKind::PipeToExternal { .. }
+        | StmtKind::For { .. } | StmtKind::ForEach { .. } | StmtKind::While { .. }
+        | StmtKind::Loop { .. } | StmtKind::Select { .. } | StmtKind::Address { .. }
+        | StmtKind::Export { .. } | StmtKind::Print { .. } => *b = true,
     }
 }
 fn walk_access_indices(
@@ -589,29 +680,26 @@ fn walk_access_indices(
             walk_expr(index, d, i, b, n);
         }
         Expr::FieldAccess { object, .. } => walk_access_indices(object, d, i, b, n),
-        _ => {}
+        Expr::Variable(v) if v == "model" || v == "item" => {}
+        _ => walk_expr(expr, d, i, b, n),
     }
 }
 fn access_path(expr: &Expr, root: &str) -> Option<String> {
     match expr {
         Expr::Variable(v) if v == root => Some(root.into()),
         Expr::FieldAccess { object, field } => {
-            access_path(object, root).map(|p| format!("{p}.{field}"))
+            access_path(object, root).map(|p| {
+                if contains_index(object) { p } else { format!("{p}.{field}") }
+            })
         }
         Expr::Index { object, .. } => access_path(object, root),
         _ => None,
     }
 }
-fn expr_depth(expr: &Expr, depth: usize) -> usize {
-    let d = depth + 1;
+fn contains_index(expr: &Expr) -> bool {
     match expr {
-        Expr::BinaryOp { left, right, .. } => d.max(expr_depth(left, d)).max(expr_depth(right, d)),
-        Expr::UnaryOp { operand, .. } => d.max(expr_depth(operand, d)),
-        Expr::FieldAccess { object, .. } | Expr::Index { object, .. } => {
-            d.max(expr_depth(object, d))
-        }
-        Expr::ListLiteral(xs) => xs.iter().map(|x| expr_depth(x, d)).max().unwrap_or(d),
-        Expr::MapLiteral(xs) => xs.iter().map(|(_, x)| expr_depth(x, d)).max().unwrap_or(d),
-        _ => d,
+        Expr::Index { .. } => true,
+        Expr::FieldAccess { object, .. } => contains_index(object),
+        _ => false,
     }
 }
