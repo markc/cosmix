@@ -110,6 +110,34 @@ async fn pure_policy_denies_send_and_emit() {
     assert_eq!(bus.emitted.borrow().len(), 1, "emit reached the handler");
 }
 
+/// The THIRD Bus-authority path: an address block's body lines desugar
+/// to sends via `address_block_send`, not through `exec_send` — so the
+/// broker-form gate alone leaves it open. Same red/green shape: deny-all
+/// must deny by class before any dispatch; no policy + a handler still
+/// delivers.
+#[tokio::test]
+async fn pure_policy_denies_address_block_sends() {
+    // Deny-all policy, no handler: the implicit send must raise
+    // CAPABILITY_DENIED, not degrade to the rc=-3 no-handler no-op.
+    let err = run_with("address \"x\"\nverbname \"y\"\nend\n", |e| {
+        e.set_capability_policy(Rc::new(CategoryAllowList::new(&[])));
+    })
+    .await
+    .expect_err("deny-all policy must deny address-block implicit sends");
+    assert!(err.contains("capability denied"), "got: {err}");
+    assert!(err.contains("Bus"), "got: {err}");
+
+    // Handler registered, NO policy: the implicit send dispatches.
+    let bus = Rc::new(RecordingBus::default());
+    let b = Rc::clone(&bus);
+    run_with("address \"x\"\nverbname \"y\"\nend\n", move |e| {
+        e.set_bus_handler(b)
+    })
+    .await
+    .expect("address-block send dispatches with no policy installed");
+    assert_eq!(bus.sent.borrow().len(), 1, "implicit send reached the handler");
+}
+
 /// The deny-all policy denies the impure builtin classes — pins the
 /// existing table classification the expression mode leans on.
 #[tokio::test]

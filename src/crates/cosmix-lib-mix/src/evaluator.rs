@@ -13423,6 +13423,11 @@ impl Evaluator {
     /// the evaluated object as the leading arg, so it rides along as
     /// `_0` exactly as the old UFCS desugar did).
     async fn address_block_send(&mut self, name: &str, eval_args: Vec<Value>) -> MixResult<Value> {
+        // The third Bus-authority path (after exec_send/exec_emit): an
+        // address block's body lines desugar to sends HERE, not through
+        // exec_send — so this site carries the same class gate the broker
+        // forms got in 0.89.0, before any argument or target work.
+        self.check_capability_class(crate::builtins::CapabilityClass::Bus, "address send")?;
         let target = self.ctx.address_stack.last().unwrap().clone();
         // Build args map from positional args
         let mut map = IndexMap::new();
