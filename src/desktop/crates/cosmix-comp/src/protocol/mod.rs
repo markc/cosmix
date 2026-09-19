@@ -1022,6 +1022,7 @@ enum ProtocolCommand {
     },
     /// A backend wired its frame reporter: advertise `wp_presentation`.
     EnablePresentation,
+    OcclusionConnect(crate::occlusion::Bridge),
     CapturePixels(CapturePixels),
     CaptureDmabufComplete(CaptureDmabufComplete),
     CaptureDmabufFailed(CaptureDmabufFailed),
@@ -1557,6 +1558,7 @@ impl SecurityPresentationReporter {
 #[derive(Clone, bevy::prelude::Resource)]
 pub(crate) struct FramePresentationReporter {
     commands: CommandSender<ProtocolCommand>,
+    pub(crate) occlusion: crate::occlusion::Bridge,
 }
 
 impl FramePresentationReporter {
@@ -1599,7 +1601,13 @@ impl FramePresentationReporter {
     #[cfg(test)]
     pub(crate) fn test_channel() -> (Self, PresentationCommandProbe) {
         let (commands, source) = channel::channel();
-        (Self { commands }, PresentationCommandProbe(source))
+        (
+            Self {
+                commands,
+                occlusion: Default::default(),
+            },
+            PresentationCommandProbe(source),
+        )
     }
 
     /// A DMA-BUF import failed for good (see `frame_content::Refusal`).
@@ -2336,6 +2344,10 @@ impl WaylandRuntime {
     /// The backend's frame reporter. Asking for it is what advertises
     /// `wp_presentation`: the global never exists without a reporter.
     pub(crate) fn frame_presentation_reporter(&self) -> FramePresentationReporter {
+        let occlusion = crate::occlusion::Bridge::default();
+        let _ = self
+            .commands
+            .send(ProtocolCommand::OcclusionConnect(occlusion.clone()));
         if self
             .commands
             .send(ProtocolCommand::EnablePresentation)
@@ -2345,6 +2357,7 @@ impl WaylandRuntime {
         }
         FramePresentationReporter {
             commands: self.commands.clone(),
+            occlusion,
         }
     }
 
@@ -3221,6 +3234,7 @@ impl ProtocolServer {
             fractional_scale_state,
             viewporter_state,
             presentation: presentation::PresentationRuntime::default(),
+            occlusion: occlusion::OcclusionRuntime::default(),
             #[cfg(feature = "xwayland")]
             xwayland_shell_state,
             #[cfg(feature = "xwayland")]
@@ -3479,7 +3493,9 @@ impl ProtocolServer {
                     }
                     ChannelEvent::Msg(PortCommand::Input(request)) => {
                         if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
-                            state.pending_port_controls.push(PortControl::Input(request));
+                            state
+                                .pending_port_controls
+                                .push(PortControl::Input(request));
                         }
                     }
                     ChannelEvent::Msg(PortCommand::Long(request)) => {
@@ -3615,6 +3631,10 @@ impl ProtocolServer {
                 }
                 ChannelEvent::Msg(ProtocolCommand::EnablePresentation) => {
                     state.enable_presentation();
+                }
+                ChannelEvent::Msg(ProtocolCommand::OcclusionConnect(bridge)) => {
+                    state.occlusion.bridge = bridge;
+                    state.refresh_occlusion();
                 }
                 ChannelEvent::Msg(ProtocolCommand::CapturePixels(pixels)) => {
                     state.capture_pixels_ready(pixels);
@@ -3903,6 +3923,7 @@ impl ProtocolServer {
         self.state.reconcile_subsurface_roles();
         self.state.backend.maintain_after_protocol_dispatch();
         self.state.popup_manager.cleanup();
+        self.state.refresh_occlusion();
         #[cfg(feature = "bus")]
         port_observation::service_observations(&mut self.state);
         #[cfg(feature = "bus")]
@@ -6056,6 +6077,7 @@ struct WaylandState {
     #[allow(dead_code)]
     viewporter_state: ViewporterState,
     presentation: presentation::PresentationRuntime,
+    occlusion: occlusion::OcclusionRuntime,
     #[cfg(feature = "xwayland")]
     xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
     #[cfg(feature = "xwayland")]
@@ -8653,6 +8675,8 @@ impl WaylandState {
         }
 
         let frame_time = monotonic_millis();
+        self.refresh_occlusion();
+        self.count_occlusion_opportunities();
         // Once per frame, not once per surface: see `workspaces::on_workspace`.
         let current_workspace = self.workspace_current();
         let mut delivered = self
@@ -8662,6 +8686,7 @@ impl WaylandState {
                 !matches!(record.role, SurfaceRole::Dormant(_))
                     && self.surface_is_session_presentable(record)
                     && record.role.parent_surface().is_none()
+                    && !self.occlusion.is_occluded(record.id)
                     && !self.surface_belongs_to_hidden_toplevel(
                         record.role.wl_surface(),
                         current_workspace,
@@ -15925,11 +15950,12 @@ mod explicit_sync;
 mod focus;
 mod handlers;
 mod input;
+#[cfg(feature = "bus")]
+mod input_injection;
+mod occlusion;
 pub(crate) mod presentation;
 pub(crate) mod presentation_stats;
 mod release_use;
-#[cfg(feature = "bus")]
-mod input_injection;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
 mod window_switching;

@@ -177,7 +177,7 @@ pub(crate) struct DecorationEntities {
     shadow: Entity,
     shadow_material: Handle<ShadowMaterial>,
     frame: Entity,
-    frame_material: Handle<ChromeFrameMaterial>,
+    pub(crate) frame_material: Handle<ChromeFrameMaterial>,
     title: Entity,
     buttons: Vec<(CaptionButton, Entity)>,
     glyphs: Vec<(CaptionButton, usize, Entity)>,
@@ -736,6 +736,7 @@ fn spawn_static_decoration(
         world
             .resource_mut::<Assets<ChromeFrameMaterial>>()
             .add(ChromeFrameMaterial {
+                square_opaque: false,
                 size: Vec2::ONE,
                 corner_radius: 0.0,
                 titlebar_bottom: 0.0,
@@ -959,6 +960,7 @@ fn update_static_decoration(
         theme.titlebar_fill(focus),
         theme.colors.titlebar_divider,
         theme.border(focus),
+        toplevel.committed_maximized || toplevel.committed_fullscreen,
     );
     let projected_title =
         projected_child_rect(chrome.title_slot, outer_origin, root_origin, scale120);
@@ -1161,6 +1163,7 @@ fn update_chrome_frame(
     titlebar_color: Srgba,
     divider_color: Srgba,
     border_color: Srgba,
+    square_opaque: bool,
 ) {
     let frame = projected_child_rect(chrome.window, outer_origin, root_origin, scale120);
     set_transform_if_changed(
@@ -1193,6 +1196,7 @@ fn update_chrome_frame(
     let projected_metric =
         |logical: f32| (logical.max(0.0) * scale120 as f32 / 120.0).round() * physical_to_logical;
     let desired = ChromeFrameMaterial {
+        square_opaque,
         size: frame.size,
         corner_radius: projected_metric(corner_radius)
             .min(frame.size.x / 2.0)
@@ -1209,9 +1213,18 @@ fn update_chrome_frame(
             window.x + window.width - titlebar.x - titlebar.width,
             window.y + window.height - content.y - content.height,
         ),
-        titlebar_color: bevy_color(titlebar_color),
-        divider_color: bevy_color(divider_color),
-        border_color: bevy_color(border_color),
+        titlebar_color: bevy_color(Srgba {
+            a: if square_opaque { 1.0 } else { titlebar_color.a },
+            ..titlebar_color
+        }),
+        divider_color: bevy_color(Srgba {
+            a: if square_opaque { 1.0 } else { divider_color.a },
+            ..divider_color
+        }),
+        border_color: bevy_color(Srgba {
+            a: if square_opaque { 1.0 } else { border_color.a },
+            ..border_color
+        }),
     };
     let mut materials = world.resource_mut::<Assets<ChromeFrameMaterial>>();
     if materials.get(&entities.frame_material) != Some(&desired) {

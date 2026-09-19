@@ -1238,13 +1238,8 @@ fn service_surface_edges(state: &mut WaylandState) {
         if old.mapped == final_mapped && !replaced {
             continue;
         }
-        let previous = replaced.then(|| {
-            (
-                old.role.clone(),
-                old.foreign_id.clone(),
-                old.window.clone(),
-            )
-        });
+        let previous =
+            replaced.then(|| (old.role.clone(), old.foreign_id.clone(), old.window.clone()));
         let role = if final_mapped {
             final_record
                 .map(|record| record.role.kind().to_string())
@@ -1846,6 +1841,34 @@ fn diff_output_row(
     }
 }
 
+fn diff_occlusion(
+    prefix: &str,
+    old: &crate::occlusion::Props,
+    new: &crate::occlusion::Props,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    for (leaf, old, new) in [
+        (
+            "occluded",
+            PropValue::Bool(old.occluded),
+            PropValue::Bool(new.occluded),
+        ),
+        (
+            "occlusion_reason",
+            prop_str(old.occlusion_reason),
+            prop_str(new.occlusion_reason),
+        ),
+        (
+            "occlusion_revision",
+            PropValue::U64(old.occlusion_revision),
+            PropValue::U64(new.occlusion_revision),
+        ),
+    ] {
+        queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
+    }
+}
+
 fn diff_surface_row(
     prefix: &str,
     old: Option<&SurfaceSnapshot>,
@@ -1853,6 +1876,9 @@ fn diff_surface_row(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
+    if let (Some(old), Some(new)) = (old, new) {
+        diff_occlusion(prefix, &old.occlusion, &new.occlusion, cause, pending);
+    }
     let (old, new) = match (old, new) {
         (None, None) => return,
         (None, Some(new)) => {
@@ -2018,6 +2044,9 @@ fn diff_window_row(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
+    if let (Some(old), Some(new)) = (old, new) {
+        diff_occlusion(prefix, &old.occlusion, &new.occlusion, cause, pending);
+    }
     let (old, new) = match (old, new) {
         (None, None) => return,
         (None, Some(new)) => {
@@ -3508,6 +3537,7 @@ mod tests {
         assert_eq!(body["new"]["width"], 640);
 
         let surface = SurfaceSnapshot {
+            occlusion: Default::default(),
             id: 7,
             role: "toplevel",
             mapped: true,

@@ -16,6 +16,7 @@ mod frame_content;
 mod frame_trace;
 #[cfg(feature = "native-quoin")]
 mod native_shell;
+mod occlusion;
 #[cfg(feature = "bus")]
 mod port;
 mod protocol;

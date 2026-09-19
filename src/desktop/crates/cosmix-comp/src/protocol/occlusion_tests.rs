@@ -1,0 +1,207 @@
+//! Real socket/Smithay transactions; renderer certificates are injected at the
+//! same shared-slot boundary as frame_content, without requiring a local GPU.
+use super::*;
+use crate::occlusion::{Bounds, Draw, TreeVisibility};
+
+fn fixture() -> (KeybindingHarness, ObjectId, ObjectId) {
+    let mut h = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut h);
+    let victim = test_toplevel_record(&h).role.wl_surface().id();
+    let (_, _, _, cover) = map_named_test_toplevel(&mut h, "cover", "test.cover");
+    (h, victim, cover)
+}
+
+fn request(h: &mut KeybindingHarness, surface: u32) -> u32 {
+    let callback = h.allocate_object_id();
+    send_request(&mut h.client, surface, 3, &words(&[callback]));
+    send_request(&mut h.client, surface, 6, &[]);
+    h.dispatch_client();
+    callback
+}
+
+fn align(h: &mut KeybindingHarness, victim: &ObjectId, cover: &ObjectId) {
+    let v = h.server.state.surfaces.get_mut(victim).unwrap();
+    v.layout.x = 10.0;
+    v.layout.y = 10.0;
+    let size = (v.layout.width, v.layout.height);
+    let c = h.server.state.surfaces.get_mut(cover).unwrap();
+    c.layout.x = 10.0;
+    c.layout.y = 10.0;
+    c.layout.width = size.0;
+    c.layout.height = size.1;
+    c.layout.z = SurfaceStackKey::normal(1000);
+}
+
+fn certify(h: &mut KeybindingHarness, opaque: bool) -> crate::occlusion::CoverageSnapshot {
+    h.server.state.refresh_occlusion();
+    let bridge = h.server.state.occlusion.bridge.clone();
+    let mut exchange = bridge.0.lock().unwrap();
+    let draws = exchange
+        .scene
+        .surfaces
+        .iter()
+        .map(|s| Draw {
+            id: s.id,
+            bounds: Bounds::new(
+                f64::from(s.layout.x),
+                f64::from(s.layout.y),
+                f64::from(s.layout.width),
+                f64::from(s.layout.height),
+            ),
+            opaque,
+            rounded: false,
+            chrome: Vec::new(),
+            ready: true,
+        })
+        .collect::<Vec<_>>();
+    let coverage = crate::occlusion::compute(&exchange.scene, &draws, exchange.revision);
+    exchange.coverage = coverage.clone();
+    drop(exchange);
+    h.server.state.refresh_occlusion();
+    coverage
+}
+
+fn done(h: &mut KeybindingHarness, callback: u32) -> usize {
+    h.sync()
+        .iter()
+        .filter(|(object, opcode, _)| *object == callback && *opcode == 0)
+        .count()
+}
+
+#[test]
+fn occlusion_wire_retains_callbacks_and_exposure_resumes_without_victim_commit() {
+    let (mut h, victim, cover) = fixture();
+    let callback = request(&mut h, victim.protocol_id());
+    align(&mut h, &victim, &cover);
+    let coverage = certify(&mut h, true);
+    let id = h.server.state.surfaces[&victim].id;
+    assert_eq!(coverage.surfaces[&id], TreeVisibility::Occluded);
+    for _ in 0..3 {
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 0);
+    }
+    let commits = h.server.state.surfaces[&victim].commit_count;
+    // A compositor move, no client commit and no replacement certificate.
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
+    assert_eq!(h.server.state.surfaces[&victim].commit_count, commits);
+    assert!(
+        h.server
+            .state
+            .occlusion
+            .bridge
+            .0
+            .lock()
+            .unwrap()
+            .counters
+            .resumes
+            > 0
+    );
+}
+
+#[test]
+fn occlusion_wire_translucency_and_one_pixel_strip_do_not_withhold() {
+    for opaque in [false, true] {
+        let (mut h, victim, cover) = fixture();
+        let callback = request(&mut h, victim.protocol_id());
+        align(&mut h, &victim, &cover);
+        h.server.state.backend.change_host_output_scale(2.5);
+        if opaque {
+            h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 0.4;
+        }
+        certify(&mut h, opaque);
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 1);
+    }
+}
+
+#[test]
+fn occlusion_wire_region_only_commit_invalidates_cover() {
+    let (mut h, victim, cover) = fixture();
+    let callback = request(&mut h, victim.protocol_id());
+    let region = h.allocate_object_id();
+    send_request(&mut h.client, TEST_COMPOSITOR_ID, 1, &words(&[region]));
+    send_request(&mut h.client, region, 1, &words(&[0, 0, 4096, 4096]));
+    send_request(&mut h.client, cover.protocol_id(), 4, &words(&[region]));
+    send_request(&mut h.client, cover.protocol_id(), 6, &[]);
+    h.dispatch_client();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, false);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
+    let seq = h.server.state.surfaces[&cover].content_seq;
+    send_request(&mut h.client, cover.protocol_id(), 4, &words(&[0]));
+    send_request(&mut h.client, cover.protocol_id(), 6, &[]);
+    h.dispatch_client();
+    assert_eq!(h.server.state.surfaces[&cover].content_seq, seq);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+}
+
+#[test]
+fn occlusion_wire_stale_certificate_cannot_restore_withholding() {
+    let (mut h, victim, cover) = fixture();
+    let callback = request(&mut h, victim.protocol_id());
+    align(&mut h, &victim, &cover);
+    let stale = certify(&mut h, true);
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.server.state.refresh_occlusion();
+    h.server.state.occlusion.bridge.0.lock().unwrap().coverage = stale;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+}
+
+#[test]
+fn occlusion_wire_exposed_popup_keeps_parent_callback_running() {
+    let (mut h, victim, cover) = fixture();
+    let (popup, _) = map_test_popup(&mut h, None);
+    let callback = request(&mut h, victim.protocol_id());
+    align(&mut h, &victim, &cover);
+    h.server.state.surfaces.get_mut(&popup).unwrap().layout.z = SurfaceStackKey::normal(2000);
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+}
+
+#[test]
+fn occlusion_wire_layer_tree_withholds_and_resumes() {
+    let (mut h, _, cover) = fixture();
+    let (layer, _) = map_test_layer_surface(&mut h, 0, TestLayerSpec::default());
+    let object = test_layer_record(&h, layer.surface).role.wl_surface().id();
+    let callback = request(&mut h, layer.surface);
+    align(&mut h, &object, &cover);
+    h.server.state.surfaces.get_mut(&object).unwrap().layout.z.band = StackBand::Background;
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+}
+
+#[test]
+fn occlusion_wire_single_output_feedback_discards_only_evidenced_sequences() {
+    let (mut h, victim, cover) = fixture();
+    let (presentation, _) = bind_test_presentation(&mut h);
+    let first = request_presentation_feedback(&mut h, presentation);
+    commit_test_buffer(&mut h, TEST_TOPLEVEL_SURFACE_ID);
+    let seq = h.server.state.surfaces[&victim].content_seq;
+    let later = request_presentation_feedback(&mut h, presentation);
+    commit_test_buffer(&mut h, TEST_TOPLEVEL_SURFACE_ID);
+    align(&mut h, &victim, &cover);
+    let coverage = certify(&mut h, true);
+    let id = h.server.state.surfaces[&victim].id;
+    let (frame, mut content) = test_frame_report(id, 1_000_000, seq, true);
+    crate::frame_content::apply_presentation_coverage(&mut content, &coverage, 1);
+    assert!(!content.surfaces[0].shown);
+    h.server.state.frame_presented(frame, content);
+    let events = h.sync();
+    assert_eq!(feedback_opcodes(&events, first), [2]);
+    assert!(feedback_opcodes(&events, later).is_empty());
+    let (_, mut multi) = test_frame_report(id, 2_000_000, seq + 1, true);
+    crate::frame_content::apply_presentation_coverage(&mut multi, &coverage, 2);
+    assert!(multi.surfaces[0].shown, "documented multi-output limit");
+}

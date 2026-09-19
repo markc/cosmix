@@ -11706,6 +11706,9 @@ fn ack_and_map_test_toplevel(harness: &mut KeybindingHarness, serial: u32) {
     harness.dispatch_client();
 }
 
+#[path = "occlusion_tests.rs"]
+mod occlusion_tests;
+
 fn map_initial_test_toplevel(harness: &mut KeybindingHarness) {
     let serial = test_toplevel_record(harness)
         .required_configure

@@ -7,7 +7,9 @@
 //! protocol thread.
 //!
 //! "Shown" means: mapped and visible, on the output, and its texture is the
-//! one this frame samples. Occlusion by other windows is not checked.
+//! one this frame samples. Single-output reports exclude proven occlusion.
+//! Multi-output presentation retains its existing shared-report semantics;
+//! callback coverage is independently computed for every output.
 //!
 //! Relies on (not enforced here): the nested backend renders every frame
 //! (no idle skip), pipelined rendering is off (extract and render belong to
@@ -75,6 +77,9 @@ impl Plugin for FrameContentPlugin {
             .init_resource::<ExtractedFrameSurfaces>()
             .init_resource::<FrameContentMemory>()
             .init_resource::<RenderFrameContent>()
+            .init_resource::<crate::occlusion::ExtractedCoverage>()
+            .init_resource::<crate::occlusion::CoverageCache>()
+            .add_systems(ExtractSchedule, crate::occlusion::extract)
             .add_systems(ExtractSchedule, extract_frame_surfaces)
             // Prepare runs after PrepareAssets, where Bevy prepares SHM
             // images and the DMA-BUF bridge installs imported ones.
@@ -151,6 +156,7 @@ pub(crate) struct Refusal {
     pub(crate) refused: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_frame_content(
     extracted: Res<ExtractedFrameSurfaces>,
     sources: Option<Res<ExtractedContentSources>>,
@@ -159,6 +165,9 @@ fn resolve_frame_content(
     reporter: Option<Res<FramePresentationReporter>>,
     mut memory: ResMut<FrameContentMemory>,
     mut content: ResMut<RenderFrameContent>,
+    coverage: Res<crate::occlusion::ExtractedCoverage>,
+    mut coverage_cache: ResMut<crate::occlusion::CoverageCache>,
+    mut pipelines: Option<ResMut<bevy::render::render_resource::PipelineCache>>,
 ) {
     // One registry lock for every DMA-BUF surface in the frame.
     let dmabuf_images = extracted
@@ -186,6 +195,30 @@ fn resolve_frame_content(
             (surface.clone(), gpu_ready, progress)
         })
         .collect::<Vec<_>>();
+    if let Some(reporter) = reporter.as_ref() {
+        let ready = pipelines.as_mut().is_some_and(|pipelines| {
+            let state = crate::render_pipeline_readiness::process_after_draw(pipelines);
+            state.pipelines > 0
+                && state.pending == 0
+                && state.failed == 0
+                && !state.changed_after_draw
+        });
+        let sampled = surfaces
+            .iter()
+            .filter_map(|(surface, gpu, progress)| {
+                ready
+                    .then(|| sampled_commit(surface, *gpu, *progress))
+                    .flatten()
+                    .map(|seq| (surface.id, seq))
+            })
+            .collect();
+        crate::occlusion::resolve(
+            &coverage,
+            &sampled,
+            &reporter.occlusion,
+            &mut coverage_cache,
+        );
+    }
     // Refusals do not wait for a presented frame: a frame that is never
     // reported must not strand them. They are marked delivered only once
     // sent (without a reporter nothing is advertised, so nothing waits).
@@ -200,6 +233,29 @@ fn resolve_frame_content(
             })
         },
     );
+    if coverage_cache.result.revision == coverage.revision {
+        apply_presentation_coverage(
+            &mut content.0,
+            &coverage_cache.result,
+            coverage.scene.outputs.len(),
+        );
+    }
+}
+
+pub(crate) fn apply_presentation_coverage(
+    content: &mut FrameContent,
+    coverage: &crate::occlusion::CoverageSnapshot,
+    outputs: usize,
+) {
+    if outputs != 1 {
+        return;
+    }
+    for surface in &mut content.surfaces {
+        if coverage.surfaces.get(&surface.id) == Some(&crate::occlusion::TreeVisibility::Occluded) {
+            surface.shown = false;
+            surface.waiting = false;
+        }
+    }
 }
 
 /// What the frame samples for one surface: `Some(commit)` when its texture

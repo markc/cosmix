@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.59.1"
+version = "0.61.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"

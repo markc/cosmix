@@ -147,6 +147,8 @@ pub(crate) struct RectSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct SurfaceSnapshot {
+    #[serde(flatten)]
+    pub(crate) occlusion: crate::occlusion::Props,
     pub(crate) id: u64,
     pub(crate) role: &'static str,
     pub(crate) mapped: bool,
@@ -225,6 +227,8 @@ pub(crate) struct LayerSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct WindowSnapshot {
+    #[serde(flatten)]
+    pub(crate) occlusion: crate::occlusion::Props,
     pub(crate) id: u64,
     pub(crate) foreign_id: Option<String>,
     pub(crate) title: Option<Arc<str>>,
@@ -602,7 +606,7 @@ macro_rules! window_snapshot {
                     ["presentation", tail @ ..] => {
                         select_serialised(self.presentation.as_ref()?, tail)
                     }
-                    _ => None,
+                    _ => select_serialised(&self.occlusion, path),
                 }
             }
 
@@ -613,7 +617,7 @@ macro_rules! window_snapshot {
                     ["presentation", tail @ ..] => {
                         serialised_node_kind(self.presentation.as_ref()?, tail)
                     }
-                    _ => None,
+                    _ => serialised_node_kind(&self.occlusion, path),
                 }
             }
         }
@@ -766,7 +770,7 @@ impl SurfaceSnapshot {
             ["layer", tail @ ..] => self.layer.as_ref()?.select(tail),
             ["foreign_id"] => serialise_selected(&self.foreign_id),
             ["generation"] => serialise_selected(&self.generation),
-            _ => None,
+            _ => select_serialised(&self.occlusion, path),
         }
     }
 
@@ -785,7 +789,7 @@ impl SurfaceSnapshot {
                 SnapshotNodeKind::Leaf
             }),
             ["layer", tail @ ..] => self.layer.as_ref()?.node_kind(tail),
-            _ => None,
+            _ => serialised_node_kind(&self.occlusion, path),
         }
     }
 }
@@ -900,6 +904,23 @@ fn project_surface_row(
         _ => None,
     };
     SurfaceSnapshot {
+        occlusion: crate::occlusion::Props {
+            occluded: state.occlusion.is_occluded(record.id),
+            occlusion_reason: state
+                .occlusion
+                .decisions
+                .get(&record.id)
+                .copied()
+                .unwrap_or_default()
+                .reason(),
+            occlusion_revision: state
+                .occlusion
+                .decision_revisions
+                .get(&record.id)
+                .copied()
+                .unwrap_or(0),
+            occlusion_counters: None,
+        },
         id: record.id.0,
         role: record.role.kind(),
         mapped: record.mapped,
@@ -959,6 +980,7 @@ fn project_surface_row(
 
 pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
     WindowSnapshot {
+        occlusion: surface.occlusion.clone(),
         id: surface.id,
         foreign_id: surface.foreign_id.clone(),
         title: surface.title.clone(),
@@ -1242,6 +1264,19 @@ pub(super) fn read_snapshot(
     scopes: &ReadScopes,
 ) -> Option<CompSnapshot> {
     let mut snapshot = snapshot(state, context)?;
+    let counters = state
+        .occlusion
+        .bridge
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .counters;
+    for surface in snapshot.surfaces.values_mut() {
+        surface.occlusion.occlusion_counters = Some(counters);
+    }
+    for window in snapshot.windows.values_mut() {
+        window.occlusion.occlusion_counters = Some(counters);
+    }
     let stats = &state.presentation.stats;
     for (key, window) in &mut snapshot.windows {
         if !scopes.wants(&format!("windows.{key}.presentation")) {
@@ -1549,6 +1584,96 @@ macro_rules! volatile {
 use PatternSegment::{Literal as L, OutputKey as O, SourceKey as C, SurfaceKey as S};
 
 pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
+    descriptor!(
+        &[L("surfaces"), S, L("occluded")],
+        Bool,
+        "Entire canonical family is covered on every intersecting output"
+    ),
+    descriptor!(
+        &[L("surfaces"), S, L("occlusion_reason")],
+        String,
+        "unknown, exposed, or opaque-coverage"
+    ),
+    descriptor!(
+        &[L("surfaces"), S, L("occlusion_revision")],
+        Number,
+        "Revision of the latest visibility decision transition"
+    ),
+    volatile!(
+        [
+            L("surfaces"),
+            S,
+            L("occlusion_counters"),
+            L("withheld_opportunities")
+        ],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [L("surfaces"), S, L("occlusion_counters"), L("resumes")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [L("surfaces"), S, L("occlusion_counters"), L("recomputes")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [
+            L("surfaces"),
+            S,
+            L("occlusion_counters"),
+            L("conservative_fallbacks")
+        ],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("occluded")],
+        Bool,
+        "Entire canonical family is covered on every intersecting output"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("occlusion_reason")],
+        String,
+        "unknown, exposed, or opaque-coverage"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("occlusion_revision")],
+        Number,
+        "Revision of the latest visibility decision transition"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("occlusion_counters"),
+            L("withheld_opportunities")
+        ],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [L("windows"), S, L("occlusion_counters"), L("resumes")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [L("windows"), S, L("occlusion_counters"), L("recomputes")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [
+            L("windows"),
+            S,
+            L("occlusion_counters"),
+            L("conservative_fallbacks")
+        ],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
     descriptor!(
         &[L("info"), L("service")],
         String,
@@ -2511,7 +2636,10 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
         Value::Object(object) => object,
         _ => return list_argument("args", "JSON object", "filter object"),
     };
-    if let Some(field) = object.keys().find(|field| !ALLOWED.contains(&field.as_str())) {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED.contains(&field.as_str()))
+    {
         return ControlReply::InvalidArgs {
             field: field.clone(),
             allowed: ALLOWED,
@@ -2811,6 +2939,7 @@ mod tests {
             },
         );
         let layer = SurfaceSnapshot {
+            occlusion: Default::default(),
             id: 1,
             role: "layer",
             mapped: true,
@@ -2921,6 +3050,7 @@ mod tests {
         windows.insert(
             "s2".into(),
             WindowSnapshot {
+                occlusion: Default::default(),
                 id: toplevel.id,
                 foreign_id: toplevel.foreign_id.clone(),
                 title: toplevel.title.clone(),

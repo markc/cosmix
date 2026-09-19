@@ -12,6 +12,7 @@ use bevy::{
 #[derive(Asset, AsBindGroup, Clone, Debug, PartialEq, TypePath)]
 #[uniform(0, ChromeFrameUniform)]
 pub(crate) struct ChromeFrameMaterial {
+    pub(crate) square_opaque: bool,
     pub(crate) size: Vec2,
     pub(crate) corner_radius: f32,
     pub(crate) titlebar_bottom: f32,
@@ -32,6 +33,7 @@ struct ChromeFrameUniform {
     titlebar_color: Vec4,
     divider_color: Vec4,
     border_color: Vec4,
+    square_opaque: u32,
 }
 
 impl AsBindGroupShaderType<ChromeFrameUniform> for ChromeFrameMaterial {
@@ -48,6 +50,7 @@ impl AsBindGroupShaderType<ChromeFrameUniform> for ChromeFrameMaterial {
             titlebar_color: self.titlebar_color.to_linear().to_vec4(),
             divider_color: self.divider_color.to_linear().to_vec4(),
             border_color: self.border_color.to_linear().to_vec4(),
+            square_opaque: u32::from(self.square_opaque),
         }
     }
 }

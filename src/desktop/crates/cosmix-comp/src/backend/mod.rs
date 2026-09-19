@@ -179,6 +179,61 @@ impl KmsBackendData {
 }
 
 impl BackendData {
+    pub(crate) fn occlusion_outputs(&self) -> Vec<crate::occlusion::OutputGeometry> {
+        use crate::occlusion::{Bounds, OutputGeometry};
+        match self {
+            Self::Winit(data) => vec![OutputGeometry {
+                name: data.output.name(),
+                bounds: Bounds::new(
+                    0.0,
+                    0.0,
+                    f64::from(data.output_size.0),
+                    f64::from(data.output_size.1),
+                ),
+                scale: data.output_scale,
+                generation: 1,
+                transform: data.output.current_transform(),
+            }],
+            Self::Kms(data) => {
+                #[cfg(any(all(feature = "kms-live", not(test)), test))]
+                {
+                    let generations = data.topology.presentation_generations();
+                    let mut outputs = data
+                        .client_outputs
+                        .outputs
+                        .values()
+                        .map(|source| {
+                            let s = &source.selected;
+                            let generation = generations
+                                .get(&s.key)
+                                .copied()
+                                .filter(|g| data.topology.output_is_ready(*g, &s.key))
+                                .unwrap_or(0);
+                            OutputGeometry {
+                                name: source.output.name(),
+                                bounds: Bounds::new(
+                                    f64::from(s.logical_rect.x),
+                                    f64::from(s.logical_rect.y),
+                                    f64::from(s.logical_rect.width),
+                                    f64::from(s.logical_rect.height),
+                                ),
+                                scale: s.output_scale.as_f64(),
+                                generation,
+                                transform: source.output.current_transform(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    outputs.sort_by(|a, b| a.name.cmp(&b.name));
+                    outputs
+                }
+                #[cfg(not(any(all(feature = "kms-live", not(test)), test)))]
+                {
+                    let _ = data;
+                    Vec::new()
+                }
+            }
+        }
+    }
     /// The output used when a protocol request deliberately leaves output
     /// selection to the compositor.
     pub(crate) fn default_output(&self) -> Option<Output> {
