@@ -18,6 +18,8 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
 use crate::adapter::{AdapterSpec, SessionBus, adapter_spec};
+use crate::adapters::notify::NotifyAdapter;
+use crate::adapters::tray::TrayAdapter;
 use crate::state::AdapterEvent;
 use crate::supervisor::{
     ABORT_STOP, GRACEFUL_STOP, LifecycleCmd, StartedSupervisor, SupervisorHandle,
@@ -54,10 +56,12 @@ const _: () = assert!(
 // main.rs) — worst case ~55 s, with margin, never a sum that just
 // touches the unit limit.
 
-/// The built-in adapter registry. Adding an adapter is one line here
-/// (the `notify` domain ships; more land in later jobs).
+/// The built-in adapter registry. Adding an adapter is one line here.
 pub fn builtin_adapters() -> Vec<AdapterSpec> {
-    vec![adapter_spec::<crate::adapters::notify::NotifyAdapter>()]
+    vec![
+        adapter_spec::<NotifyAdapter>(),
+        adapter_spec::<TrayAdapter>(),
+    ]
 }
 
 type LifecycleDone = (String, std::result::Result<(), tokio::task::JoinError>);

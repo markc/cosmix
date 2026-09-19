@@ -535,8 +535,8 @@ as locals of <code>run</code> is the whole containment story. The crate's core
 (supervisor, backoff, registry, config) builds without the <code>cosmix</code>
 feature and is unit-tested with a scripted fault adapter compiled only
 under <code>cfg(test)</code>.</p>
-<p>The <code>notify</code> adapter ships; the rest (tray, settings, then folding
-mprisd and powerd) land in later jobs.</p>
+<p>Two adapters ship: <code>notify</code> and <code>tray</code> (sections below). Next come
+<code>settings</code>, then folding mprisd (<code>media</code>) and powerd (<code>power</code>).</p>
 <h2 id="the-notify-adapter">The notify adapter</h2>
 <p>Inbound <code>org.freedesktop.Notifications</code> (spec 1.2) on the session bus,
 bridged to the <code>notify</code> Bus service — how foreign apps' notifications
@@ -626,7 +626,130 @@ before critical, but an all-critical set is capped too — critical
 buys priority, not unbounded growth). A replace counts only its size
 delta against the bytes bound and never evicts the record it
 replaces. Stored strings are capped (8 KiB, truncated at a
-char boundary and marked) and at most 32 actions are kept.</p></div></div>
+char boundary and marked) and at most 32 actions are kept.</p>
+<h2 id="the-tray-adapter">The tray adapter</h2>
+<p>Cosmix is the system-tray <strong>host</strong>. The <code>tray</code> adapter owns
+<code>org.kde.StatusNotifierWatcher</code> at <code>/StatusNotifierWatcher</code> on the
+desktop session bus and turns StatusNotifierItems into an ABP domain.
+If the watcher name is already owned when the adapter starts, the run
+<strong>fails with a clear error rather than replacing the owner</strong> — a human
+hands the name over by <code>dbusd.adapter.disable {name: "tray"}</code> on this
+side and <code>enable</code> once the other owner has released it.</p>
+<p>D-Bus side (inbound, per the SNI convention):</p>
+<ul>
+<li><code>RegisterStatusNotifierItem</code> accepts both forms: a bus name (item at
+<code>/StatusNotifierItem</code>) or an object path (item on the caller's own
+connection — resolved the way KDE/libappindicator do). Everything
+checkable synchronously is refused with a D-Bus error, never an OK
+reply followed by a silent drop: <code>InvalidArgs</code> for a malformed name
+or path, <code>AccessDenied</code> unless the caller owns the bus name it
+registers (one client cannot squat the tray with other apps' items),
+<code>Failed</code> for an unowned name or a slow owner resolution (bounded at
+2 s — the resolution runs in the interface on zbus's dispatch
+task, never in the run loop, so a flood of item signals cannot wedge
+the adapter behind it), <code>LimitsExceeded</code> past 64 items total or 8
+items per registering connection. Re-registering an already-tracked
+<code>(service, path)</code> replaces it — always allowed, even at the caps.
+The run loop re-verifies on insert too: a registration whose owner
+already vanished (the resolution raced the client's disconnect) is
+refused — unique bus names are never reused, so nothing would ever
+reap such a ghost — and a loop-side capacity refusal emits
+<code>StatusNotifierItemUnregistered</code> for the name the caller's OK reply
+promised.</li>
+<li><code>RegisterStatusNotifierHost</code> records the host (cosmix itself already
+registered as host at startup, which is what makes
+<code>IsStatusNotifierHostRegistered</code> true the whole time the adapter
+runs) and a first-time registration emits
+<code>StatusNotifierHostRegistered</code>. Host registrations are capped at 64
+and pruned when their connection vanishes. <code>ProtocolVersion</code> is 0.</li>
+<li>Item identity is the <code>(service, path)</code> pair: one connection may host
+several path-form indicators, each tracked and advertised
+separately. <code>RegisteredStatusNotifierItems</code> — and the
+<code>StatusNotifierItemRegistered</code> / <code>StatusNotifierItemUnregistered</code>
+signals — carry <code>service + path</code> for every item (e.g.
+<code>org.kde.StatusNotifierItem-1/StatusNotifierItem</code> or
+<code>:1.23/org/ayatana/NotificationItem/nm_applet</code>), matching KDE's
+watcher.</li>
+<li>Item lifetime is tracked by <code>NameOwnerChanged</code>: an item goes when its
+registered bus name is released or moves to another owner, or when
+its connection itself vanishes (a unique name losing its owner). A
+connection releasing an <em>unrelated</em> name (MPRIS, anything) reaps
+nothing. No polling anywhere.</li>
+<li>Item properties (<code>Id</code>, <code>Title</code>, <code>Category</code>, <code>Status</code>, <code>IconName</code>,
+<code>IconThemePath</code>, <code>AttentionIconName</code>, <code>ToolTip</code>, <code>Menu</code>,
+<code>ItemIsMenu</code>, <code>IconPixmap</code>) are read once at registration and
+refreshed on the item's <code>New*</code> signals, one typed <code>Get</code> per property
+— never <code>GetAll</code>: every reply body is checked against a raw-size cap
+<em>before</em> any deserialization (64 KiB for string properties, 1.25 MiB
+for the pixmap-bearing <code>IconPixmap</code>/<code>ToolTip</code> replies, 1 MiB for
+menu layouts, 4 MiB for the rest — zbus itself accepts messages up
+to 128 MiB), and the pixmap-bearing replies deserialize straight to
+their typed wire shapes (<code>a(iiay)</code> tuples, flat byte vectors), never
+a per-byte value tree. An over-cap reply is refused undecoded: the
+pixmap is dropped, the refusal counted in <code>tray.info</code>'s
+<code>oversized_reads</code>, and the daemon's memory never amplifies (an
+over-cap string turns the whole refresh Unreachable — the item keeps
+its last-known props). A pixmap entry only counts when
+<code>data.len() == width * height * 4</code> (ARGB32) and fits 1 MiB. <code>Status</code>
+defaults to <code>Active</code> when an item does not implement it; a <code>Menu</code>
+of <code>/NO_DBUSMENU</code> means no menu. Refreshes of one item are coalesced
+to at most one per 250 ms, with at most 8 property fetches in flight
+across all items (a <code>NewIcon</code> flood cannot loop the item's own
+property reads; the freshest signal still converges). Every
+D-Bus call to an item runs under a timeout (2 s verbs, 3 s menu
+reads and property refresh, 500 ms for the optional <code>AboutToShow</code>
+pre-flight), proxy builds included, so a hung app
+surfaces as a refusal and never wedges the adapter.</li>
+</ul>
+<p>ABP side — the <code>tray</code> Bus service (mesh-open; no caller authorization):</p>
+<ul>
+<li>Props <code>tray.i&lt;n&gt;.{id,title,category,status,icon_name,icon_theme_path, attention_icon_name,tooltip,has_menu,item_is_menu,service,path}</code> plus
+<code>tray.count</code>. Keys <code>i&lt;n&gt;</code> are ordinals, stable for an item's lifetime
+and never reused; the leaves vanish with the item. <code>tooltip</code> is the
+ToolTip title (the description rides <code>tray.list</code>); the full per-item
+detail (tooltip text, menu path, pixmap size) is in <code>tray.list</code>.</li>
+<li><code>IconPixmap</code> pixels never ride the props: <code>tray.i&lt;n&gt;.pixmap_width</code>
+and <code>pixmap_height</code> record the largest available size, and the
+<code>tray.icon {id}</code> verb serves the pixels as
+<code>{width, height, encoding: "argb32-network-order", argb_b64}</code> — the
+raw SNI bytes (ARGB32, network byte order, row-major, no padding),
+base64-encoded.</li>
+<li>Verbs dispatch concurrently (bounded at 8 in flight): an item
+hanging on its 2-3 s timeout delays only its own verb, never
+<code>tray.list</code> or <code>tray.props.get</code> behind it.</li>
+<li>Verbs: <code>tray.list</code>; <code>tray.activate {id, x?, y?}</code>,
+<code>tray.secondary_activate</code>, <code>tray.context_menu</code>, <code>tray.scroll {id, delta, orientation}</code> (horizontal|vertical); <code>tray.icon {id}</code>;
+<code>tray.menu {id}</code> → the item's com.canonical.dbusmenu layout —
+<code>AboutToShow(0)</code> first (the dbusmenu hook for lazily-built submenus),
+then <code>GetLayout(0, -1, propertyNames)</code> with the names pinned to the
+small set the adapter surfaces, <code>icon-data</code> excluded — as a JSON
+tree of <code>{id, label, enabled, visible, type, toggle_type, toggle_state, truncated, children}</code> nodes (absent <code>enabled</code>/<code>visible</code>
+are the dbusmenu default <code>true</code>; the tree is capped at 512 nodes and
+a cut anywhere in it carries <code>"truncated": true</code> on the cut node AND
+every ancestor up to the root); <code>tray.menu.click {id, item}</code>
+→ dbusmenu <code>Event(item, "clicked")</code> with the spec's <code>(i s v u)</code>
+body — a single-variant data (an int32), a u32 timestamp. Unknown
+ids and bad arguments are refusals (rc 10), never panics.</li>
+<li>Events <code>tray.item.added</code> / <code>tray.item.changed</code> / <code>tray.item.removed</code>
+plus <code>tray.props.changed</code> diffs, each stamped with a per-adapter-run
+monotonic <code>event_seq</code> — one shape everywhere: a JSON number in verb
+and event bodies, a decimal string in <code>BusMessage</code> headers. A gap
+means events were dropped; re-read <code>tray.props.get</code>. <code>tray.info</code>
+carries the current counter, the host list, the <code>oversized_reads</code>
+refusal count and a bounded ring of recent events.</li>
+<li>A Bus (mesh) outage never ends the run: the broker reconnects the
+<code>tray</code> Bus client inside the run and the publisher keeps its diff
+baseline, so the next event re-diffs the whole outage window and
+items survive. Only the stop signal, session-bus death (observed on
+the zbus connection's closed signal), the Bus-side broker or
+publisher task dying, or a real internal fault ends a run.</li>
+</ul>
+<p>Bounds: 64 items (8 per registering connection), 64 hosts, 4096 chars
+per string, 1 MiB per stored pixmap (largest wins, <code>w*h*4</code> bytes
+exactly), raw reply caps before any deserialization (64 KiB strings,
+1.25 MiB pixmap-bearing, 1 MiB menu layouts, 4 MiB general), 512 menu
+nodes per layout read, one refresh per item per 250 ms, 8 property
+fetches in flight across all items.</p></div></div>
     </div>
 
 </main>
