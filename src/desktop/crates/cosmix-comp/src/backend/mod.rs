@@ -184,6 +184,9 @@ impl BackendData {
         match self {
             Self::Winit(data) => vec![OutputGeometry {
                 name: data.output.name(),
+                source_id: CaptureSourceId::Nested {
+                    output_name: data.output.name(),
+                },
                 bounds: Bounds::new(
                     0.0,
                     0.0,
@@ -191,6 +194,7 @@ impl BackendData {
                     f64::from(data.output_size.1),
                 ),
                 scale: data.output_scale,
+                scale_y: data.output_scale,
                 generation: 1,
                 transform: data.output.current_transform(),
             }],
@@ -211,6 +215,10 @@ impl BackendData {
                                 .unwrap_or(0);
                             OutputGeometry {
                                 name: source.output.name(),
+                                source_id: CaptureSourceId::Kms {
+                                    key: s.key.clone(),
+                                    generation,
+                                },
                                 bounds: Bounds::new(
                                     f64::from(s.logical_rect.x),
                                     f64::from(s.logical_rect.y),
@@ -218,6 +226,7 @@ impl BackendData {
                                     f64::from(s.logical_rect.height),
                                 ),
                                 scale: s.output_scale.as_f64(),
+                                scale_y: s.output_scale.as_f64(),
                                 generation,
                                 transform: source.output.current_transform(),
                             }

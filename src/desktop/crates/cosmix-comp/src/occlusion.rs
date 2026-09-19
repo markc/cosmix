@@ -99,23 +99,31 @@ pub(crate) struct CommittedOpacity {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct OutputGeometry {
     pub name: String,
+    pub source_id: crate::backend::CaptureSourceId,
     pub bounds: Bounds,
     pub scale: f64,
+    pub scale_y: f64,
     pub generation: u64,
     pub transform: smithay::utils::Transform,
 }
 impl OutputGeometry {
     fn project(&self, bounds: Bounds, inward: bool) -> Option<Rect> {
-        if !bounds.valid() || !self.bounds.valid() || !self.scale.is_finite() || self.scale <= 0.0 {
+        if !bounds.valid()
+            || !self.bounds.valid()
+            || !self.scale.is_finite()
+            || self.scale <= 0.0
+            || !self.scale_y.is_finite()
+            || self.scale_y <= 0.0
+        {
             return None;
         }
         // Coordinates are already in displayed orientation; rotating them a
         // second time would disagree with the output camera.
         let edges = [
             (bounds.x - self.bounds.x) * self.scale,
-            (bounds.y - self.bounds.y) * self.scale,
+            (bounds.y - self.bounds.y) * self.scale_y,
             (bounds.x + bounds.w - self.bounds.x) * self.scale,
-            (bounds.y + bounds.h - self.bounds.y) * self.scale,
+            (bounds.y + bounds.h - self.bounds.y) * self.scale_y,
         ];
         let [l, t, r, b] = edges;
         Some(if inward {
@@ -173,6 +181,8 @@ impl TreeVisibility {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoverageSnapshot {
     pub revision: u64,
+    /// Individual surface contribution; callbacks use the family fold below.
+    pub content: HashMap<SurfaceId, TreeVisibility>,
     pub surfaces: HashMap<SurfaceId, TreeVisibility>,
 }
 
@@ -262,7 +272,7 @@ fn opaque_region(
             // A one-output-pixel guard alone is insufficient for magnified
             // buffers. Use a full surface logical pixel plus a physical pixel;
             // extraction rejects viewports whose sampling footprint is unknown.
-            let guard = output.scale.ceil() as i64 + 1;
+            let guard = output.scale.max(output.scale_y).ceil() as i64 + 1;
             if *add {
                 r.l += guard;
                 r.t += guard;
@@ -388,6 +398,7 @@ pub(crate) fn compute(scene: &Scene, draws: &[Draw], revision: u64) -> CoverageS
     }
     // Any exposed/unknown member keeps the entire canonical family progressing.
     let individual = result.surfaces.clone();
+    result.content = individual.clone();
     for surface in &scene.surfaces {
         let family = scene.surfaces.iter().filter(|s| s.family == surface.family);
         let mut decision = TreeVisibility::Occluded;
@@ -418,7 +429,7 @@ pub(crate) struct ExtractedCoverage {
 
 #[derive(Resource, Default)]
 pub(crate) struct CoverageCache {
-    previous: Option<(u64, Vec<Draw>)>,
+    previous: Option<(u64, Vec<Draw>, Vec<OutputGeometry>)>,
     pub result: CoverageSnapshot,
 }
 
@@ -433,6 +444,15 @@ pub(crate) fn extract(
         Option<Res<Assets<crate::chrome_frame_material::ChromeFrameMaterial>>>,
     >,
     visibility: bevy::render::Extract<Query<&ViewVisibility>>,
+    cameras: bevy::render::Extract<
+        Query<(
+            &Camera,
+            &GlobalTransform,
+            &Projection,
+            &crate::capture::CaptureOutputSource,
+        )>,
+    >,
+    canvas: bevy::render::Extract<Res<crate::compositor_scene::LogicalCanvasSize>>,
     reporter: Option<Res<crate::protocol::FramePresentationReporter>>,
     mut extracted: ResMut<ExtractedCoverage>,
 ) {
@@ -447,6 +467,49 @@ pub(crate) fn extract(
     extracted.revision = exchange.revision;
     extracted.scene = exchange.scene.clone();
     drop(exchange);
+    // Match actual views, not an assumed origin-zero canvas or nominal scale.
+    // Fixed projections may have slightly different X/Y ratios after rounding.
+    // Scanout rotation is bijective; do not rotate raster coordinates twice.
+    for output in &mut extracted.scene.outputs {
+        let mut matching = cameras.iter().filter(|(camera, _, _, source)| {
+            camera.is_active && camera.order == 0 && source.source_id == output.source_id
+        });
+        let view = matching.next();
+        if matching.next().is_some() {
+            output.generation = 0;
+            continue;
+        }
+        let Some((camera, transform, Projection::Orthographic(projection), source)) = view else {
+            output.generation = 0;
+            continue;
+        };
+        let generation = match &source.source_id {
+            crate::backend::CaptureSourceId::Nested { .. } => 1,
+            crate::backend::CaptureSourceId::Kms { generation, .. } => *generation,
+        };
+        let Some(size) = camera.physical_viewport_size() else {
+            output.generation = 0;
+            continue;
+        };
+        let (view_scale, rotation, translation) = transform.to_scale_rotation_translation();
+        if generation != output.generation
+            || view_scale != Vec3::ONE
+            || rotation != Quat::IDENTITY
+            || size.x == 0
+            || size.y == 0
+        {
+            output.generation = 0;
+            continue;
+        }
+        output.bounds = Bounds::new(
+            f64::from(translation.x + projection.area.min.x + canvas.0.x / 2.0),
+            f64::from(canvas.0.y / 2.0 - translation.y - projection.area.max.y),
+            f64::from(projection.area.width()),
+            f64::from(projection.area.height()),
+        );
+        output.scale = f64::from(size.x) / output.bounds.w;
+        output.scale_y = f64::from(size.y) / output.bounds.h;
+    }
     extracted.draws.clear();
     let surfaces = extracted.scene.surfaces.clone();
     for s in &surfaces {
@@ -546,7 +609,7 @@ pub(crate) fn resolve(
             .iter()
             .any(|s| s.id == draw.id && sampled.get(&s.id) == Some(&s.content));
     }
-    let key = (extracted.revision, draws);
+    let key = (extracted.revision, draws, extracted.scene.outputs.clone());
     let mut exchange = bridge.0.lock().unwrap_or_else(|e| e.into_inner());
     if cache.previous.as_ref() != Some(&key) {
         cache.result = compute(&extracted.scene, &key.1, extracted.revision);
@@ -597,8 +660,12 @@ mod tests {
             surfaces,
             outputs: vec![OutputGeometry {
                 name: "test".into(),
+                source_id: crate::backend::CaptureSourceId::Nested {
+                    output_name: "test".into(),
+                },
                 bounds: Bounds::new(0.0, 0.0, 100.0, 80.0),
                 scale: 2.5,
+                scale_y: 2.5,
                 generation: 1,
                 transform: smithay::utils::Transform::Normal,
             }],
@@ -687,6 +754,11 @@ mod tests {
             ..draws[0].clone()
         });
         assert!(!hidden(&scene, &draws), "exposed popup keeps parent alive");
+        assert_eq!(
+            compute(&scene, &draws, 1).content[&SurfaceId(1)],
+            TreeVisibility::Occluded,
+            "presentation contribution is independent of callback family eligibility"
+        );
         scene.outputs[1].generation = 0;
         assert!(!hidden(&scene, &draws));
     }
@@ -782,5 +854,81 @@ mod tests {
             d.bounds.x = -100.0;
         }
         assert!(hidden(&scene, &draws));
+    }
+
+    #[test]
+    fn occlusion_unknown_candidate_geometry_and_unmapped_child_keep_family_running() {
+        let (mut scene, mut draws) = fixture();
+        assert!(hidden(&scene, &draws));
+        draws[0].ready = false;
+        assert!(!hidden(&scene, &draws));
+        draws[0].ready = true;
+        let mut child = scene.surfaces[0].clone();
+        child.id = SurfaceId(3);
+        child.layout.visible = false;
+        scene.surfaces.push(child);
+        assert!(
+            !hidden(&scene, &draws),
+            "bootstrap cannot wait for a hidden parent callback"
+        );
+    }
+
+    #[test]
+    fn occlusion_camera_projection_is_used_and_missing_camera_fails_open() {
+        use crate::compositor_scene::{LogicalCanvasSize, RendererOutputScale120, SurfaceEntities};
+        use bevy::{ecs::system::RunSystemOnce, render::MainWorld};
+        let (mut scene, _) = fixture();
+        scene.outputs[0].name = "camera-test".into();
+        scene.outputs[0].source_id = crate::backend::CaptureSourceId::Nested {
+            output_name: "camera-test".into(),
+        };
+        // Deliberately disagree with the actual camera: it owns the proof.
+        scene.outputs[0].bounds.x = 500.0;
+        let (reporter, _) = crate::protocol::FramePresentationReporter::test_channel();
+        {
+            let mut exchange = reporter.occlusion.0.lock().unwrap();
+            exchange.scene = scene;
+            exchange.revision = 1;
+        }
+        let mut main = MainWorld::default();
+        main.init_resource::<SurfaceEntities>();
+        main.init_resource::<Assets<crate::client_surface_material::ClientSurfaceMaterial>>();
+        main.insert_resource(RendererOutputScale120(300));
+        main.insert_resource(LogicalCanvasSize(Vec2::new(100.0, 80.0)));
+        main.spawn((
+            Camera {
+                viewport: Some(bevy::camera::Viewport {
+                    physical_size: UVec2::new(251, 200),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            GlobalTransform::IDENTITY,
+            Projection::Orthographic(OrthographicProjection {
+                area: bevy::math::Rect::new(-50.0, -40.0, 50.0, 40.0),
+                ..OrthographicProjection::default_2d()
+            }),
+            crate::capture::CaptureOutputSource {
+                source_id: crate::backend::CaptureSourceId::Nested {
+                    output_name: "camera-test".into(),
+                },
+                output_name: "camera-test".into(),
+            },
+        ));
+        let mut render = World::new();
+        render.insert_resource(main);
+        render.insert_resource(reporter);
+        render.init_resource::<ExtractedCoverage>();
+        render.run_system_once(extract).unwrap();
+        let output = &render.resource::<ExtractedCoverage>().scene.outputs[0];
+        assert_eq!(output.bounds, Bounds::new(0.0, 0.0, 100.0, 80.0));
+        assert_eq!((output.scale, output.scale_y), (2.51, 2.5));
+        assert_eq!(output.generation, 1);
+        render.resource_mut::<MainWorld>().clear_entities();
+        render.run_system_once(extract).unwrap();
+        assert_eq!(
+            render.resource::<ExtractedCoverage>().scene.outputs[0].generation,
+            0
+        );
     }
 }

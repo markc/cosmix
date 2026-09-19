@@ -16,7 +16,9 @@ callbacks before the first buffer are never withheld by occlusion.
 Coverage uses applied opaque-region transactions and renderer-confirmed installed
 content. A pending DMA-BUF replacement cannot lend its opaque region to an older
 texture. Candidate bounds round outwards and occluders round inwards in output
-physical coordinates, including fractional scales. Unknown state, excessive
+physical coordinates, including fractional scales. Each output's actual camera
+viewport and projection supply the origin and X/Y pixel ratios; missing or
+generation-mismatched camera evidence permits callbacks. Unknown state, excessive
 region fragmentation and stale scene revisions permit callbacks. Scene changes
 invalidate coverage; the next existing frame opportunity drains retained
 callbacks once with the current monotonic millisecond timestamp. No occlusion

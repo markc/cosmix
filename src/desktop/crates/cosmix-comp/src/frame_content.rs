@@ -260,7 +260,7 @@ pub(crate) fn apply_presentation_coverage(
         return;
     }
     for surface in &mut content.surfaces {
-        if coverage.surfaces.get(&surface.id) == Some(&crate::occlusion::TreeVisibility::Occluded) {
+        if coverage.content.get(&surface.id) == Some(&crate::occlusion::TreeVisibility::Occluded) {
             surface.shown = false;
             surface.waiting = false;
         }

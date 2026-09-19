@@ -2514,7 +2514,9 @@ fn is_false(value: &bool) -> bool {
 pub(crate) fn volatile_path(path: &str) -> bool {
     path == "sources"
         || path.starts_with("sources.")
-        || path.split('.').any(|segment| segment == "presentation")
+        || path
+            .split('.')
+            .any(|segment| matches!(segment, "presentation" | "occlusion_counters"))
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -3111,6 +3113,12 @@ mod tests {
                 },
             },
         );
+        for row in surfaces.values_mut() {
+            row.occlusion.occlusion_counters = Some(Default::default());
+        }
+        for row in windows.values_mut() {
+            row.occlusion.occlusion_counters = Some(Default::default());
+        }
         CompSnapshot {
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
@@ -3295,7 +3303,7 @@ mod tests {
             assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
             volatile += usize::from(descriptor.volatile);
         }
-        assert_eq!(volatile, 13 + 8 + 4 + 19);
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 8);
     }
 
     #[test]
