@@ -16,6 +16,7 @@ pub(crate) const EVALUATION_BUDGET: Duration = Duration::from_millis(250);
 thread_local! {
     pub(crate) static COMPILE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EVALUATE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static MODEL_CONVERSION_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -185,6 +186,7 @@ pub fn reevaluate(
     let old = tree.clone();
     let mut diagnostics = Vec::new();
     let mut evaluated = Vec::new();
+    let model = prepare_model(&next.model);
     let started = Instant::now();
     for path in &set.order {
         let Some(binding) = set.bindings.get(path) else {
@@ -198,13 +200,13 @@ pub fn reevaluate(
         {
             continue;
         }
-        let Some((id, port)) = path.split_once('.') else {
+        let Some((id, port)) = path.rsplit_once('.') else {
             continue;
         };
         let Some(node) = next.nodes.get_mut(id) else {
             continue;
         };
-        let result = evaluate_budgeted(binding, &next.model, None, started, || evaluated.push(path.clone()))
+        let result = evaluate_budgeted(binding, &model, None, started, || evaluated.push(path.clone()))
             .and_then(|v| coerce_port(&v, crate::port_for(&node.family, port)));
         match result {
             Ok(v) => {
@@ -236,12 +238,14 @@ pub fn template_instantiate(
     item: &JsonValue,
 ) -> Result<Node, Diagnostic> {
     let mut out = node.clone();
+    let model = prepare_model(model);
     let started = Instant::now();
     for (path, binding) in &set.bindings {
-        let Some(port) = path.strip_prefix(&format!("{id}.")) else {
+        let Some((binding_id, port)) = path.rsplit_once('.') else {
             continue;
         };
-        let value = evaluate_budgeted(binding, model, Some(item), started, || {})
+        if binding_id != id { continue; }
+        let value = evaluate_budgeted(binding, &model, Some(item), started, || {})
             .and_then(|v| coerce_port(&v, crate::port_for(&node.family, port)))
             .map_err(|code| {
                 Diagnostic::warning(
@@ -277,7 +281,7 @@ fn parse_expression(source: &str) -> Result<Expr, cosmix_mix::MixError> {
 
 pub(crate) fn evaluate_budgeted(
     binding: &CompiledBinding,
-    model: &JsonValue,
+    model: &Value,
     item: Option<&JsonValue>,
     started: Instant,
     on_evaluate: impl FnOnce(),
@@ -288,7 +292,7 @@ pub(crate) fn evaluate_budgeted(
     on_evaluate();
     #[cfg(test)]
     EVALUATE_COUNT.with(|n| n.set(n.get() + 1));
-    let mut globals = vec![("model", to_mix(model))];
+    let mut globals = vec![("model", model.clone())];
     if let Some(item) = item {
         globals.push(("item", to_mix(item)));
     }
@@ -335,6 +339,12 @@ pub(crate) fn coerce_port(value: &Value, port: Option<Port>) -> Result<Option<Js
     }
 }
 
+pub(crate) fn prepare_model(model: &JsonValue) -> Value {
+    #[cfg(test)]
+    MODEL_CONVERSION_COUNT.with(|n| n.set(n.get() + 1));
+    to_mix(model)
+}
+
 fn to_mix(value: &JsonValue) -> Value {
     match value {
         JsonValue::Null => Value::Nil,
@@ -369,7 +379,7 @@ fn from_mix(value: &Value) -> Option<JsonValue> {
 
 pub(crate) fn evaluate_for_resolve(
     binding: &CompiledBinding,
-    model: &JsonValue,
+    model: &Value,
     port: Port,
     started: Instant,
 ) -> Result<Option<JsonValue>, String> {

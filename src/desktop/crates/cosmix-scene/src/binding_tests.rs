@@ -13,6 +13,49 @@ fn bound(source: &str) -> SceneDocument {
 }
 
 #[test]
+fn dotted_node_id_with_binding_does_not_panic() {
+    let mut d = doc(r#"root: {widget: "column", children: ["a", "a.b"]}
+a: {widget: "text", text: "= $model.label .. ' plain'"}
+"a.b": {widget: "text", text: "= $model.label .. ' dotted'"}"#);
+    d.model = Some(json!({"label": "first"}));
+    assert!(lint(&d).is_empty());
+    let tree = resolve(&d).unwrap();
+    assert_eq!(tree.nodes["a"].ports["text"], json!("first plain"));
+    assert_eq!(tree.nodes["a.b"].ports["text"], json!("first dotted"));
+    let set = compile(&d).unwrap();
+    let result = reevaluate(&tree, &set, "model.label", &json!("next")).unwrap();
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(result.tree.nodes["a.b"].ports["text"], json!("next dotted"));
+    assert_eq!(result.tree.nodes["a"].ports["text"], json!("next plain"));
+    for (id, expected) in [("a", "next plain"), ("a.b", "next dotted")] {
+        let node = template_instantiate(id, &tree.nodes[id], &set, &result.tree.model, &json!({})).unwrap();
+        assert_eq!(node.ports["text"], json!(expected));
+        assert!(!node.ports.contains_key("b.text"));
+    }
+}
+
+#[test]
+fn model_is_converted_once_per_evaluation_pass() {
+    let mut d = doc(r#"root: {widget: "column", children: ["a", "b"]}
+a: {widget: "text", text: "= $model.label"}
+b: {widget: "text", text: "= $model.label"}"#);
+    d.model = Some(json!({"label": "first", "unused": ["x".repeat(65536)]}));
+    let before = bindings::MODEL_CONVERSION_COUNT.get();
+    assert!(lint(&d).is_empty());
+    let tree = resolve(&d).unwrap();
+    assert_eq!(bindings::MODEL_CONVERSION_COUNT.get(), before + 1);
+    let set = compile(&d).unwrap();
+    let result = reevaluate(&tree, &set, "model.label", &json!("next")).unwrap();
+    assert_eq!(bindings::MODEL_CONVERSION_COUNT.get(), before + 2);
+    assert!(result.diagnostics.is_empty());
+    assert_eq!(result.evaluated, ["a.text", "b.text"]);
+    for id in ["a", "b"] {
+        assert_eq!(tree.nodes[id].ports["text"], json!("first"));
+        assert_eq!(result.tree.nodes[id].ports["text"], json!("next"));
+    }
+}
+
+#[test]
 fn template_instantiate_sees_live_model() {
     let mut d = doc("root: {widget: \"list\", rows: [], row: \"t\", row_height: 1}\nt: {widget: \"row\", children: [\"a\",\"b\"]}\na: {widget: \"text\", text: \"= $model.total .. $item.cells[0]\"}\nb: {widget: \"text\", text: \"= $model.total\"}");
     d.model = Some(json!({"total":"old"}));
@@ -133,6 +176,14 @@ fn v0_serialisation_unchanged() {
         assert_eq!(serde_json::to_string(&tree).unwrap(), old);
         assert_eq!(serde_json::from_str::<ResolvedScene>(&old).unwrap(), tree);
     }
+    let tree = resolve(&parse(include_str!("../tests/fixtures/clippanel.scene.md")).unwrap()).unwrap();
+    let wire = serde_json::to_value(&tree).unwrap();
+    // v0/main marks only list row roots, not their descendants.
+    assert_eq!(wire["templates"], json!(["entry_row"]));
+    assert_eq!(wire["nodes"]["entry_row"]["is_template"], json!(true));
+    for id in ["r_id", "r_bytes", "r_age", "r_prev"] {
+        assert_eq!(wire["nodes"][id]["is_template"], json!(false));
+    }
 }
 
 #[test]
@@ -150,9 +201,12 @@ fn nested_list_templates_share_reachability() {
     let set = compile(&d).unwrap();
     assert!(set.bindings["label.text"].reads_item);
     let tree = resolve(&d).unwrap();
-    for id in ["outer", "nested", "inner", "label"] {
+    assert_eq!(tree.templates, ["inner", "outer"]);
+    for id in ["outer", "inner"] {
         assert!(tree.nodes[id].is_template);
-        assert!(tree.templates.contains(&id.to_string()));
+    }
+    for id in ["nested", "label"] {
+        assert!(!tree.nodes[id].is_template);
     }
 }
 

@@ -600,13 +600,13 @@ fn prepare(doc: &SceneDocument) -> PreparedBindings {
     let mut out = lint_structure(doc);
     out.append(&mut prepared.diagnostics);
     if !out.iter().any(|d| d.severity == Severity::Error) {
-        let model = doc.model.clone().unwrap_or_else(empty_model);
+        let model = bindings::prepare_model(doc.model.as_ref().unwrap_or(&empty_model()));
         let started = std::time::Instant::now();
         for path in &prepared.set.order {
             let binding = &prepared.set.bindings[path];
             if binding.reads_item { continue; }
-            let (id, port) = path.split_once('.').unwrap();
-            let node = &doc.nodes[id];
+            let Some((id, port)) = path.rsplit_once('.') else { continue };
+            let Some(node) = doc.nodes.get(id) else { continue };
             let Some(schema_port) = port_for(&node.widget, port) else { continue };
             match bindings::evaluate_for_resolve(binding, &model, schema_port, started) {
                 Ok(value) => { prepared.values.insert(path.clone(), value); }
@@ -791,7 +791,11 @@ pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
     if prepared.diagnostics.iter().any(|d| d.severity == Severity::Error) {
         return Err(prepared.diagnostics);
     }
-    let ts = bindings::template_ids(doc);
+    let ts: BTreeSet<String> = doc.nodes.values()
+        .filter(|node| node.widget == "list")
+        .filter_map(|node| node.ports.get("row").and_then(JsonValue::as_str))
+        .map(str::to_owned)
+        .collect();
     let binding_set = prepared.set;
     let mut nodes = IndexMap::new();
     for (id, r) in &doc.nodes {
