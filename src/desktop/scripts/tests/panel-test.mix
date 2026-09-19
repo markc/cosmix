@@ -93,7 +93,7 @@ check(index_of($data.a.text, "\"x\"") >= 0, "quotes survive")
 
 -- Strict data reads "${" as interpolation with no escape: user text that
 -- carries one (a window title, a notification) must still parse.
-for each $hostile in ['title ${name} here', 'dangling ${', 'x ${a ?? b}']
+for each $hostile in ['title ${name} here', 'dangling ${', 'x ${a ?? b}', '~/Downloads/shot.png saved', '~', 'tab	and "quotes" ~ mid']
   $parsed = data_parse($p.node_line("root", {widget: "text", text: $hostile}))
   check(type($parsed.root.text) == "string", "hostile text parses: " .. $hostile)
 end

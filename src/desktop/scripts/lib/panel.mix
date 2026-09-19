@@ -120,9 +120,16 @@ end
 -- document parseable.
 $WORD_JOINER = json_parse("\"\\u2060\"")
 
+-- The same lexer expands a LEADING "~" (and "~/") in a double-quoted string
+-- to $HOME, which strict data also refuses -- a notification that reads
+-- "~/Downloads/x.png saved" would poison the document. Every JSON string
+-- opens with a quote, so a word joiner after an opening quote that is
+-- followed by "~" neutralises it. (Inside a string, an escaped quote \"~
+-- also matches; the joiner there is invisible and harmless.)
 fn node_line($id, $node)
   $json = replace(json_encode($node), "`", "´")
   $json = replace($json, '${', '$' .. $WORD_JOINER .. '{')
+  $json = replace($json, '"~', '"' .. $WORD_JOINER .. '~')
   return $id .. ": " .. $json
 end
 

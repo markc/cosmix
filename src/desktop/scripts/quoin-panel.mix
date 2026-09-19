@@ -82,7 +82,14 @@ fn load_scene($doc)
     note("scene.load rc=" .. to_string($rc) .. " " .. to_string($result))
     return 0
   end
-  $r = type($result) == "string" ? json_parse($result) : $result
+  $r = $result
+  if type($r) == "string" then
+    try
+      $r = json_parse($r)
+    catch $e
+      return 0
+    end
+  end
   return (type($r) == "map" and $r.revision != nil) ? $r.revision : 0
 end
 
@@ -247,14 +254,22 @@ fn fetch_vol()
   $state.vol = {ok: true, level: round(to_number($m[0].groups[0]) * 100), muted: index_of($r.stdout, "MUTED") >= 0}
 end
 
+-- Notifications come from the adapter's props tree (notify.props.get):
+-- notify.list rows carry no body, the props subtree n<id> has every field.
 fn fetch_notes()
-  $r = rpc($NOTIFY, "notify.list", {})
-  if $r == nil then
+  $r = rpc($NOTIFY, "notify.props.get", {})
+  if $r == nil or type($r) != "map" then
     $state.notes = []
     return
   end
-  $list = type($r) == "list" ? $r : ($r.notifications ?? [])
-  $state.notes = type($list) == "list" ? $list : []
+  $out = []
+  for each $key, $n in $r
+    if starts_with($key, "n") and type($n) == "map" then
+      push($out, {id: slice($key, 1, length($key)), app: $n.app ?? "", summary: $n.summary ?? "", body: $n.body ?? "", created_at: $n.created_at ?? ""})
+    end
+  end
+  -- oldest first here; notes_doc shows newest first
+  $state.notes = sort_by($out, function ($n) = $n.created_at)
 end
 
 fn fetch_status()
@@ -322,14 +337,20 @@ fn panel_doc()
   end
   push($nodes, ["gap2", {widget: "spacer", size: 8}])
 
-  -- task buttons for the current workspace (Plasma's default filter)
-  $task_ids = []
+  -- task buttons for the current workspace (Plasma's default filter),
+  -- bounded like every other list the panel emits
+  $tasks = []
   for each $w in $state.windows
-    if ($w.workspace ?? $state.ws_current) == $state.ws_current then push($task_ids, "t_" .. to_string($w.id)) end
+    if length($tasks) >= $MAX_TASKS then break end
+    if ($w.workspace ?? $state.ws_current) == $state.ws_current then push($tasks, $w) end
+  end
+  $task_ids = []
+  for each $w in $tasks
+    push($task_ids, "t_" .. to_string($w.id))
   end
   push($nodes, ["tasks", {widget: "row", gap: 4, align: "center", children: $task_ids}])
-  for each $w in $state.windows
-    if ($w.workspace ?? $state.ws_current) == $state.ws_current then
+  for each $w in $tasks
+    if true then
       $id = "t_" .. to_string($w.id)
       $b = {widget: "row", height: 40, radius: 6, padding: 8, gap: 8, align: "center", hover: $C.hover, on_click: "task", children: [$id .. "_i", $id .. "_l"]}
       if $w.focused and not $w.minimized then
@@ -349,19 +370,18 @@ fn panel_doc()
   end
   push($nodes, ["fill", {widget: "spacer"}])
 
-  -- tray: one icon per StatusNotifierItem, click = activate
+  -- tray: one icon per StatusNotifierItem, click = activate. The node id
+  -- carries the adapter's store KEY ("i<n>", what tray.activate takes -- the
+  -- SNI Id is the app's own name and is NOT accepted), so a click resolves to
+  -- the exact item even if the tray changed after this render.
   if length($state.tray) > 0 then
     $tray_ids = []
-    $n = 0
     for each $item in $state.tray
-      $n = $n + 1
-      push($tray_ids, "tr_" .. to_string($n))
+      push($tray_ids, "tr_" .. lower(to_string($item.key)))
     end
     push($nodes, ["tray", {widget: "row", gap: 2, align: "center", children: $tray_ids}])
-    $n = 0
     for each $item in $state.tray
-      $n = $n + 1
-      $id = "tr_" .. to_string($n)
+      $id = "tr_" .. lower(to_string($item.key))
       push($nodes, [$id, {widget: "row", height: 36, radius: 6, padding: 6, align: "center", hover: $C.hover, on_click: "tray", children: [$id .. "_i"]}])
       $path = icon_path($item.icon_name ?? "", 24)
       if $path != "" then
@@ -421,6 +441,7 @@ end
 -- document at most 256 KiB, so rows are capped and their text bounded.
 $MAX_LIST_ROWS = 500
 $MAX_NOTES = 50
+$MAX_TASKS = 50
 
 fn launcher_doc()
   $rows = []
@@ -587,14 +608,14 @@ fn render_launcher()
   $doc = launcher_doc()
   if not popup_live("launcher_open", $gen) then return end
   load_scene($doc)
-  if popup_live("launcher_open", $gen) then show_popup("left", "scene-launcher") end
+  if popup_live("launcher_open", $gen) then show_popup("left", "scene-launcher", "launcher_open", $gen) end
 end
 
 fn render_calendar()
   if not $state.calendar_open then return end
   $gen = $state.popup_gen
   load_scene(calendar_doc())
-  if popup_live("calendar_open", $gen) then show_popup("right", "scene-calendar") end
+  if popup_live("calendar_open", $gen) then show_popup("right", "scene-calendar", "calendar_open", $gen) end
 end
 
 fn render_notes()
@@ -610,7 +631,7 @@ fn render_notes()
     return
   end
   load_scene($doc)
-  if popup_live("notes_open", $gen) then show_popup("right", "scene-notes") end
+  if popup_live("notes_open", $gen) then show_popup("right", "scene-notes", "notes_open", $gen) end
 end
 
 -- ── popup edge pins: ours, recorded ────────────────────────────────────
@@ -638,16 +659,33 @@ fn write_pins($pins)
   end
 end
 
-fn show_popup($edge, $page)
+-- Show a popup page and pin its edge -- but the page.set/pin sends are
+-- yield points too: re-check the popup is still live after each, and if a
+-- close landed meanwhile, undo the pin instead of leaving a closed popup
+-- pinned open.
+fn show_popup($edge, $page, $flag, $gen)
   $pins = read_pins()
   if index_of($pins, $edge) < 0 then
     push($pins, $edge)
     write_pins($pins)
   end
-  show_page($edge, $page)
+  $tries = 0
+  while $tries < 20
+    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then break end
+    $tries = $tries + 1
+    sleep(0.05)
+    if not popup_live($flag, $gen) then return end
+  end
+  if not popup_live($flag, $gen) then return end
+  panel_verb("shell.panel.pin", $edge, nil)
+  if not popup_live($flag, $gen) then hide_popup($edge) end
 end
 
+-- Release a popup edge; drop it from the pin record only once the host has
+-- actually taken the unpin (a host that is down keeps the record, so the
+-- next start still knows to release it).
 fn hide_popup($edge)
+  if panel_verb("shell.panel.unpin", $edge, nil) != 0 then return end
   hide_edge($edge)
   $kept = []
   for each $e in read_pins()
@@ -764,7 +802,7 @@ on launch_first desc "launch the first search match (Enter in the search field)"
   end
 end
 
-on ws desc "switch to the clicked workspace"
+on ws desc "switch to the clicked workspace" async
   reply(0, "")
   $node = node_of()
   $n = to_number(replace(before($node, "_t") ?? $node, "ws_", ""))
@@ -774,7 +812,7 @@ on ws desc "switch to the clicked workspace"
   end
 end
 
-on task desc "focus, restore or minimise the clicked window (Plasma task semantics)"
+on task desc "focus, restore or minimise the clicked window (Plasma task semantics)" async
   reply(0, "")
   $node = node_of()
   $id_text = replace($node, "t_", "")
@@ -788,21 +826,19 @@ on task desc "focus, restore or minimise the clicked window (Plasma task semanti
       elif $w.focused then
         rpc($COMP, "comp.window.minimize", {id: $w.id, generation: $w.generation})
       else
+        -- comp.window.focus raises by default
         rpc($COMP, "comp.window.focus", {id: $w.id, generation: $w.generation})
-        rpc($COMP, "comp.window.raise", {id: $w.id, generation: $w.generation})
       end
     end
   end
   schedule()
 end
 
-on tray desc "activate the clicked tray item"
+on tray desc "activate the clicked tray item" async
   reply(0, "")
   $node = node_of()
-  $n = to_number(replace(before($node, "_i") ?? $node, "tr_", ""))
-  if $n != nil and $n >= 1 and $n <= length($state.tray) then
-    rpc($TRAY, "tray.activate", {id: $state.tray[$n - 1].id})
-  end
+  $key = replace(before($node, "_i") ?? $node, "tr_", "")
+  if $key != "" then rpc($TRAY, "tray.activate", {id: $key}) end
 end
 
 on calendar desc "toggle the calendar"
@@ -885,7 +921,7 @@ on notes_clear desc "dismiss every notification"
   render_panel()
 end
 
-on vol_mute desc "toggle mute on the default audio sink"
+on vol_mute desc "toggle mute on the default audio sink" async
   reply(0, "")
   $muted = run_argv(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
   if not $muted.ok then note("wpctl set-mute failed: " .. $muted.stderr) end
@@ -893,7 +929,7 @@ on vol_mute desc "toggle mute on the default audio sink"
   render_panel()
 end
 
-on peek desc "peek at the desktop: minimise this workspace, click again to restore"
+on peek desc "peek at the desktop: minimise this workspace, click again to restore" async
   reply(0, "")
   fetch_windows()
   if length($state.peeked) > 0 then
@@ -964,12 +1000,24 @@ end
 on clock.run async
   if $state.clock_running then return end
   $state.clock_running = true
+  $tick = 0
   while true
     sleep($p.seconds_to_next_minute(time()))
-    fetch_net()
-    fetch_vol()
-    render_panel()
-    if $state.calendar_open then render_calendar() end
+    $tick = $tick + 1
+    try
+      fetch_net()
+      fetch_vol()
+      if $tick % 5 == 0 then
+        rpc($COMP, "comp.props.watch", {})
+        fetch_windows()
+        fetch_tray()
+        fetch_notes()
+      end
+      render_panel()
+      if $state.calendar_open then render_calendar() end
+    catch $e
+      note("clock tick failed: " .. to_string($e))
+    end
   end
 end
 

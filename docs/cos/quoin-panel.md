@@ -55,12 +55,20 @@ When Quoin restarts, the next `scene.load` returns revision 1; the citizen
 takes that as a fresh host and re-selects and re-pins its panel page.
 
 Popups are one at a time. Each open/close bumps a generation, and a render
-re-checks it after every Bus call, so a rebuild already in flight can never
-reopen a popup the user has closed. Every popup pin the panel makes is
-recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at start the
-citizen releases exactly those (a popup open when Quoin or the citizen went
-down would otherwise return as a pinned native page). Pins you made
-yourself are never touched.
+re-checks it after every Bus call — including between selecting the page and
+pinning it, undoing the pin if a close landed in between — so a rebuild
+already in flight does not leave a closed popup open. Every popup pin the
+panel makes is recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at
+start the citizen releases exactly those edges (a popup open when Quoin or
+the citizen went down would otherwise return as a pinned native page). A
+record is only dropped once Quoin has taken the unpin. Pin state is per edge,
+so a pin you set on a recorded edge after the citizen stopped is released
+too; edges the panel never pinned are never touched.
+
+Once every five minutes the clock tick also re-seeds the compositor watch
+and refetches windows, tray and notifications — a backstop for an event
+missed while comp restarted, not a poll (every change still arrives as an
+event).
 
 ## Limits
 
