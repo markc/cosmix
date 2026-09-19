@@ -49,7 +49,7 @@ $state = {
   launcher_open: false, calendar_open: false,
   query: "", category: "", apps: [], apps_loaded: false,
   cal_offset: 0, icons: {},
-  popup_gen: 0, clock_running: false, dirty: false, scheduled: false
+  popup_gen: 0, clock_running: false, peek_busy: false, dirty: false, scheduled: false
 }
 
 fn note($line)
@@ -264,7 +264,7 @@ fn fetch_notes()
   end
   $out = []
   for each $key, $n in $r
-    if starts_with($key, "n") and type($n) == "map" then
+    if re_match($key, "^n[0-9]+$") and type($n) == "map" then
       push($out, {id: slice($key, 1, length($key)), app: $n.app ?? "", summary: $n.summary ?? "", body: $n.body ?? "", created_at: $n.created_at ?? ""})
     end
   end
@@ -678,7 +678,14 @@ fn show_popup($edge, $page, $flag, $gen)
   end
   if not popup_live($flag, $gen) then return end
   panel_verb("shell.panel.pin", $edge, nil)
-  if not popup_live($flag, $gen) then hide_popup($edge) end
+  if not popup_live($flag, $gen) and not edge_in_use($edge) then hide_popup($edge) end
+end
+
+-- Whether an open popup (other than a stale render) currently owns an edge:
+-- a stale render must never hide a popup the user has since opened there.
+fn edge_in_use($edge)
+  if $edge == "left" then return $state.launcher_open end
+  return $state.calendar_open or $state.notes_open
 end
 
 -- Release a popup edge; drop it from the pin record only once the host has
@@ -837,7 +844,10 @@ end
 on tray desc "activate the clicked tray item" async
   reply(0, "")
   $node = node_of()
-  $key = replace(before($node, "_i") ?? $node, "tr_", "")
+  -- node ids are tr_<key> (the row) and tr_<key>_i (its icon); keys are
+  -- i<n>, so strip the prefix first, then the icon suffix
+  $key = starts_with($node, "tr_") ? slice($node, 3, length($node)) : ""
+  if ends_with($key, "_i") then $key = slice($key, 0, length($key) - 2) end
   if $key != "" then rpc($TRAY, "tray.activate", {id: $key}) end
 end
 
@@ -931,6 +941,20 @@ end
 
 on peek desc "peek at the desktop: minimise this workspace, click again to restore" async
   reply(0, "")
+  -- async, so two quick clicks could interleave and clobber each other's
+  -- restore marks: a second click while one is running is ignored
+  if $state.peek_busy then return end
+  $state.peek_busy = true
+  try
+    peek_toggle()
+  catch $e
+    note("peek failed: " .. to_string($e))
+  end
+  $state.peek_busy = false
+  schedule()
+end
+
+fn peek_toggle()
   fetch_windows()
   if length($state.peeked) > 0 then
     -- Restore exactly what this peek minimised: same id AND the generation
@@ -954,7 +978,6 @@ on peek desc "peek at the desktop: minimise this workspace, click again to resto
     end
     $state.peeked = $marks
   end
-  schedule()
 end
 
 on panel.refresh desc "rebuild every open scene now"
@@ -1012,6 +1035,11 @@ on clock.run async
         fetch_windows()
         fetch_tray()
         fetch_notes()
+        if $state.notes_open then render_notes() end
+        -- a release that failed while Quoin was down is retried here
+        for each $edge in read_pins()
+          if not edge_in_use($edge) then hide_popup($edge) end
+        end
       end
       render_panel()
       if $state.calendar_open then render_calendar() end
