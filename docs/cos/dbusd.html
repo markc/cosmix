@@ -550,27 +550,55 @@ side and <code>enable</code> once the other owner has released it.</p>
 <ul>
 <li><code>RegisterStatusNotifierItem</code> accepts both forms: a bus name (item at
 <code>/StatusNotifierItem</code>) or an object path (item on the caller's own
-connection — resolved the way KDE/libappindicator do). Re-registering
-a service replaces its item. Past 64 tracked items, registration is
-refused with <code>LimitsExceeded</code>.</li>
+connection — resolved the way KDE/libappindicator do). Everything
+checkable synchronously is refused with a D-Bus error, never an OK
+reply followed by a silent drop: <code>InvalidArgs</code> for a malformed name
+or path, <code>AccessDenied</code> unless the caller owns the bus name it
+registers (one client cannot squat the tray with other apps' items),
+<code>Failed</code> for an unowned name or a slow owner resolution (bounded at
+250 ms — the resolution runs in the interface on zbus's dispatch
+task, never in the run loop, so a flood of item signals cannot wedge
+the adapter behind it), <code>LimitsExceeded</code> past 64 items total or 8
+items per registering connection. Re-registering an already-tracked
+<code>(service, path)</code> replaces it — always allowed, even at the caps.</li>
 <li><code>RegisterStatusNotifierHost</code> records the host (cosmix itself already
 registered as host at startup, which is what makes
 <code>IsStatusNotifierHostRegistered</code> true the whole time the adapter
-runs). <code>ProtocolVersion</code> is 0.</li>
-<li><code>RegisteredStatusNotifierItems</code> lists the bus names items registered
-under — for path-form items, the caller's unique name.</li>
-<li><code>StatusNotifierItemRegistered</code> / <code>StatusNotifierItemUnregistered</code> /
-<code>StatusNotifierHostRegistered</code> signals accompany every change.</li>
-<li>Item lifetime is tracked by <code>NameOwnerChanged</code>: an item whose
-connection vanishes (or whose registered bus name loses or moves its
-owner) is removed. No polling anywhere.</li>
+runs) and a first-time registration emits
+<code>StatusNotifierHostRegistered</code>. Host registrations are capped at 64
+and pruned when their connection vanishes. <code>ProtocolVersion</code> is 0.</li>
+<li>Item identity is the <code>(service, path)</code> pair: one connection may host
+several path-form indicators, each tracked and advertised
+separately. <code>RegisteredStatusNotifierItems</code> — and the
+<code>StatusNotifierItemRegistered</code> / <code>StatusNotifierItemUnregistered</code>
+signals — carry <code>service + path</code> for every item (e.g.
+<code>org.kde.StatusNotifierItem-1/StatusNotifierItem</code> or
+<code>:1.23/org/ayatana/NotificationItem/nm_applet</code>), matching KDE's
+watcher.</li>
+<li>Item lifetime is tracked by <code>NameOwnerChanged</code>: an item goes when its
+registered bus name is released or moves to another owner, or when
+its connection itself vanishes (a unique name losing its owner). A
+connection releasing an <em>unrelated</em> name (MPRIS, anything) reaps
+nothing. No polling anywhere.</li>
 <li>Item properties (<code>Id</code>, <code>Title</code>, <code>Category</code>, <code>Status</code>, <code>IconName</code>,
 <code>IconThemePath</code>, <code>AttentionIconName</code>, <code>ToolTip</code>, <code>Menu</code>,
 <code>ItemIsMenu</code>, <code>IconPixmap</code>) are read once at registration and
-refreshed on the item's <code>New*</code> signals. <code>Status</code> defaults to <code>Active</code>
-when an item does not implement it. Every D-Bus call to an item runs
-under a timeout (2 s verbs, 3 s menu reads, 3 s property refresh), so
-a hung app surfaces as a refusal and never wedges the adapter.</li>
+refreshed on the item's <code>New*</code> signals, one typed <code>Get</code> per property
+— never <code>GetAll</code>: pixmap data inside a reply deserializes per byte,
+so every reply body is checked against a raw-size cap <em>before</em> any
+deserialization (4 MiB general, 1.25 MiB for the pixmap-bearing
+<code>IconPixmap</code>/<code>ToolTip</code> replies — zbus itself accepts messages up to
+128 MiB). An over-cap reply is refused undecoded: the pixmap is
+dropped, the refusal counted in <code>tray.info</code>'s <code>oversized_reads</code>, and
+the daemon's memory never amplifies. A pixmap entry only counts when
+<code>data.len() == width * height * 4</code> (ARGB32) and fits 1 MiB. <code>Status</code>
+defaults to <code>Active</code> when an item does not implement it; a <code>Menu</code>
+of <code>/NO_DBUSMENU</code> means no menu. Refreshes of one item are coalesced
+to at most one per 250 ms (a <code>NewIcon</code> flood cannot loop the item's
+own property reads; the freshest signal still converges). Every
+D-Bus call to an item runs under a timeout (2 s verbs, 3 s menu
+reads and property refresh), proxy builds included, so a hung app
+surfaces as a refusal and never wedges the adapter.</li>
 </ul>
 <p>ABP side — the <code>tray</code> Bus service (mesh-open; no caller authorization):</p>
 <ul>
@@ -585,22 +613,40 @@ and <code>pixmap_height</code> record the largest available size, and the
 <code>{width, height, encoding: "argb32-network-order", argb_b64}</code> — the
 raw SNI bytes (ARGB32, network byte order, row-major, no padding),
 base64-encoded.</li>
+<li>Verbs dispatch concurrently (bounded at 8 in flight): an item
+hanging on its 2-3 s timeout delays only its own verb, never
+<code>tray.list</code> or <code>tray.props.get</code> behind it.</li>
 <li>Verbs: <code>tray.list</code>; <code>tray.activate {id, x?, y?}</code>,
 <code>tray.secondary_activate</code>, <code>tray.context_menu</code>, <code>tray.scroll {id, delta, orientation}</code> (horizontal|vertical); <code>tray.icon {id}</code>;
-<code>tray.menu {id}</code> → the item's com.canonical.dbusmenu layout
-(<code>GetLayout(0, -1)</code>) as a JSON tree of
-<code>{id, label, enabled, visible, type, toggle-type, toggle-state, children}</code> nodes (absent <code>enabled</code>/<code>visible</code> are the dbusmenu default
-<code>true</code>; the tree is capped at 512 nodes); <code>tray.menu.click {id, item}</code>
-→ dbusmenu <code>Event(item, "clicked")</code>. Unknown ids and bad arguments
-are refusals (rc 10), never panics.</li>
+<code>tray.menu {id}</code> → the item's com.canonical.dbusmenu layout —
+<code>AboutToShow(0)</code> first (the dbusmenu hook for lazily-built submenus),
+then <code>GetLayout(0, -1, propertyNames)</code> with the names pinned to the
+small set the adapter surfaces, <code>icon-data</code> excluded — as a JSON
+tree of <code>{id, label, enabled, visible, type, toggle_type, toggle_state, truncated, children}</code> nodes (absent <code>enabled</code>/<code>visible</code>
+are the dbusmenu default <code>true</code>; the tree is capped at 512 nodes and
+a cut tree carries <code>"truncated": true</code>); <code>tray.menu.click {id, item}</code>
+→ dbusmenu <code>Event(item, "clicked")</code> with the spec's <code>(i s v u)</code>
+body — a single-variant data, a u32 timestamp. Unknown ids and bad
+arguments are refusals (rc 10), never panics.</li>
 <li>Events <code>tray.item.added</code> / <code>tray.item.changed</code> / <code>tray.item.removed</code>
 plus <code>tray.props.changed</code> diffs, each stamped with a per-adapter-run
-monotonic <code>event_seq</code> — a gap means events were dropped; re-read
-<code>tray.props.get</code>. <code>tray.info</code> carries the current counter, the host
-list and a bounded ring of recent events.</li>
+monotonic <code>event_seq</code> — one shape everywhere: a JSON number in verb
+and event bodies, a decimal string in <code>BusMessage</code> headers. A gap
+means events were dropped; re-read <code>tray.props.get</code>. <code>tray.info</code>
+carries the current counter, the host list, the <code>oversized_reads</code>
+refusal count and a bounded ring of recent events.</li>
+<li>A Bus (mesh) outage never ends the run: the broker reconnects the
+<code>tray</code> Bus client inside the run and the publisher keeps its diff
+baseline, so the next event re-diffs the whole outage window and
+items survive. Only the stop signal, session-bus death (observed on
+the zbus connection's closed signal) or a real internal fault ends a
+run.</li>
 </ul>
-<p>Bounds: 64 items, 4096 chars per string, 1 MiB per stored pixmap
-(largest wins), 512 menu nodes per layout read.</p></div></div>
+<p>Bounds: 64 items (8 per registering connection), 64 hosts, 4096 chars
+per string, 1 MiB per stored pixmap (largest wins, <code>w*h*4</code> bytes
+exactly), 4 MiB raw reply cap before any deserialization (1.25 MiB for
+pixmap-bearing replies), 512 menu nodes per layout read, one refresh
+per item per 250 ms.</p></div></div>
     </div>
 
 </main>

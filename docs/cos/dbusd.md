@@ -123,27 +123,55 @@ D-Bus side (inbound, per the SNI convention):
 
 - `RegisterStatusNotifierItem` accepts both forms: a bus name (item at
   `/StatusNotifierItem`) or an object path (item on the caller's own
-  connection — resolved the way KDE/libappindicator do). Re-registering
-  a service replaces its item. Past 64 tracked items, registration is
-  refused with `LimitsExceeded`.
+  connection — resolved the way KDE/libappindicator do). Everything
+  checkable synchronously is refused with a D-Bus error, never an OK
+  reply followed by a silent drop: `InvalidArgs` for a malformed name
+  or path, `AccessDenied` unless the caller owns the bus name it
+  registers (one client cannot squat the tray with other apps' items),
+  `Failed` for an unowned name or a slow owner resolution (bounded at
+  250 ms — the resolution runs in the interface on zbus's dispatch
+  task, never in the run loop, so a flood of item signals cannot wedge
+  the adapter behind it), `LimitsExceeded` past 64 items total or 8
+  items per registering connection. Re-registering an already-tracked
+  `(service, path)` replaces it — always allowed, even at the caps.
 - `RegisterStatusNotifierHost` records the host (cosmix itself already
   registered as host at startup, which is what makes
   `IsStatusNotifierHostRegistered` true the whole time the adapter
-  runs). `ProtocolVersion` is 0.
-- `RegisteredStatusNotifierItems` lists the bus names items registered
-  under — for path-form items, the caller's unique name.
-- `StatusNotifierItemRegistered` / `StatusNotifierItemUnregistered` /
-  `StatusNotifierHostRegistered` signals accompany every change.
-- Item lifetime is tracked by `NameOwnerChanged`: an item whose
-  connection vanishes (or whose registered bus name loses or moves its
-  owner) is removed. No polling anywhere.
+  runs) and a first-time registration emits
+  `StatusNotifierHostRegistered`. Host registrations are capped at 64
+  and pruned when their connection vanishes. `ProtocolVersion` is 0.
+- Item identity is the `(service, path)` pair: one connection may host
+  several path-form indicators, each tracked and advertised
+  separately. `RegisteredStatusNotifierItems` — and the
+  `StatusNotifierItemRegistered` / `StatusNotifierItemUnregistered`
+  signals — carry `service + path` for every item (e.g.
+  `org.kde.StatusNotifierItem-1/StatusNotifierItem` or
+  `:1.23/org/ayatana/NotificationItem/nm_applet`), matching KDE's
+  watcher.
+- Item lifetime is tracked by `NameOwnerChanged`: an item goes when its
+  registered bus name is released or moves to another owner, or when
+  its connection itself vanishes (a unique name losing its owner). A
+  connection releasing an *unrelated* name (MPRIS, anything) reaps
+  nothing. No polling anywhere.
 - Item properties (`Id`, `Title`, `Category`, `Status`, `IconName`,
   `IconThemePath`, `AttentionIconName`, `ToolTip`, `Menu`,
   `ItemIsMenu`, `IconPixmap`) are read once at registration and
-  refreshed on the item's `New*` signals. `Status` defaults to `Active`
-  when an item does not implement it. Every D-Bus call to an item runs
-  under a timeout (2 s verbs, 3 s menu reads, 3 s property refresh), so
-  a hung app surfaces as a refusal and never wedges the adapter.
+  refreshed on the item's `New*` signals, one typed `Get` per property
+  — never `GetAll`: pixmap data inside a reply deserializes per byte,
+  so every reply body is checked against a raw-size cap *before* any
+  deserialization (4 MiB general, 1.25 MiB for the pixmap-bearing
+  `IconPixmap`/`ToolTip` replies — zbus itself accepts messages up to
+  128 MiB). An over-cap reply is refused undecoded: the pixmap is
+  dropped, the refusal counted in `tray.info`'s `oversized_reads`, and
+  the daemon's memory never amplifies. A pixmap entry only counts when
+  `data.len() == width * height * 4` (ARGB32) and fits 1 MiB. `Status`
+  defaults to `Active` when an item does not implement it; a `Menu`
+  of `/NO_DBUSMENU` means no menu. Refreshes of one item are coalesced
+  to at most one per 250 ms (a `NewIcon` flood cannot loop the item's
+  own property reads; the freshest signal still converges). Every
+  D-Bus call to an item runs under a timeout (2 s verbs, 3 s menu
+  reads and property refresh), proxy builds included, so a hung app
+  surfaces as a refusal and never wedges the adapter.
 
 ABP side — the `tray` Bus service (mesh-open; no caller authorization):
 
@@ -159,21 +187,39 @@ ABP side — the `tray` Bus service (mesh-open; no caller authorization):
   `{width, height, encoding: "argb32-network-order", argb_b64}` — the
   raw SNI bytes (ARGB32, network byte order, row-major, no padding),
   base64-encoded.
+- Verbs dispatch concurrently (bounded at 8 in flight): an item
+  hanging on its 2-3 s timeout delays only its own verb, never
+  `tray.list` or `tray.props.get` behind it.
 - Verbs: `tray.list`; `tray.activate {id, x?, y?}`,
   `tray.secondary_activate`, `tray.context_menu`, `tray.scroll {id,
   delta, orientation}` (horizontal|vertical); `tray.icon {id}`;
-  `tray.menu {id}` → the item's com.canonical.dbusmenu layout
-  (`GetLayout(0, -1)`) as a JSON tree of
-  `{id, label, enabled, visible, type, toggle-type, toggle-state,
-  children}` nodes (absent `enabled`/`visible` are the dbusmenu default
-  `true`; the tree is capped at 512 nodes); `tray.menu.click {id, item}`
-  → dbusmenu `Event(item, "clicked")`. Unknown ids and bad arguments
-  are refusals (rc 10), never panics.
+  `tray.menu {id}` → the item's com.canonical.dbusmenu layout —
+  `AboutToShow(0)` first (the dbusmenu hook for lazily-built submenus),
+  then `GetLayout(0, -1, propertyNames)` with the names pinned to the
+  small set the adapter surfaces, `icon-data` excluded — as a JSON
+  tree of `{id, label, enabled, visible, type, toggle_type,
+  toggle_state, truncated, children}` nodes (absent `enabled`/`visible`
+  are the dbusmenu default `true`; the tree is capped at 512 nodes and
+  a cut tree carries `"truncated": true`); `tray.menu.click {id, item}`
+  → dbusmenu `Event(item, "clicked")` with the spec's `(i s v u)`
+  body — a single-variant data, a u32 timestamp. Unknown ids and bad
+  arguments are refusals (rc 10), never panics.
 - Events `tray.item.added` / `tray.item.changed` / `tray.item.removed`
   plus `tray.props.changed` diffs, each stamped with a per-adapter-run
-  monotonic `event_seq` — a gap means events were dropped; re-read
-  `tray.props.get`. `tray.info` carries the current counter, the host
-  list and a bounded ring of recent events.
+  monotonic `event_seq` — one shape everywhere: a JSON number in verb
+  and event bodies, a decimal string in `BusMessage` headers. A gap
+  means events were dropped; re-read `tray.props.get`. `tray.info`
+  carries the current counter, the host list, the `oversized_reads`
+  refusal count and a bounded ring of recent events.
+- A Bus (mesh) outage never ends the run: the broker reconnects the
+  `tray` Bus client inside the run and the publisher keeps its diff
+  baseline, so the next event re-diffs the whole outage window and
+  items survive. Only the stop signal, session-bus death (observed on
+  the zbus connection's closed signal) or a real internal fault ends a
+  run.
 
-Bounds: 64 items, 4096 chars per string, 1 MiB per stored pixmap
-(largest wins), 512 menu nodes per layout read.
+Bounds: 64 items (8 per registering connection), 64 hosts, 4096 chars
+per string, 1 MiB per stored pixmap (largest wins, `w*h*4` bytes
+exactly), 4 MiB raw reply cap before any deserialization (1.25 MiB for
+pixmap-bearing replies), 512 menu nodes per layout read, one refresh
+per item per 250 ms.

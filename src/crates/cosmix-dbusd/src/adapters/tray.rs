@@ -12,8 +12,17 @@
 //! `NameOwnerChanged` — an item whose connection vanishes is removed; no
 //! polling anywhere. Every D-Bus call to an item runs under a timeout so
 //! a hung app can never wedge the adapter.
+//!
+//! Only three things end a run: the stop signal, session-bus death
+//! (observed on the zbus connection's closed signal), or a real internal
+//! fault. A Bus (mesh) outage never does: the broker reconnects the
+//! `tray` Bus client inside the run and the publisher keeps its diff
+//! baseline, so items survive the outage instead of being wiped by a
+//! restart.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -25,7 +34,7 @@ use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 use futures_util::StreamExt;
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use zbus::fdo::{self, DBusProxy};
 use zbus::message::{Header, Message, Type as MessageType};
 use zbus::names::WellKnownName;
@@ -48,6 +57,20 @@ const MENU_IFACE: &str = "com.canonical.dbusmenu";
 const DEFAULT_ITEM_PATH: &str = "/StatusNotifierItem";
 /// Items registering by object path sit on the caller's own connection.
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
+/// The sentinel some items use in the Menu property for "no menu".
+const NO_DBUSMENU_PATH: &str = "/NO_DBUSMENU";
+/// dbusmenu property names requested from GetLayout. `icon-data` (a
+/// pixmap per node) is deliberately absent: menu labels are tiny, node
+/// pixmaps are not, and the tray host does not render menus.
+const MENU_PROPERTY_NAMES: [&str; 7] = [
+    "type",
+    "label",
+    "enabled",
+    "visible",
+    "children-display",
+    "toggle-type",
+    "toggle-state",
+];
 
 pub const BUS_SERVICE: &str = "tray";
 pub const TOPIC_ITEM_ADDED: &str = "tray.item.added";
@@ -57,8 +80,24 @@ pub const TOPIC_ITEM_REMOVED: &str = "tray.item.removed";
 // Resource bounds. An SNI item is a small metadata record; these caps keep
 // a hostile or broken app from ballooning the adapter's memory.
 const MAX_ITEMS: usize = 64;
+/// Per registering connection: one client must not be able to squat the
+/// whole tray with items it does not own.
+const MAX_ITEMS_PER_OWNER: usize = 8;
+/// External StatusNotifierHost registrations, pruned when their
+/// connection vanishes.
+const MAX_HOSTS: usize = 64;
 const MAX_STRING_CHARS: usize = 4096;
 const MAX_PIXMAP_BYTES: usize = 1024 * 1024;
+/// Cap on any single raw D-Bus reply body BEFORE deserialization: zbus
+/// accepts messages up to 128 MiB, and deserializing a pixmap as
+/// per-byte values amplifies it before the 1 MiB pixmap cap could
+/// apply. A reply over the cap is dropped, never decoded.
+const MAX_RAW_REPLY_BYTES: usize = 4 * 1024 * 1024;
+/// Tighter cap for pixmap-bearing property replies (`IconPixmap`,
+/// `ToolTip`): one stored pixmap is at most [`MAX_PIXMAP_BYTES`], so a
+/// larger total can only be hostile or broken. Applied for the same
+/// reason as [`MAX_RAW_REPLY_BYTES`].
+const MAX_PIXMAP_REPLY_BYTES: usize = MAX_PIXMAP_BYTES + MAX_PIXMAP_BYTES / 4;
 const MAX_MENU_NODES: usize = 512;
 /// How many recent events the ring keeps for `tray.info` / tests.
 const RECENT_EVENTS: usize = 128;
@@ -68,6 +107,16 @@ const RECENT_EVENTS: usize = 128;
 const ITEM_CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const MENU_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const REFRESH_BUDGET: Duration = Duration::from_secs(3);
+/// Owner resolution inside the watcher interface: bounded so a wedged
+/// resolution surfaces as an error reply, never a hang.
+const RESOLVE_TIMEOUT: Duration = Duration::from_millis(250);
+/// Minimum spacing between property refreshes of one item: an item
+/// flooding New* signals cannot loop its own refresh.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+/// Property refreshes in flight at once (each holds a decoded reply).
+const MAX_CONCURRENT_REFRESHES: usize = 8;
+/// Verb dispatches in flight at once on the Bus side.
+const MAX_CONCURRENT_VERBS: usize = 8;
 
 // Bus-side timings, mirroring the daemon citizen's broker loop.
 const BUS_PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -156,7 +205,9 @@ fn truncate(string: &mut String, limit: usize) {
 /// One tracked tray item. `service` is the bus name under which it
 /// registered (a well-known name, or the caller's unique name for the
 /// path form); `owner` is the unique name of the connection currently
-/// serving it — the key for NameOwnerChanged reaping.
+/// serving it — the key for NameOwnerChanged reaping. Identity (and
+/// dedup) is the `(service, path)` pair: a connection may host several
+/// path-form items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayItem {
     pub key: String,
@@ -164,6 +215,15 @@ pub struct TrayItem {
     pub path: String,
     pub owner: String,
     pub props: ItemProps,
+}
+
+impl TrayItem {
+    /// The name under which the watcher advertises the item —
+    /// `service + path` for every item, matching KDE's watcher (so a
+    /// panel can tell two indicators on one connection apart).
+    pub fn registered_name(&self) -> String {
+        format!("{}{}", self.service, self.path)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,7 +257,11 @@ impl ItemEventKind {
 pub struct ItemEvent {
     pub kind: ItemEventKind,
     pub key: String,
+    /// The raw bus name the item registered under.
     pub service: String,
+    /// The watcher-surface name (`service + path`) the item is
+    /// advertised as — what Registered/Unregistered signals carry.
+    pub registered: String,
     pub seq: u64,
 }
 
@@ -210,14 +274,20 @@ pub struct TrayState {
     host_registered: bool,
     hosts: BTreeSet<String>,
     recent_events: VecDeque<ItemEvent>,
+    /// Property replies refused by the raw-size cap since the run
+    /// started (surfaced by `tray.info`).
+    oversized_reads: usize,
 }
 
 impl TrayState {
     /// Register an item, replacing any existing item with the same
-    /// service (re-registration is KDE's update idiom). Refuses past
-    /// [`MAX_ITEMS`]. Returns the fresh key plus the events (removed
-    /// first, then added). Keys are `i<n>` with a never-reused counter:
-    /// stable for the item's lifetime, gone after removal.
+    /// `(service, path)` (re-registration is KDE's update idiom — and a
+    /// replacement is always allowed, even at the item cap). A new item
+    /// is refused past [`MAX_ITEMS`] or past [`MAX_ITEMS_PER_OWNER`]
+    /// items for the registering connection. Returns the fresh key plus
+    /// the events (removed first, then added). Keys are `i<n>` with a
+    /// never-reused counter: stable for the item's lifetime, gone after
+    /// removal.
     pub fn register(
         &mut self,
         service: String,
@@ -225,37 +295,75 @@ impl TrayState {
         owner: String,
         props: ItemProps,
     ) -> std::result::Result<(String, Vec<ItemEvent>), String> {
-        if self.items.len() >= MAX_ITEMS {
-            return Err(format!(
-                "tray item limit reached ({MAX_ITEMS}); refusing to track {service}"
-            ));
+        let replacing = self
+            .items
+            .values()
+            .any(|item| item.service == service && item.path == path);
+        if !replacing {
+            if self.items.len() >= MAX_ITEMS {
+                return Err(format!(
+                    "tray item limit reached ({MAX_ITEMS}); refusing to track {service}{path}"
+                ));
+            }
+            let per_owner = self
+                .items
+                .values()
+                .filter(|item| item.owner == owner)
+                .count();
+            if per_owner >= MAX_ITEMS_PER_OWNER {
+                return Err(format!(
+                    "tray per-connection item limit reached ({MAX_ITEMS_PER_OWNER}); \
+                     refusing to track {service}{path} for {owner}"
+                ));
+            }
         }
         let mut events = Vec::new();
         let doomed: Vec<String> = self
             .items
             .values()
-            .filter(|item| item.service == service)
+            .filter(|item| item.service == service && item.path == path)
             .map(|item| item.key.clone())
             .collect();
         for key in doomed {
             if let Some(item) = self.items.remove(&key) {
-                events.push(self.stamp(ItemEventKind::Removed, item.key, item.service));
+                events.push(self.stamp(ItemEventKind::Removed, &item));
             }
         }
         let key = format!("i{}", self.next_key);
         self.next_key += 1;
-        self.items.insert(
-            key.clone(),
-            TrayItem {
-                key: key.clone(),
-                service: service.clone(),
-                path,
-                owner,
-                props,
-            },
-        );
-        events.push(self.stamp(ItemEventKind::Added, key.clone(), service));
+        let item = TrayItem {
+            key: key.clone(),
+            service,
+            path,
+            owner,
+            props,
+        };
+        let event = self.stamp(ItemEventKind::Added, &item);
+        let key = item.key.clone();
+        self.items.insert(key.clone(), item);
+        events.push(event);
         Ok((key, events))
+    }
+
+    /// Whether a registration should be accepted — the interface's
+    /// synchronous check, so a refusal is a D-Bus error reply rather
+    /// than an OK followed by a silent drop.
+    pub fn can_accept(&self, service: &str, path: &str, owner: &str) -> bool {
+        if self
+            .items
+            .values()
+            .any(|item| item.service == service && item.path == path)
+        {
+            // Replacement: always accepted (m2).
+            return true;
+        }
+        self.items.len() < MAX_ITEMS
+            && self
+                .items
+                .values()
+                .filter(|item| item.owner == owner)
+                .count()
+                < MAX_ITEMS_PER_OWNER
     }
 
     /// Apply a fresh property read. No event when nothing changed — a
@@ -267,47 +375,69 @@ impl TrayState {
         if item.props == props {
             return Vec::new();
         }
-        let (key, service) = (item.key.clone(), item.service.clone());
+        let (key, service, path) = (item.key.clone(), item.service.clone(), item.path.clone());
         item.props = props;
-        vec![self.stamp(ItemEventKind::Changed, key, service)]
+        vec![self.stamp_parts(ItemEventKind::Changed, key, service, path)]
     }
 
-    /// Reap items after a `NameOwnerChanged`: when `new_owner` is empty,
-    /// every item owned by the vanished connection goes, plus items whose
-    /// registered service lost its name; when the name merely moved
-    /// owners, items registered under that service go (the instance they
-    /// were registered from is gone).
+    /// Reap items after a `NameOwnerChanged`: an item goes when its
+    /// registered bus name is released or moves to another owner, or
+    /// when its connection itself vanishes (a unique name losing its
+    /// owner). A connection merely releasing an *unrelated* name (MPRIS,
+    /// anything) reaps nothing. Host registrations from a vanished
+    /// connection are pruned here too.
     pub fn remove_by_bus_change(
         &mut self,
         name: &str,
         old_owner: &str,
         new_owner: &str,
     ) -> Vec<ItemEvent> {
+        // A unique name going empty-owner IS its connection dying.
+        let connection_vanished = new_owner.is_empty() && name == old_owner;
         let mut events = Vec::new();
         let doomed: Vec<String> = self
             .items
             .values()
             .filter(|item| {
-                item.owner == old_owner
-                    || (item.service == name && new_owner.is_empty())
+                (item.service == name && new_owner.is_empty())
                     || (item.service == name && !old_owner.is_empty() && !new_owner.is_empty())
+                    || (connection_vanished && item.owner == old_owner)
             })
             .map(|item| item.key.clone())
             .collect();
         for key in doomed {
             if let Some(item) = self.items.remove(&key) {
-                events.push(self.stamp(ItemEventKind::Removed, item.key, item.service));
+                events.push(self.stamp(ItemEventKind::Removed, &item));
             }
+        }
+        if connection_vanished {
+            self.hosts.remove(name);
         }
         events
     }
 
-    fn stamp(&mut self, kind: ItemEventKind, key: String, service: String) -> ItemEvent {
+    fn stamp(&mut self, kind: ItemEventKind, item: &TrayItem) -> ItemEvent {
+        self.stamp_parts(
+            kind,
+            item.key.clone(),
+            item.service.clone(),
+            item.path.clone(),
+        )
+    }
+
+    fn stamp_parts(
+        &mut self,
+        kind: ItemEventKind,
+        key: String,
+        service: String,
+        path: String,
+    ) -> ItemEvent {
         self.next_event_seq += 1;
         let event = ItemEvent {
             kind,
             key,
-            service,
+            service: service.clone(),
+            registered: format!("{service}{path}"),
             seq: self.next_event_seq,
         };
         self.recent_events.push_back(event.clone());
@@ -336,13 +466,13 @@ impl TrayState {
         items
     }
 
-    /// The `RegisteredStatusNotifierItems` surface: the bus name each
-    /// item registered under (the caller's unique name for the path
-    /// form, matching KDE's watcher).
-    pub fn registered_services(&self) -> Vec<String> {
+    /// The `RegisteredStatusNotifierItems` surface: `service + path` for
+    /// every item (the caller's unique name + path for the path form),
+    /// matching KDE's watcher.
+    pub fn registered_names(&self) -> Vec<String> {
         self.items_in_order()
             .into_iter()
-            .map(|item| item.service.clone())
+            .map(|item| item.registered_name())
             .collect()
     }
 
@@ -358,6 +488,14 @@ impl TrayState {
         &self.recent_events
     }
 
+    pub fn note_oversized_read(&mut self) {
+        self.oversized_reads += 1;
+    }
+
+    pub fn oversized_reads(&self) -> usize {
+        self.oversized_reads
+    }
+
     /// Cosmix is the host: set once the watcher name is acquired.
     pub fn set_host_registered(&mut self, registered: bool) {
         self.host_registered = registered;
@@ -367,13 +505,19 @@ impl TrayState {
         self.host_registered
     }
 
-    /// Record an external StatusNotifierHost registration. Returns true
-    /// when this is the first host — normally a moot transition, because
-    /// cosmix self-registered as the host at startup.
-    pub fn add_host(&mut self, caller: String) -> bool {
-        let first = self.hosts.is_empty();
+    /// Record an external StatusNotifierHost registration. `Ok(true)`
+    /// when this is a new host (the caller emits
+    /// StatusNotifierHostRegistered); an error when the host cap is
+    /// full.
+    pub fn add_host(&mut self, caller: String) -> std::result::Result<bool, String> {
+        if self.hosts.contains(&caller) {
+            return Ok(false);
+        }
+        if self.hosts.len() >= MAX_HOSTS {
+            return Err(format!("tray host limit reached ({MAX_HOSTS})"));
+        }
         self.hosts.insert(caller);
-        first
+        Ok(true)
     }
 
     pub fn hosts(&self) -> Vec<String> {
@@ -590,6 +734,9 @@ fn push(leaves: &mut Vec<(PropPath, PropValue)>, path: &str, value: PropValue) {
 
 /// One menu node from GetLayout `(ia{sv}av)`: id, sparse property dict
 /// (dbusmenu defaults apply for absent keys), variant-wrapped children.
+/// A node whose children were cut by the budget or a malformed subtree
+/// carries `"truncated": true` — a partial tree is never presented as
+/// complete.
 pub(crate) fn menu_node_json(value: &Value<'_>, budget: &mut usize) -> Option<Json> {
     let value = match value {
         Value::Value(inner) => inner.as_ref(),
@@ -614,14 +761,23 @@ pub(crate) fn menu_node_json(value: &Value<'_>, budget: &mut usize) -> Option<Js
     };
     let mut label = dict_str(properties, "label").unwrap_or_default();
     truncate(&mut label, MAX_STRING_CHARS);
-    let node_type = dict_str(properties, "type").unwrap_or_else(|| "standard".into());
+    let mut node_type = dict_str(properties, "type").unwrap_or_else(|| "standard".into());
+    truncate(&mut node_type, MAX_STRING_CHARS);
+    let mut toggle_type = dict_str(properties, "toggle-type");
+    if let Some(toggle_type) = &mut toggle_type {
+        truncate(toggle_type, MAX_STRING_CHARS);
+    }
+    let mut truncated = false;
     let mut children_json = Vec::new();
     for child in children.iter() {
         match menu_node_json(child, budget) {
-            // Budget spent or a malformed subtree: stop instead of
-            // presenting a silently partial tree as complete.
             Some(node) => children_json.push(node),
-            None => break,
+            // Budget spent or a malformed subtree: stop and say so
+            // instead of presenting a silently partial tree.
+            None => {
+                truncated = true;
+                break;
+            }
         }
     }
     Some(json!({
@@ -631,8 +787,9 @@ pub(crate) fn menu_node_json(value: &Value<'_>, budget: &mut usize) -> Option<Js
         "enabled": dict_bool(properties, "enabled").unwrap_or(true),
         "visible": dict_bool(properties, "visible").unwrap_or(true),
         "type": node_type,
-        "toggle_type": dict_str(properties, "toggle-type"),
+        "toggle_type": toggle_type,
         "toggle_state": dict_i32(properties, "toggle-state"),
+        "truncated": truncated,
         "children": children_json,
     }))
 }
@@ -714,9 +871,22 @@ pub(crate) fn base64_encode(data: &[u8]) -> String {
 // ===========================================================================
 
 /// Registration requests hop from the interface (which must reply fast)
-/// to the run loop, which resolves owners, fetches props and publishes.
+/// to the run loop, which mutates state, emits signals and publishes.
+/// The interface fully resolves a registration — service, path and
+/// owner — because the run loop must never await the bus (a resolution
+/// in the loop stalls the item-signal drain, and with >128 queued item
+/// signals zbus's reader blocks on the full stream: the reply never
+/// arrives and the adapter wedges). Here, instead, resolution runs on
+/// zbus's own dispatch task, bounded by [`RESOLVE_TIMEOUT`].
 enum WatcherMsg {
-    RegisterItem { caller: String, arg: String },
+    RegisterItem {
+        service: String,
+        path: String,
+        owner: String,
+    },
+    RegisterHost {
+        caller: String,
+    },
 }
 
 struct WatcherIface {
@@ -724,15 +894,31 @@ struct WatcherIface {
     registrations: mpsc::Sender<WatcherMsg>,
 }
 
+/// Errors that just mean "the item does not implement this property":
+/// the SNI default applies instead of failing the read.
+fn is_unknown_property(error: &zbus::Error) -> bool {
+    matches!(
+        error,
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownProperty"
+                || name.as_str() == "org.freedesktop.DBus.Error.InvalidArgs"
+    )
+}
+
 #[interface(name = "org.kde.StatusNotifierWatcher")]
 impl WatcherIface {
     /// `RegisterStatusNotifierItem(s)` — the argument is the item's bus
     /// name (object at /StatusNotifierItem) or its object path (item on
     /// the caller's own connection), as KDE/libappindicator accept both.
+    /// Everything checkable synchronously is checked here and refused
+    /// with a D-Bus error — never an OK reply followed by a silent
+    /// drop. A name-form registration must come from the name's owner:
+    /// one client cannot squat the tray with items served by others.
     async fn register_status_notifier_item(
         &self,
         service_or_path: &str,
         #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
     ) -> fdo::Result<()> {
         let caller = header
             .sender()
@@ -740,26 +926,70 @@ impl WatcherIface {
             .ok_or_else(|| {
                 fdo::Error::Failed("RegisterStatusNotifierItem needs a sender".into())
             })?;
-        if service_or_path.is_empty() {
+        if service_or_path.is_empty() || service_or_path.len() > MAX_STRING_CHARS {
             return Err(fdo::Error::InvalidArgs(
                 "RegisterStatusNotifierItem requires a bus name or object path".into(),
             ));
         }
-        if lock_state(&self.store).count() >= MAX_ITEMS {
+        let (service, path, owner) = if service_or_path.starts_with('/') {
+            // Path form: the item sits on the caller's own connection.
+            let object_path = zvariant::ObjectPath::try_from(service_or_path)
+                .map_err(|error| fdo::Error::InvalidArgs(format!("not an object path: {error}")))?;
+            (caller.clone(), object_path.to_string(), caller)
+        } else {
+            let name = zbus::names::BusName::try_from(service_or_path)
+                .map_err(|error| fdo::Error::InvalidArgs(format!("not a bus name: {error}")))?;
+            // Bounded owner resolution off the run loop (see WatcherMsg).
+            let dbus = DBusProxy::new(connection)
+                .await
+                .map_err(|error| fdo::Error::Failed(format!("bus proxy failed: {error}")))?;
+            let owner = match tokio::time::timeout(
+                RESOLVE_TIMEOUT,
+                dbus.get_name_owner(name.clone()),
+            )
+            .await
+            {
+                Ok(Ok(owner)) => owner,
+                Ok(Err(_)) => {
+                    return Err(fdo::Error::Failed(format!(
+                        "{service_or_path} has no owner on the bus"
+                    )));
+                }
+                Err(_) => {
+                    return Err(fdo::Error::Failed(
+                        "owner resolution timed out; retry the registration".into(),
+                    ));
+                }
+            };
+            if owner.as_str() != caller {
+                return Err(fdo::Error::AccessDenied(format!(
+                    "only {service_or_path}'s owner may register it as a tray item"
+                )));
+            }
+            (
+                service_or_path.to_string(),
+                DEFAULT_ITEM_PATH.to_string(),
+                owner.to_string(),
+            )
+        };
+        if !lock_state(&self.store).can_accept(&service, &path, &owner) {
             return Err(fdo::Error::LimitsExceeded(format!(
-                "tray item limit reached ({MAX_ITEMS})"
+                "tray item limits reached ({MAX_ITEMS} total, {MAX_ITEMS_PER_OWNER} per \
+                 connection); refusing to track {service}{path}"
             )));
         }
         self.registrations
             .try_send(WatcherMsg::RegisterItem {
-                caller,
-                arg: service_or_path.to_string(),
+                service,
+                path,
+                owner,
             })
             .map_err(|_| fdo::Error::Failed("tray adapter is busy; retry".into()))
     }
 
     /// `RegisterStatusNotifierHost(s)` — recorded (cosmix is itself the
-    /// host, so the host-registered signal fired at startup already).
+    /// host); a first-time registration makes the run loop emit
+    /// `StatusNotifierHostRegistered`.
     async fn register_status_notifier_host(
         &self,
         #[zbus(header)] header: Header<'_>,
@@ -770,13 +1000,23 @@ impl WatcherIface {
             .ok_or_else(|| {
                 fdo::Error::Failed("RegisterStatusNotifierHost needs a sender".into())
             })?;
-        lock_state(&self.store).add_host(caller);
-        Ok(())
+        let accepted = {
+            let hosts = lock_state(&self.store).hosts();
+            hosts.len() < MAX_HOSTS || hosts.contains(&caller)
+        };
+        if !accepted {
+            return Err(fdo::Error::LimitsExceeded(format!(
+                "tray host limit reached ({MAX_HOSTS})"
+            )));
+        }
+        self.registrations
+            .try_send(WatcherMsg::RegisterHost { caller })
+            .map_err(|_| fdo::Error::Failed("tray adapter is busy; retry".into()))
     }
 
     #[zbus(property)]
     async fn registered_status_notifier_items(&self) -> fdo::Result<Vec<String>> {
-        Ok(lock_state(&self.store).registered_services())
+        Ok(lock_state(&self.store).registered_names())
     }
 
     /// True while this adapter runs — cosmix is the host.
@@ -810,84 +1050,203 @@ impl WatcherIface {
 // D-Bus side: reading items
 // ===========================================================================
 
-/// Read one item's property set as [`ItemProps`] within
-/// [`REFRESH_BUDGET`]. Missing properties take their SNI defaults; a
-/// total failure returns `None` (a refresh error must not wipe known
-/// good props with blanks).
-async fn fetch_item_props(connection: &Connection, service: &str, path: &str) -> Option<ItemProps> {
+/// Why a property read gave up before producing a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadStop {
+    Timeout,
+    Transport,
+    Oversized,
+}
+
+/// One item property, read individually via `org.freedesktop.DBus
+/// .Properties.Get` — never `GetAll`: a pixmap inside a reply is
+/// deserialized per byte into values, so the raw reply body is checked
+/// against `cap` BEFORE any deserialization (zbus accepts messages up
+/// to 128 MiB; the cap bounds what a hostile item can make the adapter
+/// decode). `Ok(None)` = not implemented or the wrong type (the SNI
+/// default applies); `Ok(Some(Err(..)))` = the item is unreachable or
+/// the reply was oversized (the caller keeps its last-known props).
+async fn read_property(
+    connection: &Connection,
+    service: &str,
+    path: &str,
+    name: &str,
+    cap: usize,
+) -> std::result::Result<Option<OwnedValue>, ReadStop> {
     let read = async {
-        let proxy = fdo::PropertiesProxy::builder(connection)
+        let proxy = ProxyBuilder::<Proxy>::new(connection)
             .destination(service.to_string())?
             .path(path.to_string())?
+            .interface("org.freedesktop.DBus.Properties")?
             .cache_properties(CacheProperties::No)
             .build()
             .await?;
         let interface = zbus::names::InterfaceName::from_static_str(ITEM_IFACE)?;
-        anyhow::Ok(proxy.get_all(interface).await?)
+        proxy.call_method("Get", &(interface, name)).await
     };
-    let all = match tokio::time::timeout(REFRESH_BUDGET, read).await {
-        Ok(Ok(all)) => all,
+    let reply = match tokio::time::timeout(REFRESH_BUDGET, read).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(error)) if is_unknown_property(&error) => return Ok(None),
         Ok(Err(error)) => {
-            eprintln!("cosmix-dbusd: tray: reading {service}{path} failed: {error}");
-            return None;
+            eprintln!("cosmix-dbusd: tray: reading {service}{path} {name} failed: {error}");
+            return Err(ReadStop::Transport);
         }
         Err(_) => {
             eprintln!(
-                "cosmix-dbusd: tray: reading {service}{path} exceeded the {REFRESH_BUDGET:?} budget"
+                "cosmix-dbusd: tray: reading {service}{path} {name} exceeded the \
+                 {REFRESH_BUDGET:?} budget"
             );
-            return None;
+            return Err(ReadStop::Timeout);
         }
     };
-    Some(parse_item_props(&all))
+    let body = reply.body();
+    if body.len() > cap {
+        return Err(ReadStop::Oversized);
+    }
+    match body.deserialize::<OwnedValue>() {
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
 }
 
-fn parse_item_props(all: &HashMap<String, OwnedValue>) -> ItemProps {
-    let string = |key: &str| {
-        all.get(key)
-            .and_then(|value| String::try_from(value.clone()).ok())
-            .unwrap_or_default()
-    };
-    let mut props = ItemProps {
-        id: string("Id"),
-        title: string("Title"),
-        category: string("Category"),
-        status: string("Status"),
-        icon_name: string("IconName"),
-        icon_theme_path: string("IconThemePath"),
-        attention_icon_name: string("AttentionIconName"),
-        tooltip_title: String::new(),
-        tooltip_description: String::new(),
-        tooltip_icon: String::new(),
-        menu: all
-            .get("Menu")
-            .and_then(|value| zvariant::OwnedObjectPath::try_from(value.clone()).ok())
-            .map(|path| path.to_string()),
-        item_is_menu: all
-            .get("ItemIsMenu")
-            .and_then(|value| bool::try_from(value.clone()).ok())
-            .unwrap_or(false),
-        pixmap: all
-            .get("IconPixmap")
-            .map(|value| Value::from(value.clone()))
-            .and_then(|value| largest_pixmap(&value)),
-    };
-    if props.status.is_empty() {
-        // SNI's documented default when an item does not implement Status.
-        props.status = "Active".into();
+/// What a refresh produced: fresh props (with any oversized pixmap
+/// dropped, and a marker so `tray.info` can count the refusal), or
+/// nothing (the item was unreachable — its last-known props stand).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefreshOutcome {
+    Props(ItemProps),
+    /// Props whose pixmap-bearing reads were refused by the size cap.
+    Oversized(ItemProps),
+    Unreachable,
+}
+
+/// Read one item's property set as [`ItemProps`] within
+/// [`REFRESH_BUDGET`], one typed property at a time (see
+/// [`read_property`]). Missing properties take their SNI defaults.
+pub(crate) async fn fetch_item_props(
+    connection: &Connection,
+    service: &str,
+    path: &str,
+) -> RefreshOutcome {
+    async fn string(
+        connection: &Connection,
+        service: &str,
+        path: &str,
+        name: &str,
+    ) -> std::result::Result<String, ReadStop> {
+        match read_property(connection, service, path, name, MAX_RAW_REPLY_BYTES).await {
+            Ok(Some(value)) => Ok(String::try_from(value).unwrap_or_default()),
+            Ok(None) => Ok(String::new()),
+            Err(stop) => Err(stop),
+        }
     }
-    if let Some(tip) = all
-        .get("ToolTip")
-        .map(|value| Value::from(value.clone()))
-        .and_then(|value| parse_tooltip(&value))
-    {
-        (
-            props.tooltip_icon,
-            props.tooltip_title,
-            props.tooltip_description,
-        ) = tip;
+    // The pixmap-bearing properties share one oversized marker: the
+    // refresh still lands, without the pixmaps, and the refusal is
+    // counted.
+    async fn pixmap_property(
+        connection: &Connection,
+        service: &str,
+        path: &str,
+        name: &str,
+        oversized: &mut bool,
+    ) -> std::result::Result<Option<Value<'static>>, ReadStop> {
+        match read_property(connection, service, path, name, MAX_PIXMAP_REPLY_BYTES).await {
+            Ok(Some(value)) => Ok(Some(Value::from(value))),
+            Ok(None) => Ok(None),
+            Err(ReadStop::Oversized) => {
+                *oversized = true;
+                Ok(None)
+            }
+            Err(stop) => Err(stop),
+        }
     }
-    props.clamp_strings();
-    props
+    let read = async {
+        let id = string(connection, service, path, "Id").await?;
+        let title = string(connection, service, path, "Title").await?;
+        let category = string(connection, service, path, "Category").await?;
+        let status = string(connection, service, path, "Status").await?;
+        let icon_name = string(connection, service, path, "IconName").await?;
+        let icon_theme_path = string(connection, service, path, "IconThemePath").await?;
+        let attention_icon_name = string(connection, service, path, "AttentionIconName").await?;
+        let item_is_menu =
+            match read_property(connection, service, path, "ItemIsMenu", MAX_RAW_REPLY_BYTES).await
+            {
+                Ok(Some(value)) => bool::try_from(value).unwrap_or(false),
+                Ok(None) => false,
+                Err(stop) => return Err(stop),
+            };
+        let menu = match read_property(connection, service, path, "Menu", MAX_RAW_REPLY_BYTES).await
+        {
+            Ok(Some(value)) => zvariant::OwnedObjectPath::try_from(value)
+                .ok()
+                .map(|path| path.to_string()),
+            Ok(None) => None,
+            Err(stop) => return Err(stop),
+        };
+        let mut oversized = false;
+        let pixmap =
+            match pixmap_property(connection, service, path, "IconPixmap", &mut oversized).await? {
+                Some(value) => largest_pixmap(&value),
+                None => None,
+            };
+        let tooltip =
+            match pixmap_property(connection, service, path, "ToolTip", &mut oversized).await? {
+                Some(value) => parse_tooltip(&value),
+                None => None,
+            };
+        let (tooltip_icon, tooltip_title, tooltip_description) = match tooltip {
+            Some((icon, title, description)) => (icon, title, description),
+            None => (String::new(), String::new(), String::new()),
+        };
+        Ok((
+            ItemProps {
+                id,
+                title,
+                category,
+                status,
+                icon_name,
+                icon_theme_path,
+                attention_icon_name,
+                tooltip_title,
+                tooltip_description,
+                tooltip_icon,
+                // The SNI sentinel for "no menu" is not a menu.
+                menu: menu.filter(|path| path != NO_DBUSMENU_PATH && !path.is_empty()),
+                item_is_menu,
+                pixmap,
+            },
+            oversized,
+        ))
+    };
+    match tokio::time::timeout(REFRESH_BUDGET, read).await {
+        Ok(Ok((mut props, oversized))) => {
+            if props.status.is_empty() {
+                // SNI's documented default when an item does not
+                // implement Status.
+                props.status = "Active".into();
+            }
+            props.clamp_strings();
+            if oversized {
+                RefreshOutcome::Oversized(props)
+            } else {
+                RefreshOutcome::Props(props)
+            }
+        }
+        Ok(Err(stop)) => {
+            eprintln!(
+                "cosmix-dbusd: tray: reading {service}{path} stopped ({stop:?}); keeping \
+                 last-known props"
+            );
+            RefreshOutcome::Unreachable
+        }
+        Err(_) => {
+            eprintln!(
+                "cosmix-dbusd: tray: reading {service}{path} exceeded the {REFRESH_BUDGET:?} \
+                 budget"
+            );
+            RefreshOutcome::Unreachable
+        }
+    }
 }
 
 /// ToolTip is `(s a(iiay) s s)`: icon name, pixmaps, title, description.
@@ -905,7 +1264,10 @@ fn parse_tooltip(value: &Value<'_>) -> Option<(String, String, String)> {
     Some((icon, title, description))
 }
 
-/// Keep the largest `a(iiay)` entry within [`MAX_PIXMAP_BYTES`].
+/// Keep the largest `a(iiay)` entry that is well-formed: positive
+/// dimensions, `data.len() == width * height * 4` (ARGB32), and at most
+/// [`MAX_PIXMAP_BYTES`] of data. Mismatched or oversized entries are
+/// dropped.
 fn largest_pixmap(value: &Value<'_>) -> Option<Pixmap> {
     let Value::Array(entries) = value else {
         return None;
@@ -927,6 +1289,10 @@ fn largest_pixmap(value: &Value<'_>) -> Option<Pixmap> {
         if *width <= 0 || *height <= 0 {
             continue;
         }
+        let area = u64::from(*width as u32) * u64::from(*height as u32);
+        if area > u64::try_from(MAX_PIXMAP_BYTES).expect("cap fits u64") {
+            continue;
+        }
         let data: Vec<u8> = bytes
             .iter()
             .filter_map(|byte| match byte {
@@ -934,10 +1300,9 @@ fn largest_pixmap(value: &Value<'_>) -> Option<Pixmap> {
                 _ => None,
             })
             .collect();
-        if data.len() > MAX_PIXMAP_BYTES {
+        if data.len() != (area * 4) as usize || data.len() > MAX_PIXMAP_BYTES {
             continue;
         }
-        let area = u64::from(*width as u32) * u64::from(*height as u32);
         let better = best.as_ref().is_none_or(|current| {
             area > u64::from(current.width as u32) * u64::from(current.height as u32)
         });
@@ -986,6 +1351,8 @@ async fn menu_proxy(connection: &Connection, item: &TrayItem) -> zbus::Result<Pr
 }
 
 /// Call `Activate`/`SecondaryActivate`/`ContextMenu` with `(x, y)`.
+/// The proxy build sits INSIDE the timeout: nothing on the path to a
+/// hostile item may run unbounded, even if the build is I/O-free today.
 async fn call_item_xy(
     connection: &Connection,
     item: &TrayItem,
@@ -993,12 +1360,18 @@ async fn call_item_xy(
     x: i32,
     y: i32,
 ) -> std::result::Result<(), String> {
-    let proxy = item_proxy(connection, item)
-        .await
-        .map_err(|error| format!("item {member} failed: {error}"))?;
-    match tokio::time::timeout(ITEM_CALL_TIMEOUT, proxy.call_method(member, &(x, y))).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!("item {member} failed: {error}")),
+    let work = async {
+        let proxy = item_proxy(connection, item)
+            .await
+            .map_err(|error| format!("item {member} failed: {error}"))?;
+        proxy
+            .call_method(member, &(x, y))
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("item {member} failed: {error}"))
+    };
+    match tokio::time::timeout(ITEM_CALL_TIMEOUT, work).await {
+        Ok(result) => result,
         Err(_) => Err(format!(
             "item did not answer {member} within {:?}; it may be hung",
             ITEM_CALL_TIMEOUT
@@ -1012,17 +1385,18 @@ async fn call_item_scroll(
     delta: i32,
     orientation: &str,
 ) -> std::result::Result<(), String> {
-    let proxy = item_proxy(connection, item)
-        .await
-        .map_err(|error| format!("item Scroll failed: {error}"))?;
-    match tokio::time::timeout(
-        ITEM_CALL_TIMEOUT,
-        proxy.call_method("Scroll", &(delta, orientation)),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!("item Scroll failed: {error}")),
+    let work = async {
+        let proxy = item_proxy(connection, item)
+            .await
+            .map_err(|error| format!("item Scroll failed: {error}"))?;
+        proxy
+            .call_method("Scroll", &(delta, orientation))
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("item Scroll failed: {error}"))
+    };
+    match tokio::time::timeout(ITEM_CALL_TIMEOUT, work).await {
+        Ok(result) => result,
         Err(_) => Err(format!(
             "item did not answer Scroll within {:?}; it may be hung",
             ITEM_CALL_TIMEOUT
@@ -1030,52 +1404,81 @@ async fn call_item_scroll(
     }
 }
 
-/// GetLayout(0, -1, []) → (revision, layout tree), parsed to JSON.
+/// Read the menu layout: `AboutToShow(0)` first (dbusmenu's hook for
+/// servers that build submenus lazily — errors ignored), then
+/// `GetLayout(0, -1, propertyNames)` with the names pinned to the small
+/// set the adapter surfaces, `icon-data` excluded — a pixmap per node
+/// would make one menu read a multi-megabyte affair. The raw reply body
+/// is capped before deserialization like any item read. The whole read,
+/// proxy build included, runs inside [`MENU_CALL_TIMEOUT`].
 async fn call_menu_layout(
     connection: &Connection,
     item: &TrayItem,
 ) -> std::result::Result<(u32, Json), String> {
-    let proxy = menu_proxy(connection, item)
-        .await
-        .map_err(|error| format!("menu read failed: {error}"))?;
-    let body = (0_i32, -1_i32, Vec::<String>::new());
-    let reply = match tokio::time::timeout(MENU_CALL_TIMEOUT, proxy.call_method("GetLayout", &body))
-        .await
-    {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(error)) => return Err(format!("menu read failed: {error}")),
-        Err(_) => {
+    let work = async {
+        let proxy = menu_proxy(connection, item)
+            .await
+            .map_err(|error| format!("menu read failed: {error}"))?;
+        let _ = proxy.call_method("AboutToShow", &0_i32).await;
+        let properties: Vec<&str> = MENU_PROPERTY_NAMES.to_vec();
+        let reply = proxy
+            .call_method("GetLayout", &(0_i32, -1_i32, properties))
+            .await
+            .map_err(|error| format!("menu read failed: {error}"))?;
+        let body = reply.body();
+        if body.len() > MAX_RAW_REPLY_BYTES {
             return Err(format!(
-                "item did not answer GetLayout within {:?}; it may be hung",
-                MENU_CALL_TIMEOUT
+                "menu layout exceeded the raw reply cap ({MAX_RAW_REPLY_BYTES} bytes)"
             ));
         }
+        let (revision, layout) = body
+            .deserialize::<(u32, Value)>()
+            .map_err(|error| format!("menu layout had an unexpected shape: {error}"))?;
+        let mut budget = MAX_MENU_NODES;
+        let layout = menu_node_json(&layout, &mut budget)
+            .ok_or_else(|| "menu layout had an unexpected shape".to_string())?;
+        Ok((revision, layout))
     };
-    let body = reply.body();
-    let (revision, layout) = body
-        .deserialize::<(u32, Value)>()
-        .map_err(|error| format!("menu layout had an unexpected shape: {error}"))?;
-    let mut budget = MAX_MENU_NODES;
-    let layout = menu_node_json(&layout, &mut budget)
-        .ok_or_else(|| "menu layout had an unexpected shape".to_string())?;
-    Ok((revision, layout))
+    match tokio::time::timeout(MENU_CALL_TIMEOUT, work).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "item did not answer the menu read within {:?}; it may be hung",
+            MENU_CALL_TIMEOUT
+        )),
+    }
 }
 
-/// dbusmenu `Event(id, "clicked", v, timestamp)`.
+/// The dbusmenu `Event(id, "clicked", data, timestamp)` request body —
+/// the wire shape is `(i s v u)`: the data a single variant wrapping
+/// int32, the timestamp a u32 (the unit test pins this).
+fn click_event_body(node_id: i32) -> (i32, &'static str, Value<'static>, u32) {
+    (
+        node_id,
+        "clicked",
+        Value::Value(Box::new(Value::I32(0))),
+        unix_millis() as u32,
+    )
+}
+
+/// dbusmenu `Event(id, "clicked", data, timestamp)`.
 async fn call_menu_click(
     connection: &Connection,
     item: &TrayItem,
     node_id: i32,
 ) -> std::result::Result<(), String> {
-    let proxy = menu_proxy(connection, item)
-        .await
-        .map_err(|error| format!("menu click failed: {error}"))?;
-    let timestamp = unix_millis();
-    let data = Value::Value(Box::new(Value::I32(0)));
-    let body = (node_id, "clicked", data, timestamp);
-    match tokio::time::timeout(ITEM_CALL_TIMEOUT, proxy.call_method("Event", &body)).await {
+    let work = async {
+        let proxy = menu_proxy(connection, item)
+            .await
+            .map_err(|error| format!("menu click failed: {error}"))?;
+        let body = click_event_body(node_id);
+        proxy
+            .call_method("Event", &body)
+            .await
+            .map_err(|error| format!("menu click failed: {error}"))
+    };
+    match tokio::time::timeout(ITEM_CALL_TIMEOUT, work).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!("menu click failed: {error}")),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(format!(
             "item did not answer Event within {:?}; it may be hung",
             ITEM_CALL_TIMEOUT
@@ -1124,6 +1527,7 @@ async fn dispatch(
                     "items": state.count(),
                     "hosts": state.hosts(),
                     "event_seq": state.event_seq(),
+                    "oversized_reads": state.oversized_reads(),
                     "recent_events": state.recent_events().iter().map(event_json).collect::<Vec<_>>(),
                 })
                 .to_string(),
@@ -1165,9 +1569,14 @@ fn dispatch_props(command: &IncomingCommand, store: &TrayStore, suffix: &str) ->
             json!({
                 "topic": props_changed_topic(BUS_SERVICE),
                 "domain_topics": [TOPIC_ITEM_ADDED, TOPIC_ITEM_CHANGED, TOPIC_ITEM_REMOVED],
-                "event_sequence": "per-adapter-session monotonic event_seq on every event; \
-                                   a gap means events were dropped — re-read tray.props.get",
+                // event_seq shape, one shape everywhere: a JSON number in
+                // verb and event bodies; a decimal string in BusMessage
+                // headers. Here it is the counter AT WATCH TIME — every
+                // event after it is new to this subscriber.
                 "event_seq": state.event_seq(),
+                "event_seq_note": "per-adapter-session monotonic counter; each event carries \
+                                   its own event_seq — a gap means events were dropped, \
+                                   re-read tray.props.get",
                 "bootstrap": "subscribe on this connection, then read tray.props.get",
             })
             .to_string(),
@@ -1359,6 +1768,10 @@ fn event_json(event: &ItemEvent) -> Json {
         "event": event.kind.event_name(),
         "key": event.key,
         "service": event.service,
+        // What the watcher surface advertises (service + path).
+        "registered": event.registered,
+        // The one shape: a JSON number here, a decimal string in
+        // BusMessage headers.
         "event_seq": event.seq,
     })
 }
@@ -1394,23 +1807,39 @@ struct BusBatch {
     cause: &'static str,
 }
 
-async fn publish_bus_message(
-    client: &NodedClient,
-    topic: &str,
-    message: &cosmix_bus::bus::BusMessage,
-) -> Result<()> {
-    let headers = BTreeMap::from([
-        ("name".to_string(), topic.to_string()),
-        ("retain".to_string(), "false".to_string()),
-    ]);
-    client
-        .send_with_headers("noded", "topic.publish", &headers, &message.to_wire())
-        .await
+/// The one Bus operation the publisher needs, as a trait so the
+/// publishing contract (diffs against the surviving baseline, event
+/// stamps) is testable without a live broker. `NodedClient` is the
+/// production implementation.
+trait EventPublisher: Send + Sync {
+    fn publish_event(
+        &self,
+        topic: &str,
+        message: cosmix_bus::bus::BusMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+impl EventPublisher for NodedClient {
+    fn publish_event(
+        &self,
+        topic: &str,
+        message: cosmix_bus::bus::BusMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let topic = topic.to_string();
+        Box::pin(async move {
+            let headers = BTreeMap::from([
+                ("name".to_string(), topic),
+                ("retain".to_string(), "false".to_string()),
+            ]);
+            self.send_with_headers("noded", "topic.publish", &headers, &message.to_wire())
+                .await
+        })
+    }
 }
 
 async fn wait_for_bus_client(
-    clients: &mut watch::Receiver<Option<Arc<NodedClient>>>,
-) -> Result<Arc<NodedClient>> {
+    clients: &mut watch::Receiver<Option<Arc<dyn EventPublisher>>>,
+) -> Result<Arc<dyn EventPublisher>> {
     loop {
         if let Some(client) = clients.borrow_and_update().clone() {
             return Ok(client);
@@ -1423,7 +1852,7 @@ async fn wait_for_bus_client(
 
 async fn run_event_publisher(
     mut batches: mpsc::Receiver<BusBatch>,
-    mut clients: watch::Receiver<Option<Arc<NodedClient>>>,
+    mut clients: watch::Receiver<Option<Arc<dyn EventPublisher>>>,
     faults: mpsc::Sender<()>,
 ) -> Result<()> {
     let mut baseline: Option<PropValue> = None;
@@ -1441,8 +1870,9 @@ async fn run_event_publisher(
                     "event_seq",
                     &batch.events.last().map_or(0, |e| e.seq).to_string(),
                 );
-                sent =
-                    publish_bus_message(&client, &props_changed_topic(BUS_SERVICE), &message).await;
+                sent = client
+                    .publish_event(&props_changed_topic(BUS_SERVICE), message)
+                    .await;
                 if sent.is_err() {
                     break;
                 }
@@ -1456,10 +1886,14 @@ async fn run_event_publisher(
                 message.body = json!({
                     "event": event.kind.event_name(),
                     "event_seq": event.seq,
-                    "data": {"key": event.key, "service": event.service},
+                    "data": {
+                        "key": event.key,
+                        "service": event.service,
+                        "registered": event.registered,
+                    },
                 })
                 .to_string();
-                sent = publish_bus_message(&client, event.kind.topic(), &message).await;
+                sent = client.publish_event(event.kind.topic(), message).await;
                 if sent.is_err() {
                     break;
                 }
@@ -1481,7 +1915,7 @@ async fn run_event_publisher(
 async fn run_bus_broker(
     store: TrayStore,
     session: Connection,
-    clients: watch::Sender<Option<Arc<NodedClient>>>,
+    clients: watch::Sender<Option<Arc<dyn EventPublisher>>>,
     mut faults: mpsc::Receiver<()>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -1511,8 +1945,9 @@ async fn run_bus_broker(
         };
         match connection {
             Ok(Ok(client)) => {
-                let client = Arc::new(client);
-                let _ = clients.send(Some(Arc::clone(&client)));
+                let client: Arc<NodedClient> = Arc::new(client);
+                let publisher: Arc<dyn EventPublisher> = client.clone();
+                let _ = clients.send(Some(publisher));
                 eprintln!("cosmix-dbusd: tray: registered as '{BUS_SERVICE}'");
                 let shutdown_for_serve = shutdown.clone();
                 let stopping = tokio::select! {
@@ -1566,15 +2001,69 @@ async fn run_bus_broker(
     }
 }
 
+/// The one Bus operation the command loop needs to answer a verb — a
+/// trait for the same reason as [`EventPublisher`]: the serving
+/// contract (concurrent dispatch) is testable without a live broker.
+trait CommandResponder: Send + Sync {
+    fn respond(
+        &self,
+        command: &IncomingCommand,
+        rc: u8,
+        body: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+impl CommandResponder for NodedClient {
+    fn respond(
+        &self,
+        command: &IncomingCommand,
+        rc: u8,
+        body: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        let to = command.from.clone();
+        let command_name = command.command.clone();
+        let id = command.id.clone();
+        let body = body.to_string();
+        Box::pin(async move {
+            let reply = tokio::time::timeout(
+                BUS_PUBLISH_TIMEOUT,
+                self.respond_parts(&to, &command_name, id.as_deref(), rc, &body),
+            )
+            .await;
+            match reply {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("bus response timed out")),
+            }
+        })
+    }
+}
+
 async fn serve_bus_client(
     client: Arc<NodedClient>,
     store: TrayStore,
     session: Connection,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) {
-    let Some(mut incoming) = client.incoming_async().await else {
+    let Some(incoming) = client.incoming_async().await else {
         return;
     };
+    serve_commands(incoming, store, session, client, shutdown).await;
+}
+
+/// Serve one Bus connection's commands. Each verb dispatches in its own
+/// task, bounded by [`MAX_CONCURRENT_VERBS`]: an item hanging on its
+/// 2-3 s timeout delays only its own verb, never `tray.list` or
+/// `tray.props.get` behind it. A response failure ends this connection
+/// (the broker reconnects); commands stop (bus death) end it too.
+async fn serve_commands(
+    mut incoming: mpsc::UnboundedReceiver<IncomingCommand>,
+    store: TrayStore,
+    session: Connection,
+    responder: Arc<dyn CommandResponder>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut dispatches: JoinSet<()> = JoinSet::new();
+    let (fail_tx, mut fail_rx) = mpsc::channel::<String>(1);
     loop {
         // Check the current value too: a watch cloned after the flip
         // would otherwise never see `changed()` fire.
@@ -1584,31 +2073,32 @@ async fn serve_bus_client(
         tokio::select! {
             biased;
             _ = shutdown.changed() => return,
+            failure = fail_rx.recv() => {
+                if let Some(reason) = failure {
+                    eprintln!("cosmix-dbusd: tray: {reason}; reconnecting");
+                }
+                return;
+            }
+            done = dispatches.join_next(), if !dispatches.is_empty() => {
+                let _ = done;
+            }
             command = incoming.recv() => {
                 let Some(command) = command else { return };
-                let (rc, body) = dispatch(&command, &store, &session).await;
-                match tokio::time::timeout(
-                    BUS_PUBLISH_TIMEOUT,
-                    client.respond_parts(
-                        &command.from,
-                        &command.command,
-                        command.id.as_deref(),
-                        rc,
-                        &body,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        eprintln!("cosmix-dbusd: tray: bus response failed; reconnecting: {error}");
-                        return;
-                    }
-                    Err(_) => {
-                        eprintln!("cosmix-dbusd: tray: bus response timed out; reconnecting");
-                        return;
-                    }
+                if dispatches.len() >= MAX_CONCURRENT_VERBS {
+                    // Bounded concurrency: wait for a slot before
+                    // taking the next command.
+                    let _ = dispatches.join_next().await;
                 }
+                let responder = Arc::clone(&responder);
+                let store = Arc::clone(&store);
+                let session = session.clone();
+                let fail = fail_tx.clone();
+                dispatches.spawn(async move {
+                    let (rc, body) = dispatch(&command, &store, &session).await;
+                    if let Err(error) = responder.respond(&command, rc, &body).await {
+                        let _ = fail.try_send(format!("bus response failed: {error:#}"));
+                    }
+                });
             }
         }
     }
@@ -1626,19 +2116,51 @@ pub(crate) struct TrayHost {
     store: TrayStore,
     connection: Connection,
     emitter: SignalEmitter<'static>,
-    dbus: DBusProxy<'static>,
     owner_changes: MessageStream,
     item_signals: MessageStream,
     registrations: mpsc::Receiver<WatcherMsg>,
-    refresh_tx: mpsc::Sender<(String, Option<ItemProps>)>,
-    refresh_rx: mpsc::Receiver<(String, Option<ItemProps>)>,
+    refresh_tx: mpsc::Sender<(String, RefreshOutcome)>,
+    refresh_rx: mpsc::Receiver<(String, RefreshOutcome)>,
     /// Keys with a fetch in flight / signalled again while in flight.
     refresh_active: BTreeSet<String>,
     refresh_queued: BTreeSet<String>,
+    /// Property fetches owned by the host — aborted when the run ends,
+    /// so no detached task holds a connection clone past the run.
+    refresh_tasks: JoinSet<()>,
+    /// Per-item refresh rate limit (a New* signal flood cannot loop the
+    /// item's own property reads).
+    refresh_gate: RefreshGate,
+    /// Keys whose next refresh is waiting out the gate, and when due.
+    refresh_scheduled: BTreeMap<String, std::time::Instant>,
     batches: mpsc::Sender<BusBatch>,
     broker: JoinHandle<Result<()>>,
     publisher: JoinHandle<Result<()>>,
     internal_shutdown: watch::Sender<bool>,
+}
+
+/// Per-item minimum spacing between property refreshes, pure so the
+/// spacing rule is unit-testable alone.
+#[derive(Debug, Default)]
+struct RefreshGate {
+    last: HashMap<String, std::time::Instant>,
+}
+
+impl RefreshGate {
+    /// Whether a refresh of `key` may fire at `now` — recording the
+    /// firing if it does.
+    fn admit(&mut self, key: &str, now: std::time::Instant) -> bool {
+        match self.last.get(key) {
+            Some(last) if now.duration_since(*last) < MIN_REFRESH_INTERVAL => false,
+            _ => {
+                self.last.insert(key.to_string(), now);
+                true
+            }
+        }
+    }
+
+    fn retire(&mut self, key: &str) {
+        self.last.remove(key);
+    }
 }
 
 impl TrayHost {
@@ -1717,11 +2239,17 @@ impl TrayHost {
             .msg_type(MessageType::Signal)
             .interface(ITEM_IFACE)?
             .build();
+        // The item-signal rule cannot be narrowed further: New* signals
+        // carry no arguments (no arg filters) and come from every item
+        // connection (no single sender) — interface-only is the
+        // narrowest rule expressible. The buffer is small because the
+        // run loop drains this stream constantly; the serve loop never
+        // awaits the bus, so a flood cannot wedge it (see WatcherMsg).
         let item_signals = MessageStream::for_match_rule(item_rule, &connection, Some(128))
             .await
             .map_err(|error| anyhow!("tray adapter item-watch failed: {error}"))?;
 
-        let (client_tx, client_rx) = watch::channel::<Option<Arc<NodedClient>>>(None);
+        let (client_tx, client_rx) = watch::channel::<Option<Arc<dyn EventPublisher>>>(None);
         let (fault_tx, fault_rx) = mpsc::channel(1);
         let publisher = tokio::spawn(run_event_publisher(batches_rx, client_rx, fault_tx));
         let (internal_shutdown, shutdown_rx) = watch::channel(false);
@@ -1737,7 +2265,6 @@ impl TrayHost {
             store,
             connection,
             emitter,
-            dbus,
             owner_changes,
             item_signals,
             registrations,
@@ -1745,6 +2272,9 @@ impl TrayHost {
             refresh_rx,
             refresh_active: BTreeSet::new(),
             refresh_queued: BTreeSet::new(),
+            refresh_tasks: JoinSet::new(),
+            refresh_gate: RefreshGate::default(),
+            refresh_scheduled: BTreeMap::new(),
             batches: batches_tx,
             broker,
             publisher,
@@ -1780,11 +2310,17 @@ impl TrayHost {
             self.broker.abort();
         }
         self.publisher.abort();
+        // Refresh fetches die with the run: none of them may keep a
+        // connection clone alive past it.
+        self.refresh_tasks.abort_all();
         outcome
     }
 
     async fn serve(&mut self, stop: &mut watch::Receiver<bool>) -> Result<()> {
         loop {
+            // Computed before the select: an arm expression may not
+            // borrow `self` while the `recv()` arms hold it mutably.
+            let refresh_due = self.next_refresh_due();
             tokio::select! {
                 biased;
                 changed = stop.changed() => {
@@ -1793,10 +2329,21 @@ impl TrayHost {
                         return Ok(());
                     }
                 }
+                // Session-bus death, observed authoritatively on the
+                // zbus connection itself: one of the three run-enders
+                // (stop, session death, internal fault). A Bus (mesh)
+                // outage is NOT one — the broker reconnects inside the
+                // run and the items survive.
+                _ = self.connection.closed() => {
+                    return Err(anyhow!("session bus connection closed"));
+                }
                 message = self.registrations.recv() => match message {
                     None => return Err(anyhow!("watcher interface channel ended")),
-                    Some(WatcherMsg::RegisterItem { caller, arg }) => {
-                        self.handle_register(caller, arg).await;
+                    Some(WatcherMsg::RegisterItem { service, path, owner }) => {
+                        self.handle_register(service, path, owner).await;
+                    }
+                    Some(WatcherMsg::RegisterHost { caller }) => {
+                        self.handle_register_host(caller).await;
                     }
                 },
                 message = self.owner_changes.next() => match message {
@@ -1825,59 +2372,70 @@ impl TrayHost {
                 },
                 done = self.refresh_rx.recv() => match done {
                     None => return Err(anyhow!("refresh channel ended")),
-                    Some((key, props)) => self.handle_refresh_done(key, props),
+                    Some((key, outcome)) => self.handle_refresh_done(key, outcome),
                 },
+                _ = tokio::time::sleep_until(refresh_due) => {
+                    self.fire_due_refreshes();
+                }
             }
         }
     }
 
-    /// Resolve a registration the way KDE/libappindicator expect: an
-    /// argument starting with `/` is an object path on the caller's own
-    /// connection; anything else is the item's bus name (object at
-    /// /StatusNotifierItem). The item is registered immediately (empty
-    /// props) and a property fetch fills it in — a changed event lands
-    /// when the read completes.
-    async fn handle_register(&mut self, caller: String, arg: String) {
-        let (service, path) = if arg.starts_with('/') {
-            (caller.clone(), arg)
-        } else {
-            (arg, DEFAULT_ITEM_PATH.to_string())
-        };
-        let owner = if service == caller {
-            caller
-        } else {
-            let name = match zbus::names::BusName::try_from(service.as_str()) {
-                Ok(name) => name,
-                Err(error) => {
-                    eprintln!(
-                        "cosmix-dbusd: tray: registration of invalid bus name {service}: {error}"
-                    );
-                    return;
-                }
-            };
-            match self.dbus.get_name_owner(name).await {
-                Ok(owner) => owner.to_string(),
-                Err(error) => {
-                    eprintln!(
-                        "cosmix-dbusd: tray: registration of {service} has no owner: {error}"
-                    );
-                    return;
-                }
-            }
-        };
-        let registered = lock_state(&self.store).register(
-            service.clone(),
-            path.clone(),
-            owner,
-            ItemProps::default(),
-        );
+    /// The earliest gate-delayed refresh deadline (a year out when
+    /// nothing is scheduled — tokio's far future is private).
+    fn next_refresh_due(&self) -> tokio::time::Instant {
+        self.refresh_scheduled
+            .values()
+            .copied()
+            .map(tokio::time::Instant::from_std)
+            .min()
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(365 * 86400))
+    }
+
+    fn fire_due_refreshes(&mut self) {
+        let now = std::time::Instant::now();
+        let due: Vec<String> = self
+            .refresh_scheduled
+            .iter()
+            .filter(|(_, due)| **due <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            self.refresh(&key, now);
+        }
+    }
+
+    /// A registration, fully resolved by the interface (service, path,
+    /// owner): the loop only mutates state, emits and publishes — it
+    /// never awaits the bus here (see [`WatcherMsg`]). The item lands
+    /// immediately with empty props; a property fetch fills it in.
+    async fn handle_register(&mut self, service: String, path: String, owner: String) {
+        let registered =
+            lock_state(&self.store).register(service, path, owner, ItemProps::default());
         match registered {
             Ok((key, events)) => {
                 self.emit_item_events(&events).await;
                 self.publish(events, "sni.registration");
-                self.refresh(&key);
+                self.refresh(&key, std::time::Instant::now());
             }
             Err(error) => eprintln!("cosmix-dbusd: tray: {error}"),
+        }
+    }
+
+    /// A first-time external host registration gets the
+    /// StatusNotifierHostRegistered signal (cosmix itself registered at
+    /// startup; repeats for a known host are just recorded).
+    async fn handle_register_host(&mut self, caller: String) {
+        let newly = lock_state(&self.store)
+            .add_host(caller)
+            .unwrap_or_else(|error| {
+                eprintln!("cosmix-dbusd: tray: {error}");
+                false
+            });
+        if newly
+            && let Err(error) = WatcherIface::status_notifier_host_registered(&self.emitter).await
+        {
+            eprintln!("cosmix-dbusd: tray: StatusNotifierHostRegistered signal failed: {error}");
         }
     }
 
@@ -1888,6 +2446,11 @@ impl TrayHost {
             return;
         };
         let events = lock_state(&self.store).remove_by_bus_change(&name, &old_owner, &new_owner);
+        for event in &events {
+            self.refresh_gate.retire(&event.key);
+            self.refresh_scheduled.remove(&event.key);
+            self.refresh_queued.remove(&event.key);
+        }
         if events.is_empty() {
             return;
         }
@@ -1909,32 +2472,66 @@ impl TrayHost {
         else {
             return;
         };
-        self.refresh(&key);
+        self.refresh(&key, std::time::Instant::now());
     }
 
-    fn handle_refresh_done(&mut self, key: String, props: Option<ItemProps>) {
+    fn handle_refresh_done(&mut self, key: String, outcome: RefreshOutcome) {
         self.refresh_active.remove(&key);
-        if let Some(props) = props {
-            let events = lock_state(&self.store).apply_props(&key, props);
-            if !events.is_empty() {
-                self.publish(events, "sni.refresh");
+        if lock_state(&self.store).item(&key).is_none() {
+            self.refresh_gate.retire(&key);
+            self.refresh_scheduled.remove(&key);
+            self.refresh_queued.remove(&key);
+            return;
+        }
+        let events = match outcome {
+            RefreshOutcome::Props(props) => lock_state(&self.store).apply_props(&key, props),
+            RefreshOutcome::Oversized(props) => {
+                let mut state = lock_state(&self.store);
+                state.note_oversized_read();
+                eprintln!(
+                    "cosmix-dbusd: tray: item {key} pixmap reply exceeded the \
+                     {MAX_PIXMAP_REPLY_BYTES}-byte cap; pixmap dropped"
+                );
+                state.apply_props(&key, props)
             }
+            // Unreachable: keep the last-known props — a refresh error
+            // must not wipe known good props with blanks.
+            RefreshOutcome::Unreachable => Vec::new(),
+        };
+        if !events.is_empty() {
+            self.publish(events, "sni.refresh");
         }
         if self.refresh_queued.remove(&key) && lock_state(&self.store).item(&key).is_some() {
-            self.refresh(&key);
+            self.refresh(&key, std::time::Instant::now());
         }
     }
 
     /// Fetch the item's props out-of-band (a hung item must not stall
-    /// the run loop); coalesce per item while a fetch is in flight.
-    fn refresh(&mut self, key: &str) {
+    /// the run loop); coalesce per item while a fetch is in flight and
+    /// rate-limit to one fetch per [`MIN_REFRESH_INTERVAL`] — a signal
+    /// flood cannot loop the item's property reads. Gate-delayed
+    /// refreshes fire from the serve loop when due, so the freshest
+    /// signal still converges.
+    fn refresh(&mut self, key: &str, now: std::time::Instant) {
         if self.refresh_active.contains(key) {
             self.refresh_queued.insert(key.to_string());
             return;
         }
+        if self.refresh_tasks.len() >= MAX_CONCURRENT_REFRESHES {
+            self.refresh_queued.insert(key.to_string());
+            return;
+        }
+        if !self.refresh_gate.admit(key, now) {
+            self.refresh_scheduled
+                .entry(key.to_string())
+                .or_insert(now + MIN_REFRESH_INTERVAL);
+            return;
+        }
+        self.refresh_scheduled.remove(key);
         let (service, path) = {
             let state = lock_state(&self.store);
             let Some(item) = state.item(key) else {
+                self.refresh_gate.retire(key);
                 return;
             };
             (item.service.clone(), item.path.clone())
@@ -1942,24 +2539,28 @@ impl TrayHost {
         let (connection, key) = (self.connection.clone(), key.to_string());
         let done = self.refresh_tx.clone();
         self.refresh_active.insert(key.clone());
-        tokio::spawn(async move {
-            let props = fetch_item_props(&connection, &service, &path).await;
-            let _ = done.send((key, props)).await;
+        self.refresh_tasks.spawn(async move {
+            let outcome = fetch_item_props(&connection, &service, &path).await;
+            let _ = done.send((key, outcome)).await;
         });
     }
 
     /// Emit the watcher signals for a batch (Registered for Added,
-    /// Unregistered for Removed) on the session bus.
+    /// Unregistered for Removed) on the session bus — carrying the
+    /// `service + path` surface name, matching KDE's watcher.
     async fn emit_item_events(&mut self, events: &[ItemEvent]) {
         for event in events {
             let result = match event.kind {
                 ItemEventKind::Added => {
-                    WatcherIface::status_notifier_item_registered(&self.emitter, &event.service)
+                    WatcherIface::status_notifier_item_registered(&self.emitter, &event.registered)
                         .await
                 }
                 ItemEventKind::Removed => {
-                    WatcherIface::status_notifier_item_unregistered(&self.emitter, &event.service)
-                        .await
+                    WatcherIface::status_notifier_item_unregistered(
+                        &self.emitter,
+                        &event.registered,
+                    )
+                    .await
                 }
                 ItemEventKind::Changed => Ok(()),
             };
@@ -2026,6 +2627,7 @@ impl Adapter for TrayAdapter {
 mod tests {
     use super::*;
     use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use zbus::zvariant::{Array, Signature, StructureBuilder};
 
     /// The SNI pixmap wire type `a(iiay)`, as tuples (zvariant-native).
@@ -2043,11 +2645,15 @@ mod tests {
     }
 
     fn registered(state: &mut TrayState, service: &str) -> String {
+        registered_by(state, service, ":1.42")
+    }
+
+    fn registered_by(state: &mut TrayState, service: &str, owner: &str) -> String {
         state
             .register(
                 service.into(),
                 DEFAULT_ITEM_PATH.into(),
-                ":1.42".into(),
+                owner.into(),
                 props("app", "App"),
             )
             .expect("register")
@@ -2083,12 +2689,17 @@ mod tests {
             .collect();
         assert_eq!(seqs, vec![1, 2]);
         assert_eq!(state.count(), 2);
+        // The watcher surface is service + path for every item (M4).
         assert_eq!(
-            state.registered_services(),
+            state.registered_names(),
             vec![
-                "org.kde.StatusNotifierItem-1".to_string(),
-                "org.kde.StatusNotifierItem-2".to_string()
+                "org.kde.StatusNotifierItem-1/StatusNotifierItem".to_string(),
+                "org.kde.StatusNotifierItem-2/StatusNotifierItem".to_string(),
             ]
+        );
+        assert_eq!(
+            events[0].registered,
+            "org.kde.StatusNotifierItem-1/StatusNotifierItem"
         );
     }
 
@@ -2115,11 +2726,67 @@ mod tests {
         assert_eq!(events[1].key, "i1");
     }
 
+    /// M4: identity (and dedup) is (service, path) — two path-form items
+    /// on one connection are two items, and re-registering one path
+    /// replaces only that one. On the old code (dedupe by service) the
+    /// second registration replaced the first: count would be 1.
+    #[test]
+    fn path_form_items_dedupe_on_service_and_path() {
+        let mut state = TrayState::default();
+        let first = state
+            .register(
+                ":1.10".into(),
+                "/org/ayatana/NotificationItem/one".into(),
+                ":1.10".into(),
+                props("app", "One"),
+            )
+            .expect("register")
+            .0;
+        let second = state
+            .register(
+                ":1.10".into(),
+                "/org/ayatana/NotificationItem/two".into(),
+                ":1.10".into(),
+                props("app", "Two"),
+            )
+            .expect("register")
+            .0;
+        assert_ne!(first, second);
+        assert_eq!(state.count(), 2, "two indicators on one connection");
+        // Re-registering path one replaces only it.
+        let (third, events) = state
+            .register(
+                ":1.10".into(),
+                "/org/ayatana/NotificationItem/one".into(),
+                ":1.10".into(),
+                props("app", "One again"),
+            )
+            .expect("re-register at the same path");
+        assert_eq!(state.count(), 2);
+        assert!(state.item(&first).is_none());
+        assert!(state.item(&second).is_some());
+        let kinds: Vec<ItemEventKind> = events.iter().map(|event| event.kind).collect();
+        assert_eq!(kinds, vec![ItemEventKind::Removed, ItemEventKind::Added]);
+        assert_eq!(third, "i2");
+        // Both surface separately, as service+path.
+        assert_eq!(
+            state.registered_names(),
+            vec![
+                ":1.10/org/ayatana/NotificationItem/two".to_string(),
+                ":1.10/org/ayatana/NotificationItem/one".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn registration_is_refused_past_the_item_cap() {
         let mut state = TrayState::default();
         for number in 0..MAX_ITEMS {
-            registered(&mut state, &format!("org.kde.StatusNotifierItem-{number}"));
+            registered_by(
+                &mut state,
+                &format!("org.kde.StatusNotifierItem-{number}"),
+                &format!(":1.{number}"),
+            );
         }
         assert_eq!(state.count(), MAX_ITEMS);
         let refused = state
@@ -2133,12 +2800,75 @@ mod tests {
         assert!(refused.contains("limit"), "{refused}");
     }
 
+    /// m2: at the cap, re-registering an already-tracked item is a
+    /// replacement, not a new item — it must succeed. The old code
+    /// refused it (cap checked before dedup).
+    #[test]
+    fn re_registration_at_the_cap_succeeds() {
+        let mut state = TrayState::default();
+        for number in 0..MAX_ITEMS {
+            registered_by(
+                &mut state,
+                &format!("org.kde.StatusNotifierItem-{number}"),
+                &format!(":1.{number}"),
+            );
+        }
+        let (key, events) = state
+            .register(
+                "org.kde.StatusNotifierItem-1".into(),
+                DEFAULT_ITEM_PATH.into(),
+                ":1.1".into(),
+                props("app", "Refreshed"),
+            )
+            .expect("re-registration at the cap replaces");
+        assert_eq!(state.count(), MAX_ITEMS);
+        assert_eq!(key, format!("i{MAX_ITEMS}"));
+        let kinds: Vec<ItemEventKind> = events.iter().map(|event| event.kind).collect();
+        assert_eq!(kinds, vec![ItemEventKind::Removed, ItemEventKind::Added]);
+    }
+
+    /// m3: one connection cannot fill the tray from every other app's
+    /// names — the per-owner cap refuses the ninth item for an owner.
+    #[test]
+    fn registration_is_capped_per_connection() {
+        let mut state = TrayState::default();
+        for number in 0..MAX_ITEMS_PER_OWNER {
+            registered_by(
+                &mut state,
+                &format!("org.kde.StatusNotifierItem-{number}"),
+                ":1.42",
+            );
+        }
+        let refused = state
+            .register(
+                "org.kde.StatusNotifierItem-more".into(),
+                DEFAULT_ITEM_PATH.into(),
+                ":1.42".into(),
+                ItemProps::default(),
+            )
+            .expect_err("the per-connection cap must refuse");
+        assert!(refused.contains("per-connection"), "{refused}");
+        // A different connection is unaffected, and replacements at the
+        // per-owner cap are allowed.
+        registered_by(&mut state, "org.kde.StatusNotifierItem-other", ":1.43");
+        state
+            .register(
+                "org.kde.StatusNotifierItem-0".into(),
+                DEFAULT_ITEM_PATH.into(),
+                ":1.42".into(),
+                props("app", "Again"),
+            )
+            .expect("replacement at the per-owner cap");
+        assert_eq!(state.count(), MAX_ITEMS_PER_OWNER + 1);
+    }
+
     #[test]
     fn owner_vanish_and_name_loss_remove_their_items() {
         let mut state = TrayState::default();
         let gone = registered(&mut state, "org.kde.StatusNotifierItem-gone");
         let keeper = registered(&mut state, "org.kde.StatusNotifierItem-keeper");
-        // All registered under owner :1.42 by `registered`.
+        // All registered under owner :1.42 by `registered`; the unique
+        // name :1.42 vanishing (name == old_owner, new owner empty).
         let events = state.remove_by_bus_change(":1.42", ":1.42", "");
         assert_eq!(events.len(), 2);
         assert!(state.item(&gone).is_none() && state.item(&keeper).is_none());
@@ -2162,15 +2892,50 @@ mod tests {
                 .len(),
             1
         );
-        // An unrelated name change touches nothing.
+    }
+
+    /// M3: a connection releasing an UNRELATED name (MPRIS, anything)
+    /// must not reap that connection's items. The old code removed any
+    /// item whose owner matched old_owner, whatever the name.
+    #[test]
+    fn an_unrelated_name_release_reaps_nothing() {
         let mut state = TrayState::default();
         registered(&mut state, "org.kde.StatusNotifierItem-stay");
+        let events = state.remove_by_bus_change("org.mpris.MediaPlayer2.player", ":1.42", "");
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(state.count(), 1);
+        // Same for a name the connection still holds moving nowhere.
         assert!(
             state
-                .remove_by_bus_change("org.other", ":1.7", "")
+                .remove_by_bus_change("org.other.name", ":1.42", ":1.77")
                 .is_empty()
         );
         assert_eq!(state.count(), 1);
+    }
+
+    /// m7: host registrations are deduped, capped, and pruned when
+    /// their connection vanishes.
+    #[test]
+    fn hosts_are_deduped_capped_and_pruned_with_their_connections() {
+        let mut state = TrayState::default();
+        assert!(state.add_host(":1.5".into()).expect("first host"));
+        assert!(!state.add_host(":1.5".into()).expect("repeat host"));
+        for number in 6..6 + MAX_HOSTS - 1 {
+            state
+                .add_host(format!(":1.{number}"))
+                .expect("host below the cap");
+        }
+        let refused = state
+            .add_host(":1.99".into())
+            .expect_err("the host cap must refuse");
+        assert!(refused.contains("host limit"), "{refused}");
+        assert_eq!(state.hosts().len(), MAX_HOSTS);
+        // The vanished connection's host registration goes with it.
+        state.remove_by_bus_change(":1.5", ":1.5", "");
+        assert!(!state.hosts().contains(&":1.5".to_string()));
+        // A name release by a live connection prunes no host.
+        state.remove_by_bus_change("org.mpris.MediaPlayer2.x", ":1.6", "");
+        assert!(state.hosts().contains(&":1.6".to_string()));
     }
 
     #[test]
@@ -2228,8 +2993,47 @@ mod tests {
         assert!(list.contains(&format!("{key}.pixmap_width")));
     }
 
+    /// m6: the refresh gate spaces one item's refreshes at least
+    /// MIN_REFRESH_INTERVAL apart (pure core of the coalescing rule).
+    #[test]
+    fn refresh_gate_waits_for_the_minimum_interval() {
+        let mut gate = RefreshGate::default();
+        let start = std::time::Instant::now();
+        assert!(gate.admit("i0", start));
+        // A signal storm inside the interval is deferred ...
+        assert!(!gate.admit("i0", start + MIN_REFRESH_INTERVAL / 5));
+        assert!(!gate.admit("i0", start + MIN_REFRESH_INTERVAL * 4 / 5));
+        // ... and the next one after it fires.
+        assert!(gate.admit("i0", start + MIN_REFRESH_INTERVAL));
+        // Other items are not gated by it.
+        assert!(gate.admit("i1", start));
+        gate.retire("i0");
+        assert!(gate.admit("i0", start + MIN_REFRESH_INTERVAL / 2));
+    }
+
+    /// n1: one event_seq shape — a JSON number in bodies, and the watch
+    /// reply documents it (the old body carried a separate
+    /// "event_sequence" prose key).
+    #[test]
+    fn watch_body_carries_the_documented_event_seq_shape() {
+        let store: TrayStore = Arc::new(Mutex::new(TrayState::default()));
+        lock_state(&store).add_host(":1.5".into()).expect("host");
+        let (rc, body) = dispatch_props(&command("tray.props.watch", Json::Null), &store, "watch");
+        assert_eq!(rc, 0);
+        let watch: Json = serde_json::from_str(&body).expect("watch body is JSON");
+        assert_eq!(watch["event_seq"], 0, "the current counter, as a number");
+        assert!(
+            watch["event_seq_note"].as_str().is_some(),
+            "the shape is documented in the body: {watch}"
+        );
+        assert!(
+            watch.get("event_sequence").is_none(),
+            "one shape, no second event_seq-ish key: {watch}"
+        );
+    }
+
     // ------------------------------------------------------------------
-    // Pure helpers: menu tree + base64
+    // Pure helpers: menu tree + pixmaps + base64 + click body
     // ------------------------------------------------------------------
 
     fn menu_value(
@@ -2288,6 +3092,7 @@ mod tests {
         assert_eq!(json["enabled"], true);
         assert_eq!(json["visible"], true);
         assert_eq!(json["type"], "standard");
+        assert_eq!(json["truncated"], false);
         let children = json["children"].as_array().unwrap();
         assert_eq!(children.len(), 4);
         assert_eq!(children[0]["label"], "Open");
@@ -2299,8 +3104,11 @@ mod tests {
         assert_eq!(children[3]["children"][0]["label"], "Nested");
     }
 
+    /// m8: a tree cut by the node budget says so — "truncated": true on
+    /// the node whose children were cut. The old code dropped them
+    /// silently (no truncated key anywhere).
     #[test]
-    fn menu_tree_is_capped_at_the_node_budget() {
+    fn menu_tree_is_capped_and_says_it_is_truncated() {
         let leaf = || menu_value(1, &[("label", Value::from("L"))], vec![]);
         let mut root_children = Vec::new();
         for _ in 0..=MAX_MENU_NODES {
@@ -2316,6 +3124,103 @@ mod tests {
             MAX_MENU_NODES - 1
         );
         assert_eq!(budget, 0);
+        assert_eq!(
+            json["truncated"], true,
+            "a budget-cut tree must announce it: {json}"
+        );
+    }
+
+    /// n3: menu node type strings are clamped like labels (a hostile
+    /// item cannot stuff megabytes through the "type" or "toggle-type"
+    /// keys).
+    #[test]
+    fn menu_node_type_strings_are_clamped() {
+        let huge = "x".repeat(MAX_STRING_CHARS + 10);
+        let node = menu_value(
+            3,
+            &[
+                ("type", Value::from(huge.clone())),
+                ("toggle-type", Value::from(huge)),
+            ],
+            vec![],
+        );
+        let mut budget = MAX_MENU_NODES;
+        let json = menu_node_json(&node, &mut budget).expect("node parses");
+        assert_eq!(
+            json["type"].as_str().unwrap().chars().count(),
+            MAX_STRING_CHARS
+        );
+        assert_eq!(
+            json["toggle_type"].as_str().unwrap().chars().count(),
+            MAX_STRING_CHARS
+        );
+    }
+
+    /// m11: a pixmap entry only counts when data.len() == w*h*4 — the
+    /// old code accepted any length under the byte cap.
+    #[test]
+    fn pixmaps_validate_their_dimensions() {
+        // Array::from(Vec<Value>) wraps each element in a variant
+        // ("av") — NOT the a(iiay) wire shape largest_pixmap parses;
+        // Array::new + append is signature-checked and unwrapped.
+        let build = |entries: Vec<WirePixmap>| {
+            let pixmap_signature: Signature = "(iiay)".try_into().expect("entry signature");
+            let mut array = Array::new(&pixmap_signature);
+            let byte_signature: Signature = "y".try_into().expect("byte signature");
+            for (width, height, data) in entries {
+                let mut bytes = Array::new(&byte_signature);
+                for byte in data {
+                    bytes.append(Value::U8(byte)).expect("append byte");
+                }
+                array
+                    .append(Value::Structure(
+                        StructureBuilder::new()
+                            .append_field(Value::I32(width))
+                            .append_field(Value::I32(height))
+                            .append_field(Value::Array(bytes))
+                            .build()
+                            .expect("structure"),
+                    ))
+                    .expect("append pixmap entry");
+            }
+            largest_pixmap(&Value::Array(array))
+        };
+        // Declared 4x4 but only 10 bytes of data: dropped.
+        assert!(build(vec![(4, 4, vec![0; 10])]).is_none());
+        // Exact ARGB32 payload: kept.
+        let exact = build(vec![(4, 4, vec![0x5a; 64])]).expect("valid pixmap kept");
+        assert_eq!((exact.width, exact.height), (4, 4));
+        // Largest valid entry wins over a smaller valid one.
+        let largest =
+            build(vec![(2, 2, vec![1; 16]), (8, 8, vec![2; 256])]).expect("valid pixmaps kept");
+        assert_eq!(largest.width, 8);
+    }
+
+    /// B1: the Event body is `(i s v u)` — u32 timestamp, the data a
+    /// SINGLE variant wrapping int32. The old body was (isvx): an i64
+    /// timestamp no conforming dbusmenu server accepts.
+    #[test]
+    fn the_click_event_body_is_isvu_with_a_single_variant() {
+        let body = click_event_body(5);
+        let context = zvariant::serialized::Context::new_dbus(zvariant::NATIVE_ENDIAN, 0);
+        let encoded = zvariant::to_bytes(context, &body).expect("encodes");
+        // Decoding as (i32, String, variant, u32) proves the wire shape;
+        // an i64 timestamp (signature x) would not decode as u32.
+        let (decoded, _): ((i32, String, zvariant::OwnedValue, u32), usize) =
+            encoded.deserialize().expect("decodes as (isvu)");
+        assert_eq!(decoded.0, 5);
+        assert_eq!(decoded.1, "clicked");
+        assert!(
+            matches!(
+                Value::from(decoded.2),
+                Value::Value(ref inner) if matches!(inner.as_ref(), Value::I32(0))
+            ),
+            "the data is exactly one variant wrapping int32"
+        );
+        assert_eq!(
+            <(i32, String, Value<'_>, u32) as zvariant::Type>::SIGNATURE.to_string(),
+            "(isvu)"
+        );
     }
 
     #[test]
@@ -2332,15 +3237,247 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // The Bus publisher (m13): diff publishing, baseline survival, the
+    // one event_seq shape — against a fake, no broker needed.
+    // ------------------------------------------------------------------
+
+    struct FakePublisher {
+        published: Mutex<Vec<(String, cosmix_bus::bus::BusMessage)>>,
+        broken: AtomicBool,
+    }
+
+    impl FakePublisher {
+        fn topics(&self) -> Vec<String> {
+            self.published
+                .lock()
+                .expect("published")
+                .iter()
+                .map(|(topic, _)| topic.clone())
+                .collect()
+        }
+    }
+
+    impl EventPublisher for FakePublisher {
+        fn publish_event(
+            &self,
+            topic: &str,
+            message: cosmix_bus::bus::BusMessage,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+            if self.broken.load(Ordering::Relaxed) {
+                return Box::pin(std::future::ready(Err(anyhow!("bus down"))));
+            }
+            self.published
+                .lock()
+                .expect("published")
+                .push((topic.to_string(), message));
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    fn batch_for(state: &mut TrayState, cause: &'static str) -> BusBatch {
+        // Register a fresh item (or change its title) and snapshot.
+        let count = state.count();
+        let events = if count == 0 {
+            state
+                .register(
+                    "org.kde.StatusNotifierItem-pub".into(),
+                    DEFAULT_ITEM_PATH.into(),
+                    ":1.42".into(),
+                    props("app", "One"),
+                )
+                .expect("register")
+                .1
+        } else {
+            state.apply_props("i0", props("app", "Two"))
+        };
+        let snapshot = TrayProps::new(state).snapshot();
+        BusBatch {
+            events,
+            snapshot,
+            cause,
+        }
+    }
+
+    async fn spawn_publisher(
+        fake: Arc<FakePublisher>,
+    ) -> (
+        mpsc::Sender<BusBatch>,
+        watch::Sender<Option<Arc<dyn EventPublisher>>>,
+        mpsc::Receiver<()>,
+        JoinHandle<Result<()>>,
+    ) {
+        let (batches_tx, batches_rx) = mpsc::channel(64);
+        let (clients_tx, clients_rx) = watch::channel(Some(fake as Arc<dyn EventPublisher>));
+        let (faults_tx, faults_rx) = mpsc::channel(1);
+        let task = tokio::spawn(run_event_publisher(batches_rx, clients_rx, faults_tx));
+        (batches_tx, clients_tx, faults_rx, task)
+    }
+
+    /// The first successful batch sets the baseline without a diff; the
+    /// next batch publishes the props diff against it plus the domain
+    /// event — event_seq as a number in the body, a decimal string in
+    /// the message headers (n1's one shape).
+    #[tokio::test]
+    async fn the_publisher_diffs_against_the_surviving_baseline() {
+        let fake = Arc::new(FakePublisher {
+            published: Mutex::new(Vec::new()),
+            broken: AtomicBool::new(false),
+        });
+        let (batches, _clients, _faults, publisher) = spawn_publisher(Arc::clone(&fake)).await;
+
+        let mut state = TrayState::default();
+        let first = batch_for(&mut state, "test");
+        let first_seq = first.events[0].seq;
+        batches.send(first).await.expect("batch one");
+        let second = batch_for(&mut state, "test");
+        let second_seq = second.events[0].seq;
+        batches.send(second).await.expect("batch two");
+        drop(batches);
+        publisher
+            .await
+            .expect("publisher task")
+            .expect("publisher ok");
+
+        let topics = fake.topics();
+        assert_eq!(
+            topics,
+            vec![
+                TOPIC_ITEM_ADDED.to_string(),
+                props_changed_topic(BUS_SERVICE),
+                TOPIC_ITEM_CHANGED.to_string()
+            ],
+            "added, then the title diff, then changed"
+        );
+        let guard = fake.published.lock().expect("published");
+        // n1: header event_seq is a decimal string of the body's number.
+        let added = &guard[0].1;
+        let first_stamped = first_seq.to_string();
+        assert_eq!(added.get("event_seq"), Some(first_stamped.as_str()));
+        let body: Json = serde_json::from_str(&added.body).expect("event body is JSON");
+        assert_eq!(body["event_seq"], first_seq);
+        assert_eq!(body["data"]["key"], "i0");
+        assert_eq!(
+            body["data"]["registered"],
+            "org.kde.StatusNotifierItem-pub/StatusNotifierItem"
+        );
+        // The diff carries the old and new title.
+        let diff = &guard[1].1;
+        assert!(
+            diff.body.contains("One") && diff.body.contains("Two"),
+            "{}",
+            diff.body
+        );
+        let second_stamped = second_seq.to_string();
+        assert_eq!(diff.get("event_seq"), Some(second_stamped.as_str()));
+    }
+
+    /// The F8/J2 contract: a publish failure keeps the baseline, so the
+    /// next successful batch re-diffs the whole outage window (old
+    /// value from BEFORE the outage, not the lost intermediate one).
+    #[tokio::test]
+    async fn a_failed_publish_keeps_the_baseline_for_the_outage_diff() {
+        let fake = Arc::new(FakePublisher {
+            published: Mutex::new(Vec::new()),
+            broken: AtomicBool::new(false),
+        });
+        let (batches, _clients, mut faults, publisher) = spawn_publisher(Arc::clone(&fake)).await;
+
+        let mut state = TrayState::default();
+        // One good batch establishes the baseline ("One") — and is
+        // processed before the outage starts (no send/processing race).
+        batches
+            .send(batch_for(&mut state, "test"))
+            .await
+            .expect("batch one");
+        wait_until(Duration::from_secs(5), || async {
+            fake.published.lock().expect("published").len() == 1
+        })
+        .await;
+        // The outage: this batch's publishes fail; the baseline stays.
+        fake.broken.store(true, Ordering::Relaxed);
+        batches
+            .send(batch_for(&mut state, "test"))
+            .await
+            .expect("batch two");
+        tokio::time::timeout(Duration::from_secs(5), faults.recv())
+            .await
+            .expect("the publisher faults the broker")
+            .expect("fault channel alive");
+        // Recovery: a third batch succeeds and must diff from "One"
+        // straight to the current title — the intermediate "Two" was
+        // never delivered, so it must not appear as an old value.
+        fake.broken.store(false, Ordering::Relaxed);
+        let events = state.apply_props("i0", props("app", "Three"));
+        assert!(!events.is_empty());
+        let third = BusBatch {
+            events,
+            snapshot: TrayProps::new(&state).snapshot(),
+            cause: "test",
+        };
+        batches.send(third).await.expect("batch three");
+        drop(batches);
+        publisher
+            .await
+            .expect("publisher task")
+            .expect("publisher ok");
+
+        let guard = fake.published.lock().expect("published");
+        let diff = guard
+            .iter()
+            .map(|(_, message)| message)
+            .find(|message| {
+                message.get("command") == Some("props.changed") && message.body.contains("Three")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "an outage-window diff mentioning Three exists; published: {:?}",
+                    guard
+                        .iter()
+                        .map(|(topic, message)| (topic, message.body.clone()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            diff.body.contains("One"),
+            "diffed from before the outage: {}",
+            diff.body
+        );
+    }
+
+    // ------------------------------------------------------------------
     // D-Bus-side test doubles
     // ------------------------------------------------------------------
 
     type CallLog = Arc<Mutex<Vec<String>>>;
 
-    #[derive(Debug)]
+    /// How the test item answers IconPixmap.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PixmapMode {
+        Normal,
+        /// A single >4 MiB pixmap: the raw-reply cap must refuse it
+        /// before any deserialization (M2).
+        Oversized,
+    }
+
+    #[derive(Debug, Default)]
     struct TestItemState {
         title: String,
         hang_activate: bool,
+        menu_path: &'static str,
+        pixmap_oversized: bool,
+        /// Title property reads — how the m6 coalescing test counts
+        /// refreshes.
+        title_reads: AtomicUsize,
+    }
+
+    impl TestItemState {
+        fn new() -> Self {
+            Self {
+                title: "Original title".into(),
+                menu_path: "/MenuBarItem",
+                ..Self::default()
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -2362,7 +3499,9 @@ mod tests {
 
         #[zbus(property)]
         fn title(&self) -> fdo::Result<String> {
-            Ok(self.state.lock().expect("item state").title.clone())
+            let state = self.state.lock().expect("item state");
+            state.title_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(state.title.clone())
         }
 
         #[zbus(property)]
@@ -2402,7 +3541,8 @@ mod tests {
 
         #[zbus(property)]
         fn menu(&self) -> fdo::Result<zvariant::OwnedObjectPath> {
-            Ok("/MenuBarItem".try_into().expect("menu path"))
+            let menu = self.state.lock().expect("item state").menu_path;
+            Ok(menu.try_into().expect("menu path"))
         }
 
         #[zbus(property)]
@@ -2412,7 +3552,15 @@ mod tests {
 
         #[zbus(property)]
         fn icon_pixmap(&self) -> fdo::Result<Vec<WirePixmap>> {
-            Ok(vec![pixmap(2), pixmap(4)])
+            let oversized = self.state.lock().expect("item state").pixmap_oversized;
+            if oversized {
+                // 1024 * 1280 * 4 = 5 MiB: over every cap, still well
+                // under zbus's 128 MiB message limit — only the
+                // adapter's own raw-reply cap can stop it.
+                Ok(vec![(1024, 1280, vec![0x41; 5 * 1024 * 1024])])
+            } else {
+                Ok(vec![pixmap(2), pixmap(4)])
+            }
         }
 
         async fn activate(&self, x: i32, y: i32) {
@@ -2464,8 +3612,12 @@ mod tests {
             &self,
             _parent: i32,
             _depth: i32,
-            _properties: Vec<String>,
+            properties: Vec<String>,
         ) -> fdo::Result<(u32, Value<'static>)> {
+            self.events
+                .lock()
+                .expect("menu events")
+                .push(format!("GetLayout({properties:?})"));
             let nested = menu_value(8, &[("label", Value::from("Nested"))], vec![]);
             let open = menu_value(5, &[("label", Value::from("Open"))], vec![]);
             let check = menu_value(
@@ -2496,11 +3648,47 @@ mod tests {
             Ok((7, Value::Structure(structure)))
         }
 
-        async fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: i64) {
+        /// dbusmenu Event is `(i s v u)`: the typed u32 timestamp makes
+        /// this fixture REJECT the old (isvx) body — the click test then
+        /// fails on the old client (B1's proving test).
+        async fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: u32) {
             self.events
                 .lock()
                 .expect("menu events")
                 .push(format!("Event({id},{event_id})"));
+        }
+
+        async fn about_to_show(&self, id: i32) -> fdo::Result<bool> {
+            self.events
+                .lock()
+                .expect("menu events")
+                .push(format!("AboutToShow({id})"));
+            Ok(true)
+        }
+    }
+
+    /// How to spawn a test app.
+    struct TestAppSpec<'a> {
+        address: &'a str,
+        well_known: Option<&'static str>,
+        item_path: &'static str,
+        menu_path: &'static str,
+        pixmap: PixmapMode,
+    }
+
+    impl<'a> TestAppSpec<'a> {
+        fn new(
+            address: &'a str,
+            well_known: Option<&'static str>,
+            item_path: &'static str,
+        ) -> Self {
+            Self {
+                address,
+                well_known,
+                item_path,
+                menu_path: "/MenuBarItem",
+                pixmap: PixmapMode::Normal,
+            }
         }
     }
 
@@ -2514,21 +3702,19 @@ mod tests {
     }
 
     impl TestApp {
-        async fn spawn(
-            address: &str,
-            well_known: Option<&'static str>,
-            item_path: &'static str,
-        ) -> Self {
-            let state = Arc::new(Mutex::new(TestItemState {
-                title: "Original title".into(),
-                hang_activate: false,
+        async fn spawn(spec: TestAppSpec<'_>) -> Self {
+            let state = Arc::new(Mutex::new({
+                let mut item = TestItemState::new();
+                item.menu_path = spec.menu_path;
+                item.pixmap_oversized = spec.pixmap == PixmapMode::Oversized;
+                item
             }));
             let calls: CallLog = Arc::new(Mutex::new(Vec::new()));
-            let address: zbus::address::Address = address.parse().expect("test bus address");
+            let address: zbus::address::Address = spec.address.parse().expect("test bus address");
             let mut builder = zbus::connection::Builder::address(address)
                 .expect("builder")
                 .serve_at(
-                    item_path,
+                    spec.item_path,
                     TestItem {
                         state: Arc::clone(&state),
                         calls: Arc::clone(&calls),
@@ -2536,19 +3722,19 @@ mod tests {
                 )
                 .expect("serve item")
                 .serve_at(
-                    "/MenuBarItem",
+                    spec.menu_path,
                     TestMenu {
                         events: Arc::clone(&calls),
                     },
                 )
                 .expect("serve menu");
-            if let Some(well_known) = well_known {
+            if let Some(well_known) = spec.well_known {
                 builder = builder
                     .name(WellKnownName::from_static_str(well_known).expect("well-known name"))
                     .expect("own name");
             }
             let connection = builder.build().await.expect("test app connects");
-            let emitter = SignalEmitter::new(&connection, item_path).expect("emitter");
+            let emitter = SignalEmitter::new(&connection, spec.item_path).expect("emitter");
             Self {
                 connection,
                 state,
@@ -2556,10 +3742,27 @@ mod tests {
                 emitter,
             }
         }
+
+        /// A second SNI item on the SAME connection at another path
+        /// (M4: two path-form indicators, one connection).
+        async fn serve_second_item(&self, path: &'static str) {
+            self.connection
+                .object_server()
+                .at(
+                    zvariant::ObjectPath::from_static_str(path).expect("item path"),
+                    TestItem {
+                        state: Arc::new(Mutex::new(TestItemState::new())),
+                        calls: Arc::clone(&self.calls),
+                    },
+                )
+                .await
+                .expect("second item served");
+        }
     }
 
-    /// A private `dbus-daemon --session` per test; skip (not fail) when
-    /// dbus-daemon is not installed.
+    /// A private `dbus-daemon --session` per test. Without dbus-daemon
+    /// the integration tests FAIL loudly (m12) unless
+    /// COSMIX_SKIP_DBUS_TESTS=1 says otherwise.
     struct PrivateBus {
         child: tokio::process::Child,
         address: String,
@@ -2568,14 +3771,20 @@ mod tests {
     async fn private_bus() -> Option<PrivateBus> {
         use tokio::io::AsyncBufReadExt as _;
 
+        if std::env::var_os("COSMIX_SKIP_DBUS_TESTS").is_some() {
+            eprintln!("skipped: COSMIX_SKIP_DBUS_TESTS is set");
+            return None;
+        }
         let mut child = tokio::process::Command::new("dbus-daemon")
             .args(["--session", "--print-address", "--nofork"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn();
         if let Err(error) = &mut child {
-            eprintln!("skipped: dbus-daemon is not available ({error})");
-            return None;
+            panic!(
+                "dbus-daemon is not available ({error}) — the tray adapter integration tests \
+                 need one; install dbus or set COSMIX_SKIP_DBUS_TESTS=1"
+            );
         }
         let mut child = child.expect("spawned");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -2587,8 +3796,7 @@ mod tests {
             }
             _ => {
                 let _ = child.start_kill();
-                eprintln!("skipped: dbus-daemon printed no address");
-                return None;
+                panic!("dbus-daemon printed no address");
             }
         }
         Some(PrivateBus { child, address })
@@ -2609,8 +3817,8 @@ mod tests {
             .expect("connect")
     }
 
-    async fn register_with_watcher(connection: &Connection, argument: &str) {
-        let watcher = ProxyBuilder::<Proxy>::new(connection)
+    async fn watcher_proxy(connection: &Connection) -> Proxy<'static> {
+        ProxyBuilder::<Proxy>::new(connection)
             .destination(WATCHER_NAME)
             .expect("destination")
             .path(WATCHER_PATH)
@@ -2620,11 +3828,34 @@ mod tests {
             .cache_properties(CacheProperties::No)
             .build()
             .await
-            .expect("watcher proxy");
-        watcher
+            .expect("watcher proxy")
+    }
+
+    async fn register_with_watcher(connection: &Connection, argument: &str) {
+        watcher_proxy(connection)
+            .await
             .call_method("RegisterStatusNotifierItem", &[argument])
             .await
             .expect("RegisterStatusNotifierItem replies");
+    }
+
+    /// The raw reply of a RegisterStatusNotifierItem call — error name
+    /// and all, so refusal tests can pin the D-Bus error (m1).
+    async fn register_reply(
+        connection: &Connection,
+        argument: &str,
+    ) -> std::result::Result<(), String> {
+        let reply = watcher_proxy(connection)
+            .await
+            .call_method("RegisterStatusNotifierItem", &[argument])
+            .await;
+        match reply {
+            Ok(_) => Ok(()),
+            Err(zbus::Error::MethodError(name, message, _)) => {
+                Err(format!("{}: {}", name, message.unwrap_or_default()))
+            }
+            Err(error) => Err(format!("unexpected reply failure: {error}")),
+        }
     }
 
     fn command(verb: &str, args: Json) -> IncomingCommand {
@@ -2711,15 +3942,16 @@ mod tests {
         let host = spawn_host(&bus.address).await;
 
         // Item 1: registers by bus name from its own connection.
-        let app1 = TestApp::spawn(
+        let app1 = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-test-1"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app1.connection, "org.kde.StatusNotifierItem-test-1").await;
         // Item 2: registers by object path (a second connection).
-        let app2 = TestApp::spawn(&bus.address, None, "/org/test/SecondItem").await;
+        let app2 =
+            TestApp::spawn(TestAppSpec::new(&bus.address, None, "/org/test/SecondItem")).await;
         register_with_watcher(&app2.connection, "/org/test/SecondItem").await;
 
         // Both items surface with their SNI properties read back.
@@ -2770,7 +4002,8 @@ mod tests {
         );
 
         // The watcher's own protocol surface, read by an independent
-        // client, matches the SNI spec.
+        // client, matches the SNI spec — with the KDE service+path
+        // naming for every item (M4).
         let client = plain_connection(&bus.address).await;
         let properties = fdo::PropertiesProxy::builder(&client)
             .destination(WATCHER_NAME)
@@ -2791,8 +4024,14 @@ mod tests {
                 .clone(),
         )
         .expect("string array");
-        assert!(items.contains(&"org.kde.StatusNotifierItem-test-1".to_string()));
-        assert!(items.iter().any(|item| item.starts_with(':')));
+        assert!(
+            items.contains(&"org.kde.StatusNotifierItem-test-1/StatusNotifierItem".to_string())
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| { item.starts_with(':') && item.ends_with("/org/test/SecondItem") })
+        );
         assert!(
             bool::try_from(
                 all.get("IsStatusNotifierHostRegistered")
@@ -2825,6 +4064,292 @@ mod tests {
         );
     }
 
+    /// M4 in the flesh: two path-form indicators from ONE connection are
+    /// both tracked and both advertised. The old code (dedupe by
+    /// service) collapsed them into one item.
+    #[tokio::test]
+    async fn two_path_form_items_from_one_connection_register_separately() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let app = TestApp::spawn(TestAppSpec::new(&bus.address, None, "/org/test/FirstItem")).await;
+        app.serve_second_item("/org/test/SecondItem").await;
+
+        register_with_watcher(&app.connection, "/org/test/FirstItem").await;
+        register_with_watcher(&app.connection, "/org/test/SecondItem").await;
+
+        wait_until(Duration::from_secs(10), || async {
+            let (_, list) = verb(&host.store, &host.session, "tray.list", Json::Null).await;
+            list["count"] == 2
+                && list["items"][0]["path"] == "/org/test/FirstItem"
+                && list["items"][1]["path"] == "/org/test/SecondItem"
+        })
+        .await;
+
+        let unique = app
+            .connection
+            .unique_name()
+            .expect("unique name")
+            .to_string();
+        let client = plain_connection(&bus.address).await;
+        let properties = fdo::PropertiesProxy::builder(&client)
+            .destination(WATCHER_NAME)
+            .expect("destination")
+            .path(WATCHER_PATH)
+            .expect("path")
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .expect("watcher properties proxy");
+        let all = properties
+            .get_all(zbus::names::InterfaceName::from_static_str(WATCHER_IFACE).expect("iface"))
+            .await
+            .expect("watcher properties");
+        let items = Vec::<String>::try_from(
+            all.get("RegisteredStatusNotifierItems")
+                .expect("property present")
+                .clone(),
+        )
+        .expect("string array");
+        let first = format!("{unique}/org/test/FirstItem");
+        let second = format!("{unique}/org/test/SecondItem");
+        assert!(
+            items.contains(&first) && items.contains(&second),
+            "both indicators advertised: {items:?}"
+        );
+    }
+
+    /// m1/m3: registrations that can be judged synchronously get a real
+    /// D-Bus error, not an OK followed by a silent drop — and a bus
+    /// name may only be registered by its owner.
+    #[tokio::test]
+    async fn bad_registrations_get_dbus_errors_not_ok_then_drop() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let owner = TestApp::spawn(TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-mine"),
+            DEFAULT_ITEM_PATH,
+        ))
+        .await;
+        // A third connection tries to register the name the owner holds.
+        let squatter = plain_connection(&bus.address).await;
+        let refused = register_reply(&squatter, "org.kde.StatusNotifierItem-mine")
+            .await
+            .expect_err("registering someone else's name must be refused");
+        assert!(
+            refused.contains("AccessDenied"),
+            "an ownership refusal: {refused}"
+        );
+        // Invalid bus names and unknown names are refused too.
+        let invalid = register_reply(&squatter, "not a bus name!!")
+            .await
+            .expect_err("an invalid name must be refused");
+        assert!(invalid.contains("InvalidArgs"), "{invalid}");
+        let unknown = register_reply(&squatter, "org.kde.StatusNotifierItem.nobody")
+            .await
+            .expect_err("a name with no owner must be refused");
+        assert!(unknown.contains("no owner"), "{unknown}");
+        // The owner's own registration still works.
+        register_with_watcher(&owner.connection, "org.kde.StatusNotifierItem-mine").await;
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "count"}),
+            )
+            .await
+            .1 == 1
+        })
+        .await;
+    }
+
+    /// M1: a flood of item signals during a name-form registration must
+    /// not wedge the adapter — the owner resolution never sits in the
+    /// serve loop blocking the signal drain. On the old code the inline
+    /// get_name_owner awaited while the 128-slot signal stream filled
+    /// and zbus's reader blocked: the reply never arrived and the second
+    /// item never registered.
+    #[tokio::test]
+    async fn a_signal_flood_does_not_wedge_registration() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let app1 = TestApp::spawn(TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-flood-1"),
+            DEFAULT_ITEM_PATH,
+        ))
+        .await;
+        register_with_watcher(&app1.connection, "org.kde.StatusNotifierItem-flood-1").await;
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "count"}),
+            )
+            .await
+            .1 == 1
+        })
+        .await;
+
+        // The flood: 4000 NewTitle signals, then a name-form
+        // registration whose owner must still be resolvable.
+        for _ in 0..4000 {
+            TestItem::new_title(&app1.emitter)
+                .await
+                .expect("NewTitle emitted");
+        }
+        let app2 = TestApp::spawn(TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-flood-2"),
+            DEFAULT_ITEM_PATH,
+        ))
+        .await;
+        register_with_watcher(&app2.connection, "org.kde.StatusNotifierItem-flood-2").await;
+
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "count"}),
+            )
+            .await
+            .1 == 2
+        })
+        .await;
+        let (rc, list) = verb(&host.store, &host.session, "tray.list", Json::Null).await;
+        assert_eq!(rc, 0, "the adapter still answers verbs: {list}");
+    }
+
+    /// M2: an item whose IconPixmap reply exceeds the raw-size cap is
+    /// registered, its pixmap refused without decoding, and the refusal
+    /// counted. The old code had no cap (and no counter): it happily
+    /// decoded multi-megabyte per-byte values before the 1 MiB pixmap
+    /// cap applied.
+    #[tokio::test]
+    async fn an_oversized_pixmap_is_refused_and_counted() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let mut spec = TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-huge"),
+            DEFAULT_ITEM_PATH,
+        );
+        spec.pixmap = PixmapMode::Oversized;
+        let app = TestApp::spawn(spec).await;
+        register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-huge").await;
+
+        // The item registers and its string props land ...
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "i0.title"}),
+            )
+            .await
+            .1 == "Original title"
+        })
+        .await;
+        // ... the pixmap does not, and the cap path was taken.
+        wait_until(Duration::from_secs(10), || async {
+            verb(&host.store, &host.session, "tray.info", Json::Null)
+                .await
+                .1["oversized_reads"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        })
+        .await;
+        let (_, list) = verb(&host.store, &host.session, "tray.list", Json::Null).await;
+        assert!(
+            list["items"][0]["pixmap"].is_null(),
+            "the oversized pixmap never landed: {}",
+            list["items"][0]
+        );
+        let (rc, body) = verb(&host.store, &host.session, "tray.icon", json!({"id": "i0"})).await;
+        assert_eq!(rc, 10, "tray.icon refuses: {body}");
+        // The adapter itself is unharmed.
+        let (rc, list) = verb(&host.store, &host.session, "tray.list", Json::Null).await;
+        assert_eq!(rc, 0);
+        assert_eq!(list["count"], 1);
+    }
+
+    /// m6: a NewTitle flood spread over time is coalesced — the item's
+    /// property set is read at most a handful of times, not once per
+    /// signal. The old code read it for every single signal.
+    #[tokio::test]
+    async fn signal_floods_are_refresh_coalesced() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let app = TestApp::spawn(TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-storm"),
+            DEFAULT_ITEM_PATH,
+        ))
+        .await;
+        register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-storm").await;
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "i0.title"}),
+            )
+            .await
+            .1 == "Original title"
+        })
+        .await;
+
+        let reads_before = app
+            .state
+            .lock()
+            .expect("item state")
+            .title_reads
+            .load(Ordering::Relaxed);
+        for _ in 0..80 {
+            TestItem::new_title(&app.emitter)
+                .await
+                .expect("NewTitle emitted");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        // Let the trailing (gate-delayed) refresh land.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let reads = app
+            .state
+            .lock()
+            .expect("item state")
+            .title_reads
+            .load(Ordering::Relaxed)
+            - reads_before;
+        assert!(
+            reads <= 25,
+            "80 signals over ~2.4 s must not mean 80 refreshes (gate: \
+             {MIN_REFRESH_INTERVAL:?}); title reads: {reads}"
+        );
+        // And the item's props still answer.
+        let (_, title) = verb(
+            &host.store,
+            &host.session,
+            "tray.props.get",
+            json!({"path": "i0.title"}),
+        )
+        .await;
+        assert_eq!(title, "Original title");
+    }
+
     /// NewTitle on the item refreshes the props surface and produces a
     /// changed event.
     #[tokio::test]
@@ -2833,11 +4358,11 @@ mod tests {
             return;
         };
         let host = spawn_host(&bus.address).await;
-        let app = TestApp::spawn(
+        let app = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-title"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-title").await;
         wait_until(Duration::from_secs(10), || async {
@@ -2879,19 +4404,70 @@ mod tests {
         );
     }
 
+    /// m7: an external StatusNotifierHost registration is recorded AND
+    /// signalled. The old code only recorded it (no signal).
+    #[tokio::test]
+    async fn external_host_registrations_are_signalled() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let client = plain_connection(&bus.address).await;
+        let rule = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .interface(WATCHER_IFACE)
+            .expect("interface")
+            .member("StatusNotifierHostRegistered")
+            .expect("member")
+            .build();
+        let mut signals = MessageStream::for_match_rule(rule, &client, Some(8))
+            .await
+            .expect("match rule");
+
+        watcher_proxy(&client)
+            .await
+            .call_method("RegisterStatusNotifierHost", &())
+            .await
+            .expect("RegisterStatusNotifierHost replies");
+
+        let signal = tokio::time::timeout(Duration::from_secs(10), signals.next())
+            .await
+            .expect("StatusNotifierHostRegistered within 10 s")
+            .expect("stream alive")
+            .expect("signal decodes");
+        assert_eq!(
+            signal.header().member().expect("member").as_str(),
+            "StatusNotifierHostRegistered"
+        );
+        let host_name = client.unique_name().expect("unique name").to_string();
+        wait_until(Duration::from_secs(10), || async {
+            verb(&host.store, &host.session, "tray.info", Json::Null)
+                .await
+                .1["hosts"]
+                .as_array()
+                .is_some_and(|hosts| {
+                    hosts
+                        .iter()
+                        .any(|name| name.as_str() == Some(host_name.as_str()))
+                })
+        })
+        .await;
+    }
+
     /// An item's connection dropping removes it: props vanish, and the
-    /// watcher emits StatusNotifierItemUnregistered.
+    /// watcher emits StatusNotifierItemUnregistered with the service
+    /// + path surface name.
     #[tokio::test]
     async fn a_dropped_connection_removes_the_item_and_unregisters() {
         let Some(bus) = private_bus().await else {
             return;
         };
         let host = spawn_host(&bus.address).await;
-        let app = TestApp::spawn(
+        let app = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-doomed"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-doomed").await;
         wait_until(Duration::from_secs(10), || async {
@@ -2926,7 +4502,10 @@ mod tests {
             .expect("stream alive")
             .expect("signal decodes");
         let (service,): (String,) = message.body().deserialize().expect("signal body");
-        assert_eq!(service, "org.kde.StatusNotifierItem-doomed");
+        assert_eq!(
+            service,
+            "org.kde.StatusNotifierItem-doomed/StatusNotifierItem"
+        );
 
         wait_until(Duration::from_secs(10), || async {
             verb(
@@ -2951,11 +4530,11 @@ mod tests {
             return;
         };
         let host = spawn_host(&bus.address).await;
-        let app = TestApp::spawn(
+        let app = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-activate"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-activate").await;
         wait_until(Duration::from_secs(10), || async {
@@ -3060,18 +4639,20 @@ mod tests {
     }
 
     /// tray.menu returns the com.canonical.dbusmenu layout as a JSON
-    /// tree, and tray.menu.click delivers the Event.
+    /// tree — after AboutToShow(0), with icon-data excluded from the
+    /// property request — and tray.menu.click delivers the Event with
+    /// the (isvu) body the u32-typed fixture demands (B1).
     #[tokio::test]
     async fn menu_verbs_read_the_layout_and_deliver_clicks() {
         let Some(bus) = private_bus().await else {
             return;
         };
         let host = spawn_host(&bus.address).await;
-        let app = TestApp::spawn(
+        let app = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-menu"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-menu").await;
         wait_until(Duration::from_secs(10), || async {
@@ -3089,6 +4670,7 @@ mod tests {
         let (rc, menu) = verb(&host.store, &host.session, "tray.menu", json!({"id": "i0"})).await;
         assert_eq!(rc, 0, "{menu}");
         assert_eq!(menu["revision"], 7);
+        assert_eq!(menu["layout"]["truncated"], false);
         let children = menu["layout"]["children"].as_array().expect("children");
         assert_eq!(children.len(), 4);
         assert_eq!(children[0]["id"], 5);
@@ -3098,6 +4680,25 @@ mod tests {
         assert_eq!(children[1]["toggle_state"], 1);
         assert_eq!(children[2]["type"], "separator");
         assert_eq!(children[3]["children"][0]["label"], "Nested");
+
+        // The read hit the menu the dbusmenu way: AboutToShow(0) before
+        // GetLayout (m9), and no icon-data in the property request (M2).
+        let calls = app.calls.lock().expect("calls").clone();
+        let about = calls
+            .iter()
+            .position(|call| call == "AboutToShow(0)")
+            .expect("AboutToShow(0) ran before the layout read");
+        let layout = calls
+            .iter()
+            .position(|call| call.starts_with("GetLayout("))
+            .expect("GetLayout ran");
+        assert!(about < layout, "{calls:?}");
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("GetLayout(") && !call.contains("icon-data")),
+            "the property names exclude icon-data: {calls:?}"
+        );
 
         let (rc, body) = verb(
             &host.store,
@@ -3125,6 +4726,52 @@ mod tests {
         assert!(body["error"].as_str().expect("error").contains("args.item"));
     }
 
+    /// m10: the "/NO_DBUSMENU" sentinel Menu path means no menu — the
+    /// old code treated it as a real path.
+    #[tokio::test]
+    async fn the_no_dbusmenu_sentinel_is_menuless() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let mut spec = TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-sentinel"),
+            DEFAULT_ITEM_PATH,
+        );
+        spec.menu_path = NO_DBUSMENU_PATH;
+        let app = TestApp::spawn(spec).await;
+        register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-sentinel").await;
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "i0.title"}),
+            )
+            .await
+            .1 == "Original title"
+        })
+        .await;
+        let (_, has_menu) = verb(
+            &host.store,
+            &host.session,
+            "tray.props.get",
+            json!({"path": "i0.has_menu"}),
+        )
+        .await;
+        assert_eq!(has_menu, false);
+        let (rc, body) = verb(&host.store, &host.session, "tray.menu", json!({"id": "i0"})).await;
+        assert_eq!(rc, 10, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("has no menu"),
+            "{body}"
+        );
+    }
+
     /// tray.icon serves the largest pixmap's pixels; the props never
     /// carry them.
     #[tokio::test]
@@ -3133,11 +4780,11 @@ mod tests {
             return;
         };
         let host = spawn_host(&bus.address).await;
-        let app = TestApp::spawn(
+        let app = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-icon"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-icon").await;
         wait_until(Duration::from_secs(10), || async {
@@ -3170,11 +4817,11 @@ mod tests {
             return;
         };
         let host = spawn_host(&bus.address).await;
-        let app = TestApp::spawn(
+        let app = TestApp::spawn(TestAppSpec::new(
             &bus.address,
             Some("org.kde.StatusNotifierItem-hung"),
             DEFAULT_ITEM_PATH,
-        )
+        ))
         .await;
         register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-hung").await;
         wait_until(Duration::from_secs(10), || async {
@@ -3217,6 +4864,105 @@ mod tests {
         let (rc, list) = verb(&host.store, &host.session, "tray.list", Json::Null).await;
         assert_eq!(rc, 0);
         assert_eq!(list["count"], 1);
+    }
+
+    /// m5: a verb stuck on a hung item does not delay the verbs behind
+    /// it — dispatch is concurrent (bounded). Against the old
+    /// serialized serve loop, tray.list behind a hung activate waited
+    /// out the whole 2 s item timeout.
+    #[tokio::test]
+    async fn a_hung_item_does_not_delay_other_verbs() {
+        let Some(bus) = private_bus().await else {
+            return;
+        };
+        let host = spawn_host(&bus.address).await;
+        let app = TestApp::spawn(TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-slow"),
+            DEFAULT_ITEM_PATH,
+        ))
+        .await;
+        register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-slow").await;
+        wait_until(Duration::from_secs(10), || async {
+            verb(
+                &host.store,
+                &host.session,
+                "tray.props.get",
+                json!({"path": "count"}),
+            )
+            .await
+            .1 == 1
+        })
+        .await;
+        app.state.lock().expect("item state").hang_activate = true;
+
+        struct RecordingResponder {
+            answered: Mutex<Vec<(String, tokio::time::Instant)>>,
+        }
+        impl CommandResponder for RecordingResponder {
+            fn respond(
+                &self,
+                command: &IncomingCommand,
+                _rc: u8,
+                _body: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+                self.answered
+                    .lock()
+                    .expect("answered")
+                    .push((command.command.clone(), tokio::time::Instant::now()));
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+        let responder = Arc::new(RecordingResponder {
+            answered: Mutex::new(Vec::new()),
+        });
+        let (_stop, stop_rx) = watch::channel(false);
+        let serving = tokio::spawn(serve_commands(
+            commands_rx,
+            Arc::clone(&host.store),
+            host.session.clone(),
+            responder.clone() as Arc<dyn CommandResponder>,
+            stop_rx,
+        ));
+
+        // The hung activate first, then a cheap list behind it.
+        commands_tx
+            .send(command("tray.activate", json!({"id": "i0"})))
+            .expect("send activate");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        commands_tx
+            .send(command("tray.list", Json::Null))
+            .expect("send list");
+
+        wait_until(Duration::from_secs(2), || async {
+            let answered = responder.answered.lock().expect("answered");
+            answered.iter().any(|(verb, _)| verb == "tray.list")
+        })
+        .await;
+        {
+            let answered = responder.answered.lock().expect("answered");
+            assert!(
+                !answered.iter().any(|(verb, _)| verb == "tray.activate"),
+                "the hung item is still hanging: {answered:?}"
+            );
+        }
+        // The hung verb still completes within its own timeout.
+        wait_until(
+            Duration::from_secs(ITEM_CALL_TIMEOUT.as_secs() + 5),
+            || async {
+                responder
+                    .answered
+                    .lock()
+                    .expect("answered")
+                    .iter()
+                    .any(|(verb, _)| verb == "tray.activate")
+            },
+        )
+        .await;
+        drop(commands_tx);
+        let _ = serving.await;
     }
 
     /// An already-owned watcher name fails the run with a clear error,
@@ -3266,6 +5012,48 @@ mod tests {
         assert_eq!(
             owner.to_string(),
             squatter.unique_name().expect("unique name").to_string()
+        );
+    }
+
+    /// Session-bus death ends the run — observed on the zbus
+    /// connection's own closed signal, with that exact reason. A Bus
+    /// (mesh) outage would NOT end it (the broker reconnects); this is
+    /// the session-side half of that contract.
+    #[tokio::test]
+    async fn session_bus_death_ends_the_run() {
+        let Some(mut bus) = private_bus().await else {
+            return;
+        };
+        let host = TrayHost::start(&bus.address).await.expect("host starts");
+        let store = host.store();
+        let session = host.connection().clone();
+        let (_stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(async move { host.run_until(stop_rx).await });
+        let app = TestApp::spawn(TestAppSpec::new(
+            &bus.address,
+            Some("org.kde.StatusNotifierItem-doomed-bus"),
+            DEFAULT_ITEM_PATH,
+        ))
+        .await;
+        register_with_watcher(&app.connection, "org.kde.StatusNotifierItem-doomed-bus").await;
+        wait_until(Duration::from_secs(10), || async {
+            verb(&store, &session, "tray.props.get", json!({"path": "count"}))
+                .await
+                .1
+                == 1
+        })
+        .await;
+
+        drop(app);
+        bus.child.start_kill().expect("kill dbus-daemon");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the run ends within 10 s of session-bus death")
+            .expect("run task joinable");
+        let message = format!("{:#}", outcome.expect_err("session death fails the run"));
+        assert!(
+            message.contains("session bus connection closed"),
+            "the authoritative closed-signal reason: {message}"
         );
     }
 
