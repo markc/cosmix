@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — cos/</title>
+    <title>CosMix — cos/quoin-panel</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,55 +441,70 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="cos/README.md"><div class="prose"><h1 id="cos--component-docs">cos — component docs</h1>
-<p>Summary documentation for the <strong>cos</strong> daemon family, one page per component. The
-canonical home of these pages is
-<a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> in the public
-<a href="https://github.com/markc/cosmix">markc/cos</a> repo; add a page by dropping
-<code>COMPONENT.md</code> there. The same files render three ways:</p>
+        <div id="content-doc" data-prerendered="cos/quoin-panel.md"><div class="prose"><h1 id="quoin-panel">quoin-panel</h1>
+<p>The Quoin bottom panel, application launcher, calendar and notifications
+popup, written as <a href="/cos/scenes">Mix Scenes</a>. One Mix citizen
+(<code>src/desktop/scripts/quoin-panel.mix</code>, Bus name <code>quoin-panel</code>) owns four
+scene documents and loads them into the running Quoin (<code>shell</code>):</p>
+<table><thead><tr><th>scene</th><th>edge</th><th>what it is</th></tr></thead><tbody>
+<tr><td><code>panel</code></td><td>bottom, pinned</td><td>launcher button · workspace pager · task buttons · tray icons · status applets · clock · peek-at-desktop</td></tr>
+<tr><td><code>launcher</code></td><td>left</td><td>search field + every visible <code>.desktop</code> application, click launches</td></tr>
+<tr><td><code>calendar</code></td><td>right</td><td>month grid (Monday first, today marked, neighbouring days greyed), month navigation, "Open calendar app"</td></tr>
+<tr><td><code>notes</code></td><td>right</td><td>live notifications from the <code>notify</code> adapter, click dismisses, "Clear all"</td></tr>
+</tbody></table>
+<p>The layout follows Plasma's default bottom panel and Breeze Dark palette.
+The clock is the big <code>09:05 pm</code> with <code>Wed 16 Sept</code> underneath; clicking it
+opens the calendar. One popup is open at a time, like Plasma.</p>
+<h2 id="data-sources">Data sources</h2>
+<p>Everything comes from an existing citizen or the kernel; the panel stores
+nothing of its own.</p>
 <ul>
-<li><strong>Web</strong> — <a href="https://markc.github.io/cos/">markc.github.io/cos</a> serves this manual in the site's left-hand <strong>Components</strong> pane; any page deep-links as <code>#_man/PAGE.md</code>.</li>
-<li><strong>GitHub</strong> — browse <a href="https://github.com/markc/cosmix/tree/main/docs/cos"><code>docs/_man/</code></a> directly; this file doubles as the directory README.</li>
-<li><strong>Local clone</strong> — plain markdown with relative links; any editor or viewer works.</li>
+<li><strong>Applications and icons</strong> — the <code>apps</code> citizen (<code>apps.list</code>,
+<code>apps.icon</code>, <code>apps.launch</code>): XDG desktop entries and the icon-theme spec.
+Status icons ask for <code>breeze-dark</code> (override: <code>PANEL_ICON_THEME</code>) so they
+read on the dark panel.</li>
+<li><strong>Tasks and pager</strong> — <code>comp.windows.list</code> and <code>comp.props.get workspaces</code>. A click focuses and raises a window, minimises the focused
+one, and restores a minimised one (Plasma's task semantics); pager
+buttons call <code>comp.workspace.switch</code>. Only the current workspace's
+windows are shown.</li>
+<li><strong>Tray</strong> — the <code>tray</code> adapter (<code>tray.list</code>, <code>tray.activate</code>), shown only
+when an application publishes a StatusNotifierItem.</li>
+<li><strong>Notifications</strong> — the <code>notify</code> adapter (<code>notify.list</code>,
+<code>notify.close</code>).</li>
+<li><strong>Network</strong> — <code>/sys/class/net/*/operstate</code> (no D-Bus).</li>
+<li><strong>Volume</strong> — PipeWire's default sink through <code>wpctl</code>; the applet is hidden
+when there is no default sink. Click toggles mute. <code>PIPEWIRE_RUNTIME_DIR</code>
+points at the login session's runtime directory.</li>
 </ul>
-<p>These are <strong>summaries</strong> — what each component is and how to use it — not
-exhaustive manpages. For the language that drives these daemons, see the
-<a href="https://markc.github.io/mix/">mix manual</a>.</p>
-<h2 id="start-here">Start here</h2>
-<ul>
-<li><strong><a href="/cos/overview">overview</a></strong> — what cos is, how the workspace is laid out, how it fits with bus and mix.</li>
-</ul>
-<h2 id="daemons">Daemons</h2>
-<ul>
-<li><strong><a href="/cos/noded">noded</a></strong> — the Bus broker; every node runs one.</li>
-<li><strong><a href="/cos/maild">maild</a></strong> — JMAP-native mail daemon (SMTP + IMAP + JMAP + spam).</li>
-<li><strong><a href="/cos/webd">webd</a></strong> — multi-vhost HTTPS + ACME; server-rendered web UI.</li>
-<li><strong><a href="/cos/dnsd">dnsd</a></strong> — authoritative WireGuard-mesh DNS.</li>
-<li><strong><a href="/cos/indexd">indexd</a></strong> — vector knowledge base / indexer.</li>
-<li><strong><a href="/cos/desktop">desktop</a></strong> — the CosMix desktop: <code>cosmix-comp</code> (Smithay + Bevy Wayland compositor), the <code>ctk</code> toolkit and the native apps.</li>
-<li><strong><a href="/cos/cosmix-comp">cosmix-comp</a></strong> — Wayland compositor and supported protocol globals.</li>
-<li><strong><a href="/cos/quoin">quoin</a></strong> — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.</li>
-<li><strong><a href="/cos/quoin-panel">quoin-panel</a></strong> — the Plasma-style bottom panel, launcher, calendar and notifications as Mix Scenes.</li>
-<li><strong><a href="/cos/cosmix-bg-showcase">cosmix-bg-showcase</a></strong> — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.</li>
-<li><strong><a href="/cos/cosmix-capture">cosmix-capture</a></strong> — native Wayland screenshots and full-output MP4 recording controlled through Bus.</li>
-<li><strong><a href="/cos/cosmix-media">cosmix-media</a></strong> — native CTK MP3/MP4 player with PipeWire-compatible audio and Bus playback controls.</li>
-<li><strong><a href="/cos/cosmix-wallpaper">cosmix-wallpaper</a></strong> — GPU-rendered flocking background with window avoidance, pointer repulsion and native Bus preferences.</li>
-<li><strong><a href="/cos/agentd">agentd</a></strong> — agent supervision.</li>
-<li><strong><a href="/cos/powerd">powerd</a></strong> — event-driven UPower battery and power state.</li>
-<li><strong><a href="/cos/mprisd">mprisd</a></strong> — event-driven MPRIS2 media-player state and delegated controls.</li>
-<li><strong><a href="/cos/dbusd">dbusd</a></strong> — the D-Bus boundary daemon: hosts the per-domain D-Bus adapters.</li>
-</ul>
-<h2 id="bridge--libraries">Bridge &amp; libraries</h2>
-<ul>
-<li><strong><a href="/cos/foreman">foreman</a></strong> — task runner, policy gate, verifier, and refinery operator runbook.</li>
-<li><strong><a href="/cos/mcp">mcp</a></strong> — the Claude Code MCP bridge.</li>
-<li><strong><a href="/cos/libraries">libraries</a></strong> — the shared <code>cosmix-lib-*</code> substrate crates.</li>
-</ul>
-<h2 id="see-also">See also</h2>
-<ul>
-<li>Repos: <a href="https://github.com/markc/cosmix">markc/cos</a> · <a href="https://github.com/markc/cosmix">markc/mix</a> · <a href="https://github.com/markc/cosmix">markc/bus</a>.</li>
-<li>The <a href="https://markc.github.io/mix/">mix manual</a> — the language and shell used to operate these daemons.</li>
-</ul></div></div>
+<h2 id="events-not-polling">Events, not polling</h2>
+<p>The citizen subscribes to <code>&lt;comp&gt;.props.changed</code> (windows and workspaces),
+the tray adapter's <code>item.added</code>/<code>item.removed</code>/<code>props.changed</code>, and the
+notify adapter's <code>changed</code>/<code>props.changed</code>. A handler matches the
+publisher's <strong>inner</strong> verb (<code>props.changed</code>), not the topic name. Bursts are
+coalesced into one rebuild. The only clock is the wall clock: the init body
+sleeps to each minute boundary (a top-level <code>sleep</code> keeps serving Bus
+events) and redraws the time, one wake per minute.</p>
+<p>When Quoin restarts, the next <code>scene.load</code> returns revision 1; the citizen
+takes that as a fresh host and re-selects and re-pins its panel page.</p>
+<h2 id="handlers">Handlers</h2>
+<p><code>launcher</code>, <code>filter</code>, <code>launch</code>, <code>launch_first</code>, <code>ws</code>, <code>task</code>, <code>tray</code>,
+<code>calendar</code>, <code>cal_prev</code>, <code>cal_next</code>, <code>cal_today</code>, <code>open_calendar</code>, <code>notes</code>,
+<code>note_close</code>, <code>notes_clear</code>, <code>vol_mute</code>, <code>peek</code> are scene handlers (the
+host sends them <code>{scene, node, kind, value?, item?}</code>). <code>panel.refresh</code>
+rebuilds every open scene on demand.</p>
+<p>"Open calendar app" launches the first application in the <code>Calendar</code>
+category, falling back to <code>thunderbird -calendar</code>.</p>
+<h2 id="running-it">Running it</h2>
+<pre><code class="language-sh">mix --serve src/desktop/scripts/apps.mix --name apps
+mix --serve src/desktop/scripts/quoin-panel.mix --name quoin-panel
+</code></pre>
+<p><code>SCENE_HOST</code>, <code>COMP_SERVICE</code>, <code>APPS_SERVICE</code>, <code>TRAY_SERVICE</code> and
+<code>NOTIFY_SERVICE</code> point it at a nested development desktop. The pure helpers
+(clock and date text, the month grid, document emission) live in
+<code>lib/panel.mix</code>; <code>mix tests/panel-test.mix</code> checks them in any timezone.</p>
+<p>Needs a Quoin whose scene host loads absolute-path PNG/SVG icons, accepts
+<code>{cells[i]}</code> in an image template, and supports chromeless pages
+(<code>window.chrome: false</code>) — see <a href="/cos/scenes">scenes</a>.</p></div></div>
     </div>
 
 </main>

@@ -28,6 +28,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[desktop](desktop.md)** — the CosMix desktop: `cosmix-comp` (Smithay + Bevy Wayland compositor), the `ctk` toolkit and the native apps.
 - **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
 - **[quoin](quoin.md)** — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.
+- **[quoin-panel](quoin-panel.md)** — the Plasma-style bottom panel, launcher, calendar and notifications as Mix Scenes.
 - **[cosmix-bg-showcase](cosmix-bg-showcase.md)** — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.
 - **[cosmix-capture](cosmix-capture.md)** — native Wayland screenshots and full-output MP4 recording controlled through Bus.
 - **[cosmix-media](cosmix-media.md)** — native CTK MP3/MP4 player with PipeWire-compatible audio and Bus playback controls.

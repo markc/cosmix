@@ -1,0 +1,834 @@
+-- quoin-panel -- the Quoin bottom panel and its popups, written as Mix
+-- Scenes after Plasma's default panel. One citizen owns four scenes:
+--
+--   panel     bottom edge, pinned: launcher button, workspace pager, task
+--             buttons, tray icons, status applets (notifications, volume,
+--             network), the clock (big time, date beneath), peek-at-desktop
+--   launcher  left edge: search + every visible .desktop application (the
+--             `apps` citizen), click = launch
+--   calendar  right edge: month grid, Monday first, today marked; opened by
+--             clicking the clock
+--   notes     right edge: live notifications (the `notify` adapter)
+--
+-- Run: mix --serve quoin-panel.mix --name quoin-panel
+-- Env: SCENE_HOST (default shell), COMP_SERVICE (comp), APPS_SERVICE (apps),
+--      TRAY_SERVICE (tray), NOTIFY_SERVICE (notify) -- a nested dev desktop
+--      points these elsewhere. Manual: docs/cos/quoin-panel.md.
+--
+-- Event-driven: the taskbar and pager rebuild on the compositor's
+-- props.changed topic, the tray and notifications on their adapters'
+-- events. The one
+-- clock is the wall clock itself: the init body sleeps to each minute
+-- boundary (a top-level sleep keeps dispatching Bus events), one wake per
+-- minute, never a poll of anyone's state.
+$p = require("lib/panel.mix")
+
+$ME = "quoin-panel"
+$HOST = env("SCENE_HOST", "shell")
+$COMP = env("COMP_SERVICE", "comp")
+$APPS = env("APPS_SERVICE", "apps")
+$TRAY = env("TRAY_SERVICE", "tray")
+$NOTIFY = env("NOTIFY_SERVICE", "notify")
+-- Status icons come from the dark variant so they read on the dark panel.
+$ICON_THEME = env("PANEL_ICON_THEME", "breeze-dark")
+-- PipeWire lives in the login session's runtime dir, not the desktop's.
+$PW_RUNTIME = env("PIPEWIRE_RUNTIME_DIR", "/run/user/" .. to_string(uid()))
+$LOG = env("XDG_RUNTIME_DIR", "/tmp") .. "/quoin-panel.log"
+
+-- Breeze Dark, the palette Plasma's panel uses.
+$C = {
+  panel: "#202326f2", fg: "#fcfcfc", dim: "#a1a9b1", faint: "#6e7680",
+  hover: "#ffffff1a", press: "#ffffff29", accent: "#3daee9",
+  accent_bg: "#3daee940", task_bg: "#ffffff0f", card: "#2a2e32",
+  today_fg: "#ffffff", weekend: "#c9cfd6"
+}
+
+$state = {
+  windows: [], ws_count: 1, ws_current: 1, tray: [],
+  net: {up: false, wireless: false}, vol: {ok: false, level: 0, muted: false},
+  notes: [], notes_open: false, peeked: [],
+  launcher_open: false, calendar_open: false,
+  query: "", apps: [], apps_loaded: false,
+  cal_offset: 0, icons: {},
+  dirty: false, scheduled: false
+}
+
+fn note($line)
+  try
+    append_file($LOG, to_string(floor(time())) .. " " .. $line .. "\n")
+  catch $e
+  end
+end
+
+-- ── Bus helpers ─────────────────────────────────────────────────────────
+fn rpc($target, $verb, $payload)
+  send $target $verb body=json_encode($payload) timeout=3
+  if $rc != 0 then return nil end
+  if type($result) == "string" then
+    try
+      return json_parse($result)
+    catch $e
+      return nil
+    end
+  end
+  return $result
+end
+
+-- Load a document; returns the host`s revision for it (0 = refused or no
+-- host). Revisions only restart at 1 when the HOST restarts, so revision 1
+-- is how the panel notices a Quoin restart and re-pins itself.
+fn load_scene($doc)
+  send $HOST shell.scene.load body=$doc timeout=5
+  if $rc != 0 then
+    note("scene.load rc=" .. to_string($rc) .. " " .. to_string($result))
+    return 0
+  end
+  $r = type($result) == "string" ? json_parse($result) : $result
+  return (type($r) == "map" and $r.revision != nil) ? $r.revision : 0
+end
+
+fn unload_scene($name)
+  send $HOST shell.scene.unload body=json_encode({scene: $name}) timeout=3
+end
+
+fn panel_verb($verb, $edge, $id)
+  if $id == nil then
+    send $HOST $verb edge=$edge timeout=3
+  else
+    send $HOST $verb edge=$edge id=$id timeout=3
+  end
+  return $rc
+end
+
+-- ── icons (the apps citizen resolves themes; cached here) ───────────────
+fn icon_path($name, $size)
+  return icon_path_t($name, $size, "")
+end
+
+-- Themed lookup; "" = the apps citizen's default (the user's theme).
+fn icon_path_t($name, $size, $theme)
+  if $name == nil or $name == "" then return "" end
+  $key = $name .. "@" .. to_string($size) .. "@" .. $theme
+  if has_key($state.icons, $key) then return $state.icons[$key] end
+  $req = {name: $name, size: $size}
+  if $theme != "" then $req.theme = $theme end
+  $hit = rpc($APPS, "apps.icon", $req)
+  $path = ($hit != nil and type($hit) == "map" and $hit.path != nil) ? $hit.path : ""
+  $icons = $state.icons
+  $icons[$key] = $path
+  $state.icons = $icons
+  return $path
+end
+
+-- A compositor app_id to an icon: the desktop entry's Icon= when one
+-- matches (app_id.desktop, then lower-case), else the app_id as an icon
+-- name, else a generic window icon.
+fn window_icon($app_id)
+  $key = "win:" .. to_string($app_id)
+  if has_key($state.icons, $key) then return $state.icons[$key] end
+  $icon_name = ""
+  if $app_id != nil and $app_id != "" then
+    for each $candidate in [$app_id .. ".desktop", lower($app_id) .. ".desktop"]
+      if $icon_name == "" then
+        $entry = rpc($APPS, "apps.get", {id: $candidate})
+        if $entry != nil and type($entry) == "map" and $entry.icon != nil then $icon_name = $entry.icon end
+      end
+    end
+    if $icon_name == "" then $icon_name = $app_id end
+  end
+  $path = icon_path($icon_name, 48)
+  if $path == "" then $path = icon_path("application-x-executable", 48) end
+  $icons = $state.icons
+  $icons[$key] = $path
+  $state.icons = $icons
+  return $path
+end
+
+-- ── data ────────────────────────────────────────────────────────────────
+fn fetch_windows()
+  $r = rpc($COMP, "comp.windows.list", {})
+  if $r == nil or type($r.windows) != "list" then return end
+  $out = []
+  for each $w in $r.windows
+    if $w.band == "normal" then push($out, $w) end
+  end
+  $state.windows = $p.sort_windows($out)
+  $ws = rpc($COMP, "comp.props.get", {path: "workspaces"})
+  if $ws != nil and type($ws) == "map" then
+    $state.ws_count = $ws.count ?? 1
+    $state.ws_current = $ws.current ?? 1
+  end
+end
+
+fn fetch_tray()
+  $r = rpc($TRAY, "tray.list", {})
+  if $r == nil or type($r.items) != "list" then
+    $state.tray = []
+    return
+  end
+  $state.tray = $r.items
+end
+
+-- Network: any non-loopback interface whose operstate is "up" (the kernel's
+-- own answer, read from sysfs -- no D-Bus, per the dbusd-boundary ADR).
+fn fetch_net()
+  $up = false
+  $wireless = false
+  try
+    for each $name in ls("/sys/class/net")
+      if $name != "lo" then
+        $dir = "/sys/class/net/" .. $name
+        $oper = ""
+        try
+          $oper = trim(read_file($dir .. "/operstate"))
+        catch $e
+        end
+        if $oper == "up" then
+          $up = true
+          if is_dir($dir .. "/wireless") then $wireless = true end
+        end
+      end
+    end
+  catch $e
+  end
+  $state.net = {up: $up, wireless: $wireless}
+end
+
+-- Volume: PipeWire's default sink via wpctl ("Volume: 0.40 [MUTED]"). No
+-- default sink -> the applet is hidden rather than showing a false 0 %.
+fn fetch_vol()
+  $r = run_argv(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
+  if not $r.ok then
+    $state.vol = {ok: false, level: 0, muted: false}
+    return
+  end
+  $m = re_find($r.stdout, "Volume:\\s*([0-9.]+)")
+  if length($m) == 0 then
+    $state.vol = {ok: false, level: 0, muted: false}
+    return
+  end
+  $state.vol = {ok: true, level: round(to_number($m[0].groups[0]) * 100), muted: index_of($r.stdout, "MUTED") >= 0}
+end
+
+fn fetch_notes()
+  $r = rpc($NOTIFY, "notify.list", {})
+  if $r == nil then
+    $state.notes = []
+    return
+  end
+  $list = type($r) == "list" ? $r : ($r.notifications ?? [])
+  $state.notes = type($list) == "list" ? $list : []
+end
+
+fn fetch_status()
+  fetch_net()
+  fetch_vol()
+  fetch_notes()
+end
+
+fn fetch_apps()
+  $r = rpc($APPS, "apps.list", {query: $state.query})
+  if $r == nil or type($r) != "list" then
+    $state.apps = []
+    return
+  end
+  $state.apps = $r
+end
+
+-- A 20px monochrome status icon from the dark theme, with a fallback icon
+-- name, and a text glyph when neither resolves.
+fn status_icon($name, $fallback)
+  $path = icon_path_t($name, 22, $ICON_THEME)
+  if $path == "" then $path = icon_path_t($fallback, 22, $ICON_THEME) end
+  if $path == "" then return {widget: "text", text: "•", size: 14, color: $C.dim} end
+  return {widget: "image", src: $path, w: 20, h: 20}
+end
+
+-- ── the panel scene ─────────────────────────────────────────────────────
+fn panel_doc()
+  $now = time()
+  $nodes = []
+  $children = ["launcher_btn", "gap1", "pager", "gap2", "tasks", "fill"]
+  if length($state.tray) > 0 then push($children, "tray") end
+  push($children, "status")
+  push($children, "clock")
+  push($children, "peek")
+  push($nodes, ["root", {widget: "row", fill: true, align: "center", gap: 4, padding: 4, background: $C.panel, children: $children}])
+
+  -- launcher button: the start-here icon, tinted while the launcher is open
+  $start = icon_path("start-here-kde", 48)
+  if $start == "" then $start = icon_path("start-here", 48) end
+  $lb = {widget: "row", height: 40, radius: 8, padding: 6, align: "center", hover: $C.hover, on_click: "launcher", children: ["launcher_icon"]}
+  if $state.launcher_open then $lb.background = $C.accent_bg end
+  push($nodes, ["launcher_btn", $lb])
+  if $start != "" then
+    push($nodes, ["launcher_icon", {widget: "image", src: $start, w: 28, h: 28}])
+  else
+    push($nodes, ["launcher_icon", {widget: "text", text: "Apps", size: 14, bold: true, color: $C.fg}])
+  end
+  push($nodes, ["gap1", {widget: "spacer", size: 6}])
+
+  -- pager: one button per workspace, current one filled
+  $ws_ids = []
+  for $i = 1 to $state.ws_count
+    push($ws_ids, "ws_" .. to_string($i))
+  end
+  push($nodes, ["pager", {widget: "row", gap: 3, align: "center", children: $ws_ids}])
+  for $i = 1 to $state.ws_count
+    $id = "ws_" .. to_string($i)
+    $current = $i == $state.ws_current
+    $b = {widget: "row", height: 30, radius: 6, padding: 8, align: "center", hover: $C.hover, on_click: "ws", children: [$id .. "_t"]}
+    $b.background = $current ? $C.accent : $C.task_bg
+    push($nodes, [$id, $b])
+    push($nodes, [$id .. "_t", {widget: "text", text: to_string($i), size: 12, bold: $current, color: $current ? "#0b1f2b" : $C.dim}])
+  end
+  push($nodes, ["gap2", {widget: "spacer", size: 8}])
+
+  -- task buttons for the current workspace (Plasma's default filter)
+  $task_ids = []
+  for each $w in $state.windows
+    if ($w.workspace ?? $state.ws_current) == $state.ws_current then push($task_ids, "t_" .. to_string($w.id)) end
+  end
+  push($nodes, ["tasks", {widget: "row", gap: 4, align: "center", children: $task_ids}])
+  for each $w in $state.windows
+    if ($w.workspace ?? $state.ws_current) == $state.ws_current then
+      $id = "t_" .. to_string($w.id)
+      $b = {widget: "row", height: 40, radius: 6, padding: 8, gap: 8, align: "center", hover: $C.hover, on_click: "task", children: [$id .. "_i", $id .. "_l"]}
+      if $w.focused and not $w.minimized then
+        $b.background = $C.accent_bg
+      elif not $w.minimized then
+        $b.background = $C.task_bg
+      end
+      push($nodes, [$id, $b])
+      $icon = window_icon($w.app_id)
+      if $icon != "" then
+        push($nodes, [$id .. "_i", {widget: "image", src: $icon, w: 24, h: 24}])
+      else
+        push($nodes, [$id .. "_i", {widget: "spacer", size: 0}])
+      end
+      push($nodes, [$id .. "_l", {widget: "text", text: $p.short_title($w.title, 40), size: 13, elide: true, width: 170, color: $w.minimized ? $C.faint : $C.fg}])
+    end
+  end
+  push($nodes, ["fill", {widget: "spacer"}])
+
+  -- tray: one icon per StatusNotifierItem, click = activate
+  if length($state.tray) > 0 then
+    $tray_ids = []
+    $n = 0
+    for each $item in $state.tray
+      $n = $n + 1
+      push($tray_ids, "tr_" .. to_string($n))
+    end
+    push($nodes, ["tray", {widget: "row", gap: 2, align: "center", children: $tray_ids}])
+    $n = 0
+    for each $item in $state.tray
+      $n = $n + 1
+      $id = "tr_" .. to_string($n)
+      push($nodes, [$id, {widget: "row", height: 36, radius: 6, padding: 6, align: "center", hover: $C.hover, on_click: "tray", children: [$id .. "_i"]}])
+      $path = icon_path($item.icon_name ?? "", 24)
+      if $path != "" then
+        push($nodes, [$id .. "_i", {widget: "image", src: $path, w: 20, h: 20}])
+      else
+        push($nodes, [$id .. "_i", {widget: "text", text: slice(to_string($item.title ?? "?"), 0, 1), size: 12, bold: true, color: $C.dim}])
+      end
+    end
+  end
+
+  -- status applets (Plasma's system-tray built-ins): notifications bell
+  -- with a count, volume (hidden without a default sink), network
+  $status_ids = ["st_notes"]
+  if $state.vol.ok then push($status_ids, "st_vol") end
+  push($status_ids, "st_net")
+  push($nodes, ["status", {widget: "row", gap: 2, align: "center", children: $status_ids}])
+  $n_count = length($state.notes)
+  $bell_children = ["st_notes_i"]
+  if $n_count > 0 then push($bell_children, "st_notes_n") end
+  $bell = {widget: "row", height: 36, radius: 6, padding: 7, gap: 4, align: "center", hover: $C.hover, on_click: "notes", children: $bell_children}
+  if $state.notes_open then $bell.background = $C.accent_bg end
+  push($nodes, ["st_notes", $bell])
+  $bell_icon = $n_count > 0 ? "notification-active" : "notification-inactive"
+  push($nodes, ["st_notes_i", status_icon($bell_icon, "notifications")])
+  if $n_count > 0 then push($nodes, ["st_notes_n", {widget: "text", text: to_string($n_count), size: 11, bold: true, color: $C.accent}]) end
+  if $state.vol.ok then
+    $vol_icon = "audio-volume-muted"
+    if not $state.vol.muted then
+      $vol_icon = $state.vol.level >= 67 ? "audio-volume-high" : ($state.vol.level >= 34 ? "audio-volume-medium" : ($state.vol.level > 0 ? "audio-volume-low" : "audio-volume-muted"))
+    end
+    push($nodes, ["st_vol", {widget: "row", height: 36, radius: 6, padding: 7, align: "center", hover: $C.hover, on_click: "vol_mute", children: ["st_vol_i"]}])
+    push($nodes, ["st_vol_i", status_icon($vol_icon, "audio-card")])
+  end
+  $net_icon = $state.net.up ? ($state.net.wireless ? "network-wireless-signal-excellent" : "network-wired-activated") : "network-offline"
+  push($nodes, ["st_net", {widget: "row", height: 36, radius: 6, padding: 7, align: "center", hover: $C.hover, children: ["st_net_i"]}])
+  push($nodes, ["st_net_i", status_icon($net_icon, "network-wired")])
+
+  -- clock: big time, the date beneath it; click opens the calendar
+  $clock = {widget: "row", height: 44, radius: 8, padding: 10, align: "center", hover: $C.hover, on_click: "calendar", children: ["clock_col"]}
+  if $state.calendar_open then $clock.background = $C.accent_bg end
+  push($nodes, ["clock", $clock])
+  push($nodes, ["clock_col", {widget: "column", gap: 0, children: ["clock_time", "clock_date"]}])
+  push($nodes, ["clock_time", {widget: "text", text: $p.clock_text($now), size: 19, bold: true, color: $C.fg}])
+  push($nodes, ["clock_date", {widget: "text", text: $p.date_text($now), size: 11, color: $C.dim}])
+
+  -- peek at desktop: minimise everything on this workspace; again restores
+  $peek = {widget: "row", height: 44, radius: 6, padding: 6, align: "center", hover: $C.hover, on_click: "peek", children: ["peek_i"]}
+  if length($state.peeked) > 0 then $peek.background = $C.accent_bg end
+  push($nodes, ["peek", $peek])
+  push($nodes, ["peek_i", status_icon("user-desktop", "desktop")])
+
+  return $p.document({scene: "1", name: "panel", citizen: $ME, window: {kind: "edge", edge: "bottom", title: "Panel", h: 52}}, $nodes)
+end
+
+-- ── the launcher scene ──────────────────────────────────────────────────
+fn launcher_doc()
+  $rows = []
+  for each $a in $state.apps
+    $sub = $a.generic_name ?? ""
+    if $sub == "" then $sub = $a.comment ?? "" end
+    push($rows, {id: $a.id, cells: [$a.name ?? $a.id, $sub, icon_path($a.icon ?? "", 48)]})
+  end
+  $count = to_string(length($rows)) .. (length($rows) == 1 ? " application" : " applications")
+  $nodes = [
+    ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: ["head", "search", "list"]}],
+    ["head", {widget: "row", gap: 8, align: "center", children: ["head_t", "head_fill", "head_n"]}],
+    ["head_t", {widget: "text", text: "Applications", size: 18, bold: true, color: $C.fg}],
+    ["head_fill", {widget: "spacer"}],
+    ["head_n", {widget: "text", text: $count, size: 11, color: $C.faint}],
+    ["search", {widget: "field", value: $state.query, placeholder: "Search…", width: 380, on_change: "filter", on_submit: "launch_first"}],
+    ["list", {widget: "list", row: "app_row", row_height: 46, gap: 2, fill: true, on_click: "launch", rows: $rows}],
+    ["app_row", {widget: "row", height: 46, radius: 8, padding: 8, gap: 12, align: "center", hover: $C.hover, children: ["app_icon", "app_col"]}],
+    ["app_icon", {widget: "image", src: "{cells[2]}", w: 32, h: 32}],
+    ["app_col", {widget: "column", gap: 1, fill: true, children: ["app_name", "app_sub"]}],
+    ["app_name", {widget: "text", text: "{cells[0]}", size: 14, color: $C.fg, elide: true}],
+    ["app_sub", {widget: "text", text: "{cells[1]}", size: 11, color: $C.dim, elide: true}]
+  ]
+  return $p.document({scene: "1", name: "launcher", citizen: $ME, window: {kind: "edge", edge: "left", title: "Applications", w: 440}}, $nodes)
+end
+
+-- ── the calendar scene ──────────────────────────────────────────────────
+fn calendar_doc()
+  $now = time()
+  $today = $p.ymd($now)
+  $shown = $p.shift_month($today.year, $today.month, $state.cal_offset)
+  $grid = $p.month_grid($shown.year, $shown.month, $today)
+  $nodes = []
+  $week_ids = ["wk_h"]
+  for $w = 0 to 5
+    push($week_ids, "wk_" .. to_string($w))
+  end
+  $root_children = ["cal_day", "cal_full", "cal_gap", "cal_nav"]
+  $root_children = concat($root_children, $week_ids)
+  $root_children = concat($root_children, ["cal_fill", "cal_open"])
+  push($nodes, ["root", {widget: "column", gap: 6, padding: 18, fill: true, children: $root_children}])
+  push($nodes, ["cal_day", {widget: "text", text: date_format($now, "%A"), size: 24, bold: true, color: $C.fg}])
+  push($nodes, ["cal_full", {widget: "text", text: date_format($now, "%-d ") .. $p.month_title($today.year, $today.month) .. "  ·  " .. $p.clock_text($now), size: 13, color: $C.dim}])
+  push($nodes, ["cal_gap", {widget: "spacer", size: 10}])
+  push($nodes, ["cal_nav", {widget: "row", gap: 6, align: "center", children: ["cal_title", "cal_prev", "cal_today", "cal_next"]}])
+  -- Flat tool-buttons (hover rows), the way Plasma draws calendar nav.
+  push($nodes, ["cal_title", {widget: "text", text: $p.month_title($shown.year, $shown.month), size: 16, bold: true, color: $C.fg, fill: true}])
+  push($nodes, ["cal_prev", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, on_click: "cal_prev", children: ["cal_prev_t"]}])
+  push($nodes, ["cal_prev_t", {widget: "text", text: "‹", size: 16, bold: true, color: $C.fg}])
+  push($nodes, ["cal_today", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, background: $C.task_bg, on_click: "cal_today", children: ["cal_today_t"]}])
+  push($nodes, ["cal_today_t", {widget: "text", text: "Today", size: 12, color: $C.fg}])
+  push($nodes, ["cal_next", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, on_click: "cal_next", children: ["cal_next_t"]}])
+  push($nodes, ["cal_next_t", {widget: "text", text: "›", size: 16, bold: true, color: $C.fg}])
+  -- weekday header
+  $hdr = []
+  for $c = 0 to 6
+    push($hdr, "wh_" .. to_string($c))
+  end
+  push($nodes, ["wk_h", {widget: "row", gap: 4, children: $hdr}])
+  for $c = 0 to 6
+    push($nodes, ["wh_" .. to_string($c), {widget: "text", text: $p.WEEKDAYS_SHORT[$c], size: 11, bold: true, width: 40, color: $C.faint}])
+  end
+  -- six weeks
+  for $w = 0 to 5
+    $cells = []
+    for $c = 0 to 6
+      push($cells, "d_" .. to_string($w) .. "_" .. to_string($c))
+    end
+    push($nodes, ["wk_" .. to_string($w), {widget: "row", gap: 4, children: $cells}])
+    for $c = 0 to 6
+      $cell = $grid[$w][$c]
+      $id = "d_" .. to_string($w) .. "_" .. to_string($c)
+      $box = {widget: "row", height: 38, radius: 19, padding: 0, align: "center", hover: $C.hover, children: [$id .. "_t"]}
+      if $cell.today then $box.background = $C.accent end
+      push($nodes, [$id, $box])
+      $fg = $cell.in_month ? ($cell.weekend ? $C.weekend : $C.fg) : $C.faint
+      if $cell.today then $fg = $C.today_fg end
+      push($nodes, [$id .. "_t", {widget: "text", text: lpad(to_string($cell.day), 2), size: 13, bold: $cell.today, width: 40, color: $fg}])
+    end
+  end
+  push($nodes, ["cal_fill", {widget: "spacer"}])
+  push($nodes, ["cal_open", {widget: "button", label: "Open calendar app", tone: "primary", on_click: "open_calendar"}])
+  return $p.document({scene: "1", name: "calendar", citizen: $ME, window: {kind: "edge", edge: "right", title: "Calendar", w: 360}}, $nodes)
+end
+
+-- ── the notifications scene ─────────────────────────────────────────────
+fn notes_doc()
+  $rows = []
+  for each $n in $state.notes
+    $app = $n.app ?? ""
+    if $app == "" then $app = "Notification" end
+    push($rows, {id: to_string($n.id), cells: [$app, $n.summary ?? "", $n.body ?? ""]})
+  end
+  $children = ["nh"]
+  if length($rows) == 0 then push($children, "n_empty") else push($children, "n_list") end
+  $nodes = [
+    ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: $children}],
+    ["nh", {widget: "row", gap: 8, align: "center", children: ["nh_t", "nh_fill", "nh_clear"]}],
+    ["nh_t", {widget: "text", text: "Notifications", size: 18, bold: true, color: $C.fg}],
+    ["nh_fill", {widget: "spacer"}],
+    ["nh_clear", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, background: $C.task_bg, on_click: "notes_clear", children: ["nh_clear_t"]}],
+    ["nh_clear_t", {widget: "text", text: "Clear all", size: 12, color: $C.fg}]
+  ]
+  if length($rows) == 0 then
+    push($nodes, ["n_empty", {widget: "text", text: "No new notifications", size: 13, color: $C.faint}])
+  else
+    push($nodes, ["n_list", {widget: "list", row: "n_row", row_height: 76, gap: 6, fill: true, on_click: "note_close", rows: $rows}])
+    push($nodes, ["n_row", {widget: "row", height: 76, radius: 10, padding: 12, gap: 10, align: "center", background: $C.card, hover: "#343a40", children: ["n_col"]}])
+    push($nodes, ["n_col", {widget: "column", gap: 2, fill: true, children: ["n_app", "n_sum", "n_body"]}])
+    push($nodes, ["n_app", {widget: "text", text: "{cells[0]}", size: 11, color: $C.faint, elide: true}])
+    push($nodes, ["n_sum", {widget: "text", text: "{cells[1]}", size: 14, bold: true, color: $C.fg, elide: true}])
+    push($nodes, ["n_body", {widget: "text", text: "{cells[2]}", size: 12, color: $C.dim, elide: true}])
+  end
+  return $p.document({scene: "1", name: "notes", citizen: $ME, window: {kind: "edge", edge: "right", title: "Notifications", w: 380}}, $nodes)
+end
+
+-- ── rebuilds ────────────────────────────────────────────────────────────
+fn render_panel()
+  if load_scene(panel_doc()) == 1 then
+    panel_verb("shell.panel.page.set", "bottom", "panel")
+    panel_verb("shell.panel.pin", "bottom", nil)
+  end
+end
+
+fn render_launcher()
+  if $state.launcher_open then
+    fetch_apps()
+    load_scene(launcher_doc())
+    panel_verb("shell.panel.page.set", "left", "launcher")
+    panel_verb("shell.panel.pin", "left", nil)
+  end
+end
+
+fn render_calendar()
+  if $state.calendar_open then
+    load_scene(calendar_doc())
+    panel_verb("shell.panel.page.set", "right", "calendar")
+    panel_verb("shell.panel.pin", "right", nil)
+  end
+end
+
+fn render_notes()
+  if $state.notes_open then
+    fetch_notes()
+    load_scene(notes_doc())
+    panel_verb("shell.panel.page.set", "right", "notes")
+    panel_verb("shell.panel.pin", "right", nil)
+  end
+end
+
+fn close_notes()
+  $state.notes_open = false
+  panel_verb("shell.panel.unpin", "right", nil)
+  panel_verb("shell.panel.hide", "right", nil)
+  unload_scene("notes")
+end
+
+-- One popup at a time, like Plasma: opening any closes the others.
+fn close_popups()
+  if $state.launcher_open then close_launcher() end
+  if $state.calendar_open then close_calendar() end
+  if $state.notes_open then close_notes() end
+end
+
+fn close_launcher()
+  $state.launcher_open = false
+  panel_verb("shell.panel.unpin", "left", nil)
+  panel_verb("shell.panel.hide", "left", nil)
+  unload_scene("launcher")
+end
+
+fn close_calendar()
+  $state.calendar_open = false
+  panel_verb("shell.panel.unpin", "right", nil)
+  panel_verb("shell.panel.hide", "right", nil)
+  unload_scene("calendar")
+end
+
+-- Coalesce bursts (a window opening changes many props at once) into one
+-- rebuild, the clippanel pattern.
+fn schedule()
+  $state.dirty = true
+  if $state.scheduled then return end
+  $state.scheduled = true
+  try
+    while $state.dirty
+      sleep(0.1)
+      $state.dirty = false
+      fetch_windows()
+      fetch_tray()
+      fetch_notes()
+      render_panel()
+      if $state.notes_open then render_notes() end
+    end
+  catch $err
+    note("rebuild failed: " .. to_string($err))
+  end
+  $state.scheduled = false
+end
+
+-- ── handlers ────────────────────────────────────────────────────────────
+fn node_of()
+  $a = $event.args
+  if $a == nil or type($a) != "map" then return "" end
+  return to_string($a.node ?? "")
+end
+
+on launcher desc "toggle the application launcher"
+  reply(0, "")
+  if $state.launcher_open then
+    close_launcher()
+  else
+    close_popups()
+    $state.launcher_open = true
+    $state.query = ""
+    render_launcher()
+  end
+  render_panel()
+end
+
+on filter desc "launcher search text changed"
+  reply(0, "")
+  $a = $event.args
+  if $a != nil and type($a) == "map" then $state.query = slice(to_string($a.value ?? ""), 0, 128) end
+  render_launcher()
+end
+
+on launch desc "launch the clicked application"
+  reply(0, "")
+  $a = $event.args
+  if $a == nil or type($a) != "map" or $a.item == nil then return end
+  $id = $a.item.id
+  if $id != nil then
+    rpc($APPS, "apps.launch", {id: $id})
+    close_launcher()
+    render_panel()
+  end
+end
+
+on launch_first desc "launch the first search match (Enter in the search field)"
+  reply(0, "")
+  if length($state.apps) > 0 then
+    rpc($APPS, "apps.launch", {id: $state.apps[0].id})
+    close_launcher()
+    render_panel()
+  end
+end
+
+on ws desc "switch to the clicked workspace"
+  reply(0, "")
+  $node = node_of()
+  $n = to_number(replace(before($node, "_t") ?? $node, "ws_", ""))
+  if $n != nil then
+    rpc($COMP, "comp.workspace.switch", {index: $n})
+    schedule()
+  end
+end
+
+on task desc "focus, restore or minimise the clicked window (Plasma task semantics)"
+  reply(0, "")
+  $node = node_of()
+  $id_text = replace($node, "t_", "")
+  $id_text = before($id_text, "_") ?? $id_text
+  $id = to_number($id_text)
+  if $id == nil then return end
+  for each $w in $state.windows
+    if $w.id == $id then
+      if $w.minimized then
+        rpc($COMP, "comp.window.restore", {id: $w.id, generation: $w.generation})
+      elif $w.focused then
+        rpc($COMP, "comp.window.minimize", {id: $w.id, generation: $w.generation})
+      else
+        rpc($COMP, "comp.window.focus", {id: $w.id, generation: $w.generation})
+        rpc($COMP, "comp.window.raise", {id: $w.id, generation: $w.generation})
+      end
+    end
+  end
+  schedule()
+end
+
+on tray desc "activate the clicked tray item"
+  reply(0, "")
+  $node = node_of()
+  $n = to_number(replace(before($node, "_i") ?? $node, "tr_", ""))
+  if $n != nil and $n >= 1 and $n <= length($state.tray) then
+    rpc($TRAY, "tray.activate", {id: $state.tray[$n - 1].id})
+  end
+end
+
+on calendar desc "toggle the calendar"
+  reply(0, "")
+  if $state.calendar_open then
+    close_calendar()
+  else
+    close_popups()
+    $state.calendar_open = true
+    $state.cal_offset = 0
+    render_calendar()
+  end
+  render_panel()
+end
+
+on cal_prev desc "calendar: previous month"
+  reply(0, "")
+  $state.cal_offset = $state.cal_offset - 1
+  render_calendar()
+end
+
+on cal_next desc "calendar: next month"
+  reply(0, "")
+  $state.cal_offset = $state.cal_offset + 1
+  render_calendar()
+end
+
+on cal_today desc "calendar: back to the current month"
+  reply(0, "")
+  $state.cal_offset = 0
+  render_calendar()
+end
+
+on open_calendar desc "open the desktop's calendar application"
+  reply(0, "")
+  -- A .desktop entry in the Calendar category wins; Thunderbird's calendar
+  -- tab is the fallback on a desktop that has no dedicated calendar app.
+  $apps = rpc($APPS, "apps.list", {category: "Calendar"})
+  if $apps != nil and type($apps) == "list" and length($apps) > 0 then
+    rpc($APPS, "apps.launch", {id: $apps[0].id})
+  elif which("thunderbird") != nil then
+    spawn(["thunderbird", "-calendar"], {detach: true})
+  end
+  close_calendar()
+  render_panel()
+end
+
+on notes desc "toggle the notifications popup"
+  reply(0, "")
+  if $state.notes_open then
+    close_notes()
+  else
+    close_popups()
+    $state.notes_open = true
+    render_notes()
+  end
+  render_panel()
+end
+
+on note_close desc "dismiss the clicked notification"
+  reply(0, "")
+  $a = $event.args
+  if $a != nil and type($a) == "map" and $a.item != nil then
+    $id = to_number($a.item.id)
+    if $id != nil then rpc($NOTIFY, "notify.close", {id: $id}) end
+  end
+  render_notes()
+  render_panel()
+end
+
+on notes_clear desc "dismiss every notification"
+  reply(0, "")
+  fetch_notes()
+  for each $n in $state.notes
+    rpc($NOTIFY, "notify.close", {id: $n.id})
+  end
+  render_notes()
+  render_panel()
+end
+
+on vol_mute desc "toggle mute on the default audio sink"
+  reply(0, "")
+  $muted = run_argv(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], {timeout: 2, env: {XDG_RUNTIME_DIR: $PW_RUNTIME}})
+  if not $muted.ok then note("wpctl set-mute failed: " .. $muted.stderr) end
+  fetch_vol()
+  render_panel()
+end
+
+on peek desc "peek at the desktop: minimise this workspace, click again to restore"
+  reply(0, "")
+  fetch_windows()
+  if length($state.peeked) > 0 then
+    for each $w in $state.windows
+      if index_of($state.peeked, $w.id) >= 0 and $w.minimized then rpc($COMP, "comp.window.restore", {id: $w.id, generation: $w.generation}) end
+    end
+    $state.peeked = []
+  else
+    $ids = []
+    for each $w in $state.windows
+      if ($w.workspace ?? $state.ws_current) == $state.ws_current and not $w.minimized then
+        rpc($COMP, "comp.window.minimize", {id: $w.id, generation: $w.generation})
+        push($ids, $w.id)
+      end
+    end
+    $state.peeked = $ids
+  end
+  schedule()
+end
+
+on panel.refresh desc "rebuild every open scene now"
+  reply(0, "")
+  fetch_windows()
+  fetch_tray()
+  render_panel()
+  render_launcher()
+  render_calendar()
+end
+
+-- Compositor state changes (windows opening/closing/focusing/minimising,
+-- workspace switches) and tray property diffs both arrive with the inner
+-- verb props.changed -- a handler matches the publisher`s inner verb, not
+-- the topic name.
+on props.changed async
+  schedule()
+end
+
+on item.added async
+  schedule()
+end
+
+on item.removed async
+  schedule()
+end
+
+on tray.item.added async
+  fetch_tray()
+  schedule()
+end
+
+on tray.item.removed async
+  fetch_tray()
+  schedule()
+end
+
+-- ── init ────────────────────────────────────────────────────────────────
+subscribe($COMP .. ".props.changed")
+subscribe($TRAY .. ".item.added")
+subscribe($TRAY .. ".item.removed")
+subscribe($TRAY .. ".props.changed")
+subscribe($NOTIFY .. ".changed")
+subscribe($NOTIFY .. ".props.changed")
+rpc($COMP, "comp.props.watch", {})
+fetch_windows()
+fetch_tray()
+fetch_status()
+render_panel()
+note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
+
+-- The clock: wake on each minute boundary and redraw the panel (and the
+-- calendar header when it is open). A top-level sleep keeps serving.
+while true
+  sleep($p.seconds_to_next_minute(time()))
+  fetch_net()
+  fetch_vol()
+  render_panel()
+  if $state.calendar_open then render_calendar() end
+end
