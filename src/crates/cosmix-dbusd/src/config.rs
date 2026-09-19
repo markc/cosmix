@@ -43,10 +43,22 @@ pub fn resolve_enabled(
 /// daemon, e.g. indexd): an absent file materialises the defaults —
 /// only NotFound does; a file that exists but cannot be read or parsed
 /// is FATAL, surfaced as `Err` so `serve()` exits instead of silently
-/// guessing the adapter set.
+/// guessing the adapter set. Thin wrapper over the resolver's config
+/// dir.
 #[cfg(feature = "cosmix")]
 pub fn load_settings() -> anyhow::Result<DbusdSettings> {
-    cosmix_config::store::load_service::<DbusdSettings>("dbusd")
+    load_settings_in(&cosmix_config::store::config_dir())
+}
+
+/// Directory-explicit core of [`load_settings`] (the store's own
+/// `load_service_in`): same contract, against an explicit dir. The
+/// test harness drives this against a throwaway dir rather than
+/// mutating `COSMIX_ETC` process-globally — the path resolver caches
+/// that in a `OnceLock`, so a set_var in one test would pin every
+/// sibling test's config dir too.
+#[cfg(feature = "cosmix")]
+pub fn load_settings_in(dir: &std::path::Path) -> anyhow::Result<DbusdSettings> {
+    cosmix_config::store::load_service_in::<DbusdSettings>(dir, "dbusd")
         .context("dbusd.conf.mix exists but cannot be loaded; refusing to guess the adapter set")
 }
 
@@ -100,22 +112,19 @@ mod tests {
 
     /// F4, the store contract from the loader's side: NotFound
     /// materialises defaults; a file that exists but cannot be parsed
-    /// is fatal. Run against a throwaway config dir via `COSMIX_ETC`.
+    /// is fatal. Driven against a throwaway config dir via
+    /// `load_settings_in` — no `COSMIX_ETC` mutation (the resolver
+    /// caches it in a `OnceLock`, poisoning sibling tests).
     #[cfg(feature = "cosmix")]
     #[test]
     fn missing_config_is_defaults_broken_config_is_fatal() {
         let dir = std::env::temp_dir().join(format!("cosmix-dbusd-conf-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("temp config dir");
-        // SAFETY: env mutation is process-global, but this is the only
-        // test in this binary that resolves cosmix paths, and the
-        // OnceLock-cached resolver then pins this throwaway dir for the
-        // whole run — exactly what this test wants.
-        unsafe { std::env::set_var("COSMIX_ETC", &dir) };
 
         // NotFound: defaults, materialised to disk so they are
         // discoverable by `cat`.
-        let settings = load_settings().expect("absent config must load defaults");
+        let settings = load_settings_in(&dir).expect("absent config must load defaults");
         assert_eq!(settings, DbusdSettings::default());
         assert!(
             dir.join("dbusd.conf.mix").exists(),
@@ -124,11 +133,16 @@ mod tests {
 
         // Parse error: fatal, naming the file.
         std::fs::write(dir.join("dbusd.conf.mix"), "enabled = [ unclosed").expect("break config");
-        let error = load_settings().expect_err("broken config must be fatal");
+        let error = load_settings_in(&dir).expect_err("broken config must be fatal");
         assert!(
             format!("{error:#}").contains("dbusd.conf.mix"),
             "the fatal error names the file: {error:#}"
         );
+
+        // And a valid explicit list still parses through the same path.
+        std::fs::write(dir.join("dbusd.conf.mix"), "enabled: [\"notify\"]").expect("fix config");
+        let settings = load_settings_in(&dir).expect("valid config must load");
+        assert_eq!(settings.enabled, Some(names(&["notify"])));
 
         std::fs::remove_dir_all(&dir).ok();
     }

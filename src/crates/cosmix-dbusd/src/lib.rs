@@ -17,11 +17,12 @@
 
 // Fault containment contract: a panicking adapter run must UNWIND into
 // its JoinHandle — with panic=abort every adapter panic would take the
-// daemon down. Refuse such a compilation outright. (Enforced here via
-// cfg(panic), not in build.rs: CARGO_CFG_PANIC as seen by a build
-// script is the build script's own strategy, which cargo always forces
-// to unwind, so a build.rs check can never fire.)
-#[cfg(panic = "abort")]
+// daemon down. Refuse any other strategy outright (not just abort:
+// `not(panic = "unwind")` also catches whatever future strategies rustc
+// grows). (Enforced here via cfg(panic), not in build.rs: CARGO_CFG_PANIC
+// as seen by a build script is the build script's own strategy, which
+// cargo always forces to unwind, so a build.rs check can never fire.)
+#[cfg(not(panic = "unwind"))]
 compile_error!(
     "cosmix-dbusd must be built with panic=unwind: its fault containment \
      relies on a panicking adapter run unwinding into its JoinHandle, not \

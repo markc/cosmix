@@ -473,14 +473,14 @@ with that reason; the daemon stays up and keeps answering <code>dbusd.*</code>.<
 <li>Serves the <code>dbusd</code> Bus control service (mesh-open; no caller
 authorization on any verb):
 <ul>
-<li><code>dbusd.adapters</code> — every adapter's <code>{name, service, state, restarts, last_error, since}</code> and the session-bus endpoint state.</li>
+<li><code>dbusd.adapters</code> — every adapter's <code>{name, service, state, restarts, leaked_runs, last_error, since}</code> and the session-bus endpoint state.</li>
 <li><code>dbusd.adapter.restart {name}</code> / <code>dbusd.adapter.enable {name}</code> /
 <code>dbusd.adapter.disable {name}</code> — disable stops the adapter and
 releases its names (how a human hands, say, the Notifications name
 back to another daemon); enable and restart relaunch it. Unknown
 names get a refusal reply, never a panic.</li>
 <li><code>dbusd.props.{get,list,describe,watch}</code> — the uniform props surface
-over <code>dbusd.adapters.&lt;name&gt;.state|restarts|last_error</code>.</li>
+over <code>dbusd.adapters.&lt;name&gt;.state|restarts|leaked_runs|last_error</code>.</li>
 <li><code>dbusd.ping</code>, <code>dbusd.info</code>.</li>
 </ul>
 </li>
@@ -504,11 +504,15 @@ runtime-only — the config file is the persistent source.</p>
 <tr><td><code>running</code></td><td>serving its domain</td></tr>
 <tr><td><code>backoff</code></td><td>failed (error/panic/exit); waiting out the schedule</td></tr>
 <tr><td><code>disabled</code></td><td>stopped by config or verb; names released</td></tr>
-<tr><td><code>stuck</code></td><td>the run ignored its stop signal and the abort; its names may stay held until the process restarts</td></tr>
+<tr><td><code>stuck</code></td><td>the run did not stop within the abort window — it may be CPU-bound or never yielding; its names may stay held until the process restarts</td></tr>
 </tbody></table>
 <p><code>restarts</code> counts every relaunch in this daemon process (backoff
 restarts, the restart verb, enable-after-disable). <code>last_error</code> is the
-most recent failure reason, cleared when the adapter runs healthy again.</p>
+most recent failure reason, cleared when the adapter runs healthy
+again. <code>leaked_runs</code> counts runs detached as <code>stuck</code> in this daemon
+process and never resets: the next healthy run clears <code>last_error</code>,
+but the leaked spinner may still be holding names and burning a
+worker — the count is its visible trace.</p>
 <h2 id="running-it">Running it</h2>
 <pre><code class="language-sh">/opt/cosmix/bin/cosmix-dbusd serve
 </code></pre>

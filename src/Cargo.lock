@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",

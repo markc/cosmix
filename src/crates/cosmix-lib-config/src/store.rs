@@ -53,11 +53,13 @@ where
     save_service_in(&config_dir(), settings, service)
 }
 
-/// Directory-explicit core of [`load_service`]. Split out so tests can
-/// drive it against a temp dir without mutating the `COSMIX_ETC` env var
-/// (which would poison the `OnceLock`-cached path resolver in `paths.rs`
-/// for sibling tests) — same hermeticity discipline as `node.rs`.
-fn load_service_in<T>(dir: &Path, service: &str) -> Result<T>
+/// Directory-explicit core of [`load_service`]. Public so a daemon's
+/// own config tests can drive the full store contract (missing file
+/// materialises defaults; present-but-unparsable is fatal) against a
+/// throwaway dir instead of mutating the `COSMIX_ETC` env var (which
+/// would poison the `OnceLock`-cached path resolver in `paths.rs` for
+/// sibling tests) — same hermeticity discipline as `node.rs`.
+pub fn load_service_in<T>(dir: &Path, service: &str) -> Result<T>
 where
     T: Default + serde::de::DeserializeOwned + serde::Serialize,
 {

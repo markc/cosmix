@@ -14,7 +14,7 @@ pub struct DbusdProps {
 
 impl DbusdProps {
     pub fn new(statuses: &[AdapterStatus]) -> Self {
-        let mut leaves = Vec::with_capacity(statuses.len() * 3);
+        let mut leaves = Vec::with_capacity(statuses.len() * 4);
         for status in statuses {
             push(
                 &mut leaves,
@@ -25,6 +25,13 @@ impl DbusdProps {
                 &mut leaves,
                 &format!("adapters.{}.restarts", status.name),
                 status.restarts.into(),
+            );
+            // Always present, unlike last_error: it counts a fact of
+            // the process (detached runs), not a current condition.
+            push(
+                &mut leaves,
+                &format!("adapters.{}.leaked_runs", status.name),
+                u64::from(status.leaked_runs).into(),
             );
             if let Some(error) = &status.last_error {
                 push(
@@ -78,6 +85,12 @@ impl PropTree for DbusdProps {
                 PropType::Number,
                 "Relaunches of this adapter's run in this daemon process.",
             ),
+            "leaked_runs" => PropDescribe::leaf(
+                path.clone(),
+                PropType::Number,
+                "Runs detached as stuck in this daemon process; sticky — \
+                 never reset, unlike last_error.",
+            ),
             "last_error" => PropDescribe::leaf(
                 path.clone(),
                 PropType::String,
@@ -89,9 +102,9 @@ impl PropTree for DbusdProps {
     }
 }
 
-/// `state` is the leaf every consumer watches; `restarts` and
-/// `last_error` ride the same diffs. None are transient: each change is
-/// a real, non-volatile supervision fact.
+/// `state` is the leaf every consumer watches; `restarts`,
+/// `leaked_runs` and `last_error` ride the same diffs. None are
+/// transient: each change is a real, non-volatile supervision fact.
 fn push(leaves: &mut Vec<(PropPath, PropValue)>, path: &str, value: PropValue) {
     if let Ok(path) = PropPath::new(path) {
         leaves.push((path, value));
@@ -117,6 +130,7 @@ mod tests {
             service: name.into(),
             state,
             restarts,
+            leaked_runs: 0,
             last_error: error.map(str::to_string),
             since: SystemTime::UNIX_EPOCH,
         }
@@ -124,18 +138,22 @@ mod tests {
 
     #[test]
     fn snapshot_covers_all_adapters_with_stable_paths() {
-        let props = DbusdProps::new(&[
-            status("notify", AdapterStateKind::Running, 2, None),
-            status("tray", AdapterStateKind::Backoff, 5, Some("panicked: boom")),
-        ]);
+        let mut stuck = status("tray", AdapterStateKind::Stuck, 5, Some("ignored abort"));
+        stuck.leaked_runs = 2;
+        let props = DbusdProps::new(&[status("notify", AdapterStateKind::Running, 2, None), stuck]);
         let snapshot: Value = (&props.snapshot()).into();
         assert_eq!(snapshot["adapters"]["notify"]["state"], "running");
         assert_eq!(snapshot["adapters"]["notify"]["restarts"], 2);
+        assert_eq!(snapshot["adapters"]["notify"]["leaked_runs"], 0);
         assert!(snapshot["adapters"]["notify"].get("last_error").is_none());
-        assert_eq!(snapshot["adapters"]["tray"]["state"], "backoff");
-        assert_eq!(snapshot["adapters"]["tray"]["last_error"], "panicked: boom");
+        assert_eq!(snapshot["adapters"]["tray"]["state"], "stuck");
+        assert_eq!(snapshot["adapters"]["tray"]["last_error"], "ignored abort");
+        // leaked_runs is always present, even at 0 — the count is a
+        // fact of the process, not a current condition like last_error.
+        assert_eq!(snapshot["adapters"]["tray"]["leaked_runs"], 2);
         let list: Vec<String> = props.list().iter().map(|path| path.to_string()).collect();
         assert!(list.contains(&"adapters.notify.state".to_string()));
+        assert!(list.contains(&"adapters.tray.leaked_runs".to_string()));
         assert!(list.contains(&"adapters.tray.last_error".to_string()));
     }
 
@@ -150,6 +168,10 @@ mod tests {
             .describe(&PropPath::new("adapters.notify.restarts").unwrap())
             .unwrap();
         assert_eq!(restarts.ty, PropType::Number);
+        let leaked = props
+            .describe(&PropPath::new("adapters.notify.leaked_runs").unwrap())
+            .unwrap();
+        assert_eq!(leaked.ty, PropType::Number);
         assert!(
             props
                 .describe(&PropPath::new("adapters.notify.absent").unwrap())

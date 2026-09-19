@@ -165,6 +165,7 @@ pub fn start(
                 AdapterStateKind::Disabled
             },
             restarts: 0,
+            leaked_runs: 0,
             last_error: None,
             since: SystemTime::now(),
         };
@@ -486,8 +487,9 @@ fn classify_run(result: std::result::Result<Result<()>, tokio::task::JoinError>)
 /// Apply a state change to the registry and hand the citizen layer an
 /// event. `error`: `None` leaves `last_error` alone, `Some(e)` sets it
 /// (`Some(None)` clears it — used when a run reaches healthy again).
-/// `restart_bump` marks that this transition is a relaunch. Emits
-/// unless nothing observable changed.
+/// `restart_bump` marks that this transition is a relaunch. A
+/// transition into `stuck` is one detached run: `leaked_runs` bumps and
+/// never comes back down. Emits unless nothing observable changed.
 fn transition(
     registry: &Arc<Mutex<RegistryState>>,
     events: &mpsc::Sender<AdapterEvent>,
@@ -496,7 +498,12 @@ fn transition(
     error: Option<Option<String>>,
     restart_bump: bool,
 ) {
-    let event = {
+    // The seq stamp AND the enqueue happen under one registry lock:
+    // try_send never blocks, and with the send outside the guard two
+    // lifecycles on different workers could stamp 5 then 6 but deliver
+    // 6 before 5 — breaking the "channel order is seq order" contract
+    // the event_seq gap detection relies on.
+    let (delivered, seq) = {
         let mut registry = lock_registry(registry);
         let Some(status) = registry.adapters.get_mut(name) else {
             return;
@@ -510,19 +517,25 @@ fn transition(
         if restart_bump {
             status.restarts = status.restarts.saturating_add(1);
         }
+        if new_state == AdapterStateKind::Stuck {
+            status.leaked_runs = status.leaked_runs.saturating_add(1);
+        }
         if let Some(error) = error {
             status.last_error = error;
         }
         let status = status.clone();
         registry.next_event_seq = registry.next_event_seq.saturating_add(1);
-        AdapterEvent {
-            status,
-            previous,
-            seq: registry.next_event_seq,
-        }
+        let seq = registry.next_event_seq;
+        let delivered = events
+            .try_send(AdapterEvent {
+                status,
+                previous,
+                seq,
+            })
+            .is_ok();
+        (delivered, seq)
     };
-    let seq = event.seq;
-    if events.try_send(event).is_err() {
+    if !delivered {
         eprintln!(
             "cosmix-dbusd: adapter state event dropped (backlog full): {name} -> {} (event_seq {})",
             new_state.as_str(),
@@ -576,12 +589,25 @@ mod tests {
         (specs, a, b)
     }
 
+    /// Paused-clock tests wait on virtual time, so the generic 600 s
+    /// deadline costs nothing there. Real-time tests (the never-yield
+    /// one) pass their own short limit so a regression fails in
+    /// seconds, not after ten minutes.
     async fn wait_until(
         handle: &SupervisorHandle,
         name: &str,
         predicate: impl Fn(&AdapterStatus) -> bool,
     ) {
-        let deadline = Instant::now() + Duration::from_secs(600);
+        wait_until_within(handle, name, predicate, Duration::from_secs(600)).await
+    }
+
+    async fn wait_until_within(
+        handle: &SupervisorHandle,
+        name: &str,
+        predicate: impl Fn(&AdapterStatus) -> bool,
+        limit: Duration,
+    ) {
+        let deadline = Instant::now() + limit;
         loop {
             if let Some(status) = handle.status(name)
                 && predicate(&status)
@@ -1007,30 +1033,52 @@ mod tests {
         }
 
         // Disable completes (bounded stop) and reports the honest state.
+        // Real time throughout this test: every wait gets its own short
+        // deadline so a regression fails fast instead of after 600 s.
         handle
             .control("a", LifecycleCmd::Disable)
             .expect("disable a wedged run");
-        wait_until(&handle, "a", |status| {
-            status.state == AdapterStateKind::Stuck
-                && status
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("ignored abort"))
-        })
+        wait_until_within(
+            &handle,
+            "a",
+            |status| {
+                status.state == AdapterStateKind::Stuck
+                    && status
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("ignored abort"))
+            },
+            Duration::from_secs(30),
+        )
         .await;
         assert!(
             a.holds("a"),
             "stuck means the names may still be held — that is the report"
         );
+        assert_eq!(handle.status("a").unwrap().leaked_runs, 1);
         assert_eq!(handle.status("b").unwrap().state, AdapterStateKind::Running);
 
         // The lifecycle keeps answering: enable relaunches (counted
         // restart) and the relaunched run — script exhausted — behaves.
+        // The healthy run clears last_error, but the leaked spinner is
+        // still out there holding names: leaked_runs keeps its trace.
         handle
             .control("a", LifecycleCmd::Enable)
             .expect("enable after stuck");
-        wait_running(&handle, "a").await;
+        wait_until_within(
+            &handle,
+            "a",
+            |status| status.state == AdapterStateKind::Running,
+            Duration::from_secs(30),
+        )
+        .await;
         assert_eq!(handle.status("a").unwrap().restarts, 1);
+        assert_eq!(
+            handle.status("a").unwrap().leaked_runs,
+            1,
+            "leaked_runs is sticky: a healthy relaunch never resets it"
+        );
+        assert_eq!(handle.status("a").unwrap().last_error, None);
 
         // Test teardown: end the leaked busy-loop, then shut down.
         release.store(true, std::sync::atomic::Ordering::Release);
@@ -1151,5 +1199,155 @@ mod tests {
         );
 
         shutdown_and_drain(started, shutdown_tx).await;
+    }
+
+    /// R1 regression: the seq stamp and the publisher enqueue are one
+    /// atomic step under the registry lock, so concurrent lifecycles on
+    /// different workers cannot deliver seq 6 before seq 5 — the order
+    /// the publisher receives events is exactly the seq order (the
+    /// gap-detection contract behind `event_seq`). On the old code
+    /// try_send ran after the guard dropped, and this interleaving
+    /// produced out-of-order deliveries. Real threads: a current-thread
+    /// runtime cannot interleave transitions at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_transitions_reach_the_publisher_in_seq_order() {
+        const WORKERS: usize = 4;
+        const HAMMER: usize = 1_000;
+        // Sized so nothing drops: this test asserts delivery order, not
+        // the backlog-overflow path.
+        let (events_tx, mut events_rx) = mpsc::channel(WORKERS * HAMMER);
+        let registry = Arc::new(Mutex::new(RegistryState::default()));
+        for name in ["a", "b", "c", "d"] {
+            lock_registry(&registry).adapters.insert(
+                name.into(),
+                AdapterStatus {
+                    name: name.into(),
+                    service: name.into(),
+                    state: AdapterStateKind::Disabled,
+                    restarts: 0,
+                    leaked_runs: 0,
+                    last_error: None,
+                    since: SystemTime::now(),
+                },
+            );
+        }
+
+        let mut workers = Vec::new();
+        for name in ["a", "b", "c", "d"] {
+            let registry = Arc::clone(&registry);
+            let events = events_tx.clone();
+            workers.push(tokio::spawn(async move {
+                for _ in 0..HAMMER {
+                    // restart_bump forces an emit every call, so every
+                    // iteration is a stamp-and-deliver race candidate.
+                    transition(
+                        &registry,
+                        &events,
+                        name,
+                        AdapterStateKind::Running,
+                        None,
+                        true,
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+        drop(events_tx);
+        for worker in workers {
+            worker.await.expect("hammer worker");
+        }
+
+        let mut previous = 0u64;
+        let mut delivered = 0usize;
+        while let Some(event) = events_rx.recv().await {
+            assert!(
+                event.seq > previous,
+                "publisher received seq {} after {}: deliveries must follow seq order",
+                event.seq,
+                previous
+            );
+            previous = event.seq;
+            delivered += 1;
+        }
+        assert_eq!(
+            delivered,
+            WORKERS * HAMMER,
+            "the oversized backlog must carry every event"
+        );
+        assert_eq!(
+            lock_registry(&registry).next_event_seq,
+            previous,
+            "the counter matches the last delivered event"
+        );
+    }
+
+    /// R3: every transition into `stuck` is one more detached run, and
+    /// nothing in the lifecycle — disable, relaunch, a healthy run
+    /// clearing `last_error` — ever brings the count back down.
+    #[tokio::test(start_paused = true)]
+    async fn leaked_runs_counts_stuck_detaches_and_never_resets() {
+        let (events_tx, _events_rx) = mpsc::channel(EVENT_CAPACITY);
+        let registry = Arc::new(Mutex::new(RegistryState::default()));
+        lock_registry(&registry).adapters.insert(
+            "a".into(),
+            AdapterStatus {
+                name: "a".into(),
+                service: "a".into(),
+                state: AdapterStateKind::Starting,
+                restarts: 0,
+                leaked_runs: 0,
+                last_error: None,
+                since: SystemTime::now(),
+            },
+        );
+
+        // Two stuck detachments (a disable of a wedged run parking in
+        // `stuck`, then another wedged relaunch) ...
+        transition(
+            &registry,
+            &events_tx,
+            "a",
+            AdapterStateKind::Stuck,
+            Some(Some(stuck_error())),
+            false,
+        );
+        transition(
+            &registry,
+            &events_tx,
+            "a",
+            AdapterStateKind::Disabled,
+            None,
+            false,
+        );
+        transition(
+            &registry,
+            &events_tx,
+            "a",
+            AdapterStateKind::Stuck,
+            Some(Some(stuck_error())),
+            false,
+        );
+        // ... then the full healthy cycle, including the running
+        // transition that clears last_error.
+        transition(
+            &registry,
+            &events_tx,
+            "a",
+            AdapterStateKind::Starting,
+            None,
+            true,
+        );
+        transition(
+            &registry,
+            &events_tx,
+            "a",
+            AdapterStateKind::Running,
+            Some(None),
+            false,
+        );
+
+        let status = lock_registry(&registry).adapters["a"].clone();
+        assert_eq!(status.leaked_runs, 2, "each stuck detach counts");
+        assert_eq!(status.last_error, None, "running cleared the error");
     }
 }

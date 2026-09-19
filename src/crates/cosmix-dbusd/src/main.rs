@@ -26,12 +26,23 @@ const RUNTIME_STOP: Duration = Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
     let command = Cli::parse().command;
+    // Tokio's default worker count follows the cgroup CPU quota, so a
+    // 1-CPU quota yields ONE worker — and a single never-yielding
+    // adapter run (the `stuck` case) then wedges the only worker: the
+    // GRACEFUL_STOP/ABORT_STOP timers can never fire and stop_run waits
+    // forever. Two workers keep the supervisor's timers runnable beside
+    // a wedged run; above that, follow the available CPUs.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|cpus| cpus.get())
+        .unwrap_or(1)
+        .max(2);
     // The runtime is built explicitly (not `#[tokio::main]`) so teardown
     // is bounded even with a wedged adapter run: a task that never
     // yields survives its abort, and `Runtime::shutdown_timeout` gives
     // it this window and then returns instead of hanging forever —
     // the leaked task dies with the process.
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()?;
     let result = runtime.block_on(match command {

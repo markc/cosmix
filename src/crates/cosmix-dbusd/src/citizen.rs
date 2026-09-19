@@ -19,7 +19,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::adapter::{AdapterSpec, SessionBus};
 use crate::state::AdapterEvent;
-use crate::supervisor::{LifecycleCmd, StartedSupervisor, SupervisorHandle};
+use crate::supervisor::{
+    ABORT_STOP, GRACEFUL_STOP, LifecycleCmd, StartedSupervisor, SupervisorHandle,
+};
 
 pub const BUS_SERVICE: &str = "dbusd";
 pub const TOPIC_ADAPTER_CHANGED: &str = "dbusd.adapter.changed";
@@ -36,6 +38,15 @@ const BROKER_DRAIN: Duration = Duration::from_secs(35);
 /// signalling shutdown (each already grants every run its own
 /// [`crate::supervisor::GRACEFUL_STOP`] window).
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(15);
+// Wiring check, at compile time: the supervision drain must cover a
+// full stop window (GRACEFUL_STOP + ABORT_STOP per run) with margin —
+// asserted at two windows, so bumping either timer can't silently
+// overrun SHUTDOWN_DRAIN. The unit's `TimeoutStopSec=75 s` stays the
+// outer bound (see the budget note below).
+const _: () = assert!(
+    SHUTDOWN_DRAIN.as_secs() >= 2 * (GRACEFUL_STOP.as_secs() + ABORT_STOP.as_secs()),
+    "SHUTDOWN_DRAIN must cover two full stop windows (GRACEFUL_STOP + ABORT_STOP)"
+);
 // Explicit shutdown budget, against the unit's `TimeoutStopSec=75`:
 // broker drain <= BROKER_DRAIN 35 s (its close alone <= CLOSE_TIMEOUT
 // 30 s) + supervision drain <= SHUTDOWN_DRAIN 15 s = 50 s to the end
@@ -483,6 +494,7 @@ fn status_json(status: &crate::state::AdapterStatus) -> Value {
         "service": status.service,
         "state": status.state.as_str(),
         "restarts": status.restarts,
+        "leaked_runs": status.leaked_runs,
         "last_error": status.last_error,
         "since": rfc3339(status.since),
     })
@@ -597,6 +609,7 @@ fn adapter_changed_message(event: &AdapterEvent) -> cosmix_bus::bus::BusMessage 
             "state": event.status.state.as_str(),
             "previous": event.previous.as_str(),
             "restarts": event.status.restarts,
+            "leaked_runs": event.status.leaked_runs,
             "last_error": event.status.last_error,
             "since": rfc3339(event.status.since),
             "event_seq": event.seq,
@@ -677,6 +690,7 @@ mod tests {
         assert_eq!(adapters[0]["name"], "notify");
         assert_eq!(adapters[0]["state"], "disabled");
         assert_eq!(adapters[0]["restarts"], 0);
+        assert_eq!(adapters[0]["leaked_runs"], 0);
         assert!(adapters[0]["since"].as_str().is_some());
         assert_eq!(body["session_bus"]["address"], "unix:path=/run/bus");
     }
@@ -833,6 +847,7 @@ mod tests {
                 service: "tray".into(),
                 state: AdapterStateKind::Backoff,
                 restarts: 3,
+                leaked_runs: 1,
                 last_error: Some("panicked: boom".into()),
                 since: SystemTime::UNIX_EPOCH,
             },
@@ -846,6 +861,7 @@ mod tests {
         assert_eq!(body["data"]["state"], "backoff");
         assert_eq!(body["data"]["previous"], "starting");
         assert_eq!(body["data"]["restarts"], 3);
+        assert_eq!(body["data"]["leaked_runs"], 1);
         assert_eq!(body["data"]["last_error"], "panicked: boom");
         assert_eq!(body["data"]["event_seq"], 42);
     }
@@ -869,12 +885,16 @@ mod tests {
             body["event_seq"].is_u64(),
             "watch must carry the current numeric event_seq"
         );
+        // Assert the reply's stated semantics, not a keyword any
+        // placeholder would contain: it must name the field it
+        // describes (event_seq), say what a gap means (dropped
+        // events), and point at the bootstrap truth (props.get).
+        let semantics = body["event_sequence"].as_str().unwrap();
         assert!(
-            body["event_sequence"]
-                .as_str()
-                .unwrap()
-                .contains("monotonic"),
-            "event_sequence must describe the real semantics, not an empty promise"
+            semantics.contains("event_seq")
+                && semantics.contains("gap")
+                && semantics.contains("dbusd.props.get"),
+            "event_sequence must state the real semantics: {semantics}"
         );
 
         let (rc, body) = dispatch(

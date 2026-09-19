@@ -32,14 +32,14 @@ hosted here, the same way IMAP and HTTP live at the edge.
 - Serves the `dbusd` Bus control service (mesh-open; no caller
   authorization on any verb):
   - `dbusd.adapters` — every adapter's `{name, service, state, restarts,
-    last_error, since}` and the session-bus endpoint state.
+    leaked_runs, last_error, since}` and the session-bus endpoint state.
   - `dbusd.adapter.restart {name}` / `dbusd.adapter.enable {name}` /
     `dbusd.adapter.disable {name}` — disable stops the adapter and
     releases its names (how a human hands, say, the Notifications name
     back to another daemon); enable and restart relaunch it. Unknown
     names get a refusal reply, never a panic.
   - `dbusd.props.{get,list,describe,watch}` — the uniform props surface
-    over `dbusd.adapters.<name>.state|restarts|last_error`.
+    over `dbusd.adapters.<name>.state|restarts|leaked_runs|last_error`.
   - `dbusd.ping`, `dbusd.info`.
 - Publishes state changes as they happen — one `dbusd.adapter.changed`
   event plus `dbusd.props.changed` diffs per transition, both stamped
@@ -64,11 +64,15 @@ runtime-only — the config file is the persistent source.
 | `running` | serving its domain |
 | `backoff` | failed (error/panic/exit); waiting out the schedule |
 | `disabled` | stopped by config or verb; names released |
-| `stuck` | the run ignored its stop signal and the abort; its names may stay held until the process restarts |
+| `stuck` | the run did not stop within the abort window — it may be CPU-bound or never yielding; its names may stay held until the process restarts |
 
 `restarts` counts every relaunch in this daemon process (backoff
 restarts, the restart verb, enable-after-disable). `last_error` is the
-most recent failure reason, cleared when the adapter runs healthy again.
+most recent failure reason, cleared when the adapter runs healthy
+again. `leaked_runs` counts runs detached as `stuck` in this daemon
+process and never resets: the next healthy run clears `last_error`,
+but the leaked spinner may still be holding names and burning a
+worker — the count is its visible trace.
 
 ## Running it
 

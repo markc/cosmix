@@ -17,11 +17,12 @@ pub enum AdapterStateKind {
     Backoff,
     /// Not running: disabled by config or by `dbusd.adapter.disable`.
     Disabled,
-    /// The run could not be stopped: it ignored both its stop signal
-    /// and the abort (a run that never yields cannot be preempted).
-    /// Its Bus service and D-Bus names may still be held until the
-    /// process restarts; the lifecycle keeps answering commands, and
-    /// enable/restart relaunch alongside the leaked task.
+    /// The run did not stop within the abort window (1 s): it may be
+    /// CPU-bound or never yielding — either way it could not be
+    /// preempted in time and is detached. Its Bus service and D-Bus
+    /// names may still be held until the process restarts; the
+    /// lifecycle keeps answering commands, and enable/restart relaunch
+    /// alongside the leaked task.
     Stuck,
 }
 
@@ -48,6 +49,12 @@ pub struct AdapterStatus {
     /// daemon process — backoff restarts, `dbusd.adapter.restart`, and
     /// enable-after-disable all count.
     pub restarts: u64,
+    /// Runs detached as `stuck` in this daemon process. Sticky: a
+    /// leaked spinner may keep holding names and burning a worker long
+    /// after the adapter re-enters `running` (which clears
+    /// `last_error`), so the count — never reset — is the visible
+    /// trace of every run still out there.
+    pub leaked_runs: u32,
     /// Why the adapter last failed; sticky through backoff and the next
     /// starting attempt, cleared when it reaches `running` again.
     pub last_error: Option<String>,
@@ -76,8 +83,8 @@ pub struct AdapterEvent {
 #[derive(Debug, Default)]
 pub struct RegistryState {
     pub adapters: BTreeMap<String, AdapterStatus>,
-    /// Counter behind [`AdapterEvent::seq`]; advanced under the registry
-    /// lock so the order events are handed to the publisher is the
-    /// order subscribers observe.
+    /// Counter behind [`AdapterEvent::seq`]; both the stamp and the
+    /// event's enqueue to the publisher happen under the registry
+    /// lock, so the order events reach the publisher is the seq order.
     pub next_event_seq: u64,
 }
