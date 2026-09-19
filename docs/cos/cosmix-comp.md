@@ -1,5 +1,11 @@
 # cosmix-comp
 
+The `cosmix-input-probe` hardware gate client redraws on frame callbacks and
+uses opaque XRGB buffers by default. `--translucent` instead uses premultiplied
+half-alpha ARGB buffers without an opaque region, including after resize or
+maximise. Both modes retain server decorations, allowing the occlusion gate to
+compare opaque and translucent maximised windows through the same client path.
+
 `cosmix-comp` is the Wayland compositor used by the Cosmix desktop. It can run
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.

@@ -17,6 +17,8 @@
 //! instead, like a tray app, and prints `PROBE hidden`; with
 //! `--remap-once-ms N` the first such hide is undone after N ms
 //! (`PROBE remapped`).
+//! `--translucent` uses premultiplied half-alpha ARGB with no opaque region;
+//! the default XRGB buffer is opaque. Both modes retain compositor SSD.
 
 use smithay::reexports::wayland_protocols::wp::presentation_time::client::{
     wp_presentation, wp_presentation_feedback,
@@ -76,6 +78,7 @@ struct Options {
     duration: Duration,
     hide_on_close: bool,
     remap_once: Option<Duration>,
+    translucent: bool,
 }
 
 fn options() -> Result<Options, String> {
@@ -87,6 +90,7 @@ fn options() -> Result<Options, String> {
         duration: Duration::from_secs(30),
         hide_on_close: false,
         remap_once: None,
+        translucent: false,
     };
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
@@ -114,6 +118,7 @@ fn options() -> Result<Options, String> {
                 );
             }
             "--hide-on-close" => options.hide_on_close = true,
+            "--translucent" => options.translucent = true,
             "--remap-once-ms" => {
                 options.remap_once = Some(Duration::from_millis(
                     value()?
@@ -143,6 +148,7 @@ fn canvas(
     qh: &QueueHandle<Probe>,
     width: i32,
     height: i32,
+    translucent: bool,
 ) -> Result<Canvas, String> {
     let bytes = (width * height * 4) as usize;
     let name = CString::new("cosmix-input-probe").unwrap();
@@ -160,7 +166,12 @@ fn canvas(
         .set_len(bytes as u64)
         .map_err(|error| error.to_string())?;
     let pool = shm.create_pool(backing.as_fd(), bytes as i32, qh, ());
-    let buffer = pool.create_buffer(0, width, height, width * 4, wl_shm::Format::Xrgb8888, qh, ());
+    let format = if translucent {
+        wl_shm::Format::Argb8888
+    } else {
+        wl_shm::Format::Xrgb8888
+    };
+    let buffer = pool.create_buffer(0, width, height, width * 4, format, qh, ());
     pool.destroy();
     Ok(Canvas {
         backing,
@@ -279,7 +290,7 @@ fn run() -> Result<(), String> {
                 .as_ref()
                 .is_none_or(|canvas| (canvas.width, canvas.height) != (width, height))
             {
-                current = Some(canvas(&shm, &qh, width, height)?);
+                current = Some(canvas(&shm, &qh, width, height, options.translucent)?);
                 say(&format!("configure {width} {height}"));
             }
             dirty = true;
@@ -290,7 +301,12 @@ fn run() -> Result<(), String> {
         {
             frame = frame.wrapping_add(1);
             let shade = (frame % 256) as u8;
-            let pixels = [shade, 0x80, 255 - shade, 0xff].repeat((canvas.width * canvas.height) as usize);
+            let pixel = if options.translucent {
+                [shade / 2, 0x40, (255 - shade) / 2, 0x80]
+            } else {
+                [shade, 0x80, 255 - shade, 0xff]
+            };
+            let pixels = pixel.repeat((canvas.width * canvas.height) as usize);
             canvas
                 .backing
                 .write_all_at(&pixels, 0)
