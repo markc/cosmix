@@ -1,0 +1,32 @@
+# ~/.config/systemd/user/cosmix-dbusd.service
+#
+# The D-Bus boundary daemon (ADR 2026-09-18): the one cosmix process that
+# speaks D-Bus. It serves the `dbusd.*` Bus namespace on the Cosmix Bus and
+# dials the desktop session bus for its adapters. The session bus is the
+# one cosmix-desk-dbus.service runs at /run/cosmix-desk-dbus/bus; the unit
+# sets it explicitly because systemd user units do not inherit the
+# graphical session's environment unless told to.
+#
+# A hub-side system unit (User=markc, PartOf=cosmix-desktop.target) lands
+# with the install, after review.
+#
+# Install:  cp this -> ~/.config/systemd/user/cosmix-dbusd.service
+#           systemctl --user daemon-reload
+#           systemctl --user enable --now cosmix-dbusd
+
+[Unit]
+Description=Cosmix D-Bus boundary daemon
+Documentation=https://cosmix.dev/cos/dbusd
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/cosmix-desk-dbus/bus
+ExecStart=/opt/cosmix/bin/cosmix-dbusd serve
+Restart=on-failure
+RestartSec=60s
+TimeoutStopSec=75s
+
+[Install]
+WantedBy=graphical-session.target

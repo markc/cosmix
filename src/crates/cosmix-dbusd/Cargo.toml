@@ -1,0 +1,52 @@
+[package]
+name = "cosmix-dbusd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "D-Bus boundary daemon: hosts the per-domain D-Bus adapters for Cosmix"
+
+[lib]
+name = "cosmix_dbusd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cosmix-dbusd"
+path = "src/main.rs"
+required-features = ["cosmix"]
+
+[features]
+default = ["cosmix"]
+cosmix = [
+    "dep:chrono",
+    "dep:clap",
+    "dep:cosmix_buildinfo",
+    "dep:cosmix_bus",
+    "dep:cosmix_client",
+    "dep:cosmix_config",
+    "dep:cosmix_props_core",
+    "cosmix_props_core/bus",
+    "dep:serde_json",
+    "dep:zbus",
+]
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo", optional = true }
+cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
+cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
+cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
+cosmix_props_core = { package = "cosmix-lib-props-core", path = "../cosmix-lib-props-core", default-features = false, optional = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true }
+zbus = { version = "5.18", default-features = false, features = ["tokio"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

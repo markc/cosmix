@@ -1103,6 +1103,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-dbusd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "cosmix-lib-buildinfo",
+ "cosmix-lib-bus",
+ "cosmix-lib-client",
+ "cosmix-lib-config",
+ "cosmix-lib-props-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
 name = "cosmix-dnsd"
 version = "0.3.1"
 dependencies = [
