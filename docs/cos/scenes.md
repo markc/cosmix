@@ -8,6 +8,8 @@ Invalid loads and patches return diagnostics and retain the last good tree.
 Scenes mount as pages in an edge panel. Floating windows are outside v0.
 The envelope's `window` header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
+`window.chrome` defaults to true; false lets the page fill its panel without
+the Quoin header bar, for panel-style furniture.
 An absent or cleared extent uses the shell's output-derived default thickness.
 Authored extents fit the output space left by opposing exclusive zones;
 pinning and output changes recheck that budget. Pointer resizes exceeding the
@@ -41,17 +43,20 @@ edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.
 
 List rows use CTK VirtualList. Row templates are instantiated with
-`template-node@row-id` identities and substitute `{cells[i]}` in text.
+`template-node@row-id` identities and substitute `{cells[i]}` only in
+`text.text` and `image.src` inside list templates.
 Text elision uses CTK's middle-elision policy.
+`column.align` sets cross-axis alignment to `start` (default), `center`,
+`end` or `stretch`.
+`text.align` sets justification to `left` (default), `center` or `right`
+within the text's `width` or the space allocated by `fill: true`.
 
 Absolute image `src` paths load PNG and SVG directly, rasterised or resized
 at the primary window's output scale (3× when no primary window is available)
 and cached by path and pixel size. Files over 4 MiB and targets over 1024 pixels
 on either side are refused; missing or invalid files render nothing and are
 remembered so they are not retried. The host also substitutes `{cells[i]}` in
-an image template's `src`. The current document validator still restricts
-substitutions to `text.text`; image templates require that separate validator
-change before they can be loaded through `shell.scene.load`.
+an image template's `src`, including when loaded through `shell.scene.load`.
 
 CTK shares the font source cache through weak references. Fonts still used by
 retained layouts keep the same atlas identity after idle cache pruning, so

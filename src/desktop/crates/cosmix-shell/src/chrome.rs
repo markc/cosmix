@@ -346,9 +346,11 @@ struct QuoinPanelChrome {
 
 #[derive(Component)]
 struct QuoinPanelParts {
+    header: Entity,
     pin_label: Entity,
     title_label: Entity,
     page_titles: Vec<(String, String)>,
+    page_chromeless: Vec<(String, bool)>,
     page_wrappers: Vec<(String, Entity)>,
     dot_labels: Vec<(String, Entity)>,
     controls: Vec<Entity>,
@@ -459,6 +461,18 @@ pub fn spawn_quoin_chrome(
 /// Mount a dynamic page without rebuilding other pages or their editing state.
 /// Returns false until the host has created this edge's chrome.
 pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content: Entity) -> bool {
+    mount_page_with(world, edge, id, title, content, false)
+}
+
+/// Mount or update a page, optionally hiding the header while it is active.
+pub fn mount_page_with(
+    world: &mut World,
+    edge: Edge,
+    id: &str,
+    title: &str,
+    content: Entity,
+    chromeless: bool,
+) -> bool {
     let mut query = world.query::<(Entity, &QuoinPanelChrome, &Children)>();
     let Some((panel, host)) = query
         .iter(world)
@@ -474,6 +488,9 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
         .iter()
         .any(|(page, _)| page == id);
     if exists {
+        let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
+        parts.page_chromeless.retain(|(page, _)| page != id);
+        parts.page_chromeless.push((id.into(), chromeless));
         if let Some((_, current)) = world
             .get_mut::<QuoinPanelParts>(panel)
             .unwrap()
@@ -496,7 +513,7 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
         .add_child(content)
         .id();
     world.entity_mut(host).add_child(wrapper);
-    let header = world.get::<Children>(panel).unwrap()[0];
+    let header = world.get::<QuoinPanelParts>(panel).unwrap().header;
     let dots = world.get::<Children>(header).unwrap()[3];
     let mut queue = bevy::ecs::world::CommandQueue::default();
     let mut commands = Commands::new(&mut queue, world);
@@ -514,6 +531,7 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
     parts.controls.push(dot);
     parts.dot_labels.push((id.into(), label));
     parts.page_titles.push((id.into(), title.into()));
+    parts.page_chromeless.push((id.into(), chromeless));
     parts.page_wrappers.push((id.into(), wrapper));
     let ids = parts
         .page_wrappers
@@ -547,6 +565,7 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
         .find(|(page, _)| page == id)
         .map(|(_, entity)| *entity);
     parts.page_titles.retain(|(page, _)| page != id);
+    parts.page_chromeless.retain(|(page, _)| page != id);
     parts.page_wrappers.retain(|(page, _)| page != id);
     let ids = parts
         .page_wrappers
@@ -708,9 +727,11 @@ fn spawn_panel(
                 pointer_ownership,
             },
             QuoinPanelParts {
+                header,
                 pin_label,
                 title_label,
                 page_titles,
+                page_chromeless: Vec::new(),
                 page_wrappers,
                 dot_labels,
                 controls,
@@ -1237,6 +1258,20 @@ fn present_panels(
         {
             label.0.clone_from(title);
         }
+        if let Ok(mut header) = queries.nodes.get_mut(parts.header) {
+            let chromeless = parts
+                .page_chromeless
+                .iter()
+                .any(|(id, chromeless)| *chromeless && panel.active_page_id.as_deref() == Some(id));
+            let display = if chromeless {
+                Display::None
+            } else {
+                Display::Flex
+            };
+            if header.display != display {
+                header.display = display;
+            }
+        }
         for (id, entity) in &parts.page_wrappers {
             if let Ok(mut page_node) = queries.nodes.get_mut(*entity) {
                 let display = if panel.active_page_id.as_deref() == Some(id) {
@@ -1737,6 +1772,8 @@ mod tests {
                     pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
+                    header: Entity::PLACEHOLDER,
+                    page_chromeless: Vec::new(),
                     pin_label: pin,
                     title_label: title,
                     page_titles: vec![
@@ -1857,6 +1894,8 @@ mod tests {
                     pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
+                    header: Entity::PLACEHOLDER,
+                    page_chromeless: Vec::new(),
                     pin_label,
                     title_label,
                     page_titles: Vec::new(),
@@ -1943,6 +1982,8 @@ mod tests {
                 pointer_ownership: QuoinPointerOwnership::ChromeHover,
             },
             QuoinPanelParts {
+                header: Entity::PLACEHOLDER,
+                page_chromeless: Vec::new(),
                 pin_label,
                 title_label,
                 page_titles: Vec::new(),
