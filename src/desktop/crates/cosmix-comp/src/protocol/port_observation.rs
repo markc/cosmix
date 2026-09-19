@@ -1874,6 +1874,13 @@ fn occlusion_counters_never_emit_changes_but_decisions_do() {
     let old = crate::occlusion::Props::default();
     let mut new = old.clone();
     let mut changes = PendingPropChanges::new();
+    queue_prop_change(
+        &mut changes,
+        "occlusion.counters.recomputes".into(),
+        PropValue::U64(0),
+        PropValue::U64(42),
+        "wayland.occlusion",
+    );
     diff_occlusion("surfaces.s1", &old, &new, "wayland.occlusion", &mut changes);
     assert!(changes.is_empty());
     new.occluded = true;

@@ -133,6 +133,12 @@ fn occlusion_wire_content_only_commits_never_flap_or_leak() {
     for _ in 0..3 {
         victims.push(map_named_test_toplevel(&mut h, "covered", "test.covered").3);
     }
+    // Named fixtures start at 32x24; use real equal-size buffers so a later
+    // content-only commit cannot inadvertently become a resize regression.
+    for surface in victims.iter().chain(std::iter::once(&cover)) {
+        commit_test_buffer(&mut h, surface.protocol_id());
+    }
+    h.dispatch_client();
     let callbacks = victims
         .iter()
         .map(|v| request(&mut h, v.protocol_id()))
@@ -142,6 +148,20 @@ fn occlusion_wire_content_only_commits_never_flap_or_leak() {
     }
     certify(&mut h, true);
     h.frame(Vec::new());
+    assert!(
+        !h.sync()
+            .iter()
+            .any(|(id, op, _)| callbacks.contains(id) && *op == 0),
+        "all four victims must start covered"
+    );
+    for victim in &victims {
+        assert!(
+            h.server
+                .state
+                .occlusion
+                .is_occluded(h.server.state.surfaces[victim].id)
+        );
+    }
     let decisions = h.server.state.occlusion.decisions.clone();
     let revisions = h.server.state.occlusion.decision_revisions.clone();
     let rebuilds = h.server.state.occlusion.scene_rebuilds;
@@ -211,7 +231,21 @@ fn occlusion_wire_callback_cap_completes_excess_and_retains_latest() {
     );
     h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
     h.frame(Vec::new());
-    let events = h.sync();
+    // 64 done events plus their delete_id events exceed the harness's usual
+    // 64-event sync budget. Drain this deliberately large batch to a sentinel.
+    let sentinel = h.allocate_object_id();
+    send_display_request(&mut h.client, 0, sentinel);
+    h.dispatch_client();
+    let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+    let mut events = Vec::new();
+    loop {
+        let event = read_event(&mut h.client, deadline, "occlusion callback batch");
+        if event.0 == sentinel && event.1 == 0 {
+            break;
+        }
+        events.push(event);
+        assert!(events.len() < 256, "callback batch must remain bounded");
+    }
     assert_eq!(
         events
             .iter()
