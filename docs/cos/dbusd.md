@@ -105,6 +105,61 @@ as locals of `run` is the whole containment story. The crate's core
 feature and is unit-tested with a scripted fault adapter compiled only
 under `cfg(test)`.
 
-The first adapters (notify, tray, settings, then folding mprisd and
-powerd) land in later jobs; J1 ships the host, the control service and
-the supervision guarantees.
+The `notify` adapter ships; the rest (tray, settings, then folding
+mprisd and powerd) land in later jobs.
+
+## The notify adapter
+
+Inbound `org.freedesktop.Notifications` (spec 1.2) on the session bus,
+bridged to the `notify` Bus service — how foreign apps' notifications
+become legible on the Bus, and how any mesh node posts to this
+desktop.
+
+**D-Bus side.** Owns `org.freedesktop.Notifications` at
+`/org/freedesktop/Notifications`. If the name is already owned the run
+fails with a clear error — never a replacement: the supervisor backs
+off and retries, and a human uses `dbusd.adapter.disable`/`enable` (or
+stops the other daemon) to hand the name over. Methods: `Notify`
+(with `replaces_id` semantics — a live id is reused and replaced),
+`CloseNotification` (→ `NotificationClosed` reason 3; unknown ids are
+ignored per spec), `GetCapabilities` (`actions`, `body` — only what is
+implemented; persistence is not claimed), `GetServerInformation`
+(`cosmix`, `cosmix`, crate version, `1.2`). Signals:
+`NotificationClosed(id, reason)` (1 expired, 2 dismissed, 3 closed by
+call) and `ActionInvoked(id, action_key)`. Expiry follows the pinned
+policy: `expire_timeout` −1 means the server default — 8 s for
+low/normal urgency, never for critical — and 0 means never; every
+notification gets its own timer, so there is no polling loop anywhere.
+Hints honoured: `urgency`, `resident`, `transient`, `desktop-entry`,
+`image-path`; an `image-data` pixel payload is only recorded as
+present (a `n<id>.image_data` prop) — raw pixels never enter props.
+
+**Bus side** (the `notify` service; mesh-open, no caller authorization
+on any verb):
+
+- Verbs: `notify.ping`, `notify.info`, `notify.list`,
+  `notify.close {id}` (→ `NotificationClosed` reason 2),
+  `notify.invoke {id, action}` (→ `ActionInvoked`, then close with
+  reason 2 unless the `resident` hint is set), and
+  `notify.send {summary, body?, app?, icon?, urgency?, timeout?,
+  actions?, resident?, transient?, desktop_entry?, image_path?}` —
+  creates a notification exactly as if `Notify` had been called (any
+  mesh node may post to this desktop). Unknown ids, actions and verbs
+  are refusal replies (rc 10), never panics.
+- Props: `notify.count` and one subtree per live notification —
+  `notify.n<id>.{app,summary,body,icon,urgency,actions,expires_at,
+  created_at,resident,origin}` plus `desktop_entry` / `image_path` /
+  `image_data` when present. The subtree vanishes when the
+  notification closes. `expires_at` is null for never-expiring.
+- Events: `notify.changed` carries `notification.created`,
+  `notification.replaced`, `notification.closed` (with reason code and
+  name) and `notification.action_invoked`; `notify.props.changed`
+  carries leaf diffs. Both are stamped with a per-run monotonic
+  `event_seq` — a gap means events were dropped, and
+  `notify.props.get` is the truth.
+
+**Bounds.** At most 256 live notifications: a fresh one beyond the cap
+expires the oldest non-critical first (reason 1; a set of all
+criticals overflows rather than dropping one). Stored strings are
+capped (8 KiB, truncated at a char boundary and marked) and at most 32
+actions are kept.

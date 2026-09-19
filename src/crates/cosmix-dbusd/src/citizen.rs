@@ -54,14 +54,10 @@ const _: () = assert!(
 // main.rs) — worst case ~55 s, with margin, never a sum that just
 // touches the unit limit.
 
-/// The built-in adapter registry. J1 ships the host only — adding an
-/// adapter later is one line here:
-///
-/// ```ignore
-/// adapter_spec::<NotifyAdapter>(),
-/// ```
+/// The built-in adapter registry. Adding an adapter is one line here
+/// (the `notify` domain ships; more land in later jobs).
 pub fn builtin_adapters() -> Vec<AdapterSpec> {
-    Vec::new()
+    vec![adapter_spec::<crate::adapters::notify::NotifyAdapter>()]
 }
 
 type LifecycleDone = (String, std::result::Result<(), tokio::task::JoinError>);

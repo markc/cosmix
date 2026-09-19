@@ -535,9 +535,58 @@ as locals of <code>run</code> is the whole containment story. The crate's core
 (supervisor, backoff, registry, config) builds without the <code>cosmix</code>
 feature and is unit-tested with a scripted fault adapter compiled only
 under <code>cfg(test)</code>.</p>
-<p>The first adapters (notify, tray, settings, then folding mprisd and
-powerd) land in later jobs; J1 ships the host, the control service and
-the supervision guarantees.</p></div></div>
+<p>The <code>notify</code> adapter ships; the rest (tray, settings, then folding
+mprisd and powerd) land in later jobs.</p>
+<h2 id="the-notify-adapter">The notify adapter</h2>
+<p>Inbound <code>org.freedesktop.Notifications</code> (spec 1.2) on the session bus,
+bridged to the <code>notify</code> Bus service — how foreign apps' notifications
+become legible on the Bus, and how any mesh node posts to this
+desktop.</p>
+<p><strong>D-Bus side.</strong> Owns <code>org.freedesktop.Notifications</code> at
+<code>/org/freedesktop/Notifications</code>. If the name is already owned the run
+fails with a clear error — never a replacement: the supervisor backs
+off and retries, and a human uses <code>dbusd.adapter.disable</code>/<code>enable</code> (or
+stops the other daemon) to hand the name over. Methods: <code>Notify</code>
+(with <code>replaces_id</code> semantics — a live id is reused and replaced),
+<code>CloseNotification</code> (→ <code>NotificationClosed</code> reason 3; unknown ids are
+ignored per spec), <code>GetCapabilities</code> (<code>actions</code>, <code>body</code> — only what is
+implemented; persistence is not claimed), <code>GetServerInformation</code>
+(<code>cosmix</code>, <code>cosmix</code>, crate version, <code>1.2</code>). Signals:
+<code>NotificationClosed(id, reason)</code> (1 expired, 2 dismissed, 3 closed by
+call) and <code>ActionInvoked(id, action_key)</code>. Expiry follows the pinned
+policy: <code>expire_timeout</code> −1 means the server default — 8 s for
+low/normal urgency, never for critical — and 0 means never; every
+notification gets its own timer, so there is no polling loop anywhere.
+Hints honoured: <code>urgency</code>, <code>resident</code>, <code>transient</code>, <code>desktop-entry</code>,
+<code>image-path</code>; an <code>image-data</code> pixel payload is only recorded as
+present (a <code>n&lt;id&gt;.image_data</code> prop) — raw pixels never enter props.</p>
+<p><strong>Bus side</strong> (the <code>notify</code> service; mesh-open, no caller authorization
+on any verb):</p>
+<ul>
+<li>Verbs: <code>notify.ping</code>, <code>notify.info</code>, <code>notify.list</code>,
+<code>notify.close {id}</code> (→ <code>NotificationClosed</code> reason 2),
+<code>notify.invoke {id, action}</code> (→ <code>ActionInvoked</code>, then close with
+reason 2 unless the <code>resident</code> hint is set), and
+<code>notify.send {summary, body?, app?, icon?, urgency?, timeout?, actions?, resident?, transient?, desktop_entry?, image_path?}</code> —
+creates a notification exactly as if <code>Notify</code> had been called (any
+mesh node may post to this desktop). Unknown ids, actions and verbs
+are refusal replies (rc 10), never panics.</li>
+<li>Props: <code>notify.count</code> and one subtree per live notification —
+<code>notify.n&lt;id&gt;.{app,summary,body,icon,urgency,actions,expires_at, created_at,resident,origin}</code> plus <code>desktop_entry</code> / <code>image_path</code> /
+<code>image_data</code> when present. The subtree vanishes when the
+notification closes. <code>expires_at</code> is null for never-expiring.</li>
+<li>Events: <code>notify.changed</code> carries <code>notification.created</code>,
+<code>notification.replaced</code>, <code>notification.closed</code> (with reason code and
+name) and <code>notification.action_invoked</code>; <code>notify.props.changed</code>
+carries leaf diffs. Both are stamped with a per-run monotonic
+<code>event_seq</code> — a gap means events were dropped, and
+<code>notify.props.get</code> is the truth.</li>
+</ul>
+<p><strong>Bounds.</strong> At most 256 live notifications: a fresh one beyond the cap
+expires the oldest non-critical first (reason 1; a set of all
+criticals overflows rather than dropping one). Stored strings are
+capped (8 KiB, truncated at a char boundary and marked) and at most 32
+actions are kept.</p></div></div>
     </div>
 
 </main>
