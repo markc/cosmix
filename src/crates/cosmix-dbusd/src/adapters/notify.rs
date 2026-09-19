@@ -254,16 +254,18 @@ impl NotifyEventKind {
 
 /// Cap a string at [`MAX_TEXT_BYTES`] on a char boundary, marking the
 /// cut: input from either side of the boundary is bounded before
-/// anything is stored or published.
+/// anything is stored or published. The 3-byte ellipsis is budgeted,
+/// so the capped string never exceeds the cap.
 pub fn cap_string(input: &str) -> String {
+    const ELLIPSIS: &str = "\u{2026}";
     if input.len() <= MAX_TEXT_BYTES {
         return input.to_string();
     }
-    let mut cut = MAX_TEXT_BYTES - 1;
+    let mut cut = MAX_TEXT_BYTES - ELLIPSIS.len();
     while !input.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}\u{2026}", &input[..cut])
+    format!("{}{ELLIPSIS}", &input[..cut])
 }
 
 /// Notify's flat `key,label,key,label` list → capped action pairs.
@@ -688,21 +690,25 @@ fn rfc3339(moment: SystemTime) -> String {
 
 // ──────────────────────── the wired shared state ──────────────────────
 
-/// The core plus its publish channel and signal emitter, shared by the
-/// D-Bus interface and the Bus verb dispatch. Mutations happen under
-/// the core lock and enqueue their events before releasing it, so the
-/// publisher receives events in seq order.
+/// The core plus its publish channel and a handle to the signal
+/// emitter, shared by the D-Bus interface and the Bus verb dispatch.
+/// The emitter is deliberately WEAK: it owns the zbus connection, and
+/// the connection's object server owns the interface, which owns this
+/// shared state — a strong emitter here would be a cycle that keeps
+/// the connection (and its bus names) alive after the run ends. The
+/// server (owned by the run) holds the strong emitter; once it drops,
+/// a late emission finds nothing and logs.
 #[derive(Debug)]
 pub(crate) struct NotifyShared {
     core: Mutex<NotifyCore>,
     events: mpsc::Sender<NotifyEvent>,
-    emitter: Arc<SignalEmitter<'static>>,
+    emitter: Weak<SignalEmitter<'static>>,
 }
 
 impl NotifyShared {
     fn new(
         cap: usize,
-        emitter: Arc<SignalEmitter<'static>>,
+        emitter: Weak<SignalEmitter<'static>>,
         events: mpsc::Sender<NotifyEvent>,
     ) -> Self {
         Self {
@@ -831,13 +837,26 @@ impl NotifyShared {
     }
 
     async fn emit_closed(&self, id: u32, reason: CloseReason) {
-        if let Err(error) = self.emitter.notification_closed(id, reason.code()).await {
+        let Some(emitter) = self.emitter.upgrade() else {
+            eprintln!(
+                "cosmix-dbusd notify: NotificationClosed({id}, {}) dropped — adapter shutting down",
+                reason.code()
+            );
+            return;
+        };
+        if let Err(error) = emitter.notification_closed(id, reason.code()).await {
             eprintln!("cosmix-dbusd notify: NotificationClosed emission failed: {error}");
         }
     }
 
     async fn emit_invoked(&self, id: u32, action: &str) {
-        if let Err(error) = self.emitter.action_invoked(id, action).await {
+        let Some(emitter) = self.emitter.upgrade() else {
+            eprintln!(
+                "cosmix-dbusd notify: ActionInvoked({id}, {action}) dropped — adapter shutting down"
+            );
+            return;
+        };
+        if let Err(error) = emitter.action_invoked(id, action).await {
             eprintln!("cosmix-dbusd notify: ActionInvoked emission failed: {error}");
         }
     }
@@ -1451,12 +1470,15 @@ fn resolve_args(command: &IncomingCommand) -> Option<Value> {
 
 // ──────────────────── server assembly and the adapter ─────────────────
 
-/// A started notify server: the shared state and the publisher task.
-/// Dropping it (or ending the run) drops the zbus connection's
-/// interface and the name with it.
+/// A started notify server: the shared state, the strong signal
+/// emitter and the publisher task. Dropping it (or ending the run)
+/// drops the last strong reference to the emitter — and with it the
+/// zbus connection's last reason to stay alive — so the interface and
+/// the bus name go too.
 #[derive(Debug)]
 pub(crate) struct NotifyServer {
     pub shared: Arc<NotifyShared>,
+    emitter: Arc<SignalEmitter<'static>>,
     publisher: tokio::task::JoinHandle<Result<()>>,
 }
 
@@ -1477,7 +1499,11 @@ async fn start_server<P: EventPublisher + 'static>(
 ) -> Result<(NotifyServer, mpsc::Receiver<()>)> {
     let emitter = Arc::new(SignalEmitter::new(connection, DBUS_PATH)?);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
-    let shared = Arc::new(NotifyShared::new(MAX_LIVE, emitter, events_tx));
+    let shared = Arc::new(NotifyShared::new(
+        MAX_LIVE,
+        Arc::downgrade(&emitter),
+        events_tx,
+    ));
     connection
         .object_server()
         .at(
@@ -1514,6 +1540,7 @@ async fn start_server<P: EventPublisher + 'static>(
     Ok((
         NotifyServer {
             shared,
+            emitter,
             publisher: publisher_task,
         },
         fault_rx,
@@ -2018,9 +2045,16 @@ mod tests {
         assert_eq!(cap_string("short"), "short");
         let multibyte = "\u{e9}".repeat(MAX_TEXT_BYTES + 10);
         let capped = cap_string(&multibyte);
-        assert!(capped.len() <= MAX_TEXT_BYTES);
-        assert!(capped.ends_with('\u{2026}'));
-        assert!(capped.is_char_boundary(capped.len() - 1));
+        assert!(
+            capped.len() <= MAX_TEXT_BYTES,
+            "the cap holds: {}",
+            capped.len()
+        );
+        assert!(capped.ends_with('\u{2026}'), "the cut is marked");
+        // ASCII input lands exactly on the cap.
+        let ascii = cap_string(&"x".repeat(MAX_TEXT_BYTES + 4096));
+        assert_eq!(ascii.len(), MAX_TEXT_BYTES);
+        assert!(ascii.ends_with('\u{2026}'));
     }
 
     #[test]
@@ -2749,9 +2783,8 @@ mod tests {
             .expect("Notify still works — the failure is on the Bus side");
         let fault = tokio::time::timeout(Duration::from_secs(5), faults.recv())
             .await
-            .expect("the publisher faults the run promptly")
-            .expect("the fault channel stays open");
-        assert_eq!(fault, ());
+            .expect("the publisher faults the run promptly");
+        assert!(fault.is_some(), "the fault channel stays open");
 
         // Recovery: the next event publishes, and the diff is against
         // the PRE-FAILURE baseline — the outage window's changes reach
