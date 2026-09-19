@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use anyhow::{Result, anyhow};
 use cosmix_client::IncomingCommand;
@@ -880,6 +880,26 @@ pub(crate) struct NotifyShared {
 #[cfg(test)]
 static YIELD_BEFORE_EMIT: AtomicBool = AtomicBool::new(false);
 
+/// Test hook for the timer-arm ordering contract. While not
+/// `u64::MAX`, every creator of a record with a finite ttl parks
+/// BETWEEN its locked state change and its timer arm — on a tree that
+/// arms OUTSIDE the lock that is exactly the mis-arm window — until
+/// the gate equals the record's ttl in ms (± 500 ms) or is opened
+/// back to `u64::MAX`.
+#[cfg(test)]
+static ARM_PARK_RELEASE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[cfg(test)]
+async fn park_for_arm(ttl_ms: u64) {
+    loop {
+        let gate = ARM_PARK_RELEASE.load(Ordering::SeqCst);
+        if gate == u64::MAX || gate.abs_diff(ttl_ms) < 500 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 impl NotifyShared {
     fn new(
         cap: usize,
@@ -1003,6 +1023,15 @@ impl NotifyShared {
             shared.enqueue(&events);
             (id, events)
         };
+        // Test hook: park between the locked state change — which
+        // armed the timer under the lock, in mutation order — and the
+        // emits. On a tree that arms OUTSIDE the lock this is exactly
+        // the mis-arm window, and the park makes its interleaving
+        // deterministic. See [`ARM_PARK_RELEASE`].
+        #[cfg(test)]
+        if let Some(ttl) = resolve_expiry(args.timeout, args.urgency) {
+            park_for_arm(ttl.as_millis() as u64).await;
+        }
         for event in &events {
             if let NotifyEventKind::Closed { reason } = event.kind {
                 shared.emit_closed(event.id, reason).await;
@@ -4396,16 +4425,20 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_replaces_keep_an_expiring_record_expirable() {
-        // No D-Bus needed: this races NotifyShared::create itself.
-        // Concurrent replaces of one id alternate long (60 s) and short
-        // (1 s) deadlines; every task ENDS on the short form, so the
-        // record's final deadline is always 1 s. If arm/disarm could
-        // happen outside the record lock (an arm landing out of
-        // mutation order), the live record could be left with a 60 s
-        // timer — or none at all — and would still be live long past
-        // its 1 s deadline.
+        // No D-Bus needed: this drives NotifyShared::create itself,
+        // with the ARM_PARK hook making the mis-arm interleaving
+        // deterministic. Two concurrent replaces of one id — long
+        // (60 s) mutating first, then short (1 s) — each park between
+        // their locked state change and their timer arm; the short
+        // creator is released first and arms its 1 s timer, then the
+        // long creator is released. On a tree that arms OUTSIDE the
+        // lock the late 60 s arm lands over the live 1 s-deadline
+        // record and it can never expire; on this tree both arms
+        // happened under the lock, in mutation order (the second
+        // aborting the first), so the release order is irrelevant and
+        // the record expires on its 1 s deadline.
         let (events_tx, mut events_rx) = mpsc::channel(EVENT_CAPACITY);
         tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
         let shared = Arc::new(NotifyShared::new(
@@ -4414,36 +4447,71 @@ mod tests {
             Weak::new(),
             events_tx,
         ));
+        struct OpenGate;
+        impl Drop for OpenGate {
+            fn drop(&mut self) {
+                ARM_PARK_RELEASE.store(u64::MAX, Ordering::SeqCst);
+            }
+        }
+        let _open = OpenGate;
+        ARM_PARK_RELEASE.store(u64::MAX, Ordering::SeqCst);
         let mut start = create_args("start");
         start.timeout = ExpireTimeout::Millis(1000);
         let id = NotifyShared::create(&shared, start).await;
 
-        let mut hammer = Vec::new();
-        for round in 0..8 {
-            let shared = Arc::clone(&shared);
-            hammer.push(tokio::spawn(async move {
-                for index in 0..10_000 {
-                    let mut long = create_args(&format!("long {round}.{index}"));
-                    long.replaces_id = id;
-                    long.timeout = ExpireTimeout::Millis(60_000);
-                    NotifyShared::create(&shared, long).await;
-                    let mut short = create_args(&format!("short {round}.{index}"));
-                    short.replaces_id = id;
-                    short.timeout = ExpireTimeout::Millis(1000);
-                    NotifyShared::create(&shared, short).await;
-                    tokio::task::yield_now().await;
-                }
-            }));
-        }
-        for task in hammer {
-            task.await.expect("hammer task");
-        }
+        // Gate closed: every finite-ttl creator parks after its locked
+        // state change. Long replaces first (mutation order), then
+        // short — each confirmed landed before the next starts.
+        ARM_PARK_RELEASE.store(0, Ordering::SeqCst);
+        let mut long = create_args("long");
+        long.replaces_id = id;
+        long.timeout = ExpireTimeout::Millis(60_000);
+        let long_shared = Arc::clone(&shared);
+        let long_task = tokio::spawn(async move { NotifyShared::create(&long_shared, long).await });
+        poll_until(
+            Duration::from_secs(5),
+            || ttl_of(&shared, id).is_some_and(|ttl| ttl > Duration::from_secs(55)),
+            "the long replace to land",
+        )
+        .await;
+        let mut short = create_args("short");
+        short.replaces_id = id;
+        short.timeout = ExpireTimeout::Millis(1000);
+        let short_shared = Arc::clone(&shared);
+        let short_task =
+            tokio::spawn(async move { NotifyShared::create(&short_shared, short).await });
+        poll_until(
+            Duration::from_secs(5),
+            || ttl_of(&shared, id).is_some_and(|ttl| ttl < Duration::from_secs(5)),
+            "the short replace to land",
+        )
+        .await;
+
+        // Release the short creator first, then the long one: on a
+        // post-lock-arm tree the 60 s timer is armed OVER the 1 s
+        // record; on this tree the release order changes nothing.
+        ARM_PARK_RELEASE.store(1_000, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ARM_PARK_RELEASE.store(60_000, Ordering::SeqCst);
+        assert!(long_task.await.is_ok(), "the long creator finishes");
+        assert!(short_task.await.is_ok(), "the short creator finishes");
+
         poll_until(
             Duration::from_secs(6),
             || (shared.status().0 == 0).then_some(()),
-            "the record to expire on its 1 s deadline after the hammer",
+            "the record to expire on its 1 s deadline after the re-ordering",
         )
         .await;
+    }
+
+    /// The live record's remaining time, if it exists and is in the
+    /// future.
+    fn ttl_of(shared: &Arc<NotifyShared>, id: u32) -> Option<Duration> {
+        shared
+            .records()
+            .get(&id)
+            .and_then(|record| record.expires_mono)
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
