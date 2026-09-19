@@ -1,0 +1,116 @@
+-- Deterministic tests for lib/panel.mix: clock/date text, the calendar
+-- arithmetic, and scene-document emission. No Bus, no desktop effects.
+$p = require("../lib/panel.mix")
+
+fn check($condition, $message)
+  if not $condition then raise("PANEL_TEST", $message) end
+end
+
+-- ── calendar arithmetic ────────────────────────────────────────────────
+-- Known weekdays (ISO 1 = Monday): 2026-09-01 Tue, 2026-09-20 Sun,
+-- 2000-01-01 Sat, 2024-02-29 Thu, 1970-01-01 Thu.
+check($p.iso_weekday(2026, 9, 1) == 2, "2026-09-01 is a Tuesday")
+check($p.iso_weekday(2026, 9, 20) == 7, "2026-09-20 is a Sunday")
+check($p.iso_weekday(2000, 1, 1) == 6, "2000-01-01 is a Saturday")
+check($p.iso_weekday(2024, 2, 29) == 4, "2024-02-29 is a Thursday")
+check($p.iso_weekday(1970, 1, 1) == 4, "1970-01-01 is a Thursday")
+
+check($p.days_in_month(2024, 2) == 29, "2024 is a leap year")
+check($p.days_in_month(2100, 2) == 28, "2100 is not a leap year")
+check($p.days_in_month(2000, 2) == 29, "2000 is a leap year")
+check($p.days_in_month(2026, 9) == 30, "September has 30 days")
+check($p.days_in_month(2026, 12) == 31, "December has 31 days")
+
+$s = $p.shift_month(2026, 12, 1)
+check($s.year == 2027 and $s.month == 1, "December + 1 carries into January")
+$s = $p.shift_month(2026, 1, -1)
+check($s.year == 2025 and $s.month == 12, "January - 1 carries into December")
+$s = $p.shift_month(2026, 9, -21)
+check($s.year == 2024 and $s.month == 12, "21 months back from Sept 2026 is Dec 2024")
+
+-- September 2026: starts on Tuesday, so Monday 31 August leads the grid.
+$g = $p.month_grid(2026, 9, {year: 2026, month: 9, day: 20})
+check(length($g) == 6, "six weeks")
+check(length($g[0]) == 7, "seven days a week")
+check($g[0][0].day == 31 and not $g[0][0].in_month, "leading day is 31 Aug, greyed")
+check($g[0][1].day == 1 and $g[0][1].in_month, "1 Sept falls on Tuesday")
+check($g[2][6].day == 20 and $g[2][6].today, "20 Sept (Sun) is today")
+check($g[2][6].weekend and not $g[2][0].weekend, "Sunday is weekend, Monday is not")
+check($g[4][2].day == 30 and $g[4][3].day == 1 and not $g[4][3].in_month, "30 Sept then 1 Oct")
+$todays = 0
+for each $week in $g
+  for each $cell in $week
+    if $cell.today then $todays = $todays + 1 end
+  end
+end
+check($todays == 1, "exactly one today")
+$g2 = $p.month_grid(2026, 10, {year: 2026, month: 9, day: 20})
+for each $week in $g2
+  for each $cell in $week
+    check(not $cell.today, "no today marker in another month")
+  end
+end
+
+check($p.month_title(2026, 9) == "September 2026", "month title")
+
+-- ── clock and date text ────────────────────────────────────────────────
+-- date_parse reads UTC and date_format prints local time, so shift by the
+-- local offset at that instant: the test holds in any timezone.
+fn local_ts($text)
+  $u = date_parse($text, "%Y-%m-%d %H:%M:%S")
+  $z = date_format($u, "%z")
+  $sign = starts_with($z, "-") ? -1 : 1
+  $off = $sign * (to_number(slice($z, 1, 3)) * 3600 + to_number(slice($z, 3, 5)) * 60)
+  return $u - $off
+end
+$t = local_ts("2026-09-16 21:05:07")
+check($p.clock_text($t) == "09:05 pm", "12-hour zero-padded clock, got " .. $p.clock_text($t))
+check($p.date_text($t) == "Wed 16 Sept", "Sept, not Sep: got " .. $p.date_text($t))
+$t2 = local_ts("2026-06-01 00:30:00")
+check($p.clock_text($t2) == "12:30 am", "midnight hour reads 12 am, got " .. $p.clock_text($t2))
+check($p.date_text($t2) == "Mon 1 June", "June spelt out, no zero pad: got " .. $p.date_text($t2))
+
+$w = $p.seconds_to_next_minute($t)
+check($w > 52 and $w <= 53, "07 s past the minute waits ~53 s, got " .. to_string($w))
+$w = $p.seconds_to_next_minute(local_ts("2026-09-16 21:05:00"))
+check($w > 59 and $w <= 60, "on the boundary waits a full minute, got " .. to_string($w))
+$w = $p.seconds_to_next_minute(local_ts("2026-09-16 21:05:59") + 0.99)
+check($w >= 0.05 and $w < 0.1, "10 ms before the boundary sleeps just past it, got " .. to_string($w))
+
+-- ── document emission ─────────────────────────────────────────────────
+$doc = $p.document({scene: "1", name: "t", window: {kind: "edge", edge: "bottom", h: 52}}, [
+  ["root", {widget: "row", children: ["a"]}],
+  ["a", {widget: "text", text: "tick `quoted` \"x\""}]
+])
+check(starts_with($doc, "---\n"), "envelope opens")
+check(index_of($doc, "window: {") >= 0, "window header is JSON")
+$fence = after($doc, "```mix\n")
+$fence = before($fence, "\n```")
+$data = data_parse($fence)
+check($data.root.widget == "row", "fence parses as strict data")
+check(index_of($data.a.text, "`") < 0, "a backtick cannot close the fence")
+check(index_of($data.a.text, "\"x\"") >= 0, "quotes survive")
+
+-- Strict data reads "${" as interpolation with no escape: user text that
+-- carries one (a window title, a notification) must still parse.
+for each $hostile in ['title ${name} here', 'dangling ${', 'x ${a ?? b}', '~/Downloads/shot.png saved', '~', 'tab	and "quotes" ~ mid']
+  $parsed = data_parse($p.node_line("root", {widget: "text", text: $hostile}))
+  check(type($parsed.root.text) == "string", "hostile text parses: " .. $hostile)
+end
+
+check($p.short_title("abcdef", 4) == "abc…", "long titles are cut with an ellipsis")
+check($p.short_title("abc", 4) == "abc", "short titles are left alone")
+check($p.short_title(nil, 4) == "", "nil title is empty")
+
+$sorted = $p.sort_windows([{id: 9}, {id: 2}, {id: 5}])
+check($sorted[0].id == 2 and $sorted[2].id == 9, "windows sort by id")
+
+-- ── launcher categories ───────────────────────────────────────────────
+check($p.category_label("") == "All", "the empty category is All")
+check($p.category_label("AudioVideo") == "Media", "AudioVideo reads Media")
+check($p.category_label("Network") == "Internet", "Network reads Internet")
+check($p.category_from_node("cat_all") == "", "cat_all is every app")
+check($p.category_from_node("cat_audiovideo") == "AudioVideo", "chip id maps back to its category")
+check($p.category_from_node("cat_nonsense") == "", "unknown chip falls back to All")
+
+print("panel-test: ok")
