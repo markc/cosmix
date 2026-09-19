@@ -279,6 +279,71 @@ fn eval_expr_string_denies_loops_and_bus_constructs_in_if_bodies() {
     }
 }
 
+/// `export` runs unsafe set_var on the HOST process, and its runtime
+/// gate is permissive when no policy is installed — a legal call shape
+/// for this entry point — so the walk must deny it statically. The
+/// blocking builtins are denied BY NAME: `sleep` is table-classed Pure
+/// and the stdin readers are evaluator-special (outside the table, no
+/// capability gate at dispatch), so neither a deny-all policy nor the
+/// class walk stops them — only the name list can.
+#[test]
+fn eval_expr_string_denies_export_and_blocking_builtins() {
+    let cases: &[(&str, &str)] = &[
+        // export in an untaken if-expression branch: static denial means
+        // the construct rejects even though it would never run.
+        (
+            "(if $x then export PATH = \"/tmp/x\" else 0 end)",
+            "export statement",
+        ),
+        // sleep in an untaken ternary arm — the Pure class would allow it.
+        ("false ? 1 : sleep(0.01)", "sleep builtin"),
+        ("(if $x then sleep(1) else 0 end)", "sleep builtin"),
+        // The stdin readers: evaluator-special, ungated at dispatch.
+        ("false ? 1 : readline()", "readline builtin"),
+        ("read_stdin()", "read_stdin builtin"),
+        ("read_stdin_bytes()", "read_stdin_bytes builtin"),
+    ];
+    for (src, construct) in cases {
+        let err = match eval_pure(src, &[("x", Value::Bool(false))]) {
+            Err(e) => e,
+            Ok(_) => panic!("{src} must be denied before execution"),
+        };
+        assert!(err.contains(construct), "{src}: got: {err}");
+    }
+}
+
+/// The six evaluator-reserved Bus builtins (port_exists, bus_reconnect,
+/// noded_register, subscribe, unsubscribe, reply) are absent from the
+/// BUILTINS table, so class resolution failed OPEN to Pure and no
+/// allowlist stopped them — real broker subscriptions/registrations from
+/// a "Bus-denied" script the moment a handler was wired. Gated at their
+/// inline arms since 0.89.0, same class as the broker forms. Red on the
+/// pre-fix tree (port_exists surfaced "Bus not available", subscribe
+/// validated args first) — the capability denial now precedes all of
+/// that, and an uninstrumented host learns nothing.
+#[tokio::test]
+async fn pure_policy_denies_reserved_bus_builtins() {
+    for src in [
+        "port_exists(\"x\")\n",
+        "bus_reconnect()\n",
+        "noded_register(\"x\")\n",
+        "subscribe(\"topic\")\n",
+        "unsubscribe(\"topic\")\n",
+        "reply(\"ok\")\n",
+    ] {
+        let err = match run_with(src, |e| {
+            e.set_capability_policy(Rc::new(CategoryAllowList::new(&[])));
+        })
+        .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("{src} must be denied under a deny-all policy"),
+        };
+        assert!(err.contains("capability denied"), "{src}: got: {err}");
+        assert!(err.contains("Bus"), "{src}: got: {err}");
+    }
+}
+
 /// The pure shapes an embedding host actually evaluates — all allowed,
 /// under the deny-all policy.
 #[test]

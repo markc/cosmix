@@ -2872,6 +2872,18 @@ impl Default for EvalLimits {
 /// builds a deep tree, so this walk carries its own cap.
 pub const MAX_EXPR_DEPTH: usize = 256;
 
+/// Builtins denied BY NAME in expression mode even though their table
+/// class is `Pure` or they are evaluator-special (outside the table, so
+/// no capability gate is consulted at dispatch): each one blocks on
+/// wall-clock or host input, and the mode's fuel premise — cost bounded
+/// by the size caps, never by waiting — must hold statically.
+pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
+    "sleep",     // Pure-classed, pends on the tokio timer
+    "readline",  // evaluator-special: blocks on host input
+    "read_stdin",
+    "read_stdin_bytes",
+];
+
 /// Evaluate exactly one Mix expression with preset globals, an optional
 /// capability policy and eval limits — the expression evaluation mode
 /// embedding hosts (e.g. scene hosts) use for small pure expressions.
@@ -2886,8 +2898,14 @@ pub const MAX_EXPR_DEPTH: usize = 256;
 /// to a bareword `FunctionCall` at parse time and stays allowed), and
 /// any string interpolation part beyond literals and Mix variables
 /// (env-var expansion, in-string command substitution). The walk is
-/// depth-capped at [`MAX_EXPR_DEPTH`]. Ordinary builtins stay allowed
-/// and are gated by `policy` at dispatch, as usual.
+/// depth-capped at [`MAX_EXPR_DEPTH`]. Note the interpolation nuance: a
+/// `${NAME}` Mix-variable part stays ALLOWED and resolves scope-first
+/// with a process-env fallback (so `"${HOME}"` reads the host env — see
+/// the manual); the denial covers the `~`-form env part and command
+/// substitution. Builtins that block on wall-clock or host input
+/// (`sleep`, `readline`, `read_stdin*`) are denied by NAME regardless of
+/// class — see [`EXPR_MODE_DENIED_BUILTINS`]. Ordinary builtins stay
+/// allowed and are gated by `policy` at dispatch, as usual.
 ///
 /// Synchronous: the evaluator's async expression path is driven on a
 /// fresh current-thread tokio runtime inside this call (a pure-policy
@@ -2936,6 +2954,7 @@ pub fn eval_expr_string(
     if let Some(policy) = policy {
         eval.set_capability_policy(policy);
     }
+    let dur = limits.time_limit; // Copy out before set_limits takes ownership
     eval.set_limits(limits);
     for (name, value) in globals {
         eval.set_global(name, value.clone());
@@ -2948,7 +2967,29 @@ pub fn eval_expr_string(
             span: None,
             msg: format!("eval_expr_string: {}", e),
         })?;
-    rt.block_on(eval.eval_expr(expr))
+    // This entry point has no statement loop, so the evaluator's own
+    // per-statement deadline poll never runs here — arm the wall-clock
+    // budget at the future instead: on expiry the evaluation future is
+    // dropped at its next yield point and the caller gets a clean error.
+    // (A single non-yielding CPU-bound builtin can still overshoot until
+    // its next yield; the four blocking-by-nature builtins are statically
+    // denied above, which is the load-bearing bound.)
+    let fut = eval.eval_expr(expr);
+    rt.block_on(async move {
+        match dur {
+            Some(dur) => match tokio::time::timeout(dur, fut).await {
+                Ok(v) => v,
+                Err(_) => Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "eval_expr_string: time limit ({:?}) exceeded",
+                        dur
+                    ),
+                }),
+            },
+            None => fut.await,
+        }
+    })
 }
 
 /// Human name for a statement kind, for [`eval_expr_string`]'s
@@ -3062,7 +3103,18 @@ fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
                 expr_mode_deny_stmts(body, depth + 1)?;
             }
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall { name, args } => {
+            // Blocking-by-nature builtins are denied by name: their table
+            // class is Pure (sleep) or they sit outside the table entirely
+            // (readline/read_stdin*, no capability gate at dispatch), so
+            // neither the class walk nor a deny-all policy stops them —
+            // but a binding that blocks on wall-clock or host input breaks
+            // the mode's fuel premise.
+            if EXPR_MODE_DENIED_BUILTINS.contains(&name.as_str()) {
+                return Err(denied(&format!(
+                    "{name} builtin (blocks on wall-clock or host input)"
+                )));
+            }
             for arg in args {
                 expr_mode_deny_walk(arg, depth + 1)?;
             }
@@ -3138,6 +3190,10 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
         // both would hang or misfire inside a host's synchronous eval.
         StmtKind::Select { .. } => return Err(denied("select statement")),
         StmtKind::Address { .. } => return Err(denied("address block")),
+        // `export` runs `unsafe set_var` on the HOST process; its runtime
+        // gate is permissive when no policy is installed (a legal call
+        // shape for this entry point), so the static walk must deny it.
+        StmtKind::Export { .. } => return Err(denied("export statement")),
 
         StmtKind::Assignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
         StmtKind::FieldAssignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
@@ -3198,7 +3254,6 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
                 expr_mode_deny_stmts(body, depth + 1)?;
             }
         }
-        StmtKind::Export { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
         StmtKind::Alias { name, command } => {
             if let Some(name) = name {
                 expr_mode_deny_walk(name, depth + 1)?;
@@ -11470,6 +11525,14 @@ impl Evaluator {
 
                     // port_exists() — delegates to Bus handler
                     if name == "port_exists" {
+                        // Evaluator-reserved Bus builtin (0.89.0): absent
+                        // from the BUILTINS table, so classification fails
+                        // OPEN to Pure and no allowlist stops it — gate the
+                        // class here, before any handler consult.
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "port_exists",
+                        )?;
                         // SPEC 18 Phase 2 WS3-C.5 — clone-out: scope the
                         // `Ref` guard so it is dropped before `.await`;
                         // the `Rc<dyn BusHandler>` keeps the handler
@@ -11507,6 +11570,13 @@ impl Evaluator {
                     // Ok(()), subscribe/reply's is Err — so this is not
                     // an inconsistency. Idempotent; always returns true.
                     if name == "bus_reconnect" {
+                        // Evaluator-reserved Bus builtin — see the
+                        // port_exists gate above for why the class gate
+                        // lives here (0.89.0).
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "bus_reconnect",
+                        )?;
                         // SPEC 18 Phase 2 WS3-C.5 — clone-out: only call
                         // when wired (idempotent no-op otherwise), and
                         // release the globals borrow before `.await`.
@@ -11526,6 +11596,12 @@ impl Evaluator {
 
                     // noded_register(name) — register as a named service on the broker
                     if name == "noded_register" {
+                        // Evaluator-reserved Bus builtin — see the
+                        // port_exists gate above (0.89.0).
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "noded_register",
+                        )?;
                         // SPEC 18 Phase 2 WS3-C.5 — clone-out (see port_exists above).
                         let handler =
                             { self.globals.borrow().bus_handler.clone() }.ok_or_else(|| {
@@ -11578,6 +11654,14 @@ impl Evaluator {
                     // missing/empty name is a hard error — a silently
                     // dropped subscribe is the partial-truth bug.
                     if name == "subscribe" || name == "unsubscribe" {
+                        // Evaluator-reserved Bus builtins — see the
+                        // port_exists gate above (0.89.0). Gated BEFORE
+                        // the argument validation below so a denied
+                        // caller learns nothing about topic state.
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            name,
+                        )?;
                         // Validate the argument before consulting the handler:
                         // an empty topic is a caller bug regardless of whether
                         // Bus is wired, and validating first keeps the error
@@ -11628,6 +11712,12 @@ impl Evaluator {
                     // regardless of dispatch state or Bus wiring (same
                     // discipline as subscribe()/unsubscribe()).
                     if name == "reply" {
+                        // Evaluator-reserved Bus builtin — see the
+                        // port_exists gate above (0.89.0).
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "reply",
+                        )?;
                         let (rc, body) = match eval_args.len() {
                             1 => (0u8, eval_args[0].to_mix_string()),
                             2 => {

@@ -68,6 +68,8 @@ rejects, because the walk never evaluates anything):
 | `on` / `source` / `include` / `… | cmd` nested in an if-expression | named per construct |
 | `for` / `for … in` / `while` / `loop` nested in an if-expression branch | `for loop` / `for-each loop` / `while loop` / `loop statement` |
 | `select … end` / `address "…" … end` nested in an if-expression branch | `select statement` / `address block` |
+| `export` (mutates the HOST process environment; its runtime gate is permissive with no policy installed) | `export statement` |
+| `sleep`, `readline`, `read_stdin`, `read_stdin_bytes` — by NAME, even though `sleep` is table-classed Pure and the stdin readers are evaluator-special (no capability gate at dispatch); each blocks on wall-clock or host input | `<name> builtin (blocks on wall-clock or host input)` |
 | string interpolation beyond literals and Mix variables | `environment-variable interpolation in string`, `command substitution in string` |
 
 What stays **allowed**: literals, variables, arithmetic and comparison,
@@ -113,14 +115,23 @@ concat is a clean `string length N exceeds limit M` error), and
 one expression without lambdas). **Loops cannot be expressed at all**:
 the loop statements are denied everywhere the walk reaches, including
 inside if-expression branch bodies — the one place a `for`/`while` could
-otherwise hide — so evaluation cost is bounded by the size caps, never
-by iteration count. The **time limit is a backstop**: it
-is checked at the per-statement poll, so it cannot interrupt a single
-blocking builtin mid-syscall — see [capabilities &
-embedding](capabilities.md) for the same caveat in full programs. A
-pure-policy expression has no handler to pend on (the Db/Jmap/Bus seam
-builtins raise "not available" when no handler is registered), so the
-size caps are the ones that actually bind.
+otherwise hide — and neither can the constructs that *wait*: `sleep`,
+`readline` and the stdin readers are denied by name (their table class
+would not stop them — `sleep` is `Pure`), `select`/`address`/`send`/
+`emit`/`sh`/`export` are denied by construct, and a fresh expression
+evaluator has no Bus/Db/Jmap handler to pend on (those seam builtins
+raise "not available"). Evaluation cost is therefore bounded by the size
+caps, never by iteration count or by waiting.
+
+The **time limit** is armed at this entry point itself — there is no
+statement loop here to carry the evaluator's usual per-statement poll,
+so the budget is enforced by wrapping the evaluation future: on expiry
+the future is dropped at its next yield and the caller gets a clean
+`time limit exceeded` error. A single non-yielding CPU-bound builtin can
+still overshoot until its next yield point; with the blocking four
+denied statically, that residual is a slow computation, not a hang. See
+[capabilities & embedding](capabilities.md) for the same caveat in full
+programs.
 
 `eval_expr_string` is **synchronous**: it drives the evaluator's async
 path on a fresh current-thread runtime inside the call. Don't call it

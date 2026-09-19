@@ -498,6 +498,8 @@ rejects, because the walk never evaluates anything):</p>
 <tr><td><code>on</code> / <code>source</code> / <code>include</code> / `…</td><td>cmd` nested in an if-expression</td></tr>
 <tr><td><code>for</code> / <code>for … in</code> / <code>while</code> / <code>loop</code> nested in an if-expression branch</td><td><code>for loop</code> / <code>for-each loop</code> / <code>while loop</code> / <code>loop statement</code></td></tr>
 <tr><td><code>select … end</code> / <code>address "…" … end</code> nested in an if-expression branch</td><td><code>select statement</code> / <code>address block</code></td></tr>
+<tr><td><code>export</code> (mutates the HOST process environment; its runtime gate is permissive with no policy installed)</td><td><code>export statement</code></td></tr>
+<tr><td><code>sleep</code>, <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code> — by NAME, even though <code>sleep</code> is table-classed Pure and the stdin readers are evaluator-special (no capability gate at dispatch); each blocks on wall-clock or host input</td><td><code>&lt;name&gt; builtin (blocks on wall-clock or host input)</code></td></tr>
 <tr><td>string interpolation beyond literals and Mix variables</td><td><code>environment-variable interpolation in string</code>, <code>command substitution in string</code></td></tr>
 </tbody></table>
 <p>What stays <strong>allowed</strong>: literals, variables, arithmetic and comparison,
@@ -536,14 +538,22 @@ concat is a clean <code>string length N exceeds limit M</code> error), and
 one expression without lambdas). <strong>Loops cannot be expressed at all</strong>:
 the loop statements are denied everywhere the walk reaches, including
 inside if-expression branch bodies — the one place a <code>for</code>/<code>while</code> could
-otherwise hide — so evaluation cost is bounded by the size caps, never
-by iteration count. The <strong>time limit is a backstop</strong>: it
-is checked at the per-statement poll, so it cannot interrupt a single
-blocking builtin mid-syscall — see <a href="/mix/capabilities">capabilities &amp;
-embedding</a> for the same caveat in full programs. A
-pure-policy expression has no handler to pend on (the Db/Jmap/Bus seam
-builtins raise "not available" when no handler is registered), so the
-size caps are the ones that actually bind.</p>
+otherwise hide — and neither can the constructs that <em>wait</em>: <code>sleep</code>,
+<code>readline</code> and the stdin readers are denied by name (their table class
+would not stop them — <code>sleep</code> is <code>Pure</code>), <code>select</code>/<code>address</code>/<code>send</code>/
+<code>emit</code>/<code>sh</code>/<code>export</code> are denied by construct, and a fresh expression
+evaluator has no Bus/Db/Jmap handler to pend on (those seam builtins
+raise "not available"). Evaluation cost is therefore bounded by the size
+caps, never by iteration count or by waiting.</p>
+<p>The <strong>time limit</strong> is armed at this entry point itself — there is no
+statement loop here to carry the evaluator's usual per-statement poll,
+so the budget is enforced by wrapping the evaluation future: on expiry
+the future is dropped at its next yield and the caller gets a clean
+<code>time limit exceeded</code> error. A single non-yielding CPU-bound builtin can
+still overshoot until its next yield point; with the blocking four
+denied statically, that residual is a slow computation, not a hang. See
+<a href="/mix/capabilities">capabilities &amp; embedding</a> for the same caveat in full
+programs.</p>
 <p><code>eval_expr_string</code> is <strong>synchronous</strong>: it drives the evaluator's async
 path on a fresh current-thread runtime inside the call. Don't call it
 from within an async execution context — hop to a blocking task first.</p>
