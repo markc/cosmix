@@ -1471,7 +1471,7 @@ impl Drop for NotifyServer {
 /// `DoNotQueue` alone, so a name someone else owns fails here with a
 /// clear error and the supervisor backs off — a human uses
 /// `dbusd.adapter.disable`/`enable` to hand it over.
-async fn start_server<P: EventPublisher>(
+async fn start_server<P: EventPublisher + 'static>(
     connection: &zbus::Connection,
     publisher: Arc<P>,
 ) -> Result<(NotifyServer, mpsc::Receiver<()>)> {
@@ -1547,7 +1547,7 @@ impl Adapter for NotifyAdapter {
                     .await
                     .map_err(|error| anyhow!("notify: Bus connection: {error:#}"))?,
             );
-            let (server, mut fault_rx) = start_server(&session, Arc::clone(&bus)).await?;
+            let (mut server, mut fault_rx) = start_server(&session, Arc::clone(&bus)).await?;
             ctx.signal_ready();
             let mut shutdown = ctx.shutdown().clone();
             let mut incoming = bus
