@@ -4470,7 +4470,7 @@ mod tests {
         let long_task = tokio::spawn(async move { NotifyShared::create(&long_shared, long).await });
         poll_until(
             Duration::from_secs(5),
-            || ttl_of(&shared, id).is_some_and(|ttl| ttl > Duration::from_secs(55)),
+            || (ttl_of(&shared, id).is_some_and(|ttl| ttl > Duration::from_secs(55))).then_some(()),
             "the long replace to land",
         )
         .await;
@@ -4482,7 +4482,7 @@ mod tests {
             tokio::spawn(async move { NotifyShared::create(&short_shared, short).await });
         poll_until(
             Duration::from_secs(5),
-            || ttl_of(&shared, id).is_some_and(|ttl| ttl < Duration::from_secs(5)),
+            || (ttl_of(&shared, id).is_some_and(|ttl| ttl < Duration::from_secs(5))).then_some(()),
             "the short replace to land",
         )
         .await;
