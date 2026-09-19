@@ -389,11 +389,6 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
     icons::begin_revision(world);
     let ops = cosmix_scene::diff(&mounted.tree, tree);
     let templates = template_ids(tree);
-    // Detach scene-owned roots before removals; a retained descendant must not
-    // be recursively despawned with a removed parent.
-    for view in mounted.nodes.values() {
-        world.entity_mut(view.root).remove::<ChildOf>();
-    }
     let remove: Vec<_> = mounted
         .nodes
         .keys()
@@ -410,7 +405,31 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
                 })
         })
         .cloned()
-        .collect();
+        .collect::<Vec<_>>();
+    // The hierarchy is only rebuilt when it can have changed: a node removed
+    // or added, or any node's children list edited. Detaching and re-parenting
+    // every scene root on an otherwise unchanged revision makes Bevy re-lay
+    // out every text, blanking all labels for a few frames -- on a panel that
+    // re-renders each minute that is a visible flicker of the whole bar.
+    let structural = !remove.is_empty()
+        || tree
+            .nodes
+            .keys()
+            .any(|id| !templates.contains(id) && !mounted.nodes.contains_key(id))
+        || tree.nodes.iter().any(|(id, node)| {
+            mounted
+                .tree
+                .nodes
+                .get(id)
+                .is_none_or(|old| children(old).ne(children(node)))
+        });
+    if structural {
+        // Detach scene-owned roots before removals; a retained descendant must
+        // not be recursively despawned with a removed parent.
+        for view in mounted.nodes.values() {
+            world.entity_mut(view.root).remove::<ChildOf>();
+        }
+    }
     for id in remove {
         if let Some(view) = mounted.nodes.remove(&id) {
             world.despawn(view.root);
@@ -459,16 +478,18 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
         }
     }
     // Reparent last, in authored order. Internal CTK children are untouched.
-    for (id, node) in &tree.nodes {
-        if let Some(parent) = mounted.nodes.get(id) {
-            let entities: Vec<_> = children(node)
-                .filter_map(|id| mounted.nodes.get(id).map(|v| v.root))
-                .collect();
-            world.entity_mut(parent.root).add_children(&entities);
+    if structural {
+        for (id, node) in &tree.nodes {
+            if let Some(parent) = mounted.nodes.get(id) {
+                let entities: Vec<_> = children(node)
+                    .filter_map(|id| mounted.nodes.get(id).map(|v| v.root))
+                    .collect();
+                world.entity_mut(parent.root).add_children(&entities);
+            }
         }
-    }
-    if let Some(root) = mounted.nodes.get("root") {
-        world.entity_mut(mounted.page).add_child(root.root);
+        if let Some(root) = mounted.nodes.get("root") {
+            world.entity_mut(mounted.page).add_child(root.root);
+        }
     }
     mounted.tree = tree.clone();
 }
@@ -1207,13 +1228,22 @@ mod tests {
         apply(&mut world, &mut mounted, &first);
         let label = mounted.nodes["label"].label.unwrap();
         let clock = mounted.nodes["clock"].label.unwrap();
+        let label_root = mounted.nodes["label"].root;
         let label_tick = world.entity(label).get_ref::<Text>().unwrap().last_changed();
+        let parent_tick = world.entity(label_root).get_ref::<ChildOf>().unwrap().last_changed();
         world.increment_change_tick();
         apply(&mut world, &mut mounted, &second);
         assert_eq!(
             world.entity(label).get_ref::<Text>().unwrap().last_changed(),
             label_tick,
             "the unchanged label must not be re-inserted"
+        );
+        // No node added, removed or re-childed: the hierarchy is left alone
+        // (detach + re-parent re-lays out every text for a few frames).
+        assert_eq!(
+            world.entity(label_root).get_ref::<ChildOf>().unwrap().last_changed(),
+            parent_tick,
+            "a non-structural revision must not re-parent scene roots"
         );
         assert_eq!(world.get::<Text>(clock).unwrap().0, "09:06 pm");
     }
