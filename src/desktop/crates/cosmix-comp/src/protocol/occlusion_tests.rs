@@ -126,6 +126,13 @@ fn occlusion_wire_translucency_and_one_pixel_strip_do_not_withhold() {
         let callback = request(&mut h, victim.protocol_id());
         align(&mut h, &victim, &cover);
         h.server.state.backend.change_host_output_scale(2.5);
+        certify(&mut h, true);
+        h.frame(Vec::new());
+        assert_eq!(
+            done(&mut h, callback),
+            0,
+            "opaque baseline must withhold before testing exposure"
+        );
         if opaque {
             h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 0.4;
         }
@@ -164,6 +171,8 @@ fn occlusion_wire_stale_certificate_cannot_restore_withholding() {
     let callback = request(&mut h, victim.protocol_id());
     align(&mut h, &victim, &cover);
     let stale = certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
     h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
     h.server.state.refresh_occlusion();
     h.server.state.occlusion.bridge.0.lock().unwrap().coverage = stale;
@@ -174,9 +183,12 @@ fn occlusion_wire_stale_certificate_cannot_restore_withholding() {
 #[test]
 fn occlusion_wire_exposed_popup_keeps_parent_callback_running() {
     let (mut h, victim, cover) = fixture();
-    let (popup, _) = map_test_popup(&mut h, None);
     let callback = request(&mut h, victim.protocol_id());
     align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
+    let (popup, _) = map_test_popup(&mut h, None);
     h.server.state.surfaces.get_mut(&popup).unwrap().layout.z = SurfaceStackKey::normal(2000);
     certify(&mut h, true);
     h.frame(Vec::new());
