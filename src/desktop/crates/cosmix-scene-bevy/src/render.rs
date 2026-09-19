@@ -389,11 +389,6 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
     icons::begin_revision(world);
     let ops = cosmix_scene::diff(&mounted.tree, tree);
     let templates = template_ids(tree);
-    // Detach scene-owned roots before removals; a retained descendant must not
-    // be recursively despawned with a removed parent.
-    for view in mounted.nodes.values() {
-        world.entity_mut(view.root).remove::<ChildOf>();
-    }
     let remove: Vec<_> = mounted
         .nodes
         .keys()
@@ -410,7 +405,31 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
                 })
         })
         .cloned()
-        .collect();
+        .collect::<Vec<_>>();
+    // The hierarchy is only rebuilt when it can have changed: a node removed
+    // or added, or any node's children list edited. Detaching and re-parenting
+    // every scene root on an otherwise unchanged revision makes Bevy re-lay
+    // out every text, blanking all labels for a few frames -- on a panel that
+    // re-renders each minute that is a visible flicker of the whole bar.
+    let structural = !remove.is_empty()
+        || tree
+            .nodes
+            .keys()
+            .any(|id| !templates.contains(id) && !mounted.nodes.contains_key(id))
+        || tree.nodes.iter().any(|(id, node)| {
+            mounted
+                .tree
+                .nodes
+                .get(id)
+                .is_none_or(|old| children(old).ne(children(node)))
+        });
+    if structural {
+        // Detach scene-owned roots before removals; a retained descendant must
+        // not be recursively despawned with a removed parent.
+        for view in mounted.nodes.values() {
+            world.entity_mut(view.root).remove::<ChildOf>();
+        }
+    }
     for id in remove {
         if let Some(view) = mounted.nodes.remove(&id) {
             world.despawn(view.root);
@@ -421,12 +440,26 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
             continue;
         }
         let fresh = !mounted.nodes.contains_key(id);
+        // A fill text's cross-axis stretch depends on its PARENT column, so a
+        // changed parent re-updates it; an unchanged text is otherwise left
+        // alone -- re-inserting its Text components forces a re-layout that
+        // blanks the label for a frame on every revision (a visible flicker
+        // on a panel that re-renders each minute). Images still re-update on
+        // every apply: that is how a missing icon file is retried on the next
+        // revision, and a cache hit re-inserts the same handle (no flicker).
+        let text_parent_changed = node.family == "text"
+            && flag(node, "fill")
+            && tree.nodes.iter().any(|(parent_id, parent)| {
+                children(parent).any(|child| child == id)
+                    && mounted.tree.nodes.get(parent_id) != Some(parent)
+            });
         let view = mounted
             .nodes
             .entry(id.clone())
             .or_insert_with(|| spawn(world, tree, id, node));
         let changed = fresh
-            || matches!(node.family.as_str(), "text" | "image")
+            || node.family == "image"
+            || text_parent_changed
             || mounted.tree.nodes.get(id) != Some(node)
             || ops.iter().any(|op| matches!(op, Op::SetScene { .. }));
         if changed {
@@ -445,16 +478,18 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
         }
     }
     // Reparent last, in authored order. Internal CTK children are untouched.
-    for (id, node) in &tree.nodes {
-        if let Some(parent) = mounted.nodes.get(id) {
-            let entities: Vec<_> = children(node)
-                .filter_map(|id| mounted.nodes.get(id).map(|v| v.root))
-                .collect();
-            world.entity_mut(parent.root).add_children(&entities);
+    if structural {
+        for (id, node) in &tree.nodes {
+            if let Some(parent) = mounted.nodes.get(id) {
+                let entities: Vec<_> = children(node)
+                    .filter_map(|id| mounted.nodes.get(id).map(|v| v.root))
+                    .collect();
+                world.entity_mut(parent.root).add_children(&entities);
+            }
         }
-    }
-    if let Some(root) = mounted.nodes.get("root") {
-        world.entity_mut(mounted.page).add_child(root.root);
+        if let Some(root) = mounted.nodes.get("root") {
+            world.entity_mut(mounted.page).add_child(root.root);
+        }
     }
     mounted.tree = tree.clone();
 }
@@ -1173,6 +1208,44 @@ mod tests {
             }
         }
         assert!(checked > 30, "only {checked} clearable ports tested");
+    }
+
+    #[test]
+    fn unchanged_text_is_not_reinserted_when_a_sibling_changes() {
+        // A panel re-renders every minute (the clock) and on every window
+        // event; re-inserting unchanged Text components re-lays them out and
+        // blanks every label for a frame. Only the text that changed may be
+        // touched.
+        let doc = |clock: &str| {
+            format!(
+                "---\nscene: 1\nname: panel\ncitizen: test\n---\n```mix\nroot: {{widget: \"row\", align: \"center\", children: [\"label\", \"clock\"]}}\nlabel: {{widget: \"text\", text: \"foot\"}}\nclock: {{widget: \"text\", text: \"{clock}\"}}\n```\n"
+            )
+        };
+        let first = cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:05 pm")).unwrap()).unwrap();
+        let second = cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:06 pm")).unwrap()).unwrap();
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &first);
+        apply(&mut world, &mut mounted, &first);
+        let label = mounted.nodes["label"].label.unwrap();
+        let clock = mounted.nodes["clock"].label.unwrap();
+        let label_root = mounted.nodes["label"].root;
+        let label_tick = world.entity(label).get_ref::<Text>().unwrap().last_changed();
+        let parent_tick = world.entity(label_root).get_ref::<ChildOf>().unwrap().last_changed();
+        world.increment_change_tick();
+        apply(&mut world, &mut mounted, &second);
+        assert_eq!(
+            world.entity(label).get_ref::<Text>().unwrap().last_changed(),
+            label_tick,
+            "the unchanged label must not be re-inserted"
+        );
+        // No node added, removed or re-childed: the hierarchy is left alone
+        // (detach + re-parent re-lays out every text for a few frames).
+        assert_eq!(
+            world.entity(label_root).get_ref::<ChildOf>().unwrap().last_changed(),
+            parent_tick,
+            "a non-structural revision must not re-parent scene roots"
+        );
+        assert_eq!(world.get::<Text>(clock).unwrap().0, "09:06 pm");
     }
 
     #[test]
