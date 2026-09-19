@@ -69,7 +69,7 @@ rejects, because the walk never evaluates anything):
 | `for` / `for … in` / `while` / `loop` nested in an if-expression branch | `for loop` / `for-each loop` / `while loop` / `loop statement` |
 | `select … end` / `address "…" … end` nested in an if-expression branch | `select statement` / `address block` |
 | `export` (mutates the HOST process environment; its runtime gate is permissive with no policy installed) | `export statement` |
-| `sleep`, `readline`, `read_stdin`, `read_stdin_bytes` — by NAME, even though `sleep` is table-classed Pure and the stdin readers are evaluator-special (no capability gate at dispatch); each blocks on wall-clock or host input | `<name> builtin (blocks on wall-clock or host input)` |
+| `sleep`, `readline`, `read_stdin`, `read_stdin_bytes` — by NAME: `sleep` is table-classed Pure (no installed policy stops it) and the stdin readers are Env-classed but still block under `policy: None`; the static deny makes the no-waiting premise unconditional, whatever policy the host chose | `<name> builtin (blocks on wall-clock or host input)` |
 | string interpolation beyond literals and Mix variables | `environment-variable interpolation in string`, `command substitution in string` |
 
 What stays **allowed**: literals, variables, arithmetic and comparison,
@@ -116,12 +116,16 @@ one expression without lambdas). **Loops cannot be expressed at all**:
 the loop statements are denied everywhere the walk reaches, including
 inside if-expression branch bodies — the one place a `for`/`while` could
 otherwise hide — and neither can the constructs that *wait*: `sleep`,
-`readline` and the stdin readers are denied by name (their table class
-would not stop them — `sleep` is `Pure`), `select`/`address`/`send`/
-`emit`/`sh`/`export` are denied by construct, and a fresh expression
-evaluator has no Bus/Db/Jmap handler to pend on (those seam builtins
-raise "not available"). Evaluation cost is therefore bounded by the size
-caps, never by iteration count or by waiting.
+`readline` and the stdin readers are denied by name (sleep is `Pure`, so
+no installed policy stops it; the readers are `Env`, stoppable by a
+policy but not by `policy: None` — the static deny covers both),
+`select`/`address`/`send`/`emit`/`sh`/`export` are denied by construct,
+and a fresh expression evaluator has no Bus/Db/Jmap handler to pend on
+(those seam builtins raise "not available"). Evaluation cost is bounded
+by the size caps, never by iteration count or by *unbounded* waiting
+(`flock`'s argument-bounded wait remains reachable only when the host
+installs a permissive policy — its class is `FsWrite`, denied under
+`deny_all()`).
 
 The **time limit** is armed at this entry point itself — there is no
 statement loop here to carry the evaluator's usual per-statement poll,

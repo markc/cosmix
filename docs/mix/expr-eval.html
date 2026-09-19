@@ -499,7 +499,7 @@ rejects, because the walk never evaluates anything):</p>
 <tr><td><code>for</code> / <code>for … in</code> / <code>while</code> / <code>loop</code> nested in an if-expression branch</td><td><code>for loop</code> / <code>for-each loop</code> / <code>while loop</code> / <code>loop statement</code></td></tr>
 <tr><td><code>select … end</code> / <code>address "…" … end</code> nested in an if-expression branch</td><td><code>select statement</code> / <code>address block</code></td></tr>
 <tr><td><code>export</code> (mutates the HOST process environment; its runtime gate is permissive with no policy installed)</td><td><code>export statement</code></td></tr>
-<tr><td><code>sleep</code>, <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code> — by NAME, even though <code>sleep</code> is table-classed Pure and the stdin readers are evaluator-special (no capability gate at dispatch); each blocks on wall-clock or host input</td><td><code>&lt;name&gt; builtin (blocks on wall-clock or host input)</code></td></tr>
+<tr><td><code>sleep</code>, <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code> — by NAME: <code>sleep</code> is table-classed Pure (no installed policy stops it) and the stdin readers are Env-classed but still block under <code>policy: None</code>; the static deny makes the no-waiting premise unconditional, whatever policy the host chose</td><td><code>&lt;name&gt; builtin (blocks on wall-clock or host input)</code></td></tr>
 <tr><td>string interpolation beyond literals and Mix variables</td><td><code>environment-variable interpolation in string</code>, <code>command substitution in string</code></td></tr>
 </tbody></table>
 <p>What stays <strong>allowed</strong>: literals, variables, arithmetic and comparison,
@@ -539,12 +539,16 @@ one expression without lambdas). <strong>Loops cannot be expressed at all</stron
 the loop statements are denied everywhere the walk reaches, including
 inside if-expression branch bodies — the one place a <code>for</code>/<code>while</code> could
 otherwise hide — and neither can the constructs that <em>wait</em>: <code>sleep</code>,
-<code>readline</code> and the stdin readers are denied by name (their table class
-would not stop them — <code>sleep</code> is <code>Pure</code>), <code>select</code>/<code>address</code>/<code>send</code>/
-<code>emit</code>/<code>sh</code>/<code>export</code> are denied by construct, and a fresh expression
-evaluator has no Bus/Db/Jmap handler to pend on (those seam builtins
-raise "not available"). Evaluation cost is therefore bounded by the size
-caps, never by iteration count or by waiting.</p>
+<code>readline</code> and the stdin readers are denied by name (sleep is <code>Pure</code>, so
+no installed policy stops it; the readers are <code>Env</code>, stoppable by a
+policy but not by <code>policy: None</code> — the static deny covers both),
+<code>select</code>/<code>address</code>/<code>send</code>/<code>emit</code>/<code>sh</code>/<code>export</code> are denied by construct,
+and a fresh expression evaluator has no Bus/Db/Jmap handler to pend on
+(those seam builtins raise "not available"). Evaluation cost is bounded
+by the size caps, never by iteration count or by <em>unbounded</em> waiting
+(<code>flock</code>'s argument-bounded wait remains reachable only when the host
+installs a permissive policy — its class is <code>FsWrite</code>, denied under
+<code>deny_all()</code>).</p>
 <p>The <strong>time limit</strong> is armed at this entry point itself — there is no
 statement loop here to carry the evaluator's usual per-statement poll,
 so the budget is enforced by wrapping the evaluation future: on expiry

@@ -2872,14 +2872,17 @@ impl Default for EvalLimits {
 /// builds a deep tree, so this walk carries its own cap.
 pub const MAX_EXPR_DEPTH: usize = 256;
 
-/// Builtins denied BY NAME in expression mode even though their table
-/// class is `Pure` or they are evaluator-special (outside the table, so
-/// no capability gate is consulted at dispatch): each one blocks on
+/// Builtins denied BY NAME in expression mode: each blocks on
 /// wall-clock or host input, and the mode's fuel premise — cost bounded
-/// by the size caps, never by waiting — must hold statically.
+/// by the size caps, never by waiting — must hold statically, whatever
+/// policy the host installed (including none). `sleep` is table-classed
+/// `Pure`, so no installed policy stops it; the stdin readers are
+/// `Env`-classed (an installed allowlist can stop them) but block on
+/// host input whenever the host passes `policy: None` — a legal call
+/// shape — so the static deny is what makes the premise unconditional.
 pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
     "sleep",     // Pure-classed, pends on the tokio timer
-    "readline",  // evaluator-special: blocks on host input
+    "readline",  // Env-classed but blocking on host input
     "read_stdin",
     "read_stdin_bytes",
 ];
@@ -3104,12 +3107,12 @@ fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
             }
         }
         Expr::FunctionCall { name, args } => {
-            // Blocking-by-nature builtins are denied by name: their table
-            // class is Pure (sleep) or they sit outside the table entirely
-            // (readline/read_stdin*, no capability gate at dispatch), so
-            // neither the class walk nor a deny-all policy stops them —
-            // but a binding that blocks on wall-clock or host input breaks
-            // the mode's fuel premise.
+            // Blocking-by-nature builtins are denied by name so the fuel
+            // premise holds whatever policy the host installed: sleep is
+            // Pure-classed (no installed policy stops it), the stdin
+            // readers are Env-classed (stop under an allowlist without
+            // Env) but block whenever the host passes policy:None — the
+            // static deny is the unconditional bound.
             if EXPR_MODE_DENIED_BUILTINS.contains(&name.as_str()) {
                 return Err(denied(&format!(
                     "{name} builtin (blocks on wall-clock or host input)"

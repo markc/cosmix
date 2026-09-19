@@ -282,10 +282,11 @@ fn eval_expr_string_denies_loops_and_bus_constructs_in_if_bodies() {
 /// `export` runs unsafe set_var on the HOST process, and its runtime
 /// gate is permissive when no policy is installed — a legal call shape
 /// for this entry point — so the walk must deny it statically. The
-/// blocking builtins are denied BY NAME: `sleep` is table-classed Pure
-/// and the stdin readers are evaluator-special (outside the table, no
-/// capability gate at dispatch), so neither a deny-all policy nor the
-/// class walk stops them — only the name list can.
+/// blocking builtins are denied BY NAME so the fuel premise holds
+/// whatever policy the host chose: `sleep` is table-classed Pure (no
+/// installed policy stops it), and the stdin readers are Env-classed
+/// (an allowlist without Env stops them) but still block under
+/// policy:None — the name list is the unconditional bound.
 #[test]
 fn eval_expr_string_denies_export_and_blocking_builtins() {
     let cases: &[(&str, &str)] = &[
