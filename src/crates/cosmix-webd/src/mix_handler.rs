@@ -772,7 +772,10 @@ async fn run_with_limits(
             // Pure + FsRead (+ Db when wants_db), minus `sleep` (see
             // HandlerCapabilityPolicy). Shell syntax (sh/$()/pipe) is
             // Process-gated by the policy's check_class (cosmix-lib-mix
-            // ≥ 0.14.1). No Bus handler → send/emit inert.
+            // ≥ 0.14.1); since 0.89.0 the bare send/emit broker forms
+            // are Bus-gated too (and Bus here is granted only for
+            // bus:<verb> routes — those handlers get a catchable
+            // CAPABILITY_DENIED, not a silent no-op).
             eval.set_capability_policy(Rc::new(HandlerCapabilityPolicy::new(
                 wants_db, wants_jmap, wants_bus, wants_net,
             )));

@@ -1172,10 +1172,14 @@ impl CategoryAllowList {
         }
     }
 
-    /// The deny-all-by-category policy: no builtin class is allowed. Shell
-    /// syntax, `send`/`emit` (since the capability-gate fix), pipes and
-    /// command substitution are all denied by class. Embedding hosts use this
-    /// as the starting point for expression evaluation modes.
+    /// The deny-all-by-category policy: no class beyond `Pure` is
+    /// allowed (`Pure` builtins always pass — they are, by definition,
+    /// side-effect-free computation; note `sleep` is classed Pure and
+    /// pends, which is why the expression mode denies it BY NAME).
+    /// Shell syntax, `send`/`emit`, the address block's implicit sends
+    /// and the reserved Bus builtins (all since 0.89.0), pipes and
+    /// command substitution are denied by class. Embedding hosts use
+    /// this as the starting point for expression evaluation modes.
     pub fn deny_all() -> Self {
         CategoryAllowList::new(&[])
     }

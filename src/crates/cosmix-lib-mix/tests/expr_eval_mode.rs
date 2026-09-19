@@ -345,6 +345,70 @@ async fn pure_policy_denies_reserved_bus_builtins() {
     }
 }
 
+/// The interpolation coalesce default (`${x ?? …}`) is parsed and
+/// executed as a FULL PROGRAM at runtime (eval_interp_default) — the
+/// walk must statically analyse every payload with the same rules
+/// (single expression + recursive deny walk), or a binding smuggles a
+/// shell, a hang or a loop past the "rejected before execution"
+/// promise. Found by the GLM review arm (its BLOCKER); heredocs share
+/// the part machinery. NOTE: sleeps in the hostile cases are kept SHORT
+/// so a walk miss fails the test in seconds instead of hanging it.
+#[test]
+fn eval_expr_string_denies_coalesce_payloads() {
+    let cases: &[(&str, &str)] = &[
+        ("\"${q ?? sleep(1)}\"", "sleep builtin"),
+        // A command-sub EXPRESSION payload: single-expression rule
+        // passes, the recursive walk denies the construct.
+        ("\"${q ?? $(echo hi)}\"", "command substitution"),
+        // A STATEMENT payload: the single-expression rule itself rejects.
+        ("\"${q ?? sh 'id'}\"", "single expression"),
+        ("\"${q ?? send 'comp' 'window.focus'}\"", "single expression"),
+        // A loop inside the payload: the single-expression rule rejects.
+        (
+            "\"${q ?? for $i = 1 to 9\n$i\nend}\"",
+            "single expression",
+        ),
+        // Heredoc body carrying a coalesce default.
+        ("<<EOF\n${q ?? sleep(1)}\nEOF\n", "sleep builtin"),
+    ];
+    for (src, construct) in cases {
+        let err = match eval_pure(src, &[("q", Value::Nil)]) {
+            Err(e) => e,
+            Ok(_) => panic!("{src} must be denied before execution"),
+        };
+        assert!(err.contains(construct), "{src}: got: {err}");
+    }
+
+    // A benign default still evaluates: nil head fires it.
+    assert_eq!(
+        eval_pure("\"${q ?? 'anon'}\"", &[("q", Value::Nil)]).unwrap(),
+        Value::String("anon".into())
+    );
+}
+
+/// The output family (printf/eprintf/write_stdout/write_stderr/
+/// print_raw/eprint_raw, all Pure-classed — load-bearing for webd's
+/// sieve case — plus the print statement) writes to the evaluator's
+/// output sink, which for a default-constructed evaluator is the HOST
+/// daemon's real stdout/stderr. No policy stops Pure; the static walk
+/// is the only unconditional bound, so a binding has no output channel.
+#[test]
+fn eval_expr_string_denies_output_family() {
+    let cases: &[(&str, &str)] = &[
+        ("write_stdout('x')", "write_stdout builtin"),
+        ("false ? 1 : printf('%d', 2)", "printf builtin"),
+        ("eprint_raw('x')", "eprint_raw builtin"),
+        ("(if $x then print(\"spam\") else 0 end)", "print statement"),
+    ];
+    for (src, construct) in cases {
+        let err = match eval_pure(src, &[("x", Value::Bool(false))]) {
+            Err(e) => e,
+            Ok(_) => panic!("{src} must be denied before execution"),
+        };
+        assert!(err.contains(construct), "{src}: got: {err}");
+    }
+}
+
 /// The pure shapes an embedding host actually evaluates — all allowed,
 /// under the deny-all policy.
 #[test]

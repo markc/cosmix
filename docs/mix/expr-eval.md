@@ -69,7 +69,9 @@ rejects, because the walk never evaluates anything):
 | `for` / `for … in` / `while` / `loop` nested in an if-expression branch | `for loop` / `for-each loop` / `while loop` / `loop statement` |
 | `select … end` / `address "…" … end` nested in an if-expression branch | `select statement` / `address block` |
 | `export` (mutates the HOST process environment; its runtime gate is permissive with no policy installed) | `export statement` |
-| `sleep`, `readline`, `read_stdin`, `read_stdin_bytes` — by NAME: `sleep` is table-classed Pure (no installed policy stops it) and the stdin readers are Env-classed but still block under `policy: None`; the static deny makes the no-waiting premise unconditional, whatever policy the host chose | `<name> builtin (blocks on wall-clock or host input)` |
+| `print` statement nested in an if-expression (writes to the evaluator's output sink — the host daemon's real stdout/stderr) | `print statement` |
+| a coalesce default in an interpolation (`"${x ?? …}"` and heredoc bodies): the payload is parsed and executed as a full program AT RUNTIME, so the walk statically analyses it here — it must be a single expression and passes the same deny rules recursively (nested coalesces included) | `coalesce default must be a single expression…`, or the inner construct's name |
+| `sleep`, `readline`, `read_stdin`, `read_stdin_bytes`, `printf`, `eprintf`, `write_stdout`, `write_stderr`, `print_raw`, `eprint_raw` — by NAME: each is Pure- or Env-classed so no installed policy stops the Pure ones, and a binding has no business blocking on time/input or writing to the host's output stream; the static deny makes those premises unconditional, whatever policy the host chose | `<name> builtin` |
 | string interpolation beyond literals and Mix variables | `environment-variable interpolation in string`, `command substitution in string` |
 
 What stays **allowed**: literals, variables, arithmetic and comparison,
@@ -138,8 +140,11 @@ denied statically, that residual is a slow computation, not a hang. See
 programs.
 
 `eval_expr_string` is **synchronous**: it drives the evaluator's async
-path on a fresh current-thread runtime inside the call. Don't call it
-from within an async execution context — hop to a blocking task first.
+path on a fresh current-thread runtime inside the call. Calling it from
+within an async execution context **panics** (tokio refuses to block a
+runtime thread) — hop to a blocking task first. A fresh runtime per
+call is fine at config/scene-load rates; a host re-evaluating bindings
+per frame should measure it.
 
 ## The honest boundary
 
@@ -148,9 +153,12 @@ same gate: an in-process gate is a **robustness** boundary for trusted
 embedded expressions, **not a containment** boundary for untrusted
 code — a compromise owns the address space the gate runs in. The
 single-expression rule and the deny walk are deterministic *fuel and
-footgun* bounds (no accidental side effects, no runaway construction),
-not a sandbox. Untrusted or multi-tenant code runs out-of-process under
-OS isolation; see [capabilities & embedding](capabilities.md) for the
+footgun* bounds (no runaway construction, no blocking on time or input,
+no output to the host's streams, no env or shell reach — the deny table
+above is the whole story), not a sandbox. What remains within a
+conforming expression is pure computation over its inputs and the size
+caps. Untrusted or multi-tenant code runs out-of-process under OS
+isolation; see [capabilities & embedding](capabilities.md) for the
 trust-split model.
 
 ## See also

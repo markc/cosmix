@@ -2885,6 +2885,16 @@ pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
     "readline",  // Env-classed but blocking on host input
     "read_stdin",
     "read_stdin_bytes",
+    // The whole output family is Pure-classed (load-bearing for webd's
+    // sieve case), so no installed policy stops it — but a binding
+    // writing to the host daemon's real stdout/stderr is an undocumented
+    // side channel (log injection, per-frame spam). Deny by name.
+    "printf",
+    "eprintf",
+    "write_stdout",
+    "write_stderr",
+    "print_raw",
+    "eprint_raw",
 ];
 
 /// Evaluate exactly one Mix expression with preset globals, an optional
@@ -2900,7 +2910,12 @@ pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
 /// (`MethodCall`; method-syntax-on-a-builtin like `$s.upper()` desugars
 /// to a bareword `FunctionCall` at parse time and stays allowed), and
 /// any string interpolation part beyond literals and Mix variables
-/// (env-var expansion, in-string command substitution). The walk is
+/// (env-var expansion, in-string command substitution). An
+/// interpolation coalesce default (`"${x ?? …}"`, heredoc bodies
+/// included) is parsed and executed as a full program at RUNTIME, so
+/// the walk statically analyses every payload with the same rules: it
+/// must be a single expression and passes the recursive deny walk
+/// (nested coalesces included). The walk is
 /// depth-capped at [`MAX_EXPR_DEPTH`]. Note the interpolation nuance: a
 /// `${NAME}` Mix-variable part stays ALLOWED and resolves scope-first
 /// with a process-env fallback (so `"${HOME}"` reads the host env — see
@@ -2970,13 +2985,14 @@ pub fn eval_expr_string(
             span: None,
             msg: format!("eval_expr_string: {}", e),
         })?;
-    // This entry point has no statement loop, so the evaluator's own
-    // per-statement deadline poll never runs here — arm the wall-clock
-    // budget at the future instead: on expiry the evaluation future is
-    // dropped at its next yield point and the caller gets a clean error.
-    // (A single non-yielding CPU-bound builtin can still overshoot until
-    // its next yield; the four blocking-by-nature builtins are statically
-    // denied above, which is the load-bearing bound.)
+    // A statement-free expression never reaches the evaluator's
+    // per-statement deadline poll (if-expression branch bodies DO poll,
+    // via execute_inner) — so arm the wall-clock budget at the future as
+    // well: on expiry the evaluation future is dropped at its next yield
+    // point and the caller gets a clean error. (A single non-yielding
+    // CPU-bound builtin can still overshoot until its next yield; the
+    // blocking-by-nature builtins are statically denied above, which is
+    // the load-bearing bound.)
     let fut = eval.eval_expr(expr);
     rt.block_on(async move {
         match dur {
@@ -3040,6 +3056,53 @@ fn expr_mode_construct_name(kind: &StmtKind) -> &'static str {
 /// non-expression constructs BEFORE execution, untaken branches
 /// included. Depth-capped at [`MAX_EXPR_DEPTH`] so a deep tree is a
 /// clean error, not a stack overflow in the walk.
+/// Static analysis for an interpolation coalesce default (`${x ?? …}`):
+/// the payload is lexed/parsed/executed as a full program at runtime by
+/// [`Evaluator::eval_interp_default`], so it must satisfy the mode's
+/// rules statically — exactly one expression statement, then the same
+/// deny walk (which recurses into any nested coalesce payloads). A
+/// payload that does not parse, or is not a single expression, is
+/// rejected here rather than trusted at runtime.
+fn expr_mode_check_payload(src: &str, depth: usize) -> MixResult<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if depth > MAX_EXPR_DEPTH {
+        return Err(expr_mode_depth_error());
+    }
+    let mut lexer = crate::lexer::Lexer::new(src);
+    let tokens = lexer
+        .tokenize()
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: coalesce default does not parse: {e}"),
+        })?;
+    let stmts = crate::parser::Parser::new(tokens, src)
+        .parse_program()
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: coalesce default does not parse: {e}"),
+        })?;
+    match stmts.len() {
+        1 => match &stmts[0].kind {
+            StmtKind::Expression(expr) => expr_mode_deny_walk(expr, depth),
+            kind => Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "eval_expr_string: coalesce default must be a single expression, not a {}",
+                    expr_mode_construct_name(kind)
+                ),
+            }),
+        },
+        n => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "eval_expr_string: coalesce default must be a single expression, found {n} statements"
+            ),
+        }),
+    }
+}
+
 fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
     if depth > MAX_EXPR_DEPTH {
         return Err(expr_mode_depth_error());
@@ -3060,11 +3123,23 @@ fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
         Expr::MethodCall { .. } => return Err(denied("method call")),
 
         // Interpolation: only literals and Mix variables. Env-var
-        // expansion and command substitution inside strings are out.
+        // expansion and command substitution inside strings are out. A
+        // variable part may carry a coalesce default (`${x ?? …}`),
+        // whose payload is parsed and executed AT RUNTIME by
+        // eval_interp_default — as a full program, invisible to this
+        // walk unless the walk analyses it HERE: every payload gets the
+        // same static treatment (single expression + recursive deny
+        // walk, so nested coalesces cannot smuggle a construct either).
         Expr::InterpolatedString(parts) | Expr::Heredoc(parts) => {
             for part in parts {
                 match part {
-                    StringPart::Literal(_) | StringPart::Variable(_) => {}
+                    StringPart::Literal(_) => {}
+                    StringPart::Variable(spec) => {
+                        let (_, coalesce) = split_interp_coalesce(spec);
+                        if let Some((_, payload)) = coalesce {
+                            expr_mode_check_payload(payload, depth + 1)?;
+                        }
+                    }
                     StringPart::CommandSub(_) => {
                         return Err(denied("command substitution in string"));
                     }
@@ -3114,9 +3189,7 @@ fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
             // Env) but block whenever the host passes policy:None — the
             // static deny is the unconditional bound.
             if EXPR_MODE_DENIED_BUILTINS.contains(&name.as_str()) {
-                return Err(denied(&format!(
-                    "{name} builtin (blocks on wall-clock or host input)"
-                )));
+                return Err(denied(&format!("{name} builtin")));
             }
             for arg in args {
                 expr_mode_deny_walk(arg, depth + 1)?;
@@ -3197,6 +3270,12 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
         // gate is permissive when no policy is installed (a legal call
         // shape for this entry point), so the static walk must deny it.
         StmtKind::Export { .. } => return Err(denied("export statement")),
+        // `print` writes to the evaluator's output sink — real
+        // stdout/stderr for a default-constructed evaluator, i.e. the
+        // host daemon's log stream. A binding has no business writing
+        // there; the output builtins are denied by name for the same
+        // reason.
+        StmtKind::Print { .. } => return Err(denied("print statement")),
 
         StmtKind::Assignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
         StmtKind::FieldAssignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
@@ -3235,11 +3314,6 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
         StmtKind::Return(value) => {
             if let Some(value) = value {
                 expr_mode_deny_walk(value, depth + 1)?;
-            }
-        }
-        StmtKind::Print { args, .. } => {
-            for arg in args {
-                expr_mode_deny_walk(arg, depth + 1)?;
             }
         }
         StmtKind::Parse { source, .. } => expr_mode_deny_walk(source, depth + 1)?,

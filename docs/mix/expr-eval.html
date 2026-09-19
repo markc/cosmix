@@ -499,7 +499,9 @@ rejects, because the walk never evaluates anything):</p>
 <tr><td><code>for</code> / <code>for … in</code> / <code>while</code> / <code>loop</code> nested in an if-expression branch</td><td><code>for loop</code> / <code>for-each loop</code> / <code>while loop</code> / <code>loop statement</code></td></tr>
 <tr><td><code>select … end</code> / <code>address "…" … end</code> nested in an if-expression branch</td><td><code>select statement</code> / <code>address block</code></td></tr>
 <tr><td><code>export</code> (mutates the HOST process environment; its runtime gate is permissive with no policy installed)</td><td><code>export statement</code></td></tr>
-<tr><td><code>sleep</code>, <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code> — by NAME: <code>sleep</code> is table-classed Pure (no installed policy stops it) and the stdin readers are Env-classed but still block under <code>policy: None</code>; the static deny makes the no-waiting premise unconditional, whatever policy the host chose</td><td><code>&lt;name&gt; builtin (blocks on wall-clock or host input)</code></td></tr>
+<tr><td><code>print</code> statement nested in an if-expression (writes to the evaluator's output sink — the host daemon's real stdout/stderr)</td><td><code>print statement</code></td></tr>
+<tr><td>a coalesce default in an interpolation (<code>"${x ?? …}"</code> and heredoc bodies): the payload is parsed and executed as a full program AT RUNTIME, so the walk statically analyses it here — it must be a single expression and passes the same deny rules recursively (nested coalesces included)</td><td><code>coalesce default must be a single expression…</code>, or the inner construct's name</td></tr>
+<tr><td><code>sleep</code>, <code>readline</code>, <code>read_stdin</code>, <code>read_stdin_bytes</code>, <code>printf</code>, <code>eprintf</code>, <code>write_stdout</code>, <code>write_stderr</code>, <code>print_raw</code>, <code>eprint_raw</code> — by NAME: each is Pure- or Env-classed so no installed policy stops the Pure ones, and a binding has no business blocking on time/input or writing to the host's output stream; the static deny makes those premises unconditional, whatever policy the host chose</td><td><code>&lt;name&gt; builtin</code></td></tr>
 <tr><td>string interpolation beyond literals and Mix variables</td><td><code>environment-variable interpolation in string</code>, <code>command substitution in string</code></td></tr>
 </tbody></table>
 <p>What stays <strong>allowed</strong>: literals, variables, arithmetic and comparison,
@@ -559,17 +561,23 @@ denied statically, that residual is a slow computation, not a hang. See
 <a href="/mix/capabilities">capabilities &amp; embedding</a> for the same caveat in full
 programs.</p>
 <p><code>eval_expr_string</code> is <strong>synchronous</strong>: it drives the evaluator's async
-path on a fresh current-thread runtime inside the call. Don't call it
-from within an async execution context — hop to a blocking task first.</p>
+path on a fresh current-thread runtime inside the call. Calling it from
+within an async execution context <strong>panics</strong> (tokio refuses to block a
+runtime thread) — hop to a blocking task first. A fresh runtime per
+call is fine at config/scene-load rates; a host re-evaluating bindings
+per frame should measure it.</p>
 <h2 id="the-honest-boundary">The honest boundary</h2>
 <p>The same wording as the <code>CapabilityPolicy</code> trait, because it is the
 same gate: an in-process gate is a <strong>robustness</strong> boundary for trusted
 embedded expressions, <strong>not a containment</strong> boundary for untrusted
 code — a compromise owns the address space the gate runs in. The
 single-expression rule and the deny walk are deterministic <em>fuel and
-footgun</em> bounds (no accidental side effects, no runaway construction),
-not a sandbox. Untrusted or multi-tenant code runs out-of-process under
-OS isolation; see <a href="/mix/capabilities">capabilities &amp; embedding</a> for the
+footgun</em> bounds (no runaway construction, no blocking on time or input,
+no output to the host's streams, no env or shell reach — the deny table
+above is the whole story), not a sandbox. What remains within a
+conforming expression is pure computation over its inputs and the size
+caps. Untrusted or multi-tenant code runs out-of-process under OS
+isolation; see <a href="/mix/capabilities">capabilities &amp; embedding</a> for the
 trust-split model.</p>
 <h2 id="see-also">See also</h2>
 <ul>
