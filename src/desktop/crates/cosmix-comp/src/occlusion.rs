@@ -896,26 +896,28 @@ mod tests {
         main.init_resource::<Assets<crate::client_surface_material::ClientSurfaceMaterial>>();
         main.insert_resource(RendererOutputScale120(300));
         main.insert_resource(LogicalCanvasSize(Vec2::new(100.0, 80.0)));
-        main.spawn((
-            Camera {
-                viewport: Some(bevy::camera::Viewport {
-                    physical_size: UVec2::new(251, 200),
+        let camera = main
+            .spawn((
+                Camera {
+                    viewport: Some(bevy::camera::Viewport {
+                        physical_size: UVec2::new(251, 200),
+                        ..Default::default()
+                    }),
                     ..Default::default()
+                },
+                GlobalTransform::IDENTITY,
+                Projection::Orthographic(OrthographicProjection {
+                    area: bevy::math::Rect::new(-50.0, -40.0, 50.0, 40.0),
+                    ..OrthographicProjection::default_2d()
                 }),
-                ..Default::default()
-            },
-            GlobalTransform::IDENTITY,
-            Projection::Orthographic(OrthographicProjection {
-                area: bevy::math::Rect::new(-50.0, -40.0, 50.0, 40.0),
-                ..OrthographicProjection::default_2d()
-            }),
-            crate::capture::CaptureOutputSource {
-                source_id: crate::backend::CaptureSourceId::Nested {
+                crate::capture::CaptureOutputSource {
+                    source_id: crate::backend::CaptureSourceId::Nested {
+                        output_name: "camera-test".into(),
+                    },
                     output_name: "camera-test".into(),
                 },
-                output_name: "camera-test".into(),
-            },
-        ));
+            ))
+            .id();
         let mut render = World::new();
         render.insert_resource(main);
         render.insert_resource(reporter);
@@ -925,7 +927,7 @@ mod tests {
         assert_eq!(output.bounds, Bounds::new(0.0, 0.0, 100.0, 80.0));
         assert_eq!((output.scale, output.scale_y), (2.51, 2.5));
         assert_eq!(output.generation, 1);
-        render.resource_mut::<MainWorld>().clear_entities();
+        render.resource_mut::<MainWorld>().despawn(camera);
         render.run_system_once(extract).unwrap();
         assert_eq!(
             render.resource::<ExtractedCoverage>().scene.outputs[0].generation,
