@@ -56,9 +56,17 @@ pub(super) fn certify(
     h: &mut KeybindingHarness,
     opaque: bool,
 ) -> crate::occlusion::CoverageSnapshot {
+    certify_sampled(h, opaque, None)
+}
+
+fn certify_sampled(
+    h: &mut KeybindingHarness,
+    opaque: bool,
+    lagging: Option<(SurfaceId, u64)>,
+) -> crate::occlusion::CoverageSnapshot {
     h.server.state.refresh_occlusion();
     let bridge = h.server.state.occlusion.bridge.clone();
-    let mut exchange = bridge.0.lock().unwrap();
+    let exchange = bridge.0.lock().unwrap();
     let draws = exchange
         .scene
         .surfaces
@@ -78,11 +86,25 @@ pub(super) fn certify(
             sampled: true,
         })
         .collect::<Vec<_>>();
-    let coverage = crate::occlusion::compute(&exchange.scene, &draws, exchange.revision);
-    exchange.coverage = coverage.clone();
+    let extracted = crate::occlusion::ExtractedCoverage {
+        revision: exchange.revision,
+        scene: exchange.scene.clone(),
+        draws,
+    };
+    let mut sampled = exchange
+        .scene
+        .surfaces
+        .iter()
+        .map(|s| (s.id, s.content))
+        .collect::<HashMap<_, _>>();
+    if let Some((id, seq)) = lagging {
+        sampled.insert(id, seq);
+    }
     drop(exchange);
+    let mut cache = crate::occlusion::CoverageCache::default();
+    crate::occlusion::resolve(&extracted, &sampled, &bridge, &mut cache);
     h.server.state.refresh_occlusion();
-    coverage
+    cache.result
 }
 
 pub(super) fn done(h: &mut KeybindingHarness, callback: u32) -> usize {
@@ -123,6 +145,39 @@ fn occlusion_wire_retains_callbacks_and_exposure_resumes_without_victim_commit()
             .counters
             .resumes
             > 0
+    );
+}
+
+#[test]
+fn occlusion_wire_coverage_floor_tracks_applied_changes_between_refreshes() {
+    let (mut h, _, cover) = fixture();
+    let region = h.allocate_object_id();
+    send_request(&mut h.client, TEST_COMPOSITOR_ID, 1, &words(&[region]));
+    send_request(&mut h.client, region, 1, &words(&[0, 0, 4096, 4096]));
+    send_request(&mut h.client, cover.protocol_id(), 4, &words(&[region]));
+    commit_test_buffer(&mut h, cover.protocol_id());
+    h.dispatch_client();
+    h.server.state.refresh_occlusion();
+    let id = h.server.state.surfaces[&cover].id;
+    let initial = h.server.state.surfaces[&cover].content_seq;
+    // Two applied commits before any coverage refresh: A -> B -> A.
+    send_request(&mut h.client, cover.protocol_id(), 4, &words(&[0]));
+    commit_test_buffer(&mut h, cover.protocol_id());
+    h.dispatch_client();
+    send_request(&mut h.client, cover.protocol_id(), 4, &words(&[region]));
+    commit_test_buffer(&mut h, cover.protocol_id());
+    h.dispatch_client();
+    let changed = h.server.state.surfaces[&cover].content_seq;
+    assert!(changed > initial);
+    commit_test_buffer(&mut h, cover.protocol_id());
+    h.dispatch_client();
+    h.server.state.refresh_occlusion();
+    let exchange = h.server.state.occlusion.bridge.0.lock().unwrap();
+    let surface = exchange.scene.surfaces.iter().find(|s| s.id == id).unwrap();
+    assert_eq!(surface.coverage_since, changed);
+    assert!(
+        surface.content > changed,
+        "unchanged content must not advance the floor"
     );
 }
 
@@ -168,8 +223,13 @@ fn occlusion_wire_content_only_commits_never_flap_or_leak() {
     for _ in 0..20 {
         // Commit after certification, before the pulse: previously this cleared
         // all decisions and leaked every covered callback before re-extraction.
+        let sampled = (
+            h.server.state.surfaces[&cover].id,
+            h.server.state.surfaces[&cover].content_seq,
+        );
         commit_test_buffer(&mut h, cover.protocol_id());
         h.dispatch_client();
+        certify_sampled(&mut h, true, Some(sampled));
         h.frame(Vec::new());
         let events = h.sync();
         assert!(

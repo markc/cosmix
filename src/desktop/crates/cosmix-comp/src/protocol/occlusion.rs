@@ -2,6 +2,17 @@
 use super::*;
 use crate::occlusion::{Bounds, Bridge, CommittedOpacity, Scene, SceneSurface, TreeVisibility};
 
+#[derive(PartialEq)]
+struct CoverageInputs {
+    generation: u64,
+    buffer_size: Option<(u32, u32)>,
+    format_opaque: bool,
+    size: (f32, f32),
+    source: Option<TextureSourceRect>,
+    transform: SurfaceTransform,
+    opacity: CommittedOpacity,
+}
+
 #[derive(Default)]
 pub(super) struct OcclusionRuntime {
     pub bridge: Bridge,
@@ -9,6 +20,9 @@ pub(super) struct OcclusionRuntime {
     pub revision: u64,
     pub decision_revisions: HashMap<SurfaceId, u64>,
     opacity: HashMap<SurfaceId, (u64, u64, CommittedOpacity)>,
+    // Updated at every accepted applied transaction, not only at dispatch
+    // reconciliation: A -> B -> A in one dispatch must still retire B evidence.
+    coverage_epochs: HashMap<SurfaceId, (CoverageInputs, u64)>,
     refused_opacity: HashSet<SurfaceId>,
     scene_indices: HashMap<SurfaceId, usize>,
     pub withheld: HashMap<SurfaceId, HashSet<ObjectId>>,
@@ -86,9 +100,36 @@ impl WaylandState {
                 );
                 CommittedOpacity { operations }
             });
-        self.occlusion
-            .opacity
-            .insert(record.id, (record.generation, record.content_seq, opacity));
+        self.occlusion.opacity.insert(
+            record.id,
+            (record.generation, record.content_seq, opacity.clone()),
+        );
+        let inputs = CoverageInputs {
+            generation: record.generation,
+            buffer_size: record.buffer_dimensions,
+            format_opaque: record
+                .shm_backing
+                .as_ref()
+                .is_some_and(|b| b.format == wl_shm::Format::Xrgb8888)
+                || record
+                    .dmabuf_backing
+                    .as_ref()
+                    .is_some_and(|b| b.descriptor.is_opaque()),
+            size: (record.layout.width, record.layout.height),
+            source: record.layout.source,
+            transform: record.layout.transform,
+            opacity,
+        };
+        if self
+            .occlusion
+            .coverage_epochs
+            .get(&record.id)
+            .is_none_or(|(previous, _)| *previous != inputs)
+        {
+            self.occlusion
+                .coverage_epochs
+                .insert(record.id, (inputs, record.content_seq));
+        }
         self.occlusion.refused_opacity.remove(&record.id);
     }
 
@@ -129,12 +170,19 @@ impl WaylandState {
                 .scene_indices
                 .get(&record.id)
                 .and_then(|i| exchange.scene.surfaces.get_mut(*i))
+                .filter(|previous| previous.id == record.id)
             {
                 changed_scene |= previous.family != family
                     || previous.generation != record.generation
                     || previous.layout != record.layout
                     || previous.buffer_size != record.buffer_dimensions
                     || previous.format_opaque != format_opaque
+                    || previous.coverage_since
+                        != self
+                            .occlusion
+                            .coverage_epochs
+                            .get(&record.id)
+                            .map_or(record.content_seq, |(_, seq)| *seq)
                     || opacity.unwrap_or(&CommittedOpacity::default()) != &previous.opacity;
                 previous.content = record.content_seq;
             } else {
@@ -165,6 +213,11 @@ impl WaylandState {
                     generation: record.generation,
                     layout: record.layout,
                     content: record.content_seq,
+                    coverage_since: self
+                        .occlusion
+                        .coverage_epochs
+                        .get(&record.id)
+                        .map_or(record.content_seq, |(_, seq)| *seq),
                     buffer_size: record.buffer_dimensions,
                     format_opaque: record
                         .shm_backing
@@ -203,6 +256,9 @@ impl WaylandState {
         self.occlusion
             .refused_opacity
             .retain(|id| self.surface_objects.contains_key(id));
+        self.occlusion
+            .coverage_epochs
+            .retain(|id, _| self.surface_objects.contains_key(id));
         let revision = exchange.revision;
         let decisions = if revision != 0 && exchange.coverage.revision == revision {
             Some(&exchange.coverage.surfaces)
@@ -286,6 +342,7 @@ impl WaylandState {
             return;
         }
         let workspace = self.workspace_current();
+        let frame_time = monotonic_millis();
         for record in self.surfaces.values() {
             if self.occlusion.is_occluded(record.id)
                 && record.role.parent_surface().is_none()
@@ -294,7 +351,7 @@ impl WaylandState {
             {
                 let batch = send_frames_surface_tree_limited(
                     record.role.wl_surface(),
-                    monotonic_millis(),
+                    frame_time,
                     &self.surfaces,
                     64,
                     &HashSet::new(),

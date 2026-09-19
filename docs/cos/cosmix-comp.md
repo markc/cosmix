@@ -22,9 +22,13 @@ generation-mismatched camera evidence permits callbacks. Unknown state, excessiv
 region fragmentation and stale scene revisions permit callbacks. Scene changes
 invalidate coverage; the next existing frame opportunity drains retained
 callbacks once with the current monotonic millisecond timestamp. Content-only
-commits preserve coverage decisions; installed content is checked separately for
-occluders. No occlusion
-polling timer or victim commit is required.
+commits preserve coverage decisions: an occluder's applied and sampled content
+sequences must each be greater than or equal to the sequence where its current
+coverage inputs last changed, rather than equal to its latest content sequence.
+That floor advances at applied opacity-region, format-opacity, buffer-size,
+generation, transform or viewport changes. A pending import may retain older
+content from the same coverage interval; content predating the floor cannot
+occlude. No occlusion polling timer or victim commit is required.
 
 Maximised SSD frames have square opaque chrome bands without outer/inner edge
 antialiasing. Floating rounded chrome is unchanged. Fullscreen removes SSD;
@@ -38,7 +42,9 @@ surfaces remain observable under `surfaces`. `occlusion.counters` contains
 compositor-wide `withheld_opportunities`, `resumes`, `recomputes` and
 `conservative_fallbacks`; these read-only counters do not emit property changes.
 Withheld opportunities count eligible root-tree pulse opportunities, not dropped
-callbacks. Resumes match delivered callback identities against the retained set,
+callbacks. `resumes` counts surface trees resumed, not individual callbacks:
+one tree delivering several retained callbacks adds one. Resumes match delivered
+callback identities against the retained set,
 so destroying a child cannot turn an unrelated callback into a resume. They do not count transitions
 to unknown visibility. While occluded, each surface retains at most 64 committed
 callbacks: excess older callbacks receive `done` immediately (fail-open), without

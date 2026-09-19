@@ -1610,7 +1610,7 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     volatile!(
         [L("occlusion"), L("counters"), L("resumes")],
         Number,
-        "Compositor-wide occlusion counter; read-only, never diffed"
+        "Surface trees resumed by delivering retained callbacks; read-only, never diffed"
     ),
     volatile!(
         [L("occlusion"), L("counters"), L("recomputes")],

@@ -151,6 +151,9 @@ pub(crate) struct SceneSurface {
     pub generation: u64,
     pub layout: SurfaceLayout,
     pub content: u64,
+    /// First content sequence carrying the current coverage contract. Newer
+    /// content with identical inputs need not have reached the renderer yet.
+    pub coverage_since: u64,
     pub buffer_size: Option<(u32, u32)>,
     pub format_opaque: bool,
     pub opacity: CommittedOpacity,
@@ -586,7 +589,7 @@ pub(crate) fn extract(
             chrome: Vec::new(),
             ready: entity.layout == s.layout
                 && visibility.get(entity.entity).is_ok_and(|v| v.get()),
-            sampled: entity.applied_commit == s.content,
+            sampled: entity.applied_commit >= s.coverage_since,
         };
         if let (Some(deco), Some(toplevel), Some(chrome)) =
             (&entity.decoration, s.layout.toplevel, chrome.as_ref())
@@ -640,12 +643,12 @@ pub(crate) fn resolve(
         .scene
         .surfaces
         .iter()
-        .map(|s| (s.id, s.content))
+        .map(|s| (s.id, s.coverage_since))
         .collect();
     for draw in &mut draws {
         draw.sampled &= content
             .get(&draw.id)
-            .is_some_and(|seq| sampled.get(&draw.id) == Some(seq));
+            .is_some_and(|since| sampled.get(&draw.id).is_some_and(|seq| seq >= since));
     }
     let key = (extracted.revision, draws, extracted.scene.outputs.clone());
     let mut exchange = bridge.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -741,6 +744,78 @@ mod tests {
             &mut cache,
         );
         cache.result.surfaces[&SurfaceId(1)]
+    }
+
+    #[test]
+    fn occlusion_extract_same_opacity_keeps_lagging_content_eligible() {
+        use crate::compositor_scene::SurfaceEntities;
+        let (scene, _) = fixture();
+        let mut world = extraction_fixture(scene);
+        for latest in 2..=20 {
+            world
+                .resource::<crate::protocol::FramePresentationReporter>()
+                .occlusion
+                .0
+                .lock()
+                .unwrap()
+                .scene
+                .surfaces[1]
+                .content = latest;
+            // Protocol can be ahead of extraction; DMA-BUF sampling can also
+            // remain on the old texture after the entity accepted a new one.
+            for applied in [1, latest] {
+                world
+                    .resource_mut::<MainWorld>()
+                    .resource_mut::<SurfaceEntities>()
+                    .surfaces
+                    .get_mut(&SurfaceId(2))
+                    .unwrap()
+                    .applied_commit = applied;
+                assert_eq!(
+                    extracted_decision(
+                        &mut world,
+                        HashMap::from([(SurfaceId(1), 1), (SurfaceId(2), 1)])
+                    ),
+                    TreeVisibility::Occluded,
+                    "unchanged contract since 1, applied {applied}, latest {latest}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn occlusion_extract_opacity_change_rejects_older_content_then_recovers_at_floor() {
+        use crate::compositor_scene::SurfaceEntities;
+        let (mut scene, _) = fixture();
+        let cover = &mut scene.surfaces[1];
+        cover.format_opaque = false;
+        cover.opacity.operations = Some(vec![(true, Bounds::new(0.0, 0.0, 100.0, 80.0))]);
+        cover.coverage_since = 4; // The opaque declaration first applied here.
+        cover.content = 6; // Later commits have the identical declaration.
+        let mut world = extraction_fixture(scene);
+        for (applied, sampled, expected) in [
+            (2, 2, TreeVisibility::Visible),
+            (6, 2, TreeVisibility::Visible),
+            (2, 6, TreeVisibility::Visible),
+            (4, 4, TreeVisibility::Occluded),
+            (6, 6, TreeVisibility::Occluded),
+        ] {
+            world
+                .resource_mut::<MainWorld>()
+                .resource_mut::<SurfaceEntities>()
+                .surfaces
+                .get_mut(&SurfaceId(2))
+                .unwrap()
+                .applied_commit = applied;
+            assert_eq!(
+                extracted_decision(
+                    &mut world,
+                    HashMap::from([(SurfaceId(1), 1), (SurfaceId(2), sampled)])
+                ),
+                expected,
+                "applied {applied}, sampled {sampled}, contract since 4, latest 6"
+            );
+        }
     }
 
     #[test]
@@ -958,6 +1033,7 @@ mod tests {
                 family: SurfaceId(id),
                 generation: 1,
                 content: 1,
+                coverage_since: 1,
                 buffer_size: Some((100, 80)),
                 format_opaque: true,
                 opacity: CommittedOpacity {
