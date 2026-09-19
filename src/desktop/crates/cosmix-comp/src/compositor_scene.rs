@@ -526,6 +526,27 @@ pub(crate) struct SurfaceEntity {
 const DMABUF_REQUEST_HISTORY: usize = 8;
 
 impl SurfaceEntity {
+    #[cfg(test)]
+    pub(crate) fn coverage_fixture(
+        entity: Entity,
+        material: Handle<ClientSurfaceMaterial>,
+        layout: SurfaceLayout,
+    ) -> Self {
+        Self {
+            entity,
+            material,
+            layout,
+            image: ClientSurfaceImage::encoded_premultiplied_unorm(Handle::default()),
+            buffer_kind: SurfaceBufferKind::Shm,
+            opaque: false,
+            kind: SceneSurfaceKind::Toplevel,
+            title: None,
+            renderer_z: 0.0,
+            decoration: None,
+            applied_commit: 1,
+            dmabuf_requests: VecDeque::new(),
+        }
+    }
     pub(crate) fn image_id(&self) -> bevy::asset::AssetId<Image> {
         self.image.id()
     }

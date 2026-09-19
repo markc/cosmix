@@ -151,6 +151,8 @@ pub(crate) struct SceneSurface {
     pub generation: u64,
     pub layout: SurfaceLayout,
     pub content: u64,
+    pub buffer_size: Option<(u32, u32)>,
+    pub format_opaque: bool,
     pub opacity: CommittedOpacity,
 }
 
@@ -201,8 +203,6 @@ pub(crate) struct Props {
     pub occluded: bool,
     pub occlusion_reason: &'static str,
     pub occlusion_revision: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub occlusion_counters: Option<Counters>,
 }
 #[cfg(feature = "bus")]
 impl Default for Props {
@@ -211,7 +211,6 @@ impl Default for Props {
             occluded: false,
             occlusion_reason: "unknown",
             occlusion_revision: 0,
-            occlusion_counters: None,
         }
     }
 }
@@ -241,6 +240,59 @@ pub(crate) struct Draw {
     /// Opaque, hard-edged SSD bands, in the same projected logical space.
     pub chrome: Vec<Bounds>,
     pub ready: bool,
+    /// Content evidence gates occluders, never the candidate's own bounds.
+    pub sampled: bool,
+}
+
+fn full_surface_region(surface: &SceneSurface) -> bool {
+    let Some(operations) = &surface.opacity.operations else {
+        return false;
+    };
+    // Surface regions use integral logical coordinates. Conservatively require
+    // coverage of the outward-rounded surface, before applying sampling guards.
+    let bounds = Rect {
+        l: 0,
+        t: 0,
+        r: f64::from(surface.layout.width).ceil() as i64,
+        b: f64::from(surface.layout.height).ceil() as i64,
+    };
+    let mut region = Vec::new();
+    for (add, r) in operations {
+        if !r.valid() {
+            return false;
+        }
+        let rect = Rect {
+            l: r.x.ceil() as i64,
+            t: r.y.ceil() as i64,
+            r: (r.x + r.w).floor() as i64,
+            b: (r.y + r.h).floor() as i64,
+        };
+        if subtract(&mut region, rect).is_err() {
+            return false;
+        }
+        if *add {
+            region.push(rect);
+        }
+        if region.len() > REGION_LIMIT {
+            return false;
+        }
+    }
+    let mut remaining = vec![bounds];
+    for rect in region {
+        if subtract(&mut remaining, rect).is_err() {
+            return false;
+        }
+    }
+    remaining.is_empty()
+}
+
+fn partial_region_sampling_safe(surface: &SceneSurface) -> bool {
+    surface.layout.source.is_none()
+        && surface.layout.transform == crate::protocol::SurfaceTransform::Normal
+        && surface.buffer_size.is_some_and(|(w, h)| {
+            f64::from(w) == f64::from(surface.layout.width)
+                && f64::from(h) == f64::from(surface.layout.height)
+        })
 }
 
 fn opaque_region(
@@ -248,14 +300,17 @@ fn opaque_region(
     draw: &Draw,
     output: &OutputGeometry,
 ) -> Result<Vec<Rect>, ()> {
-    if !draw.ready || draw.rounded {
+    if !draw.ready || !draw.sampled {
         return Ok(Vec::new());
     }
     let bounds = output.project(draw.bounds, true).ok_or(())?;
     let mut region = Vec::new();
-    if draw.opaque {
+    if !draw.rounded && (draw.opaque || full_surface_region(surface)) {
         region.push(bounds);
-    } else if let Some(operations) = &surface.opacity.operations {
+    } else if !draw.rounded
+        && partial_region_sampling_safe(surface)
+        && let Some(operations) = &surface.opacity.operations
+    {
         // wl_surface opaque regions are in destination surface coordinates.
         // Project through the actual renderer rectangle, including edge snap.
         let sx = draw.bounds.w / f64::from(surface.layout.width);
@@ -270,9 +325,9 @@ fn opaque_region(
             let Some(mut r) = output.project(r, *add) else {
                 return Err(());
             };
-            // A one-output-pixel guard alone is insufficient for magnified
-            // buffers. Use a full surface logical pixel plus a physical pixel;
-            // extraction rejects viewports whose sampling footprint is unknown.
+            // Only uncropped, untransformed, 1:1 buffer-to-destination regions
+            // reach here. Destination-only scaling and buffer-scale mismatches
+            // reject partial regions; whole-surface opacity remains usable.
             let guard = output.scale.max(output.scale_y).ceil() as i64 + 1;
             if *add {
                 r.l += guard;
@@ -295,18 +350,6 @@ fn opaque_region(
                 }
             }
         }
-        // A region covering the complete sampled surface has no internal alpha
-        // boundary. It is safe to retain its texture-clamped exterior edges.
-        if operations.len() == 1 && operations[0].0 {
-            let r = operations[0].1;
-            if r.x <= 0.0
-                && r.y <= 0.0
-                && r.x + r.w >= f64::from(surface.layout.width)
-                && r.y + r.h >= f64::from(surface.layout.height)
-            {
-                region = vec![bounds];
-            }
-        }
     }
     for chrome in &draw.chrome {
         region.push(output.project(*chrome, true).ok_or(())?);
@@ -320,11 +363,12 @@ pub(crate) fn compute(scene: &Scene, draws: &[Draw], revision: u64) -> CoverageS
         ..Default::default()
     };
     let mut ordered = scene.surfaces.iter().collect::<Vec<_>>();
+    let draws: HashMap<_, _> = draws.iter().map(|draw| (draw.id, draw)).collect();
     ordered.sort_by_key(|s| std::cmp::Reverse(s.layout.z));
     for candidate in &ordered {
         let mut intersects = false;
         let mut decision = TreeVisibility::Occluded;
-        let Some(draw) = draws.iter().find(|d| d.id == candidate.id) else {
+        let Some(draw) = draws.get(&candidate.id) else {
             result
                 .surfaces
                 .insert(candidate.id, TreeVisibility::Unknown);
@@ -363,7 +407,7 @@ pub(crate) fn compute(scene: &Scene, draws: &[Draw], revision: u64) -> CoverageS
                 if above.family == candidate.family || !above.layout.visible {
                     continue;
                 }
-                let Some(above_draw) = draws.iter().find(|d| d.id == above.id) else {
+                let Some(above_draw) = draws.get(&above.id) else {
                     continue;
                 };
                 match opaque_region(above, above_draw, output) {
@@ -398,21 +442,22 @@ pub(crate) fn compute(scene: &Scene, draws: &[Draw], revision: u64) -> CoverageS
         result.surfaces.insert(candidate.id, decision);
     }
     // Any exposed/unknown member keeps the entire canonical family progressing.
-    let individual = result.surfaces.clone();
-    result.content = individual.clone();
+    result.content = result.surfaces.clone();
+    let mut families = HashMap::new();
     for surface in &scene.surfaces {
-        let family = scene.surfaces.iter().filter(|s| s.family == surface.family);
-        let mut decision = TreeVisibility::Occluded;
-        for member in family {
-            match individual.get(&member.id).copied().unwrap_or_default() {
-                TreeVisibility::Visible => {
-                    decision = TreeVisibility::Visible;
-                    break;
-                }
-                TreeVisibility::Unknown => decision = TreeVisibility::Unknown,
-                TreeVisibility::Occluded => (),
+        let decision = families
+            .entry(surface.family)
+            .or_insert(TreeVisibility::Occluded);
+        match result.content.get(&surface.id).copied().unwrap_or_default() {
+            TreeVisibility::Visible => *decision = TreeVisibility::Visible,
+            TreeVisibility::Unknown if *decision != TreeVisibility::Visible => {
+                *decision = TreeVisibility::Unknown
             }
+            _ => (),
         }
+    }
+    for surface in &scene.surfaces {
+        let mut decision = families[&surface.family];
         if !surface.layout.visible {
             decision = TreeVisibility::Unknown;
         }
@@ -445,6 +490,7 @@ pub(crate) fn extract(
         Option<Res<Assets<crate::chrome_frame_material::ChromeFrameMaterial>>>,
     >,
     visibility: bevy::render::Extract<Query<&ViewVisibility>>,
+    inherited_visibility: bevy::render::Extract<Query<&InheritedVisibility>>,
     cameras: bevy::render::Extract<
         Query<(
             &Camera,
@@ -539,28 +585,15 @@ pub(crate) fn extract(
             rounded: material.corner_radius > 0.0,
             chrome: Vec::new(),
             ready: entity.layout == s.layout
-                && entity.applied_commit == s.content
                 && visibility.get(entity.entity).is_ok_and(|v| v.get()),
+            sampled: entity.applied_commit == s.content,
         };
-        // Partial viewport regions need the exact source-to-destination filter
-        // footprint. Until supplied, only format-opaque or complete regions count.
-        if s.layout.source.is_some() && !draw.opaque {
-            let full = s.opacity.operations.as_ref().is_some_and(|ops| {
-                ops.len() == 1
-                    && ops[0].0
-                    && ops[0].1.x <= 0.0
-                    && ops[0].1.y <= 0.0
-                    && ops[0].1.x + ops[0].1.w >= f64::from(s.layout.width)
-                    && ops[0].1.y + ops[0].1.h >= f64::from(s.layout.height)
-            });
-            if !full {
-                draw.ready = false;
-            }
-        }
         if let (Some(deco), Some(toplevel), Some(chrome)) =
             (&entity.decoration, s.layout.toplevel, chrome.as_ref())
             && let Some(frame) = chrome.get(&deco.frame_material)
             && frame.square_opaque
+            && inherited_visibility.get(deco.root).is_ok_and(|v| v.get())
+            && visibility.get(deco.frame).is_ok_and(|v| v.get())
         {
             let layout = &deco.chrome_layout;
             let offset = layout.content_offset();
@@ -603,12 +636,16 @@ pub(crate) fn resolve(
     cache: &mut CoverageCache,
 ) {
     let mut draws = extracted.draws.clone();
+    let content: HashMap<_, _> = extracted
+        .scene
+        .surfaces
+        .iter()
+        .map(|s| (s.id, s.content))
+        .collect();
     for draw in &mut draws {
-        draw.ready &= extracted
-            .scene
-            .surfaces
-            .iter()
-            .any(|s| s.id == draw.id && sampled.get(&s.id) == Some(&s.content));
+        draw.sampled &= content
+            .get(&draw.id)
+            .is_some_and(|seq| sampled.get(&draw.id) == Some(seq));
     }
     let key = (extracted.revision, draws, extracted.scene.outputs.clone());
     let mut exchange = bridge.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -632,6 +669,287 @@ pub(crate) fn resolve(
 mod tests {
     use super::*;
     use crate::protocol::{SurfaceStackKey, SurfaceTransform};
+    use bevy::{ecs::system::RunSystemOnce, render::MainWorld};
+
+    fn extraction_fixture(scene: Scene) -> World {
+        use crate::client_surface_material::{ClientSurfaceImage, ClientSurfaceMaterial};
+        use crate::compositor_scene::{
+            LogicalCanvasSize, RendererOutputScale120, SurfaceEntities, SurfaceEntity,
+        };
+        let (reporter, _) = crate::protocol::FramePresentationReporter::test_channel();
+        let mut main = MainWorld::default();
+        main.init_resource::<SurfaceEntities>();
+        main.init_resource::<Assets<ClientSurfaceMaterial>>();
+        main.init_resource::<Assets<crate::chrome_frame_material::ChromeFrameMaterial>>();
+        main.insert_resource(RendererOutputScale120(300));
+        main.insert_resource(LogicalCanvasSize(Vec2::new(100.0, 80.0)));
+        let visible = ViewVisibility::VISIBLE;
+        for s in &scene.surfaces {
+            let entity = main.spawn(visible).id();
+            let material = main.resource_mut::<Assets<ClientSurfaceMaterial>>().add(
+                ClientSurfaceMaterial::new(
+                    &ClientSurfaceImage::encoded_premultiplied_unorm(Handle::default()),
+                    s.format_opaque,
+                ),
+            );
+            main.resource_mut::<SurfaceEntities>().surfaces.insert(
+                s.id,
+                SurfaceEntity::coverage_fixture(entity, material, s.layout),
+            );
+        }
+        main.spawn((
+            Camera {
+                viewport: Some(bevy::camera::Viewport {
+                    physical_size: UVec2::new(250, 200),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            GlobalTransform::IDENTITY,
+            Projection::Orthographic(OrthographicProjection {
+                area: bevy::math::Rect::new(-50.0, -40.0, 50.0, 40.0),
+                ..OrthographicProjection::default_2d()
+            }),
+            crate::capture::CaptureOutputSource {
+                source_id: scene.outputs[0].source_id.clone(),
+                output_name: scene.outputs[0].name.clone(),
+            },
+        ));
+        {
+            let mut exchange = reporter.occlusion.0.lock().unwrap();
+            exchange.scene = scene;
+            exchange.revision = 1;
+        }
+        let mut render = World::new();
+        render.insert_resource(main);
+        render.insert_resource(reporter);
+        render.init_resource::<ExtractedCoverage>();
+        render
+    }
+
+    fn extracted_decision(world: &mut World, sampled: HashMap<SurfaceId, u64>) -> TreeVisibility {
+        world.run_system_once(extract).unwrap();
+        let bridge = world
+            .resource::<crate::protocol::FramePresentationReporter>()
+            .occlusion
+            .clone();
+        let mut cache = CoverageCache::default();
+        resolve(
+            world.resource::<ExtractedCoverage>(),
+            &sampled,
+            &bridge,
+            &mut cache,
+        );
+        cache.result.surfaces[&SurfaceId(1)]
+    }
+
+    #[test]
+    fn occlusion_extract_destination_only_scaling_rejects_partial_regions() {
+        let (mut scene, _) = fixture();
+        scene.surfaces[0].layout.x = 20.0;
+        scene.surfaces[0].layout.y = 20.0;
+        scene.surfaces[0].layout.width = 20.0;
+        scene.surfaces[0].layout.height = 20.0;
+        scene.surfaces[1].layout.width = 1920.0;
+        scene.surfaces[1].layout.height = 1080.0;
+        scene.surfaces[1].buffer_size = Some((640, 360));
+        scene.surfaces[1].format_opaque = false;
+        scene.surfaces[1].opacity.operations =
+            Some(vec![(true, Bounds::new(0.0, 0.0, 1800.0, 1080.0))]);
+        let mut world = extraction_fixture(scene);
+        assert_ne!(
+            extracted_decision(
+                &mut world,
+                HashMap::from([(SurfaceId(1), 1), (SurfaceId(2), 1)])
+            ),
+            TreeVisibility::Occluded,
+            "destination-only upscale must not certify a partial region"
+        );
+        // Same partial region is usable when the buffer really is 1:1.
+        world
+            .resource::<crate::protocol::FramePresentationReporter>()
+            .occlusion
+            .0
+            .lock()
+            .unwrap()
+            .scene
+            .surfaces[1]
+            .buffer_size = Some((1920, 1080));
+        assert_eq!(
+            extracted_decision(
+                &mut world,
+                HashMap::from([(SurfaceId(1), 1), (SurfaceId(2), 1)])
+            ),
+            TreeVisibility::Occluded
+        );
+    }
+
+    #[test]
+    fn occlusion_extract_mismatch_fails_open_but_candidate_content_does_not_gate() {
+        use crate::compositor_scene::SurfaceEntities;
+        let (scene, _) = fixture();
+        let mut world = extraction_fixture(scene);
+        let sampled = HashMap::from([(SurfaceId(1), 1), (SurfaceId(2), 1)]);
+        assert_eq!(
+            extracted_decision(&mut world, sampled.clone()),
+            TreeVisibility::Occluded
+        );
+        world
+            .resource_mut::<MainWorld>()
+            .resource_mut::<SurfaceEntities>()
+            .surfaces
+            .get_mut(&SurfaceId(2))
+            .unwrap()
+            .layout
+            .x += 1.0;
+        assert_ne!(
+            extracted_decision(&mut world, sampled.clone()),
+            TreeVisibility::Occluded
+        );
+        {
+            let mut main = world.resource_mut::<MainWorld>();
+            let mut entities = main.resource_mut::<SurfaceEntities>();
+            entities.surfaces.get_mut(&SurfaceId(2)).unwrap().layout.x -= 1.0;
+            entities
+                .surfaces
+                .get_mut(&SurfaceId(1))
+                .unwrap()
+                .applied_commit = 0;
+        }
+        assert_eq!(
+            extracted_decision(
+                &mut world,
+                HashMap::from([(SurfaceId(1), 0), (SurfaceId(2), 1)])
+            ),
+            TreeVisibility::Occluded,
+            "candidate content is irrelevant to coverage of its stable bounds"
+        );
+    }
+
+    #[test]
+    fn occlusion_extract_chrome_requires_square_visible_root() {
+        use crate::{
+            chrome_frame_material::ChromeFrameMaterial,
+            compositor_scene::SurfaceEntities,
+            decoration_scene::DecorationEntities,
+            protocol::{SceneDecorationMode, SceneWindowGeometry, ToplevelSceneState},
+        };
+        let (mut scene, _) = fixture();
+        scene.surfaces[1].layout.y = 50.0;
+        scene.surfaces[1].layout.toplevel = Some(ToplevelSceneState {
+            decoration: SceneDecorationMode::ServerSide,
+            focused: true,
+            committed_maximized: true,
+            committed_fullscreen: false,
+            window_geometry: SceneWindowGeometry {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 80.0,
+            },
+            chrome_pointer: Default::default(),
+        });
+        let mut world = extraction_fixture(scene);
+        let visible = ViewVisibility::VISIBLE;
+        let (root, material) = {
+            let mut main = world.resource_mut::<MainWorld>();
+            let root = main.spawn((visible, InheritedVisibility::VISIBLE)).id();
+            let material =
+                main.resource_mut::<Assets<ChromeFrameMaterial>>()
+                    .add(ChromeFrameMaterial {
+                        square_opaque: true,
+                        size: Vec2::new(102.0, 114.0),
+                        corner_radius: 0.0,
+                        titlebar_bottom: 30.0,
+                        divider_thickness: 1.0,
+                        border_insets: Vec4::ONE,
+                        titlebar_color: Color::WHITE,
+                        divider_color: Color::WHITE,
+                        border_color: Color::WHITE,
+                    });
+            main.resource_mut::<SurfaceEntities>()
+                .surfaces
+                .get_mut(&SurfaceId(2))
+                .unwrap()
+                .decoration = Some(DecorationEntities::coverage_fixture(root, material.clone()));
+            (root, material)
+        };
+        world.run_system_once(extract).unwrap();
+        let band = world
+            .resource::<ExtractedCoverage>()
+            .draws
+            .iter()
+            .find(|d| d.id == SurfaceId(2))
+            .unwrap()
+            .chrome[0];
+        // Put the victim solely under the title band, outside client content.
+        let layout = {
+            let reporter = world.resource::<crate::protocol::FramePresentationReporter>();
+            let mut exchange = reporter.occlusion.0.lock().unwrap();
+            let layout = &mut exchange.scene.surfaces[0].layout;
+            layout.x = (band.x + 5.0) as f32;
+            layout.y = (band.y + 5.0) as f32;
+            layout.width = 5.0;
+            layout.height = 5.0;
+            *layout
+        };
+        world
+            .resource_mut::<MainWorld>()
+            .resource_mut::<SurfaceEntities>()
+            .surfaces
+            .get_mut(&SurfaceId(1))
+            .unwrap()
+            .layout = layout;
+        let sampled = HashMap::from([(SurfaceId(1), 1), (SurfaceId(2), 1)]);
+        assert_eq!(
+            extracted_decision(&mut world, sampled.clone()),
+            TreeVisibility::Occluded
+        );
+        world
+            .resource_mut::<MainWorld>()
+            .resource_mut::<Assets<ChromeFrameMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .square_opaque = false;
+        assert_ne!(
+            extracted_decision(&mut world, sampled.clone()),
+            TreeVisibility::Occluded,
+            "floating rounded chrome is not a band occluder"
+        );
+        world
+            .resource_mut::<MainWorld>()
+            .resource_mut::<Assets<ChromeFrameMaterial>>()
+            .get_mut(&material)
+            .unwrap()
+            .square_opaque = true;
+        world
+            .resource_mut::<MainWorld>()
+            .entity_mut(root)
+            .insert(InheritedVisibility::HIDDEN);
+        assert_ne!(
+            extracted_decision(&mut world, sampled),
+            TreeVisibility::Occluded,
+            "hidden decoration root cannot occlude"
+        );
+    }
+
+    #[test]
+    fn occlusion_unioned_full_region_has_no_sampling_seams() {
+        let (mut scene, mut draws) = fixture();
+        draws[1].opaque = false;
+        scene.surfaces[1].opacity.operations = Some(vec![
+            (true, Bounds::new(0.0, 0.0, 50.0, 80.0)),
+            (true, Bounds::new(50.0, 0.0, 50.0, 80.0)),
+        ]);
+        assert!(hidden(&scene, &draws));
+        scene.surfaces[1]
+            .opacity
+            .operations
+            .as_mut()
+            .unwrap()
+            .push((false, Bounds::new(49.0, 0.0, 1.0, 80.0)));
+        assert!(!hidden(&scene, &draws));
+    }
 
     fn fixture() -> (Scene, Vec<Draw>) {
         let surfaces = (1..=2)
@@ -640,6 +958,8 @@ mod tests {
                 family: SurfaceId(id),
                 generation: 1,
                 content: 1,
+                buffer_size: Some((100, 80)),
+                format_opaque: true,
                 opacity: CommittedOpacity {
                     operations: Some(Vec::new()),
                 },
@@ -680,6 +1000,7 @@ mod tests {
                 rounded: false,
                 chrome: Vec::new(),
                 ready: true,
+                sampled: true,
             })
             .collect();
         (scene, draws)
@@ -702,6 +1023,18 @@ mod tests {
         assert!(!hidden(&scene, &draws));
         draws[1].rounded = false; // maximised hard edge
         assert!(hidden(&scene, &draws));
+        // A fractional raster edge matters at 2.5, even though the logical
+        // occluder extends past the candidate. At scale 1 both edges cover 99px;
+        // at 2.5 the candidate needs pixel 248 and inward coverage ends at 247.
+        let mut scene = scene;
+        draws[0].bounds.w = 99.0;
+        draws[1].bounds.w = 99.1;
+        scene.outputs[0].scale = 1.0;
+        scene.outputs[0].scale_y = 1.0;
+        assert!(hidden(&scene, &draws));
+        scene.outputs[0].scale = 2.5;
+        scene.outputs[0].scale_y = 2.5;
+        assert!(!hidden(&scene, &draws));
     }
 
     #[test]
@@ -847,10 +1180,9 @@ mod tests {
     }
 
     #[test]
-    fn occlusion_negative_origin_and_rotated_output_use_displayed_coordinates_once() {
+    fn occlusion_negative_output_origin() {
         let (mut scene, mut draws) = fixture();
         scene.outputs[0].bounds.x = -100.0;
-        scene.outputs[0].transform = smithay::utils::Transform::_90;
         for d in &mut draws {
             d.bounds.x = -100.0;
         }
@@ -927,6 +1259,19 @@ mod tests {
         assert_eq!(output.bounds, Bounds::new(0.0, 0.0, 100.0, 80.0));
         assert_eq!((output.scale, output.scale_y), (2.51, 2.5));
         assert_eq!(output.generation, 1);
+        // Camera rotation is unsupported proof, independently of the scanout
+        // transform. Exercise extraction rather than asserting inert metadata.
+        render
+            .resource_mut::<MainWorld>()
+            .entity_mut(camera)
+            .insert(GlobalTransform::from(Transform::from_rotation(
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+            )));
+        render.run_system_once(extract).unwrap();
+        assert_eq!(
+            render.resource::<ExtractedCoverage>().scene.outputs[0].generation,
+            0
+        );
         render.resource_mut::<MainWorld>().despawn(camera);
         render.run_system_once(extract).unwrap();
         assert_eq!(

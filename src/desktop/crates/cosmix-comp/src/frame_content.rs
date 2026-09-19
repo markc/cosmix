@@ -246,6 +246,8 @@ fn resolve_frame_content(
         apply_presentation_coverage(
             &mut content.0,
             &coverage_cache.result,
+            // Include unproven outputs: absence of camera evidence cannot prove
+            // this shared report covers only one output (0.61 conservative limit).
             coverage.scene.outputs.len(),
         );
     }

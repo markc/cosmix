@@ -176,11 +176,35 @@ pub(crate) struct DecorationEntities {
     pub(crate) chrome_layout: ChromeLayout,
     shadow: Entity,
     shadow_material: Handle<ShadowMaterial>,
-    frame: Entity,
+    pub(crate) frame: Entity,
     pub(crate) frame_material: Handle<ChromeFrameMaterial>,
     title: Entity,
     buttons: Vec<(CaptionButton, Entity)>,
     glyphs: Vec<(CaptionButton, usize, Entity)>,
+}
+
+#[cfg(test)]
+impl DecorationEntities {
+    pub(crate) fn coverage_fixture(
+        root: Entity,
+        frame_material: Handle<ChromeFrameMaterial>,
+    ) -> Self {
+        Self {
+            root,
+            frame_material,
+            client_transform: Transform::default(),
+            chrome_layout: ChromeLayout::compute(
+                &cosmix_deco::presets::win11(cosmix_deco::Mode::Light),
+                vec2(100.0, 80.0),
+            ),
+            shadow: root,
+            shadow_material: Handle::default(),
+            frame: root,
+            title: root,
+            buttons: Vec::new(),
+            glyphs: Vec::new(),
+        }
+    }
 }
 
 impl Plugin for ChromeTypographyPlugin {
@@ -960,7 +984,7 @@ fn update_static_decoration(
         theme.titlebar_fill(focus),
         theme.colors.titlebar_divider,
         theme.border(focus),
-        toplevel.committed_maximized || toplevel.committed_fullscreen,
+        toplevel.committed_maximized, // Fullscreen removes SSD entirely.
     );
     let projected_title =
         projected_child_rect(chrome.title_slot, outer_origin, root_origin, scale120);

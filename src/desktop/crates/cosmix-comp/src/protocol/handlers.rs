@@ -688,6 +688,8 @@ impl CompositorHandler for WaylandState {
             .get(&surface.id())
             .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)));
         if valid_bufferless_opacity {
+            // Common applied-transaction path: layers and subsurfaces recapture
+            // region-setting commits here too, not only xdg toplevels.
             self.capture_bufferless_opacity(surface);
         }
         let is_lock = self
@@ -711,6 +713,7 @@ impl CompositorHandler for WaylandState {
 
     fn transaction_applied(&mut self) {
         self.take_presentation_commits();
+        self.limit_occluded_callbacks();
         self.pointer_hit_test_transaction_applying = false;
         self.reconcile_deferred_pointer_hit_test();
     }

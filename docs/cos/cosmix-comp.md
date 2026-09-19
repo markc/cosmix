@@ -21,7 +21,9 @@ viewport and projection supply the origin and X/Y pixel ratios; missing or
 generation-mismatched camera evidence permits callbacks. Unknown state, excessive
 region fragmentation and stale scene revisions permit callbacks. Scene changes
 invalidate coverage; the next existing frame opportunity drains retained
-callbacks once with the current monotonic millisecond timestamp. No occlusion
+callbacks once with the current monotonic millisecond timestamp. Content-only
+commits preserve coverage decisions; installed content is checked separately for
+occluders. No occlusion
 polling timer or victim commit is required.
 
 Maximised SSD frames have square opaque chrome bands without outer/inner edge
@@ -32,22 +34,37 @@ work areas or exposed strips of wallpaper correctly prevent withholding.
 Read `comp.props.get` paths `surfaces.s<id>.occluded`, `occlusion_reason`
 (`unknown`, `exposed`, `opaque-coverage`) and `occlusion_revision`. These leaves
 are mirrored under `windows.s<id>` where a window row exists. Layer and X11
-surfaces remain observable under `surfaces`. `occlusion_counters` contains
+surfaces remain observable under `surfaces`. `occlusion.counters` contains
 compositor-wide `withheld_opportunities`, `resumes`, `recomputes` and
 `conservative_fallbacks`; these read-only counters do not emit property changes.
 Withheld opportunities count eligible root-tree pulse opportunities, not dropped
-callbacks. `comp_occlusion_transition` traces surface id, occluded flag and
+callbacks. Resumes count actual delivery of retained callbacks, not transitions
+to unknown visibility. While occluded, each surface retains at most 64 committed
+callbacks: excess older callbacks receive `done` immediately (fail-open), without
+discarding protocol objects. This cap does not override session-lock or workspace
+gates. `comp_occlusion_transition` traces surface id, occluded flag and
 revision; existing `comp_callback_done_queued` traces confirm callback delivery.
 
 For single-output presentation reports, covered surfaces receive `discarded`
 feedback only through the content sequence evidenced by that frame. Frame
 callbacks remain queued independently. **0.61.0 limit:** multi-output callback
 coverage is supported, but multi-output presentation retains the existing shared
-content-report semantics. The existing origin-zero canvas predicate in
+content-report semantics. Unproven (generation-zero) outputs still count towards
+this conservative multi-output gate: missing evidence cannot establish that the
+shared report covers a single output. The existing origin-zero canvas predicate in
 `frame_content` remains a presentation-only limit; coverage uses each output's
-origin and displayed orientation independently. Rounded client clips and partial
-viewport opaque regions with unknown sampling footprints are conservatively
-excluded as occluders. Clients must honour their opaque-region declarations and
+origin independently; rotated camera projections fail open. Rounded client clips
+and partial opaque regions with a crop, transform or non-1:1 buffer-to-destination
+ratio (including destination-only viewports and buffer-scale changes) are
+conservatively excluded as occluders. Unioned regions covering the entire surface
+retain clamped outer edges without artificial internal seams.
+
+Coverage bounds come from layout, not the entity's actual transform. Future
+renderer-side offsets or animations must feed occlusion or disable its proof.
+Coverage also relies on draw order matching `SurfaceStackKey`, and chrome bands
+remaining tied to the decoration root's visibility; extraction checks that root
+before crediting bands. These renderer conventions are not enforced by a shared
+geometry/order type. Clients must honour their opaque-region declarations and
 pace rendering on callbacks for CPU savings. Native Quoin's continuous-render
 setting is unchanged.
 

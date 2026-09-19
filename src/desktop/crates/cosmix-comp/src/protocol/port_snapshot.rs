@@ -86,6 +86,7 @@ pub(crate) struct SnapshotContext {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CompSnapshot {
+    pub(crate) occlusion: OcclusionSnapshot,
     pub(crate) info: InfoSnapshot,
     pub(crate) outputs: BTreeMap<String, OutputSnapshot>,
     pub(crate) surfaces: BTreeMap<String, SurfaceSnapshot>,
@@ -102,6 +103,11 @@ pub(crate) struct CompSnapshot {
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     full_tree: tokio::sync::OnceCell<SerialisedReply>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct OcclusionSnapshot {
+    pub(crate) counters: crate::occlusion::Counters,
 }
 
 #[derive(Clone, Debug)]
@@ -415,6 +421,7 @@ impl CompSnapshot {
             return None;
         };
         match *head {
+            "occlusion" => select_serialised(&self.occlusion, tail),
             "info" => self.info.select(tail),
             "outputs" => select_map(&self.outputs, tail, OutputSnapshot::select),
             "surfaces" => select_map(&self.surfaces, tail, SurfaceSnapshot::select),
@@ -438,6 +445,7 @@ impl CompSnapshot {
             return None;
         };
         match *head {
+            "occlusion" => serialised_node_kind(&self.occlusion, tail),
             "info" => self.info.node_kind(tail),
             "outputs" => map_node_kind(&self.outputs, tail, OutputSnapshot::node_kind),
             "surfaces" => map_node_kind(&self.surfaces, tail, SurfaceSnapshot::node_kind),
@@ -919,7 +927,6 @@ fn project_surface_row(
                 .get(&record.id)
                 .copied()
                 .unwrap_or(0),
-            occlusion_counters: None,
         },
         id: record.id.0,
         role: record.role.kind(),
@@ -1152,6 +1159,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
 
     let bindings = state.bindings.port_snapshot();
     Some(CompSnapshot {
+        occlusion: Default::default(),
         info: InfoSnapshot {
             service: context.service.clone(),
             version: context.version.clone(),
@@ -1271,12 +1279,7 @@ pub(super) fn read_snapshot(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .counters;
-    for surface in snapshot.surfaces.values_mut() {
-        surface.occlusion.occlusion_counters = Some(counters);
-    }
-    for window in snapshot.windows.values_mut() {
-        window.occlusion.occlusion_counters = Some(counters);
-    }
+    snapshot.occlusion.counters = counters;
     let stats = &state.presentation.stats;
     for (key, window) in &mut snapshot.windows {
         if !scopes.wants(&format!("windows.{key}.presentation")) {
@@ -1600,32 +1603,22 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Revision of the latest visibility decision transition"
     ),
     volatile!(
-        [
-            L("surfaces"),
-            S,
-            L("occlusion_counters"),
-            L("withheld_opportunities")
-        ],
+        [L("occlusion"), L("counters"), L("withheld_opportunities")],
         Number,
         "Compositor-wide occlusion counter; read-only, never diffed"
     ),
     volatile!(
-        [L("surfaces"), S, L("occlusion_counters"), L("resumes")],
+        [L("occlusion"), L("counters"), L("resumes")],
         Number,
         "Compositor-wide occlusion counter; read-only, never diffed"
     ),
     volatile!(
-        [L("surfaces"), S, L("occlusion_counters"), L("recomputes")],
+        [L("occlusion"), L("counters"), L("recomputes")],
         Number,
         "Compositor-wide occlusion counter; read-only, never diffed"
     ),
     volatile!(
-        [
-            L("surfaces"),
-            S,
-            L("occlusion_counters"),
-            L("conservative_fallbacks")
-        ],
+        [L("occlusion"), L("counters"), L("conservative_fallbacks")],
         Number,
         "Compositor-wide occlusion counter; read-only, never diffed"
     ),
@@ -1643,36 +1636,6 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         &[L("windows"), S, L("occlusion_revision")],
         Number,
         "Revision of the latest visibility decision transition"
-    ),
-    volatile!(
-        [
-            L("windows"),
-            S,
-            L("occlusion_counters"),
-            L("withheld_opportunities")
-        ],
-        Number,
-        "Compositor-wide occlusion counter; read-only, never diffed"
-    ),
-    volatile!(
-        [L("windows"), S, L("occlusion_counters"), L("resumes")],
-        Number,
-        "Compositor-wide occlusion counter; read-only, never diffed"
-    ),
-    volatile!(
-        [L("windows"), S, L("occlusion_counters"), L("recomputes")],
-        Number,
-        "Compositor-wide occlusion counter; read-only, never diffed"
-    ),
-    volatile!(
-        [
-            L("windows"),
-            S,
-            L("occlusion_counters"),
-            L("conservative_fallbacks")
-        ],
-        Number,
-        "Compositor-wide occlusion counter; read-only, never diffed"
     ),
     descriptor!(
         &[L("info"), L("service")],
@@ -2514,9 +2477,8 @@ fn is_false(value: &bool) -> bool {
 pub(crate) fn volatile_path(path: &str) -> bool {
     path == "sources"
         || path.starts_with("sources.")
-        || path
-            .split('.')
-            .any(|segment| matches!(segment, "presentation" | "occlusion_counters"))
+        || path.split('.').any(|segment| segment == "presentation")
+        || path.starts_with("occlusion.counters.")
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -3113,13 +3075,8 @@ mod tests {
                 },
             },
         );
-        for row in surfaces.values_mut() {
-            row.occlusion.occlusion_counters = Some(Default::default());
-        }
-        for row in windows.values_mut() {
-            row.occlusion.occlusion_counters = Some(Default::default());
-        }
         CompSnapshot {
+            occlusion: Default::default(),
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
                 version: Arc::from("0.37.0"),
@@ -3287,6 +3244,16 @@ mod tests {
     /// `props.changed` filters on never disagree.
     #[test]
     fn descriptor_volatility_matches_the_path_rule() {
+        let snapshot = fixture();
+        assert_eq!(
+            snapshot.select(&["occlusion", "counters", "resumes"]),
+            Some(serde_json::json!(0))
+        );
+        assert!(
+            snapshot
+                .select(&["surfaces", "s1", "occlusion_counters"])
+                .is_none()
+        );
         let mut volatile = 0;
         for descriptor in DESCRIPTORS {
             let path = descriptor
@@ -3303,7 +3270,7 @@ mod tests {
             assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
             volatile += usize::from(descriptor.volatile);
         }
-        assert_eq!(volatile, 13 + 8 + 4 + 19 + 8);
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4);
     }
 
     #[test]

@@ -1873,10 +1873,6 @@ fn diff_occlusion(
 fn occlusion_counters_never_emit_changes_but_decisions_do() {
     let old = crate::occlusion::Props::default();
     let mut new = old.clone();
-    new.occlusion_counters = Some(crate::occlusion::Counters {
-        recomputes: 42,
-        ..Default::default()
-    });
     let mut changes = PendingPropChanges::new();
     diff_occlusion("surfaces.s1", &old, &new, "wayland.occlusion", &mut changes);
     assert!(changes.is_empty());
@@ -1901,8 +1897,7 @@ fn diff_surface_row(
     let (old, new) = match (old, new) {
         (None, None) => return,
         (None, Some(new)) => {
-            let mut new = new.clone();
-            new.occlusion.occlusion_counters = None;
+            let new = new.clone();
             queue_prop_change(
                 pending,
                 prefix.into(),
@@ -1913,8 +1908,7 @@ fn diff_surface_row(
             return;
         }
         (Some(old), None) => {
-            let mut old = old.clone();
-            old.occlusion.occlusion_counters = None;
+            let old = old.clone();
             queue_prop_change(
                 pending,
                 prefix.into(),
@@ -2079,10 +2073,6 @@ fn diff_window_row(
                 PropValue::null(),
                 PropValue::WindowRow(Box::new(WindowSnapshot {
                     presentation: None,
-                    occlusion: crate::occlusion::Props {
-                        occlusion_counters: None,
-                        ..new.occlusion.clone()
-                    },
                     ..new.clone()
                 })),
                 cause,
@@ -2095,10 +2085,6 @@ fn diff_window_row(
                 prefix.into(),
                 PropValue::WindowRow(Box::new(WindowSnapshot {
                     presentation: None,
-                    occlusion: crate::occlusion::Props {
-                        occlusion_counters: None,
-                        ..old.occlusion.clone()
-                    },
                     ..old.clone()
                 })),
                 PropValue::null(),

@@ -8677,9 +8677,10 @@ impl WaylandState {
         let frame_time = monotonic_millis();
         self.refresh_occlusion();
         self.count_occlusion_opportunities();
+        self.limit_occluded_callbacks();
         // Once per frame, not once per surface: see `workspaces::on_workspace`.
         let current_workspace = self.workspace_current();
-        let mut delivered = self
+        let roots = self
             .surfaces
             .values()
             .filter(|record| {
@@ -8692,10 +8693,22 @@ impl WaylandState {
                         current_workspace,
                     )
             })
-            .map(|record| {
-                send_frames_surface_tree(record.role.wl_surface(), frame_time, &self.surfaces)
-            })
-            .sum::<usize>();
+            .map(|record| (record.id, record.role.wl_surface().clone()))
+            .collect::<Vec<_>>();
+        let mut delivered = 0;
+        for (id, surface) in roots {
+            let count = send_frames_surface_tree(&surface, frame_time, &self.surfaces);
+            if count > 0 && self.occlusion.withheld.remove(&id) {
+                self.occlusion
+                    .bridge
+                    .0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .counters
+                    .resumes += 1;
+            }
+            delivered += count;
+        }
         if let CursorSelection::Surface(id) = &self.cursor_selection
             && let Some(record) = self.cursor_surfaces.get(id)
             && record.presentation.is_some()
@@ -17060,19 +17073,27 @@ fn send_frames_surface_tree(
     time: u32,
     surfaces: &HashMap<ObjectId, SurfaceRecord>,
 ) -> usize {
+    send_frames_surface_tree_limited(surface, time, surfaces, 0).0
+}
+
+fn send_frames_surface_tree_limited(
+    surface: &WlSurface,
+    time: u32,
+    surfaces: &HashMap<ObjectId, SurfaceRecord>,
+    retain: usize,
+) -> (usize, bool) {
     let mut delivered = 0;
+    let mut retained = false;
     with_surface_tree_downward(
         surface,
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
         |surface, states, &()| {
-            for callback in states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .frame_callbacks
-                .drain(..)
-            {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let callbacks = &mut attributes.current().frame_callbacks;
+            let excess = callbacks.len().saturating_sub(retain);
+            retained |= callbacks.len() > excess;
+            for callback in callbacks.drain(..excess) {
                 callback.done(time);
                 crate::frame_trace::event("comp_callback_done_queued", || {
                     (
@@ -17086,7 +17107,7 @@ fn send_frames_surface_tree(
         },
         |_, _, &()| true,
     );
-    delivered
+    (delivered, retained)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

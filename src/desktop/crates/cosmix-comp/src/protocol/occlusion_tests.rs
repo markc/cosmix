@@ -69,6 +69,7 @@ pub(super) fn certify(
             rounded: false,
             chrome: Vec::new(),
             ready: true,
+            sampled: true,
         })
         .collect::<Vec<_>>();
     let coverage = crate::occlusion::compute(&exchange.scene, &draws, exchange.revision);
@@ -120,6 +121,119 @@ fn occlusion_wire_retains_callbacks_and_exposure_resumes_without_victim_commit()
 }
 
 #[test]
+fn occlusion_wire_content_only_commits_never_flap_or_leak() {
+    let (mut h, first, cover) = fixture();
+    let mut victims = vec![first];
+    for _ in 0..3 {
+        victims.push(map_named_test_toplevel(&mut h, "covered", "test.covered").3);
+    }
+    let callbacks = victims
+        .iter()
+        .map(|v| request(&mut h, v.protocol_id()))
+        .collect::<Vec<_>>();
+    for v in &victims {
+        align(&mut h, v, &cover);
+    }
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    let decisions = h.server.state.occlusion.decisions.clone();
+    let revisions = h.server.state.occlusion.decision_revisions.clone();
+    let rebuilds = h.server.state.occlusion.scene_rebuilds;
+    for _ in 0..20 {
+        // Commit after certification, before the pulse: previously this cleared
+        // all decisions and leaked every covered callback before re-extraction.
+        commit_test_buffer(&mut h, cover.protocol_id());
+        h.dispatch_client();
+        h.frame(Vec::new());
+        let events = h.sync();
+        assert!(
+            !events
+                .iter()
+                .any(|(id, op, _)| callbacks.contains(id) && *op == 0)
+        );
+        assert_eq!(h.server.state.occlusion.decisions, decisions);
+        assert_eq!(h.server.state.occlusion.decision_revisions, revisions);
+        assert_eq!(
+            h.server
+                .state
+                .occlusion
+                .bridge
+                .0
+                .lock()
+                .unwrap()
+                .counters
+                .resumes,
+            0
+        );
+        certify(&mut h, true);
+    }
+    assert_eq!(
+        h.server.state.occlusion.scene_rebuilds, rebuilds,
+        "no full scene rebuild on content-only/idle dispatch"
+    );
+    // These are exactly the three decision leaves diffed for both props rows.
+    // Stable decisions + decision revisions imply zero decision prop changes.
+}
+
+#[test]
+fn occlusion_wire_callback_cap_completes_excess_and_retains_latest() {
+    let (mut h, victim, cover) = fixture();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    let mut callbacks = Vec::new();
+    for _ in 0..70 {
+        callbacks.push(request(&mut h, victim.protocol_id()));
+    }
+    let events = h.sync();
+    let completed = events
+        .iter()
+        .filter(|(id, op, _)| callbacks.contains(id) && *op == 0)
+        .map(|(id, _, _)| *id)
+        .collect::<Vec<_>>();
+    assert_eq!(completed, callbacks[..6]);
+    assert_eq!(
+        h.server
+            .state
+            .occlusion
+            .bridge
+            .0
+            .lock()
+            .unwrap()
+            .counters
+            .resumes,
+        0
+    );
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.frame(Vec::new());
+    let events = h.sync();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(id, op, _)| callbacks.contains(id) && *op == 0)
+            .count(),
+        64
+    );
+    assert_eq!(
+        h.server
+            .state
+            .occlusion
+            .bridge
+            .0
+            .lock()
+            .unwrap()
+            .counters
+            .resumes,
+        1
+    );
+    h.frame(Vec::new());
+    assert!(
+        !h.sync()
+            .iter()
+            .any(|(id, op, _)| callbacks.contains(id) && *op == 0)
+    );
+}
+
+#[test]
 fn occlusion_wire_translucency_and_one_pixel_strip_do_not_withhold() {
     for opaque in [false, true] {
         let (mut h, victim, cover) = fixture();
@@ -163,6 +277,85 @@ fn occlusion_wire_region_only_commit_invalidates_cover() {
     assert_eq!(h.server.state.surfaces[&cover].content_seq, seq);
     h.frame(Vec::new());
     assert_eq!(done(&mut h, callback), 1);
+}
+
+#[test]
+fn occlusion_wire_bufferless_layer_and_subsurface_regions_cover_union() {
+    for layer_role in [false, true] {
+        let (mut h, parent, other) = fixture();
+        let (victim, occluder) = if layer_role {
+            let (layer, _) = map_test_layer_surface(&mut h, 0, TestLayerSpec::default());
+            (
+                parent.clone(),
+                test_layer_record(&h, layer.surface).role.wl_surface().id(),
+            )
+        } else {
+            (
+                other,
+                h.server
+                    .state
+                    .surfaces
+                    .values()
+                    .find(|r| r.role.wl_surface().id().protocol_id() == TEST_SUBSURFACE_SURFACE_ID)
+                    .unwrap()
+                    .role
+                    .wl_surface()
+                    .id(),
+            )
+        };
+        let before = h.server.state.surfaces[&occluder].content_seq;
+        let (width, height) = h.server.state.surfaces[&occluder]
+            .buffer_dimensions
+            .unwrap();
+        let region = h.allocate_object_id();
+        send_request(&mut h.client, TEST_COMPOSITOR_ID, 1, &words(&[region]));
+        send_request(&mut h.client, region, 1, &words(&[0, 0, width / 2, height]));
+        send_request(
+            &mut h.client,
+            region,
+            1,
+            &words(&[width / 2, 0, width - width / 2, height]),
+        );
+        send_request(&mut h.client, occluder.protocol_id(), 4, &words(&[region]));
+        send_request(&mut h.client, occluder.protocol_id(), 6, &[]);
+        if !layer_role {
+            send_request(&mut h.client, parent.protocol_id(), 6, &[]);
+        }
+        h.dispatch_client();
+        assert_eq!(
+            h.server.state.surfaces[&occluder].content_seq, before,
+            "region-setting transaction has no new buffer"
+        );
+        align(&mut h, &victim, &occluder);
+        let id = h.server.state.surfaces[&occluder].id;
+        let victim_id = h.server.state.surfaces[&victim].id;
+        h.server.state.refresh_occlusion();
+        assert_eq!(
+            h.server
+                .state
+                .occlusion
+                .bridge
+                .0
+                .lock()
+                .unwrap()
+                .scene
+                .surfaces
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .opacity
+                .operations
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            certify(&mut h, false).surfaces[&victim_id],
+            TreeVisibility::Occluded,
+            "bufferless region union must remain usable for either role"
+        );
+    }
 }
 
 #[test]
