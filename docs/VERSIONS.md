@@ -38,7 +38,7 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.89.0 |
+| `cosmix-lib-mix` | 0.89.1 |
 | `cosmix-mix` | 0.89.0 |
 | `mix-bench` | 0.1.0 |
 
@@ -115,7 +115,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
 | `cosmix-quoin` | 0.12.3 |
-| `cosmix-scene` | 0.1.1 |
+| `cosmix-scene` | 0.2.0 |
 | `cosmix-scene-bevy` | 0.1.3 |
 | `cosmix-shell` | 0.11.0 |
 | `cosmix-shell-host` | 0.6.10 |
