@@ -264,6 +264,7 @@ impl CompositorHandler for WaylandState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        self.invalidate_committed_opacity(surface);
         self.committed_surfaces.insert(surface.id());
         self.note_presentation_commit(surface);
         // Smithay invokes this handler only when a transaction is applied.
@@ -507,6 +508,7 @@ impl CompositorHandler for WaylandState {
             .get(&surface.id())
             .is_some_and(|record| self.surface_is_renderer_presentable(record));
 
+        let mut valid_bufferless_opacity = false;
         match buffer {
             Some(BufferAssignment::NewBuffer(buffer)) => {
                 self.commit_new_buffer(
@@ -588,6 +590,7 @@ impl CompositorHandler for WaylandState {
                         buffer_transform,
                     ) {
                         Ok(presentation) => {
+                            valid_bufferless_opacity = true;
                             let window_geometry = self.committed_toplevel_window_geometry(
                                 surface,
                                 presentation.size,
@@ -684,6 +687,9 @@ impl CompositorHandler for WaylandState {
             .surfaces
             .get(&surface.id())
             .is_some_and(|record| matches!(record.role, SurfaceRole::Layer(_)));
+        if valid_bufferless_opacity {
+            self.capture_bufferless_opacity(surface);
+        }
         let is_lock = self
             .surfaces
             .get(&surface.id())

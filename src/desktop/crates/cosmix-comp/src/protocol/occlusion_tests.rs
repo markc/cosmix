@@ -310,3 +310,43 @@ fn occlusion_wire_unmapped_child_preserves_bootstrap_delivery() {
         );
     });
 }
+
+#[test]
+fn occlusion_refused_content_cannot_lend_opacity_to_retained_texture() {
+    let (mut h, victim, cover) = fixture();
+    let callback = request(&mut h, victim.protocol_id());
+    let region = h.allocate_object_id();
+    send_request(&mut h.client, TEST_COMPOSITOR_ID, 1, &words(&[region]));
+    send_request(&mut h.client, region, 1, &words(&[0, 0, 4096, 4096]));
+    send_request(&mut h.client, cover.protocol_id(), 4, &words(&[region]));
+    send_request(&mut h.client, cover.protocol_id(), 6, &[]);
+    h.dispatch_client();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, false);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
+    let record = &h.server.state.surfaces[&cover];
+    let surface = record.role.wl_surface().clone();
+    let buffer = record.dmabuf_backing.as_ref().unwrap().buffer.clone();
+    // Model the soft-refusal boundary (e.g. duplicating a DMA-BUF fd fails):
+    // an applied replacement is consumed but no new content is published.
+    compositor::with_states(&surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .buffer = Some(BufferAssignment::NewBuffer(buffer));
+    });
+    h.server.state.invalidate_committed_opacity(&surface);
+    compositor::with_states(&surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .buffer = None;
+    });
+    h.server.state.capture_bufferless_opacity(&surface);
+    certify(&mut h, false);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+}

@@ -219,6 +219,7 @@ impl Default for Props {
 #[derive(Default)]
 pub(crate) struct Exchange {
     pub revision: u64,
+    pub exhausted: bool,
     pub scene: Scene,
     pub coverage: CoverageSnapshot,
     pub counters: Counters,

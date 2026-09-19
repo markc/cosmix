@@ -8,6 +8,8 @@ pub(super) struct OcclusionRuntime {
     pub decisions: HashMap<SurfaceId, TreeVisibility>,
     pub revision: u64,
     pub decision_revisions: HashMap<SurfaceId, u64>,
+    opacity: HashMap<SurfaceId, (u64, u64, CommittedOpacity)>,
+    refused_opacity: HashSet<SurfaceId>,
 }
 impl OcclusionRuntime {
     pub fn is_occluded(&self, id: SurfaceId) -> bool {
@@ -16,6 +18,76 @@ impl OcclusionRuntime {
 }
 
 impl WaylandState {
+    pub(super) fn invalidate_committed_opacity(&mut self, surface: &WlSurface) {
+        if let Some(record) = self.surfaces.get(&surface.id()) {
+            self.occlusion.opacity.remove(&record.id);
+            let replacing = compositor::with_states(surface, |states| {
+                matches!(
+                    states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer,
+                    Some(BufferAssignment::NewBuffer(_))
+                )
+            });
+            if replacing {
+                self.occlusion.refused_opacity.insert(record.id);
+            }
+        }
+    }
+
+    pub(super) fn capture_bufferless_opacity(&mut self, surface: &WlSurface) {
+        if self
+            .surfaces
+            .get(&surface.id())
+            .is_some_and(|r| self.occlusion.refused_opacity.contains(&r.id))
+        {
+            return;
+        }
+        self.capture_committed_opacity(surface);
+    }
+
+    /// Called only after accepting a new buffer or a valid bufferless applied
+    /// transaction. Soft-refused buffers cannot lend newer opacity to retained
+    /// old content. The renderer additionally checks the installed sequence.
+    pub(super) fn capture_committed_opacity(&mut self, surface: &WlSurface) {
+        let Some(record) = self.surfaces.get(&surface.id()) else {
+            return;
+        };
+        let opacity =
+            compositor::with_states(surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let operations = attributes.current().opaque_region.as_ref().map_or(
+                    Some(Vec::new()),
+                    |region| {
+                        (region.rects.len() <= 256).then(|| {
+                            region
+                                .rects
+                                .iter()
+                                .map(|(kind, r)| {
+                                    (
+                                        matches!(kind, RectangleKind::Add),
+                                        Bounds::new(
+                                            f64::from(r.loc.x),
+                                            f64::from(r.loc.y),
+                                            f64::from(r.size.w),
+                                            f64::from(r.size.h),
+                                        ),
+                                    )
+                                })
+                                .collect()
+                        })
+                    },
+                );
+                CommittedOpacity { operations }
+            });
+        self.occlusion
+            .opacity
+            .insert(record.id, (record.generation, record.content_seq, opacity));
+        self.occlusion.refused_opacity.remove(&record.id);
+    }
+
     /// Reconcile at protocol dispatch boundaries AND before each callback pulse.
     /// Comparing the entire applied scene makes invalidation independent of
     /// Bus feature flags and of individual mutation sites remembering a hook.
@@ -28,34 +100,15 @@ impl WaylandState {
         for record in self.surfaces.values() {
             let root = canonical_root_surface(&self.popup_manager, record.role.wl_surface());
             let family = self.surfaces.get(&root.id()).map_or(record.id, |r| r.id);
-            let opacity = compositor::with_states(record.role.wl_surface(), |states| {
-                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-                let current = attributes.current();
-                let operations =
-                    current
-                        .opaque_region
-                        .as_ref()
-                        .map_or(Some(Vec::new()), |region| {
-                            (region.rects.len() <= 256).then(|| {
-                                region
-                                    .rects
-                                    .iter()
-                                    .map(|(kind, r)| {
-                                        (
-                                            matches!(kind, RectangleKind::Add),
-                                            Bounds::new(
-                                                f64::from(r.loc.x),
-                                                f64::from(r.loc.y),
-                                                f64::from(r.size.w),
-                                                f64::from(r.size.h),
-                                            ),
-                                        )
-                                    })
-                                    .collect()
-                            })
-                        });
-                CommittedOpacity { operations }
-            });
+            let opacity = self
+                .occlusion
+                .opacity
+                .get(&record.id)
+                .filter(|(generation, seq, _)| {
+                    *generation == record.generation && *seq == record.content_seq
+                })
+                .map(|(_, _, opacity)| opacity.clone())
+                .unwrap_or_default();
             scene.surfaces.push(SceneSurface {
                 id: record.id,
                 family,
@@ -66,10 +119,21 @@ impl WaylandState {
             });
         }
         scene.surfaces.sort_by_key(|s| s.id.0);
+        self.occlusion
+            .opacity
+            .retain(|id, _| self.surface_objects.contains_key(id));
+        self.occlusion
+            .refused_opacity
+            .retain(|id| self.surface_objects.contains_key(id));
         let bridge = self.occlusion.bridge.clone();
         let mut exchange = bridge.0.lock().unwrap_or_else(|e| e.into_inner());
         if exchange.scene != scene {
-            exchange.revision = exchange.revision.checked_add(1).unwrap_or(0);
+            exchange.exhausted |= exchange.revision == u64::MAX;
+            exchange.revision = if exchange.exhausted {
+                0
+            } else {
+                exchange.revision + 1
+            };
             exchange.scene = scene;
             exchange.coverage = Default::default();
         }

@@ -15582,6 +15582,7 @@ impl WaylandState {
                         record.scene_snapshot()
                     };
                     self.note_content_published(surface);
+                    self.capture_committed_opacity(surface);
                     self.push_surface_upsert(
                         surface,
                         ProtocolEvent::SurfaceUpserted {
@@ -15764,6 +15765,7 @@ impl WaylandState {
                     record.scene_snapshot()
                 };
                 self.note_content_published(surface);
+                self.capture_committed_opacity(surface);
                 self.push_surface_upsert(
                     surface,
                     ProtocolEvent::SurfaceUpserted {
