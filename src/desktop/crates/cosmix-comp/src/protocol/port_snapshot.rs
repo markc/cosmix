@@ -86,6 +86,7 @@ pub(crate) struct SnapshotContext {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CompSnapshot {
+    pub(crate) occlusion: OcclusionSnapshot,
     pub(crate) info: InfoSnapshot,
     pub(crate) outputs: BTreeMap<String, OutputSnapshot>,
     pub(crate) surfaces: BTreeMap<String, SurfaceSnapshot>,
@@ -102,6 +103,11 @@ pub(crate) struct CompSnapshot {
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     full_tree: tokio::sync::OnceCell<SerialisedReply>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct OcclusionSnapshot {
+    pub(crate) counters: crate::occlusion::Counters,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +153,8 @@ pub(crate) struct RectSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct SurfaceSnapshot {
+    #[serde(flatten)]
+    pub(crate) occlusion: crate::occlusion::Props,
     pub(crate) id: u64,
     pub(crate) role: &'static str,
     pub(crate) mapped: bool,
@@ -225,6 +233,8 @@ pub(crate) struct LayerSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct WindowSnapshot {
+    #[serde(flatten)]
+    pub(crate) occlusion: crate::occlusion::Props,
     pub(crate) id: u64,
     pub(crate) foreign_id: Option<String>,
     pub(crate) title: Option<Arc<str>>,
@@ -411,6 +421,7 @@ impl CompSnapshot {
             return None;
         };
         match *head {
+            "occlusion" => select_serialised(&self.occlusion, tail),
             "info" => self.info.select(tail),
             "outputs" => select_map(&self.outputs, tail, OutputSnapshot::select),
             "surfaces" => select_map(&self.surfaces, tail, SurfaceSnapshot::select),
@@ -434,6 +445,7 @@ impl CompSnapshot {
             return None;
         };
         match *head {
+            "occlusion" => serialised_node_kind(&self.occlusion, tail),
             "info" => self.info.node_kind(tail),
             "outputs" => map_node_kind(&self.outputs, tail, OutputSnapshot::node_kind),
             "surfaces" => map_node_kind(&self.surfaces, tail, SurfaceSnapshot::node_kind),
@@ -602,7 +614,7 @@ macro_rules! window_snapshot {
                     ["presentation", tail @ ..] => {
                         select_serialised(self.presentation.as_ref()?, tail)
                     }
-                    _ => None,
+                    _ => select_serialised(&self.occlusion, path),
                 }
             }
 
@@ -613,7 +625,7 @@ macro_rules! window_snapshot {
                     ["presentation", tail @ ..] => {
                         serialised_node_kind(self.presentation.as_ref()?, tail)
                     }
-                    _ => None,
+                    _ => serialised_node_kind(&self.occlusion, path),
                 }
             }
         }
@@ -766,7 +778,7 @@ impl SurfaceSnapshot {
             ["layer", tail @ ..] => self.layer.as_ref()?.select(tail),
             ["foreign_id"] => serialise_selected(&self.foreign_id),
             ["generation"] => serialise_selected(&self.generation),
-            _ => None,
+            _ => select_serialised(&self.occlusion, path),
         }
     }
 
@@ -785,7 +797,7 @@ impl SurfaceSnapshot {
                 SnapshotNodeKind::Leaf
             }),
             ["layer", tail @ ..] => self.layer.as_ref()?.node_kind(tail),
-            _ => None,
+            _ => serialised_node_kind(&self.occlusion, path),
         }
     }
 }
@@ -900,6 +912,22 @@ fn project_surface_row(
         _ => None,
     };
     SurfaceSnapshot {
+        occlusion: crate::occlusion::Props {
+            occluded: state.occlusion.is_occluded(record.id),
+            occlusion_reason: state
+                .occlusion
+                .decisions
+                .get(&record.id)
+                .copied()
+                .unwrap_or_default()
+                .reason(),
+            occlusion_revision: state
+                .occlusion
+                .decision_revisions
+                .get(&record.id)
+                .copied()
+                .unwrap_or(0),
+        },
         id: record.id.0,
         role: record.role.kind(),
         mapped: record.mapped,
@@ -959,6 +987,7 @@ fn project_surface_row(
 
 pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
     WindowSnapshot {
+        occlusion: surface.occlusion.clone(),
         id: surface.id,
         foreign_id: surface.foreign_id.clone(),
         title: surface.title.clone(),
@@ -1130,6 +1159,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
 
     let bindings = state.bindings.port_snapshot();
     Some(CompSnapshot {
+        occlusion: Default::default(),
         info: InfoSnapshot {
             service: context.service.clone(),
             version: context.version.clone(),
@@ -1242,6 +1272,14 @@ pub(super) fn read_snapshot(
     scopes: &ReadScopes,
 ) -> Option<CompSnapshot> {
     let mut snapshot = snapshot(state, context)?;
+    let counters = state
+        .occlusion
+        .bridge
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .counters;
+    snapshot.occlusion.counters = counters;
     let stats = &state.presentation.stats;
     for (key, window) in &mut snapshot.windows {
         if !scopes.wants(&format!("windows.{key}.presentation")) {
@@ -1549,6 +1587,56 @@ macro_rules! volatile {
 use PatternSegment::{Literal as L, OutputKey as O, SourceKey as C, SurfaceKey as S};
 
 pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
+    descriptor!(
+        &[L("surfaces"), S, L("occluded")],
+        Bool,
+        "Entire canonical family is covered on every intersecting output"
+    ),
+    descriptor!(
+        &[L("surfaces"), S, L("occlusion_reason")],
+        String,
+        "unknown, exposed, or opaque-coverage"
+    ),
+    descriptor!(
+        &[L("surfaces"), S, L("occlusion_revision")],
+        Number,
+        "Revision of the latest visibility decision transition"
+    ),
+    volatile!(
+        [L("occlusion"), L("counters"), L("withheld_opportunities")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [L("occlusion"), L("counters"), L("resumes")],
+        Number,
+        "Surface trees resumed by delivering retained callbacks; read-only, never diffed"
+    ),
+    volatile!(
+        [L("occlusion"), L("counters"), L("recomputes")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    volatile!(
+        [L("occlusion"), L("counters"), L("conservative_fallbacks")],
+        Number,
+        "Compositor-wide occlusion counter; read-only, never diffed"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("occluded")],
+        Bool,
+        "Entire canonical family is covered on every intersecting output"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("occlusion_reason")],
+        String,
+        "unknown, exposed, or opaque-coverage"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("occlusion_revision")],
+        Number,
+        "Revision of the latest visibility decision transition"
+    ),
     descriptor!(
         &[L("info"), L("service")],
         String,
@@ -2390,6 +2478,7 @@ pub(crate) fn volatile_path(path: &str) -> bool {
     path == "sources"
         || path.starts_with("sources.")
         || path.split('.').any(|segment| segment == "presentation")
+        || path.starts_with("occlusion.counters.")
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -2511,7 +2600,10 @@ fn windows_list(snapshot: &CompSnapshot, args: &Value) -> (u8, Arc<str>) {
         Value::Object(object) => object,
         _ => return list_argument("args", "JSON object", "filter object"),
     };
-    if let Some(field) = object.keys().find(|field| !ALLOWED.contains(&field.as_str())) {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !ALLOWED.contains(&field.as_str()))
+    {
         return ControlReply::InvalidArgs {
             field: field.clone(),
             allowed: ALLOWED,
@@ -2811,6 +2903,7 @@ mod tests {
             },
         );
         let layer = SurfaceSnapshot {
+            occlusion: Default::default(),
             id: 1,
             role: "layer",
             mapped: true,
@@ -2844,6 +2937,7 @@ mod tests {
             window: WindowExtras::default(),
         };
         let toplevel = SurfaceSnapshot {
+            occlusion: Default::default(),
             id: 2,
             role: "toplevel",
             mapped: true,
@@ -2921,6 +3015,7 @@ mod tests {
         windows.insert(
             "s2".into(),
             WindowSnapshot {
+                occlusion: Default::default(),
                 id: toplevel.id,
                 foreign_id: toplevel.foreign_id.clone(),
                 title: toplevel.title.clone(),
@@ -2981,6 +3076,7 @@ mod tests {
             },
         );
         CompSnapshot {
+            occlusion: Default::default(),
             info: InfoSnapshot {
                 service: Arc::from("comp-nested"),
                 version: Arc::from("0.37.0"),
@@ -3148,6 +3244,16 @@ mod tests {
     /// `props.changed` filters on never disagree.
     #[test]
     fn descriptor_volatility_matches_the_path_rule() {
+        let snapshot = fixture();
+        assert_eq!(
+            snapshot.select(&["occlusion", "counters", "resumes"]),
+            Some(serde_json::json!(0))
+        );
+        assert!(
+            snapshot
+                .select(&["surfaces", "s1", "occlusion_counters"])
+                .is_none()
+        );
         let mut volatile = 0;
         for descriptor in DESCRIPTORS {
             let path = descriptor
@@ -3164,7 +3270,7 @@ mod tests {
             assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
             volatile += usize::from(descriptor.volatile);
         }
-        assert_eq!(volatile, 13 + 8 + 4 + 19);
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4);
     }
 
     #[test]

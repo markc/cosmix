@@ -1238,13 +1238,8 @@ fn service_surface_edges(state: &mut WaylandState) {
         if old.mapped == final_mapped && !replaced {
             continue;
         }
-        let previous = replaced.then(|| {
-            (
-                old.role.clone(),
-                old.foreign_id.clone(),
-                old.window.clone(),
-            )
-        });
+        let previous =
+            replaced.then(|| (old.role.clone(), old.foreign_id.clone(), old.window.clone()));
         let role = if final_mapped {
             final_record
                 .map(|record| record.role.kind().to_string())
@@ -1846,6 +1841,56 @@ fn diff_output_row(
     }
 }
 
+fn diff_occlusion(
+    prefix: &str,
+    old: &crate::occlusion::Props,
+    new: &crate::occlusion::Props,
+    cause: &'static str,
+    pending: &mut PendingPropChanges,
+) {
+    for (leaf, old, new) in [
+        (
+            "occluded",
+            PropValue::Bool(old.occluded),
+            PropValue::Bool(new.occluded),
+        ),
+        (
+            "occlusion_reason",
+            prop_str(old.occlusion_reason),
+            prop_str(new.occlusion_reason),
+        ),
+        (
+            "occlusion_revision",
+            PropValue::U64(old.occlusion_revision),
+            PropValue::U64(new.occlusion_revision),
+        ),
+    ] {
+        queue_prop_change(pending, format!("{prefix}.{leaf}"), old, new, cause);
+    }
+}
+
+#[test]
+fn occlusion_counters_never_emit_changes_but_decisions_do() {
+    let old = crate::occlusion::Props::default();
+    let mut new = old.clone();
+    let mut changes = PendingPropChanges::new();
+    queue_prop_change(
+        &mut changes,
+        "occlusion.counters.recomputes".into(),
+        PropValue::U64(0),
+        PropValue::U64(42),
+        "wayland.occlusion",
+    );
+    diff_occlusion("surfaces.s1", &old, &new, "wayland.occlusion", &mut changes);
+    assert!(changes.is_empty());
+    new.occluded = true;
+    new.occlusion_reason = "opaque-coverage";
+    new.occlusion_revision = 2;
+    diff_occlusion("surfaces.s1", &old, &new, "wayland.occlusion", &mut changes);
+    assert_eq!(changes.len(), 3);
+    assert!(changes.contains_key("surfaces.s1.occluded"));
+}
+
 fn diff_surface_row(
     prefix: &str,
     old: Option<&SurfaceSnapshot>,
@@ -1853,23 +1898,28 @@ fn diff_surface_row(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
+    if let (Some(old), Some(new)) = (old, new) {
+        diff_occlusion(prefix, &old.occlusion, &new.occlusion, cause, pending);
+    }
     let (old, new) = match (old, new) {
         (None, None) => return,
         (None, Some(new)) => {
+            let new = new.clone();
             queue_prop_change(
                 pending,
                 prefix.into(),
                 PropValue::null(),
-                PropValue::SurfaceRow(Box::new(new.clone())),
+                PropValue::SurfaceRow(Box::new(new)),
                 cause,
             );
             return;
         }
         (Some(old), None) => {
+            let old = old.clone();
             queue_prop_change(
                 pending,
                 prefix.into(),
-                PropValue::SurfaceRow(Box::new(old.clone())),
+                PropValue::SurfaceRow(Box::new(old)),
                 PropValue::null(),
                 cause,
             );
@@ -2018,6 +2068,9 @@ fn diff_window_row(
     cause: &'static str,
     pending: &mut PendingPropChanges,
 ) {
+    if let (Some(old), Some(new)) = (old, new) {
+        diff_occlusion(prefix, &old.occlusion, &new.occlusion, cause, pending);
+    }
     let (old, new) = match (old, new) {
         (None, None) => return,
         (None, Some(new)) => {
@@ -3508,6 +3561,7 @@ mod tests {
         assert_eq!(body["new"]["width"], 640);
 
         let surface = SurfaceSnapshot {
+            occlusion: Default::default(),
             id: 7,
             role: "toplevel",
             mapped: true,

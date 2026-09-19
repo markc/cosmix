@@ -42,6 +42,7 @@ struct ChromeFrameMaterial {
     titlebar_color: vec4<f32>,
     divider_color: vec4<f32>,
     border_color: vec4<f32>,
+    square_opaque: u32,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: ChromeFrameMaterial;
@@ -85,7 +86,7 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
     let local = mesh.uv * material.size;
     let outer_distance = rounded_rect_distance(local, material.size, material.corner_radius);
     let antialias_width = max(fwidth(outer_distance), 0.0001);
-    let outer_coverage = 1.0 - smoothstep(-antialias_width, antialias_width, outer_distance);
+    let outer_coverage = select(1.0 - smoothstep(-antialias_width, antialias_width, outer_distance), 1.0, material.square_opaque != 0u);
     if outer_coverage <= 0.0 {
         discard;
     }
@@ -120,8 +121,10 @@ fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
         );
         let inner_distance = rounded_rect_distance(inner_position, inner_size, inner_radius);
         let inner_antialias_width = max(fwidth(inner_distance), 0.0001);
-        let inner_coverage =
-            1.0 - smoothstep(-inner_antialias_width, inner_antialias_width, inner_distance);
+        let inner_coverage = select(
+            1.0 - smoothstep(-inner_antialias_width, inner_antialias_width, inner_distance),
+            select(0.0, 1.0, all(inner_position >= vec2<f32>(0.0)) && all(inner_position < inner_size)),
+            material.square_opaque != 0u);
         // Source-over, NOT a 4-channel mix(). This material is submitted through
         // straight-alpha blending (SrcAlpha / OneMinusSrcAlpha), so interpolating
         // RGB toward the content colour would multiply by coverage a second time
