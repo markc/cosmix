@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
-use crate::adapter::{AdapterSpec, SessionBus};
+use crate::adapter::{AdapterSpec, SessionBus, adapter_spec};
 use crate::state::AdapterEvent;
 use crate::supervisor::{
     ABORT_STOP, GRACEFUL_STOP, LifecycleCmd, StartedSupervisor, SupervisorHandle,

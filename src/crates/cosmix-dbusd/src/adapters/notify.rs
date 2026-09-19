@@ -692,6 +692,7 @@ fn rfc3339(moment: SystemTime) -> String {
 /// D-Bus interface and the Bus verb dispatch. Mutations happen under
 /// the core lock and enqueue their events before releasing it, so the
 /// publisher receives events in seq order.
+#[derive(Debug)]
 pub(crate) struct NotifyShared {
     core: Mutex<NotifyCore>,
     events: mpsc::Sender<NotifyEvent>,
@@ -830,15 +831,13 @@ impl NotifyShared {
     }
 
     async fn emit_closed(&self, id: u32, reason: CloseReason) {
-        if let Err(error) =
-            NotificationsSignals::notification_closed(&self.emitter, id, reason.code()).await
-        {
+        if let Err(error) = self.emitter.notification_closed(id, reason.code()).await {
             eprintln!("cosmix-dbusd notify: NotificationClosed emission failed: {error}");
         }
     }
 
     async fn emit_invoked(&self, id: u32, action: &str) {
-        if let Err(error) = NotificationsSignals::action_invoked(&self.emitter, id, action).await {
+        if let Err(error) = self.emitter.action_invoked(id, action).await {
             eprintln!("cosmix-dbusd notify: ActionInvoked emission failed: {error}");
         }
     }
@@ -1455,6 +1454,7 @@ fn resolve_args(command: &IncomingCommand) -> Option<Value> {
 /// A started notify server: the shared state and the publisher task.
 /// Dropping it (or ending the run) drops the zbus connection's
 /// interface and the name with it.
+#[derive(Debug)]
 pub(crate) struct NotifyServer {
     pub shared: Arc<NotifyShared>,
     publisher: tokio::task::JoinHandle<Result<()>>,
@@ -1546,7 +1546,8 @@ impl Adapter for NotifyAdapter {
                     .await
                     .map_err(|error| anyhow!("notify: Bus connection: {error:#}"))?,
             );
-            let (server, mut fault_rx) = start_server(&session, Arc::clone(&bus)).await?;
+            let publisher: Arc<dyn EventPublisher> = Arc::clone(&bus);
+            let (server, mut fault_rx) = start_server(&session, publisher).await?;
             ctx.signal_ready();
             let mut shutdown = ctx.shutdown().clone();
             let mut incoming = bus
@@ -1732,7 +1733,7 @@ mod tests {
         }
     }
 
-    #[proxy(
+    #[zbus::proxy(
         interface = "org.freedesktop.Notifications",
         default_service = "org.freedesktop.Notifications",
         default_path = "/org/freedesktop/Notifications"
@@ -2586,7 +2587,8 @@ mod tests {
         let dbus = zbus::fdo::DBusProxy::new(&squatter)
             .await
             .expect("fdo proxy");
-        let owner_before = dbus.get_name_owner(DBUS_NAME).await.expect("owner");
+        let name: zbus::names::BusName<'_> = DBUS_NAME.try_into().expect("valid name");
+        let owner_before = dbus.get_name_owner(name).await.expect("owner");
 
         let session = bus.connect().await;
         let error = start_server(&session, Arc::new(FakePublisher::default()))
@@ -2596,7 +2598,7 @@ mod tests {
             format!("{error:#}").contains("already owned"),
             "the error says what to do: {error:#}"
         );
-        let owner_after = dbus.get_name_owner(DBUS_NAME).await.expect("owner");
+        let owner_after = dbus.get_name_owner(name).await.expect("owner");
         assert_eq!(
             owner_before, owner_after,
             "the existing owner keeps the name"
@@ -2771,7 +2773,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while wired
             .publisher
-            .bodies(props_changed_topic(BUS_SERVICE))
+            .bodies(&props_changed_topic(BUS_SERVICE))
             .is_empty()
         {
             assert!(
@@ -2780,7 +2782,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let diffs = wired.publisher.bodies(props_changed_topic(BUS_SERVICE));
+        let diffs = wired.publisher.bodies(&props_changed_topic(BUS_SERVICE));
         assert!(
             diffs
                 .iter()
