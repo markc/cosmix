@@ -50,7 +50,7 @@ pub use error::{MixError, MixResult};
 pub use evaluator::{
     ArityMode, BusCallFuture, BusCallHandler, BusHandler, CapabilityPolicy,
     DEFAULT_RECURSION_LIMIT, DbFuture, DbHandler, EvalLimits, ExtFn, JmapCall, JmapFuture,
-    JmapHandler, SharedBuf, sync_ext,
+    JmapHandler, MAX_EXPR_DEPTH, SharedBuf, eval_expr_string, sync_ext,
 };
 /// Re-exported so embedders can build a `Value::Map` (which wraps
 /// `IndexMap<String, Value>`) without a version-coupled `indexmap`

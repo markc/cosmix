@@ -1021,8 +1021,10 @@ pub enum CapabilityClass {
     Jmap,
     /// Calls a host-injected Bus verb under DELEGATED identity via the
     /// [`BusCallHandler`](crate::evaluator::BusCallHandler) seam
-    /// (`bus_call`). Distinct from the bare `send`/`emit` broker forms
-    /// (which a sandboxed handler never gets) because the seam is a
+    /// (`bus_call`). The bare `send`/`emit` broker forms are gated
+    /// `Bus` too (since the 0.89.0 capability-gate fix — a policy that
+    /// withholds `Bus` denies them before any arg evaluates), while the
+    /// `bus_call` seam remains separately classed because it is a
     /// *scoped, mediated* control-plane channel the embedder fully
     /// controls: the embedder bounds WHICH verbs are callable (a per-route
     /// exact-verb allowlist) and injects the delegation envelope (the
@@ -1168,6 +1170,18 @@ impl CategoryAllowList {
         CategoryAllowList {
             allowed: allowed.iter().copied().collect(),
         }
+    }
+
+    /// The deny-all-by-category policy: no class beyond `Pure` is
+    /// allowed (`Pure` builtins always pass — they are, by definition,
+    /// side-effect-free computation; note `sleep` is classed Pure and
+    /// pends, which is why the expression mode denies it BY NAME).
+    /// Shell syntax, `send`/`emit`, the address block's implicit sends
+    /// and the reserved Bus builtins (all since 0.89.0), pipes and
+    /// command substitution are denied by class. Embedding hosts use
+    /// this as the starting point for expression evaluation modes.
+    pub fn deny_all() -> Self {
+        CategoryAllowList::new(&[])
     }
 }
 

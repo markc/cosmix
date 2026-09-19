@@ -2783,7 +2783,9 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
 /// error; the default (no policy installed) is fully permissive, so
 /// every existing caller is unaffected. The seam governs the builtin
 /// table (`read_file`/`write_file`/`http_get`/`ssh_run`/`run`/…);
-/// `send`/`emit`/`sh` are separately gated by their own handler seams.
+/// `sh`/`$()`/pipes are gated [`CapabilityClass::Process`] and the bare
+/// `send`/`emit` broker forms [`crate::builtins::CapabilityClass::Bus`]
+/// at their exec sites (since 0.89.0).
 ///
 /// A policy typically classifies `name` via
 /// [`crate::builtins::capability_category`] and allows/denies by class.
@@ -2859,6 +2861,499 @@ impl Default for EvalLimits {
             max_map_len: None,
             max_string_len: None,
         }
+    }
+}
+
+/// Maximum `Expr` tree depth accepted by [`eval_expr_string`]'s static
+/// deny walk. A deeper tree is a clean pre-execution error, never a
+/// stack overflow inside the walk. Distinct from the parser's own
+/// nesting cap (`MAX_NESTING_DEPTH`, which bounds parse *recursion*):
+/// a left-associative operator chain parses iteratively but still
+/// builds a deep tree, so this walk carries its own cap.
+pub const MAX_EXPR_DEPTH: usize = 256;
+
+/// Builtins denied BY NAME in expression mode: each blocks on
+/// wall-clock or host input, and the mode's fuel premise — cost bounded
+/// by the size caps, never by waiting — must hold statically, whatever
+/// policy the host installed (including none). `sleep` is table-classed
+/// `Pure`, so no installed policy stops it; the stdin readers are
+/// `Env`-classed (an installed allowlist can stop them) but block on
+/// host input whenever the host passes `policy: None` — a legal call
+/// shape — so the static deny is what makes the premise unconditional.
+pub const EXPR_MODE_DENIED_BUILTINS: &[&str] = &[
+    "sleep",     // Pure-classed, pends on the tokio timer
+    "readline",  // Env-classed but blocking on host input
+    "read_stdin",
+    "read_stdin_bytes",
+    // The whole output family is Pure-classed (load-bearing for webd's
+    // sieve case), so no installed policy stops it — but a binding
+    // writing to the host daemon's real stdout/stderr is an undocumented
+    // side channel (log injection, per-frame spam). Deny by name.
+    "printf",
+    "eprintf",
+    "write_stdout",
+    "write_stderr",
+    "print_raw",
+    "eprint_raw",
+];
+
+/// Evaluate exactly one Mix expression with preset globals, an optional
+/// capability policy and eval limits — the expression evaluation mode
+/// embedding hosts (e.g. scene hosts) use for small pure expressions.
+///
+/// `source` must be a single expression statement; anything else
+/// (assignment, control flow, multiple statements, lambdas, shell/Bus
+/// constructs) is rejected BEFORE execution — including in untaken
+/// branches (deterministic compile semantics). The static deny walk
+/// additionally rejects `send`/`sh`/`$(…)` expressions, function
+/// literals, first-class calls (`ValueCall`) and dynamic method calls
+/// (`MethodCall`; method-syntax-on-a-builtin like `$s.upper()` desugars
+/// to a bareword `FunctionCall` at parse time and stays allowed), and
+/// any string interpolation part beyond literals and Mix variables
+/// (env-var expansion, in-string command substitution). An
+/// interpolation coalesce default (`"${x ?? …}"`, heredoc bodies
+/// included) is parsed and executed as a full program at RUNTIME, so
+/// the walk statically analyses every payload with the same rules: it
+/// must be a single expression and passes the recursive deny walk
+/// (nested coalesces included). The walk is
+/// depth-capped at [`MAX_EXPR_DEPTH`]. Note the interpolation nuance: a
+/// `${NAME}` Mix-variable part stays ALLOWED and resolves scope-first
+/// with a process-env fallback (so `"${HOME}"` reads the host env — see
+/// the manual); the denial covers the `~`-form env part and command
+/// substitution. Builtins that block on wall-clock or host input
+/// (`sleep`, `readline`, `read_stdin*`) are denied by NAME regardless of
+/// class — see [`EXPR_MODE_DENIED_BUILTINS`]. Ordinary builtins stay
+/// allowed and are gated by `policy` at dispatch, as usual.
+///
+/// Synchronous: the evaluator's async expression path is driven on a
+/// fresh current-thread tokio runtime inside this call (a pure-policy
+/// program never pends on a handler — the Db/Jmap/Bus seam builtins
+/// raise "not available" when no handler is registered), so it must
+/// not be called from within an async execution context. This is a
+/// robustness/fuel boundary, NOT a security sandbox — see
+/// [`CapabilityPolicy`]'s scope note.
+pub fn eval_expr_string(
+    source: &str,
+    globals: &[(&str, Value)],
+    policy: Option<Rc<dyn CapabilityPolicy>>,
+    limits: EvalLimits,
+) -> MixResult<Value> {
+    let mut lexer = crate::lexer::Lexer::new(source);
+    let tokens = lexer.tokenize()?;
+    let mut parser = crate::parser::Parser::new(tokens, source);
+    let stmts = parser.parse_program()?;
+
+    if stmts.len() != 1 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "eval_expr_string: expected exactly one expression statement, \
+                 found {} statements",
+                stmts.len()
+            ),
+        });
+    }
+    let expr = match &stmts[0].kind {
+        StmtKind::Expression(expr) => expr,
+        kind => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "eval_expr_string: not an expression: {}",
+                    expr_mode_construct_name(kind)
+                ),
+            });
+        }
+    };
+
+    expr_mode_deny_walk(expr, 0)?;
+
+    let mut eval = Evaluator::new();
+    if let Some(policy) = policy {
+        eval.set_capability_policy(policy);
+    }
+    let dur = limits.time_limit; // Copy out before set_limits takes ownership
+    eval.set_limits(limits);
+    for (name, value) in globals {
+        eval.set_global(name, value.clone());
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: {}", e),
+        })?;
+    // A statement-free expression never reaches the evaluator's
+    // per-statement deadline poll (if-expression branch bodies DO poll,
+    // via execute_inner) — so arm the wall-clock budget at the future as
+    // well: on expiry the evaluation future is dropped at its next yield
+    // point and the caller gets a clean error. (A single non-yielding
+    // CPU-bound builtin can still overshoot until its next yield; the
+    // blocking-by-nature builtins are statically denied above, which is
+    // the load-bearing bound.)
+    let fut = eval.eval_expr(expr);
+    rt.block_on(async move {
+        match dur {
+            Some(dur) => match tokio::time::timeout(dur, fut).await {
+                Ok(v) => v,
+                Err(_) => Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "eval_expr_string: time limit ({:?}) exceeded",
+                        dur
+                    ),
+                }),
+            },
+            None => fut.await,
+        }
+    })
+}
+
+/// Human name for a statement kind, for [`eval_expr_string`]'s
+/// single-expression rule. Exhaustive by design so a new `StmtKind`
+/// variant fails compilation here rather than slipping through
+/// un-named.
+fn expr_mode_construct_name(kind: &StmtKind) -> &'static str {
+    match kind {
+        StmtKind::Expression(_) => "expression",
+        StmtKind::Assignment { .. } => "assignment",
+        StmtKind::FieldAssignment { .. } => "field assignment",
+        StmtKind::IndexAssignment { .. } => "index assignment",
+        StmtKind::PathAssignment { .. } => "path assignment",
+        StmtKind::If { .. } => "if statement",
+        StmtKind::For { .. } => "for loop",
+        StmtKind::ForEach { .. } => "for-each loop",
+        StmtKind::While { .. } => "while loop",
+        StmtKind::Loop { .. } => "loop statement",
+        StmtKind::Break(_) => "break statement",
+        StmtKind::Continue(_) => "continue statement",
+        StmtKind::BreakIf(..) => "break-if statement",
+        StmtKind::ContinueIf(..) => "continue-if statement",
+        StmtKind::FunctionDef { .. } => "function definition",
+        StmtKind::Return(_) => "return statement",
+        StmtKind::Select { .. } => "select statement",
+        StmtKind::Print { .. } => "print statement",
+        StmtKind::Parse { .. } => "parse statement",
+        StmtKind::Die(_) => "die statement",
+        StmtKind::TryCatch { .. } => "try statement",
+        StmtKind::Export { .. } => "export statement",
+        StmtKind::Alias { .. } => "alias statement",
+        StmtKind::Send { .. } => "send statement",
+        StmtKind::Address { .. } => "address block",
+        StmtKind::Emit { .. } => "emit statement",
+        StmtKind::On { .. } => "on handler registration",
+        StmtKind::Source { .. } => "source statement",
+        StmtKind::Include { .. } => "include statement",
+        StmtKind::Sh { .. } => "sh statement",
+        StmtKind::PipeToExternal { .. } => "pipe statement",
+        StmtKind::Chain { .. } => "chained statements",
+    }
+}
+
+/// Static deny walk for [`eval_expr_string`]: reject the
+/// non-expression constructs BEFORE execution, untaken branches
+/// included. Depth-capped at [`MAX_EXPR_DEPTH`] so a deep tree is a
+/// clean error, not a stack overflow in the walk.
+/// Static analysis for an interpolation coalesce default (`${x ?? …}`):
+/// the payload is lexed/parsed/executed as a full program at runtime by
+/// [`Evaluator::eval_interp_default`], so it must satisfy the mode's
+/// rules statically — exactly one expression statement, then the same
+/// deny walk (which recurses into any nested coalesce payloads). A
+/// payload that does not parse, or is not a single expression, is
+/// rejected here rather than trusted at runtime.
+fn expr_mode_check_payload(src: &str, depth: usize) -> MixResult<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if depth > MAX_EXPR_DEPTH {
+        return Err(expr_mode_depth_error());
+    }
+    let mut lexer = crate::lexer::Lexer::new(src);
+    let tokens = lexer
+        .tokenize()
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: coalesce default does not parse: {e}"),
+        })?;
+    let stmts = crate::parser::Parser::new(tokens, src)
+        .parse_program()
+        .map_err(|e| MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: coalesce default does not parse: {e}"),
+        })?;
+    match stmts.len() {
+        1 => match &stmts[0].kind {
+            StmtKind::Expression(expr) => expr_mode_deny_walk(expr, depth),
+            kind => Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "eval_expr_string: coalesce default must be a single expression, not a {}",
+                    expr_mode_construct_name(kind)
+                ),
+            }),
+        },
+        n => Err(MixError::RuntimeError {
+            span: None,
+            msg: format!(
+                "eval_expr_string: coalesce default must be a single expression, found {n} statements"
+            ),
+        }),
+    }
+}
+
+fn expr_mode_deny_walk(expr: &Expr, depth: usize) -> MixResult<()> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(expr_mode_depth_error());
+    }
+    let denied = |what: &str| {
+        MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: {what} is not allowed in expression mode"),
+        }
+    };
+    match expr {
+        // No Bus / shell authority, no lambdas, no first-class calls.
+        Expr::Send { .. } => return Err(denied("send expression")),
+        Expr::Sh(_) => return Err(denied("sh expression")),
+        Expr::CommandSub(_) => return Err(denied("command substitution $()")),
+        Expr::FunctionLiteral { .. } => return Err(denied("function literal")),
+        Expr::ValueCall { .. } => return Err(denied("function-value call")),
+        Expr::MethodCall { .. } => return Err(denied("method call")),
+
+        // Interpolation: only literals and Mix variables. Env-var
+        // expansion and command substitution inside strings are out. A
+        // variable part may carry a coalesce default (`${x ?? …}`),
+        // whose payload is parsed and executed AT RUNTIME by
+        // eval_interp_default — as a full program, invisible to this
+        // walk unless the walk analyses it HERE: every payload gets the
+        // same static treatment (single expression + recursive deny
+        // walk, so nested coalesces cannot smuggle a construct either).
+        Expr::InterpolatedString(parts) | Expr::Heredoc(parts) => {
+            for part in parts {
+                match part {
+                    StringPart::Literal(_) => {}
+                    StringPart::Variable(spec) => {
+                        let (_, coalesce) = split_interp_coalesce(spec);
+                        if let Some((_, payload)) = coalesce {
+                            expr_mode_check_payload(payload, depth + 1)?;
+                        }
+                    }
+                    StringPart::CommandSub(_) => {
+                        return Err(denied("command substitution in string"));
+                    }
+                    StringPart::EnvVar(_) => {
+                        return Err(denied("environment-variable interpolation in string"));
+                    }
+                }
+            }
+        }
+
+        Expr::BinaryOp { left, right, .. } => {
+            expr_mode_deny_walk(left, depth + 1)?;
+            expr_mode_deny_walk(right, depth + 1)?;
+        }
+        Expr::UnaryOp { operand, .. } => expr_mode_deny_walk(operand, depth + 1)?,
+        Expr::Ternary {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            expr_mode_deny_walk(cond, depth + 1)?;
+            expr_mode_deny_walk(then_branch, depth + 1)?;
+            expr_mode_deny_walk(else_branch, depth + 1)?;
+        }
+        Expr::If(if_expr) => {
+            let IfExpr {
+                condition,
+                then_body,
+                else_ifs,
+                else_body,
+            } = &**if_expr;
+            expr_mode_deny_walk(condition, depth + 1)?;
+            expr_mode_deny_stmts(then_body, depth + 1)?;
+            for (cond, body) in else_ifs {
+                expr_mode_deny_walk(cond, depth + 1)?;
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = else_body {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        Expr::FunctionCall { name, args } => {
+            // Blocking-by-nature builtins are denied by name so the fuel
+            // premise holds whatever policy the host installed: sleep is
+            // Pure-classed (no installed policy stops it), the stdin
+            // readers are Env-classed (stop under an allowlist without
+            // Env) but block whenever the host passes policy:None — the
+            // static deny is the unconditional bound.
+            if EXPR_MODE_DENIED_BUILTINS.contains(&name.as_str()) {
+                return Err(denied(&format!("{name} builtin")));
+            }
+            for arg in args {
+                expr_mode_deny_walk(arg, depth + 1)?;
+            }
+        }
+        Expr::Index { object, index } => {
+            expr_mode_deny_walk(object, depth + 1)?;
+            expr_mode_deny_walk(index, depth + 1)?;
+        }
+        Expr::FieldAccess { object, .. } => expr_mode_deny_walk(object, depth + 1)?,
+        Expr::ListLiteral(items) => {
+            for item in items {
+                expr_mode_deny_walk(item, depth + 1)?;
+            }
+        }
+        Expr::MapLiteral(entries) => {
+            for (_, value) in entries {
+                expr_mode_deny_walk(value, depth + 1)?;
+            }
+        }
+
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::EscapedQuoteStringLiteral(_)
+        | Expr::BoolLiteral(_)
+        | Expr::NilLiteral
+        | Expr::Variable(_) => {}
+    }
+    Ok(())
+}
+
+/// Statement-level companion of [`expr_mode_deny_walk`] for the only
+/// statement bodies an expression can contain (an if-expression's
+/// branches): deny the statement forms of the denied expression
+/// constructs — plus handler registration and file execution, which
+/// are runtime-mode constructs, not expressions — and recurse into
+/// every other statement's expressions.
+fn expr_mode_deny_stmts(stmts: &[Stmt], depth: usize) -> MixResult<()> {
+    for stmt in stmts {
+        expr_mode_deny_stmt(stmt, depth)?;
+    }
+    Ok(())
+}
+
+fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(expr_mode_depth_error());
+    }
+    let denied = |what: &str| {
+        MixError::RuntimeError {
+            span: None,
+            msg: format!("eval_expr_string: {what} is not allowed in expression mode"),
+        }
+    };
+    match &stmt.kind {
+        StmtKind::FunctionDef { .. } => return Err(denied("function definition")),
+        StmtKind::Send { .. } => return Err(denied("send statement")),
+        StmtKind::Emit { .. } => return Err(denied("emit statement")),
+        StmtKind::Sh { .. } => return Err(denied("sh statement")),
+        StmtKind::On { .. } => return Err(denied("on handler registration")),
+        StmtKind::Source { .. } => return Err(denied("source statement")),
+        StmtKind::Include { .. } => return Err(denied("include statement")),
+        StmtKind::PipeToExternal { .. } => return Err(denied("pipe statement")),
+        // Loops: an if-expression's branches are statement bodies, so a
+        // `for`/`while` nested there would execute at evaluation time and
+        // break the mode's "a binding cannot loop" fuel premise — even in
+        // an untaken branch, denied statically like everything else here.
+        StmtKind::For { .. } => return Err(denied("for loop")),
+        StmtKind::ForEach { .. } => return Err(denied("for-each loop")),
+        StmtKind::While { .. } => return Err(denied("while loop")),
+        StmtKind::Loop { .. } => return Err(denied("loop statement")),
+        // `select` pends on Bus/watch events and `address` targets a Bus
+        // service — both are runtime-mode constructs, not expressions, and
+        // both would hang or misfire inside a host's synchronous eval.
+        StmtKind::Select { .. } => return Err(denied("select statement")),
+        StmtKind::Address { .. } => return Err(denied("address block")),
+        // `export` runs `unsafe set_var` on the HOST process; its runtime
+        // gate is permissive when no policy is installed (a legal call
+        // shape for this entry point), so the static walk must deny it.
+        StmtKind::Export { .. } => return Err(denied("export statement")),
+        // `print` writes to the evaluator's output sink — real
+        // stdout/stderr for a default-constructed evaluator, i.e. the
+        // host daemon's log stream. A binding has no business writing
+        // there; the output builtins are denied by name for the same
+        // reason.
+        StmtKind::Print { .. } => return Err(denied("print statement")),
+
+        StmtKind::Assignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
+        StmtKind::FieldAssignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
+        StmtKind::IndexAssignment { index, value, .. } => {
+            expr_mode_deny_walk(index, depth + 1)?;
+            expr_mode_deny_walk(value, depth + 1)?;
+        }
+        StmtKind::PathAssignment { path, value, .. } => {
+            for seg in path {
+                if let PathSeg::Index(index) = seg {
+                    expr_mode_deny_walk(index, depth + 1)?;
+                }
+            }
+            expr_mode_deny_walk(value, depth + 1)?;
+        }
+        StmtKind::If {
+            condition,
+            then_body,
+            else_ifs,
+            else_body,
+        } => {
+            expr_mode_deny_walk(condition, depth + 1)?;
+            expr_mode_deny_stmts(then_body, depth + 1)?;
+            for (cond, body) in else_ifs {
+                expr_mode_deny_walk(cond, depth + 1)?;
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = else_body {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        StmtKind::Break(_) | StmtKind::Continue(_) => {}
+        StmtKind::BreakIf(cond, _) | StmtKind::ContinueIf(cond, _) => {
+            expr_mode_deny_walk(cond, depth + 1)?
+        }
+        StmtKind::Return(value) => {
+            if let Some(value) = value {
+                expr_mode_deny_walk(value, depth + 1)?;
+            }
+        }
+        StmtKind::Parse { source, .. } => expr_mode_deny_walk(source, depth + 1)?,
+        StmtKind::Die(expr) => expr_mode_deny_walk(expr, depth + 1)?,
+        StmtKind::TryCatch {
+            try_body,
+            catch,
+            finally_body,
+        } => {
+            expr_mode_deny_stmts(try_body, depth + 1)?;
+            if let Some(CatchClause { body, .. }) = catch {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+            if let Some(body) = finally_body {
+                expr_mode_deny_stmts(body, depth + 1)?;
+            }
+        }
+        StmtKind::Alias { name, command } => {
+            if let Some(name) = name {
+                expr_mode_deny_walk(name, depth + 1)?;
+            }
+            if let Some(command) = command {
+                expr_mode_deny_walk(command, depth + 1)?;
+            }
+        }
+        StmtKind::Chain { left, right, .. } => {
+            expr_mode_deny_stmt(left, depth + 1)?;
+            expr_mode_deny_stmt(right, depth + 1)?;
+        }
+        StmtKind::Expression(expr) => expr_mode_deny_walk(expr, depth + 1)?,
+    }
+    Ok(())
+}
+
+fn expr_mode_depth_error() -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: format!(
+            "eval_expr_string: expression nesting exceeds MAX_EXPR_DEPTH ({MAX_EXPR_DEPTH})"
+        ),
     }
 }
 
@@ -11107,6 +11602,14 @@ impl Evaluator {
 
                     // port_exists() — delegates to Bus handler
                     if name == "port_exists" {
+                        // Evaluator-reserved Bus builtin (0.89.0): absent
+                        // from the BUILTINS table, so classification fails
+                        // OPEN to Pure and no allowlist stops it — gate the
+                        // class here, before any handler consult.
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "port_exists",
+                        )?;
                         // SPEC 18 Phase 2 WS3-C.5 — clone-out: scope the
                         // `Ref` guard so it is dropped before `.await`;
                         // the `Rc<dyn BusHandler>` keeps the handler
@@ -11144,6 +11647,13 @@ impl Evaluator {
                     // Ok(()), subscribe/reply's is Err — so this is not
                     // an inconsistency. Idempotent; always returns true.
                     if name == "bus_reconnect" {
+                        // Evaluator-reserved Bus builtin — see the
+                        // port_exists gate above for why the class gate
+                        // lives here (0.89.0).
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "bus_reconnect",
+                        )?;
                         // SPEC 18 Phase 2 WS3-C.5 — clone-out: only call
                         // when wired (idempotent no-op otherwise), and
                         // release the globals borrow before `.await`.
@@ -11163,6 +11673,12 @@ impl Evaluator {
 
                     // noded_register(name) — register as a named service on the broker
                     if name == "noded_register" {
+                        // Evaluator-reserved Bus builtin — see the
+                        // port_exists gate above (0.89.0).
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "noded_register",
+                        )?;
                         // SPEC 18 Phase 2 WS3-C.5 — clone-out (see port_exists above).
                         let handler =
                             { self.globals.borrow().bus_handler.clone() }.ok_or_else(|| {
@@ -11215,6 +11731,14 @@ impl Evaluator {
                     // missing/empty name is a hard error — a silently
                     // dropped subscribe is the partial-truth bug.
                     if name == "subscribe" || name == "unsubscribe" {
+                        // Evaluator-reserved Bus builtins — see the
+                        // port_exists gate above (0.89.0). Gated BEFORE
+                        // the argument validation below so a denied
+                        // caller learns nothing about topic state.
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            name,
+                        )?;
                         // Validate the argument before consulting the handler:
                         // an empty topic is a caller bug regardless of whether
                         // Bus is wired, and validating first keeps the error
@@ -11265,6 +11789,12 @@ impl Evaluator {
                     // regardless of dispatch state or Bus wiring (same
                     // discipline as subscribe()/unsubscribe()).
                     if name == "reply" {
+                        // Evaluator-reserved Bus builtin — see the
+                        // port_exists gate above (0.89.0).
+                        self.check_capability_class(
+                            crate::builtins::CapabilityClass::Bus,
+                            "reply",
+                        )?;
                         let (rc, body) = match eval_args.len() {
                             1 => (0u8, eval_args[0].to_mix_string()),
                             2 => {
@@ -13060,6 +13590,11 @@ impl Evaluator {
     /// the evaluated object as the leading arg, so it rides along as
     /// `_0` exactly as the old UFCS desugar did).
     async fn address_block_send(&mut self, name: &str, eval_args: Vec<Value>) -> MixResult<Value> {
+        // The third Bus-authority path (after exec_send/exec_emit): an
+        // address block's body lines desugar to sends HERE, not through
+        // exec_send — so this site carries the same class gate the broker
+        // forms got in 0.89.0, before any argument or target work.
+        self.check_capability_class(crate::builtins::CapabilityClass::Bus, "address send")?;
         let target = self.ctx.address_stack.last().unwrap().clone();
         // Build args map from positional args
         let mut map = IndexMap::new();
@@ -13399,6 +13934,12 @@ impl Evaluator {
         args: &'a [(String, Expr)],
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            // Gate before evaluating anything: the bare broker form reaches
+            // Bus authority without a builtin name, so a policy that
+            // withholds the class must short-circuit here — mirroring the
+            // sh/`$()` Process gates (0.89.0; `bus_call` gates separately
+            // as a named builtin).
+            self.check_capability_class(crate::builtins::CapabilityClass::Bus, "send")?;
             let target_str = self.eval_expr(target).await?.to_mix_string();
             let command_str = self.eval_expr(command).await?.to_mix_string();
             if command_str.is_empty() {
@@ -13592,6 +14133,9 @@ impl Evaluator {
         args: &'a [(String, Expr)],
     ) -> Pin<Box<dyn Future<Output = MixResult<Value>> + 'a>> {
         Box::pin(async move {
+            // Gate before evaluating anything, as `exec_send` does above —
+            // the fire-and-forget form holds the same Bus authority.
+            self.check_capability_class(crate::builtins::CapabilityClass::Bus, "emit")?;
             let target_str = self.eval_expr(target).await?.to_mix_string();
             let command_str = self.eval_expr(command).await?.to_mix_string();
             if command_str.is_empty() {
