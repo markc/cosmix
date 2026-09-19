@@ -26,6 +26,9 @@ pub(super) fn align(h: &mut KeybindingHarness, victim: &ObjectId, cover: &Object
     let v = h.server.state.surfaces.get_mut(victim).unwrap();
     v.layout.x = 10.0;
     v.layout.y = 10.0;
+    v.window_origin = v
+        .committed_window_geometry
+        .map_or((10.0, 10.0), |g| (10.0 + g.x, 10.0 + g.y));
     let size = (v.layout.width, v.layout.height);
     let root = v.id;
     for child in h
@@ -41,6 +44,9 @@ pub(super) fn align(h: &mut KeybindingHarness, victim: &ObjectId, cover: &Object
     let c = h.server.state.surfaces.get_mut(cover).unwrap();
     c.layout.x = 10.0;
     c.layout.y = 10.0;
+    c.window_origin = c
+        .committed_window_geometry
+        .map_or((10.0, 10.0), |g| (10.0 + g.x, 10.0 + g.y));
     c.layout.width = size.0;
     c.layout.height = size.1;
     c.layout.z = SurfaceStackKey::normal(1000);
