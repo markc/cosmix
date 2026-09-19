@@ -6,12 +6,15 @@ use crate::occlusion::{Bounds, Draw, TreeVisibility};
 fn fixture() -> (KeybindingHarness, ObjectId, ObjectId) {
     let mut h = KeybindingHarness::new(true);
     map_initial_test_toplevel(&mut h);
+    commit_test_buffer(&mut h, TEST_SUBSURFACE_SURFACE_ID);
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    h.dispatch_client();
     let victim = test_toplevel_record(&h).role.wl_surface().id();
     let (_, _, _, cover) = map_named_test_toplevel(&mut h, "cover", "test.cover");
     (h, victim, cover)
 }
 
-fn request(h: &mut KeybindingHarness, surface: u32) -> u32 {
+pub(super) fn request(h: &mut KeybindingHarness, surface: u32) -> u32 {
     let callback = h.allocate_object_id();
     send_request(&mut h.client, surface, 3, &words(&[callback]));
     send_request(&mut h.client, surface, 6, &[]);
@@ -19,11 +22,22 @@ fn request(h: &mut KeybindingHarness, surface: u32) -> u32 {
     callback
 }
 
-fn align(h: &mut KeybindingHarness, victim: &ObjectId, cover: &ObjectId) {
+pub(super) fn align(h: &mut KeybindingHarness, victim: &ObjectId, cover: &ObjectId) {
     let v = h.server.state.surfaces.get_mut(victim).unwrap();
     v.layout.x = 10.0;
     v.layout.y = 10.0;
     let size = (v.layout.width, v.layout.height);
+    let root = v.id;
+    for child in h
+        .server
+        .state
+        .surfaces
+        .values_mut()
+        .filter(|r| r.layout.parent == Some(root))
+    {
+        child.layout.x = 10.0;
+        child.layout.y = 10.0;
+    }
     let c = h.server.state.surfaces.get_mut(cover).unwrap();
     c.layout.x = 10.0;
     c.layout.y = 10.0;
@@ -32,7 +46,10 @@ fn align(h: &mut KeybindingHarness, victim: &ObjectId, cover: &ObjectId) {
     c.layout.z = SurfaceStackKey::normal(1000);
 }
 
-fn certify(h: &mut KeybindingHarness, opaque: bool) -> crate::occlusion::CoverageSnapshot {
+pub(super) fn certify(
+    h: &mut KeybindingHarness,
+    opaque: bool,
+) -> crate::occlusion::CoverageSnapshot {
     h.server.state.refresh_occlusion();
     let bridge = h.server.state.occlusion.bridge.clone();
     let mut exchange = bridge.0.lock().unwrap();
@@ -61,7 +78,7 @@ fn certify(h: &mut KeybindingHarness, opaque: bool) -> crate::occlusion::Coverag
     coverage
 }
 
-fn done(h: &mut KeybindingHarness, callback: u32) -> usize {
+pub(super) fn done(h: &mut KeybindingHarness, callback: u32) -> usize {
     h.sync()
         .iter()
         .filter(|(object, opcode, _)| *object == callback && *opcode == 0)
@@ -173,7 +190,14 @@ fn occlusion_wire_layer_tree_withholds_and_resumes() {
     let object = test_layer_record(&h, layer.surface).role.wl_surface().id();
     let callback = request(&mut h, layer.surface);
     align(&mut h, &object, &cover);
-    h.server.state.surfaces.get_mut(&object).unwrap().layout.z.band = StackBand::Background;
+    h.server
+        .state
+        .surfaces
+        .get_mut(&object)
+        .unwrap()
+        .layout
+        .z
+        .band = StackBand::Background;
     certify(&mut h, true);
     h.frame(Vec::new());
     assert_eq!(done(&mut h, callback), 0);
@@ -188,9 +212,11 @@ fn occlusion_wire_single_output_feedback_discards_only_evidenced_sequences() {
     let (presentation, _) = bind_test_presentation(&mut h);
     let first = request_presentation_feedback(&mut h, presentation);
     commit_test_buffer(&mut h, TEST_TOPLEVEL_SURFACE_ID);
+    h.dispatch_client();
     let seq = h.server.state.surfaces[&victim].content_seq;
     let later = request_presentation_feedback(&mut h, presentation);
     commit_test_buffer(&mut h, TEST_TOPLEVEL_SURFACE_ID);
+    h.dispatch_client();
     align(&mut h, &victim, &cover);
     let coverage = certify(&mut h, true);
     let id = h.server.state.surfaces[&victim].id;
@@ -204,4 +230,83 @@ fn occlusion_wire_single_output_feedback_discards_only_evidenced_sequences() {
     let (_, mut multi) = test_frame_report(id, 2_000_000, seq + 1, true);
     crate::frame_content::apply_presentation_coverage(&mut multi, &coverage, 2);
     assert!(multi.surfaces[0].shown, "documented multi-output limit");
+}
+
+#[test]
+fn occlusion_wire_subsurface_callbacks_follow_family_and_remain_queued() {
+    let (mut h, victim, cover) = fixture();
+    let callback = request(&mut h, TEST_SUBSURFACE_SURFACE_ID);
+    // Apply the synchronized child's callback transaction on the parent.
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    h.dispatch_client();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    for _ in 0..2 {
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 0);
+    }
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 1);
+}
+
+#[test]
+fn occlusion_wire_cover_minimise_and_workspace_move_resume_victim() {
+    for workspace in [false, true] {
+        let (mut h, victim, cover) = fixture();
+        let callback = request(&mut h, victim.protocol_id());
+        align(&mut h, &victim, &cover);
+        certify(&mut h, true);
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 0);
+        if workspace {
+            h.server
+                .state
+                .move_window_to_workspace(&cover, workspaces::WorkspaceTarget::Index(2))
+                .unwrap();
+        } else {
+            let surface = h.server.state.surfaces[&cover].role.wl_surface().clone();
+            h.server.state.minimize_toplevel(&surface);
+        }
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 1);
+    }
+}
+
+#[test]
+fn occlusion_wire_unmapped_child_preserves_bootstrap_delivery() {
+    let (mut h, victim, cover) = fixture();
+    let first = request(&mut h, victim.protocol_id());
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, first), 0);
+    let (child, _) = stage_test_synchronized_subsurface(&mut h, TEST_TOPLEVEL_SURFACE_ID);
+    send_request(&mut h.client, child, 1, &words(&[0, 0, 0]));
+    let child_callback = request(&mut h, child);
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    h.dispatch_client();
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, first), 1);
+    // The same flush carried both; inspect committed callback storage to avoid
+    // consuming the second event in a second socket drain.
+    let child = h
+        .server
+        .state
+        .surfaces
+        .values()
+        .find(|s| s.role.wl_surface().id().protocol_id() == child)
+        .unwrap();
+    compositor::with_states(child.role.wl_surface(), |states| {
+        assert!(
+            states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .frame_callbacks
+                .is_empty(),
+            "bootstrap callback {child_callback} drained"
+        );
+    });
 }

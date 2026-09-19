@@ -2973,6 +2973,7 @@ mod tests {
             window: WindowExtras::default(),
         };
         let toplevel = SurfaceSnapshot {
+            occlusion: Default::default(),
             id: 2,
             role: "toplevel",
             mapped: true,

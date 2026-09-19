@@ -41048,6 +41048,24 @@ fn x11_override_redirect_role_string_matches_the_gate_needle() {
 
 #[cfg(feature = "xwayland")]
 mod x11 {
+    #[test]
+    fn occlusion_x11_tree_withholds_and_resumes() {
+        use super::occlusion_tests::{align, certify, done, request};
+        let mut h = KeybindingHarness::new(true);
+        map_initial_test_toplevel(&mut h);
+        let (surface, _, _, victim) = associate_normal_window(&mut h, 9061);
+        commit_dmabuf(&mut h, surface, 32, 24);
+        let (_, _, _, cover) = map_named_test_toplevel(&mut h, "cover", "test.cover");
+        let callback = request(&mut h, surface);
+        align(&mut h, &victim, &cover);
+        certify(&mut h, true);
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 0);
+        h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 1);
+    }
+
     mod window_switching {
         include!("window_switching_x11_tests.rs");
     }

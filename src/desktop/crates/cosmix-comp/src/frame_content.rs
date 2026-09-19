@@ -168,6 +168,7 @@ fn resolve_frame_content(
     coverage: Res<crate::occlusion::ExtractedCoverage>,
     mut coverage_cache: ResMut<crate::occlusion::CoverageCache>,
     mut pipelines: Option<ResMut<bevy::render::render_resource::PipelineCache>>,
+    assets: Option<Res<crate::render_asset_readiness::AssetPreparationStatus>>,
 ) {
     // One registry lock for every DMA-BUF surface in the frame.
     let dmabuf_images = extracted
@@ -196,13 +197,21 @@ fn resolve_frame_content(
         })
         .collect::<Vec<_>>();
     if let Some(reporter) = reporter.as_ref() {
-        let ready = pipelines.as_mut().is_some_and(|pipelines| {
-            let state = crate::render_pipeline_readiness::process_after_draw(pipelines);
-            state.pipelines > 0
-                && state.pending == 0
-                && state.failed == 0
-                && !state.changed_after_draw
+        let assets_ready = assets.as_ref().is_some_and(|assets| {
+            let s = assets.snapshot();
+            s.revision.is_some()
+                && s.tracked_types > 0
+                && s.pending_preparations == 0
+                && s.pending_removals == 0
         });
+        let ready = assets_ready
+            && pipelines.as_mut().is_some_and(|pipelines| {
+                let state = crate::render_pipeline_readiness::process_after_draw(pipelines);
+                state.pipelines > 0
+                    && state.pending == 0
+                    && state.failed == 0
+                    && !state.changed_after_draw
+            });
         let sampled = surfaces
             .iter()
             .filter_map(|(surface, gpu, progress)| {

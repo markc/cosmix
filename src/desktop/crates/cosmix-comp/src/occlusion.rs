@@ -319,7 +319,7 @@ pub(crate) fn compute(scene: &Scene, draws: &[Draw], revision: u64) -> CoverageS
                 .insert(candidate.id, TreeVisibility::Unknown);
             continue;
         };
-        if !candidate.layout.visible || scene.locked || scene.outputs.is_empty() {
+        if !draw.ready || !candidate.layout.visible || scene.locked || scene.outputs.is_empty() {
             result
                 .surfaces
                 .insert(candidate.id, TreeVisibility::Unknown);
@@ -389,10 +389,7 @@ pub(crate) fn compute(scene: &Scene, draws: &[Draw], revision: u64) -> CoverageS
     // Any exposed/unknown member keeps the entire canonical family progressing.
     let individual = result.surfaces.clone();
     for surface in &scene.surfaces {
-        let family = scene
-            .surfaces
-            .iter()
-            .filter(|s| s.family == surface.family && s.layout.visible);
+        let family = scene.surfaces.iter().filter(|s| s.family == surface.family);
         let mut decision = TreeVisibility::Occluded;
         for member in family {
             match individual.get(&member.id).copied().unwrap_or_default() {
@@ -551,9 +548,6 @@ pub(crate) fn resolve(
     }
     let key = (extracted.revision, draws);
     let mut exchange = bridge.0.lock().unwrap_or_else(|e| e.into_inner());
-    if exchange.revision != extracted.revision {
-        return;
-    }
     if cache.previous.as_ref() != Some(&key) {
         cache.result = compute(&extracted.scene, &key.1, extracted.revision);
         cache.previous = Some(key);
@@ -565,7 +559,9 @@ pub(crate) fn resolve(
             .filter(|v| **v == TreeVisibility::Unknown)
             .count() as u64;
     }
-    exchange.coverage = cache.result.clone();
+    if exchange.revision == extracted.revision {
+        exchange.coverage = cache.result.clone();
+    }
 }
 
 #[cfg(test)]

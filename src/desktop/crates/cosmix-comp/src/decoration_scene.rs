@@ -3385,6 +3385,10 @@ mod tests {
         );
         assert_eq!(client_material(app.world(), id).corner_radius, 0.0);
         assert_eq!(chrome_frame_material(app.world(), id).corner_radius, 0.0);
+        let frame = chrome_frame_material(app.world(), id);
+        assert!(frame.square_opaque);
+        assert_eq!(frame.titlebar_color.alpha(), 1.0);
+        assert_eq!(frame.border_color.alpha(), 1.0);
 
         let unfocused = SurfaceLayout {
             toplevel: Some(ToplevelSceneState {

@@ -120,10 +120,16 @@ impl WaylandState {
     }
 
     pub(super) fn count_occlusion_opportunities(&self) {
+        let workspace = self.workspace_current();
         let withheld = self
             .surfaces
             .values()
-            .filter(|r| self.occlusion.is_occluded(r.id) && r.role.parent_surface().is_none())
+            .filter(|r| {
+                self.occlusion.is_occluded(r.id)
+                    && r.role.parent_surface().is_none()
+                    && self.surface_is_session_presentable(r)
+                    && !self.surface_belongs_to_hidden_toplevel(r.role.wl_surface(), workspace)
+            })
             .count() as u64;
         let mut exchange = self
             .occlusion

@@ -1869,6 +1869,25 @@ fn diff_occlusion(
     }
 }
 
+#[test]
+fn occlusion_counters_never_emit_changes_but_decisions_do() {
+    let old = crate::occlusion::Props::default();
+    let mut new = old.clone();
+    new.occlusion_counters = Some(crate::occlusion::Counters {
+        recomputes: 42,
+        ..Default::default()
+    });
+    let mut changes = PendingPropChanges::new();
+    diff_occlusion("surfaces.s1", &old, &new, "wayland.occlusion", &mut changes);
+    assert!(changes.is_empty());
+    new.occluded = true;
+    new.occlusion_reason = "opaque-coverage";
+    new.occlusion_revision = 2;
+    diff_occlusion("surfaces.s1", &old, &new, "wayland.occlusion", &mut changes);
+    assert_eq!(changes.len(), 3);
+    assert!(changes.contains_key("surfaces.s1.occluded"));
+}
+
 fn diff_surface_row(
     prefix: &str,
     old: Option<&SurfaceSnapshot>,
@@ -1882,20 +1901,24 @@ fn diff_surface_row(
     let (old, new) = match (old, new) {
         (None, None) => return,
         (None, Some(new)) => {
+            let mut new = new.clone();
+            new.occlusion.occlusion_counters = None;
             queue_prop_change(
                 pending,
                 prefix.into(),
                 PropValue::null(),
-                PropValue::SurfaceRow(Box::new(new.clone())),
+                PropValue::SurfaceRow(Box::new(new)),
                 cause,
             );
             return;
         }
         (Some(old), None) => {
+            let mut old = old.clone();
+            old.occlusion.occlusion_counters = None;
             queue_prop_change(
                 pending,
                 prefix.into(),
-                PropValue::SurfaceRow(Box::new(old.clone())),
+                PropValue::SurfaceRow(Box::new(old)),
                 PropValue::null(),
                 cause,
             );
@@ -2056,6 +2079,10 @@ fn diff_window_row(
                 PropValue::null(),
                 PropValue::WindowRow(Box::new(WindowSnapshot {
                     presentation: None,
+                    occlusion: crate::occlusion::Props {
+                        occlusion_counters: None,
+                        ..new.occlusion.clone()
+                    },
                     ..new.clone()
                 })),
                 cause,
@@ -2068,6 +2095,10 @@ fn diff_window_row(
                 prefix.into(),
                 PropValue::WindowRow(Box::new(WindowSnapshot {
                     presentation: None,
+                    occlusion: crate::occlusion::Props {
+                        occlusion_counters: None,
+                        ..old.occlusion.clone()
+                    },
                     ..old.clone()
                 })),
                 PropValue::null(),
