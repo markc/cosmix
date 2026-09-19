@@ -26,6 +26,9 @@ use serde_json::{Value, json};
 
 use super::SceneStore;
 
+mod icons;
+use icons::IconCache;
+
 #[derive(Component, Clone)]
 struct Binding {
     scene: String,
@@ -139,6 +142,7 @@ pub(crate) fn install(app: &mut App) {
         app.add_plugins(VirtualListPlugin);
     }
     app.init_resource::<Events>()
+        .init_resource::<IconCache>()
         .add_observer(activate)
         .add_observer(toggle)
         .add_observer(field_change)
@@ -694,11 +698,23 @@ fn update(
             };
         }
         "image" => {
-            let image = world
-                .get_resource::<AssetServer>()
-                .map(|assets| assets.load::<Image>(text(node, "src").to_owned()));
+            let src = text(node, "src");
+            let image = if src.starts_with('/') {
+                icons::load(
+                    world,
+                    src,
+                    number(node, "w", 16.0),
+                    number(node, "h", 16.0),
+                )
+            } else {
+                world
+                    .get_resource::<AssetServer>()
+                    .map(|assets| assets.load::<Image>(src.to_owned()))
+            };
             if let Some(image) = image {
                 world.entity_mut(view.root).insert(ImageNode::new(image));
+            } else if src.starts_with('/') {
+                world.entity_mut(view.root).remove::<ImageNode>();
             }
             layout.width = px(number(node, "w", 16.0));
             layout.height = px(number(node, "h", 16.0));
@@ -769,6 +785,9 @@ fn template_node(world: &mut World, tree: &ResolvedScene, id: &str, item: &Value
     if node.family == "text" {
         let value = substitute_cells(text(&node, "text"), &item["cells"]);
         node.ports.insert("text".into(), json!(value));
+    } else if node.family == "image" {
+        let value = substitute_cells(text(&node, "src"), &item["cells"]);
+        node.ports.insert("src".into(), json!(value));
     }
     let instance = format!("{id}@{}", item["id"].as_str().unwrap_or_default());
     let view = spawn(world, tree, &instance, &node);
@@ -865,6 +884,172 @@ fn color(value: &str, fallback: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ICON_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red" fill-opacity="0.5"/></svg>"#;
+
+    fn icon_tree(path: &std::path::Path) -> ResolvedScene {
+        let source = format!(
+            "---\nscene: 1\nname: icons\ncitizen: test\n---\n```mix\nroot: {{widget: \"image\", src: {}, w: 24, h: 24}}\n```\n",
+            json!(path.to_str().unwrap())
+        );
+        cosmix_scene::resolve(&cosmix_scene::parse(&source).unwrap()).unwrap()
+    }
+
+    fn rendered_icon(world: &World, entity: Entity, pixels: u32) -> Handle<Image> {
+        let handle = world.get::<ImageNode>(entity).unwrap().image.clone();
+        let image = world.resource::<Assets<Image>>().get(&handle).unwrap();
+        assert_eq!(image.texture_descriptor.size.width, pixels);
+        assert_eq!(image.texture_descriptor.size.height, pixels);
+        handle
+    }
+
+    #[test]
+    fn svg_icon_rasterises_at_oversampled_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.SVG");
+        std::fs::write(&path, ICON_SVG).unwrap();
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut window = Window::default();
+        window.resolution.set_scale_factor_override(Some(2.5));
+        world.spawn((window, bevy::window::PrimaryWindow));
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let handle = rendered_icon(&world, mounted.nodes["root"].root, 60);
+        let image = world.resource::<Assets<Image>>().get(&handle).unwrap();
+        assert_eq!(&image.data.as_ref().unwrap()[..4], &[255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn png_icon_loads_from_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        rendered_icon(&world, mounted.nodes["root"].root, 72);
+    }
+
+    #[test]
+    fn missing_icon_is_absent_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.svg");
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let view = &mounted.nodes["root"];
+        assert!(world.get::<ImageNode>(view.root).is_none());
+        // A now-valid file stays absent: the second update must use the negative cache.
+        std::fs::write(&path, ICON_SVG).unwrap();
+        update(&mut world, &tree, "root", &tree.nodes["root"], None, view);
+        assert!(world.get::<ImageNode>(view.root).is_none());
+    }
+
+    #[test]
+    fn icon_cache_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.svg");
+        std::fs::write(&path, ICON_SVG).unwrap();
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut first = mounted(&mut world, &tree);
+        apply(&mut world, &mut first, &tree);
+        let handle = rendered_icon(&world, first.nodes["root"].root, 72);
+        std::fs::remove_file(&path).unwrap();
+        let mut second = mounted(&mut world, &tree);
+        apply(&mut world, &mut second, &tree);
+        assert_eq!(handle, rendered_icon(&world, second.nodes["root"].root, 72));
+        update(
+            &mut world,
+            &tree,
+            "root",
+            &tree.nodes["root"],
+            None,
+            &first.nodes["root"],
+        );
+        assert_eq!(handle, rendered_icon(&world, first.nodes["root"].root, 72));
+        assert_eq!(world.resource::<Assets<Image>>().len(), 1);
+    }
+
+    #[test]
+    fn template_image_src_substitutes_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [dir.path().join("one.svg"), dir.path().join("two.svg")];
+        for path in &paths {
+            std::fs::write(path, ICON_SVG).unwrap();
+        }
+        let source = format!(
+            "---\nscene: 1\nname: icons\ncitizen: test\n---\n```mix\nroot: {{widget: \"list\", row: \"icon\", row_height: 24, rows: {}}}\nicon: {{widget: \"image\", src: \"placeholder.svg\", w: 24, h: 24}}\n```\n",
+            json!([{"id":"one","cells":["One",paths[0]]},{"id":"two","cells":["Two",paths[1]]}])
+        );
+        let mut tree = cosmix_scene::resolve(&cosmix_scene::parse(&source).unwrap()).unwrap();
+        // P1 currently permits substitutions only in text.text. Exercise the
+        // host's resolved-scene boundary without changing that separate crate.
+        tree.nodes["icon"].ports.insert("src".into(), json!("{cells[1]}"));
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let model = ListModel(mounted.nodes["root"].list.as_ref().unwrap().clone());
+        for (index, path) in paths.iter().enumerate() {
+            let content = world.spawn_empty().id();
+            model.bind(&mut world, content, index);
+            let entity = world.get::<Children>(content).unwrap()[0];
+            let handle = rendered_icon(&world, entity, 72);
+            assert_eq!(
+                Some(handle),
+                icons::load(&mut world, path.to_str().unwrap(), 24.0, 24.0)
+            );
+        }
+        assert_eq!(world.resource::<Assets<Image>>().len(), 2);
+    }
+
+    #[test]
+    fn invalid_icons_clear_previous_images_and_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.svg");
+        std::fs::write(&valid, ICON_SVG).unwrap();
+        let valid_tree = icon_tree(&valid);
+        for (name, contents, size) in [
+            ("broken.svg", "not SVG", 24.0),
+            ("zero.svg", ICON_SVG, 0.0),
+            ("large-target.svg", ICON_SVG, 342.0),
+            ("large-file.svg", ICON_SVG, 24.0),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            if name == "large-file.svg" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(4 * 1024 * 1024 + 1)
+                    .unwrap();
+            }
+            let mut tree = icon_tree(&path);
+            tree.nodes["root"].ports.insert("w".into(), json!(size));
+            let mut world = World::new();
+            let view = spawn(&mut world, &tree, "root", &tree.nodes["root"]);
+            update(
+                &mut world,
+                &valid_tree,
+                "root",
+                &valid_tree.nodes["root"],
+                None,
+                &view,
+            );
+            rendered_icon(&world, view.root, 72);
+            update(&mut world, &tree, "root", &tree.nodes["root"], None, &view);
+            assert!(world.get::<ImageNode>(view.root).is_none(), "{name}");
+            std::fs::write(&path, ICON_SVG).unwrap();
+            assert!(icons::load(&mut world, path.to_str().unwrap(), 24.0, 24.0).is_none());
+        }
+    }
+
     fn mounted(world: &mut World, tree: &ResolvedScene) -> Mounted {
         Mounted {
             revision: 0,

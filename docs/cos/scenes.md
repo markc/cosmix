@@ -41,8 +41,17 @@ edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.
 
 List rows use CTK VirtualList. Row templates are instantiated with
-`template-node@row-id` identities and substitute only `{cells[i]}` in text.
+`template-node@row-id` identities and substitute `{cells[i]}` in text.
 Text elision uses CTK's middle-elision policy.
+
+Absolute image `src` paths load PNG and SVG directly, rasterised or resized
+at the primary window's output scale (3× when no primary window is available)
+and cached by path and pixel size. Files over 4 MiB and targets over 1024 pixels
+on either side are refused; missing or invalid files render nothing and are
+remembered so they are not retried. The host also substitutes `{cells[i]}` in
+an image template's `src`. The current document validator still restricts
+substitutions to `text.text`; image templates require that separate validator
+change before they can be loaded through `shell.scene.load`.
 
 CTK shares the font source cache through weak references. Fonts still used by
 retained layouts keep the same atlas identity after idle cache pruning, so
