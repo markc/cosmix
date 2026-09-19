@@ -8697,8 +8697,15 @@ impl WaylandState {
             .collect::<Vec<_>>();
         let mut delivered = 0;
         for (id, surface) in roots {
-            let count = send_frames_surface_tree(&surface, frame_time, &self.surfaces);
-            if count > 0 && self.occlusion.withheld.remove(&id) {
+            let withheld = self.occlusion.withheld.remove(&id).unwrap_or_default();
+            let batch = send_frames_surface_tree_limited(
+                &surface,
+                frame_time,
+                &self.surfaces,
+                0,
+                &withheld,
+            );
+            if batch.resumed {
                 self.occlusion
                     .bridge
                     .0
@@ -8707,7 +8714,7 @@ impl WaylandState {
                     .counters
                     .resumes += 1;
             }
-            delivered += count;
+            delivered += batch.delivered;
         }
         if let CursorSelection::Surface(id) = &self.cursor_selection
             && let Some(record) = self.cursor_surfaces.get(id)
@@ -17073,7 +17080,14 @@ fn send_frames_surface_tree(
     time: u32,
     surfaces: &HashMap<ObjectId, SurfaceRecord>,
 ) -> usize {
-    send_frames_surface_tree_limited(surface, time, surfaces, 0).0
+    send_frames_surface_tree_limited(surface, time, surfaces, 0, &HashSet::new()).delivered
+}
+
+#[derive(Default)]
+struct FrameCallbackBatch {
+    delivered: usize,
+    retained: HashSet<ObjectId>,
+    resumed: bool,
 }
 
 fn send_frames_surface_tree_limited(
@@ -17081,9 +17095,9 @@ fn send_frames_surface_tree_limited(
     time: u32,
     surfaces: &HashMap<ObjectId, SurfaceRecord>,
     retain: usize,
-) -> (usize, bool) {
-    let mut delivered = 0;
-    let mut retained = false;
+    withheld: &HashSet<ObjectId>,
+) -> FrameCallbackBatch {
+    let mut batch = FrameCallbackBatch::default();
     with_surface_tree_downward(
         surface,
         (),
@@ -17092,8 +17106,8 @@ fn send_frames_surface_tree_limited(
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let callbacks = &mut attributes.current().frame_callbacks;
             let excess = callbacks.len().saturating_sub(retain);
-            retained |= callbacks.len() > excess;
             for callback in callbacks.drain(..excess) {
+                batch.resumed |= withheld.contains(&callback.id());
                 callback.done(time);
                 crate::frame_trace::event("comp_callback_done_queued", || {
                     (
@@ -17102,12 +17116,13 @@ fn send_frames_surface_tree_limited(
                         u64::from(surface.id().protocol_id()),
                     )
                 });
-                delivered += 1;
+                batch.delivered += 1;
             }
+            batch.retained.extend(callbacks.iter().map(Resource::id));
         },
         |_, _, &()| true,
     );
-    (delivered, retained)
+    batch
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -530,6 +530,38 @@ fn occlusion_wire_subsurface_callbacks_follow_family_and_remain_queued() {
 }
 
 #[test]
+fn occlusion_wire_destroyed_child_callback_cannot_count_an_unrelated_resume() {
+    let (mut h, victim, cover) = fixture();
+    let callback = request(&mut h, TEST_SUBSURFACE_SURFACE_ID);
+    send_request(&mut h.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    h.dispatch_client();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, callback), 0);
+    send_request(&mut h.client, TEST_SUBSURFACE_SURFACE_ID, 0, &[]);
+    h.dispatch_client();
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.server.state.refresh_occlusion();
+    let unrelated = request(&mut h, victim.protocol_id());
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, unrelated), 1);
+    assert_eq!(
+        h.server
+            .state
+            .occlusion
+            .bridge
+            .0
+            .lock()
+            .unwrap()
+            .counters
+            .resumes,
+        0,
+        "the retained child callback was never delivered"
+    );
+}
+
+#[test]
 fn occlusion_wire_cover_minimise_and_workspace_move_resume_victim() {
     for workspace in [false, true] {
         let (mut h, victim, cover) = fixture();

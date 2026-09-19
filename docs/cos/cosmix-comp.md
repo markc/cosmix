@@ -38,7 +38,8 @@ surfaces remain observable under `surfaces`. `occlusion.counters` contains
 compositor-wide `withheld_opportunities`, `resumes`, `recomputes` and
 `conservative_fallbacks`; these read-only counters do not emit property changes.
 Withheld opportunities count eligible root-tree pulse opportunities, not dropped
-callbacks. Resumes count actual delivery of retained callbacks, not transitions
+callbacks. Resumes match delivered callback identities against the retained set,
+so destroying a child cannot turn an unrelated callback into a resume. They do not count transitions
 to unknown visibility. While occluded, each surface retains at most 64 committed
 callbacks: excess older callbacks receive `done` immediately (fail-open), without
 discarding protocol objects. This cap does not override session-lock or workspace

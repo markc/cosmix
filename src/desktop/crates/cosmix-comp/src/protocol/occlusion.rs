@@ -11,7 +11,7 @@ pub(super) struct OcclusionRuntime {
     opacity: HashMap<SurfaceId, (u64, u64, CommittedOpacity)>,
     refused_opacity: HashSet<SurfaceId>,
     scene_indices: HashMap<SurfaceId, usize>,
-    pub withheld: HashSet<SurfaceId>,
+    pub withheld: HashMap<SurfaceId, HashSet<ObjectId>>,
     #[cfg(test)]
     pub scene_rebuilds: usize,
 }
@@ -241,7 +241,7 @@ impl WaylandState {
             .retain(|id, _| self.surface_objects.contains_key(id));
         self.occlusion
             .withheld
-            .retain(|id| self.surface_objects.contains_key(id));
+            .retain(|id, _| self.surface_objects.contains_key(id));
         self.occlusion
             .decision_revisions
             .retain(|id, _| self.surface_objects.contains_key(id));
@@ -288,14 +288,17 @@ impl WaylandState {
                 && self.surface_is_session_presentable(record)
                 && !self.surface_belongs_to_hidden_toplevel(record.role.wl_surface(), workspace)
             {
-                let (_, retained) = send_frames_surface_tree_limited(
+                let batch = send_frames_surface_tree_limited(
                     record.role.wl_surface(),
                     monotonic_millis(),
                     &self.surfaces,
                     64,
+                    &HashSet::new(),
                 );
-                if retained {
-                    self.occlusion.withheld.insert(record.id);
+                if !batch.retained.is_empty() {
+                    self.occlusion.withheld.insert(record.id, batch.retained);
+                } else {
+                    self.occlusion.withheld.remove(&record.id);
                 }
             }
         }
