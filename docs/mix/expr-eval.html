@@ -451,6 +451,11 @@ one expression</strong> under an optional capability policy and the standard
 eval limits, rejecting everything that isn't a pure expression shape
 <strong>before execution</strong>. It landed in lib-mix 0.89.0 together with the
 <code>send</code>/<code>emit</code> capability-gate fix.</p>
+<p><code>expr_mode_check(source) -&gt; MixResult&lt;()&gt;</code> (lib-mix 0.89.1) performs the same
+single-expression, static deny and depth checks without evaluation. Hosts
+can reject invalid bindings at compile time without constructing an evaluator
+or running builtins. Runtime errors such as division by zero remain evaluation
+errors; this check does not predict values or enforce a host capability policy.</p>
 <pre><code class="language-rust">use cosmix_lib_mix::{
     eval_expr_string, CategoryAllowList, EvalLimits, IndexMap, Value,
 };

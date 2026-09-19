@@ -25,6 +25,59 @@ loads. Rejected patches retain both the tree and its revision.
 `shell.scene.describe {family?}` reports the shared P1 registry.
 `shell.scene.unload {scene}` removes the page.
 
+## V1 bindings
+
+A port value beginning `= ` is one Mix expression. `== x` escapes to the
+literal `= x`, while `=x` remains a literal. For example:
+
+```mix
+root: {widget: "text", text: "= $model.title", hidden: "= !$model.visible"}
+```
+
+Bindings read the scene's JSON `$model`; row templates may also read the
+current `$item`. A binding is a pure function of `$model` and `$item`.
+Nested lists and their row subtrees use the same template rule. Row
+instantiation takes a node ID and the live model, so sibling templates
+keep their own bindings and see the latest model patch.
+When a model path changes, a binding reruns when its dependency is that path,
+an ancestor, or a descendant of it; unrelated bindings do not run.
+Interpolation and heredocs record dependencies too: `"Hi ${model.user.name}"`
+depends on `model.user.name`, including dependencies inside coalesce defaults.
+`${NAME}` with any root other than `model` (or template-only `item`) is a
+`binding-policy` error; bindings cannot use interpolation to read process
+environment variables. Index access collapses its dependency to the base
+path and also tracks dependencies in the index expression.
+
+Compilation uses lib-mix's static expression-mode check. Denied constructs
+fail compilation, including untaken branches; evaluation follows the engine's
+short-circuit and coalesce semantics. At load, a failed binding takes the
+schema default, or the port is absent when there is no default. The binding
+source is never a literal fallback. A nil result also restores the default
+or removes the port. Later failures preserve the last good value.
+
+Lint and resolve share cached compilation and load results; changing the
+document invalidates the cache. Each binding runs at most once per load.
+Load evaluation and each re-evaluation pass have a 250 ms total wall budget,
+with at most 50 ms per expression. Remaining bindings report `binding-eval`
+with `evaluation budget exhausted`; they take defaults at load or retain
+last-good values on a patch. As with lib-mix limits, a non-yielding builtin
+can overshoot until it returns. Template instantiation uses the same budget.
+Null model patches remove keys without creating missing parent maps. Patch
+values are limited to 256 KiB of serialised JSON (`model-path` on excess).
+Empty model and binding fields are omitted from resolved-tree serialisation.
+
+| diagnostic | meaning |
+| --- | --- |
+| `invalid-binding` | expression syntax, statement count or depth is invalid |
+| `binding-policy` | a disallowed root or operation was used |
+| `binding-not-allowed` | a structural port was bound |
+| `binding-eval` | evaluation failed or budget exhausted; default at load, last good on patch |
+| `binding-type` | the result failed strict port validation |
+| `model-path` | the model patch path is malformed or its value exceeds the size limit |
+
+Calling `time()` is allowed but emits a `binding-nondeterministic` warning;
+it is not a policy violation.
+
 `shell.scene.watch {scene}` returns `{scene,revision,digest}`. Subscribe to
 `shell.scene.changed` for summaries `{scene,revision,ops,diagnostics}`;
 fetch the complete tree with `get`. Revisions increase on accepted loads and

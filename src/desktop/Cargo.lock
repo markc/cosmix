@@ -3072,7 +3072,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-config"
-version = "0.8.4"
+version = "0.8.5"
 dependencies = [
  "anyhow",
  "cosmix-lib-bus",
@@ -3121,7 +3121,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-lib-mix"
-version = "0.88.0"
+version = "0.89.1"
 dependencies = [
  "futures-util",
  "indexmap",
@@ -3248,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-mix",

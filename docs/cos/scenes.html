@@ -465,6 +465,50 @@ The complete serialised patch candidate must fit the same 256 KiB bound as
 loads. Rejected patches retain both the tree and its revision.
 <code>shell.scene.describe {family?}</code> reports the shared P1 registry.
 <code>shell.scene.unload {scene}</code> removes the page.</p>
+<h2 id="v1-bindings">V1 bindings</h2>
+<p>A port value beginning <code>= </code> is one Mix expression. <code>== x</code> escapes to the
+literal <code>= x</code>, while <code>=x</code> remains a literal. For example:</p>
+<pre><code class="language-mix">root: {widget: "text", text: "= $model.title", hidden: "= !$model.visible"}
+</code></pre>
+<p>Bindings read the scene's JSON <code>$model</code>; row templates may also read the
+current <code>$item</code>. A binding is a pure function of <code>$model</code> and <code>$item</code>.
+Nested lists and their row subtrees use the same template rule. Row
+instantiation takes a node ID and the live model, so sibling templates
+keep their own bindings and see the latest model patch.
+When a model path changes, a binding reruns when its dependency is that path,
+an ancestor, or a descendant of it; unrelated bindings do not run.
+Interpolation and heredocs record dependencies too: <code>"Hi ${model.user.name}"</code>
+depends on <code>model.user.name</code>, including dependencies inside coalesce defaults.
+<code>${NAME}</code> with any root other than <code>model</code> (or template-only <code>item</code>) is a
+<code>binding-policy</code> error; bindings cannot use interpolation to read process
+environment variables. Index access collapses its dependency to the base
+path and also tracks dependencies in the index expression.</p>
+<p>Compilation uses lib-mix's static expression-mode check. Denied constructs
+fail compilation, including untaken branches; evaluation follows the engine's
+short-circuit and coalesce semantics. At load, a failed binding takes the
+schema default, or the port is absent when there is no default. The binding
+source is never a literal fallback. A nil result also restores the default
+or removes the port. Later failures preserve the last good value.</p>
+<p>Lint and resolve share cached compilation and load results; changing the
+document invalidates the cache. Each binding runs at most once per load.
+Load evaluation and each re-evaluation pass have a 250 ms total wall budget,
+with at most 50 ms per expression. Remaining bindings report <code>binding-eval</code>
+with <code>evaluation budget exhausted</code>; they take defaults at load or retain
+last-good values on a patch. As with lib-mix limits, a non-yielding builtin
+can overshoot until it returns. Template instantiation uses the same budget.
+Null model patches remove keys without creating missing parent maps. Patch
+values are limited to 256 KiB of serialised JSON (<code>model-path</code> on excess).
+Empty model and binding fields are omitted from resolved-tree serialisation.</p>
+<table><thead><tr><th>diagnostic</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>invalid-binding</code></td><td>expression syntax, statement count or depth is invalid</td></tr>
+<tr><td><code>binding-policy</code></td><td>a disallowed root or operation was used</td></tr>
+<tr><td><code>binding-not-allowed</code></td><td>a structural port was bound</td></tr>
+<tr><td><code>binding-eval</code></td><td>evaluation failed or budget exhausted; default at load, last good on patch</td></tr>
+<tr><td><code>binding-type</code></td><td>the result failed strict port validation</td></tr>
+<tr><td><code>model-path</code></td><td>the model patch path is malformed or its value exceeds the size limit</td></tr>
+</tbody></table>
+<p>Calling <code>time()</code> is allowed but emits a <code>binding-nondeterministic</code> warning;
+it is not a policy violation.</p>
 <p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
 <code>shell.scene.changed</code> for summaries <code>{scene,revision,ops,diagnostics}</code>;
 fetch the complete tree with <code>get</code>. Revisions increase on accepted loads and
