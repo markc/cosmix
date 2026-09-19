@@ -114,10 +114,10 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-interactgui` | 0.1.2 |
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
-| `cosmix-quoin` | 0.12.3 |
-| `cosmix-scene` | 0.2.0 |
-| `cosmix-scene-bevy` | 0.1.3 |
-| `cosmix-shell` | 0.11.0 |
+| `cosmix-quoin` | 0.12.5 |
+| `cosmix-scene` | 0.3.0 |
+| `cosmix-scene-bevy` | 0.3.1 |
+| `cosmix-shell` | 0.12.1 |
 | `cosmix-shell-host` | 0.6.10 |
 | `cosmix-studio` | 0.4.7 |
 | `cosmix-term` | 0.8.6 |
