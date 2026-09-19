@@ -52,7 +52,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-agentd` | 0.2.0 |
 | `cosmix-app-identity` | 0.2.0 |
 | `cosmix-claud` | 0.2.0 |
-| `cosmix-dbusd` | 0.2.0 |
+| `cosmix-dbusd` | 0.3.0 |
 | `cosmix-dnsd` | 0.3.1 |
 | `cosmix-filesd` | 0.8.1 |
 | `cosmix-indexd` | 0.9.1 |
