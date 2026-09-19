@@ -288,7 +288,41 @@ fn occlusion_wire_translucency_and_one_pixel_strip_do_not_withhold() {
             "opaque baseline must withhold before testing exposure"
         );
         if opaque {
-            h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 0.4;
+            // Inward/outward raster rounding agrees at scale 1, but differs
+            // by one physical pixel at 2.5 for this fractional outer edge.
+            let root = h.server.state.surfaces[&victim].id;
+            h.server
+                .state
+                .surfaces
+                .get_mut(&victim)
+                .unwrap()
+                .layout
+                .width = 63.0;
+            for child in h
+                .server
+                .state
+                .surfaces
+                .values_mut()
+                .filter(|r| r.layout.parent == Some(root))
+            {
+                child.layout.width = 62.0;
+            }
+            h.server
+                .state
+                .surfaces
+                .get_mut(&cover)
+                .unwrap()
+                .layout
+                .width = 63.1;
+            h.server.state.backend.change_host_output_scale(1.0);
+            certify(&mut h, true);
+            h.frame(Vec::new());
+            assert_eq!(
+                done(&mut h, callback),
+                0,
+                "scale 1 has no uncovered raster pixel"
+            );
+            h.server.state.backend.change_host_output_scale(2.5);
         }
         certify(&mut h, opaque);
         h.frame(Vec::new());
