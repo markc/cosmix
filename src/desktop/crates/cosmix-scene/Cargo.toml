@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-scene"
-version = "0.2.0"
+version = "0.3.0"
 description = "Headless Mix Scenes document parser, registry and diff"
 edition = "2024"
 rust-version = "1.95"

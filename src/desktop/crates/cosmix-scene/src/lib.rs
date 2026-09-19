@@ -258,7 +258,7 @@ fn schema(f: &str) -> Option<&'static [Port]> {
     static ALIGN: &[&str] = &["start", "center", "end", "stretch"];
     static TONE: &[&str] = &["normal", "danger", "primary"];
     static KIND: &[&str] = &["edge"];
-    static WINDOW: [Port; 5] = [
+    static WINDOW: [Port; 6] = [
         Port {
             name: "kind",
             ty: "string",
@@ -271,12 +271,16 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         p("title", "string", false, None),
         pn("w", false, None),
         pn("h", false, None),
+        p("chrome", "bool", false, Some("true")),
     ];
-    static BOX: [Port; 4] = [
+    static BOX: [Port; 5] = [
         p("children", "list", true, None),
         pnd("gap", "0", None),
         pnd("padding", "0", None),
         p("fill", "bool", false, Some("false")),
+        // A column stretched its children before `align` existed; the
+        // default keeps every v0 document laying out exactly as it did.
+        pe("align", "\"stretch\"", ALIGN),
     ];
     static ROW: [Port; 10] = [
         p("children", "list", true, None),
@@ -297,7 +301,7 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         p("hover", "string", false, None),
         p("on_click", "string", false, None),
     ];
-    static TEXT: [Port; 9] = [
+    static TEXT: [Port; 10] = [
         p("text", "string", true, None),
         pnd("size", "13", Some(0.0)),
         p("bold", "bool", false, Some("false")),
@@ -307,6 +311,7 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         pn("width", false, None),
         p("fill", "bool", false, Some("false")),
         p("hidden", "bool", false, Some("false")),
+        pe("align", "\"left\"", &["left", "center", "right"]),
     ];
     static FIELD: [Port; 6] = [
         p("value", "string", true, None),
@@ -645,6 +650,7 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
         ));
     }
     let mut parents: HashMap<String, usize> = HashMap::new();
+    let mut template_nodes = HashSet::new();
     for (id, n) in &doc.nodes {
         if id.contains('@') {
             out.push(Diagnostic::error(
@@ -728,7 +734,9 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
                 }
                 match doc.nodes.get(row) {
                     Some(t) => {
-                        check_template(row, t, doc, minimum_cells(n), &mut out, &mut HashSet::new())
+                        let mut seen = HashSet::new();
+                        check_template(row, t, doc, minimum_cells(n), &mut out, &mut seen);
+                        template_nodes.extend(seen);
                     }
                     None => out.push(Diagnostic::error(
                         "dangling-child",
@@ -737,6 +745,22 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
                     )),
                 }
             }
+        }
+    }
+    for (id, node) in &doc.nodes {
+        if !template_nodes.contains(id)
+            && node.ports.iter().any(|(port, value)| {
+                matches!(
+                    (node.widget.as_str(), port.as_str()),
+                    ("text", "text") | ("image", "src")
+                ) && value.as_str().is_some_and(|s| s.contains("{cells["))
+            })
+        {
+            out.push(Diagnostic::error(
+                "cell-substitution",
+                node.line,
+                "cell substitution is allowed only in text.text and image.src inside list templates",
+            ));
         }
     }
     if !doc.nodes.contains_key("root") {
@@ -754,8 +778,15 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
         ));
     }
     if let Some(w) = &doc.window {
+        if w.get("chrome").is_some_and(|value| !value.is_boolean()) {
+            out.push(Diagnostic::error(
+                "port-type",
+                1,
+                "window.chrome must be bool",
+            ));
+        }
         for n in doc.nodes.values().filter(|n| n.widget == "window") {
-            if ["kind", "edge", "title", "w", "h"]
+            if ["kind", "edge", "title", "w", "h", "chrome"]
                 .iter()
                 .any(|k| n.ports.get(*k) != w.get(*k))
             {
@@ -1026,14 +1057,16 @@ fn check_template(
     }
     for (k, v) in &n.ports {
         if let Some(s) = v.as_str() {
-            if s.contains("{cells[") && k != "text" {
+            let allows_cells =
+                (n.widget == "text" && k == "text") || (n.widget == "image" && k == "src");
+            if s.contains("{cells[") && !allows_cells {
                 o.push(Diagnostic::error(
                     "cell-substitution",
                     n.line,
-                    "cell substitution is allowed only in text.text",
+                    "cell substitution is allowed only in text.text and image.src inside list templates",
                 ));
             }
-            if k == "text" {
+            if allows_cells {
                 for (start, _) in s.match_indices("{cells[") {
                     if let Some(e) = s[start + 7..].find("]}") {
                         if s[start + 7..start + 7 + e]
@@ -1184,6 +1217,118 @@ mod tests {
         ))
         .unwrap()
     }
+    #[test]
+    fn image_src_cell_substitution_allowed_in_template() {
+        let source = "root: {widget: \"list\", rows: [{id: \"a\", cells: [\"icon.png\"]}], row: \"t\", row_height: 24}\nt: {widget: \"row\", children: [\"icon\"]}\nicon: {widget: \"image\", src: \"{cells[0]}\"}";
+        assert!(lint(&doc(source)).is_empty());
+        for invalid in [
+            source.replace("{cells[0]}", "{cells[1]}"),
+            source.replace(
+                "children: [\"icon\"]",
+                "children: [\"icon\"], background: \"{cells[0]}\"",
+            ),
+            "root: {widget: \"image\", src: \"{cells[0]}\"}".into(),
+            "root: {widget: \"text\", text: \"{cells[0]}\"}".into(),
+        ] {
+            assert!(
+                lint(&doc(&invalid))
+                    .iter()
+                    .any(|d| d.code == "cell-substitution"),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_template_cell_markers_in_literal_ports_load() {
+        for source in [
+            "root: {widget: \"field\", value: \"{cells[0]}\"}",
+            "root: {widget: \"button\", label: \"{cells[\"}",
+        ] {
+            assert!(resolve(&doc(source)).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn envelope_window_chrome_is_type_checked() {
+        let mut document = doc("root: {widget: \"column\", children: []}");
+        for value in [json!("false"), json!(0), JsonValue::Null] {
+            document.window = Some(json!({"chrome":value}));
+            assert!(lint(&document).iter().any(|d| d.code == "port-type"));
+            assert!(resolve(&document).is_err());
+        }
+        for value in [json!(true), json!(false)] {
+            document.window = Some(json!({"chrome":value}));
+            assert!(resolve(&document).is_ok());
+        }
+    }
+
+    #[test]
+    fn window_chrome_port_defaults_true_and_accepts_false() {
+        let source = "root: {widget: \"window\", kind: \"edge\"}";
+        assert_eq!(
+            resolve(&doc(source)).unwrap().nodes["root"].ports["chrome"],
+            true
+        );
+        let mut document = doc(source);
+        document
+            .nodes
+            .get_mut("root")
+            .unwrap()
+            .ports
+            .insert("chrome".into(), json!(false));
+        assert_eq!(
+            resolve(&document).unwrap().nodes["root"].ports["chrome"],
+            false
+        );
+        document.window = Some(json!({"kind":"edge","chrome":false}));
+        assert!(lint(&document).is_empty());
+        document.window.as_mut().unwrap()["chrome"] = json!(true);
+        assert!(
+            lint(&document)
+                .iter()
+                .any(|d| d.code == "window-disagreement")
+        );
+        document.window = None;
+        document
+            .nodes
+            .get_mut("root")
+            .unwrap()
+            .ports
+            .insert("chrome".into(), json!("false"));
+        assert!(lint(&document).iter().any(|d| d.code == "port-type"));
+    }
+
+    #[test]
+    fn column_align_and_text_align_validate_enums() {
+        for (family, ports, default, values) in [
+            (
+                "column",
+                "children: []",
+                "stretch",
+                vec!["start", "center", "end", "stretch"],
+            ),
+            (
+                "text",
+                "text: \"x\"",
+                "left",
+                vec!["left", "center", "right"],
+            ),
+        ] {
+            let source = format!("root: {{widget: \"{family}\", {ports}}}");
+            assert_eq!(
+                resolve(&doc(&source)).unwrap().nodes["root"].ports["align"],
+                default
+            );
+            for value in values {
+                let source = format!("root: {{widget: \"{family}\", {ports}, align: \"{value}\"}}");
+                assert!(lint(&doc(&source)).is_empty());
+            }
+            let source = format!("root: {{widget: \"{family}\", {ports}, align: \"invalid\"}}");
+            assert!(lint(&doc(&source)).iter().any(|d| d.code == "enum-value"));
+        }
+    }
+
     #[test]
     fn fixture_round_trips() {
         for s in [C, F, S] {

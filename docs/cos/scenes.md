@@ -8,6 +8,10 @@ Invalid loads and patches return diagnostics and retain the last good tree.
 Scenes mount as pages in an edge panel. Floating windows are outside v0.
 The envelope's `window` header is the mount request; when absent, the window
 node supplies edge, title and extent. Patching that node reapplies the mount.
+`window.chrome` must be a boolean and defaults to true; false lets the page
+fill its panel without the Quoin header bar, for panel-style furniture.
+Chromeless pages have no in-panel page navigation or pin control: use them
+alone on an edge or drive navigation and pinning through Bus verbs.
 An absent or cleared extent uses the shell's output-derived default thickness.
 Authored extents fit the output space left by opposing exclusive zones;
 pinning and output changes recheck that budget. Pointer resizes exceeding the
@@ -94,8 +98,31 @@ edits take precedence over incoming value replacements while focused.
 Changing a field's family or password mode replaces that widget.
 
 List rows use CTK VirtualList. Row templates are instantiated with
-`template-node@row-id` identities and substitute only `{cells[i]}` in text.
+`template-node@row-id` identities and substitute `{cells[i]}` only in
+`text.text` and `image.src` inside list templates.
+Outside templates, cell markers in other ports are literal data.
 Text elision uses CTK's middle-elision policy.
+`column.align` sets cross-axis alignment to `start`, `center`,
+`end` or `stretch` (default).
+`text.align` sets justification to `left` (default), `center` or `right`
+within the text's `width` or the space allocated by `fill: true`.
+
+Absolute image `src` paths load PNG and SVG directly, rasterised or resized
+at `UiScale` multiplied by the primary window's scale factor, or `UiScale`
+alone in a compositor host without a primary window. Scale changes reapply
+icons. The 512-entry LRU cache keys path, file modification time, file size,
+pixel target and effective scale; eviction drops the cache's image handle.
+Only regular files up to 4 MiB and targets up to 1024 pixels per side are
+accepted. PNG input is limited to 4096 pixels per side and 64 MiB of decoder
+allocation. SVG paths and gradients are supported; SVG text and embedded
+images (including data URLs and filesystem references) are disabled. SVGs
+retain their aspect ratio and are centred in the target.
+Invalid files render nothing, with decode/type failures remembered per target
+and file version. Missing files are retried on a scene load/revision; other
+I/O failures are retried on the next apply. Diagnostics are logged once per
+cached failure; all cache entries, including failures, share the LRU bound.
+The host also substitutes `{cells[i]}` in
+an image template's `src`, including when loaded through `shell.scene.load`.
 
 CTK shares the font source cache through weak references. Fonts still used by
 retained layouts keep the same atlas identity after idle cache pruning, so

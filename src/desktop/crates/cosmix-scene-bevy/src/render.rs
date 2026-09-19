@@ -26,6 +26,12 @@ use serde_json::{Value, json};
 
 use super::SceneStore;
 
+mod icons;
+use icons::IconCache;
+
+#[derive(Resource)]
+struct IconScale(f32);
+
 #[derive(Component, Clone)]
 struct Binding {
     scene: String,
@@ -139,6 +145,7 @@ pub(crate) fn install(app: &mut App) {
         app.add_plugins(VirtualListPlugin);
     }
     app.init_resource::<Events>()
+        .init_resource::<IconCache>()
         .add_observer(activate)
         .add_observer(toggle)
         .add_observer(field_change)
@@ -232,6 +239,11 @@ struct View {
 }
 
 pub(crate) fn reconcile(world: &mut World) {
+    let scale = icons::effective_scale(world);
+    let scale_changed = world
+        .get_resource::<IconScale>()
+        .is_none_or(|old| old.0 != scale);
+    world.insert_resource(IconScale(scale));
     world.resource_scope(|world, mut store: Mut<SceneStore>| {
         for mounted in store.removed.drain(..) {
             destroy(world, mounted);
@@ -264,7 +276,7 @@ pub(crate) fn reconcile(world: &mut World) {
                 registered: false,
                 nodes: BTreeMap::new(),
             });
-            if mounted.revision != entry.revision {
+            if mounted.revision != entry.revision || scale_changed {
                 if mount_config(&mounted.tree) != mount_config(&entry.tree) {
                     mounted.registered = false;
                 }
@@ -279,12 +291,13 @@ pub(crate) fn reconcile(world: &mut World) {
                     .as_ref()
                     .and_then(|w| w["title"].as_str())
                     .unwrap_or(&entry.tree.name);
-                mounted.registered = cosmix_shell::chrome::mount_page(
+                mounted.registered = cosmix_shell::chrome::mount_page_with(
                     world,
                     edge,
                     &page_id(&entry.tree),
                     title,
                     mounted.page,
+                    config.as_ref().and_then(|w| w["chrome"].as_bool()) == Some(false),
                 );
                 if mounted.registered {
                     use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
@@ -373,6 +386,7 @@ fn template_ids(tree: &ResolvedScene) -> BTreeSet<String> {
 }
 
 fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
+    icons::begin_revision(world);
     let ops = cosmix_scene::diff(&mounted.tree, tree);
     let templates = template_ids(tree);
     // Detach scene-owned roots before removals; a retained descendant must not
@@ -412,6 +426,7 @@ fn apply(world: &mut World, mounted: &mut Mounted, tree: &ResolvedScene) {
             .entry(id.clone())
             .or_insert_with(|| spawn(world, tree, id, node));
         let changed = fresh
+            || matches!(node.family.as_str(), "text" | "image")
             || mounted.tree.nodes.get(id) != Some(node)
             || ops.iter().any(|op| matches!(op, Op::SetScene { .. }));
         if changed {
@@ -590,11 +605,10 @@ fn update(
                 layout.flex_shrink = 0.0;
             }
             layout.border_radius = BorderRadius::all(px(number(node, "radius", 0.0)));
-            layout.align_items = match (node.family.as_str(), text(node, "align")) {
-                ("column", _) => AlignItems::Stretch,
-                (_, "center") => AlignItems::Center,
-                (_, "end") => AlignItems::End,
-                (_, "stretch") => AlignItems::Stretch,
+            layout.align_items = match text(node, "align") {
+                "center" => AlignItems::Center,
+                "end" => AlignItems::End,
+                "stretch" => AlignItems::Stretch,
                 _ => AlignItems::Start,
             };
             let normal = color(text(node, "background"), Color::NONE);
@@ -656,6 +670,29 @@ fn update(
         }
         "text" => {
             let label = view.label.unwrap();
+            world.get_mut::<TextLayout>(label).unwrap().justify = match text(node, "align") {
+                "center" => Justify::Center,
+                "right" => Justify::Right,
+                _ => Justify::Left,
+            };
+            // Justification uses the wrapper's authored or flex-allocated width.
+            world.get_mut::<Node>(label).unwrap().width =
+                if node.ports.contains_key("width") || flag(node, "fill") {
+                    percent(100)
+                } else {
+                    Val::Auto
+                };
+            if flag(node, "fill")
+                && tree.nodes.values().any(|parent| {
+                    parent.family == "column"
+                        && text(parent, "align") == "stretch"
+                        && children(parent).any(|child| child == id.split('@').next().unwrap_or(id))
+                })
+            {
+                layout.align_self = AlignSelf::Stretch;
+            } else {
+                layout.align_self = AlignSelf::Auto;
+            }
             world.entity_mut(label).insert((
                 Text::new(text(node, "text")),
                 TextFont::from_font_size(number(node, "size", 13.0)).with_font_weight(
@@ -694,11 +731,23 @@ fn update(
             };
         }
         "image" => {
-            let image = world
-                .get_resource::<AssetServer>()
-                .map(|assets| assets.load::<Image>(text(node, "src").to_owned()));
+            let src = text(node, "src");
+            let image = if src.starts_with('/') {
+                icons::load(
+                    world,
+                    src,
+                    number(node, "w", 16.0),
+                    number(node, "h", 16.0),
+                )
+            } else {
+                world
+                    .get_resource::<AssetServer>()
+                    .map(|assets| assets.load::<Image>(src.to_owned()))
+            };
             if let Some(image) = image {
                 world.entity_mut(view.root).insert(ImageNode::new(image));
+            } else if src.starts_with('/') {
+                world.entity_mut(view.root).remove::<ImageNode>();
             }
             layout.width = px(number(node, "w", 16.0));
             layout.height = px(number(node, "h", 16.0));
@@ -769,6 +818,9 @@ fn template_node(world: &mut World, tree: &ResolvedScene, id: &str, item: &Value
     if node.family == "text" {
         let value = substitute_cells(text(&node, "text"), &item["cells"]);
         node.ports.insert("text".into(), json!(value));
+    } else if node.family == "image" {
+        let value = substitute_cells(text(&node, "src"), &item["cells"]);
+        node.ports.insert("src".into(), json!(value));
     }
     let instance = format!("{id}@{}", item["id"].as_str().unwrap_or_default());
     let view = spawn(world, tree, &instance, &node);
@@ -865,6 +917,203 @@ fn color(value: &str, fallback: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ICON_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red" fill-opacity="0.5"/></svg>"#;
+
+    fn icon_tree(path: &std::path::Path) -> ResolvedScene {
+        let source = format!(
+            "---\nscene: 1\nname: icons\ncitizen: test\n---\n```mix\nroot: {{widget: \"image\", src: {}, w: 24, h: 24}}\n```\n",
+            json!(path.to_str().unwrap())
+        );
+        cosmix_scene::resolve(&cosmix_scene::parse(&source).unwrap()).unwrap()
+    }
+
+    fn rendered_icon(world: &World, entity: Entity, pixels: u32) -> Handle<Image> {
+        let handle = world.get::<ImageNode>(entity).unwrap().image.clone();
+        let image = world.resource::<Assets<Image>>().get(&handle).unwrap();
+        assert_eq!(image.texture_descriptor.size.width, pixels);
+        assert_eq!(image.texture_descriptor.size.height, pixels);
+        handle
+    }
+
+    #[test]
+    fn svg_icon_rasterises_at_oversampled_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.SVG");
+        std::fs::write(&path, ICON_SVG).unwrap();
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut window = Window::default();
+        window.resolution.set_scale_factor_override(Some(2.5));
+        world.spawn((window, bevy::window::PrimaryWindow));
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let handle = rendered_icon(&world, mounted.nodes["root"].root, 60);
+        let image = world.resource::<Assets<Image>>().get(&handle).unwrap();
+        assert_eq!(&image.data.as_ref().unwrap()[..4], &[255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn png_icon_loads_from_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 255, 0, 255]))
+            .save(&path)
+            .unwrap();
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        rendered_icon(&world, mounted.nodes["root"].root, 24);
+    }
+
+    #[test]
+    fn missing_icon_is_absent_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.svg");
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let view = &mounted.nodes["root"];
+        assert!(world.get::<ImageNode>(view.root).is_none());
+        // A now-valid file stays absent: the second update must use the negative cache.
+        std::fs::write(&path, ICON_SVG).unwrap();
+        update(&mut world, &tree, "root", &tree.nodes["root"], None, view);
+        assert!(world.get::<ImageNode>(view.root).is_none());
+        apply(&mut world, &mut mounted, &tree);
+        rendered_icon(&world, mounted.nodes["root"].root, 24);
+    }
+
+    #[test]
+    fn scale_change_reapplies_unchanged_scene_icons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.svg");
+        std::fs::write(&path, ICON_SVG).unwrap();
+        let source = format!(
+            "---\nscene: 1\nname: icons\ncitizen: test\n---\n```mix\nroot: {{widget: \"image\", src: {}, w: 24, h: 24}}\n```\n",
+            json!(path.to_str().unwrap())
+        );
+        let mut store = SceneStore::default();
+        store
+            .request(cosmix_shell::runtime::SceneVerb::Load, &source, &Value::Null)
+            .unwrap();
+        let mut world = World::new();
+        world.insert_resource(store);
+        reconcile(&mut world);
+        let entry = &world.resource::<SceneStore>().scenes["icons"];
+        let revision = entry.revision;
+        let root = entry.mounted.as_ref().unwrap().nodes["root"].root;
+        let first = rendered_icon(&world, root, 24);
+        world.insert_resource(UiScale(2.0));
+        reconcile(&mut world);
+        assert_ne!(rendered_icon(&world, root, 48), first);
+        assert_eq!(
+            world.resource::<SceneStore>().scenes["icons"].revision,
+            revision
+        );
+    }
+
+    #[test]
+    fn icon_cache_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.svg");
+        std::fs::write(&path, ICON_SVG).unwrap();
+        let tree = icon_tree(&path);
+        let mut world = World::new();
+        let mut first = mounted(&mut world, &tree);
+        apply(&mut world, &mut first, &tree);
+        let handle = rendered_icon(&world, first.nodes["root"].root, 24);
+        let mut second = mounted(&mut world, &tree);
+        apply(&mut world, &mut second, &tree);
+        assert_eq!(handle, rendered_icon(&world, second.nodes["root"].root, 24));
+        update(
+            &mut world,
+            &tree,
+            "root",
+            &tree.nodes["root"],
+            None,
+            &first.nodes["root"],
+        );
+        assert_eq!(handle, rendered_icon(&world, first.nodes["root"].root, 24));
+        assert_eq!(world.resource::<Assets<Image>>().len(), 1);
+    }
+
+    #[test]
+    fn template_image_src_substitutes_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = [dir.path().join("one.svg"), dir.path().join("two.svg")];
+        for path in &paths {
+            std::fs::write(path, ICON_SVG).unwrap();
+        }
+        let source = format!(
+            "---\nscene: 1\nname: icons\ncitizen: test\n---\n```mix\nroot: {{widget: \"list\", row: \"icon\", row_height: 24, rows: {}}}\nicon: {{widget: \"image\", src: \"{{cells[1]}}\", w: 24, h: 24}}\n```\n",
+            json!([{"id":"one","cells":["One",paths[0]]},{"id":"two","cells":["Two",paths[1]]}])
+        );
+        let tree = cosmix_scene::resolve(&cosmix_scene::parse(&source).unwrap()).unwrap();
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        apply(&mut world, &mut mounted, &tree);
+        let model = ListModel(mounted.nodes["root"].list.as_ref().unwrap().clone());
+        for (index, path) in paths.iter().enumerate() {
+            let content = world.spawn_empty().id();
+            model.bind(&mut world, content, index);
+            let entity = world.get::<Children>(content).unwrap()[0];
+            let handle = rendered_icon(&world, entity, 24);
+            assert_eq!(
+                Some(handle),
+                icons::load(&mut world, path.to_str().unwrap(), 24.0, 24.0)
+            );
+        }
+        assert_eq!(world.resource::<Assets<Image>>().len(), 2);
+    }
+
+    #[test]
+    fn invalid_icons_clear_previous_images_and_are_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.svg");
+        std::fs::write(&valid, ICON_SVG).unwrap();
+        let valid_tree = icon_tree(&valid);
+        for (name, contents, size) in [
+            ("broken.svg", "not SVG", 24.0),
+            ("zero.svg", ICON_SVG, 0.0),
+            ("large-target.svg", ICON_SVG, 1025.0),
+            ("large-file.svg", ICON_SVG, 24.0),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            if name == "large-file.svg" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(4 * 1024 * 1024 + 1)
+                    .unwrap();
+            }
+            let mut tree = icon_tree(&path);
+            tree.nodes["root"].ports.insert("w".into(), json!(size));
+            let mut world = World::new();
+            let view = spawn(&mut world, &tree, "root", &tree.nodes["root"]);
+            update(
+                &mut world,
+                &valid_tree,
+                "root",
+                &valid_tree.nodes["root"],
+                None,
+                &view,
+            );
+            rendered_icon(&world, view.root, 24);
+            update(&mut world, &tree, "root", &tree.nodes["root"], None, &view);
+            assert!(world.get::<ImageNode>(view.root).is_none(), "{name}");
+            assert!(icons::load(&mut world, path.to_str().unwrap(), size, 24.0).is_none());
+            if size == 0.0 || size > 1024.0 {
+                assert!(icons::load(&mut world, path.to_str().unwrap(), 24.0, 24.0).is_some());
+            }
+            std::fs::write(&path, ICON_SVG).unwrap();
+            assert!(icons::load(&mut world, path.to_str().unwrap(), 24.0, 24.0).is_some());
+        }
+    }
+
     fn mounted(world: &mut World, tree: &ResolvedScene) -> Mounted {
         Mounted {
             revision: 0,
@@ -924,6 +1173,258 @@ mod tests {
             }
         }
         assert!(checked > 30, "only {checked} clearable ports tested");
+    }
+
+    #[test]
+    fn text_align_center_sets_justify() {
+        for (family, align, expected) in [
+            ("row", "center", AlignSelf::Auto),
+            ("column", "center", AlignSelf::Auto),
+            ("column", "stretch", AlignSelf::Stretch),
+        ] {
+            let source = format!(
+                "---\nscene: 1\nname: alignment\ncitizen: test\n---\n```mix\nroot: {{widget: \"{family}\", align: \"{align}\", children: [\"label\"]}}\nlabel: {{widget: \"text\", text: \"Clock\", align: \"center\", fill: true}}\n```\n"
+            );
+            let mut tree = cosmix_scene::resolve(&cosmix_scene::parse(&source).unwrap()).unwrap();
+            let mut world = World::new();
+            let mut mounted = mounted(&mut world, &tree);
+            apply(&mut world, &mut mounted, &tree);
+            let view = &mounted.nodes["label"];
+            assert_eq!(world.get::<Node>(view.root).unwrap().align_self, expected);
+            assert_eq!(
+                world.get::<Node>(view.label.unwrap()).unwrap().width,
+                percent(100)
+            );
+            assert_eq!(
+                world
+                    .get::<TextLayout>(view.label.unwrap())
+                    .unwrap()
+                    .justify,
+                Justify::Center
+            );
+            tree.nodes["root"]
+                .ports
+                .insert("align".into(), json!("center"));
+            apply(&mut world, &mut mounted, &tree);
+            assert_eq!(
+                world
+                    .get::<Node>(mounted.nodes["label"].root)
+                    .unwrap()
+                    .align_self,
+                AlignSelf::Auto
+            );
+        }
+        for sizing in ["width: 120", "fill: true"] {
+            let source = format!(
+                "---\nscene: 1\nname: alignment\ncitizen: test\n---\n```mix\nroot: {{widget: \"text\", text: \"Clock\", align: \"center\", {sizing}}}\n```\n"
+            );
+            let mut tree = cosmix_scene::resolve(&cosmix_scene::parse(&source).unwrap()).unwrap();
+            let mut world = World::new();
+            let mut mounted = mounted(&mut world, &tree);
+            apply(&mut world, &mut mounted, &tree);
+            let label = mounted.nodes["root"].label.unwrap();
+            assert_eq!(
+                world.get::<TextLayout>(label).unwrap().justify,
+                Justify::Center
+            );
+            assert_eq!(world.get::<Node>(label).unwrap().width, percent(100));
+            let root = world.get::<Node>(mounted.nodes["root"].root).unwrap();
+            if sizing.starts_with("width") {
+                assert_eq!(root.width, px(120));
+            } else {
+                assert_eq!(root.flex_grow, 1.0);
+                assert_eq!(root.align_self, AlignSelf::Auto);
+            }
+            for (align, justify) in [("right", Justify::Right), ("left", Justify::Left)] {
+                tree.nodes
+                    .get_mut("root")
+                    .unwrap()
+                    .ports
+                    .insert("align".into(), json!(align));
+                apply(&mut world, &mut mounted, &tree);
+                assert_eq!(world.get::<TextLayout>(label).unwrap().justify, justify);
+            }
+        }
+    }
+
+    #[test]
+    fn column_align_center_sets_align_items() {
+        let source = "---\nscene: 1\nname: alignment\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", children: [], align: \"center\"}\n```\n";
+        let mut tree = cosmix_scene::resolve(&cosmix_scene::parse(source).unwrap()).unwrap();
+        let mut world = World::new();
+        let mut mounted = mounted(&mut world, &tree);
+        for (align, expected) in [
+            ("center", AlignItems::Center),
+            ("end", AlignItems::End),
+            ("stretch", AlignItems::Stretch),
+            ("start", AlignItems::Start),
+        ] {
+            tree.nodes
+                .get_mut("root")
+                .unwrap()
+                .ports
+                .insert("align".into(), json!(align));
+            apply(&mut world, &mut mounted, &tree);
+            assert_eq!(
+                world
+                    .get::<Node>(mounted.nodes["root"].root)
+                    .unwrap()
+                    .align_items,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn chromeless_scene_hides_panel_header() {
+        use cosmix_shell::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            mount_page, spawn_quoin_chrome,
+        };
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{
+            SceneVerb, ShellFrameState, ShellRuntimePlugin, set_shell_pages,
+        };
+        let mut app = App::new();
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ShellRuntimePlugin::new(model))
+            .add_plugins(QuoinChromePlugin)
+            .init_resource::<ButtonInput<KeyCode>>();
+        let world = app.world_mut();
+        let registry = QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap();
+        let props = registry
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
+        queue.apply(world);
+        let source = "---\nscene: 1\nname: chrome-test\ncitizen: test\nwindow: {\"kind\":\"edge\",\"edge\":\"bottom\",\"chrome\":false}\n---\n```mix\nroot: {widget: \"column\", children: []}\n```\n";
+        let mut store = SceneStore::default();
+        store
+            .request(SceneVerb::Load, source, &Value::Null)
+            .unwrap();
+        world.insert_resource(store);
+        reconcile(world);
+        let page = world.resource::<SceneStore>().scenes["chrome-test"]
+            .mounted
+            .as_ref()
+            .unwrap()
+            .page;
+        let wrapper = world.get::<ChildOf>(page).unwrap().parent();
+        let host = world.get::<ChildOf>(wrapper).unwrap().parent();
+        let panel = world.get::<ChildOf>(host).unwrap().parent();
+        let header = world.get::<Children>(panel).unwrap()[0];
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(header).unwrap().display,
+            Display::None
+        );
+        let normal = app.world_mut().spawn(Node::default()).id();
+        assert!(mount_page(
+            app.world_mut(),
+            Edge::Bottom,
+            "normal",
+            "Normal",
+            normal
+        ));
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(header).unwrap().display,
+            Display::Flex
+        );
+        set_shell_pages(
+            app.world_mut(),
+            Edge::Bottom,
+            vec!["scene-chrome-test".into(), "normal".into()],
+            Some("scene-chrome-test"),
+        );
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(header).unwrap().display,
+            Display::None
+        );
+        // Reload the envelope, then use a node-only window and patch its flag.
+        app.world_mut()
+            .resource_mut::<SceneStore>()
+            .request(
+                SceneVerb::Load,
+                &source.replace("false", "true"),
+                &Value::Null,
+            )
+            .unwrap();
+        reconcile(app.world_mut());
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(header).unwrap().display,
+            Display::Flex
+        );
+        let node_source = "---\nscene: 1\nname: chrome-test\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"bottom\", chrome: false}\n```\n";
+        app.world_mut()
+            .resource_mut::<SceneStore>()
+            .request(SceneVerb::Load, node_source, &Value::Null)
+            .unwrap();
+        reconcile(app.world_mut());
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(header).unwrap().display,
+            Display::None
+        );
+        for value in [json!(true), json!(false), Value::Null, json!(false)] {
+            app.world_mut()
+                .resource_mut::<SceneStore>()
+                .request(
+                    SceneVerb::Patch,
+                    "",
+                    &json!({"scene":"chrome-test","path":"root.chrome","value":value}),
+                )
+                .unwrap();
+            reconcile(app.world_mut());
+            app.update();
+            let expected = if value == json!(false) {
+                Display::None
+            } else {
+                Display::Flex
+            };
+            assert_eq!(app.world().get::<Node>(header).unwrap().display, expected);
+        }
+        // Unloading the active chromeless page must reveal the remaining
+        // normal page's header, not leave the panel permanently chromeless.
+        app.world_mut()
+            .resource_mut::<SceneStore>()
+            .request(SceneVerb::Unload, "", &json!({"scene":"chrome-test"}))
+            .unwrap();
+        reconcile(app.world_mut());
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(header).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Bottom)
+                .active_page_id
+                .as_deref(),
+            Some("normal")
+        );
     }
 
     #[test]

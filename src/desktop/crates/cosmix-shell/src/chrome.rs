@@ -346,9 +346,11 @@ struct QuoinPanelChrome {
 
 #[derive(Component)]
 struct QuoinPanelParts {
+    header: Entity,
     pin_label: Entity,
     title_label: Entity,
     page_titles: Vec<(String, String)>,
+    page_chromeless: Vec<(String, bool)>,
     page_wrappers: Vec<(String, Entity)>,
     dot_labels: Vec<(String, Entity)>,
     controls: Vec<Entity>,
@@ -459,6 +461,18 @@ pub fn spawn_quoin_chrome(
 /// Mount a dynamic page without rebuilding other pages or their editing state.
 /// Returns false until the host has created this edge's chrome.
 pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content: Entity) -> bool {
+    mount_page_with(world, edge, id, title, content, false)
+}
+
+/// Mount or update a page, optionally hiding the header while it is active.
+pub fn mount_page_with(
+    world: &mut World,
+    edge: Edge,
+    id: &str,
+    title: &str,
+    content: Entity,
+    chromeless: bool,
+) -> bool {
     let mut query = world.query::<(Entity, &QuoinPanelChrome, &Children)>();
     let Some((panel, host)) = query
         .iter(world)
@@ -474,6 +488,9 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
         .iter()
         .any(|(page, _)| page == id);
     if exists {
+        let mut parts = world.get_mut::<QuoinPanelParts>(panel).unwrap();
+        parts.page_chromeless.retain(|(page, _)| page != id);
+        parts.page_chromeless.push((id.into(), chromeless));
         if let Some((_, current)) = world
             .get_mut::<QuoinPanelParts>(panel)
             .unwrap()
@@ -496,7 +513,7 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
         .add_child(content)
         .id();
     world.entity_mut(host).add_child(wrapper);
-    let header = world.get::<Children>(panel).unwrap()[0];
+    let header = world.get::<QuoinPanelParts>(panel).unwrap().header;
     let dots = world.get::<Children>(header).unwrap()[3];
     let mut queue = bevy::ecs::world::CommandQueue::default();
     let mut commands = Commands::new(&mut queue, world);
@@ -514,6 +531,7 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
     parts.controls.push(dot);
     parts.dot_labels.push((id.into(), label));
     parts.page_titles.push((id.into(), title.into()));
+    parts.page_chromeless.push((id.into(), chromeless));
     parts.page_wrappers.push((id.into(), wrapper));
     let ids = parts
         .page_wrappers
@@ -547,6 +565,7 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
         .find(|(page, _)| page == id)
         .map(|(_, entity)| *entity);
     parts.page_titles.retain(|(page, _)| page != id);
+    parts.page_chromeless.retain(|(page, _)| page != id);
     parts.page_wrappers.retain(|(page, _)| page != id);
     let ids = parts
         .page_wrappers
@@ -708,9 +727,11 @@ fn spawn_panel(
                 pointer_ownership,
             },
             QuoinPanelParts {
+                header,
                 pin_label,
                 title_label,
                 page_titles,
+                page_chromeless: Vec::new(),
                 page_wrappers,
                 dot_labels,
                 controls,
@@ -1168,6 +1189,11 @@ fn present_panels(
 ) {
     for (chrome, parts, mut node, mut transform) in &mut queries.panels {
         let panel = frame.0.panel(chrome.edge);
+        let chromeless = parts
+            .page_chromeless
+            .iter()
+            .any(|(id, chromeless)| *chromeless && panel.active_page_id.as_deref() == Some(id));
+        let controls_enabled = panel.mapped && !chromeless;
         let display = if panel.mapped {
             Display::Flex
         } else {
@@ -1178,18 +1204,18 @@ fn present_panels(
         }
         for control in &parts.controls {
             if let Ok(mut tab_index) = queries.tab_indices.get_mut(*control) {
-                let index = if panel.mapped { 0 } else { -1 };
+                let index = if controls_enabled { 0 } else { -1 };
                 if tab_index.0 != index {
                     tab_index.0 = index;
                 }
             }
             let disabled = queries.disabled_controls.get(*control).unwrap_or(false);
-            if panel.mapped && disabled {
+            if controls_enabled && disabled {
                 commands.entity(*control).remove::<InteractionDisabled>();
-            } else if !panel.mapped && !disabled {
+            } else if !controls_enabled && !disabled {
                 commands.entity(*control).insert(InteractionDisabled);
             }
-            if !panel.mapped && focus.get() == Some(*control) {
+            if !controls_enabled && focus.get() == Some(*control) {
                 focus.clear();
             }
         }
@@ -1236,6 +1262,16 @@ fn present_panels(
             && label.0 != *title
         {
             label.0.clone_from(title);
+        }
+        if let Ok(mut header) = queries.nodes.get_mut(parts.header) {
+            let display = if chromeless {
+                Display::None
+            } else {
+                Display::Flex
+            };
+            if header.display != display {
+                header.display = display;
+            }
         }
         for (id, entity) in &parts.page_wrappers {
             if let Ok(mut page_node) = queries.nodes.get_mut(*entity) {
@@ -1737,6 +1773,8 @@ mod tests {
                     pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
+                    header: Entity::PLACEHOLDER,
+                    page_chromeless: Vec::new(),
                     pin_label: pin,
                     title_label: title,
                     page_titles: vec![
@@ -1857,6 +1895,8 @@ mod tests {
                     pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
+                    header: Entity::PLACEHOLDER,
+                    page_chromeless: Vec::new(),
                     pin_label,
                     title_label,
                     page_titles: Vec::new(),
@@ -1918,6 +1958,75 @@ mod tests {
     }
 
     #[test]
+    fn hidden_header_controls_are_not_reachable_by_tab_focus() {
+        use bevy::input_focus::tab_navigation::{NavAction, TabNavigation};
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        let mut frame = ShellFrame::from_model(&model);
+        frame.panels[Edge::Left.index()].mapped = true;
+        frame.panels[Edge::Left.index()].active_page_id = Some("plain".into());
+        let mut world = World::new();
+        let control = world.spawn(TabIndex(0)).id();
+        let content_control = world.spawn(TabIndex(0)).id();
+        let header = world.spawn(Node::default()).add_child(control).id();
+        let pin_label = world.spawn(Text::new("◇")).id();
+        let title_label = world.spawn(Text::new("Panel")).id();
+        world
+            .spawn((
+                QuoinPanelChrome {
+                    edge: Edge::Left,
+                    motion_ownership: QuoinMotionOwnership::Chrome,
+                    pointer_ownership: QuoinPointerOwnership::ChromeHover,
+                },
+                QuoinPanelParts {
+                    header,
+                    pin_label,
+                    title_label,
+                    page_chromeless: vec![("plain".into(), true)],
+                    page_titles: Vec::new(),
+                    page_wrappers: Vec::new(),
+                    dot_labels: Vec::new(),
+                    controls: vec![control],
+                },
+                Node::default(),
+                UiTransform::default(),
+                TabGroup::new(0),
+            ))
+            .add_children(&[header, content_control]);
+        world.insert_resource(ShellFrameState(frame));
+        world.insert_resource(InputFocus::from_entity(control));
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(world.get::<Node>(header).unwrap().display, Display::None);
+        assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(-1)));
+        assert!(world.entity(control).contains::<InteractionDisabled>());
+        assert_eq!(world.resource::<InputFocus>().get(), None);
+        let next = world
+            .run_system_once(|nav: TabNavigation, focus: Res<InputFocus>| {
+                nav.navigate(&focus, NavAction::Next).unwrap()
+            })
+            .unwrap();
+        assert_eq!(next, content_control);
+        world.resource_mut::<ShellFrameState>().0.panels[Edge::Left.index()].active_page_id =
+            Some("normal".into());
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(world.get::<Node>(header).unwrap().display, Display::Flex);
+        assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(0)));
+        assert!(!world.entity(control).contains::<InteractionDisabled>());
+        let next = world
+            .run_system_once(|nav: TabNavigation, focus: Res<InputFocus>| {
+                nav.navigate(&focus, NavAction::Next).unwrap()
+            })
+            .unwrap();
+        assert_eq!(next, control);
+    }
+
+    #[test]
     fn unmapping_panel_disables_controls_and_clears_focus() {
         let mut model = ShellModel::new(
             OutputKey::new("test").unwrap(),
@@ -1943,6 +2052,8 @@ mod tests {
                 pointer_ownership: QuoinPointerOwnership::ChromeHover,
             },
             QuoinPanelParts {
+                header: Entity::PLACEHOLDER,
+                page_chromeless: Vec::new(),
                 pin_label,
                 title_label,
                 page_titles: Vec::new(),
