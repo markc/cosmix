@@ -481,11 +481,26 @@ points at the login session's runtime directory.</li>
 the tray adapter's <code>item.added</code>/<code>item.removed</code>/<code>props.changed</code>, and the
 notify adapter's <code>changed</code>/<code>props.changed</code>. A handler matches the
 publisher's <strong>inner</strong> verb (<code>props.changed</code>), not the topic name. Bursts are
-coalesced into one rebuild. The only clock is the wall clock: the init body
-sleeps to each minute boundary (a top-level <code>sleep</code> keeps serving Bus
-events) and redraws the time, one wake per minute.</p>
+coalesced into one rebuild. The only clock is the wall clock: an <code>async</code>
+handler (<code>clock.run</code>, kicked once by init) sleeps to each minute boundary
+and redraws the time, one wake per minute. Init itself returns, so the
+runtime's reserved verbs (<code>RELOAD</code>, <code>QUIT</code>, <code>INFO</code>, lifecycle props) are
+served normally; on shutdown the loop is drained like any async handler.</p>
 <p>When Quoin restarts, the next <code>scene.load</code> returns revision 1; the citizen
 takes that as a fresh host and re-selects and re-pins its panel page.</p>
+<p>Popups are one at a time. Each open/close bumps a generation, and a render
+re-checks it after every Bus call, so a rebuild already in flight can never
+reopen a popup the user has closed. Every popup pin the panel makes is
+recorded in <code>$XDG_STATE_HOME/cosmix/quoin-panel-pins.json</code>; at start the
+citizen releases exactly those (a popup open when Quoin or the citizen went
+down would otherwise return as a pinned native page). Pins you made
+yourself are never touched.</p>
+<h2 id="limits">Limits</h2>
+<p>The launcher shows at most 500 applications (the host's list cap) and the
+notifications popup the 50 newest; long names, descriptions and bodies are
+cut with an ellipsis so the document stays inside the 256 KiB bound. User
+text that contains <code>${</code> (strict data would read it as interpolation, and has
+no escape for it) gets an invisible word joiner between <code>$</code> and <code>{</code>.</p>
 <h2 id="handlers">Handlers</h2>
 <p><code>launcher</code>, <code>filter</code>, <code>launch</code>, <code>launch_first</code>, <code>ws</code>, <code>task</code>, <code>tray</code>,
 <code>calendar</code>, <code>cal_prev</code>, <code>cal_next</code>, <code>cal_today</code>, <code>open_calendar</code>, <code>notes</code>,

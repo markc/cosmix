@@ -45,12 +45,30 @@ The citizen subscribes to `<comp>.props.changed` (windows and workspaces),
 the tray adapter's `item.added`/`item.removed`/`props.changed`, and the
 notify adapter's `changed`/`props.changed`. A handler matches the
 publisher's **inner** verb (`props.changed`), not the topic name. Bursts are
-coalesced into one rebuild. The only clock is the wall clock: the init body
-sleeps to each minute boundary (a top-level `sleep` keeps serving Bus
-events) and redraws the time, one wake per minute.
+coalesced into one rebuild. The only clock is the wall clock: an `async`
+handler (`clock.run`, kicked once by init) sleeps to each minute boundary
+and redraws the time, one wake per minute. Init itself returns, so the
+runtime's reserved verbs (`RELOAD`, `QUIT`, `INFO`, lifecycle props) are
+served normally; on shutdown the loop is drained like any async handler.
 
 When Quoin restarts, the next `scene.load` returns revision 1; the citizen
 takes that as a fresh host and re-selects and re-pins its panel page.
+
+Popups are one at a time. Each open/close bumps a generation, and a render
+re-checks it after every Bus call, so a rebuild already in flight can never
+reopen a popup the user has closed. Every popup pin the panel makes is
+recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at start the
+citizen releases exactly those (a popup open when Quoin or the citizen went
+down would otherwise return as a pinned native page). Pins you made
+yourself are never touched.
+
+## Limits
+
+The launcher shows at most 500 applications (the host's list cap) and the
+notifications popup the 50 newest; long names, descriptions and bodies are
+cut with an ellipsis so the document stays inside the 256 KiB bound. User
+text that contains `${` (strict data would read it as interpolation, and has
+no escape for it) gets an invisible word joiner between `$` and `{`.
 
 ## Handlers
 

@@ -74,6 +74,8 @@ $w = $p.seconds_to_next_minute($t)
 check($w > 52 and $w <= 53, "07 s past the minute waits ~53 s, got " .. to_string($w))
 $w = $p.seconds_to_next_minute(local_ts("2026-09-16 21:05:00"))
 check($w > 59 and $w <= 60, "on the boundary waits a full minute, got " .. to_string($w))
+$w = $p.seconds_to_next_minute(local_ts("2026-09-16 21:05:59") + 0.99)
+check($w >= 0.05 and $w < 0.1, "10 ms before the boundary sleeps just past it, got " .. to_string($w))
 
 -- ── document emission ─────────────────────────────────────────────────
 $doc = $p.document({scene: "1", name: "t", window: {kind: "edge", edge: "bottom", h: 52}}, [
@@ -88,6 +90,13 @@ $data = data_parse($fence)
 check($data.root.widget == "row", "fence parses as strict data")
 check(index_of($data.a.text, "`") < 0, "a backtick cannot close the fence")
 check(index_of($data.a.text, "\"x\"") >= 0, "quotes survive")
+
+-- Strict data reads "${" as interpolation with no escape: user text that
+-- carries one (a window title, a notification) must still parse.
+for each $hostile in ['title ${name} here', 'dangling ${', 'x ${a ?? b}']
+  $parsed = data_parse($p.node_line("root", {widget: "text", text: $hostile}))
+  check(type($parsed.root.text) == "string", "hostile text parses: " .. $hostile)
+end
 
 check($p.short_title("abcdef", 4) == "abc…", "long titles are cut with an ellipsis")
 check($p.short_title("abc", 4) == "abc", "short titles are left alone")

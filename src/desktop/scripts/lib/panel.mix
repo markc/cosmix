@@ -22,13 +22,15 @@ fn date_text($t)
   return date_format($t, "%a %-d ") .. $MONTHS_SHORT[$month - 1]
 end
 
--- Seconds until the next wall-clock minute boundary (never 0: a tick that
--- lands exactly on the boundary waits for the next one, not a busy loop).
+-- Seconds until the next wall-clock minute boundary, never less than 50 ms:
+-- a wake 10 ms before the boundary sleeps just past it (not a whole extra
+-- minute), and a wake exactly ON a boundary waits the full minute to the
+-- next -- no busy loop either way.
 fn seconds_to_next_minute($t)
   $s = to_number(date_format($t, "%S"))
   $frac = $t - floor($t)
   $wait = 60 - $s - $frac
-  if $wait <= 0.05 then $wait = $wait + 60 end
+  if $wait < 0.05 then $wait = 0.05 end
   return $wait
 end
 
@@ -110,8 +112,18 @@ end
 -- valid strict Mix data; a backtick would close the fence, so it becomes a
 -- visible stand-in (U+00B4) -- strict data does not decode \uXXXX escapes.
 
+-- Strict Mix data treats "${" inside a string as interpolation and has no
+-- escape for a literal one (neither \$ nor \u0024 is honoured -- a Mix gap,
+-- filed in TODO-mix), so a window title or notification carrying "${name}"
+-- would make the whole document fail to parse. An invisible WORD JOINER
+-- (U+2060) between "$" and "{" keeps the text looking the same and the
+-- document parseable.
+$WORD_JOINER = json_parse("\"\\u2060\"")
+
 fn node_line($id, $node)
-  return $id .. ": " .. replace(json_encode($node), "`", "´")
+  $json = replace(json_encode($node), "`", "´")
+  $json = replace($json, '${', '$' .. $WORD_JOINER .. '{')
+  return $id .. ": " .. $json
 end
 
 -- A whole document: AMP envelope + one fence. $header is a map of

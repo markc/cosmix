@@ -17,10 +17,9 @@
 --
 -- Event-driven: the taskbar and pager rebuild on the compositor's
 -- props.changed topic, the tray and notifications on their adapters'
--- events. The one
--- clock is the wall clock itself: the init body sleeps to each minute
--- boundary (a top-level sleep keeps dispatching Bus events), one wake per
--- minute, never a poll of anyone's state.
+-- events. The one clock is the wall clock itself: an async handler kicked
+-- once by init sleeps to each minute boundary, one wake per minute, never a
+-- poll of anyone's state.
 $p = require("lib/panel.mix")
 
 $ME = "quoin-panel"
@@ -50,7 +49,7 @@ $state = {
   launcher_open: false, calendar_open: false,
   query: "", category: "", apps: [], apps_loaded: false,
   cal_offset: 0, icons: {},
-  dirty: false, scheduled: false
+  popup_gen: 0, clock_running: false, dirty: false, scheduled: false
 }
 
 fn note($line)
@@ -144,10 +143,19 @@ fn icon_path_t($name, $size, $theme)
   if $theme != "" then $req.theme = $theme end
   $hit = rpc($APPS, "apps.icon", $req)
   $path = ($hit != nil and type($hit) == "map" and $hit.path != nil) ? $hit.path : ""
+  -- Cache hits only: a miss (apps not up yet, theme mid-install) is asked
+  -- again next time rather than remembered forever.
+  if $path != "" then cache_icon($key, $path) end
+  return $path
+end
+
+-- Bounded memo: past 512 entries start afresh (every entry is re-derivable
+-- with one apps.icon call; a panel sees far fewer distinct icons than this).
+fn cache_icon($key, $path)
   $icons = $state.icons
+  if length(keys($icons)) >= 512 then $icons = {} end
   $icons[$key] = $path
   $state.icons = $icons
-  return $path
 end
 
 -- A compositor app_id to an icon: the desktop entry's Icon= when one
@@ -169,9 +177,7 @@ fn window_icon($app_id)
   end
   $path = icon_path($icon_name, 48)
   if $path == "" then $path = icon_path("application-x-executable", 48) end
-  $icons = $state.icons
-  $icons[$key] = $path
-  $state.icons = $icons
+  if $path != "" then cache_icon($key, $path) end
   return $path
 end
 
@@ -411,14 +417,20 @@ fn panel_doc()
 end
 
 -- ── the launcher scene ──────────────────────────────────────────────────
+-- Scene limits the host enforces: a list holds at most 500 rows and a whole
+-- document at most 256 KiB, so rows are capped and their text bounded.
+$MAX_LIST_ROWS = 500
+$MAX_NOTES = 50
+
 fn launcher_doc()
   $rows = []
   for each $a in $state.apps
+    if length($rows) >= $MAX_LIST_ROWS then break end
     $sub = $a.generic_name ?? ""
     if $sub == "" then $sub = $a.comment ?? "" end
-    push($rows, {id: $a.id, cells: [$a.name ?? $a.id, $sub, icon_path($a.icon ?? "", 48)]})
+    push($rows, {id: $a.id, cells: [$p.short_title($a.name ?? $a.id, 80), $p.short_title($sub, 120), icon_path($a.icon ?? "", 48)]})
   end
-  $count = to_string(length($rows)) .. (length($rows) == 1 ? " application" : " applications")
+  $count = to_string(length($state.apps)) .. (length($state.apps) == 1 ? " application" : " applications")
   $nodes = [
     ["root", {widget: "column", gap: 10, padding: 16, fill: true, children: ["head", "search", "cats1", "cats2", "list"]}],
     ["head", {widget: "row", gap: 8, align: "center", children: ["head_t", "head_fill", "head_n"]}],
@@ -515,10 +527,14 @@ end
 -- ── the notifications scene ─────────────────────────────────────────────
 fn notes_doc()
   $rows = []
-  for each $n in $state.notes
+  -- newest first, bounded: a flood of notifications cannot outgrow the
+  -- document limit (the popup shows one line of body anyway)
+  $newest = reverse($state.notes)
+  for each $n in $newest
+    if length($rows) >= $MAX_NOTES then break end
     $app = $n.app ?? ""
     if $app == "" then $app = "Notification" end
-    push($rows, {id: to_string($n.id), cells: [$app, $n.summary ?? "", $n.body ?? ""]})
+    push($rows, {id: to_string($n.id), cells: [$p.short_title($app, 60), $p.short_title($n.summary ?? "", 120), $p.short_title($n.body ?? "", 240)]})
   end
   $children = ["nh"]
   if length($rows) == 0 then push($children, "n_empty") else push($children, "n_list") end
@@ -550,39 +566,100 @@ fn render_panel()
   end
 end
 
+-- Popups are opened and closed by click handlers while async rebuilds are in
+-- flight, and every Bus call is a yield point. Each open/close bumps
+-- popup_gen; a render captures it first and re-checks it (and its own open
+-- flag) after every yield, so a rebuild that started before a close can
+-- never load or pin a popup the user has since closed.
+fn popup_live($flag, $gen)
+  return $state[$flag] and $state.popup_gen == $gen
+end
+
+fn bump_popups()
+  $state.popup_gen = $state.popup_gen + 1
+end
+
 fn render_launcher()
-  if $state.launcher_open then
-    fetch_apps()
-    load_scene(launcher_doc())
-    show_page("left", "scene-launcher")
-  end
+  if not $state.launcher_open then return end
+  $gen = $state.popup_gen
+  fetch_apps()
+  if not popup_live("launcher_open", $gen) then return end
+  $doc = launcher_doc()
+  if not popup_live("launcher_open", $gen) then return end
+  load_scene($doc)
+  if popup_live("launcher_open", $gen) then show_popup("left", "scene-launcher") end
 end
 
 fn render_calendar()
-  if $state.calendar_open then
-    load_scene(calendar_doc())
-    show_page("right", "scene-calendar")
-  end
+  if not $state.calendar_open then return end
+  $gen = $state.popup_gen
+  load_scene(calendar_doc())
+  if popup_live("calendar_open", $gen) then show_popup("right", "scene-calendar") end
 end
 
 fn render_notes()
-  if $state.notes_open then
-    fetch_notes()
-    $doc = ""
-    try
-      $doc = notes_doc()
-    catch $e
-      note("notes_doc failed: " .. to_string($e))
-      return
-    end
-    load_scene($doc)
-    show_page("right", "scene-notes")
+  if not $state.notes_open then return end
+  $gen = $state.popup_gen
+  fetch_notes()
+  if not popup_live("notes_open", $gen) then return end
+  $doc = ""
+  try
+    $doc = notes_doc()
+  catch $e
+    note("notes_doc failed: " .. to_string($e))
+    return
   end
+  load_scene($doc)
+  if popup_live("notes_open", $gen) then show_popup("right", "scene-notes") end
+end
+
+-- ── popup edge pins: ours, recorded ────────────────────────────────────
+-- Quoin persists pins across restarts but not our popup scenes, so a popup
+-- open when Quoin or this citizen went down would come back as a pinned
+-- native page. We record every popup pin we make in a small state file and,
+-- at start, release ONLY those -- a pin the user made is never touched.
+$PIN_FILE = env("XDG_STATE_HOME", env("HOME", "/tmp") .. "/.local/state") .. "/cosmix/quoin-panel-pins.json"
+
+fn read_pins()
+  try
+    $v = json_parse(read_file($PIN_FILE))
+    return type($v) == "list" ? $v : []
+  catch $e
+    return []
+  end
+end
+
+fn write_pins($pins)
+  try
+    mkdir(dirname($PIN_FILE))
+    write_file($PIN_FILE, json_encode($pins))
+  catch $e
+    note("pin record not written: " .. to_string($e))
+  end
+end
+
+fn show_popup($edge, $page)
+  $pins = read_pins()
+  if index_of($pins, $edge) < 0 then
+    push($pins, $edge)
+    write_pins($pins)
+  end
+  show_page($edge, $page)
+end
+
+fn hide_popup($edge)
+  hide_edge($edge)
+  $kept = []
+  for each $e in read_pins()
+    if $e != $edge then push($kept, $e) end
+  end
+  write_pins($kept)
 end
 
 fn close_notes()
   $state.notes_open = false
-  hide_edge("right")
+  bump_popups()
+  hide_popup("right")
   unload_scene("notes")
 end
 
@@ -595,13 +672,15 @@ end
 
 fn close_launcher()
   $state.launcher_open = false
-  hide_edge("left")
+  bump_popups()
+  hide_popup("left")
   unload_scene("launcher")
 end
 
 fn close_calendar()
   $state.calendar_open = false
-  hide_edge("right")
+  bump_popups()
+  hide_popup("right")
   unload_scene("calendar")
 end
 
@@ -641,6 +720,7 @@ on launcher desc "toggle the application launcher"
   else
     close_popups()
     $state.launcher_open = true
+    bump_popups()
     $state.query = ""
     $state.category = ""
     render_launcher()
@@ -732,6 +812,7 @@ on calendar desc "toggle the calendar"
   else
     close_popups()
     $state.calendar_open = true
+    bump_popups()
     $state.cal_offset = 0
     render_calendar()
   end
@@ -777,6 +858,7 @@ on notes desc "toggle the notifications popup"
   else
     close_popups()
     $state.notes_open = true
+    bump_popups()
     render_notes()
   end
   render_panel()
@@ -815,19 +897,26 @@ on peek desc "peek at the desktop: minimise this workspace, click again to resto
   reply(0, "")
   fetch_windows()
   if length($state.peeked) > 0 then
+    -- Restore exactly what this peek minimised: same id AND the generation
+    -- recorded then (a window that has since changed identity, or that the
+    -- user restored or closed meanwhile, is left alone).
     for each $w in $state.windows
-      if index_of($state.peeked, $w.id) >= 0 and $w.minimized then rpc($COMP, "comp.window.restore", {id: $w.id, generation: $w.generation}) end
+      for each $mark in $state.peeked
+        if $mark.id == $w.id and $mark.generation == $w.generation and $w.minimized then
+          rpc($COMP, "comp.window.restore", {id: $w.id, generation: $w.generation})
+        end
+      end
     end
     $state.peeked = []
   else
-    $ids = []
+    $marks = []
     for each $w in $state.windows
       if ($w.workspace ?? $state.ws_current) == $state.ws_current and not $w.minimized then
-        rpc($COMP, "comp.window.minimize", {id: $w.id, generation: $w.generation})
-        push($ids, $w.id)
+        send $COMP "comp.window.minimize" body=json_encode({id: $w.id, generation: $w.generation}) timeout=3
+        if $rc == 0 then push($marks, {id: $w.id, generation: $w.generation}) end
       end
     end
-    $state.peeked = $ids
+    $state.peeked = $marks
   end
   schedule()
 end
@@ -836,9 +925,11 @@ on panel.refresh desc "rebuild every open scene now"
   reply(0, "")
   fetch_windows()
   fetch_tray()
+  fetch_status()
   render_panel()
   render_launcher()
   render_calendar()
+  render_notes()
 end
 
 -- Compositor state (windows opening/closing/focusing/minimising, workspace
@@ -867,6 +958,21 @@ on notification.closed async
   schedule()
 end
 
+-- The clock: wake on each minute boundary and redraw the panel (and the
+-- calendar header when it is open) -- one wake per minute. A second kick is
+-- ignored so a stray clock.run cannot start a second loop.
+on clock.run async
+  if $state.clock_running then return end
+  $state.clock_running = true
+  while true
+    sleep($p.seconds_to_next_minute(time()))
+    fetch_net()
+    fetch_vol()
+    render_panel()
+    if $state.calendar_open then render_calendar() end
+  end
+end
+
 -- ── init ────────────────────────────────────────────────────────────────
 subscribe($COMP .. ".props.changed")
 subscribe($TRAY .. ".item.added")
@@ -878,22 +984,17 @@ rpc($COMP, "comp.props.watch", {})
 fetch_windows()
 fetch_tray()
 fetch_status()
--- The left and right edges are this panel's popup edges. Quoin persists pins
--- across restarts but not our popup scenes, so a popup open when the host
--- (or this citizen) went down comes back as a pinned native page: release
--- them. The top edge is left exactly as the user set it.
-for each $edge in ["left", "right"]
-  if rpc($HOST, "shell.props.get", {path: "panels." .. $edge .. ".pinned"}) == true then hide_edge($edge) end
+-- A popup that was open when Quoin or this citizen went down comes back as
+-- a pinned native page. Release exactly the popup pins this panel recorded
+-- (show_popup/hide_popup keep $PIN_FILE); a pin the user made is untouched.
+for each $edge in read_pins()
+  hide_popup($edge)
 end
 render_panel()
 note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
 
--- The clock: wake on each minute boundary and redraw the panel (and the
--- calendar header when it is open). A top-level sleep keeps serving.
-while true
-  sleep($p.seconds_to_next_minute(time()))
-  fetch_net()
-  fetch_vol()
-  render_panel()
-  if $state.calendar_open then render_calendar() end
-end
+-- The clock runs in its own async handler (below), kicked once from here, so
+-- this init body returns and the runtime serves its reserved verbs (RELOAD,
+-- QUIT, INFO, lifecycle props) -- an init that never returns would starve
+-- them. On shutdown the runtime drains the loop like any async handler.
+emit $ME clock.run
