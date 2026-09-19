@@ -13,14 +13,19 @@ hosted here, the same way IMAP and HTTP live at the edge.
   zbus connection for its whole run — both locals of its `run`, so an
   adapter that returns, fails or panics drops them and withdraws its
   names. Fault containment falls out of ownership: one adapter's death
-  never touches another adapter or the daemon.
+  never touches another adapter or the daemon. One language limit: a
+  panic inside `Drop` during a panic unwind aborts the whole process —
+  containment covers one fault, not a second one during cleanup.
 - Supervises every adapter in its own tokio task, observing the
   JoinHandle: a panic (`JoinError::is_panic`), an `Err` return, or an
   unexpected `Ok` return all record a failure, put the adapter in
   `backoff`, and relaunch it after an exponential schedule (1 s doubling
   to a 60 s cap; five healthy minutes reset the escalation). A
   consistently failing adapter stays in `backoff` forever — it never
-  takes the daemon down.
+  takes the daemon down. A run that never yields cannot be preempted:
+  it is reported `stuck`, its Bus service and D-Bus names may stay held
+  until the process restarts, and its lifecycle keeps answering
+  commands.
 - Dials the desktop session bus from `DBUS_SESSION_BUS_ADDRESS` per
   adapter. Unset or unreachable means that adapter sits in `backoff`
   with that reason; the daemon stays up and keeps answering `dbusd.*`.
@@ -37,14 +42,19 @@ hosted here, the same way IMAP and HTTP live at the edge.
     over `dbusd.adapters.<name>.state|restarts|last_error`.
   - `dbusd.ping`, `dbusd.info`.
 - Publishes state changes as they happen — one `dbusd.adapter.changed`
-  event plus `dbusd.props.changed` diffs per transition. No polling
-  anywhere: supervision is JoinHandle- and signal-driven.
+  event plus `dbusd.props.changed` diffs per transition, both stamped
+  with a per-daemon-session monotonic `event_seq`. Events can be
+  dropped under backlog: a gap in `event_seq` says so, and the props
+  (`dbusd.props.get`) are the truth. No polling anywhere: supervision
+  is JoinHandle- and signal-driven.
 
 Configuration is `~/.config/cosmix/dbusd.conf.mix`
 (`enabled: ["notify", "tray"]`); an absent `enabled` means every
-built-in adapter, an empty list means none. Unknown names are logged and
-ignored. Enable/disable verbs are runtime-only — the config file is the
-persistent source.
+built-in adapter, an empty list means none. An absent file materialises
+the defaults on disk; a file that exists but cannot be read or parsed
+is fatal — the daemon exits rather than silently guessing the adapter
+set. Unknown names are logged and ignored. Enable/disable verbs are
+runtime-only — the config file is the persistent source.
 
 ## Adapter status
 
@@ -54,6 +64,7 @@ persistent source.
 | `running` | serving its domain |
 | `backoff` | failed (error/panic/exit); waiting out the schedule |
 | `disabled` | stopped by config or verb; names released |
+| `stuck` | the run ignored its stop signal and the abort; its names may stay held until the process restarts |
 
 `restarts` counts every relaunch in this daemon process (backoff
 restarts, the restart verb, enable-after-disable). `last_error` is the

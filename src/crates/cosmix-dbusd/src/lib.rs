@@ -8,10 +8,25 @@
 //! never lets one adapter take the daemon down.
 //!
 //! Core-first, like `cosmix-powerd`: the supervisor, backoff schedule,
-//! adapter registry and config resolution in this crate's default build
-//! have no Bus and no zbus dependency and are unit-testable alone; the
-//! Bus citizen (`dbusd` control service, props, events) and the zbus
-//! session-bus dial are behind the `cosmix` feature.
+//! adapter registry and config resolution build without the `cosmix`
+//! feature — no Bus, no zbus — and are unit-testable alone
+//! (`cargo test -p cosmix-dbusd --no-default-features`); the Bus
+//! citizen (`dbusd` control service, props, events) and the zbus
+//! session-bus dial are behind the `cosmix` feature, which is part of
+//! the default build.
+
+// Fault containment contract: a panicking adapter run must UNWIND into
+// its JoinHandle — with panic=abort every adapter panic would take the
+// daemon down. Refuse such a compilation outright. (Enforced here via
+// cfg(panic), not in build.rs: CARGO_CFG_PANIC as seen by a build
+// script is the build script's own strategy, which cargo always forces
+// to unwind, so a build.rs check can never fire.)
+#[cfg(panic = "abort")]
+compile_error!(
+    "cosmix-dbusd must be built with panic=unwind: its fault containment \
+     relies on a panicking adapter run unwinding into its JoinHandle, not \
+     aborting the process"
+);
 
 pub mod adapter;
 pub mod backoff;

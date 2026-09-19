@@ -19,7 +19,7 @@ use anyhow::{Result, anyhow};
 use crate::adapter::{Adapter, AdapterCtx, BoxRunFuture};
 
 /// What this launch does.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum FaultAction {
     /// Panic inside the run task.
     Panic,
@@ -34,6 +34,14 @@ pub(crate) enum FaultAction {
     RunFor(Duration),
     /// Serve until stopped; never fails.
     RunForever,
+    /// Busy-loop with no await point until `release` flips: a run that
+    /// cannot be preempted (stop signal unseen, abort undeliverable).
+    /// The test owns the flag so it can end the leaked task on
+    /// teardown; the name lease is held for the whole spin, modelling
+    /// names the wedged run keeps holding. Its ready signal strands the
+    /// ready monitor on the wedged worker, so the adapter honestly
+    /// never leaves `starting`.
+    NeverYield(Arc<std::sync::atomic::AtomicBool>),
 }
 
 /// Shared script + observation points, so the test and every (re)launch
@@ -155,6 +163,13 @@ impl Adapter for FaultAdapter {
                 FaultAction::RunForever => {
                     ctx.signal_ready();
                     park_until_stopped(&mut ctx).await
+                }
+                FaultAction::NeverYield(release) => {
+                    ctx.signal_ready();
+                    // Deliberately no await: this is the whole point —
+                    // neither the stop signal nor abort can be observed.
+                    while !release.load(std::sync::atomic::Ordering::Relaxed) {}
+                    Err(anyhow!("never-yield run released by its test"))
                 }
             }
         })

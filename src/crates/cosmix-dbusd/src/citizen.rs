@@ -26,10 +26,22 @@ pub const TOPIC_ADAPTER_CHANGED: &str = "dbusd.adapter.changed";
 
 const BROKER_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Budget for the broker closing its Bus client at shutdown.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long serve() waits for the broker task (register→drain→close)
+/// after shutdown is signalled. Sits above [`CLOSE_TIMEOUT`] so a
+/// healthy broker finishes its close inside it.
+const BROKER_DRAIN: Duration = Duration::from_secs(35);
 /// How long serve() waits for the supervision tasks to wind down after
 /// signalling shutdown (each already grants every run its own
 /// [`crate::supervisor::GRACEFUL_STOP`] window).
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(15);
+// Explicit shutdown budget, against the unit's `TimeoutStopSec=75`:
+// broker drain <= BROKER_DRAIN 35 s (its close alone <= CLOSE_TIMEOUT
+// 30 s) + supervision drain <= SHUTDOWN_DRAIN 15 s = 50 s to the end
+// of serve(), plus main's 5 s runtime teardown (RUNTIME_STOP in
+// main.rs) — worst case ~55 s, with margin, never a sum that just
+// touches the unit limit.
 
 /// The built-in adapter registry. J1 ships the host only — adding an
 /// adapter later is one line here:
@@ -49,7 +61,7 @@ type LifecycleDone = (String, std::result::Result<(), tokio::task::JoinError>);
 /// (a daemon-level bug), end it. SIGTERM exits 0 after every adapter
 /// released its names.
 pub async fn serve() -> Result<()> {
-    let settings = crate::config::load_settings();
+    let settings = crate::config::load_settings()?;
     let specs = builtin_adapters();
     let builtin: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
     let (enabled, unknown) = crate::config::resolve_enabled(settings.enabled.as_deref(), &builtin);
@@ -73,6 +85,9 @@ pub async fn serve() -> Result<()> {
         handle,
         events,
         lifecycles,
+        // Zero adapters (J1's registry) would otherwise close the event
+        // stream the moment start returns; held until serve() ends.
+        _events_keepalive,
     } = crate::supervisor::start(
         specs
             .into_iter()
@@ -89,7 +104,7 @@ pub async fn serve() -> Result<()> {
         }),
     );
 
-    let (client_tx, client_rx) = watch::channel::<Option<Arc<NodedClient>>>(None);
+    let (client_tx, client_rx) = watch::channel::<Option<Arc<dyn EventPublisher>>>(None);
     let (publisher_fault_tx, publisher_fault_rx) = mpsc::channel(1);
     let mut publisher = tokio::spawn(run_publisher(
         handle.clone(),
@@ -130,14 +145,22 @@ pub async fn serve() -> Result<()> {
     let _ = shutdown_tx.send(true);
     let graceful = matches!(exit, Exit::Signal(Ok(())));
     if graceful && !broker.is_finished() {
-        match broker.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        // Bounded: the broker's own work is register-drain plus a close
+        // inside CLOSE_TIMEOUT; anything past BROKER_DRAIN is aborted so
+        // shutdown stays inside its budget (RUNTIME_STOP in
+        // main.rs closes it out).
+        match tokio::time::timeout(BROKER_DRAIN, &mut broker).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
                 eprintln!("cosmix-dbusd: broker shutdown failed; continuing teardown: {error:#}")
             }
-            Err(error) => eprintln!(
+            Ok(Err(error)) => eprintln!(
                 "cosmix-dbusd: broker task failed during shutdown; continuing teardown: {error}"
             ),
+            Err(_) => {
+                broker.abort();
+                eprintln!("cosmix-dbusd: broker did not stop within {BROKER_DRAIN:?}; aborted");
+            }
         }
     } else {
         broker.abort();
@@ -209,10 +232,43 @@ async fn shutdown_signal() -> Result<()> {
     tokio::signal::ctrl_c().await.context("listen for Ctrl-C")
 }
 
+/// The one Bus operation the event publisher needs, as a trait so the
+/// publisher's reconnect policy is testable without a live noded.
+/// `NodedClient` is the production implementation; tests inject a fake.
+trait EventPublisher: Send + Sync {
+    /// Publish one message on a topic via the broker.
+    fn publish_event(
+        &self,
+        topic: &str,
+        message: cosmix_bus::bus::BusMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+impl EventPublisher for NodedClient {
+    fn publish_event(
+        &self,
+        topic: &str,
+        message: cosmix_bus::bus::BusMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        // Own the topic before the async block so the returned future
+        // borrows only `self` (the single elided `'_` lifetime).
+        let topic = topic.to_string();
+        Box::pin(async move {
+            let headers = BTreeMap::from([
+                ("name".to_string(), topic),
+                ("retain".to_string(), "false".to_string()),
+            ]);
+            let wire = message.to_wire();
+            self.send_with_headers("noded", "topic.publish", &headers, &wire)
+                .await
+        })
+    }
+}
+
 async fn run_broker(
     handle: SupervisorHandle,
     session_bus: SessionBus,
-    client_tx: watch::Sender<Option<Arc<NodedClient>>>,
+    client_tx: watch::Sender<Option<Arc<dyn EventPublisher>>>,
     mut publisher_fault_rx: mpsc::Receiver<()>,
     provenance: cosmix_bus::RegisterProvenance,
     mut shutdown: watch::Receiver<bool>,
@@ -235,7 +291,7 @@ async fn run_broker(
         match connection {
             Ok(Ok(client)) => {
                 let client = Arc::new(client);
-                let _ = client_tx.send(Some(Arc::clone(&client)));
+                let _ = client_tx.send(Some(client.clone()));
                 eprintln!("cosmix-dbusd: registered as '{BUS_SERVICE}'");
                 let stopping = tokio::select! {
                     biased;
@@ -253,7 +309,7 @@ async fn run_broker(
                     }
                 };
                 let _ = client_tx.send(None);
-                if tokio::time::timeout(PUBLISH_TIMEOUT, client.close())
+                if tokio::time::timeout(CLOSE_TIMEOUT, client.close())
                     .await
                     .is_err()
                 {
@@ -330,7 +386,9 @@ fn dispatch(
                 json!({
                     "topic": props_changed_topic(BUS_SERVICE),
                     "domain_topics": [TOPIC_ADAPTER_CHANGED],
-                    "event_sequence": "daemon_session_monotonic",
+                    "event_sequence": "per-daemon-session monotonic event_seq on every event; \
+                                       a gap means events were dropped — re-read dbusd.props.get",
+                    "event_seq": handle.event_seq(),
                     "bootstrap": "subscribe on this connection, then read dbusd.props.get",
                 })
                 .to_string(),
@@ -375,6 +433,7 @@ fn dispatch(
                     "git_dirty": build.git_dirty,
                     "build_time": build.build_time,
                     "adapters": handle.statuses().len(),
+                    "event_seq": handle.event_seq(),
                     "session_bus": session_bus_json(session_bus),
                 })
                 .to_string(),
@@ -443,18 +502,24 @@ fn rfc3339(moment: std::time::SystemTime) -> String {
 
 /// Consume supervision events and publish them on the daemon's `dbusd`
 /// connection: `dbusd.props.changed` diffs plus one
-/// `dbusd.adapter.changed` event per change. No polling — every
-/// publication is driven by an event. A publish failure faults the
-/// broker client (reconnect) instead of losing supervision.
+/// `dbusd.adapter.changed` event per change, both stamped with the
+/// event's per-session `event_seq` so subscribers can detect drops. No
+/// polling — every publication is driven by an event. A publish failure
+/// faults the broker client (reconnect) instead of losing supervision.
 async fn run_publisher(
     handle: SupervisorHandle,
     mut events: mpsc::Receiver<AdapterEvent>,
-    mut clients: watch::Receiver<Option<Arc<NodedClient>>>,
+    mut clients: watch::Receiver<Option<Arc<dyn EventPublisher>>>,
     faults: mpsc::Sender<()>,
 ) -> Result<()> {
-    // Diff baseline for the props stream. Reset whenever publishing
-    // fails so a fresh connection does not diff against a snapshot it
-    // never served.
+    // Diff baseline for the props stream. Deliberately KEPT across a
+    // publish failure and the publisher's own reconnect: Bus
+    // subscribers subscribe to topics, not to this daemon's connection,
+    // so a subscriber that stayed connected through the outage has seen
+    // exactly up to the baseline and needs the accumulated diff on the
+    // next event. A re-sent diff is idempotent (it carries old and new
+    // values); a dropped one is a silent gap. Fresh subscribers
+    // bootstrap with dbusd.props.get regardless.
     let mut last_props: Option<PropValue> = None;
     loop {
         let Some(event) = events.recv().await else {
@@ -467,20 +532,17 @@ async fn run_publisher(
 
         let statuses = handle.statuses();
         let snapshot = crate::props::DbusdProps::new(&statuses).snapshot();
-        let mut sent = publish_event_diffs(&client, last_props.as_ref(), &snapshot).await;
+        let mut sent =
+            publish_event_diffs(&*client, last_props.as_ref(), &snapshot, event.seq).await;
         if sent.is_ok() {
-            sent = publish(
-                &client,
-                TOPIC_ADAPTER_CHANGED,
-                adapter_changed_message(&event),
-            )
-            .await;
+            sent = client
+                .publish_event(TOPIC_ADAPTER_CHANGED, adapter_changed_message(&event))
+                .await;
         }
         match sent {
             Ok(()) => last_props = Some(snapshot),
             Err(error) => {
                 eprintln!("cosmix-dbusd: event publish failed: {error:#}");
-                last_props = None;
                 let _ = faults.try_send(());
             }
         }
@@ -488,8 +550,8 @@ async fn run_publisher(
 }
 
 async fn wait_for_client(
-    clients: &mut watch::Receiver<Option<Arc<NodedClient>>>,
-) -> Result<Arc<NodedClient>> {
+    clients: &mut watch::Receiver<Option<Arc<dyn EventPublisher>>>,
+) -> Result<Arc<dyn EventPublisher>> {
     loop {
         if let Some(client) = clients.borrow_and_update().clone() {
             return Ok(client);
@@ -504,17 +566,21 @@ async fn wait_for_client(
 }
 
 async fn publish_event_diffs(
-    client: &NodedClient,
+    client: &dyn EventPublisher,
     old: Option<&PropValue>,
     new: &PropValue,
+    seq: u64,
 ) -> Result<()> {
     let Some(old) = old else {
         return Ok(());
     };
     for (path, old_value, new_value) in cosmix_props_core::diff(old, new) {
-        let message =
+        let mut message =
             build_props_changed_message(&path, &old_value, &new_value, "supervisor.state_change");
-        publish(client, &props_changed_topic(BUS_SERVICE), message).await?;
+        message.set("event_seq", &seq.to_string());
+        client
+            .publish_event(&props_changed_topic(BUS_SERVICE), message)
+            .await?;
     }
     Ok(())
 }
@@ -522,6 +588,7 @@ async fn publish_event_diffs(
 fn adapter_changed_message(event: &AdapterEvent) -> cosmix_bus::bus::BusMessage {
     let mut message = cosmix_bus::bus::BusMessage::new();
     message.set("command", "adapter.changed");
+    message.set("event_seq", &event.seq.to_string());
     message.body = json!({
         "event": "adapter.changed",
         "data": {
@@ -532,25 +599,11 @@ fn adapter_changed_message(event: &AdapterEvent) -> cosmix_bus::bus::BusMessage 
             "restarts": event.status.restarts,
             "last_error": event.status.last_error,
             "since": rfc3339(event.status.since),
+            "event_seq": event.seq,
         }
     })
     .to_string();
     message
-}
-
-async fn publish(
-    client: &NodedClient,
-    topic: &str,
-    message: cosmix_bus::bus::BusMessage,
-) -> Result<()> {
-    let headers = BTreeMap::from([
-        ("name".to_string(), topic.to_string()),
-        ("retain".to_string(), "false".to_string()),
-    ]);
-    let wire = message.to_wire();
-    client
-        .send_with_headers("noded", "topic.publish", &headers, &wire)
-        .await
 }
 
 fn resolve_args(command: &IncomingCommand) -> Option<Value> {
@@ -732,8 +785,48 @@ mod tests {
         assert_eq!(watch_body["domain_topics"][0], "dbusd.adapter.changed");
     }
 
+    /// F1 regression: with zero adapters (J1's shipped registry is
+    /// empty) the publisher must stay parked on the event stream — not
+    /// see it end. Runs the real `supervisor::start` wiring and the real
+    /// publisher (no noded: no client ever appears, exactly like a
+    /// daemon whose broker is down). On the old code the only events
+    /// sender was dropped when `start()` returned, `recv()` yielded
+    /// `None`, and the daemon exited into a systemd crash-loop.
+    #[tokio::test(start_paused = true)]
+    async fn zero_adapter_daemon_keeps_its_event_publisher_alive() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = crate::supervisor::start(
+            Vec::new(),
+            SessionBus::Unavailable("unset".into()),
+            shutdown_rx,
+            None,
+        );
+        let (_client_tx, client_rx) = watch::channel::<Option<Arc<dyn EventPublisher>>>(None);
+        let (fault_tx, mut fault_rx) = mpsc::channel(1);
+        let publisher = tokio::spawn(run_publisher(
+            started.handle.clone(),
+            started.events,
+            client_rx,
+            fault_tx,
+        ));
+
+        // A (virtual) while of zero-adapter uptime: the publisher must
+        // still be alive and must not have faulted.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !publisher.is_finished(),
+            "zero-adapter daemon must keep its event publisher running"
+        );
+        assert!(
+            fault_rx.try_recv().is_err(),
+            "no publisher fault may occur with zero adapters"
+        );
+
+        publisher.abort();
+    }
+
     #[test]
-    fn adapter_changed_message_carries_the_new_state() {
+    fn adapter_changed_message_carries_the_new_state_and_seq() {
         let event = AdapterEvent {
             status: crate::state::AdapterStatus {
                 name: "tray".into(),
@@ -744,13 +837,211 @@ mod tests {
                 since: SystemTime::UNIX_EPOCH,
             },
             previous: AdapterStateKind::Starting,
+            seq: 42,
         };
         let message = adapter_changed_message(&event);
         assert_eq!(message.get("command"), Some("adapter.changed"));
+        assert_eq!(message.get("event_seq"), Some("42"));
         let body: Value = serde_json::from_str(&message.body).unwrap();
         assert_eq!(body["data"]["state"], "backoff");
         assert_eq!(body["data"]["previous"], "starting");
         assert_eq!(body["data"]["restarts"], 3);
         assert_eq!(body["data"]["last_error"], "panicked: boom");
+        assert_eq!(body["data"]["event_seq"], 42);
+    }
+
+    /// The watch reply surfaces the real sequence semantics and the
+    /// current counter (F5): a subscriber can tell from `event_seq`
+    /// whether it has seen every event.
+    #[tokio::test]
+    async fn watch_reply_surfaces_the_real_event_sequence() {
+        let handle = test_handle().await;
+        let (rc, body) = dispatch(
+            &command("dbusd.props.watch", Value::Null),
+            &handle,
+            &SessionBus::Unavailable("unset".into()),
+        );
+        assert_eq!(rc, 0);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["topic"], "dbusd.props.changed");
+        assert_eq!(body["domain_topics"][0], "dbusd.adapter.changed");
+        assert!(
+            body["event_seq"].is_u64(),
+            "watch must carry the current numeric event_seq"
+        );
+        assert!(
+            body["event_sequence"]
+                .as_str()
+                .unwrap()
+                .contains("monotonic"),
+            "event_sequence must describe the real semantics, not an empty promise"
+        );
+
+        let (rc, body) = dispatch(
+            &command("dbusd.info", Value::Null),
+            &handle,
+            &SessionBus::Unavailable("unset".into()),
+        );
+        assert_eq!(rc, 0);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert!(body["event_seq"].is_u64(), "info carries event_seq");
+    }
+
+    /// F8: the props diff baseline survives a publish failure and the
+    /// publisher's own reconnect. A subscriber that stayed connected
+    /// through the outage must get the accumulated diff on the next
+    /// event — on the old code the baseline was reset and the outage
+    /// window's changes never reached `dbusd.props.changed` subscribers.
+    #[tokio::test(start_paused = true)]
+    async fn props_diff_baseline_survives_publisher_reconnect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakePublisher {
+            fail_next: AtomicUsize,
+            published: std::sync::Mutex<Vec<(String, String)>>,
+        }
+
+        impl FakePublisher {
+            fn fail_next(&self, count: usize) {
+                self.fail_next.store(count, Ordering::SeqCst);
+            }
+
+            fn published(&self) -> Vec<(String, String)> {
+                self.published.lock().expect("fake lock").clone()
+            }
+        }
+
+        impl EventPublisher for FakePublisher {
+            fn publish_event(
+                &self,
+                topic: &str,
+                message: cosmix_bus::bus::BusMessage,
+            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+                let topic = topic.to_string();
+                Box::pin(async move {
+                    let pending = self.fail_next.load(Ordering::SeqCst);
+                    if pending > 0 {
+                        self.fail_next.store(pending - 1, Ordering::SeqCst);
+                        return Err(anyhow!("scripted publish failure"));
+                    }
+                    self.published
+                        .lock()
+                        .expect("fake lock")
+                        .push((topic, message.body.clone()));
+                    Ok(())
+                })
+            }
+        }
+
+        let factory: crate::adapter::AdapterFactory =
+            Arc::new(|| Box::new(crate::fault::FaultAdapter::default()));
+        let spec = crate::adapter::AdapterSpec {
+            name: "notify".into(),
+            service: "notify".into(),
+            factory,
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = crate::supervisor::start(
+            vec![(spec, true)],
+            SessionBus::Unavailable("unset".into()),
+            shutdown_rx,
+            None,
+        );
+        let handle = started.handle.clone();
+        let mut saw_running = false;
+        while !saw_running {
+            saw_running = handle
+                .status("notify")
+                .is_some_and(|status| status.state == AdapterStateKind::Running);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let fake = Arc::new(FakePublisher {
+            fail_next: AtomicUsize::new(0),
+            published: std::sync::Mutex::new(Vec::new()),
+        });
+        let (client_tx, client_rx) = watch::channel::<Option<Arc<dyn EventPublisher>>>(None);
+        client_tx
+            .send(Some(Arc::clone(&fake) as Arc<dyn EventPublisher>))
+            .expect("client");
+        let (fault_tx, mut fault_rx) = mpsc::channel(1);
+        let publisher = tokio::spawn(run_publisher(
+            handle.clone(),
+            started.events,
+            client_rx,
+            fault_tx,
+        ));
+
+        // The buffered starting/running events publish; the running
+        // snapshot becomes the baseline.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while !fake
+            .published()
+            .iter()
+            .any(|(topic, _)| topic == TOPIC_ADAPTER_CHANGED)
+        {
+            assert!(tokio::time::Instant::now() < deadline, "no initial publish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The outage: the disable event's publish fails, the publisher
+        // faults the broker client.
+        fake.fail_next(1);
+        handle
+            .control("notify", LifecycleCmd::Disable)
+            .expect("disable");
+        fault_rx
+            .recv()
+            .await
+            .expect("publish failure must fault the broker client");
+
+        // Reconnect: the client goes away and comes back, then a state
+        // change arrives (enable). The first publish after reconnect
+        // must diff against the pre-outage baseline.
+        client_tx.send(None).expect("clear client");
+        handle
+            .control("notify", LifecycleCmd::Enable)
+            .expect("enable");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client_tx
+            .send(Some(Arc::clone(&fake) as Arc<dyn EventPublisher>))
+            .expect("restore client");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let diffs: Vec<(String, String)> = fake
+                .published()
+                .into_iter()
+                .filter(|(topic, _)| topic == "dbusd.props.changed")
+                .collect();
+            // The enable's changes (state cycle + restart bump; the
+            // starting/running states may coalesce, the restart count
+            // cannot) must be diffed against the PRE-OUTAGE baseline —
+            // restarts was 0 there and 1 after enable. On the old code
+            // the baseline was reset and no diff at all reached
+            // props.changed after the outage.
+            let covered = diffs.iter().any(|(_, body)| {
+                let body: Value = serde_json::from_str(body).unwrap();
+                body["path"] == "adapters.notify.restarts" && body["old"] == 0 && body["new"] == 1
+            });
+            if covered {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the accumulated diff (restarts 0 -> 1, against the pre-outage \
+                 baseline) never reached props.changed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        publisher.abort();
+        shutdown_tx.send(true).expect("shutdown");
+        for (name, join) in started.lifecycles {
+            tokio::time::timeout(Duration::from_secs(30), join)
+                .await
+                .unwrap_or_else(|_| panic!("lifecycle '{name}' did not stop"))
+                .expect("lifecycle join");
+        }
     }
 }

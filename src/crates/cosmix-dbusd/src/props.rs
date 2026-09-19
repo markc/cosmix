@@ -57,7 +57,7 @@ impl PropTree for DbusdProps {
                 let mut description = PropDescribe::leaf(
                     path.clone(),
                     PropType::String,
-                    "Supervision state: starting, running, backoff, or disabled.",
+                    "Supervision state: starting, running, backoff, disabled, or stuck.",
                 );
                 description.enum_values = Some(
                     [
@@ -65,6 +65,7 @@ impl PropTree for DbusdProps {
                         AdapterStateKind::Running,
                         AdapterStateKind::Backoff,
                         AdapterStateKind::Disabled,
+                        AdapterStateKind::Stuck,
                     ]
                     .iter()
                     .map(|state| state.as_str().to_string())

@@ -9,13 +9,18 @@
 //! that returned when it should serve forever) is treated the same way.
 //! A failing adapter never leaves its own lifecycle task, so it can
 //! never take the daemon or a sibling adapter down.
+//!
+//! Two limits of the language bound this containment: a panic inside
+//! `Drop` during a panic unwind aborts the whole process, and a run
+//! that never yields cannot be preempted — it is reported `stuck`, its
+//! names may stay held until the process restarts, and its lifecycle
+//! keeps answering commands.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use futures_util::future::OptionFuture;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -39,6 +44,23 @@ const EVENT_CAPACITY: usize = 64;
 /// drop its connections before the task is aborted.
 pub const GRACEFUL_STOP: Duration = Duration::from_secs(5);
 
+/// How long an aborted run gets to land the cancellation (abort is
+/// cooperative — it only takes effect at a yield point). A run that
+/// exceeds even this never yields: it is reported `stuck` and detached.
+pub const ABORT_STOP: Duration = Duration::from_secs(1);
+
+/// Whether [`stop_run`] actually ended the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunStop {
+    /// The run returned (gracefully or on abort) and dropped what it
+    /// owned.
+    Stopped,
+    /// The run never yielded: its task is detached and leaked, and its
+    /// Bus service / D-Bus names may still be held until the process
+    /// restarts.
+    Stuck,
+}
+
 /// One supervisor command, as issued by the `dbusd.adapter.*` verbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleCmd {
@@ -59,6 +81,13 @@ pub struct StartedSupervisor {
     pub handle: SupervisorHandle,
     pub events: mpsc::Receiver<AdapterEvent>,
     pub lifecycles: Vec<(String, JoinHandle<()>)>,
+    /// Holds an events sender for the supervisor's whole lifetime. With
+    /// zero adapters (J1 ships none) no lifecycle task holds one, and
+    /// without this the channel would close when `start` returns — the
+    /// publisher's `recv()` would end and the daemon would exit into a
+    /// systemd crash-loop. Underscore-prefixed *binding*, not `_`: it
+    /// must live as long as the struct, not drop on construction.
+    pub _events_keepalive: mpsc::Sender<AdapterEvent>,
 }
 
 /// Control surface over the running supervision. Cheap to clone; the
@@ -72,9 +101,7 @@ pub struct SupervisorHandle {
 impl SupervisorHandle {
     /// All adapter statuses, ordered by name.
     pub fn statuses(&self) -> Vec<AdapterStatus> {
-        self.registry
-            .lock()
-            .expect("dbusd registry poisoned")
+        lock_registry(&self.registry)
             .adapters
             .values()
             .cloned()
@@ -82,12 +109,14 @@ impl SupervisorHandle {
     }
 
     pub fn status(&self, name: &str) -> Option<AdapterStatus> {
-        self.registry
-            .lock()
-            .expect("dbusd registry poisoned")
-            .adapters
-            .get(name)
-            .cloned()
+        lock_registry(&self.registry).adapters.get(name).cloned()
+    }
+
+    /// The per-daemon-session event sequence counter: what the last
+    /// stamped event carried. Surfaced on `dbusd.info` / props.watch so
+    /// a subscriber can tell whether it has seen every event.
+    pub fn event_seq(&self) -> u64 {
+        lock_registry(&self.registry).next_event_seq
     }
 
     /// Issue a control command. Unknown names are refused (the refusal
@@ -139,9 +168,7 @@ pub fn start(
             last_error: None,
             since: SystemTime::now(),
         };
-        registry
-            .lock()
-            .expect("dbusd registry poisoned")
+        lock_registry(&registry)
             .adapters
             .insert(spec.name.clone(), status);
 
@@ -165,6 +192,7 @@ pub fn start(
         handle: SupervisorHandle { control, registry },
         events: events_rx,
         lifecycles,
+        _events_keepalive: events_tx,
     }
 }
 
@@ -184,6 +212,9 @@ async fn adapter_lifecycle(
 ) {
     let mut backoff = Backoff::default();
     let mut launches: u64 = 0;
+    // The last run could not be stopped (never yielded): park in
+    // `stuck` rather than `disabled` until a command relaunches.
+    let mut stuck = false;
 
     // A watch receiver cloned after the value flipped never sees a
     // change; check the current value once on entry.
@@ -193,14 +224,25 @@ async fn adapter_lifecycle(
 
     loop {
         if !enabled {
-            transition(
-                &registry,
-                &events,
-                &spec.name,
-                AdapterStateKind::Disabled,
-                None,
-                false,
-            );
+            if stuck {
+                transition(
+                    &registry,
+                    &events,
+                    &spec.name,
+                    AdapterStateKind::Stuck,
+                    Some(Some(stuck_error())),
+                    false,
+                );
+            } else {
+                transition(
+                    &registry,
+                    &events,
+                    &spec.name,
+                    AdapterStateKind::Disabled,
+                    None,
+                    false,
+                );
+            }
             loop {
                 tokio::select! {
                     biased;
@@ -214,6 +256,7 @@ async fn adapter_lifecycle(
                         Some(LifecycleCmd::Disable) => {}
                         Some(LifecycleCmd::Restart | LifecycleCmd::Enable) => {
                             enabled = true;
+                            stuck = false;
                             backoff.reset();
                             break;
                         }
@@ -235,7 +278,21 @@ async fn adapter_lifecycle(
         );
 
         let adapter = (spec.factory)();
+        // The ready signal hops through a monitor task, never straight
+        // into this lifecycle: a run task may only wake the MONITOR.
+        // A run that never yields strands whatever it wakes on its own
+        // worker (tokio's LIFO slot is unstealable while that worker
+        // spins), so the lifecycle must not be a direct wake target of
+        // its own run — this way commands and shutdown (woken from
+        // their senders' contexts) keep reaching the lifecycle even
+        // then, and a wedged run simply never reaches `running`.
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (ready_in_tx, mut ready_in) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if ready_rx.await.is_ok() {
+                let _ = ready_in_tx.send(()).await;
+            }
+        });
         // This launch's own stop signal: flipped on daemon shutdown,
         // disable and restart alike, so one select in the adapter covers
         // every stop path.
@@ -250,7 +307,6 @@ async fn adapter_lifecycle(
 
         let started_at = Instant::now();
         let mut launch = tokio::spawn(adapter.run(ctx));
-        let mut ready: OptionFuture<oneshot::Receiver<()>> = Some(ready_rx).into();
 
         'launch: loop {
             tokio::select! {
@@ -258,32 +314,42 @@ async fn adapter_lifecycle(
                 changed = daemon_shutdown.changed() => {
                     if changed.is_err() || *daemon_shutdown.borrow_and_update() {
                         let _ = launch_stop_tx.send(true);
-                        stop_run(&mut launch).await;
+                        if stop_run(&mut launch).await == RunStop::Stuck {
+                            mark_stuck(&registry, &events, &spec.name);
+                        }
                         return;
                     }
                 }
                 cmd = control.recv() => match cmd {
                     None => {
                         let _ = launch_stop_tx.send(true);
-                        stop_run(&mut launch).await;
+                        if stop_run(&mut launch).await == RunStop::Stuck {
+                            mark_stuck(&registry, &events, &spec.name);
+                        }
                         return;
                     }
                     Some(LifecycleCmd::Enable) => {}
                     Some(LifecycleCmd::Restart) => {
                         let _ = launch_stop_tx.send(true);
-                        stop_run(&mut launch).await;
+                        if stop_run(&mut launch).await == RunStop::Stuck {
+                            mark_stuck(&registry, &events, &spec.name);
+                            // The wedged run is detached and leaked, its
+                            // names possibly still held; relaunch anyway —
+                            // the operator explicitly asked for a restart.
+                        }
                         backoff.reset();
                         break 'launch;
                     }
                     Some(LifecycleCmd::Disable) => {
                         let _ = launch_stop_tx.send(true);
-                        stop_run(&mut launch).await;
+                        if stop_run(&mut launch).await == RunStop::Stuck {
+                            stuck = true;
+                        }
                         enabled = false;
                         break 'launch;
                     }
                 },
-                Some(Ok(())) = &mut ready => {
-                    ready = None.into();
+                Some(()) = ready_in.recv() => {
                     transition(
                         &registry,
                         &events,
@@ -318,7 +384,11 @@ async fn adapter_lifecycle(
                             }
                             cmd = control.recv() => match cmd {
                                 None => return,
-                                Some(LifecycleCmd::Restart) => {
+                                // Enable while waiting out backoff is an
+                                // explicit ask to run: relaunch now (same
+                                // as restart), not a silent no-op until
+                                // the schedule expires.
+                                Some(LifecycleCmd::Restart | LifecycleCmd::Enable) => {
                                     backoff.reset();
                                     break;
                                 }
@@ -326,8 +396,6 @@ async fn adapter_lifecycle(
                                     enabled = false;
                                     break;
                                 }
-                                // Already enabled and waiting: keep waiting.
-                                Some(LifecycleCmd::Enable) => {}
                             },
                             _ = tokio::time::sleep_until(deadline) => break,
                         }
@@ -341,15 +409,58 @@ async fn adapter_lifecycle(
 
 /// Stop the current run: graceful window first (the run observed its
 /// stop signal, returned, and dropped its Bus + zbus connections and
-/// names), abort as the backstop for a run that will not stop.
-async fn stop_run(launch: &mut JoinHandle<Result<()>>) {
+/// names), abort as the backstop for a run that will not stop. Abort is
+/// cooperative — it only lands at a yield point — so the post-abort
+/// wait is bounded too: a run that never yields is returned as
+/// [`RunStop::Stuck`] and detached (dropping the handle leaks the
+/// wedged task; its names go when the process does).
+async fn stop_run(launch: &mut JoinHandle<Result<()>>) -> RunStop {
     if tokio::time::timeout(GRACEFUL_STOP, &mut *launch)
         .await
         .is_err()
     {
         launch.abort();
-        let _ = launch.await;
+        if tokio::time::timeout(ABORT_STOP, &mut *launch)
+            .await
+            .is_err()
+        {
+            return RunStop::Stuck;
+        }
     }
+    RunStop::Stopped
+}
+
+/// Record a wedged run: state `stuck`, `last_error` saying what that
+/// means for the names it may still hold.
+fn mark_stuck(
+    registry: &Arc<Mutex<RegistryState>>,
+    events: &mpsc::Sender<AdapterEvent>,
+    name: &str,
+) {
+    transition(
+        registry,
+        events,
+        name,
+        AdapterStateKind::Stuck,
+        Some(Some(stuck_error())),
+        false,
+    );
+}
+
+fn stuck_error() -> String {
+    "run ignored abort and never yielded; its Bus service and D-Bus \
+     names may still be held until the process restarts"
+        .to_string()
+}
+
+/// Lock the registry, recovering from poison. One holder's panic must
+/// not cascade to every adapter and the Bus service: a poisoned mutex
+/// means a panic mid-update, and the map is still structurally sound —
+/// the next transition overwrites whatever the panicking writer left.
+fn lock_registry(registry: &Arc<Mutex<RegistryState>>) -> std::sync::MutexGuard<'_, RegistryState> {
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Render a finished run's JoinHandle result as the failure reason
@@ -386,7 +497,7 @@ fn transition(
     restart_bump: bool,
 ) {
     let event = {
-        let mut registry = registry.lock().expect("dbusd registry poisoned");
+        let mut registry = lock_registry(registry);
         let Some(status) = registry.adapters.get_mut(name) else {
             return;
         };
@@ -402,15 +513,20 @@ fn transition(
         if let Some(error) = error {
             status.last_error = error;
         }
+        let status = status.clone();
+        registry.next_event_seq = registry.next_event_seq.saturating_add(1);
         AdapterEvent {
-            status: status.clone(),
+            status,
             previous,
+            seq: registry.next_event_seq,
         }
     };
+    let seq = event.seq;
     if events.try_send(event).is_err() {
         eprintln!(
-            "cosmix-dbusd: adapter state event dropped (backlog full): {name} -> {}",
-            new_state.as_str()
+            "cosmix-dbusd: adapter state event dropped (backlog full): {name} -> {} (event_seq {})",
+            new_state.as_str(),
+            seq
         );
     }
 }
@@ -851,5 +967,189 @@ mod tests {
         assert_eq!(classify_run(failed), "nope");
         let exited = tokio::spawn(async { Ok::<_, anyhow::Error>(()) }).await;
         assert!(classify_run(exited).contains("returned Ok unexpectedly"));
+    }
+
+    /// F2: a run that never yields cannot be preempted — disable must
+    /// still complete (the post-abort wait is bounded), the state must
+    /// tell the truth (`stuck`, names possibly still held), and the
+    /// lifecycle must keep answering commands. Real time and a
+    /// multi-thread runtime: the wedged task busy-loops on one worker
+    /// while everything else runs on another — a current-thread runtime
+    /// (or a paused clock, which cannot advance past a busy loop) could
+    /// never run this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn never_yielding_run_is_reported_stuck_and_control_stays_answerable() {
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a = FaultScript::new(vec![FaultAction::NeverYield(Arc::clone(&release))]);
+        let b = FaultScript::new(Vec::new());
+        let specs = vec![
+            (spec("a", Arc::clone(&a)), true),
+            (spec("b", Arc::clone(&b)), true),
+        ];
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = start(
+            specs,
+            SessionBus::Unavailable(NO_BUS.into()),
+            shutdown_rx,
+            None,
+        );
+        let handle = started.handle.clone();
+        // Do NOT wait for the supervision state here: the wedged run
+        // cannot yield, so even its ready signal strands on the wedged
+        // worker's LIFO slot — `running` may never land. Observe the
+        // launch through the fault script instead (no scheduler
+        // involvement). Commands still get through because they wake
+        // the lifecycle from the sender's context, not the spinner's.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !(a.launch_count() == 1 && a.holds("a")) {
+            assert!(Instant::now() < deadline, "the wedged run never launched");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Disable completes (bounded stop) and reports the honest state.
+        handle
+            .control("a", LifecycleCmd::Disable)
+            .expect("disable a wedged run");
+        wait_until(&handle, "a", |status| {
+            status.state == AdapterStateKind::Stuck
+                && status
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("ignored abort"))
+        })
+        .await;
+        assert!(
+            a.holds("a"),
+            "stuck means the names may still be held — that is the report"
+        );
+        assert_eq!(handle.status("b").unwrap().state, AdapterStateKind::Running);
+
+        // The lifecycle keeps answering: enable relaunches (counted
+        // restart) and the relaunched run — script exhausted — behaves.
+        handle
+            .control("a", LifecycleCmd::Enable)
+            .expect("enable after stuck");
+        wait_running(&handle, "a").await;
+        assert_eq!(handle.status("a").unwrap().restarts, 1);
+
+        // Test teardown: end the leaked busy-loop, then shut down.
+        release.store(true, std::sync::atomic::Ordering::Release);
+        shutdown_and_drain(started, shutdown_tx).await;
+    }
+
+    /// F3: a panic while holding the registry lock (poison) must not
+    /// cascade — the control surface keeps reading, the lifecycles keep
+    /// writing, siblings are untouched.
+    #[tokio::test(start_paused = true)]
+    async fn poisoned_registry_does_not_take_down_the_control_surface() {
+        let (specs, _a, _b) = two_adapters(Vec::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = start(
+            specs,
+            SessionBus::Unavailable(NO_BUS.into()),
+            shutdown_rx,
+            None,
+        );
+        let handle = started.handle.clone();
+        wait_running(&handle, "a").await;
+
+        // Poison the mutex: panic while holding the lock.
+        let registry = Arc::clone(&handle.registry);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.lock().expect("take the lock to poison it");
+            panic!("poison the dbusd registry");
+        }));
+        assert!(poisoned.is_err(), "the poisoning panic must be caught");
+
+        // Readers recover across the poison:
+        assert_eq!(handle.statuses().len(), 2);
+        assert_eq!(handle.status("a").unwrap().state, AdapterStateKind::Running);
+        assert!(handle.event_seq() > 0, "seq reads recover too");
+        // And writers: a command still lands a transition.
+        handle
+            .control("a", LifecycleCmd::Disable)
+            .expect("control across poison");
+        wait_until(&handle, "a", |status| {
+            status.state == AdapterStateKind::Disabled
+        })
+        .await;
+        assert_eq!(handle.status("b").unwrap().state, AdapterStateKind::Running);
+
+        shutdown_and_drain(started, shutdown_tx).await;
+    }
+
+    /// F9: enable while waiting out backoff relaunches now (same as
+    /// restart), not a silent no-op until the schedule expires.
+    #[tokio::test(start_paused = true)]
+    async fn enable_during_backoff_relaunches_immediately() {
+        let (specs, a, _b) = two_adapters(vec![FaultAction::Fail("once".into())]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let started = start(
+            specs,
+            SessionBus::Unavailable(NO_BUS.into()),
+            shutdown_rx,
+            None,
+        );
+        let handle = started.handle.clone();
+
+        wait_until(&handle, "a", |status| {
+            status.state == AdapterStateKind::Backoff
+        })
+        .await;
+        handle
+            .control("a", LifecycleCmd::Enable)
+            .expect("enable during backoff");
+        wait_running(&handle, "a").await;
+        assert_eq!(handle.status("a").unwrap().restarts, 1);
+        // The relaunch came from the command, not the schedule: the gap
+        // after the failed launch is well under the 1 s initial backoff.
+        let gaps = a.launch_times();
+        assert_eq!(gaps.len(), 1);
+        assert!(
+            gaps[0] < Duration::from_secs(1),
+            "relaunched immediately, not after backoff: {:?}",
+            gaps[0]
+        );
+
+        shutdown_and_drain(started, shutdown_tx).await;
+    }
+
+    /// F5: every state change carries a per-daemon-session monotonic
+    /// seq, strictly increasing, and the handle's counter matches the
+    /// last stamped event.
+    #[tokio::test(start_paused = true)]
+    async fn events_carry_a_strictly_monotonic_session_seq() {
+        let (specs, _a, _b) = two_adapters(Vec::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut started = start(
+            specs,
+            SessionBus::Unavailable(NO_BUS.into()),
+            shutdown_rx,
+            None,
+        );
+        let handle = started.handle.clone();
+        wait_running(&handle, "a").await;
+        handle.control("a", LifecycleCmd::Disable).expect("disable");
+        wait_until(&handle, "a", |status| {
+            status.state == AdapterStateKind::Disabled
+        })
+        .await;
+
+        let mut seqs = Vec::new();
+        while let Ok(event) = started.events.try_recv() {
+            seqs.push(event.seq);
+        }
+        assert!(!seqs.is_empty(), "state changes must produce events");
+        assert!(
+            seqs.windows(2).all(|pair| pair[0] < pair[1]),
+            "seq must strictly increase: {seqs:?}"
+        );
+        assert_eq!(
+            *seqs.last().unwrap(),
+            handle.event_seq(),
+            "the counter matches the last stamped event"
+        );
+
+        shutdown_and_drain(started, shutdown_tx).await;
     }
 }

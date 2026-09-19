@@ -17,6 +17,12 @@ pub enum AdapterStateKind {
     Backoff,
     /// Not running: disabled by config or by `dbusd.adapter.disable`.
     Disabled,
+    /// The run could not be stopped: it ignored both its stop signal
+    /// and the abort (a run that never yields cannot be preempted).
+    /// Its Bus service and D-Bus names may still be held until the
+    /// process restarts; the lifecycle keeps answering commands, and
+    /// enable/restart relaunch alongside the leaked task.
+    Stuck,
 }
 
 impl AdapterStateKind {
@@ -26,6 +32,7 @@ impl AdapterStateKind {
             Self::Running => "running",
             Self::Backoff => "backoff",
             Self::Disabled => "disabled",
+            Self::Stuck => "stuck",
         }
     }
 }
@@ -56,6 +63,11 @@ pub struct AdapterEvent {
     pub status: AdapterStatus,
     /// State before the change (`status.state` is the new one).
     pub previous: AdapterStateKind,
+    /// Per-daemon-session monotonic sequence (1, 2, …), stamped on
+    /// every published state event. A gap between successive events
+    /// means events were dropped (backlog overflow); the props surface
+    /// (`dbusd.props.get`) is the truth.
+    pub seq: u64,
 }
 
 /// Registry of all adapters' statuses, shared between the supervision
@@ -64,4 +76,8 @@ pub struct AdapterEvent {
 #[derive(Debug, Default)]
 pub struct RegistryState {
     pub adapters: BTreeMap<String, AdapterStatus>,
+    /// Counter behind [`AdapterEvent::seq`]; advanced under the registry
+    /// lock so the order events are handed to the publisher is the
+    /// order subscribers observe.
+    pub next_event_seq: u64,
 }

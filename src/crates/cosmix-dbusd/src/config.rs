@@ -1,5 +1,7 @@
 //! `dbusd.conf.mix` — which adapters are enabled.
 
+#[cfg(feature = "cosmix")]
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// Typed `~/.config/cosmix/dbusd.conf.mix`. A missing file materialises
@@ -37,22 +39,15 @@ pub fn resolve_enabled(
     }
 }
 
-/// Load `dbusd.conf.mix`. Read/parse problems are loudly reported and
-/// answered with the default (all built-ins): a broken config file must
-/// not take the boundary daemon down — that is the same containment
-/// law the supervisor applies to adapters.
+/// Load `dbusd.conf.mix` per the store contract (same as every other
+/// daemon, e.g. indexd): an absent file materialises the defaults —
+/// only NotFound does; a file that exists but cannot be read or parsed
+/// is FATAL, surfaced as `Err` so `serve()` exits instead of silently
+/// guessing the adapter set.
 #[cfg(feature = "cosmix")]
-pub fn load_settings() -> DbusdSettings {
-    match cosmix_config::store::load_service::<DbusdSettings>("dbusd") {
-        Ok(settings) => settings,
-        Err(error) => {
-            eprintln!(
-                "cosmix-dbusd: reading dbusd.conf.mix failed; using defaults \
-                 (all built-in adapters): {error:#}"
-            );
-            DbusdSettings::default()
-        }
-    }
+pub fn load_settings() -> anyhow::Result<DbusdSettings> {
+    cosmix_config::store::load_service::<DbusdSettings>("dbusd")
+        .context("dbusd.conf.mix exists but cannot be loaded; refusing to guess the adapter set")
 }
 
 #[cfg(test)]
@@ -101,5 +96,40 @@ mod tests {
     #[test]
     fn default_settings_enable_all_builtins() {
         assert_eq!(DbusdSettings::default().enabled, None);
+    }
+
+    /// F4, the store contract from the loader's side: NotFound
+    /// materialises defaults; a file that exists but cannot be parsed
+    /// is fatal. Run against a throwaway config dir via `COSMIX_ETC`.
+    #[cfg(feature = "cosmix")]
+    #[test]
+    fn missing_config_is_defaults_broken_config_is_fatal() {
+        let dir = std::env::temp_dir().join(format!("cosmix-dbusd-conf-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("temp config dir");
+        // SAFETY: env mutation is process-global, but this is the only
+        // test in this binary that resolves cosmix paths, and the
+        // OnceLock-cached resolver then pins this throwaway dir for the
+        // whole run — exactly what this test wants.
+        unsafe { std::env::set_var("COSMIX_ETC", &dir) };
+
+        // NotFound: defaults, materialised to disk so they are
+        // discoverable by `cat`.
+        let settings = load_settings().expect("absent config must load defaults");
+        assert_eq!(settings, DbusdSettings::default());
+        assert!(
+            dir.join("dbusd.conf.mix").exists(),
+            "absent config materialises defaults"
+        );
+
+        // Parse error: fatal, naming the file.
+        std::fs::write(dir.join("dbusd.conf.mix"), "enabled = [ unclosed").expect("break config");
+        let error = load_settings().expect_err("broken config must be fatal");
+        assert!(
+            format!("{error:#}").contains("dbusd.conf.mix"),
+            "the fatal error names the file: {error:#}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
