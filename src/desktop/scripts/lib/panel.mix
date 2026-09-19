@@ -160,10 +160,10 @@ fn category_label($cat)
   return $CATEGORY_LABELS[$cat] ?? $cat
 end
 
--- Chip node ids are "cat-<lowercase category>" ("cat-all" = everything);
+-- Chip node ids are "cat_<lowercase category>" ("cat_all" = everything);
 -- map one back to its freedesktop category name.
 fn category_from_node($node)
-  $key = replace($node, "cat-", "")
+  $key = replace($node, "cat_", "")
   if $key == "all" then return "" end
   for each $cat, $label in $CATEGORY_LABELS
     if lower($cat) == $key then return $cat end

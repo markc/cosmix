@@ -114,6 +114,22 @@ fn show_page($edge, $page)
   panel_verb("shell.panel.pin", $edge, nil)
 end
 
+-- Unpin an edge and hide it. hide is a no-op while the edge is still
+-- pinned, and the unpin lands on the host's next frame, so re-issue the hide
+-- until the host reports the edge hidden (bounded, ~1 s). A pointer resting
+-- on the panel legitimately keeps it revealed; that is Quoin's rule, not ours.
+fn hide_edge($edge)
+  panel_verb("shell.panel.unpin", $edge, nil)
+  $tries = 0
+  while $tries < 20
+    panel_verb("shell.panel.hide", $edge, nil)
+    $state_r = rpc($HOST, "shell.props.get", {path: "panels." .. $edge .. ".visible"})
+    if $state_r == false then break end
+    $tries = $tries + 1
+    sleep(0.05)
+  end
+end
+
 -- ── icons (the apps citizen resolves themes; cached here) ───────────────
 fn icon_path($name, $size)
   return icon_path_t($name, $size, "")
@@ -135,14 +151,15 @@ fn icon_path_t($name, $size, $theme)
 end
 
 -- A compositor app_id to an icon: the desktop entry's Icon= when one
--- matches (app_id.desktop, then lower-case), else the app_id as an icon
--- name, else a generic window icon.
+-- matches (the apps registry keys entries by desktop-file id without the
+-- .desktop suffix; tried as-is, then lower-case), else the app_id as an
+-- icon name, else a generic window icon.
 fn window_icon($app_id)
   $key = "win:" .. to_string($app_id)
   if has_key($state.icons, $key) then return $state.icons[$key] end
   $icon_name = ""
   if $app_id != nil and $app_id != "" then
-    for each $candidate in [$app_id .. ".desktop", lower($app_id) .. ".desktop"]
+    for each $candidate in [$app_id, lower($app_id)]
       if $icon_name == "" then
         $entry = rpc($APPS, "apps.get", {id: $candidate})
         if $entry != nil and type($entry) == "map" and $entry.icon != nil then $icon_name = $entry.icon end
@@ -270,8 +287,9 @@ fn panel_doc()
   push($nodes, ["root", {widget: "row", fill: true, align: "center", gap: 4, padding: 4, background: $C.panel, children: $children}])
 
   -- launcher button: the start-here icon, tinted while the launcher is open
-  $start = icon_path("start-here-kde", 48)
-  if $start == "" then $start = icon_path("start-here", 48) end
+  -- the dark-theme variant: the light one draws dark-on-dark here
+  $start = icon_path_t("start-here-kde", 48, $ICON_THEME)
+  if $start == "" then $start = icon_path_t("start-here", 48, $ICON_THEME) end
   $lb = {widget: "row", height: 40, radius: 8, padding: 6, align: "center", hover: $C.hover, on_click: "launcher", children: ["launcher_icon"]}
   if $state.launcher_open then $lb.background = $C.accent_bg end
   push($nodes, ["launcher_btn", $lb])
@@ -422,17 +440,17 @@ fn launcher_doc()
     $r = $r + 1
     $ids = []
     for each $cat in $cats
-      push($ids, "cat-" .. ($cat == "" ? "all" : lower($cat)))
+      push($ids, "cat_" .. ($cat == "" ? "all" : lower($cat)))
     end
     push($nodes, ["cats" .. to_string($r), {widget: "row", gap: 6, align: "center", children: $ids}])
     for each $cat in $cats
-      $id = "cat-" .. ($cat == "" ? "all" : lower($cat))
+      $id = "cat_" .. ($cat == "" ? "all" : lower($cat))
       $on = $cat == $state.category
       push($nodes, [$id, {widget: "row", height: 28, radius: 14, padding: 10, align: "center", hover: $C.hover, background: $on ? $C.accent : $C.task_bg, on_click: "cat", children: [$id .. "_t"]}])
       push($nodes, [$id .. "_t", {widget: "text", text: $p.category_label($cat), size: 12, bold: $on, color: $on ? "#0b1f2b" : $C.fg}])
     end
   end
-  return $p.document({scene: "1", name: "launcher", citizen: $ME, window: {kind: "edge", edge: "left", title: "Applications", w: 440}}, $nodes)
+  return $p.document({scene: "1", name: "launcher", citizen: $ME, window: {kind: "edge", edge: "left", title: "Applications", w: 440, chrome: false}}, $nodes)
 end
 
 -- ── the calendar scene ──────────────────────────────────────────────────
@@ -491,7 +509,7 @@ fn calendar_doc()
   end
   push($nodes, ["cal_fill", {widget: "spacer"}])
   push($nodes, ["cal_open", {widget: "button", label: "Open calendar app", tone: "primary", on_click: "open_calendar"}])
-  return $p.document({scene: "1", name: "calendar", citizen: $ME, window: {kind: "edge", edge: "right", title: "Calendar", w: 360}}, $nodes)
+  return $p.document({scene: "1", name: "calendar", citizen: $ME, window: {kind: "edge", edge: "right", title: "Calendar", w: 360, chrome: false}}, $nodes)
 end
 
 -- ── the notifications scene ─────────────────────────────────────────────
@@ -522,7 +540,7 @@ fn notes_doc()
     push($nodes, ["n_sum", {widget: "text", text: "{cells[1]}", size: 14, bold: true, color: $C.fg, elide: true}])
     push($nodes, ["n_body", {widget: "text", text: "{cells[2]}", size: 12, color: $C.dim, elide: true}])
   end
-  return $p.document({scene: "1", name: "notes", citizen: $ME, window: {kind: "edge", edge: "right", title: "Notifications", w: 380}}, $nodes)
+  return $p.document({scene: "1", name: "notes", citizen: $ME, window: {kind: "edge", edge: "right", title: "Notifications", w: 380, chrome: false}}, $nodes)
 end
 
 -- ── rebuilds ────────────────────────────────────────────────────────────
@@ -564,8 +582,7 @@ end
 
 fn close_notes()
   $state.notes_open = false
-  panel_verb("shell.panel.unpin", "right", nil)
-  panel_verb("shell.panel.hide", "right", nil)
+  hide_edge("right")
   unload_scene("notes")
 end
 
@@ -578,15 +595,13 @@ end
 
 fn close_launcher()
   $state.launcher_open = false
-  panel_verb("shell.panel.unpin", "left", nil)
-  panel_verb("shell.panel.hide", "left", nil)
+  hide_edge("left")
   unload_scene("launcher")
 end
 
 fn close_calendar()
   $state.calendar_open = false
-  panel_verb("shell.panel.unpin", "right", nil)
-  panel_verb("shell.panel.hide", "right", nil)
+  hide_edge("right")
   unload_scene("calendar")
 end
 
@@ -863,6 +878,13 @@ rpc($COMP, "comp.props.watch", {})
 fetch_windows()
 fetch_tray()
 fetch_status()
+-- The left and right edges are this panel's popup edges. Quoin persists pins
+-- across restarts but not our popup scenes, so a popup open when the host
+-- (or this citizen) went down comes back as a pinned native page: release
+-- them. The top edge is left exactly as the user set it.
+for each $edge in ["left", "right"]
+  if rpc($HOST, "shell.props.get", {path: "panels." .. $edge .. ".pinned"}) == true then hide_edge($edge) end
+end
 render_panel()
 note("quoin-panel up: host=" .. $HOST .. " comp=" .. $COMP)
 
