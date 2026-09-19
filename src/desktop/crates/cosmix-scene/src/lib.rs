@@ -629,10 +629,12 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
     }
     for (id, node) in &doc.nodes {
         if !template_nodes.contains(id)
-            && node
-                .ports
-                .values()
-                .any(|value| value.as_str().is_some_and(|s| s.contains("{cells[")))
+            && node.ports.iter().any(|(port, value)| {
+                matches!(
+                    (node.widget.as_str(), port.as_str()),
+                    ("text", "text") | ("image", "src")
+                ) && value.as_str().is_some_and(|s| s.contains("{cells["))
+            })
         {
             out.push(Diagnostic::error(
                 "cell-substitution",
@@ -656,6 +658,13 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
         ));
     }
     if let Some(w) = &doc.window {
+        if w.get("chrome").is_some_and(|value| !value.is_boolean()) {
+            out.push(Diagnostic::error(
+                "port-type",
+                1,
+                "window.chrome must be bool",
+            ));
+        }
         for n in doc.nodes.values().filter(|n| n.widget == "window") {
             if ["kind", "edge", "title", "w", "h", "chrome"]
                 .iter()
@@ -1120,6 +1129,30 @@ mod tests {
                     .any(|d| d.code == "cell-substitution"),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn non_template_cell_markers_in_literal_ports_load() {
+        for source in [
+            "root: {widget: \"field\", value: \"{cells[0]}\"}",
+            "root: {widget: \"button\", label: \"{cells[\"}",
+        ] {
+            assert!(resolve(&doc(source)).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn envelope_window_chrome_is_type_checked() {
+        let mut document = doc("root: {widget: \"column\", children: []}");
+        for value in [json!("false"), json!(0), JsonValue::Null] {
+            document.window = Some(json!({"chrome":value}));
+            assert!(lint(&document).iter().any(|d| d.code == "port-type"));
+            assert!(resolve(&document).is_err());
+        }
+        for value in [json!(true), json!(false)] {
+            document.window = Some(json!({"chrome":value}));
+            assert!(resolve(&document).is_ok());
         }
     }
 

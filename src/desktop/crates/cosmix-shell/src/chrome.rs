@@ -1189,6 +1189,11 @@ fn present_panels(
 ) {
     for (chrome, parts, mut node, mut transform) in &mut queries.panels {
         let panel = frame.0.panel(chrome.edge);
+        let chromeless = parts
+            .page_chromeless
+            .iter()
+            .any(|(id, chromeless)| *chromeless && panel.active_page_id.as_deref() == Some(id));
+        let controls_enabled = panel.mapped && !chromeless;
         let display = if panel.mapped {
             Display::Flex
         } else {
@@ -1199,18 +1204,18 @@ fn present_panels(
         }
         for control in &parts.controls {
             if let Ok(mut tab_index) = queries.tab_indices.get_mut(*control) {
-                let index = if panel.mapped { 0 } else { -1 };
+                let index = if controls_enabled { 0 } else { -1 };
                 if tab_index.0 != index {
                     tab_index.0 = index;
                 }
             }
             let disabled = queries.disabled_controls.get(*control).unwrap_or(false);
-            if panel.mapped && disabled {
+            if controls_enabled && disabled {
                 commands.entity(*control).remove::<InteractionDisabled>();
-            } else if !panel.mapped && !disabled {
+            } else if !controls_enabled && !disabled {
                 commands.entity(*control).insert(InteractionDisabled);
             }
-            if !panel.mapped && focus.get() == Some(*control) {
+            if !controls_enabled && focus.get() == Some(*control) {
                 focus.clear();
             }
         }
@@ -1259,10 +1264,6 @@ fn present_panels(
             label.0.clone_from(title);
         }
         if let Ok(mut header) = queries.nodes.get_mut(parts.header) {
-            let chromeless = parts
-                .page_chromeless
-                .iter()
-                .any(|(id, chromeless)| *chromeless && panel.active_page_id.as_deref() == Some(id));
             let display = if chromeless {
                 Display::None
             } else {
@@ -1954,6 +1955,75 @@ mod tests {
         );
         assert_eq!(model.panel(Edge::Left).visible_fraction, 0.0);
         assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 0.0);
+    }
+
+    #[test]
+    fn hidden_header_controls_are_not_reachable_by_tab_focus() {
+        use bevy::input_focus::tab_navigation::{NavAction, TabNavigation};
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        let mut frame = ShellFrame::from_model(&model);
+        frame.panels[Edge::Left.index()].mapped = true;
+        frame.panels[Edge::Left.index()].active_page_id = Some("plain".into());
+        let mut world = World::new();
+        let control = world.spawn(TabIndex(0)).id();
+        let content_control = world.spawn(TabIndex(0)).id();
+        let header = world.spawn(Node::default()).add_child(control).id();
+        let pin_label = world.spawn(Text::new("◇")).id();
+        let title_label = world.spawn(Text::new("Panel")).id();
+        world
+            .spawn((
+                QuoinPanelChrome {
+                    edge: Edge::Left,
+                    motion_ownership: QuoinMotionOwnership::Chrome,
+                    pointer_ownership: QuoinPointerOwnership::ChromeHover,
+                },
+                QuoinPanelParts {
+                    header,
+                    pin_label,
+                    title_label,
+                    page_chromeless: vec![("plain".into(), true)],
+                    page_titles: Vec::new(),
+                    page_wrappers: Vec::new(),
+                    dot_labels: Vec::new(),
+                    controls: vec![control],
+                },
+                Node::default(),
+                UiTransform::default(),
+                TabGroup::new(0),
+            ))
+            .add_children(&[header, content_control]);
+        world.insert_resource(ShellFrameState(frame));
+        world.insert_resource(InputFocus::from_entity(control));
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(world.get::<Node>(header).unwrap().display, Display::None);
+        assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(-1)));
+        assert!(world.entity(control).contains::<InteractionDisabled>());
+        assert_eq!(world.resource::<InputFocus>().get(), None);
+        let next = world
+            .run_system_once(|nav: TabNavigation, focus: Res<InputFocus>| {
+                nav.navigate(&focus, NavAction::Next).unwrap()
+            })
+            .unwrap();
+        assert_eq!(next, content_control);
+        world.resource_mut::<ShellFrameState>().0.panels[Edge::Left.index()].active_page_id =
+            Some("normal".into());
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(world.get::<Node>(header).unwrap().display, Display::Flex);
+        assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(0)));
+        assert!(!world.entity(control).contains::<InteractionDisabled>());
+        let next = world
+            .run_system_once(|nav: TabNavigation, focus: Res<InputFocus>| {
+                nav.navigate(&focus, NavAction::Next).unwrap()
+            })
+            .unwrap();
+        assert_eq!(next, control);
     }
 
     #[test]
