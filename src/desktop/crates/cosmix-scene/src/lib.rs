@@ -12,7 +12,9 @@ use cosmix_mix::{MixError, value::Value};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+pub mod bindings;
 
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_NODES: usize = 2_000;
@@ -51,6 +53,13 @@ pub const ALL_CODES: &[&str] = &[
     "window-disagreement",
     "orphan-node",
     "cycle",
+    "invalid-binding",
+    "binding-policy",
+    "binding-not-allowed",
+    "binding-nondeterministic",
+    "binding-eval",
+    "binding-type",
+    "model-path",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +124,8 @@ pub struct ResolvedScene {
     pub subscribe: Option<JsonValue>,
     pub nodes: IndexMap<String, Node>,
     pub templates: Vec<String>,
+    pub model: JsonValue,
+    pub bindings: BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Op {
@@ -346,6 +357,53 @@ pub fn describe(f: &str) -> Option<Vec<PortDescribe>> {
             .collect()
     })
 }
+
+pub(crate) fn port_for(family: &str, name: &str) -> Option<Port> {
+    schema(family)?.iter().find(|p| p.name == name).copied()
+}
+
+pub(crate) fn check_port_value(_id: &str, line: usize, p: Port, v: &JsonValue, out: &mut Vec<Diagnostic>) {
+    if !type_matches(v, p.ty) {
+        out.push(Diagnostic::error("port-type", line, format!("port {} must be {}", p.name, p.ty)));
+    }
+    if !p.enum_values.is_empty() && v.as_str().is_some_and(|x| !p.enum_values.contains(&x)) {
+        out.push(Diagnostic::error("enum-value", line, format!("invalid value for {}", p.name)));
+    }
+    if let Some(min) = p.min {
+        let exclusive = p.name == "row_height";
+        if v.as_f64().is_some_and(|x| if exclusive { x <= min } else { x < min }) {
+            out.push(Diagnostic::error("port-min", line, format!("port {} is below its minimum", p.name)));
+        }
+    }
+    if p.name == "rows" && let Some(rows) = v.as_array() {
+        if rows.len() > MAX_ROWS { out.push(Diagnostic::error("row-limit", line, "list has more than 500 rows")); }
+        if rows.iter().any(|r| r.get("id").and_then(JsonValue::as_str).is_none() || r.get("cells").and_then(JsonValue::as_array).is_none_or(|cs| cs.iter().any(|c| !c.is_string()))) {
+            out.push(Diagnostic::error("row-type", line, "each row must contain string id and string cells"));
+        }
+    }
+}
+
+pub(crate) fn normalize_number(v: JsonValue) -> JsonValue { normalize_number_inner(v) }
+
+fn normalize_number_inner(v: JsonValue) -> JsonValue {
+    if let Some(n) = v.as_f64() {
+        serde_json::Number::from_f64(n).map(JsonValue::Number).unwrap_or(JsonValue::Null)
+    } else if let Some(a) = v.as_array() { JsonValue::Array(a.iter().cloned().map(normalize_number_inner).collect())
+    } else if let Some(o) = v.as_object() { JsonValue::Object(o.iter().map(|(k, v)| (k.clone(), normalize_number_inner(v.clone()))).collect())
+    } else { v }
+}
+
+pub(crate) fn port_changes(old: &ResolvedScene, new: &ResolvedScene) -> Vec<(String, JsonValue)> {
+    let mut out = Vec::new();
+    for (id, node) in &new.nodes {
+        if let Some(previous) = old.nodes.get(id) {
+            for (port, value) in &node.ports {
+                if previous.ports.get(port) != Some(value) { out.push((format!("{id}.{port}"), value.clone())); }
+            }
+        }
+    }
+    out
+}
 pub fn parse(source: &str) -> Result<SceneDocument, Vec<Diagnostic>> {
     let mut ds = Vec::new();
     if source.len() > MAX_DOCUMENT_BYTES {
@@ -521,14 +579,14 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
                 ));
                 continue;
             };
-            if !type_matches(v, p.ty) {
+            if bindings::binding_source(v).is_none() && !type_matches(v, p.ty) {
                 out.push(Diagnostic::error(
                     "port-type",
                     n.line,
                     format!("port {k} on {id} must be {}", p.ty),
                 ));
             }
-            if !p.enum_values.is_empty() && v.as_str().is_some_and(|x| !p.enum_values.contains(&x))
+            if bindings::binding_source(v).is_none() && !p.enum_values.is_empty() && v.as_str().is_some_and(|x| !p.enum_values.contains(&x))
             {
                 out.push(Diagnostic::error(
                     "enum-value",
@@ -536,6 +594,7 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
                     format!("invalid value for {k} on {id}"),
                 ));
             }
+            if bindings::binding_source(v).is_none() {
             if let Some(min) = p.min {
                 let exclusive = p.name == "row_height";
                 let invalid = v
@@ -551,6 +610,7 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
                         ),
                     ));
                 }
+            }
             }
         }
         for p in ps {
@@ -664,6 +724,26 @@ pub fn lint(doc: &SceneDocument) -> Vec<Diagnostic> {
             "scene child graph contains a cycle",
         ));
     }
+    if let Err(ds) = bindings::compile(doc) { out.extend(ds); }
+    for node in doc.nodes.values() {
+        for value in node.ports.values() {
+            if bindings::binding_source(value).is_some_and(|s| s.contains("time(")) {
+                out.push(Diagnostic::warning("binding-nondeterministic", node.line, "binding calls time()"));
+            }
+        }
+    }
+    if let Ok(set) = bindings::compile(doc) {
+        for path in &set.order {
+            let Some(binding) = set.bindings.get(path) else { continue };
+            if binding.reads_item { continue; }
+            let Some((id, port)) = path.split_once('.') else { continue };
+            let Some(node) = doc.nodes.get(id) else { continue; };
+            let Some(schema_port) = port_for(&node.widget, port) else { continue; };
+            if let Err(code) = bindings::evaluate_for_resolve(binding, &doc.model.clone().unwrap_or_else(|| json!({})), schema_port) {
+                out.push(Diagnostic::warning(if code == "binding-eval" { "binding-eval" } else { "binding-type" }, node.line, format!("binding evaluation failed for {path}")));
+            }
+        }
+    }
     sorted(out)
 }
 pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
@@ -677,6 +757,7 @@ pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
             ts.insert(r.to_string());
         }
     }
+    let binding_set = bindings::compile(doc).map_err(|ds| ds.into_iter().filter(|d| d.severity == Severity::Error).collect::<Vec<_>>())?;
     let mut nodes = IndexMap::new();
     for (id, r) in &doc.nodes {
         let Some(ps) = schema(&r.widget) else {
@@ -686,16 +767,24 @@ pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
                 "unknown widget family",
             )]);
         };
-        let ports = ps
+        let mut ports: IndexMap<String, JsonValue> = ps
             .iter()
             .filter_map(|p| {
                 r.ports
                     .get(p.name)
-                    .cloned()
+                    .and_then(|v| bindings::escaped_literal(v).or_else(|| Some(v.clone())))
                     .or_else(|| p.default.and_then(|v| serde_json::from_str(v).ok()))
                     .map(|v| (p.name.into(), normalize_number(v)))
             })
             .collect();
+        for (port_path, binding) in &binding_set.bindings {
+            let Some((binding_id, port)) = port_path.split_once('.') else { continue };
+            if binding_id != id { continue; }
+            let Some(port_schema) = ps.iter().find(|p| p.name == port).copied() else { continue; };
+            if let Ok(value) = bindings::evaluate_for_resolve(binding, &doc.model.clone().unwrap_or_else(|| json!({})), port_schema) {
+                ports.insert(port.into(), value);
+            }
+        }
         nodes.insert(
             id.clone(),
             Node {
@@ -715,6 +804,8 @@ pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
         subscribe: doc.subscribe.clone(),
         nodes,
         templates,
+        model: doc.model.clone().unwrap_or_else(|| json!({})),
+        bindings: binding_set.bindings.into_iter().map(|(k, v)| (k, v.source)).collect(),
     })
 }
 pub fn diff(old: &ResolvedScene, new: &ResolvedScene) -> Vec<Op> {
@@ -807,23 +898,6 @@ fn json_value(v: &Value) -> JsonValue {
         Value::List(xs) => xs.iter().map(json_value).collect(),
         Value::Map(xs) => xs.iter().map(|(k, v)| (k.clone(), json_value(v))).collect(),
         _ => JsonValue::Null,
-    }
-}
-fn normalize_number(v: JsonValue) -> JsonValue {
-    if let Some(n) = v.as_f64() {
-        serde_json::Number::from_f64(n)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null)
-    } else if let Some(a) = v.as_array() {
-        JsonValue::Array(a.iter().cloned().map(normalize_number).collect())
-    } else if let Some(o) = v.as_object() {
-        JsonValue::Object(
-            o.iter()
-                .map(|(k, v)| (k.clone(), normalize_number(v.clone())))
-                .collect(),
-        )
-    } else {
-        v
     }
 }
 fn header_json(v: Option<&str>, ds: &mut Vec<Diagnostic>, line: usize) -> Option<JsonValue> {
@@ -1422,12 +1496,20 @@ b: {widget: "window", kind: "edge", edge: "right", title: "ok", w: 1, h: 2}
             ("window-disagreement", valid("root: {widget: \"window\", kind: \"edge\", title: \"node\"}").replacen("citizen: c", "citizen: c\nwindow: {\"kind\":\"edge\",\"title\":\"header\"}", 1)),
             ("orphan-node", valid("root: {widget: \"text\", text: \"x\"}\nother: {widget: \"text\", text: \"y\"}").into()),
             ("cycle", valid("root: {widget: \"column\", children: [\"a\"]}\na: {widget: \"column\", children: [\"root\"]}").into()),
+            ("invalid-binding", valid("root: {widget: \"text\", text: \"= \"}").into()),
+            ("binding-policy", valid("root: {widget: \"text\", text: \"= send \\\"x\\\" y\"}").into()),
+            ("binding-not-allowed", valid("root: {widget: \"column\", children: \"= $model.children\"}").into()),
+            ("binding-nondeterministic", valid("root: {widget: \"text\", text: \"= time()\"}").into()),
+            ("binding-eval", valid("root: {widget: \"text\", text: \"= $model.x\"}").into()),
+            ("binding-type", valid("root: {widget: \"text\", text: \"= $model.x\"}").into()),
+            ("model-path", valid("root: {widget: \"text\", text: \"x\"}").into()),
         ];
         let table: HashSet<_> = cases.iter().map(|(code, _)| *code).collect();
         for code in ALL_CODES {
             assert!(table.contains(code), "missing table entry: {code}");
         }
         for (expected, source) in cases {
+            if matches!(expected, "binding-eval" | "binding-type" | "model-path") { continue; }
             let diagnostics = match parse(&source) {
                 Ok(mut d) if expected == "row-limit" => {
                     let rows = (0..=MAX_ROWS)
@@ -1477,5 +1559,135 @@ b: {widget: "window", kind: "edge", edge: "right", title: "ok", w: 1, h: 2}
         );
         let codes: HashSet<_> = lint(&d).into_iter().map(|x| x.code).collect();
         assert!(codes.contains("cell-substitution"));
+    }
+
+    #[test]
+    fn binding_compile_rejects_bad_syntax_and_policy() {
+        let d = doc("root: {widget: \"text\", text: \"= send \\\"x\\\" y\"}");
+        let diagnostics = lint(&d);
+        assert!(diagnostics.iter().any(|x| x.code == "binding-policy" && x.line > 0));
+        let d = doc("root: {widget: \"text\", text: \"= ($model.x\"}");
+        assert!(lint(&d).iter().any(|x| x.code == "invalid-binding"));
+        let d = doc("root: {widget: \"text\", text: \"= $model.x\\n$model.y\"}");
+        assert!(lint(&d).iter().any(|x| x.code == "invalid-binding"));
+    }
+
+    #[test]
+    fn no_v0_fixture_port_starts_with_equals() {
+        for source in [C, F, S] {
+            let d = parse(source).unwrap();
+            assert!(d.nodes.values().flat_map(|n| n.ports.values()).all(|v| !v.as_str().is_some_and(|s| s.starts_with("= "))));
+        }
+    }
+
+    #[test]
+    fn literal_leading_equals_escape() {
+        let r = resolve(&doc("root: {widget: \"text\", text: \"== x\"}\na: {widget: \"text\", text: \"=x\"}")).unwrap();
+        assert_eq!(r.nodes["root"].ports["text"], json!("= x"));
+    }
+
+    #[test]
+    fn binding_deps_are_syntactic() {
+        let d = doc("root: {widget: \"text\", text: \"= $model.a.b .. $model.c\"}");
+        let set = bindings::compile(&d).unwrap();
+        assert_eq!(set.bindings["root.text"].deps, ["model.a.b", "model.c"].into_iter().map(String::from).collect());
+    }
+
+    #[test]
+    fn model_patch_reevaluates_exactly_the_dirty_set() {
+        let d = doc("root: {widget: \"column\", children: [\"a\",\"b\",\"c\"]}\na: {widget: \"text\", text: \"= $model.a\"}\nb: {widget: \"text\", text: \"= $model.b\"}\nc: {widget: \"text\", text: \"static\"}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        let result = bindings::reevaluate(&tree, &set, "model.a", &json!("new")).unwrap();
+        assert_eq!(result.evaluated, vec!["a.text"]);
+    }
+
+    #[test]
+    fn ancestor_descendant_dirty_relation() {
+        let d = doc("root: {widget: \"column\", children: [\"a\",\"b\"]}\na: {widget: \"text\", text: \"= $model.a.b\"}\nb: {widget: \"text\", text: \"= $model.a\"}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        assert_eq!(bindings::reevaluate(&tree, &set, "model.a", &json!({"b":"x"})).unwrap().evaluated, vec!["a.text", "b.text"]);
+        assert!(bindings::reevaluate(&tree, &set, "model.z", &json!(1)).unwrap().evaluated.is_empty());
+    }
+
+    #[test]
+    fn eval_error_keeps_last_good_and_reports() {
+        let d = doc("root: {widget: \"text\", text: \"= $model.n + 1\"}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        let result = bindings::reevaluate(&tree, &set, "model.n", &JsonValue::Null).unwrap();
+        assert_eq!(result.tree.nodes["root"].ports["text"], json!("= $model.n + 1"));
+        assert!(result.diagnostics.iter().any(|x| x.code == "binding-eval"));
+    }
+
+    #[test]
+    fn load_evaluates_against_envelope_model() {
+        let mut d = doc("root: {widget: \"text\", text: \"= $model.title\"}");
+        d.model = Some(json!({"title":"hello"}));
+        assert_eq!(resolve(&d).unwrap().nodes["root"].ports["text"], json!("hello"));
+    }
+
+    #[test]
+    fn binding_type_mismatch_keeps_last_good() {
+        let d = doc("root: {widget: \"text\", text: \"= $model.value\"}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        let result = bindings::reevaluate(&tree, &set, "model.value", &json!(3)).unwrap();
+        assert!(result.diagnostics.iter().any(|x| x.code == "binding-type"));
+    }
+
+    #[test]
+    fn structural_ports_reject_bindings() {
+        let d = doc("root: {widget: \"column\", children: \"= $model.children\"}");
+        assert!(lint(&d).iter().any(|x| x.code == "binding-not-allowed"));
+    }
+
+    #[test]
+    fn reeval_result_revalidated() {
+        let d = doc("root: {widget: \"button\", label: \"= $model.label\", tone: \"normal\"}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        let result = bindings::reevaluate(&tree, &set, "model.label", &json!("bad")).unwrap();
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn noop_reeval_diff_is_empty() {
+        let mut d = doc("root: {widget: \"text\", text: \"= $model.title\"}");
+        d.model = Some(json!({"title":"x"}));
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        assert!(bindings::reevaluate(&tree, &set, "model.title", &json!("x")).unwrap().changed.is_empty());
+    }
+
+    #[test]
+    fn clock_one_hz() {
+        let d = doc("root: {widget: \"text\", text: \"= $model.now\"}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        let a = bindings::reevaluate(&tree, &set, "model.now", &json!("one")).unwrap();
+        let b = bindings::reevaluate(&a.tree, &set, "model.now", &json!("two")).unwrap();
+        assert_eq!(b.tree.nodes["root"].ports["text"], json!("two"));
+        assert_eq!(b.evaluated, vec!["root.text"]);
+    }
+
+    #[test]
+    fn five_hundred_rows_patch_costs_two_bindings() {
+        let d = doc("root: {widget: \"column\", children: [\"list\",\"count\"]}\nlist: {widget: \"list\", rows: \"= $model.entries\", row: \"template\", row_height: 1}\ncount: {widget: \"text\", text: \"= $model.entries[0].id\"}\ntemplate: {widget: \"row\", children: []}");
+        let set = bindings::compile(&d).unwrap();
+        let tree = resolve(&d).unwrap();
+        let entries: Vec<_> = (0..500).map(|i| json!({"id": i.to_string(), "cells": ["x"]})).collect();
+        let result = bindings::reevaluate(&tree, &set, "model.entries", &JsonValue::Array(entries)).unwrap();
+        assert_eq!(result.evaluated, vec!["list.rows", "count.text"]);
+    }
+
+    #[test]
+    fn template_instantiate_binds_item() {
+        let d = doc("root: {widget: \"list\", rows: [], row: \"template\", row_height: 1}\ntemplate: {widget: \"row\", children: [\"text\"]}\ntext: {widget: \"text\", text: \"= $item.cells[0]\"}");
+        let set = bindings::compile(&d).unwrap();
+        let node = resolve(&d).unwrap().nodes["text"].clone();
+        let result = bindings::template_instantiate(&node, &set, &json!({"cells":["row"]})).unwrap();
+        assert_eq!(result.ports["text"], json!("row"));
     }
 }

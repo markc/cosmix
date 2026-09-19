@@ -25,6 +25,32 @@ loads. Rejected patches retain both the tree and its revision.
 `shell.scene.describe {family?}` reports the shared P1 registry.
 `shell.scene.unload {scene}` removes the page.
 
+## V1 bindings
+
+A port value beginning `= ` is one Mix expression. `== x` escapes to the
+literal `= x`, while `=x` remains a literal. For example:
+
+```mix
+root: {widget: "text", text: "= $model.title", hidden: "= !$model.visible"}
+```
+
+Bindings read the scene's JSON `$model`; row templates may also read the
+current `$item`. A binding is a pure function of `$model` and `$item`.
+When a model path changes, a binding reruns when its dependency is that path,
+an ancestor, or a descendant of it; unrelated bindings do not run.
+
+| diagnostic | meaning |
+| --- | --- |
+| `invalid-binding` | expression syntax, statement count or depth is invalid |
+| `binding-policy` | a disallowed root or operation was used |
+| `binding-not-allowed` | a structural port was bound |
+| `binding-eval` | evaluation failed; the last good value remains |
+| `binding-type` | the result failed strict port validation |
+| `model-path` | the model patch path is malformed |
+
+Calling `time()` is allowed but emits a `binding-nondeterministic` warning;
+it is not a policy violation.
+
 `shell.scene.watch {scene}` returns `{scene,revision,digest}`. Subscribe to
 `shell.scene.changed` for summaries `{scene,revision,ops,diagnostics}`;
 fetch the complete tree with `get`. Revisions increase on accepted loads and

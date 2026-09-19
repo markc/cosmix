@@ -465,6 +465,25 @@ The complete serialised patch candidate must fit the same 256 KiB bound as
 loads. Rejected patches retain both the tree and its revision.
 <code>shell.scene.describe {family?}</code> reports the shared P1 registry.
 <code>shell.scene.unload {scene}</code> removes the page.</p>
+<h2 id="v1-bindings">V1 bindings</h2>
+<p>A port value beginning <code>= </code> is one Mix expression. <code>== x</code> escapes to the
+literal <code>= x</code>, while <code>=x</code> remains a literal. For example:</p>
+<pre><code class="language-mix">root: {widget: "text", text: "= $model.title", hidden: "= !$model.visible"}
+</code></pre>
+<p>Bindings read the scene's JSON <code>$model</code>; row templates may also read the
+current <code>$item</code>. A binding is a pure function of <code>$model</code> and <code>$item</code>.
+When a model path changes, a binding reruns when its dependency is that path,
+an ancestor, or a descendant of it; unrelated bindings do not run.</p>
+<table><thead><tr><th>diagnostic</th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>invalid-binding</code></td><td>expression syntax, statement count or depth is invalid</td></tr>
+<tr><td><code>binding-policy</code></td><td>a disallowed root or operation was used</td></tr>
+<tr><td><code>binding-not-allowed</code></td><td>a structural port was bound</td></tr>
+<tr><td><code>binding-eval</code></td><td>evaluation failed; the last good value remains</td></tr>
+<tr><td><code>binding-type</code></td><td>the result failed strict port validation</td></tr>
+<tr><td><code>model-path</code></td><td>the model patch path is malformed</td></tr>
+</tbody></table>
+<p>Calling <code>time()</code> is allowed but emits a <code>binding-nondeterministic</code> warning;
+it is not a policy violation.</p>
 <p><code>shell.scene.watch {scene}</code> returns <code>{scene,revision,digest}</code>. Subscribe to
 <code>shell.scene.changed</code> for summaries <code>{scene,revision,ops,diagnostics}</code>;
 fetch the complete tree with <code>get</code>. Revisions increase on accepted loads and
