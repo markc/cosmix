@@ -206,10 +206,20 @@ fn occlusion_wire_callback_cap_completes_excess_and_retains_latest() {
     let (mut h, victim, cover) = fixture();
     align(&mut h, &victim, &cover);
     certify(&mut h, true);
+    // Transaction-time overflow must also respect the presentation unlock
+    // barrier, even after the logical session lock is no longer active.
+    h.server.state.kms_session_lock_gate.deferred_unlock = true;
     let mut callbacks = Vec::new();
     for _ in 0..70 {
         callbacks.push(request(&mut h, victim.protocol_id()));
     }
+    assert!(
+        !h.sync()
+            .iter()
+            .any(|(id, op, _)| callbacks.contains(id) && *op == 0)
+    );
+    h.server.state.kms_session_lock_gate.deferred_unlock = false;
+    h.server.state.limit_occluded_callbacks();
     let events = h.sync();
     let completed = events
         .iter()

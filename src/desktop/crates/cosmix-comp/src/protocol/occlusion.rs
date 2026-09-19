@@ -278,7 +278,11 @@ impl WaylandState {
 
     /// Complete excess older callbacks fail-open; never silently drop them.
     pub(super) fn limit_occluded_callbacks(&mut self) {
-        if self.session_lock_active() {
+        if self.session_lock_active()
+            || self
+                .kms_session_lock_gate
+                .client_delivery_blocked(false, false)
+        {
             return;
         }
         let workspace = self.workspace_current();
