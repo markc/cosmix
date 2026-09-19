@@ -12,19 +12,30 @@
 //! signals. A name conflict is a hard failure, not a replacement: the
 //! run errors with a clear reason, the supervisor backs off, and a
 //! human hands the name over with `dbusd.adapter.disable`.
+//!
+//! Lifetime doctrine: the D-Bus server, the notification state and the
+//! session connection SURVIVE a Bus outage. The Bus client is
+//! reconnected inside the run (the `dbusd` citizen's reconnect
+//! doctrine) and the props-diff baseline survives the outage, so no
+//! live notification is lost and `org.freedesktop.Notifications` is
+//! never released for the taking. The run ends only when the session
+//! bus dies (the name cannot be served without it), the supervisor
+//! stops it, or an internal fault makes progress impossible.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow};
 use cosmix_client::IncomingCommand;
 use cosmix_props_core::publish::{build_props_changed_message, props_changed_topic};
 use cosmix_props_core::{PropPath, PropTree, PropValue};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::AbortHandle;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 
@@ -57,6 +68,18 @@ pub const MAX_ACTIONS: usize = 32;
 const EVENT_CAPACITY: usize = 64;
 /// Bus publish/response budget, matching the other citizens.
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Total stored-bytes budget across live notifications, enforced like
+/// the count cap: evict the oldest (non-critical first) as expired.
+pub const MAX_STORED_BYTES: usize = 16 * 1024 * 1024;
+/// Any effective expiry is clamped to at least this: a notification
+/// whose timer would beat the Notify reply must not close before the
+/// client has even received its id.
+pub const MIN_EXPIRY: Duration = Duration::from_secs(1);
+/// How long the run waits before re-dialing the Bus after a Bus
+/// outage (the run itself survives the outage).
+const BUS_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+/// Budget for deregistering a superseded Bus client.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ───────────────────────────── core types ─────────────────────────────
 
@@ -177,8 +200,13 @@ pub struct Notification {
     pub body: String,
     pub urgency: Urgency,
     pub actions: Vec<Action>,
-    /// None = never expires.
+    /// Wall-clock expiry — display only (`n<id>.expires_at`); None =
+    /// never expires.
     pub expires_at: Option<SystemTime>,
+    /// Monotonic expiry deadline — the truth for due checks and
+    /// timers; a wall-clock step can never delay or hasten it. None =
+    /// never expires.
+    pub expires_mono: Option<Instant>,
     pub created_at: SystemTime,
     /// The `resident` hint: action activation does not close it.
     pub resident: bool,
@@ -281,17 +309,21 @@ fn actions_from_dbus(flat: &[String]) -> Vec<Action> {
         .collect()
 }
 
-/// Resolve an expiry argument against the urgency: the server default
-/// is 8 s for low/normal and never for critical; 0 is always never.
-fn resolve_expiry(timeout: ExpireTimeout, urgency: Urgency, now: SystemTime) -> Option<SystemTime> {
-    match timeout {
-        ExpireTimeout::Never => None,
+/// Resolve an expiry argument against the urgency into the effective
+/// time-to-live: the server default is 8 s for low/normal and never
+/// for critical; 0 is always never; any finite expiry is clamped to at
+/// least [`MIN_EXPIRY`] (a notification must not close before the
+/// client has received its id).
+fn resolve_expiry(timeout: ExpireTimeout, urgency: Urgency) -> Option<Duration> {
+    let ttl = match timeout {
+        ExpireTimeout::Never => return None,
         ExpireTimeout::Default => match urgency {
-            Urgency::Critical => None,
-            Urgency::Low | Urgency::Normal => Some(now + DEFAULT_EXPIRY),
+            Urgency::Critical => return None,
+            Urgency::Low | Urgency::Normal => DEFAULT_EXPIRY,
         },
-        ExpireTimeout::Millis(ms) => Some(now + Duration::from_millis(u64::from(ms))),
-    }
+        ExpireTimeout::Millis(ms) => Duration::from_millis(u64::from(ms)),
+    };
+    Some(ttl.max(MIN_EXPIRY))
 }
 
 // ─────────────────────────── the pure core ────────────────────────────
@@ -303,18 +335,27 @@ fn resolve_expiry(timeout: ExpireTimeout, urgency: Urgency, now: SystemTime) -> 
 #[derive(Debug)]
 pub struct NotifyCore {
     notifications: BTreeMap<u32, Notification>,
-    next_id: u32,
     event_seq: u64,
     cap: usize,
+    max_stored_bytes: usize,
 }
 
+/// Process-wide id clock, shared by every adapter run in this process:
+/// a restarted run must never hand out an id a caller may still hold —
+/// its `replaces_id` / `CloseNotification` would otherwise hit an
+/// unrelated notification. `0` is the "unseeded" value; the first
+/// allocation seeds from the wall clock, so a daemon restart does not
+/// reuse recent ids either. Ids are never 0 (`0` is Notify's
+/// "no replaces_id").
+static ID_CLOCK: AtomicU32 = AtomicU32::new(0);
+
 impl NotifyCore {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize, max_stored_bytes: usize) -> Self {
         Self {
             notifications: BTreeMap::new(),
-            next_id: 0,
             event_seq: 0,
             cap,
+            max_stored_bytes,
         }
     }
 
@@ -344,52 +385,46 @@ impl NotifyCore {
         }
     }
 
-    /// Fresh id, never 0 (0 is Notify's "no replaces_id"), skipping
+    /// Fresh id from the process-wide [`ID_CLOCK`]: never 0, skipping
     /// any id still live (possible only after a u32 wrap).
     fn allocate_id(&mut self) -> u32 {
         loop {
-            self.next_id = self.next_id.wrapping_add(1);
-            if self.next_id != 0 && !self.notifications.contains_key(&self.next_id) {
-                return self.next_id;
+            let id = ID_CLOCK
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    Some(if current == 0 {
+                        id_seed()
+                    } else {
+                        current.wrapping_add(1)
+                    })
+                })
+                .expect("the closure always proposes a value");
+            if id != 0 && !self.notifications.contains_key(&id) {
+                return id;
             }
         }
     }
 
     /// Apply a creation. `replaces_id` semantics per spec: a live id is
     /// reused and its record replaced (no Closed event — the id simply
-    /// carries on); otherwise a fresh id is allocated. Inserting a
-    /// fresh id when the live set is at the cap expires the oldest
-    /// non-critical notification first (reason 1); a live set of all
-    /// criticals overflows rather than silently dropping one —
-    /// critical means a human must see it.
-    pub fn create(&mut self, args: &CreateArgs, now: SystemTime) -> (u32, Vec<NotifyEvent>) {
+    /// carries on); a non-zero id that is NOT live is created under
+    /// that very id (safe: this process never reuses ids); 0 allocates
+    /// a fresh one. A fresh insert that would pass the live cap or the
+    /// stored-bytes budget first evicts the oldest notification —
+    /// non-critical first, else the oldest critical — with reason 1:
+    /// no caller, mesh or D-Bus, may grow the live set without bound.
+    pub fn create(
+        &mut self,
+        args: &CreateArgs,
+        now: SystemTime,
+        mono: Instant,
+    ) -> (u32, Vec<NotifyEvent>) {
         let replacing = args.replaces_id != 0 && self.notifications.contains_key(&args.replaces_id);
-        let mut events = Vec::new();
-        if !replacing {
-            while self.notifications.len() >= self.cap {
-                let victim = self
-                    .notifications
-                    .values()
-                    .filter(|record| record.urgency != Urgency::Critical)
-                    .min_by_key(|record| (record.created_at, record.id))
-                    .map(|record| record.id);
-                let Some(victim) = victim else {
-                    break;
-                };
-                self.notifications.remove(&victim);
-                events.push(self.stamp(
-                    victim,
-                    NotifyEventKind::Closed {
-                        reason: CloseReason::Expired,
-                    },
-                ));
-            }
-        }
-        let id = if replacing {
+        let id = if args.replaces_id != 0 {
             args.replaces_id
         } else {
             self.allocate_id()
         };
+        let ttl = resolve_expiry(args.timeout, args.urgency);
         let record = Notification {
             id,
             app: cap_string(&args.app),
@@ -406,7 +441,8 @@ impl NotifyCore {
                     label: cap_string(&action.label),
                 })
                 .collect(),
-            expires_at: resolve_expiry(args.timeout, args.urgency, now),
+            expires_at: ttl.map(|ttl| now + ttl),
+            expires_mono: ttl.map(|ttl| mono + ttl),
             created_at: now,
             resident: args.resident,
             transient: args.transient,
@@ -415,6 +451,36 @@ impl NotifyCore {
             image_data: args.image_data,
             origin: args.origin,
         };
+        let mut events = Vec::new();
+        if !replacing {
+            let prospective = notification_bytes(&record);
+            while self.notifications.len() >= self.cap
+                || self.stored_bytes() + prospective > self.max_stored_bytes
+            {
+                let victim = self
+                    .notifications
+                    .iter()
+                    .filter(|(live, _)| **live != id)
+                    .min_by_key(|(live, record)| {
+                        (
+                            record.urgency == Urgency::Critical,
+                            record.created_at,
+                            **live,
+                        )
+                    })
+                    .map(|(live, _)| *live);
+                let Some(victim) = victim else {
+                    break;
+                };
+                self.notifications.remove(&victim);
+                events.push(self.stamp(
+                    victim,
+                    NotifyEventKind::Closed {
+                        reason: CloseReason::Expired,
+                    },
+                ));
+            }
+        }
         self.notifications.insert(id, record.clone());
         events.push(self.stamp(
             id,
@@ -433,13 +499,15 @@ impl NotifyCore {
     }
 
     /// Close by id with reason 1, but only if the record is still live
-    /// and its deadline has actually passed — a stale timer from
-    /// before a replace (longer deadline) must not close anything.
-    pub fn expire_if_due(&mut self, id: u32, now: SystemTime) -> Option<NotifyEvent> {
-        let due = self
-            .notifications
-            .get(&id)
-            .is_some_and(|record| record.expires_at.is_some_and(|at| at <= now));
+    /// and its monotonic deadline has actually passed — a stale timer
+    /// from before a replace (longer deadline) must not close anything,
+    /// and a wall-clock step must never delay or hasten the close.
+    pub fn expire_if_due(&mut self, id: u32, mono_now: Instant) -> Option<NotifyEvent> {
+        let due = self.notifications.get(&id).is_some_and(|record| {
+            record
+                .expires_mono
+                .is_some_and(|deadline| deadline <= mono_now)
+        });
         if due {
             self.close(id, CloseReason::Expired)
         } else {
@@ -488,6 +556,40 @@ impl NotifyCore {
         }
         Ok((events, closed))
     }
+
+    /// Approximate stored bytes across the live set, for the budget
+    /// check (an estimate: strings plus a fixed allowance per record
+    /// and per action).
+    fn stored_bytes(&self) -> usize {
+        self.notifications.values().map(notification_bytes).sum()
+    }
+}
+
+/// The per-record share of the stored-bytes budget: every stored
+/// string plus the fixed parts.
+fn notification_bytes(record: &Notification) -> usize {
+    std::mem::size_of::<Notification>()
+        + record.app.len()
+        + record.icon.len()
+        + record.summary.len()
+        + record.body.len()
+        + record
+            .actions
+            .iter()
+            .map(|action| std::mem::size_of::<Action>() + action.key.len() + action.label.len())
+            .sum::<usize>()
+        + record.desktop_entry.as_deref().map_or(0, str::len)
+        + record.image_path.as_deref().map_or(0, str::len)
+}
+
+/// Seed for [`ID_CLOCK`]: wall-clock milliseconds truncated to u32,
+/// never 0.
+fn id_seed() -> u32 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u32)
+        .unwrap_or(0)
+        .max(1)
 }
 
 // ───────────────────────── props projection ───────────────────────────
@@ -563,6 +665,11 @@ impl NotifyProps {
                 &mut leaves,
                 &format!("{base}.resident"),
                 record.resident.into(),
+            );
+            push(
+                &mut leaves,
+                &format!("{base}.transient"),
+                record.transient.into(),
             );
             push(
                 &mut leaves,
@@ -652,6 +759,11 @@ impl PropTree for NotifyProps {
                 cosmix_props_core::PropType::Bool,
                 "The resident hint: activating an action does not close it.",
             ),
+            "transient" => cosmix_props_core::PropDescribe::leaf(
+                path.clone(),
+                cosmix_props_core::PropType::Bool,
+                "The transient hint: passed through for the display side.",
+            ),
             "image_data" => cosmix_props_core::PropDescribe::leaf(
                 path.clone(),
                 cosmix_props_core::PropType::Bool,
@@ -703,18 +815,25 @@ pub(crate) struct NotifyShared {
     core: Mutex<NotifyCore>,
     events: mpsc::Sender<NotifyEvent>,
     emitter: Weak<SignalEmitter<'static>>,
+    /// One live expiry timer per expiring notification, by id. A timer
+    /// is aborted the moment its notification is replaced, closed or
+    /// evicted, and every timer dies with the run — replace spam can
+    /// never accumulate detached sleepers.
+    timers: Mutex<HashMap<u32, AbortHandle>>,
 }
 
 impl NotifyShared {
     fn new(
         cap: usize,
+        max_stored_bytes: usize,
         emitter: Weak<SignalEmitter<'static>>,
         events: mpsc::Sender<NotifyEvent>,
     ) -> Self {
         Self {
-            core: Mutex::new(NotifyCore::new(cap)),
+            core: Mutex::new(NotifyCore::new(cap, max_stored_bytes)),
             events,
             emitter,
+            timers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -722,6 +841,34 @@ impl NotifyShared {
         self.core
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_timers(&self) -> MutexGuard<'_, HashMap<u32, AbortHandle>> {
+        self.timers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Abort and forget the timer for `id`, if any (the notification
+    /// was closed, evicted, or replaced by a never-expiring record).
+    fn disarm_timer(&self, id: u32) {
+        if let Some(handle) = self.lock_timers().remove(&id) {
+            handle.abort();
+        }
+    }
+
+    /// Abort every live timer: the run is ending.
+    fn abort_timers(&self) {
+        for (_, handle) in self.lock_timers().drain() {
+            handle.abort();
+        }
+    }
+
+    /// Live expiry timers (test visibility for the cancellation
+    /// contract).
+    #[cfg(test)]
+    fn timer_count(&self) -> usize {
+        self.lock_timers().len()
     }
 
     /// Stamp-ordered enqueue: called with the lock held, so two
@@ -754,22 +901,24 @@ impl NotifyShared {
     }
 
     /// Create a notification (the Notify method or `notify.send`):
-    /// apply under the lock, arm the per-notification timer, then emit
-    /// NotificationClosed for any cap-evicted predecessor. Returns the
-    /// id — exactly what Notify replies with.
+    /// apply under the lock, (re)arm the per-notification timer, then
+    /// disarm and emit NotificationClosed for any cap-evicted
+    /// predecessor. Returns the id — exactly what Notify replies with.
     pub async fn create(shared: &Arc<Self>, args: CreateArgs) -> u32 {
-        let (id, expires_at, events) = {
+        let (id, expires_mono, events) = {
             let mut core = shared.lock();
-            let (id, events) = core.create(&args, SystemTime::now());
-            let expires_at = core.get(id).and_then(|record| record.expires_at);
+            let (id, events) = core.create(&args, SystemTime::now(), Instant::now());
+            let expires_mono = core.get(id).and_then(|record| record.expires_mono);
             shared.enqueue(&events);
-            (id, expires_at, events)
+            (id, expires_mono, events)
         };
-        if let Some(deadline) = expires_at {
-            arm_timer(shared, id, deadline);
+        match expires_mono {
+            Some(deadline) => arm_timer(shared, id, deadline),
+            None => shared.disarm_timer(id),
         }
         for event in &events {
             if let NotifyEventKind::Closed { reason } = event.kind {
+                shared.disarm_timer(event.id);
                 shared.emit_closed(event.id, reason).await;
             }
         }
@@ -778,8 +927,8 @@ impl NotifyShared {
 
     /// CloseNotification (reason 3), `notify.close` (reason 2) and the
     /// expiry timer (reason 1) all land here. Returns false for an
-    /// unknown id — the D-Bus method ignores it per spec, the verb
-    /// refuses.
+    /// unknown id — the D-Bus method replies with an error (the caller
+    /// may be acting on stale state), the verb refuses.
     pub async fn close(&self, id: u32, reason: CloseReason) -> bool {
         let closed = {
             let mut core = self.lock();
@@ -790,6 +939,7 @@ impl NotifyShared {
             event.is_some()
         };
         if closed {
+            self.disarm_timer(id);
             self.emit_closed(id, reason).await;
         }
         closed
@@ -811,6 +961,7 @@ impl NotifyShared {
                     self.emit_invoked(id, action).await;
                 }
                 NotifyEventKind::Closed { reason } => {
+                    self.disarm_timer(event.id);
                     self.emit_closed(id, *reason).await;
                 }
                 NotifyEventKind::Created { .. } => {}
@@ -825,13 +976,14 @@ impl NotifyShared {
     pub async fn expire(&self, id: u32) {
         let closed = {
             let mut core = self.lock();
-            let event = core.expire_if_due(id, SystemTime::now());
+            let event = core.expire_if_due(id, Instant::now());
             if let Some(event) = &event {
                 self.enqueue(std::slice::from_ref(event));
             }
             event.is_some()
         };
         if closed {
+            self.disarm_timer(id);
             self.emit_closed(id, CloseReason::Expired).await;
         }
     }
@@ -862,21 +1014,25 @@ impl NotifyShared {
     }
 }
 
-/// One timer per expiring notification — sleep until its deadline,
-/// then check once. No polling loop anywhere. The timer holds only a
-/// weak pointer: it must never keep the adapter alive, and a dropped
-/// adapter's late fire finds nothing to close.
-fn arm_timer(shared: &Arc<NotifyShared>, id: u32, deadline: SystemTime) {
-    let shared: Weak<NotifyShared> = Arc::downgrade(shared);
-    tokio::spawn(async move {
-        let remaining = deadline
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
-        tokio::time::sleep(remaining).await;
-        if let Some(shared) = shared.upgrade() {
+/// Arm (or re-arm, on replace) the expiry timer for `id`: sleep until
+/// the monotonic deadline on tokio's clock, then close with reason 1
+/// only if still due. No polling loop anywhere. The handle is kept so
+/// a replace, close, eviction or the run's end can abort it; any timer
+/// it supersedes is aborted here and gone for good. The timer holds
+/// only a weak pointer: it must never keep the adapter alive, and a
+/// dropped adapter's late fire finds nothing to close.
+fn arm_timer(shared: &Arc<NotifyShared>, id: u32, deadline: Instant) {
+    let weak: Weak<NotifyShared> = Arc::downgrade(shared);
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        if let Some(shared) = weak.upgrade() {
             shared.expire(id).await;
         }
     });
+    let mut timers = shared.lock_timers();
+    if let Some(superseded) = timers.insert(id, handle.abort_handle()) {
+        superseded.abort();
+    }
 }
 
 // ─────────────────────── the D-Bus interface ──────────────────────────
@@ -917,9 +1073,17 @@ impl Notifications {
         .await
     }
 
-    async fn close_notification(&self, id: u32) {
-        // Unknown ids are ignored per spec: no error reply, no signal.
-        self.shared.close(id, CloseReason::Requested).await;
+    /// Spec 1.2: an unknown id is an error reply — the caller may be
+    /// acting on stale state and deserves to know — never a silent
+    /// success and never a signal.
+    async fn close_notification(&self, id: u32) -> Result<(), zbus::fdo::Error> {
+        if self.shared.close(id, CloseReason::Requested).await {
+            Ok(())
+        } else {
+            Err(zbus::fdo::Error::UnknownObject(format!(
+                "no notification {id}"
+            )))
+        }
     }
 
     fn get_capabilities(&self) -> Vec<String> {
@@ -968,7 +1132,7 @@ impl CreateArgs {
     ) -> Self {
         let urgency = hints
             .get("urgency")
-            .and_then(|value| u8::try_from(value.clone()).ok())
+            .and_then(urgency_from_hint)
             .map_or(Urgency::Normal, Urgency::from_byte);
         Self {
             app: app.to_string(),
@@ -1001,26 +1165,50 @@ fn hint_bool(hints: &HashMap<String, OwnedValue>, keys: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// The spec says the `urgency` hint is a byte, but non-conforming
+/// clients send it as an int32 or uint32 — accept all three widths.
+fn urgency_from_hint(value: &OwnedValue) -> Option<u8> {
+    if let Ok(byte) = u8::try_from(value.clone()) {
+        return Some(byte);
+    }
+    if let Ok(wide) = i32::try_from(value.clone()) {
+        return u8::try_from(wide).ok();
+    }
+    if let Ok(wide) = u32::try_from(value.clone()) {
+        return u8::try_from(wide).ok();
+    }
+    None
+}
+
 fn hint_string(hints: &HashMap<String, OwnedValue>, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| hints.get(*key))
         .and_then(|value| String::try_from(value.clone()).ok())
 }
 
-// ─────────────────── the Bus publisher (events out) ───────────────────
+// ─────────────────── the Bus client abstraction ───────────────────────
 
-/// The one Bus operation the publisher needs, as a trait so its
-/// behaviour is testable without a live broker. `NodedClient` is the
-/// production implementation.
-trait EventPublisher: Send + Sync {
+/// The Bus operations the run needs, as a trait so the reconnect and
+/// reply behaviour is testable without a live broker. `NodedClient` is
+/// the production implementation; tests inject a fake.
+trait BusClient: Send + Sync {
+    /// Publish one event on a topic via the broker.
     fn publish_event(
         &self,
         topic: &str,
         message: cosmix_bus::bus::BusMessage,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+
+    /// Reply to one incoming command.
+    fn respond<'a>(
+        &'a self,
+        command: &'a IncomingCommand,
+        rc: u8,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
-impl EventPublisher for cosmix_client::NodedClient {
+impl BusClient for cosmix_client::NodedClient {
     fn publish_event(
         &self,
         topic: &str,
@@ -1037,38 +1225,128 @@ impl EventPublisher for cosmix_client::NodedClient {
                 .await
         })
     }
+
+    fn respond<'a>(
+        &'a self,
+        command: &'a IncomingCommand,
+        rc: u8,
+        body: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.respond(command, rc, body).await })
+    }
 }
 
-/// Consume notification events and publish them on the adapter's Bus
-/// connection: `notify.props.changed` diffs against the surviving
-/// baseline (the `dbusd` citizen's doctrine: a re-sent diff is
-/// idempotent, a dropped one is a silent gap) plus one `notify.changed`
-/// event per change, both stamped with the event's `event_seq`. A
-/// publish failure faults the run (the adapter's one-connection fault
-/// model: the supervisor restarts it) rather than losing events.
+/// One live Bus connection as the run's Bus side: the client (publish
+/// plus reply), the incoming command stream, and an optional close that
+/// deregisters the service before the next re-dial.
+struct BusSession {
+    client: Arc<dyn BusClient>,
+    incoming: mpsc::UnboundedReceiver<IncomingCommand>,
+    close: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+/// How the run obtains Bus sessions — reconnectable by design. The
+/// production connector dials through the adapter context; tests
+/// script it.
+trait BusConnector: Send {
+    fn connect(&mut self) -> Pin<Box<dyn Future<Output = Result<BusSession>> + Send + '_>>;
+}
+
+/// The production connector: the adapter context's registered Bus
+/// connection, fresh per (re)connect.
+struct CtxBusConnector<'a> {
+    ctx: &'a AdapterCtx,
+}
+
+impl BusConnector for CtxBusConnector<'_> {
+    fn connect(&mut self) -> Pin<Box<dyn Future<Output = Result<BusSession>> + Send + '_>> {
+        Box::pin(async move {
+            let client = Arc::new(self.ctx.connect_bus().await?);
+            let incoming = client
+                .incoming_async()
+                .await
+                .ok_or_else(|| anyhow!("notify: incoming Bus channel already taken"))?;
+            let closer = Arc::clone(&client);
+            Ok(BusSession {
+                client,
+                incoming,
+                close: Some(Box::pin(async move {
+                    if tokio::time::timeout(CLOSE_TIMEOUT, closer.close())
+                        .await
+                        .is_err()
+                    {
+                        eprintln!("cosmix-dbusd notify: Bus client close timed out");
+                    }
+                })),
+            })
+        })
+    }
+}
+
+// ─────────────────── the Bus publisher (events out) ───────────────────
+
+/// Consume notification events and publish them on whichever Bus
+/// client the run currently holds (`clients` is `None` while the Bus
+/// side is down: the publisher parks — events buffer up to the channel
+/// capacity, overflow drops with a log): `notify.props.changed` diffs
+/// against the surviving baseline (the `dbusd` citizen's doctrine: a
+/// re-sent diff is idempotent, a dropped one is a silent gap) plus one
+/// `notify.changed` event per change. The baseline starts as the EMPTY
+/// tree, so the run's very first change publishes its diff too. Events
+/// stamped under one core lock arrive as a batch; the batch's
+/// coalesced diff is stamped with the LAST `event_seq` it covers. A
+/// publish failure hands the run a fault (it reconnects the Bus
+/// client) rather than losing the baseline.
 async fn run_publisher(
     shared: Weak<NotifyShared>,
     mut events: mpsc::Receiver<NotifyEvent>,
-    publisher: Arc<dyn EventPublisher>,
+    mut clients: watch::Receiver<Option<Arc<dyn BusClient>>>,
     faults: mpsc::Sender<()>,
 ) -> Result<()> {
-    let mut baseline: Option<PropValue> = None;
+    let mut baseline = NotifyProps::new(&BTreeMap::new()).snapshot();
     loop {
-        let Some(event) = events.recv().await else {
+        let Some(mut event) = events.recv().await else {
             return Err(anyhow!("notify: event stream ended"));
         };
         let Some(shared) = shared.upgrade() else {
             return Err(anyhow!("notify: adapter state dropped"));
         };
+        // Drain the rest of the batch (every event stamped under the
+        // same core lock) so the diff covers the batch's whole effect.
+        let mut batch = Vec::new();
+        loop {
+            batch.push(event);
+            event = match events.try_recv() {
+                Ok(next) => next,
+                Err(_) => break,
+            };
+        }
+        let last_seq = batch.last().expect("a batch has one event").seq;
+        let client = match wait_for_client(&mut clients).await {
+            Ok(client) => client,
+            Err(error) => return Err(error),
+        };
         let snapshot = shared.props().snapshot();
         let mut failed = false;
-        if let Some(old) = baseline.as_ref() {
-            for (path, old_value, new_value) in cosmix_props_core::diff(old, &snapshot) {
-                let mut message =
-                    build_props_changed_message(&path, &old_value, &new_value, "notify.event");
+        for (path, old_value, new_value) in cosmix_props_core::diff(&baseline, &snapshot) {
+            let mut message =
+                build_props_changed_message(&path, &old_value, &new_value, "notify.event");
+            message.set("event_seq", &last_seq.to_string());
+            if publish_with_timeout(&*client, &props_changed_topic(BUS_SERVICE), message)
+                .await
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        if !failed {
+            for event in &batch {
+                let mut message = cosmix_bus::bus::BusMessage::new();
+                message.set("command", event.kind.name());
                 message.set("event_seq", &event.seq.to_string());
-                if publisher
-                    .publish_event(&props_changed_topic(BUS_SERVICE), message)
+                message.body = event_body(event).to_string();
+                if publish_with_timeout(&*client, TOPIC_NOTIFY_CHANGED, message)
                     .await
                     .is_err()
                 {
@@ -1077,28 +1355,47 @@ async fn run_publisher(
                 }
             }
         }
-        if !failed {
-            let mut message = cosmix_bus::bus::BusMessage::new();
-            message.set("command", event.kind.name());
-            message.set("event_seq", &event.seq.to_string());
-            message.body = event_body(&event).to_string();
-            if publisher
-                .publish_event(TOPIC_NOTIFY_CHANGED, message)
-                .await
-                .is_err()
-            {
-                failed = true;
-            }
-        }
         if failed {
-            eprintln!("cosmix-dbusd notify: event publish failed; faulting the run");
+            eprintln!("cosmix-dbusd notify: event publish failed; faulting the Bus client");
             let _ = faults.try_send(());
-            // The baseline survives the failure and the fault: a
-            // subscriber that stayed connected through the outage needs
-            // the accumulated diff on the next event.
+            // The baseline survives the failure AND the reconnect it
+            // triggers: a subscriber that stayed connected through the
+            // outage has seen exactly up to the baseline and needs the
+            // accumulated diff on the next event.
             continue;
         }
-        baseline = Some(snapshot);
+        baseline = snapshot;
+    }
+}
+
+/// Publish one message under the Bus budget: a wedged publish faults
+/// the client instead of parking the publisher forever.
+async fn publish_with_timeout(
+    client: &dyn BusClient,
+    topic: &str,
+    message: cosmix_bus::bus::BusMessage,
+) -> Result<()> {
+    match tokio::time::timeout(PUBLISH_TIMEOUT, client.publish_event(topic, message)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(anyhow!("publish timed out after {PUBLISH_TIMEOUT:?}")),
+    }
+}
+
+/// The publisher's view of the run's Bus client: park while the run is
+/// between Bus connections (initial dial or reconnect).
+async fn wait_for_client(
+    clients: &mut watch::Receiver<Option<Arc<dyn BusClient>>>,
+) -> Result<Arc<dyn BusClient>> {
+    loop {
+        if let Some(client) = clients.borrow_and_update().clone() {
+            return Ok(client);
+        }
+        // No Bus connection right now: park until one appears. Events
+        // buffer in the bounded channel meanwhile; overflow is dropped
+        // at the source with a log, and props.get is the bootstrap.
+        if clients.changed().await.is_err() {
+            return Err(anyhow!("notify: publisher client channel ended"));
+        }
     }
 }
 
@@ -1474,8 +1771,8 @@ fn resolve_args(command: &IncomingCommand) -> Option<Value> {
 /// A started notify server: the shared state, the strong signal
 /// emitter and the publisher task. Dropping it (or ending the run)
 /// drops the last strong reference to the emitter — and with it the
-/// zbus connection's last reason to stay alive — so the interface and
-/// the bus name go too.
+/// zbus connection's last reason to stay alive — so the interface, the
+/// bus name and every expiry timer go too.
 #[derive(Debug)]
 pub(crate) struct NotifyServer {
     pub shared: Arc<NotifyShared>,
@@ -1489,6 +1786,7 @@ pub(crate) struct NotifyServer {
 impl Drop for NotifyServer {
     fn drop(&mut self) {
         self.publisher.abort();
+        self.shared.abort_timers();
     }
 }
 
@@ -1496,15 +1794,20 @@ impl Drop for NotifyServer {
 /// claim [`DBUS_NAME`]. The claim never replaces an existing owner:
 /// `DoNotQueue` alone, so a name someone else owns fails here with a
 /// clear error and the supervisor backs off — a human uses
-/// `dbusd.adapter.disable`/`enable` to hand it over.
-async fn start_server<P: EventPublisher + 'static>(
+/// `dbusd.adapter.disable`/`enable` to hand it over. The publisher
+/// publishes through whichever Bus client `clients` currently carries
+/// (`None` while the Bus side is down).
+async fn start_server(
     connection: &zbus::Connection,
-    publisher: Arc<P>,
+    clients: watch::Receiver<Option<Arc<dyn BusClient>>>,
+    cap: usize,
+    max_stored_bytes: usize,
 ) -> Result<(NotifyServer, mpsc::Receiver<()>)> {
     let emitter = Arc::new(SignalEmitter::new(connection, DBUS_PATH)?);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
     let shared = Arc::new(NotifyShared::new(
-        MAX_LIVE,
+        cap,
+        max_stored_bytes,
         Arc::downgrade(&emitter),
         events_tx,
     ));
@@ -1534,11 +1837,10 @@ async fn start_server<P: EventPublisher + 'static>(
         }
     }
     let (fault_tx, fault_rx) = mpsc::channel(1);
-    let publisher: Arc<dyn EventPublisher> = publisher;
     let publisher_task = tokio::spawn(run_publisher(
         Arc::downgrade(&shared),
         events_rx,
-        publisher,
+        clients,
         fault_tx,
     ));
     Ok((
@@ -1551,10 +1853,218 @@ async fn start_server<P: EventPublisher + 'static>(
     ))
 }
 
+// ───────────── the run: Bus driver and lifetime management ────────────
+
+/// Why `serve_bus` stopped serving one session.
+enum ServeOutcome {
+    /// The command stream ended or a reply failed or timed out —
+    /// reconnect the Bus client.
+    Reconnect,
+    /// Shutdown was signalled — the run is ending.
+    Stopped,
+}
+
+/// Serve incoming Bus commands on one session. Every dispatch and
+/// reply is raced against shutdown, so a stop is honoured mid-flight
+/// without waiting out a wedged dispatch or the reply budget.
+async fn serve_bus(
+    session: &mut BusSession,
+    shared: &Arc<NotifyShared>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> ServeOutcome {
+    loop {
+        let command = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                match changed {
+                    Ok(_) if !*shutdown.borrow_and_update() => continue,
+                    _ => return ServeOutcome::Stopped,
+                }
+            }
+            command = session.incoming.recv() => {
+                match command {
+                    Some(command) => command,
+                    None => return ServeOutcome::Reconnect,
+                }
+            }
+        };
+        let handled = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                match changed {
+                    Ok(_) if !*shutdown.borrow_and_update() => None,
+                    _ => return ServeOutcome::Stopped,
+                }
+            }
+            handled = handle_command(&*session.client, shared, &command) => Some(handled),
+        };
+        let Some(outcome) = handled else {
+            // A spurious (non-true) shutdown change: nothing to redo,
+            // keep serving.
+            continue;
+        };
+        if let Err(error) = outcome {
+            eprintln!("cosmix-dbusd notify: {error:#}; reconnecting the Bus client");
+            return ServeOutcome::Reconnect;
+        }
+    }
+}
+
+/// Dispatch one command and reply on the session's client. Ok means
+/// replied; Err means the reply failed or timed out (reconnect).
+async fn handle_command(
+    client: &dyn BusClient,
+    shared: &Arc<NotifyShared>,
+    command: &IncomingCommand,
+) -> Result<()> {
+    let (rc, body) = dispatch(shared, command).await;
+    match tokio::time::timeout(PUBLISH_TIMEOUT, client.respond(command, rc, &body)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow!("Bus response failed ({error:#})")),
+        Err(_) => Err(anyhow!("Bus response timed out")),
+    }
+}
+
+/// Sleep `delay`, waking immediately on shutdown. Ok(true) means stop.
+async fn sleep_or_stop(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> Result<bool> {
+    tokio::select! {
+        biased;
+        changed = shutdown.changed() => {
+            changed.map_err(|_| anyhow!("notify: stop channel ended"))?;
+            Ok(*shutdown.borrow_and_update())
+        }
+        _ = tokio::time::sleep(delay) => Ok(false),
+    }
+}
+
+/// The Bus side of the run, J1-citizen style: dial, serve, and on any
+/// Bus trouble (command stream end, publish fault, reply failure or
+/// timeout, a failed dial) close the client and re-dial after
+/// `reconnect_delay`. The notify server, its state and the session
+/// connection all survive — only the Bus client is replaced, and the
+/// publisher's props baseline survives with it. Ok is returned only on
+/// shutdown; Err is an internal fault.
+async fn run_bus<C: BusConnector>(
+    mut connector: C,
+    clients: watch::Sender<Option<Arc<dyn BusClient>>>,
+    mut faults: mpsc::Receiver<()>,
+    mut shutdown: watch::Receiver<bool>,
+    shared: Arc<NotifyShared>,
+    reconnect_delay: Duration,
+) -> Result<()> {
+    loop {
+        let mut session = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                changed.map_err(|_| anyhow!("notify: stop channel ended"))?;
+                if *shutdown.borrow_and_update() {
+                    return Ok(());
+                }
+                continue;
+            }
+            session = connector.connect() => match session {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!(
+                        "cosmix-dbusd notify: Bus unavailable ({error:#}); retrying in {reconnect_delay:?}"
+                    );
+                    if sleep_or_stop(&mut shutdown, reconnect_delay).await? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            },
+        };
+        let _ = clients.send(Some(Arc::clone(&session.client)));
+        let outcome = tokio::select! {
+            biased;
+            fault = faults.recv() => {
+                if fault.is_none() {
+                    return Err(anyhow!("notify: publisher fault channel ended"));
+                }
+                eprintln!("cosmix-dbusd notify: event publish faulted; reconnecting the Bus client");
+                ServeOutcome::Reconnect
+            }
+            outcome = serve_bus(&mut session, &shared, &mut shutdown) => outcome,
+        };
+        let _ = clients.send(None);
+        if let Some(close) = session.close.take() {
+            close.await;
+        }
+        // A fault that raced the new session must not tear it down:
+        // drop stale faults before serving again.
+        while faults.try_recv().is_ok() {}
+        match outcome {
+            ServeOutcome::Stopped => return Ok(()),
+            ServeOutcome::Reconnect => {
+                eprintln!("cosmix-dbusd notify: Bus disconnected; retrying in {reconnect_delay:?}");
+                if sleep_or_stop(&mut shutdown, reconnect_delay).await? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// The run's core: hold the notify server and the session connection
+/// for the whole run, drive the Bus side through `connector`, and end
+/// the run only on shutdown, session-bus death or an internal fault —
+/// a Bus outage is waited out inside the run, with the notifications
+/// and the D-Bus name intact.
+async fn notify_run<C: BusConnector>(
+    session: zbus::Connection,
+    server: NotifyServer,
+    clients: watch::Sender<Option<Arc<dyn BusClient>>>,
+    faults: mpsc::Receiver<()>,
+    connector: C,
+    mut shutdown: watch::Receiver<bool>,
+    reconnect_delay: Duration,
+) -> Result<()> {
+    // A pinned local (not spawned): dropping it at run end cancels the
+    // driver wherever it is — no detached task, no 'static connector.
+    let mut bus = Box::pin(run_bus(
+        connector,
+        clients,
+        faults,
+        shutdown.clone(),
+        Arc::clone(&server.shared),
+        reconnect_delay,
+    ));
+    loop {
+        tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                match changed {
+                    Err(_) => break Err(anyhow!("notify: stop channel ended")),
+                    Ok(_) if !*shutdown.borrow_and_update() => continue,
+                    Ok(_) => break Ok(()),
+                }
+            }
+            _ = session.closed() => {
+                break Err(anyhow!(
+                    "notify: session bus connection lost; ending the run so the \
+                     supervisor re-dials"
+                ));
+            }
+            result = &mut bus => {
+                // The driver returns Ok only on shutdown — which the
+                // biased shutdown arm above sees first. Anything else
+                // is an internal fault.
+                break match result {
+                    Ok(()) => Err(anyhow!("notify: Bus driver stopped unexpectedly")),
+                    Err(error) => Err(anyhow!("notify: Bus driver failed: {error:#}")),
+                };
+            }
+        }
+    }
+}
+
 /// The `notify` adapter: inbound `org.freedesktop.Notifications` server
 /// bridged to the `notify` Bus service. One zbus connection (the
-/// served name) and one Bus connection (the registered service), both
-/// locals of the run — returning, failing or panicking withdraws both.
+/// served name) for the whole run; the Bus client is a local that is
+/// REPLACED, not ended, on Bus trouble — notifications, props state
+/// and the D-Bus name survive a Bus outage. Only session-bus death,
+/// shutdown or an internal fault ends the run, withdrawing everything.
 #[derive(Default)]
 pub struct NotifyAdapter;
 
@@ -1569,83 +2079,40 @@ impl Adapter for NotifyAdapter {
 
     fn run(self: Box<Self>, mut ctx: AdapterCtx) -> BoxRunFuture {
         Box::pin(async move {
-            let session = ctx
-                .connect_session_bus()
-                .await
-                .map_err(|error| anyhow!("notify: session bus: {error:#}"))?;
-            let bus = Arc::new(
-                ctx.connect_bus()
-                    .await
-                    .map_err(|error| anyhow!("notify: Bus connection: {error:#}"))?,
-            );
-            let (mut server, mut fault_rx) = start_server(&session, Arc::clone(&bus)).await?;
-            ctx.signal_ready();
             let mut shutdown = ctx.shutdown().clone();
-            let mut incoming = bus
-                .incoming_async()
-                .await
-                .ok_or_else(|| anyhow!("notify: incoming Bus channel already taken"))?;
-            loop {
-                tokio::select! {
-                    biased;
-                    changed = shutdown.changed() => {
-                        if changed.is_err() {
-                            break Err(anyhow!("notify: stop channel ended"));
-                        }
-                        if *shutdown.borrow_and_update() {
-                            break Ok(());
-                        }
-                    }
-                    command = incoming.recv() => {
-                        let Some(command) = command else {
-                            break Err(anyhow!("notify: Bus command stream ended"));
-                        };
-                        let (rc, body) = dispatch(&server.shared, &command).await;
-                        match tokio::time::timeout(
-                            PUBLISH_TIMEOUT,
-                            bus.respond_parts(
-                                &command.from,
-                                &command.command,
-                                command.id.as_deref(),
-                                rc,
-                                &body,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                break Err(anyhow!(
-                                    "notify: Bus response failed ({error:#}); ending the \
-                                     run so the supervisor restarts the adapter"
-                                ));
-                            }
-                            Err(_) => {
-                                break Err(anyhow!(
-                                    "notify: Bus response timed out; ending the run so \
-                                     the supervisor restarts the adapter"
-                                ));
-                            }
-                        }
-                    }
-                    fault = fault_rx.recv() => {
-                        if fault.is_none() {
-                            break Err(anyhow!("notify: publisher fault channel ended"));
-                        }
-                        break Err(anyhow!(
-                            "notify: event publish failed; ending the run so the \
-                             supervisor restarts the adapter"
-                        ));
-                    }
-                    result = &mut server.publisher => {
-                        break match result {
-                            Ok(Ok(())) => Err(anyhow!("notify: publisher ended unexpectedly")),
-                            Ok(Err(error)) => Err(anyhow!("notify: publisher failed: {error:#}")),
-                            Err(error) => Err(anyhow!("notify: publisher task failed: {error}")),
-                        };
-                    }
+            // Setup races shutdown: a stop must not wait out a dial or
+            // a name claim.
+            let session = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    changed.map_err(|_| anyhow!("notify: stop channel ended"))?;
+                    return Ok(());
                 }
-            }
+                session = ctx.connect_session_bus() => session
+                    .map_err(|error| anyhow!("notify: session bus: {error:#}"))?,
+            };
+            let (clients_tx, clients_rx) = watch::channel(None);
+            let (server, faults) = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    changed.map_err(|_| anyhow!("notify: stop channel ended"))?;
+                    return Ok(());
+                }
+                started = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES) => {
+                    started?
+                }
+            };
+            ctx.signal_ready();
+            notify_run(
+                session,
+                server,
+                clients_tx,
+                faults,
+                CtxBusConnector { ctx: &ctx },
+                shutdown,
+                BUS_RECONNECT_DELAY,
+            )
+            .await
         })
     }
 }
@@ -1657,7 +2124,7 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use std::io::ErrorKind;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::AsyncBufReadExt as _;
 
     // ── harness: a private dbus-daemon and a fake Bus publisher ──
@@ -1667,7 +2134,7 @@ mod tests {
     /// session. Dropping it kills the daemon.
     struct PrivateBus {
         address: String,
-        _child: tokio::process::Child,
+        child: tokio::process::Child,
     }
 
     impl PrivateBus {
@@ -1702,10 +2169,7 @@ mod tests {
             }
             let address = address.trim().to_string();
             assert!(address.starts_with("unix:"), "bus address: {address}");
-            Some(Self {
-                address,
-                _child: child,
-            })
+            Some(Self { address, child })
         }
 
         async fn connect(&self) -> zbus::Connection {
@@ -1716,13 +2180,21 @@ mod tests {
                 .await
                 .expect("connect to the private bus")
         }
+
+        /// Kill the daemon — session-bus death for everyone connected.
+        async fn kill(&mut self) {
+            self.child.start_kill().expect("kill dbus-daemon");
+        }
     }
 
-    /// Records every publication; can be scripted to fail.
+    /// Records every publication and reply; can be scripted to fail
+    /// publishes or hang replies.
     #[derive(Default)]
     struct FakePublisher {
-        published: Mutex<Vec<(String, String)>>,
+        published: Mutex<Vec<(String, cosmix_bus::bus::BusMessage)>>,
+        replies: Mutex<Vec<(String, u8, String)>>,
         fail_next: AtomicUsize,
+        hang_replies: AtomicBool,
     }
 
     impl FakePublisher {
@@ -1732,16 +2204,58 @@ mod tests {
                 .expect("fake publisher lock")
                 .iter()
                 .filter(|(name, _)| name == topic)
-                .map(|(_, body)| serde_json::from_str(body).expect("json body"))
+                .map(|(_, message)| serde_json::from_str(&message.body).expect("json body"))
+                .collect()
+        }
+
+        /// One topic's messages whole, headers included (diff stamps
+        /// live in headers).
+        fn messages(&self, topic: &str) -> Vec<cosmix_bus::bus::BusMessage> {
+            self.published
+                .lock()
+                .expect("fake publisher lock")
+                .iter()
+                .filter(|(name, _)| name == topic)
+                .map(|(_, message)| message.clone())
+                .collect()
+        }
+
+        /// The `event_seq` header of the diffs whose body hits `path`,
+        /// in publish order.
+        fn diff_seqs(&self, path: &str) -> Vec<u64> {
+            self.messages(&props_changed_topic(BUS_SERVICE))
+                .iter()
+                .filter(|message| {
+                    serde_json::from_str::<Value>(&message.body)
+                        .expect("json body")
+                        .get("path")
+                        .is_some_and(|seen| seen == path)
+                })
+                .filter_map(|message| message.get("event_seq"))
+                .map(|seq| seq.parse().expect("numeric event_seq header"))
+                .collect()
+        }
+
+        fn replies_for(&self, command: &str) -> Vec<(u8, String)> {
+            self.replies
+                .lock()
+                .expect("fake publisher lock")
+                .iter()
+                .filter(|(name, _, _)| name == command)
+                .map(|(_, rc, body)| (*rc, body.clone()))
                 .collect()
         }
 
         fn fail_next(&self, count: usize) {
             self.fail_next.store(count, Ordering::SeqCst);
         }
+
+        fn hang_replies(&self) {
+            self.hang_replies.store(true, Ordering::SeqCst);
+        }
     }
 
-    impl EventPublisher for FakePublisher {
+    impl BusClient for FakePublisher {
         fn publish_event(
             &self,
             topic: &str,
@@ -1757,8 +2271,72 @@ mod tests {
                 self.published
                     .lock()
                     .expect("fake publisher lock")
-                    .push((topic, message.body.clone()));
+                    .push((topic, message));
                 Ok(())
+            })
+        }
+
+        fn respond<'a>(
+            &'a self,
+            command: &'a IncomingCommand,
+            rc: u8,
+            body: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            let recorded = (command.command.clone(), rc, body.to_string());
+            let hang = self.hang_replies.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if hang {
+                    return std::future::pending().await;
+                }
+                self.replies
+                    .lock()
+                    .expect("fake publisher lock")
+                    .push(recorded);
+                Ok(())
+            })
+        }
+    }
+
+    /// A scripted Bus for the run-level tests: preloaded sessions
+    /// handed to `notify_run`'s connector in order, so a test can drop
+    /// a command stream (Bus outage), fail publishes and watch the
+    /// run reconnect — all against the REAL run loop.
+    #[derive(Clone, Default)]
+    struct ScriptedBus {
+        sessions: Arc<Mutex<Vec<BusSession>>>,
+    }
+
+    impl ScriptedBus {
+        fn add(&self) -> ScriptSession {
+            let publisher = Arc::new(FakePublisher::default());
+            let (sender, incoming) = mpsc::unbounded_channel();
+            self.sessions
+                .lock()
+                .expect("scripted bus lock")
+                .push(BusSession {
+                    client: Arc::clone(&publisher) as Arc<dyn BusClient>,
+                    incoming,
+                    close: None,
+                });
+            ScriptSession { publisher, sender }
+        }
+    }
+
+    /// One scripted session's handles: what it published and the
+    /// sending end of its command stream (drop it to end the stream).
+    struct ScriptSession {
+        publisher: Arc<FakePublisher>,
+        sender: mpsc::UnboundedSender<IncomingCommand>,
+    }
+
+    impl BusConnector for ScriptedBus {
+        fn connect(&mut self) -> Pin<Box<dyn Future<Output = Result<BusSession>> + Send + '_>> {
+            Box::pin(async move {
+                self.sessions
+                    .lock()
+                    .expect("scripted bus lock")
+                    .pop()
+                    .ok_or_else(|| anyhow!("scripted bus exhausted"))
             })
         }
     }
@@ -1801,23 +2379,61 @@ mod tests {
     struct Wired {
         server: NotifyServer,
         publisher: Arc<FakePublisher>,
+        /// Held for liveness only: dropping it would end the publisher's
+        /// client channel.
+        _clients_tx: watch::Sender<Option<Arc<dyn BusClient>>>,
         _session: zbus::Connection,
     }
 
     async fn wired(bus: &PrivateBus) -> (Wired, mpsc::Receiver<()>) {
+        wired_with_cap(bus, MAX_LIVE, MAX_STORED_BYTES).await
+    }
+
+    async fn wired_with_cap(
+        bus: &PrivateBus,
+        cap: usize,
+        max_stored_bytes: usize,
+    ) -> (Wired, mpsc::Receiver<()>) {
         let session = bus.connect().await;
         let publisher = Arc::new(FakePublisher::default());
-        let (server, fault_rx) = start_server(&session, Arc::clone(&publisher))
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, fault_rx) = start_server(&session, clients_rx, cap, max_stored_bytes)
             .await
             .expect("notify server starts and claims the name");
+        clients_tx
+            .send(Some(Arc::clone(&publisher) as Arc<dyn BusClient>))
+            .expect("the publisher channel is alive");
         (
             Wired {
                 server,
                 publisher,
+                _clients_tx: clients_tx,
                 _session: session,
             },
             fault_rx,
         )
+    }
+
+    /// Poll until `org.freedesktop.Notifications` has an owner on the
+    /// private bus (the run-level tests' readiness signal).
+    async fn wait_name_owned(connection: &zbus::Connection) {
+        let dbus = zbus::fdo::DBusProxy::new(connection)
+            .await
+            .expect("fdo proxy");
+        let name: zbus::names::BusName<'_> = DBUS_NAME.try_into().expect("valid name");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match dbus.get_name_owner(name.clone()).await {
+                Ok(_) => return,
+                Err(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the notify name was never owned"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 
     fn command(verb: &str, args: Value) -> IncomingCommand {
@@ -1931,95 +2547,171 @@ mod tests {
 
     #[test]
     fn expiry_resolution_follows_the_pinned_policy() {
-        let now = SystemTime::UNIX_EPOCH;
         // -1 (default): 8 s for low and normal ...
         assert_eq!(
-            resolve_expiry(ExpireTimeout::Default, Urgency::Normal, now),
-            Some(now + DEFAULT_EXPIRY)
+            resolve_expiry(ExpireTimeout::Default, Urgency::Normal),
+            Some(DEFAULT_EXPIRY)
         );
         assert_eq!(
-            resolve_expiry(ExpireTimeout::Default, Urgency::Low, now),
-            Some(now + DEFAULT_EXPIRY)
+            resolve_expiry(ExpireTimeout::Default, Urgency::Low),
+            Some(DEFAULT_EXPIRY)
         );
         // ... and never for critical.
         assert_eq!(
-            resolve_expiry(ExpireTimeout::Default, Urgency::Critical, now),
+            resolve_expiry(ExpireTimeout::Default, Urgency::Critical),
             None
         );
-        // 0 is never; an explicit timeout wins regardless of urgency.
+        // 0 is never; an explicit timeout wins regardless of urgency,
+        // but is clamped to at least MIN_EXPIRY so the notification
+        // cannot close before the client has its id.
+        assert_eq!(resolve_expiry(ExpireTimeout::Never, Urgency::Normal), None);
         assert_eq!(
-            resolve_expiry(ExpireTimeout::Never, Urgency::Normal, now),
-            None
+            resolve_expiry(ExpireTimeout::Millis(1200), Urgency::Critical),
+            Some(Duration::from_millis(1200))
         );
         assert_eq!(
-            resolve_expiry(ExpireTimeout::Millis(1200), Urgency::Critical, now),
-            Some(now + Duration::from_millis(1200))
+            resolve_expiry(ExpireTimeout::Millis(1), Urgency::Normal),
+            Some(MIN_EXPIRY),
+            "a very short timeout is clamped to the minimum"
+        );
+        assert_eq!(
+            resolve_expiry(ExpireTimeout::Millis(0), Urgency::Normal),
+            Some(MIN_EXPIRY)
         );
     }
 
     #[test]
-    fn replaces_id_reuses_a_live_id_and_emits_replaced() {
-        let mut core = NotifyCore::new(MAX_LIVE);
+    fn replaces_id_reuses_a_live_id_and_adopts_a_dead_one() {
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
         let now = SystemTime::UNIX_EPOCH;
-        let (first, events) = core.create(&create_args("one"), now);
-        assert_eq!(first, 1);
+        let mono = Instant::now();
+        let (first, events) = core.create(&create_args("one"), now, mono);
+        assert_ne!(first, 0, "0 is Notify's no-replaces_id");
         assert!(created(&events, false), "{events:?}");
-        assert_eq!(core.get(1).expect("live").summary, "one");
+        assert_eq!(core.get(first).expect("live").summary, "one");
 
         let mut args = create_args("two");
-        args.replaces_id = 1;
-        let (second, events) = core.create(&args, now);
-        assert_eq!(second, 1, "a live replaces_id is reused");
+        args.replaces_id = first;
+        let (second, events) = core.create(&args, now, mono);
+        assert_eq!(second, first, "a live replaces_id is reused");
         assert!(created(&events, true), "{events:?}");
         assert!(!closed(&events, CloseReason::Expired), "{events:?}");
         assert_eq!(core.count(), 1);
-        assert_eq!(core.get(1).expect("still live").summary, "two");
+        assert_eq!(core.get(first).expect("still live").summary, "two");
 
-        // A replaces_id that is not live allocates a fresh id instead.
+        // A non-zero replaces_id that is not live is created under that
+        // very id (spec: the returned id is the replaces_id) — safe
+        // because this process never reuses ids.
         let mut stale = create_args("three");
         stale.replaces_id = 42;
-        let (fresh, _) = core.create(&stale, now);
-        assert_eq!(fresh, 2);
+        let (adopted, events) = core.create(&stale, now, mono);
+        assert_eq!(adopted, 42, "a dead replaces_id is adopted");
+        assert!(created(&events, false), "{events:?}");
         assert_eq!(core.count(), 2);
+        assert_eq!(
+            core.get(42).expect("live under the adopted id").summary,
+            "three"
+        );
+    }
+
+    #[test]
+    fn ids_are_process_wide_and_never_restart() {
+        // Two cores in one process = an adapter restart: a fresh run
+        // must never hand out ids the previous run already gave out.
+        let now = SystemTime::now();
+        let mono = Instant::now();
+        let mut first = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let (id, _) = first.create(&create_args(&format!("first {index}")), now, mono);
+            ids.push(id);
+        }
+        let mut second = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
+        let (fresh, _) = second.create(&create_args("after restart"), now, mono);
+        assert_ne!(fresh, 0);
+        assert!(
+            !ids.contains(&fresh),
+            "a restarted run never reuses an id (gave {fresh} after {ids:?})"
+        );
+        let (again, _) = second.create(&create_args("next"), now, mono);
+        assert_ne!(again, fresh, "ids stay monotonic inside the run");
     }
 
     #[test]
     fn cap_evicts_the_oldest_non_critical_as_expired() {
-        let mut core = NotifyCore::new(3);
+        let mut core = NotifyCore::new(3, MAX_STORED_BYTES);
         let now = SystemTime::UNIX_EPOCH;
+        let mono = Instant::now();
         let mut critical = create_args("hold me");
         critical.urgency = Urgency::Critical;
         critical.timeout = ExpireTimeout::Never;
-        core.create(&create_args("first"), now);
-        core.create(&critical, now + Duration::from_secs(1));
-        core.create(&create_args("third"), now + Duration::from_secs(2));
+        let (first, _) = core.create(&create_args("first"), now, mono);
+        let (critical_id, _) = core.create(&critical, now + Duration::from_secs(1), mono);
+        core.create(&create_args("third"), now + Duration::from_secs(2), mono);
         assert_eq!(core.count(), 3);
 
-        let (fourth, events) = core.create(&create_args("fourth"), now + Duration::from_secs(3));
-        assert_eq!(fourth, 4);
+        let (fourth, events) =
+            core.create(&create_args("fourth"), now + Duration::from_secs(3), mono);
+        assert_ne!(fourth, 0);
         assert_eq!(core.count(), 3, "the cap holds");
         assert!(closed(&events, CloseReason::Expired), "{events:?}");
         assert!(created(&events, false), "{events:?}");
-        assert!(core.get(1).is_none(), "the oldest non-critical went");
-        assert!(core.get(2).is_some(), "critical survives eviction");
-        assert!(core.get(3).is_some());
-        assert!(core.get(4).is_some());
+        assert!(core.get(first).is_none(), "the oldest non-critical went");
+        assert!(
+            core.get(critical_id).is_some(),
+            "critical survives eviction"
+        );
+        assert!(core.get(fourth).is_some(), "the newcomer is live");
 
-        // A live set of all criticals overflows rather than dropping
-        // one: critical means a human must see it.
-        let mut core = NotifyCore::new(2);
+        // A live set of all criticals at the cap evicts the OLDEST
+        // CRITICAL as expired (reason 1) — critical buys priority, not
+        // unbounded growth.
+        let mut core = NotifyCore::new(2, MAX_STORED_BYTES);
+        let mut seen = Vec::new();
         for index in 0..3 {
             let mut args = create_args("critical");
             args.urgency = Urgency::Critical;
             args.timeout = ExpireTimeout::Never;
-            core.create(&args, now + Duration::from_secs(index));
+            let (id, events) = core.create(&args, now + Duration::from_secs(index), mono);
+            if index == 2 {
+                assert!(
+                    closed(&events, CloseReason::Expired),
+                    "the oldest critical is evicted as expired: {events:?}"
+                );
+            }
+            seen.push(id);
         }
-        assert_eq!(core.count(), 3);
+        assert_eq!(core.count(), 2, "the cap holds even for all-critical");
+        assert!(core.get(seen[0]).is_none(), "the oldest critical went");
+        assert!(core.get(seen[1]).is_some());
+        assert!(core.get(seen[2]).is_some());
+    }
+
+    #[test]
+    fn the_stored_bytes_budget_evicts_the_oldest() {
+        // A budget of 2 KiB against ~4 KiB records: the live set stays
+        // within budget by expiring the oldest, cap or no cap.
+        let mut core = NotifyCore::new(10, 2 * 1024);
+        let now = SystemTime::now();
+        let mono = Instant::now();
+        let mut first = create_args("first");
+        first.body = "b".repeat(2 * 1024);
+        let (id_first, _) = core.create(&first, now, mono);
+        let mut second = create_args("second");
+        second.body = "b".repeat(2 * 1024);
+        let (id_second, events) = core.create(&second, now + Duration::from_secs(1), mono);
+        assert_eq!(core.count(), 1, "the bytes budget holds");
+        assert!(
+            closed(&events, CloseReason::Expired),
+            "the oldest was evicted as expired: {events:?}"
+        );
+        assert!(core.get(id_first).is_none());
+        assert!(core.get(id_second).is_some());
     }
 
     #[test]
     fn stored_strings_and_actions_are_capped() {
-        let mut core = NotifyCore::new(MAX_LIVE);
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
         let huge = "x".repeat(MAX_TEXT_BYTES + 4096);
         let mut args = create_args(&huge);
         args.body = huge.clone();
@@ -2029,7 +2721,7 @@ mod tests {
                 label: format!("l{index}"),
             })
             .collect();
-        let (id, _) = core.create(&args, SystemTime::now());
+        let (id, _) = core.create(&args, SystemTime::now(), Instant::now());
         let record = core.get(id).expect("live");
         assert!(record.summary.len() <= MAX_TEXT_BYTES);
         assert!(record.summary.ends_with('\u{2026}'), "the cut is marked");
@@ -2062,7 +2754,7 @@ mod tests {
 
     #[test]
     fn invoke_refuses_unknowns_and_closes_unless_resident() {
-        let mut core = NotifyCore::new(MAX_LIVE);
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
         let mut args = create_args("with actions");
         args.actions = vec![
             Action {
@@ -2074,7 +2766,7 @@ mod tests {
                 label: "Reply".into(),
             },
         ];
-        let (id, _) = core.create(&args, SystemTime::now());
+        let (id, _) = core.create(&args, SystemTime::now(), Instant::now());
         assert_eq!(core.invoke(id, "nope"), Err("unknown action"));
         assert_eq!(core.invoke(999, "default"), Err("unknown id"));
 
@@ -2102,7 +2794,7 @@ mod tests {
         let mut resident = create_args("resident");
         resident.resident = true;
         resident.actions = args.actions.clone();
-        let (id, _) = core.create(&resident, SystemTime::now());
+        let (id, _) = core.create(&resident, SystemTime::now(), Instant::now());
         let (events, closed) = core.invoke(id, "default").expect("invoked");
         assert!(!closed, "resident survives activation");
         assert!(matches!(
@@ -2117,26 +2809,31 @@ mod tests {
 
     #[test]
     fn a_stale_timer_never_closes_a_replaced_notification() {
-        let mut core = NotifyCore::new(MAX_LIVE);
+        let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
+        // The wall clock is parked at the epoch for the whole test:
+        // due-ness must depend only on the monotonic clock, so a
+        // wall-clock step backwards can never keep a notification from
+        // expiring (nor fire it early).
         let now = SystemTime::UNIX_EPOCH;
+        let mono = Instant::now();
         let mut short = create_args("short");
         short.timeout = ExpireTimeout::Millis(50);
-        let (id, _) = core.create(&short, now);
+        let (id, _) = core.create(&short, now, mono);
 
         // Replaced with a much longer deadline before the 50 ms timer
         // fires: the stale fire must find the deadline in the future.
         let mut long = create_args("long");
         long.replaces_id = id;
         long.timeout = ExpireTimeout::Millis(5000);
-        core.create(&long, now + Duration::from_millis(10));
+        core.create(&long, now, mono + Duration::from_millis(10));
 
         assert_eq!(
-            core.expire_if_due(id, now + Duration::from_millis(60)),
+            core.expire_if_due(id, mono + Duration::from_millis(60)),
             None
         );
         assert!(core.get(id).is_some());
         assert_eq!(
-            core.expire_if_due(id, now + Duration::from_millis(6000)),
+            core.expire_if_due(id, mono + Duration::from_millis(6000)),
             Some(NotifyEvent {
                 seq: 3,
                 id,
@@ -2147,9 +2844,29 @@ mod tests {
             "the real deadline closes exactly once"
         );
         assert_eq!(
-            core.expire_if_due(id, now + Duration::from_millis(7000)),
+            core.expire_if_due(id, mono + Duration::from_millis(7000)),
             None
         );
+    }
+
+    #[test]
+    fn urgency_hint_accepts_byte_int32_and_uint32() {
+        let empty: HashMap<String, OwnedValue> = HashMap::new();
+        let args = |hints: HashMap<String, OwnedValue>| {
+            CreateArgs::from_dbus("app", 0, "", "s", "", &[], &hints, -1)
+        };
+        // The spec's byte form.
+        let byte = HashMap::from([("urgency".to_string(), OwnedValue::from(2u8))]);
+        assert_eq!(args(byte).urgency, Urgency::Critical);
+        // Non-conforming but seen in the wild: int32 and uint32.
+        let int32 = HashMap::from([("urgency".to_string(), OwnedValue::from(0i32))]);
+        assert_eq!(args(int32).urgency, Urgency::Low);
+        let uint32 = HashMap::from([("urgency".to_string(), OwnedValue::from(2u32))]);
+        assert_eq!(args(uint32).urgency, Urgency::Critical);
+        // Absent stays normal; an out-of-range width stays normal too.
+        assert_eq!(args(empty).urgency, Urgency::Normal);
+        let wide = HashMap::from([("urgency".to_string(), OwnedValue::from(9u32))]);
+        assert_eq!(args(wide).urgency, Urgency::Normal);
     }
 
     #[test]
@@ -2257,35 +2974,80 @@ mod tests {
             )
             .await
             .expect("Notify");
-        assert_eq!(id, 1, "ids start at 1");
+        assert_ne!(id, 0, "0 is never handed out (it means no replaces_id)");
 
         let shared = &wired.server.shared;
+        let base = format!("n{id}");
         assert_eq!(prop(shared, "count").await, json!(1));
-        assert_eq!(prop(shared, "n1.app").await, json!("TestApp"));
-        assert_eq!(prop(shared, "n1.summary").await, json!("the summary"));
-        assert_eq!(prop(shared, "n1.body").await, json!("the body"));
-        assert_eq!(prop(shared, "n1.icon").await, json!("test-icon"));
-        assert_eq!(prop(shared, "n1.urgency").await, json!("normal"));
-        assert_eq!(prop(shared, "n1.origin").await, json!("dbus"));
-        assert_eq!(prop(shared, "n1.resident").await, json!(false));
+        assert_eq!(prop(shared, &format!("{base}.app")).await, json!("TestApp"));
         assert_eq!(
-            prop(shared, "n1.actions").await,
+            prop(shared, &format!("{base}.summary")).await,
+            json!("the summary")
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.body")).await,
+            json!("the body")
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.icon")).await,
+            json!("test-icon")
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.urgency")).await,
+            json!("normal")
+        );
+        assert_eq!(prop(shared, &format!("{base}.origin")).await, json!("dbus"));
+        assert_eq!(
+            prop(shared, &format!("{base}.resident")).await,
+            json!(false)
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.transient")).await,
+            json!(false),
+            "transient is a projected leaf even when unset"
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.actions")).await,
             json!([{"key": "default", "label": "Show"}])
         );
         assert!(
-            prop(shared, "n1.expires_at").await.is_string(),
+            prop(shared, &format!("{base}.expires_at"))
+                .await
+                .is_string(),
             "-1 resolves to the 8 s server default"
         );
-        assert!(prop(shared, "n1.created_at").await.is_string());
-        let (rc, _) = verb(shared, "notify.props.get", json!({"path": "n1.image_data"})).await;
+        assert!(
+            prop(shared, &format!("{base}.created_at"))
+                .await
+                .is_string()
+        );
+        let (rc, _) = verb(
+            shared,
+            "notify.props.get",
+            json!({"path": format!("{base}.image_data")}),
+        )
+        .await;
         assert_eq!(rc, 10, "no image-data leaf without the hint");
 
-        // The created event is published with a stamped seq.
+        // The created event is published with a stamped seq — and the
+        // run's FIRST change publishes a props diff too: the baseline
+        // is seeded with the empty tree, not skipped.
         wait_for_events(&wired.publisher, 1).await;
         let events = wired.publisher.bodies(TOPIC_NOTIFY_CHANGED);
         assert_eq!(events[0]["event"], "notification.created");
         assert_eq!(events[0]["event_seq"], 1);
         assert_eq!(events[0]["data"]["notification"]["summary"], "the summary");
+        let diffs = wired.publisher.bodies(&props_changed_topic(BUS_SERVICE));
+        assert!(
+            diffs
+                .iter()
+                .any(|diff| diff["path"] == "count" && diff["old"] == 0 && diff["new"] == 1),
+            "the first change of the run reaches notify.props.changed: {diffs:?}"
+        );
+        assert!(
+            diffs.iter().any(|diff| diff["path"] == format!("n{id}")),
+            "the new subtree is in the first diff: {diffs:?}"
+        );
         let (rc, info) = verb(shared, "notify.info", Value::Null).await;
         assert_eq!(rc, 0);
         assert_eq!(info["count"], 1);
@@ -2614,10 +3376,16 @@ mod tests {
         let Some(bus) = PrivateBus::spawn().await else {
             return;
         };
-        // A squatter owns the name first.
+        // A squatter owns the name first — and holds it WITH
+        // AllowReplacement, so a regression to a ReplaceExisting claim
+        // really would steal the name; this test would catch it.
         let squatter = bus.connect().await;
         squatter
-            .request_name(DBUS_NAME)
+            .request_name_with_flags(
+                DBUS_NAME,
+                zbus::fdo::RequestNameFlags::AllowReplacement
+                    | zbus::fdo::RequestNameFlags::DoNotQueue,
+            )
             .await
             .expect("squatter takes the name");
         let dbus = zbus::fdo::DBusProxy::new(&squatter)
@@ -2627,7 +3395,7 @@ mod tests {
         let owner_before = dbus.get_name_owner(name.clone()).await.expect("owner");
 
         let session = bus.connect().await;
-        let error = start_server(&session, Arc::new(FakePublisher::default()))
+        let error = start_server(&session, watch::channel(None).1, MAX_LIVE, MAX_STORED_BYTES)
             .await
             .expect_err("must refuse an owned name");
         assert!(
@@ -2646,7 +3414,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let fresh = bus.connect().await;
-            match start_server(&fresh, Arc::new(FakePublisher::default())).await {
+            match start_server(&fresh, watch::channel(None).1, MAX_LIVE, MAX_STORED_BYTES).await {
                 Ok((_server, _faults)) => break,
                 Err(retry) if tokio::time::Instant::now() < deadline => {
                     assert!(
@@ -2673,7 +3441,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let fresh = bus.connect().await;
-            match start_server(&fresh, Arc::new(FakePublisher::default())).await {
+            match start_server(&fresh, watch::channel(None).1, MAX_LIVE, MAX_STORED_BYTES).await {
                 Ok((_server, _faults)) => break,
                 Err(retry) if tokio::time::Instant::now() < deadline => {
                     assert!(
@@ -2722,15 +3490,20 @@ mod tests {
         assert_eq!(rc, 10, "props.get of a vanished leaf is a refusal");
 
         // The D-Bus side stays healthy: CloseNotification of an
-        // unknown id is ignored per spec and the server keeps serving.
+        // unknown id is an error reply per spec 1.2 (the caller may be
+        // acting on stale state), and the server keeps serving.
         let client_conn = bus.connect().await;
         let client = NotificationsClientProxy::new(&client_conn)
             .await
             .expect("proxy");
-        client
+        let unknown = client
             .close_notification(999)
             .await
-            .expect("ignored, not an error");
+            .expect_err("unknown id: an error reply, not a silent success");
+        assert!(
+            format!("{unknown}").contains("no notification 999"),
+            "the error names the id: {unknown}"
+        );
         let id = client
             .notify(
                 "app",
@@ -2751,32 +3524,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_publish_failure_faults_the_run() {
+    async fn a_bus_outage_is_survived_without_losing_the_name() {
         let Some(bus) = PrivateBus::spawn().await else {
             return;
         };
-        let (wired, mut faults) = wired(&bus).await;
+        let session = bus.connect().await;
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, faults) = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES)
+            .await
+            .expect("notify server starts and claims the name");
+        let shared = Arc::clone(&server.shared);
+        let scripted = ScriptedBus::default();
+        let first = scripted.add();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let run_task = tokio::spawn(notify_run(
+            session,
+            server,
+            clients_tx,
+            faults,
+            scripted.clone(),
+            stop_rx,
+            Duration::from_millis(50),
+        ));
+        let poll_conn = bus.connect().await;
+        wait_name_owned(&poll_conn).await;
         let client_conn = bus.connect().await;
         let client = NotificationsClientProxy::new(&client_conn)
             .await
             .expect("proxy");
 
-        // The first notification establishes the props baseline.
-        client
-            .notify("app", 0, "", "first", "", Vec::new(), HashMap::new(), 0)
-            .await
-            .expect("Notify");
-        wait_for_events(&wired.publisher, 1).await;
-
-        // The second's publication fails on the Bus side — Notify
-        // itself still works; the publisher faults the run.
-        wired.publisher.fail_next(1);
+        // Before the outage: one notification lands, one verb is served
+        // through the run's own Bus session.
         client
             .notify(
                 "app",
                 0,
                 "",
-                "lost to a publish failure",
+                "before the outage",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                0,
+            )
+            .await
+            .expect("Notify");
+        wait_for_events(&first.publisher, 1).await;
+        first
+            .sender
+            .send(command("notify.ping", Value::Null))
+            .expect("command reaches the run");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while first.publisher.replies_for("notify.ping").is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the run never replied to notify.ping"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(first.publisher.replies_for("notify.ping")[0].0, 0);
+
+        // The outage: the Bus publish fails (fault → reconnect).
+        first.publisher.fail_next(1);
+        client
+            .notify(
+                "app",
+                0,
+                "",
+                "lost to the publish failure",
                 "",
                 Vec::new(),
                 HashMap::new(),
@@ -2784,14 +3598,20 @@ mod tests {
             )
             .await
             .expect("Notify still works — the failure is on the Bus side");
-        let fault = tokio::time::timeout(Duration::from_secs(5), faults.recv())
-            .await
-            .expect("the publisher faults the run promptly");
-        assert!(fault.is_some(), "the fault channel stays open");
+        let second = scripted.add();
 
-        // Recovery: the next event publishes, and the diff is against
-        // the PRE-FAILURE baseline — the outage window's changes reach
-        // notify.props.changed subscribers as an accumulated diff.
+        // The run SURVIVED: the name is still owned, the notifications
+        // are intact (none was closed for the outage's sake), and
+        // Notify keeps being served — the D-Bus side never blinked.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        wait_name_owned(&poll_conn).await;
+        assert_eq!(shared.status().0, 2, "both notifications are still live");
+        let (_, list) = verb(&shared, "notify.list", Value::Null).await;
+        assert_eq!(list["count"], 2);
+
+        // After the reconnect: the next change publishes on the NEW
+        // Bus client, and the props diff carries the accumulated
+        // change across the outage window (baseline survived).
         client
             .notify(
                 "app",
@@ -2806,23 +3626,346 @@ mod tests {
             .await
             .expect("Notify");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while wired
+        while second
             .publisher
             .bodies(&props_changed_topic(BUS_SERVICE))
             .is_empty()
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the accumulated props diff never published"
+                "the accumulated props diff never published after reconnect"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let diffs = wired.publisher.bodies(&props_changed_topic(BUS_SERVICE));
+        let diffs = second.publisher.bodies(&props_changed_topic(BUS_SERVICE));
         assert!(
             diffs
                 .iter()
                 .any(|diff| diff["path"] == "count" && diff["old"] == 1 && diff["new"] == 3),
             "the diff covers the outage window (count 1 -> 3): {diffs:?}"
+        );
+        // And no notification was closed as part of surviving.
+        assert!(
+            second
+                .publisher
+                .bodies(TOPIC_NOTIFY_CHANGED)
+                .iter()
+                .all(|event| event["event"] != "notification.closed"),
+            "surviving the outage closed nothing"
+        );
+
+        // The run stops cleanly when asked.
+        stop_tx.send(true).expect("stop signal");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), run_task)
+            .await
+            .expect("the run ends on stop")
+            .expect("run task alive");
+        assert!(outcome.is_ok(), "clean stop: {outcome:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_bus_death_ends_the_run_promptly() {
+        let Some(mut bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let session = bus.connect().await;
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, faults) = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES)
+            .await
+            .expect("notify server starts and claims the name");
+        let scripted = ScriptedBus::default();
+        scripted.add();
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let run_task = tokio::spawn(notify_run(
+            session,
+            server,
+            clients_tx,
+            faults,
+            scripted,
+            stop_rx,
+            Duration::from_millis(50),
+        ));
+        let poll_conn = bus.connect().await;
+        wait_name_owned(&poll_conn).await;
+
+        // The session bus dies: the run must observe it and end with a
+        // clear error, so the supervisor backs off and re-dials.
+        bus.kill().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("the run ends promptly after session-bus death")
+            .expect("run task alive");
+        let error = outcome.expect_err("session-bus death ends the run with Err");
+        assert!(
+            format!("{error:#}").contains("session bus"),
+            "the error says what died: {error:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiry_timers_are_cancelled_by_replace_close_and_run_end() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let (wired, _faults) = wired(&bus).await;
+        let shared = Arc::clone(&wired.server.shared);
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+
+        // Replace spam: 50 replaces of one id with a huge timeout —
+        // exactly ONE live timer may exist, not 50 sleepers.
+        let id = client
+            .notify(
+                "app",
+                0,
+                "",
+                "spam me",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                3_600_000,
+            )
+            .await
+            .expect("Notify");
+        for index in 0..50 {
+            client
+                .notify(
+                    "app",
+                    id,
+                    "",
+                    &format!("replace {index}"),
+                    "",
+                    Vec::new(),
+                    HashMap::new(),
+                    3_600_000,
+                )
+                .await
+                .expect("replace Notify");
+        }
+        assert_eq!(shared.timer_count(), 1, "one live timer after 50 replaces");
+
+        // Close: the last timer goes too.
+        client
+            .close_notification(id)
+            .await
+            .expect("CloseNotification");
+        assert_eq!(shared.timer_count(), 0, "close cancels the timer");
+
+        // Re-arm once more, then end the run: every timer dies with it.
+        client
+            .notify(
+                "app",
+                0,
+                "",
+                "still armed",
+                "",
+                Vec::new(),
+                HashMap::new(),
+                3_600_000,
+            )
+            .await
+            .expect("Notify");
+        assert_eq!(shared.timer_count(), 1);
+        drop(wired);
+        assert_eq!(shared.timer_count(), 0, "all timers die with the run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_is_honoured_mid_dispatch_without_waiting_the_reply_budget() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let session = bus.connect().await;
+        let (clients_tx, clients_rx) = watch::channel(None);
+        let (server, faults) = start_server(&session, clients_rx, MAX_LIVE, MAX_STORED_BYTES)
+            .await
+            .expect("notify server starts and claims the name");
+        let scripted = ScriptedBus::default();
+        let session_one = scripted.add();
+        session_one.publisher.hang_replies();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let run_task = tokio::spawn(notify_run(
+            session,
+            server,
+            clients_tx,
+            faults,
+            scripted,
+            stop_rx,
+            Duration::from_millis(50),
+        ));
+        let poll_conn = bus.connect().await;
+        wait_name_owned(&poll_conn).await;
+
+        // A command whose reply hangs forever (a wedged broker): the
+        // in-flight dispatch is raced against shutdown, so the stop is
+        // honoured immediately — not after the 60 s reply budget.
+        session_one
+            .sender
+            .send(command("notify.ping", Value::Null))
+            .expect("command reaches the run");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop_tx.send(true).expect("stop signal");
+        let outcome = tokio::time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("stop preempts a hung in-flight reply")
+            .expect("run task alive");
+        assert!(outcome.is_ok(), "clean stop: {outcome:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn optional_hints_project_as_leaves_without_their_payloads() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let (wired, _faults) = wired(&bus).await;
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+        let shared = &wired.server.shared;
+
+        let mut hints = HashMap::new();
+        let string_hint = |text: &str| {
+            OwnedValue::try_from(zbus::zvariant::Value::new(text)).expect("a string hint builds")
+        };
+        hints.insert("transient".to_string(), OwnedValue::from(true));
+        hints.insert("desktop-entry".to_string(), string_hint("org.example.app"));
+        hints.insert(
+            "image-path".to_string(),
+            string_hint("file:///tmp/example.png"),
+        );
+        hints.insert("image-data".to_string(), string_hint("not-the-pixels"));
+        let id = client
+            .notify("app", 0, "", "hinted", "", Vec::new(), hints, 0)
+            .await
+            .expect("Notify");
+        let base = format!("n{id}");
+        assert_eq!(
+            prop(shared, &format!("{base}.transient")).await,
+            json!(true)
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.desktop_entry")).await,
+            json!("org.example.app")
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.image_path")).await,
+            json!("file:///tmp/example.png")
+        );
+        assert_eq!(
+            prop(shared, &format!("{base}.image_data")).await,
+            json!(true),
+            "image-data is recorded as PRESENT"
+        );
+        // Raw pixels never enter props: no leaf anywhere carries the
+        // payload value.
+        let (rc, body) = verb(shared, "notify.props.list", Value::Null).await;
+        assert_eq!(rc, 0, "{body}");
+        let paths = body.as_array().expect("a path list");
+        for path in paths {
+            let path = path.as_str().expect("a path string");
+            assert_ne!(
+                prop(shared, path).await,
+                json!("not-the-pixels"),
+                "no leaf carries the pixel payload ({path})"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_very_short_timeout_is_clamped_to_one_second() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        let (wired, _faults) = wired(&bus).await;
+        let client_conn = bus.connect().await;
+        let client = NotificationsClientProxy::new(&client_conn)
+            .await
+            .expect("proxy");
+        let shared = &wired.server.shared;
+
+        // 10 ms would close before the client has the id; the effective
+        // expiry is clamped to at least 1 s.
+        let id = client
+            .notify("app", 0, "", "blink", "", Vec::new(), HashMap::new(), 10)
+            .await
+            .expect("Notify");
+        let record = shared.records().get(&id).expect("live").clone();
+        let ttl = record
+            .expires_at
+            .expect("a finite expiry")
+            .duration_since(SystemTime::now())
+            .expect("in the future");
+        assert!(
+            ttl + Duration::from_millis(50) >= MIN_EXPIRY,
+            "the effective expiry is at least {MIN_EXPIRY:?}: {ttl:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            shared.status().0,
+            1,
+            "still live after 400 ms — the 10 ms timeout was clamped"
+        );
+        // It does close eventually (the clamp delays, never cancels).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while shared.status().0 != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the clamped expiry never fired"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_diff_is_stamped_with_the_batch_last_seq() {
+        let Some(bus) = PrivateBus::spawn().await else {
+            return;
+        };
+        // Cap 2: the third create evicts the first — one batch of
+        // [Closed(eviction), Created(new)], whose coalesced diff must
+        // carry the LAST event_seq of the batch.
+        let (wired, _faults) = wired_with_cap(&bus, 2, MAX_STORED_BYTES).await;
+        let shared = &wired.server.shared;
+        let (_, first) = verb(shared, "notify.send", json!({"summary": "one"})).await;
+        let id_one = first["id"].as_u64().expect("id") as u32;
+        verb(shared, "notify.send", json!({"summary": "two"})).await;
+        wait_for_events(&wired.publisher, 2).await;
+        let (_, third) = verb(shared, "notify.send", json!({"summary": "three"})).await;
+        let id_three = third["id"].as_u64().expect("id") as u32;
+        assert_ne!(id_one, id_three);
+        wait_for_events(&wired.publisher, 4).await;
+
+        let events = wired.publisher.bodies(TOPIC_NOTIFY_CHANGED);
+        let last_seq = events.last().expect("the batch's events")["event_seq"]
+            .as_u64()
+            .expect("seq");
+        let evicted = events
+            .iter()
+            .find(|event| event["event"] == "notification.closed")
+            .expect("the eviction event");
+        assert_eq!(
+            evicted["id"].as_u64(),
+            Some(u64::from(id_one)),
+            "the oldest was evicted"
+        );
+        // The eviction batch [Closed, Created] publishes ONE coalesced
+        // diff stamped with the batch's LAST seq — a subtree gone from
+        // the tree diffs at the subtree path, so the removal of the
+        // evicted subtree and the addition of the new one both carry it.
+        let removed = format!("n{id_one}");
+        let added = format!("n{id_three}");
+        let removed_stamps = wired.publisher.diff_seqs(&removed);
+        assert!(
+            removed_stamps.contains(&last_seq),
+            "the eviction diff carries the batch's LAST seq ({last_seq}): {removed_stamps:?}"
+        );
+        assert_eq!(
+            wired.publisher.diff_seqs(&added),
+            vec![last_seq],
+            "the addition diff carries the batch's LAST seq"
         );
     }
 
