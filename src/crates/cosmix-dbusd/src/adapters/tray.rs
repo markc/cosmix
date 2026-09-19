@@ -2267,18 +2267,12 @@ mod tests {
                 ("label", Value::from("Sub")),
                 ("children-display", Value::from("submenu")),
             ],
-            vec![Value::Value(Box::new(nested))],
+            // Children go in as plain nodes: `Array::from` frames them
+            // as variants per the "av" signature (a manual Value::Value
+            // here would double-wrap and defeat the parser).
+            vec![nested],
         );
-        let root = menu_value(
-            0,
-            &[],
-            vec![
-                Value::Value(Box::new(open)),
-                Value::Value(Box::new(check)),
-                Value::Value(Box::new(separator)),
-                Value::Value(Box::new(submenu)),
-            ],
-        );
+        let root = menu_value(0, &[], vec![open, check, separator, submenu]);
         let mut budget = MAX_MENU_NODES;
         let json = menu_node_json(&root, &mut budget).expect("layout parses");
         // dbusmenu defaults: absent enabled/visible are true.
@@ -2302,7 +2296,7 @@ mod tests {
         let leaf = || menu_value(1, &[("label", Value::from("L"))], vec![]);
         let mut root_children = Vec::new();
         for _ in 0..=MAX_MENU_NODES {
-            root_children.push(Value::Value(Box::new(leaf())));
+            root_children.push(leaf());
         }
         let root = menu_value(0, &[], root_children);
         let mut budget = MAX_MENU_NODES;
@@ -2414,7 +2408,10 @@ mod tests {
         }
 
         async fn activate(&self, x: i32, y: i32) {
-            if self.state.lock().expect("item state").hang_activate {
+            // Bind before the await: a lock temporary in the `if`
+            // condition would be held across it (clippy agrees).
+            let hang = self.state.lock().expect("item state").hang_activate;
+            if hang {
                 // A hung app: this call never replies.
                 std::future::pending::<()>().await;
             }
@@ -2476,25 +2473,19 @@ mod tests {
             let submenu = menu_value(
                 9,
                 &[("children-display", Value::from("submenu"))],
-                vec![Value::Value(Box::new(nested))],
+                vec![nested],
             );
             let root = menu_value(
                 0,
                 &[("label", Value::from("Root"))],
-                vec![
-                    Value::Value(Box::new(open)),
-                    Value::Value(Box::new(check)),
-                    Value::Value(Box::new(separator)),
-                    Value::Value(Box::new(submenu)),
-                ],
+                vec![open, check, separator, submenu],
             );
             let Value::Structure(structure) = root else {
                 unreachable!("menu_value builds a structure");
             };
-            // The reply carries the layout as a variant — the adapter
-            // accepts that exactly as it accepts real servers' bare
-            // struct (both paths are covered; see menu_node_json tests).
-            Ok((7, Value::Value(Box::new(Value::Structure(structure)))))
+            // The layout goes out as the bare struct — exactly the
+            // `(u(ia{sv}av))` shape real dbusmenu servers reply with.
+            Ok((7, Value::Structure(structure)))
         }
 
         async fn event(&self, id: i32, event_id: &str, _data: Value<'_>, _timestamp: i64) {
