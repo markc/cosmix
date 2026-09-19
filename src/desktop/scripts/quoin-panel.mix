@@ -925,7 +925,8 @@ on notes_clear desc "dismiss every notification"
   reply(0, "")
   fetch_notes()
   for each $n in $state.notes
-    rpc($NOTIFY, "notify.close", {id: $n.id})
+    -- ids come from the props keys as strings; notify.close takes a number
+    rpc($NOTIFY, "notify.close", {id: to_number($n.id)})
   end
   render_notes()
   render_panel()
