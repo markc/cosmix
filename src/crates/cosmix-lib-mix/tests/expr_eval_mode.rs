@@ -208,6 +208,49 @@ fn eval_expr_string_static_denies() {
     assert!(err.contains("command substitution in string"), "got: {err}");
 }
 
+/// Loops and Bus-runtime constructs nested in if-expression branch bodies
+/// are denied before execution too. The fuel premise of the mode ("a
+/// binding expression cannot loop") holds ONLY if the loop statements a
+/// branch body can carry are denied statically — a `for`/`while` in an
+/// untaken branch must reject exactly like one that would run. `select`
+/// pends on Bus/watch events and `address` targets a Bus service; both
+/// are runtime-mode constructs that would hang a host's synchronous eval.
+#[test]
+fn eval_expr_string_denies_loops_and_bus_constructs_in_if_bodies() {
+    let cases: &[(&str, &str)] = &[
+        (
+            "(if $x then for $i = 1 to 9\n$i\nend else 0 end)",
+            "for loop",
+        ),
+        (
+            "(if $x then for $e in [1, 2]\n$e\nend else 0 end)",
+            "for-each loop",
+        ),
+        (
+            "(if $x then while false\n1\nend else 0 end)",
+            "while loop",
+        ),
+        (
+            "(if $x then loop\n1\nend else 0 end)",
+            "loop statement",
+        ),
+        (
+            "(if $x then select 1\nwhen 1 then 1\notherwise 0\nend else 0 end)",
+            "select statement",
+        ),
+        ("(if $x then address \"sh\"\nend else 0 end)", "address block"),
+    ];
+    for (src, construct) in cases {
+        // $x is false — every branch is untaken; denial is static, so the
+        // constructs reject anyway. That is the property under test.
+        let err = match eval_pure(src, &[("x", Value::Bool(false))]) {
+            Err(e) => e,
+            Ok(_) => panic!("{src} must be denied before execution (untaken branch)"),
+        };
+        assert!(err.contains(construct), "{src}: got: {err}");
+    }
+}
+
 /// The pure shapes an embedding host actually evaluates — all allowed,
 /// under the deny-all policy.
 #[test]

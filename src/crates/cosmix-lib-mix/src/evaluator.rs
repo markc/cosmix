@@ -3125,6 +3125,19 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
         StmtKind::Source { .. } => return Err(denied("source statement")),
         StmtKind::Include { .. } => return Err(denied("include statement")),
         StmtKind::PipeToExternal { .. } => return Err(denied("pipe statement")),
+        // Loops: an if-expression's branches are statement bodies, so a
+        // `for`/`while` nested there would execute at evaluation time and
+        // break the mode's "a binding cannot loop" fuel premise — even in
+        // an untaken branch, denied statically like everything else here.
+        StmtKind::For { .. } => return Err(denied("for loop")),
+        StmtKind::ForEach { .. } => return Err(denied("for-each loop")),
+        StmtKind::While { .. } => return Err(denied("while loop")),
+        StmtKind::Loop { .. } => return Err(denied("loop statement")),
+        // `select` pends on Bus/watch events and `address` targets a Bus
+        // service — both are runtime-mode constructs, not expressions, and
+        // both would hang or misfire inside a host's synchronous eval.
+        StmtKind::Select { .. } => return Err(denied("select statement")),
+        StmtKind::Address { .. } => return Err(denied("address block")),
 
         StmtKind::Assignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
         StmtKind::FieldAssignment { value, .. } => expr_mode_deny_walk(value, depth + 1)?,
@@ -3156,37 +3169,6 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
                 expr_mode_deny_stmts(body, depth + 1)?;
             }
         }
-        StmtKind::For {
-            start,
-            end,
-            step,
-            body,
-            ..
-        } => {
-            expr_mode_deny_walk(start, depth + 1)?;
-            expr_mode_deny_walk(end, depth + 1)?;
-            if let Some(step) = step {
-                expr_mode_deny_walk(step, depth + 1)?;
-            }
-            expr_mode_deny_stmts(body, depth + 1)?;
-        }
-        StmtKind::ForEach {
-            iterable,
-            body,
-            ..
-        } => {
-            expr_mode_deny_walk(iterable, depth + 1)?;
-            expr_mode_deny_stmts(body, depth + 1)?;
-        }
-        StmtKind::While {
-            condition,
-            body,
-            ..
-        } => {
-            expr_mode_deny_walk(condition, depth + 1)?;
-            expr_mode_deny_stmts(body, depth + 1)?;
-        }
-        StmtKind::Loop { body, .. } => expr_mode_deny_stmts(body, depth + 1)?,
         StmtKind::Break(_) | StmtKind::Continue(_) => {}
         StmtKind::BreakIf(cond, _) | StmtKind::ContinueIf(cond, _) => {
             expr_mode_deny_walk(cond, depth + 1)?
@@ -3194,20 +3176,6 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
         StmtKind::Return(value) => {
             if let Some(value) = value {
                 expr_mode_deny_walk(value, depth + 1)?;
-            }
-        }
-        StmtKind::Select {
-            value,
-            cases,
-            otherwise,
-        } => {
-            expr_mode_deny_walk(value, depth + 1)?;
-            for (when, body) in cases {
-                expr_mode_deny_walk(when, depth + 1)?;
-                expr_mode_deny_stmts(body, depth + 1)?;
-            }
-            if let Some(body) = otherwise {
-                expr_mode_deny_stmts(body, depth + 1)?;
             }
         }
         StmtKind::Print { args, .. } => {
@@ -3238,10 +3206,6 @@ fn expr_mode_deny_stmt(stmt: &Stmt, depth: usize) -> MixResult<()> {
             if let Some(command) = command {
                 expr_mode_deny_walk(command, depth + 1)?;
             }
-        }
-        StmtKind::Address { target, body } => {
-            expr_mode_deny_walk(target, depth + 1)?;
-            expr_mode_deny_stmts(body, depth + 1)?;
         }
         StmtKind::Chain { left, right, .. } => {
             expr_mode_deny_stmt(left, depth + 1)?;

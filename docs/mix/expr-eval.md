@@ -66,6 +66,8 @@ rejects, because the walk never evaluates anything):
 | `$f(x)` — call on a function-valued expression | `function-value call` |
 | `$x.name(…)` where `name` is not a builtin | `method call` |
 | `on` / `source` / `include` / `… | cmd` nested in an if-expression | named per construct |
+| `for` / `for … in` / `while` / `loop` nested in an if-expression branch | `for loop` / `for-each loop` / `while loop` / `loop statement` |
+| `select … end` / `address "…" … end` nested in an if-expression branch | `select statement` / `address block` |
 | string interpolation beyond literals and Mix variables | `environment-variable interpolation in string`, `command substitution in string` |
 
 What stays **allowed**: literals, variables, arithmetic and comparison,
@@ -108,7 +110,11 @@ class.
 `max_string_len` are enforced as values are built (an over-cap `..`
 concat is a clean `string length N exceeds limit M` error), and
 `recursion_limit` bounds what recursion can even be expressed (none, in
-one expression without lambdas). The **time limit is a backstop**: it
+one expression without lambdas). **Loops cannot be expressed at all**:
+the loop statements are denied everywhere the walk reaches, including
+inside if-expression branch bodies — the one place a `for`/`while` could
+otherwise hide — so evaluation cost is bounded by the size caps, never
+by iteration count. The **time limit is a backstop**: it
 is checked at the per-statement poll, so it cannot interrupt a single
 blocking builtin mid-syscall — see [capabilities &
 embedding](capabilities.md) for the same caveat in full programs. A

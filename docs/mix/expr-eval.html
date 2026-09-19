@@ -496,6 +496,8 @@ rejects, because the walk never evaluates anything):</p>
 <tr><td><code>$f(x)</code> — call on a function-valued expression</td><td><code>function-value call</code></td></tr>
 <tr><td><code>$x.name(…)</code> where <code>name</code> is not a builtin</td><td><code>method call</code></td></tr>
 <tr><td><code>on</code> / <code>source</code> / <code>include</code> / `…</td><td>cmd` nested in an if-expression</td></tr>
+<tr><td><code>for</code> / <code>for … in</code> / <code>while</code> / <code>loop</code> nested in an if-expression branch</td><td><code>for loop</code> / <code>for-each loop</code> / <code>while loop</code> / <code>loop statement</code></td></tr>
+<tr><td><code>select … end</code> / <code>address "…" … end</code> nested in an if-expression branch</td><td><code>select statement</code> / <code>address block</code></td></tr>
 <tr><td>string interpolation beyond literals and Mix variables</td><td><code>environment-variable interpolation in string</code>, <code>command substitution in string</code></td></tr>
 </tbody></table>
 <p>What stays <strong>allowed</strong>: literals, variables, arithmetic and comparison,
@@ -531,7 +533,11 @@ class.</p>
 <code>max_string_len</code> are enforced as values are built (an over-cap <code>..</code>
 concat is a clean <code>string length N exceeds limit M</code> error), and
 <code>recursion_limit</code> bounds what recursion can even be expressed (none, in
-one expression without lambdas). The <strong>time limit is a backstop</strong>: it
+one expression without lambdas). <strong>Loops cannot be expressed at all</strong>:
+the loop statements are denied everywhere the walk reaches, including
+inside if-expression branch bodies — the one place a <code>for</code>/<code>while</code> could
+otherwise hide — so evaluation cost is bounded by the size caps, never
+by iteration count. The <strong>time limit is a backstop</strong>: it
 is checked at the per-statement poll, so it cannot interrupt a single
 blocking builtin mid-syscall — see <a href="/mix/capabilities">capabilities &amp;
 embedding</a> for the same caveat in full programs. A
