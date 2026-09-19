@@ -1471,9 +1471,9 @@ impl Drop for NotifyServer {
 /// `DoNotQueue` alone, so a name someone else owns fails here with a
 /// clear error and the supervisor backs off — a human uses
 /// `dbusd.adapter.disable`/`enable` to hand it over.
-async fn start_server(
+async fn start_server<P: EventPublisher>(
     connection: &zbus::Connection,
-    publisher: Arc<dyn EventPublisher>,
+    publisher: Arc<P>,
 ) -> Result<(NotifyServer, mpsc::Receiver<()>)> {
     let emitter = Arc::new(SignalEmitter::new(connection, DBUS_PATH)?);
     let (events_tx, events_rx) = mpsc::channel(EVENT_CAPACITY);
@@ -1504,6 +1504,7 @@ async fn start_server(
         }
     }
     let (fault_tx, fault_rx) = mpsc::channel(1);
+    let publisher: Arc<dyn EventPublisher> = publisher;
     let publisher_task = tokio::spawn(run_publisher(
         Arc::downgrade(&shared),
         events_rx,
@@ -1546,8 +1547,7 @@ impl Adapter for NotifyAdapter {
                     .await
                     .map_err(|error| anyhow!("notify: Bus connection: {error:#}"))?,
             );
-            let publisher: Arc<dyn EventPublisher> = Arc::clone(&bus);
-            let (server, mut fault_rx) = start_server(&session, publisher).await?;
+            let (server, mut fault_rx) = start_server(&session, Arc::clone(&bus)).await?;
             ctx.signal_ready();
             let mut shutdown = ctx.shutdown().clone();
             let mut incoming = bus
@@ -1777,10 +1777,9 @@ mod tests {
     async fn wired(bus: &PrivateBus) -> (Wired, mpsc::Receiver<()>) {
         let session = bus.connect().await;
         let publisher = Arc::new(FakePublisher::default());
-        let (server, fault_rx) =
-            start_server(&session, Arc::clone(&publisher) as Arc<dyn EventPublisher>)
-                .await
-                .expect("notify server starts and claims the name");
+        let (server, fault_rx) = start_server(&session, Arc::clone(&publisher))
+            .await
+            .expect("notify server starts and claims the name");
         (
             Wired {
                 server,
@@ -2588,7 +2587,7 @@ mod tests {
             .await
             .expect("fdo proxy");
         let name: zbus::names::BusName<'_> = DBUS_NAME.try_into().expect("valid name");
-        let owner_before = dbus.get_name_owner(name).await.expect("owner");
+        let owner_before = dbus.get_name_owner(name.clone()).await.expect("owner");
 
         let session = bus.connect().await;
         let error = start_server(&session, Arc::new(FakePublisher::default()))
