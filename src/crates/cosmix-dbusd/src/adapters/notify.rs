@@ -422,7 +422,7 @@ impl NotifyCore {
     /// carries on); a non-zero id that is NOT live is created under
     /// that very id (the caller's explicit request; the adopted id is
     /// reserved against [`ID_CLOCK`] so the clock never hands it to
-    /// another app while it is live); 0 allocates a fresh one. Any
+    /// another app, live or closed); 0 allocates a fresh one. Any
     /// insert — fresh OR replace — that would pass the live cap or the
     /// stored-bytes budget first evicts the oldest notification —
     /// non-critical first, else the oldest critical — with reason 1: no
@@ -439,7 +439,13 @@ impl NotifyCore {
     ) -> (u32, Vec<NotifyEvent>) {
         let replacing = args.replaces_id != 0 && self.notifications.contains_key(&args.replaces_id);
         let id = if args.replaces_id != 0 {
-            ID_CLOCK.fetch_max(args.replaces_id, Ordering::SeqCst);
+            // Reserve the adopted id: the clock must point PAST it, or
+            // the next allocation — which hands out the clock's current
+            // value — would re-issue the very id just adopted. +1
+            // wraps to 0 at u32::MAX (no higher value exists): a
+            // MAX-adopting caller races only the full u32 wrap, 4
+            // billion allocations later.
+            ID_CLOCK.fetch_max(args.replaces_id.wrapping_add(1), Ordering::SeqCst);
             args.replaces_id
         } else {
             self.allocate_id()
@@ -478,10 +484,7 @@ impl NotifyCore {
         // refilled, so only the delta counts, and the eviction below
         // never picks the id itself as a victim.
         let prospective = notification_bytes(&record);
-        let replaced_bytes = self
-            .notifications
-            .get(&id)
-            .map_or(0, |outgoing| notification_bytes(outgoing));
+        let replaced_bytes = self.notifications.get(&id).map_or(0, notification_bytes);
         loop {
             let count_ok = replacing || self.notifications.len() < self.cap;
             let bytes_ok =
@@ -2989,14 +2992,37 @@ mod tests {
         );
 
         for (round, id) in ids.into_iter().enumerate() {
+            // Once the huges overflow the budget, earlier rounds'
+            // eviction may legitimately take LATER round's tiny
+            // targets too — a target that is already dead is adopted,
+            // not replaced. The contract under test: the budget holds
+            // every round, a live target is replaced (never evicted),
+            // and the target is live after its own insert.
+            let live_before = core.get(id).is_some();
             let mut args = huge.clone();
             args.replaces_id = id;
             let (returned, events) = core.create(&args, now, mono);
-            assert_eq!(returned, id, "the live id is reused");
-            assert!(created(&events, true), "round {round}: {events:?}");
+            assert_eq!(
+                returned, id,
+                "round {round}: replace or adopt, the id is kept"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.id == id
+                        && matches!(event.kind, NotifyEventKind::Created { .. })),
+                "round {round}: a Created event for the id: {events:?}"
+            );
+            if live_before {
+                assert!(
+                    events.iter().any(|event| event.id == id
+                        && matches!(event.kind, NotifyEventKind::Created { replaced: true, .. })),
+                    "round {round}: a live target is replaced, not evicted: {events:?}"
+                );
+            }
             assert!(
                 core.get(id).is_some(),
-                "round {round}: the replaced record survives — it is never a victim"
+                "round {round}: the target survives its own insert"
             );
             assert!(
                 core.stored_bytes() <= MAX_STORED_BYTES,
@@ -3008,42 +3034,69 @@ mod tests {
         assert!(core.count() <= MAX_LIVE, "the count cap holds too");
     }
 
+    /// Tests that bend ID_CLOCK's magnitude serialize here: a near-wrap
+    /// store and an adoption's fetch_max jump must not interleave with
+    /// each other (plain allocations are always benign — they only
+    /// ever issue values the clock already points at).
+    static ID_CLOCK_SERIALIZED: Mutex<()> = Mutex::new(());
+
     #[test]
     fn an_adopted_id_is_reserved_against_the_id_clock() {
-        // Adopting a dead caller-supplied id must reserve it: the
-        // clock can never hand that id to another app later. The id is
-        // far past anything the clock reaches during this test — the
-        // margin absorbs ids other tests allocate in parallel.
+        // Adopting a dead caller-supplied id must reserve it so the
+        // clock can never hand that id to another app — even after the
+        // adopted record closes (a reservation that only holds while
+        // the record is live is the same-core live-check, not a
+        // reservation). The id sits far past anything the clock itself
+        // reaches during this test.
+        let _serialized = ID_CLOCK_SERIALIZED.lock().expect("id test lock");
         let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
         let hot = ID_CLOCK
             .load(Ordering::SeqCst)
             .saturating_add(2_000_000)
-            .max(1);
+            .max(1_000_000);
         let mut args = create_args("adopted");
         args.replaces_id = hot;
         let (id, _) = core.create(&args, SystemTime::now(), Instant::now());
         assert_eq!(id, hot, "a dead replaces_id is adopted under that id");
         assert!(
-            ID_CLOCK.load(Ordering::SeqCst) >= hot,
-            "adopting an id reserves it against the clock (clock at {})",
-            ID_CLOCK.load(Ordering::SeqCst)
+            ID_CLOCK.load(Ordering::SeqCst) > hot,
+            "adopting reserves PAST the id (clock at {} not > {})",
+            ID_CLOCK.load(Ordering::SeqCst),
+            hot
         );
+        // The dangerous window is after the adopted id dies: a fresh
+        // create must still never be handed `hot`.
+        assert!(core.close(hot, CloseReason::Dismissed).is_some());
         let (fresh, _) = core.create(&create_args("fresh"), SystemTime::now(), Instant::now());
         assert_ne!(fresh, hot, "the clock never hands an adopted id out");
     }
 
     #[test]
     fn id_clock_wraps_to_one_without_a_wall_clock_reseed() {
-        // At the top of the u32 range the clock wraps to 1 and carries
-        // on — a wall-clock re-seed would jump BACK to recent ids and
-        // re-issue them.
-        ID_CLOCK.store(u32::MAX, Ordering::SeqCst);
+        // At the top of the u32 range the last ids run out (MAX-1,
+        // MAX) and the clock wraps to 1 — a wall-clock re-seed would
+        // jump BACK to ~3e9, re-issuing the ids handed out moments
+        // ago. Allocation hands out the clock's current value and
+        // moves it past, so three allocations from MAX-1 must all land
+        // in the run-out or the small wrapped range.
+        let _serialized = ID_CLOCK_SERIALIZED.lock().expect("id test lock");
+        ID_CLOCK.store(u32::MAX - 1, Ordering::SeqCst);
         let mut core = NotifyCore::new(MAX_LIVE, MAX_STORED_BYTES);
-        let (id, _) = core.create(&create_args("wrap"), SystemTime::now(), Instant::now());
-        assert!(
-            id > 0 && id < 1_000_000,
-            "the wrap continues from 1, not a wall-clock re-seed: {id}"
-        );
+        let mut issued = Vec::new();
+        for index in 0..3 {
+            let (id, _) = core.create(
+                &create_args(&format!("wrap {index}")),
+                SystemTime::now(),
+                Instant::now(),
+            );
+            issued.push(id);
+        }
+        for id in issued {
+            assert!(
+                id >= u32::MAX - 1 || (id > 0 && id < 1_000_000),
+                "the wrap continues from 1, not a wall-clock re-seed: {id}"
+            );
+        }
     }
 
     #[test]
@@ -3618,8 +3671,15 @@ mod tests {
         // expiry path still aborts its own timer task on disarm, the
         // abort lands exactly at that yield and the signal is silently
         // lost — deterministically, no socket contention needed.
+        struct ResetYield;
+        impl Drop for ResetYield {
+            fn drop(&mut self) {
+                YIELD_BEFORE_EMIT.store(false, Ordering::SeqCst);
+            }
+        }
         YIELD_BEFORE_EMIT.store(true, Ordering::SeqCst);
-        let (wired, _faults) = wired(&bus).await;
+        let _reset = ResetYield;
+        let (_wired, _faults) = wired(&bus).await;
         let client_conn = bus.connect().await;
         let client = NotificationsClientProxy::new(&client_conn)
             .await
@@ -3640,14 +3700,7 @@ mod tests {
             .await
             .expect("Notify");
         assert_eq!(next_closed(&mut closed_stream).await, (id, 1));
-
-        // CloseNotification's emission goes through the same yield and
-        // still arrives.
-        client
-            .notify("app", 0, "", "closing", "", Vec::new(), HashMap::new(), 0)
-            .await
-            .expect("Notify");
-        YIELD_BEFORE_EMIT.store(false, Ordering::SeqCst);
+        // The reset guard clears YIELD_BEFORE_EMIT on every exit path.
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
