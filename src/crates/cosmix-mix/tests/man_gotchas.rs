@@ -21,6 +21,14 @@
 //! A row that stops being true fails the build. A page that loses its
 //! table, or its rows, fails too — a doctest that silently checks
 //! nothing is worse than no doctest, because it reads as coverage.
+//!
+//! **A probe must be deterministic in ANY environment this suite runs
+//! in.** In particular it must not depend on which Bus services happen
+//! to be registered: a row that sent to `comp-nested` printed `string`
+//! on a build worker and would have printed `map` on the days the
+//! nested compositor was running, turning the page red for a reason
+//! that had nothing to do with the page. Send probes name a service
+//! that can never exist.
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;

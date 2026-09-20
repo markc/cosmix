@@ -44,7 +44,7 @@ must appear in the error.
 | `sort_by` takes a direction | ascending only, with a lambda; `reverse()` for descending | `print(sort_by([3, 1, 2], fn($x) = $x))` | `[1, 2, 3]` |
 | `'~/x'` expands | a **single**-quoted string is raw — no `~`, no `${...}` | `print('~/x')` | `~/x` |
 | — and `"~/x"`? | a double-quoted one expands `~` to `$HOME` | `print(starts_with("~/x", "/"))` | `true` |
-| `send svc-name verb` needs quoting | it does not — a tight-hyphenated bare target is read whole, like the quoted and `$var` forms | `send comp-nested ping timeout=1; print(type($result))` | `string` |
+| `send svc-name verb` needs quoting | it does not — a tight-hyphenated bare target is read whole, like the quoted and `$var` forms | `send zz-no-such-svc ping timeout=1; print(type($result))` | `string` |
 | — but `send a - b verb`? | a **space** makes it subtraction again, and a bareword is a string, so that is a type error | `send a - b ping timeout=1` | `!as number` |
 | `replace()` tells you it missed | it returns the input unchanged, **silently** — check the result, or use `mix edit` from a prompt | `print(replace("abc", "zz", "!"))` | `abc` |
 | `replace()` replaces the first | it replaces **all** of them | `print(replace("a a a", "a", "b"))` | `b b b` |

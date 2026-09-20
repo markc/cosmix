@@ -109,14 +109,67 @@ fn the_accepted_shape_covers_real_service_names() {
     for name in [
         "comp-nested",
         "shell-scenes-p2",
-        "desktop-vt1",
         "bterm-bevy-3164175",
         "a-b.c",
         "_leading-underscore",
+        "X-Y",
+        // A digit segment is fine as long as it is a well-formed
+        // number, and `vt01` is an identifier (it starts with a letter)
+        // rather than the leading-zero number the manual warns about.
+        "svc-1",
+        "svc-10",
+        "desktop-vt01",
+        // A LEADING SEGMENT THAT IS A MIX KEYWORD. `next`, `print`,
+        // `on`, `source`, `select`, `loop`, `end`, `to`, `in`, `and`
+        // and friends all lex as keyword tokens, not identifiers, so a
+        // `Token::String`-only guard left every one of these unwritable
+        // bare while its quoted form worked.
+        "next-hop",
+        "print-server",
+        "on-boot",
+        "source-x",
+        "select-db",
+        "loop-back",
+        "end-node",
+        "true-b",
+        "in-box",
     ] {
         let bare = send_outcome(name);
         let quoted = send_outcome(&format!("\"{name}\""));
         assert_eq!(bare, quoted, "target {name:?} did not round-trip");
+        // A DOTTED name is a mesh address, so the broker splits it and
+        // names a segment (`Unknown mesh node: 'c'`) rather than the
+        // whole string — the quoted form does exactly the same, which
+        // the equality above already proves. Identity is only checkable
+        // for a plain service name.
+        if !name.contains('.') {
+            identity_check(name, &bare);
+        }
+    }
+}
+
+/// The shapes the LEXER refuses before the parser can see them. They
+/// are pinned so the manual's "quote these" table stays true, and so
+/// that fixing them later (it would take a lexer change, not a parser
+/// one) is a deliberate act with a failing test to notice.
+#[test]
+fn malformed_number_segments_still_need_quoting() {
+    for name in ["svc-01", "node-007", "a-1.2.3", "fn-svc"] {
+        let out = mix(&["-c", &format!("send {name} ping timeout=1")]);
+        assert!(
+            !out.status.success(),
+            "{name:?} now works bare — update docs/mix/bus.md's quote-it table"
+        );
+        // …and the quoted spelling is the documented way through.
+        let out = mix(&[
+            "-c",
+            &format!("send \"{name}\" ping timeout=1\nprint(to_string($rc))"),
+        ]);
+        assert!(
+            out.status.success(),
+            "the quoted form of {name:?} must work: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 

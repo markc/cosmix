@@ -1440,15 +1440,52 @@ impl Parser {
     /// the classifier that already makes this exact call for shell
     /// command heads: an ASCII letter or `_` first, at least one `-`,
     /// alphanumerics/`_`/`-`/`.` within, and an alphanumeric or `_`
-    /// last. Everything else — a call (`env("DEST")`), an index, a
-    /// concat, `$var`, a quoted string, a parenthesised expression —
+    /// last — plus `.`, for dotted names, and a leading segment that is
+    /// a Mix KEYWORD. Everything else — a call (`env("DEST")`), an
+    /// index, `$var`, a quoted string, a parenthesised expression —
     /// fails the shape or the terminator check below and takes the
     /// expression path exactly as before.
+    ///
+    /// Two shapes the LEXER refuses before this ever runs, so they must
+    /// be quoted and the manual says so: an all-digit segment that is a
+    /// malformed number (`svc-01`, `a-1.2.3`), and `fn-…`, where `fn`
+    /// starts a lambda.
     fn take_hyphenated_service_word(&mut self) -> Option<String> {
-        let Token::String(_) = self.peek() else {
-            return None;
+        // A bare identifier, OR a KEYWORD lexeme. `next-hop`,
+        // `print-server`, `on-boot`, `source-x`, `select-db` and
+        // `loop-back` are all plausible service names whose first
+        // segment the lexer emits as a keyword token, not a String — so
+        // a `Token::String`-only guard left them unwritable bare while
+        // their quoted forms worked, and the manual would have promised
+        // a shape the code did not accept. In TARGET position a bare
+        // keyword is always a parse error today ("unexpected token
+        // Next"), so accepting one here is strictly additive.
+        let head: String = match self.peek() {
+            Token::String(s) => s.clone(),
+            tok => keyword_lexeme(tok)?.to_string(),
         };
         let start = self.tokens.get(self.pos)?.offset;
+
+        // The raw scan below reads `self.source`, while the token stream
+        // is the other view of the same text — and they are only the
+        // same text because one caller built both. Nothing in the type
+        // system says so: a caller that lexed an alias-expanded or
+        // preprocessed string and handed `Parser::new` the original
+        // would make this read the WRONG bytes, silently and with no
+        // debug build catching it. So check the two views agree on this
+        // token's own characters, and fail SAFE to the expression path
+        // if they do not, rather than trusting an invariant nothing
+        // enforces. (`parse_bareword_path` shares the assumption and
+        // does not check it; this is the cheaper half of paying it off.)
+        let end_of_head = start.checked_add(head.chars().count())?;
+        if end_of_head > self.source.len()
+            || !self.source[start..end_of_head]
+                .iter()
+                .copied()
+                .eq(head.chars())
+        {
+            return None;
+        }
 
         let mut end = start;
         while end < self.source.len() {

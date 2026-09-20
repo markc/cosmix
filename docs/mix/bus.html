@@ -636,19 +636,30 @@ spellings.</p>
 <code>.</code> for dotted names: an ASCII letter or <code>_</code> first, at least one <code>-</code>,
 alphanumerics / <code>_</code> / <code>-</code> / <code>.</code> within, an alphanumeric or <code>_</code> last, and the
 whole thing delimited by whitespace, a newline, a <code>;</code>, or end of input.
-Anything else keeps the expression reading it always had — a call
-(<code>send env("DEST") …</code>), an index, a concat, a parenthesised expression, a
-<code>$var</code>, and a <strong>spaced</strong> <code>send a - b …</code>, where the space says an operator was
-meant.</p>
+A first segment that is a Mix keyword is fine too (<code>next-hop</code>, <code>print-server</code>,
+<code>on-boot</code>), because a bare keyword in target position was never anything but a
+parse error.</p>
+<p>Anything else keeps the expression reading it always had — a call
+(<code>send env("DEST") …</code>), an index, a parenthesised expression, a <code>$var</code>, and a
+<strong>spaced</strong> <code>send a - b …</code>, where the space says an operator was meant. The one
+exception is a concat whose left operand is a bare hyphenated word
+(<code>send a-b .. "c" …</code>): that is now a <em>parse</em> error where it used to be a
+runtime one, because the word is taken as the target and the <code>..</code> is left with
+nowhere to go. It could never have been a working concat — the left operand of
+<code>..</code> there is a bareword, which is a string, so the subtraction ahead of it
+always failed first.</p>
 <p><strong>Quote a name the bare form cannot reach.</strong> Three shapes fall outside it, and
 quoting is the answer to all three:</p>
 <table><thead><tr><th>name</th><th>why</th><th>write</th></tr></thead><tbody>
-<tr><td><code>a--b</code></td><td><code>--</code> opens a <strong>comment</strong>; the bare form stops there, so the target would be <code>a</code></td><td><code>send "a--b" …</code></td></tr>
-<tr><td><code>svc-01</code>, <code>node-007</code>, <code>svc-1.2.3</code></td><td>the LEXER reads the tail as a number and rejects <code>01</code> (ambiguous leading zero) or <code>1.2.3</code> (not a number) before the parser sees the line</td><td><code>send "svc-01" …</code></td></tr>
-<tr><td><code>if-service</code>, <code>true-b</code></td><td>the first word is a Mix keyword or literal, not a bare identifier</td><td><code>send "if-service" …</code></td></tr>
+<tr><td><code>a--b</code></td><td><code>--</code> opens a <strong>comment</strong>, so the bare word stops there and the shape is refused</td><td><code>send "a--b" …</code></td></tr>
+<tr><td><code>svc-01</code>, <code>node-007</code>, <code>a-1.2.3</code></td><td>a segment that is <strong>all digits</strong> is lexed as a NUMBER, and the lexer rejects a leading zero or a second dot before the parser ever sees the line</td><td><code>send "svc-01" …</code></td></tr>
+<tr><td><code>fn-svc</code></td><td><code>fn</code> starts a lambda</td><td><code>send "fn-svc" …</code></td></tr>
 </tbody></table>
-<p>The leading-zero case is the one worth remembering, because <code>desktop-vt01</code> is
-a plausible service name and the error it gives (<code>ambiguous leading-zero number '01'</code>) does not mention <code>send</code> at all.</p>
+<p>Only an all-digit segment is affected, and only a malformed one: <code>svc-1</code>,
+<code>svc-10</code>, <code>bterm-bevy-3164175</code> and <code>desktop-vt01</code> are all fine bare — <code>vt01</code>
+begins with a letter, so it is an identifier, not a number. The trap is
+<code>node-007</code>, whose error (<code>ambiguous leading-zero number '007'</code>) does not
+mention <code>send</code> at all.</p>
 <p>Nothing that worked before changed meaning: the shape <em>requires</em> a hyphen, so
 every target that already resolved still takes the expression path, and a
 bareword is a string, so <code>a - b</code> on two barewords was always the runtime type
