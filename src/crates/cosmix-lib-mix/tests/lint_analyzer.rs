@@ -1030,3 +1030,26 @@ fn an_escaped_physical_newline_is_located_and_named_safely() {
         );
     }
 }
+
+#[test]
+fn d3015_parameter_visibility_is_scoped_to_the_function() {
+    // Round 2 caught the cost of the file-wide parameter union: an
+    // unrelated helper's parameter made ordinary prose a finding.
+    assert!(
+        !codes_with_source(
+            "fn unrelated($price)\n  return $price\nend\nprint(\"The price is $price per item\")\nunrelated(1)\n"
+        )
+        .contains(&"MIX-D3015".to_string()),
+        "a parameter must not be visible outside its own function"
+    );
+    // ...while the in-scope case it was added for still fires, including
+    // across a multi-line body and inside a lambda.
+    assert!(
+        codes_with_source("fn helper($dir)\n  $a = 1\n  print(\"$dir/sub\")\n  return $a\nend\nhelper(\"x\")\n")
+            .contains(&"MIX-D3015".to_string())
+    );
+    assert!(
+        codes_with_source("$f = fn($q) print(\"$q/file\") end\n$f(\"x\")\n")
+            .contains(&"MIX-D3015".to_string())
+    );
+}

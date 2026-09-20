@@ -7814,7 +7814,13 @@ impl Evaluator {
                             self.ctx
                                 .var_slot_cache_f64
                                 .push((assign_name as *const str, assign_f64 as *const f64));
-                            let inner: MixResult<()> = (|| {
+                            // Snapshot the accumulator before any mutation,
+                            // exactly as take_mixed does: on a non-numeric
+                            // body we restore it and let the generic loop
+                            // run from scratch, so completed iterations are
+                            // not double-counted.
+                            let saved_assign = unsafe { *assign_f64 };
+                            let inner: MixResult<bool> = (|| {
                                 for item in items.iter() {
                                     let v = match item {
                                         Value::Number(n) => *n,
@@ -7826,35 +7832,44 @@ impl Evaluator {
                                     let n = match self.try_eval_expr_num(assign_value) {
                                         Some(Ok(n)) => n,
                                         Some(Err(e)) => return Err(e),
-                                        None => {
-                                            // Body produced a non-numeric
-                                            // value (Concat/Eq/bound non-
-                                            // Number/unbound positional).
-                                            // The take_fast path here exits
-                                            // Ok(()) and the caller returns
-                                            // Ok(Value::Nil) WITHOUT running
-                                            // the generic loop — a latent
-                                            // silent-no-body-execution shape
-                                            // pre-dating the sync-fastpath
-                                            // panic fix. Fully resolving it
-                                            // requires either inner_kind
-                                            // ("not applicable" vs "done")
-                                            // or wiring a true fall-through
-                                            // back to the generic loop.
-                                            // Tracked for a focused refactor.
-                                            return Ok(());
-                                        }
+                                        // Body produced a non-numeric value
+                                        // (Concat/Eq/bound non-Number/
+                                        // unbound positional). This used to
+                                        // `return Ok(())`, and the caller
+                                        // then returned Value::Nil WITHOUT
+                                        // running the generic loop — the
+                                        // body never executed AT ALL, rc 0.
+                                        // `$sum = 0` + `for $i in [1,2,3]:
+                                        // $sum = $sum + $l` printed 0 and
+                                        // raised nothing, and the LEGAL
+                                        // scalar case (`+ "x"`) was skipped
+                                        // the same way; the identical body
+                                        // in a `while` loop was correct.
+                                        // The sibling take_mixed path a
+                                        // screen above has always had the
+                                        // fall-through; this one never got
+                                        // it (its own comment called it "a
+                                        // latent silent-no-body-execution
+                                        // shape … tracked for a focused
+                                        // refactor"). Found by the GLM arm
+                                        // of the 0.90.0 cold review.
+                                        None => return Ok(false),
                                     };
                                     unsafe {
                                         *assign_f64 = n;
                                     }
                                 }
-                                Ok(())
+                                Ok(true)
                             })();
                             self.ctx.var_slot_cache_f64.truncate(f64_cache_start);
                             self.ctx.var_slot_cache.truncate(cache_start);
-                            inner?;
-                            return Ok(Value::Nil);
+                            match inner {
+                                Ok(true) => return Ok(Value::Nil),
+                                Ok(false) => unsafe {
+                                    *assign_f64 = saved_assign;
+                                },
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
 

@@ -81,3 +81,34 @@ async fn indexing_a_collection_then_adding_still_works() {
         .unwrap();
     assert_eq!(out, "2\n30\n");
 }
+
+#[tokio::test]
+async fn a_top_level_for_in_loop_runs_its_body_at_all() {
+    // The GLM arm of the 0.90.0 cold review found that the `+` raise was
+    // unreachable in the ONE shape accumulation actually lives in. A
+    // top-level `for $i in <all-Number list>` whose body is a single
+    // assignment into a Number accumulator takes a fast path that, when
+    // the RHS is not numeric, RETURNED WITHOUT RUNNING THE BODY — rc 0,
+    // accumulator untouched, nothing raised. Pre-existing (the sibling
+    // take_mixed path always had the fall-through; this one never got
+    // it), but it made both halves of this file's contract false.
+    let err = run("$l = [1]\n$sum = 0\nfor $i in [1, 2, 3]\n  $sum = $sum + $l\nend\nprint($sum)\n")
+        .await
+        .expect_err("a container operand must raise even inside the loop fast path");
+    assert!(err.contains("not defined for"), "{err}");
+
+    // The LEGAL scalar fallback was skipped identically, which is how the
+    // bug stayed invisible: the answer looked like "the loop did nothing"
+    // rather than "the loop is broken". The same body in a `while` loop
+    // was always correct, and now the two agree.
+    let out = run("$s = \"x\"\n$sum = 0\nfor $i in [1, 2, 3]\n  $sum = $sum + $s\nend\nprint($sum)\n")
+        .await
+        .unwrap();
+    assert_eq!(out, "0xxx\n");
+
+    // ...and the numeric fast path it protects is untouched.
+    let out = run("$sum = 0\nfor $i in [1, 2, 3]\n  $sum = $sum + $i\nend\nprint($sum)\n")
+        .await
+        .unwrap();
+    assert_eq!(out, "6\n");
+}

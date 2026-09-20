@@ -454,18 +454,21 @@ fn check_string_literal_spelling(
     let Some(source) = cfg.source.as_deref() else {
         return;
     };
-    // A note carries only a line, so the "is this name bound" test uses a
-    // file-wide SUPERSET: everything `top_level_names` holds plus every
-    // function and lambda PARAMETER, which it deliberately does not (a
-    // param binds inside one frame, not the file). Without the params a
-    // helper's own `print("$p/file")` — the commonest shape of this
-    // mistake — went unreported.
-    let mut bound = ctx.top_level_names.clone();
-    collect_param_names(stmts, &mut bound);
+    // A note carries only a line, so the "is this name bound" test is
+    // `top_level_names` plus any PARAMETER whose function's line range
+    // contains that line. Parameters are not file-wide names — without
+    // them a helper's own `print("$p/file")`, the commonest shape of this
+    // mistake, went unreported; with them file-wide, prose that merely
+    // spelled an unrelated helper's parameter became a finding.
+    let scopes = collect_param_scopes(stmts);
     for note in crate::lexer::Lexer::notes_for(source) {
         match note {
             crate::lexer::StringNote::BareDollar { line, name } => {
-                if !bound.contains(&name) {
+                let bound = ctx.top_level_names.contains(&name)
+                    || scopes.iter().any(|s| {
+                        (s.start..=s.end).contains(&line) && s.params.contains(&name)
+                    });
+                if !bound {
                     continue;
                 }
                 a.diagnostics.push(diag(
@@ -474,8 +477,15 @@ fn check_string_literal_spelling(
                     Severity::Note,
                     line,
                     format!("bare `${name}` in a double-quoted string is literal, not interpolated"),
+                    // Both spellings, neither presented as THE answer. The
+                    // review arm found `raise(…, "… and $root_docs here")`
+                    // in this repo's own generator, where `${root_docs}`
+                    // would splice a LIST into the message and make it
+                    // worse — a hint that leads with the interpolating form
+                    // recommends corruption in exactly the case the rule is
+                    // least sure about.
                     Some(format!(
-                        "did you mean `${{{name}}}`? an intentional literal is `\\${name}` or a single-quoted '…' string"
+                        "if the value was meant, write `${{{name}}}`; if the text was meant, write `\\${name}` or use a single-quoted '…' string — a note, because only you know which"
                     )),
                 ));
             }
@@ -505,27 +515,77 @@ fn check_string_literal_spelling(
     }
 }
 
-/// Every `function`/`fn` and lambda parameter name in the file, at any
-/// depth. Deliberately NOT part of `FileContext::top_level_names`, which
-/// models the universe a top-level read resolves against; this is the
-/// wider "was this spelling ever a variable here" question MIX-D3015 asks.
-fn collect_param_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+/// One parameter scope: the LINE RANGE a `function`/`fn`/lambda covers,
+/// and the names its parameters bind inside it.
+///
+/// A parameter is not a file-wide name — it binds in one frame — but a
+/// [`crate::lexer::StringNote`] carries only a line, so MIX-D3015 has no
+/// scope to resolve against. A line range is the closest thing the note's
+/// coordinates can be matched to: a function's body is contiguous, so
+/// "inside these lines" and "inside this frame" coincide except for source
+/// that interleaves definitions, which Mix cannot express.
+///
+/// Admitting every parameter FILE-WIDE instead was the first cut, and the
+/// round-2 re-review caught what it cost: `fn unrelated($price)` made a
+/// top-level `"The price is $price per item"` a finding, because the name
+/// existed somewhere. Prose that happens to spell an unrelated helper's
+/// parameter must stay silent.
+struct ParamScope {
+    start: usize,
+    end: usize,
+    params: Vec<String>,
+}
+
+/// The maximum statement line anywhere inside `stmts`, including nested
+/// bodies and lambda bodies. `None` for an empty body — a function with no
+/// statements binds its parameters over no lines, so it admits nothing,
+/// which is the safe direction.
+fn max_stmt_line(stmts: &[Stmt]) -> Option<usize> {
+    let mut max = None;
     walk_stmts(stmts, &mut |stmt| {
-        if let StmtKind::FunctionDef { params, .. } = &stmt.kind {
-            for p in params {
-                out.insert(p.name.clone());
-            }
+        max = Some(max.map_or(stmt.line, |m: usize| m.max(stmt.line)));
+    });
+    max
+}
+
+fn collect_param_scopes(stmts: &[Stmt]) -> Vec<ParamScope> {
+    let mut out = Vec::new();
+    walk_stmts(stmts, &mut |stmt| {
+        if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind
+            && !params.is_empty()
+        {
+            let end = match body {
+                FunctionBody::Block(b) => max_stmt_line(b).unwrap_or(stmt.line),
+                FunctionBody::Expression(_) => stmt.line,
+            };
+            out.push(ParamScope {
+                start: stmt.line,
+                end: end.max(stmt.line),
+                params: params.iter().map(|p| p.name.clone()).collect(),
+            });
         }
+        // A lambda has no line of its own, so it is bracketed by the
+        // statement that contains it and the last line of its own body.
+        let line = stmt.line;
         walk_stmt_exprs(stmt, &mut |expr| {
             for_each_expr(expr, &mut |e| {
-                if let Expr::FunctionLiteral { params, .. } = e {
-                    for p in params {
-                        out.insert(p.name.clone());
-                    }
+                if let Expr::FunctionLiteral { params, body } = e
+                    && !params.is_empty()
+                {
+                    let end = match &**body {
+                        FunctionBody::Block(b) => max_stmt_line(b).unwrap_or(line),
+                        FunctionBody::Expression(_) => line,
+                    };
+                    out.push(ParamScope {
+                        start: line,
+                        end: end.max(line),
+                        params: params.iter().map(|p| p.name.clone()).collect(),
+                    });
                 }
             });
         });
     });
+    out
 }
 
 /// Immutable per-file facts shared by the passes.

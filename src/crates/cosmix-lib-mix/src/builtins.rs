@@ -1476,6 +1476,13 @@ fn builtin_replace(args: Vec<Value>) -> MixResult<Option<Value>> {
 // `run_argv_must` / `run_pipeline_must` / `ssh_must`: same operation, raises
 // instead of handing back a value you have to remember to check.
 
+/// The largest `{count: n}` a `_must` twin will accept. An f64 holds every
+/// integer up to 2^53 exactly, and no subject can contain more occurrences
+/// than it has bytes, so this is far above any real assertion while staying
+/// inside the range where `as usize` is a faithful conversion rather than a
+/// saturating one.
+const MAX_MUST_COUNT: f64 = 9_007_199_254_740_992.0; // 2^53
+
 /// Shared option parsing for the `_must` twins: `{count: n, path: "…"}`.
 /// Unknown keys RAISE — a silently ignored `{counts: 2}` would turn the
 /// count assertion off at exactly the moment the caller was being careful
@@ -1506,10 +1513,18 @@ fn must_replace_opts(name: &str, opts: Option<&Value>) -> MixResult<(Option<usiz
                     span: None,
                     msg: format!("{name}(): count must be a number, got {}", v.type_name()),
                 })?;
-                if !n.is_finite() || n.fract() != 0.0 || n < 0.0 {
+                // The upper bound is not pedantry: `as usize` SATURATES, so
+                // without it `{count: 1e300}` became usize::MAX and the
+                // mismatch message read "not the 18446744073709551615
+                // asserted" — a number the caller never wrote. A subject
+                // cannot hold more occurrences than it has bytes, so
+                // anything past that is a typo, not an assertion.
+                if !n.is_finite() || n.fract() != 0.0 || !(0.0..=MAX_MUST_COUNT).contains(&n) {
                     return Err(MixError::RuntimeError {
                         span: None,
-                        msg: format!("{name}(): count must be a whole number >= 0, got {n}"),
+                        msg: format!(
+                            "{name}(): count must be a whole number in 0..={MAX_MUST_COUNT}, got {n}"
+                        ),
                     });
                 }
                 count = Some(n as usize);

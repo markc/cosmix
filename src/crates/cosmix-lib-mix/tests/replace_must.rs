@@ -114,3 +114,24 @@ async fn bad_options_raise_rather_than_silently_disarming_the_check() {
         assert!(err.contains(needle), "{src} -> {err}");
     }
 }
+
+#[tokio::test]
+async fn an_absurd_count_is_refused_rather_than_saturated() {
+    // `as usize` SATURATES, so {count: 1e300} became usize::MAX and the
+    // mismatch message quoted a number the caller never wrote:
+    // "not the 18446744073709551615 asserted". Found by the GLM arm of the
+    // 0.90.0 cold review.
+    let err = run("print(replace_must(\"aa\", \"a\", \"b\", {count: 1e300}))\n")
+        .await
+        .expect_err("an out-of-range count must be refused");
+    assert!(err.contains("0..=9007199254740992"), "{err}");
+    assert!(
+        !err.contains("18446744073709551615"),
+        "must not quote the saturated value: {err}"
+    );
+    // The bound is far above anything real, so ordinary counts are intact.
+    let out = run("print(replace_must(\"aa\", \"a\", \"b\", {count: 2}))\n")
+        .await
+        .unwrap();
+    assert_eq!(out, "bb\n");
+}
