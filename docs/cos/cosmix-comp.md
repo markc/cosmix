@@ -10,6 +10,44 @@ compare opaque and translucent maximised windows through the same client path.
 nested inside an existing Wayland session with `cosmix-comp --nested`, or use
 the KMS backend on a system seat.
 
+## Command-line options
+
+`--help` prints the command usage. `--version` prints four lines of embedded
+build provenance (the package line, full commit, enabled behaviour features,
+and the cargo profile) and exits successfully before opening any device,
+session, socket or Bus connection. It is recognised anywhere in the argument
+vector, including after the `kms-live` subcommand, and wins when combined with
+other options.
+
+## KMS target-device changes (0.62.1)
+
+A udev event for the authorised DRM device is no longer treated as proof that the
+display was hotplugged. Switching to a text console makes the kernel modeset the
+card for fbcon, which emits a udev `change`, so an ordinary VT round trip used to
+manufacture a hotplug and cost the session every client it was hosting.
+
+Only one case is now decided on the session thread: a `Removed` event while
+`kms-live` is Active revokes authority, because the device being driven is gone
+and that needs no query to establish. An `Added` event while Active is not
+authority loss. Every `Changed` event, and every event of any kind while the
+session is not Active — which includes the whole resume transition — is recorded
+for diagnosis and left to verification.
+
+That thread does no I/O at all, deliberately: it owns the libseat pause
+acknowledgement and answers session commands under a three-second deadline, and a
+synchronous DRM probe cannot be interrupted once it is inside the driver, so a
+wedged probe there would stall the pause acknowledgement and lose the session
+harder than the bug being fixed.
+
+The identity invariant is unchanged and is enforced where the code already budgets
+for a synchronous driver call. The resume path re-verifies the stable device path,
+the device incarnation, the VT, DRM master state and connector presence before the
+session can return to the glass, and refuses terminally when the connector is
+absent — so a device that really went away cannot reach the glass by being
+deferred. While the session is Active no resume is pending, and there a connector
+that stops accepting frames is caught by presentation evidence rather than by a
+connector query.
+
 ## Occlusion and frame callbacks (0.61.0)
 
 Frame callbacks remain queued while a canonical surface family is provably

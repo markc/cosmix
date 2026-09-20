@@ -10,12 +10,12 @@ mod compositor_scene;
 mod content_source;
 mod decoration;
 mod decoration_scene;
+#[cfg(feature = "embedded-quoin")]
+mod embedded_shell;
 #[cfg(feature = "frame-capture")]
 mod frame_capture;
 mod frame_content;
 mod frame_trace;
-#[cfg(feature = "embedded-quoin")]
-mod embedded_shell;
 mod occlusion;
 #[cfg(feature = "bus")]
 mod port;
@@ -185,6 +185,10 @@ fn init_kms_live_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 fn main() -> ExitCode {
     let cli = match Cli::parse(env::args_os().skip(1)) {
+        Ok(ParseOutcome::Version) => {
+            print!("{}", version_text());
+            return ExitCode::SUCCESS;
+        }
         Ok(ParseOutcome::Run(cli)) => cli,
         Ok(ParseOutcome::ListBindings {
             keybindings_enabled,
@@ -495,7 +499,57 @@ Options:
   --presentation     Select kms-live presentation (default atomic;
                      direct-display is accepted only to report its permanent retirement)
   -h, --help         Print this help
+  --version, -V      Print build provenance and exit, touching no device, VT,
+                     seat, Wayland socket or Bus; safe against a live compositor.
+                     Honoured anywhere in argv, including after `kms-live`
 ";
+
+fn version_text() -> String {
+    let build = cosmix_buildinfo::build_info!();
+    let mut features = Vec::new();
+    if cfg!(feature = "kms-live") {
+        features.push("kms-live");
+    }
+    if cfg!(feature = "bus") {
+        features.push("bus");
+    }
+    if cfg!(feature = "xwayland") {
+        features.push("xwayland");
+    }
+    if cfg!(feature = "frame-capture") {
+        features.push("frame-capture");
+    }
+    if cfg!(feature = "embedded-quoin") {
+        features.push("embedded-quoin");
+    }
+    if cfg!(feature = "hud-probe") {
+        features.push("hud-probe");
+    }
+    // content-source-probe installs a runtime plugin (see the gate in main), and
+    // explicit-sync-live-test changes live behaviour, so a binary carrying either
+    // is not the same binary as one without it. Both were missing from the first
+    // cut of this list, which is the failure mode to watch: a feature added to
+    // Cargo.toml without a line here makes this output under-report what the
+    // binary can do, and an under-reporting identity flag is worse than none.
+    if cfg!(feature = "content-source-probe") {
+        features.push("content-source-probe");
+    }
+    if cfg!(feature = "explicit-sync-live-test") {
+        features.push("explicit-sync-live-test");
+    }
+    let features = if features.is_empty() {
+        "none".to_string()
+    } else {
+        features.join(",")
+    };
+    format!(
+        "{}\ncommit: {}\nfeatures: {}\nprofile: {}\n",
+        build.line(),
+        build.git_sha_full,
+        features,
+        env!("COSMIX_KMS_LIVE_CARGO_PROFILE"),
+    )
+}
 
 #[derive(Debug, PartialEq)]
 struct Cli {
@@ -508,6 +562,7 @@ struct Cli {
 }
 
 enum ParseOutcome {
+    Version,
     Run(Box<Cli>),
     ListBindings {
         keybindings_enabled: bool,
@@ -555,7 +610,21 @@ fn extract_f9_bus(
 
 impl Cli {
     fn parse(args: impl IntoIterator<Item = OsString>) -> Result<ParseOutcome, String> {
-        let (args, bus_service) = extract_bus_service(args.into_iter().collect())?;
+        let args: Vec<OsString> = args.into_iter().collect();
+        // `-V` as well as `--version`, because mix spells it both ways
+        // (cosmix-mix meta.rs `version_request`, 0.89.1) and two cosmix binaries
+        // should not need two different flags to answer the same question. Unlike
+        // mix this is scanned across the whole argv rather than only argv[1]: comp
+        // is launched by a systemd unit whose argv starts with a subcommand, and
+        // the point of the flag is that the unit's exact argv can be reused with
+        // the flag appended.
+        if args
+            .iter()
+            .any(|argument| argument == "--version" || argument == "-V")
+        {
+            return Ok(ParseOutcome::Version);
+        }
+        let (args, bus_service) = extract_bus_service(args)?;
         let (args, f9_bus) = extract_f9_bus(args)?;
         if args.first().and_then(|argument| argument.to_str()) == Some("kms-live") {
             if args.len() == 2 && matches!(args[1].to_str(), Some("--help" | "-h")) {
@@ -2554,6 +2623,59 @@ mod tests {
         };
 
         assert_eq!(argv.first().and_then(|arg| arg.to_str()), Some("kms-live"));
+    }
+
+    #[test]
+    fn version_is_a_pure_parse_outcome_in_every_argument_position() {
+        assert!(matches!(parse(&["--version"]), Ok(ParseOutcome::Version)));
+        // `-V` is mix's spelling; both must work or an operator has to remember
+        // which cosmix binary wants which flag.
+        assert!(matches!(parse(&["-V"]), Ok(ParseOutcome::Version)));
+        // The daily driver's exact unit argv with the flag appended — the case the
+        // flag exists for.
+        assert!(matches!(
+            parse(&[
+                "kms-live",
+                "--device",
+                "/dev/dri/card1",
+                "--connector",
+                "HDMI-A-1",
+                "--scale",
+                "2.5",
+                "--chrome",
+                "mac",
+                "--f9-bus",
+                "bg-showcase",
+                "boing.kick",
+                "--version",
+            ]),
+            Ok(ParseOutcome::Version)
+        ));
+        assert!(matches!(
+            parse(&["kms-live", "--device", "/dev/dri/card0", "--version"]),
+            Ok(ParseOutcome::Version)
+        ));
+        assert!(matches!(
+            parse(&["--nested", "--version", "--socket", "untouched"]),
+            Ok(ParseOutcome::Version)
+        ));
+        assert!(matches!(
+            parse(&["--bus-service", "--version"]),
+            Ok(ParseOutcome::Version)
+        ));
+    }
+
+    #[test]
+    fn version_text_has_four_provenance_lines_in_order() {
+        let rendered = version_text();
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("cosmix-comp "));
+        let commit = lines[1].strip_prefix("commit: ").expect("commit key");
+        assert!(commit == "unknown" || (commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit())));
+        let features = lines[2].strip_prefix("features: ").expect("features key");
+        assert!(!features.is_empty());
+        assert!(lines[3].starts_with("profile: "));
     }
 
     #[test]
