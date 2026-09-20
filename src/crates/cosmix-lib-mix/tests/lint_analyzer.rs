@@ -936,3 +936,97 @@ fn the_spelling_rules_are_silent_without_a_source() {
     // these two rules and nothing else.
     assert!(codes("$sp = \"/tmp/x\"\nprint(\"$sp/x\")\nprint(\"bad \\q\")\n").is_empty());
 }
+
+// ── Two-arm cold review, round 1 (2026-09-21) ───────────────────────
+//
+// Five findings against the 0.90.0 lint additions, each pinned here so
+// the fix cannot regress quietly.
+
+#[test]
+fn d3014_sees_inside_an_if_expression_both_ways() {
+    // `walk_expr_children` skips Expr::If entirely, so the branch bodies
+    // and the CONDITION were invisible to both halves of the rule: the
+    // unchecked write went unreported, and a `contains()` guard written
+    // in a condition did not silence anything.
+    assert!(
+        codes("$x = if true then\n  write_file(\"/dev/null\", replace(\"a\", \"a\", \"b\"))\nelse\n  nil\nend\n")
+            .contains(&"MIX-D3014".to_string()),
+        "an unchecked write inside an if-EXPRESSION branch must still be seen"
+    );
+    assert!(
+        !codes("$g = if contains(\"a\", \"a\") then 1 else 2 end\nwrite_file(\"/dev/null\", replace(\"a\", \"a\", \"b\"))\n")
+            .contains(&"MIX-D3014".to_string()),
+        "a guard in an if-EXPRESSION condition must silence the file"
+    );
+}
+
+#[test]
+fn d3014_facts_do_not_cross_a_function_frame_or_survive_a_branch() {
+    // A parameter SHADOWS the enclosing binding, so an outer
+    // `$s = replace(...)` says nothing about the `$s` inside `save`.
+    assert!(
+        !codes("$s = replace(\"a\", \"a\", \"b\")\nfn save($s)\n  write_file(\"/dev/null\", $s)\nend\nsave(\"plain\")\n")
+            .contains(&"MIX-D3014".to_string()),
+        "a same-named parameter is a different variable"
+    );
+    // A conditional reassignment makes the fact UNKNOWN, not still-true.
+    assert!(
+        !codes("$s = replace(\"a\", \"a\", \"b\")\nif true then\n  $s = \"unrelated\"\nend\nwrite_file(\"/dev/null\", $s)\n")
+            .contains(&"MIX-D3014".to_string()),
+        "a branch that rebinds the name must invalidate the fact"
+    );
+}
+
+#[test]
+fn d3015_covers_function_parameters_not_only_top_level_names() {
+    // `top_level_names` excludes parameters by design, and a helper's own
+    // `print("$p/file")` is the commonest shape of this mistake.
+    assert!(
+        codes_with_source("fn sample($p)\n  print(\"$p/file\")\nend\nsample(\"x\")\n")
+            .contains(&"MIX-D3015".to_string())
+    );
+    assert!(
+        codes_with_source("$f = fn($q) print(\"$q/file\") end\n$f(\"x\")\n")
+            .contains(&"MIX-D3015".to_string()),
+        "a lambda parameter counts too"
+    );
+}
+
+#[test]
+fn an_escaped_physical_newline_is_located_and_named_safely() {
+    // Three separate defects in one shape: the note was attributed to the
+    // line AFTER the backslash (self.line had already advanced over the
+    // newline), `multiline` was never set so the bare-$ batch survived in
+    // a string that genuinely spans lines, and the message quoted the
+    // escape verbatim — putting a raw newline inside a diagnostic and
+    // splitting one finding across two output lines.
+    let src = "$x = 1\nprint(\"x\\\n$x\")\n";
+    let out = lint_cfg(
+        src,
+        &AnalyzerConfig {
+            source: Some(src.to_string()),
+            ..AnalyzerConfig::default()
+        },
+    );
+    let codes: Vec<&str> = out.iter().map(|(c, _)| c.as_str()).collect();
+    assert_eq!(codes, vec!["MIX-W2405"], "no D3015: the string is multi-line");
+    assert_eq!(out[0].1, Some(2), "the backslash is on line 2, not line 3");
+
+    let tokens = Lexer::new(src).tokenize().unwrap();
+    let stmts = Parser::new(tokens, src).parse_program().unwrap();
+    let analysis = analyze(
+        &stmts,
+        Some("test.mix"),
+        &AnalyzerConfig {
+            source: Some(src.to_string()),
+            ..AnalyzerConfig::default()
+        },
+    );
+    for d in &analysis.diagnostics {
+        let text = format!("{}{}", d.message, d.hint.clone().unwrap_or_default());
+        assert!(
+            !text.contains('\n') && !text.contains('\r'),
+            "no diagnostic text may contain a raw line break: {text:?}"
+        );
+    }
+}

@@ -464,7 +464,7 @@ raw ${name} $(date)
 </code></pre>
 <p>The split mirrors bash's quoting, with one trap that bites everyone:</p>
 <table><thead><tr><th>Form</th><th>Interpolates <code>${x}</code></th><th>Bare <code>$x</code></th><th><code>$(...)</code></th><th>leading <code>~</code></th><th>Escapes</th></tr></thead><tbody>
-<tr><td><code>"double"</code></td><td>yes (scope → env)</td><td><strong>literal text</strong></td><td><strong>literal text</strong></td><td>expands to <code>$HOME</code></td><td><code>\n \t \r \e \" \\ \$ \~ \u{…}</code></td></tr>
+<tr><td><code>"double"</code></td><td>yes (scope → env)</td><td><strong>literal text</strong></td><td><strong>literal text</strong></td><td>expands to <code>$HOME</code></td><td><code>\n \t \r \e \a \b \f \v \0 \xHH \" \\ \$ \~ \u{…}</code></td></tr>
 <tr><td><code>'single'</code></td><td>no</td><td>literal</td><td>literal</td><td>literal</td><td>only <code>\'</code> and <code>\\</code></td></tr>
 </tbody></table>
 <p><strong>Only <code>${...}</code> interpolates</strong> inside double quotes. A bare <code>$name</code> is the literal
@@ -675,7 +675,13 @@ print(pos("é", "café"))         -- 1-based codepoint position
 <tr><td>codepoints (default)</td><td><code>length</code>/<code>len</code>, <code>pos</code>, <code>lastpos</code>, <code>index_of</code>, <code>substr</code>, <code>reverse</code>, <code>left</code>, <code>right</code></td><td>Unicode scalar values</td></tr>
 <tr><td>raw bytes</td><td><code>byte_length</code>, <code>byte_pos</code>, <code>byte_lastpos</code>, <code>byte_index_of</code></td><td>UTF-8 bytes</td></tr>
 <tr><td>user-perceived chars</td><td><code>grapheme_count</code>, <code>grapheme_substr</code>, <code>grapheme_reverse</code></td><td>grapheme clusters (UAX #29)</td></tr>
+<tr><td>terminal columns</td><td><code>display_width</code>, <code>lpad_w</code>, <code>rpad_w</code>, <code>word_wrap_w</code></td><td>display cells (UAX #11)</td></tr>
 </tbody></table>
+<p>All four rows are operations on <strong>text</strong>. Operations on a raw <code>bytes</code>/<code>buffer</code>
+<em>value</em> are a different family, <code>bytes_*</code> — see
+<a href="/mix/io#naming-byte_-vs-bytes_">io</a>. The two are easy to confuse and are not
+interchangeable: <code>byte_length($some_bytes)</code> stringifies its argument first and
+so measures the <code>&lt;bytes:N&gt;</code> placeholder, not the bytes.</p>
 <h3 id="ord--chr--codepoint--character-0900"><code>ord</code> / <code>chr</code> — codepoint ↔ character (0.90.0)</h3>
 <p><code>ord(s)</code> is the Unicode codepoint of the <strong>first character</strong>; <code>chr(n)</code> is the
 one-character string for a codepoint. They are the runtime twins of the <code>\u{…}</code>
@@ -696,13 +702,7 @@ print(chr(0x27))         -- the runtime twin of "\u{27}"
 also mean "absent". <code>chr</code> takes the <code>\u{…}</code> validity rule exactly — a surrogate
 (<code>chr(0xD800)</code>), anything above <code>0x10FFFF</code>, and a fractional or negative argument
 all raise rather than saturate to a plausible wrong character.
-| terminal columns | <code>display_width</code>, <code>lpad_w</code>, <code>rpad_w</code>, <code>word_wrap_w</code> | display cells (UAX #11) |</p>
-<p>All four rows are operations on <strong>text</strong>. Operations on a raw <code>bytes</code>/<code>buffer</code>
-<em>value</em> are a different family, <code>bytes_*</code> — see
-<a href="/mix/io#naming-byte_-vs-bytes_">io</a>. The two are easy to confuse and are not
-interchangeable: <code>byte_length($some_bytes)</code> stringifies its argument first and
-so measures the <code>&lt;bytes:N&gt;</code> placeholder, not the bytes.</p>
-<p>A plain <code>substr</code>/<code>reverse</code> is codepoint-based and <strong>splits</strong> an emoji ZWJ sequence or
+A plain <code>substr</code>/<code>reverse</code> is codepoint-based and <strong>splits</strong> an emoji ZWJ sequence or
 combining cluster; the <code>grapheme_*</code> ops keep it whole:</p>
 <pre><code class="language-mix">print(reverse("a👍🏽b"))          -- codepoint reverse splits the skin-tone modifier
 print(grapheme_reverse("a👍🏽b")) -- grapheme reverse keeps it whole

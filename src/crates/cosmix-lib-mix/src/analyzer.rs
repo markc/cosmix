@@ -403,7 +403,7 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
         true,
     );
     check_recurring_silent_bugs(stmts, &ctx, &mut a);
-    check_string_literal_spelling(&ctx, &mut a, cfg);
+    check_string_literal_spelling(stmts, &ctx, &mut a, cfg);
     check_release_transition_advisories(stmts, &ctx, &mut a);
     // Guarded against unbounded recursion: a remote body may itself contain
     // an `ssh_mix`, and nothing stops that nesting from being circular
@@ -445,14 +445,27 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
 /// escape. `\u` without a brace is exempt — that literal is documented
 /// design, not an accident. This one IS a warning: the same fleet sweep
 /// found two findings, both real.
-fn check_string_literal_spelling(ctx: &FileContext, a: &mut Analysis, cfg: &AnalyzerConfig) {
+fn check_string_literal_spelling(
+    stmts: &[Stmt],
+    ctx: &FileContext,
+    a: &mut Analysis,
+    cfg: &AnalyzerConfig,
+) {
     let Some(source) = cfg.source.as_deref() else {
         return;
     };
+    // A note carries only a line, so the "is this name bound" test uses a
+    // file-wide SUPERSET: everything `top_level_names` holds plus every
+    // function and lambda PARAMETER, which it deliberately does not (a
+    // param binds inside one frame, not the file). Without the params a
+    // helper's own `print("$p/file")` — the commonest shape of this
+    // mistake — went unreported.
+    let mut bound = ctx.top_level_names.clone();
+    collect_param_names(stmts, &mut bound);
     for note in crate::lexer::Lexer::notes_for(source) {
         match note {
             crate::lexer::StringNote::BareDollar { line, name } => {
-                if !ctx.top_level_names.contains(&name) {
+                if !bound.contains(&name) {
                     continue;
                 }
                 a.diagnostics.push(diag(
@@ -470,6 +483,10 @@ fn check_string_literal_spelling(ctx: &FileContext, a: &mut Analysis, cfg: &Anal
                 let hint = match text.as_str() {
                     "\\x" => "`\\xHH` takes exactly two hex digits (0.90.0) — `\\x27`, not `\\x2`; for a literal backslash write `\\\\x`".to_string(),
                     "\\'" => "double quotes need no escape for `'` — write `'` alone, or `\\\\'` for a literal backslash-quote".to_string(),
+                    // A backslash at end of line. Mix has no in-string line
+                    // continuation, so this keeps BOTH characters — which is
+                    // almost never what a shell/C habit intended.
+                    "\\<newline>" | "\\<carriage-return>" => "a backslash before a line break is NOT a continuation in Mix — both characters are kept; join the pieces with `..`, or write `\\\\` for a literal backslash".to_string(),
                     _ => format!(
                         "`{text}` is kept literally (backslash included) — write `\\\\{}` if that is what you want, or use `\\u{{…}}` for a codepoint",
                         &text[1..]
@@ -486,6 +503,29 @@ fn check_string_literal_spelling(ctx: &FileContext, a: &mut Analysis, cfg: &Anal
             }
         }
     }
+}
+
+/// Every `function`/`fn` and lambda parameter name in the file, at any
+/// depth. Deliberately NOT part of `FileContext::top_level_names`, which
+/// models the universe a top-level read resolves against; this is the
+/// wider "was this spelling ever a variable here" question MIX-D3015 asks.
+fn collect_param_names(stmts: &[Stmt], out: &mut HashSet<String>) {
+    walk_stmts(stmts, &mut |stmt| {
+        if let StmtKind::FunctionDef { params, .. } = &stmt.kind {
+            for p in params {
+                out.insert(p.name.clone());
+            }
+        }
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_expr(expr, &mut |e| {
+                if let Expr::FunctionLiteral { params, .. } = e {
+                    for p in params {
+                        out.insert(p.name.clone());
+                    }
+                }
+            });
+        });
+    });
 }
 
 /// Immutable per-file facts shared by the passes.
@@ -1440,8 +1480,23 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
 
 /// Deep-walk an expression and every descendant (lambda bodies excluded,
 /// same as `walk_expr_children`).
+///
+/// `walk_expr_children` skips `Expr::If` ENTIRELY — its branches are
+/// statement lists, which is the scope pass's business — so the
+/// expression-position `if`'s CONDITIONS would otherwise never be seen by
+/// any caller of this walker. They are ordinary expressions evaluated in
+/// the current scope, so they are visited here; the branch statements are
+/// left to `for_each_embedded_stmt_list`, which is what the statement
+/// walkers use.
 fn for_each_expr(expr: &Expr, visit: &mut dyn FnMut(&Expr)) {
     visit(expr);
+    if let Expr::If(ifexpr) = expr {
+        for_each_expr(&ifexpr.condition, visit);
+        for (c, _) in &ifexpr.else_ifs {
+            for_each_expr(c, visit);
+        }
+        return;
+    }
     walk_expr_children(expr, &mut |child| for_each_expr(child, visit));
 }
 
@@ -1540,8 +1595,47 @@ fn scan_edit_chain_block(
             });
         });
 
+        // A `function`/`fn` body is a FRESH frame: its parameters SHADOW
+        // whatever the enclosing block bound, so carrying the facts in
+        // reported a write of an unrelated parameter that merely reused
+        // the name. Every other body (if/while/for/try) runs in the same
+        // scope and does inherit.
+        let nested_is_frame = matches!(&stmt.kind, StmtKind::FunctionDef { .. });
         for body in stmt_bodies(&stmt.kind) {
-            scan_edit_chain_block(body, ctx, a, &mut edited.clone());
+            let mut inner = if nested_is_frame {
+                HashMap::new()
+            } else {
+                edited.clone()
+            };
+            scan_edit_chain_block(body, ctx, a, &mut inner);
+        }
+        // Branch statements of an expression-position `if` run in the
+        // CURRENT scope; lambda bodies do not, so they are left alone
+        // (a conservative false negative, which is this analyzer's bias).
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_embedded_stmt_list(expr, false, &mut |body| {
+                scan_edit_chain_block(body, ctx, a, &mut edited.clone());
+            });
+        });
+
+        // A conditional body that reassigns a name makes the outer fact
+        // UNKNOWN, not still-true: `$s = replace(..)` then `if c then $s =
+        // "x" end` must not keep reporting the write as a replace result.
+        // Facts only ever cause a note, so dropping them is the safe way
+        // to be wrong.
+        if !nested_is_frame {
+            let mut written = HashSet::new();
+            for body in stmt_bodies(&stmt.kind) {
+                collect_bound_names(body, false, &mut written);
+            }
+            walk_stmt_exprs(stmt, &mut |expr| {
+                for_each_embedded_stmt_list(expr, false, &mut |body| {
+                    collect_bound_names(body, false, &mut written);
+                });
+            });
+            for name in written {
+                edited.remove(&name);
+            }
         }
 
         if let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } = &stmt.kind {

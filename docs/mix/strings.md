@@ -28,7 +28,7 @@ The split mirrors bash's quoting, with one trap that bites everyone:
 
 | Form | Interpolates `${x}` | Bare `$x` | `$(...)` | leading `~` | Escapes |
 |---|---|---|---|---|---|
-| `"double"` | yes (scope → env) | **literal text** | **literal text** | expands to `$HOME` | `\n \t \r \e \" \\ \$ \~ \u{…}` |
+| `"double"` | yes (scope → env) | **literal text** | **literal text** | expands to `$HOME` | `\n \t \r \e \a \b \f \v \0 \xHH \" \\ \$ \~ \u{…}` |
 | `'single'` | no | literal | literal | literal | only `\'` and `\\` |
 
 **Only `${...}` interpolates** inside double quotes. A bare `$name` is the literal
@@ -313,6 +313,13 @@ The three boundaries, in one table:
 | codepoints (default) | `length`/`len`, `pos`, `lastpos`, `index_of`, `substr`, `reverse`, `left`, `right` | Unicode scalar values |
 | raw bytes | `byte_length`, `byte_pos`, `byte_lastpos`, `byte_index_of` | UTF-8 bytes |
 | user-perceived chars | `grapheme_count`, `grapheme_substr`, `grapheme_reverse` | grapheme clusters (UAX #29) |
+| terminal columns | `display_width`, `lpad_w`, `rpad_w`, `word_wrap_w` | display cells (UAX #11) |
+
+All four rows are operations on **text**. Operations on a raw `bytes`/`buffer`
+*value* are a different family, `bytes_*` — see
+[io](io.md#naming-byte_-vs-bytes_). The two are easy to confuse and are not
+interchangeable: `byte_length($some_bytes)` stringifies its argument first and
+so measures the `<bytes:N>` placeholder, not the bytes.
 
 ### `ord` / `chr` — codepoint ↔ character (0.90.0)
 
@@ -339,14 +346,6 @@ print(chr(0x27))         -- the runtime twin of "\u{27}"
 also mean "absent". `chr` takes the `\u{…}` validity rule exactly — a surrogate
 (`chr(0xD800)`), anything above `0x10FFFF`, and a fractional or negative argument
 all raise rather than saturate to a plausible wrong character.
-| terminal columns | `display_width`, `lpad_w`, `rpad_w`, `word_wrap_w` | display cells (UAX #11) |
-
-All four rows are operations on **text**. Operations on a raw `bytes`/`buffer`
-*value* are a different family, `bytes_*` — see
-[io](io.md#naming-byte_-vs-bytes_). The two are easy to confuse and are not
-interchangeable: `byte_length($some_bytes)` stringifies its argument first and
-so measures the `<bytes:N>` placeholder, not the bytes.
-
 A plain `substr`/`reverse` is codepoint-based and **splits** an emoji ZWJ sequence or
 combining cluster; the `grapheme_*` ops keep it whole:
 

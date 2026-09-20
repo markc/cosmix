@@ -616,6 +616,11 @@ impl Lexer {
                     break;
                 }
                 Some('\\') => {
+                    // The line of the BACKSLASH, not of whatever follows:
+                    // `self.advance()` over an escaped physical newline has
+                    // already moved `self.line` on, which reported the
+                    // escape one line below where it was written.
+                    let esc_line = self.line;
                     self.advance();
                     match self.advance() {
                         Some('n') => {
@@ -680,13 +685,24 @@ impl Lexer {
                                 // 0x00..=0xFF is always a valid char.
                                 current.push(char::from_u32(cp).expect("0x00..=0xFF is a char"));
                             } else {
-                                self.note_unknown_escape('x');
+                                self.note_unknown_escape(esc_line, 'x');
                                 current.push('\\');
                                 current.push('x');
                             }
                         }
                         Some(c) => {
-                            self.note_unknown_escape(c);
+                            // A backslash before a PHYSICAL newline: the
+                            // string really does span lines (so the bare-`$`
+                            // batch must be dropped with every other
+                            // multi-line string), and its diagnostic cannot
+                            // quote the escape verbatim without putting a
+                            // raw newline inside the message — which would
+                            // break the one-finding-per-line human format
+                            // and the `--json` text alike.
+                            if c == '\n' || c == '\r' {
+                                multiline = true;
+                            }
+                            self.note_unknown_escape(esc_line, c);
                             current.push('\\');
                             current.push(c);
                         }
@@ -780,14 +796,20 @@ impl Lexer {
     /// design decision (it protects embedded JSON and `C:\users`), so
     /// warning about it would be noise on code that is already correct.
     /// `\u{…}` never reaches here at all.
-    fn note_unknown_escape(&mut self, c: char) {
+    fn note_unknown_escape(&mut self, line: usize, c: char) {
         if c == 'u' {
             return;
         }
-        self.string_notes.push(StringNote::UnknownEscape {
-            line: self.line,
-            text: format!("\\{c}"),
-        });
+        // Never put a raw control character in a diagnostic: `text` is
+        // quoted straight into the message, and a literal newline there
+        // splits one finding across two output lines.
+        let text = match c {
+            '\n' => "\\<newline>".to_string(),
+            '\r' => "\\<carriage-return>".to_string(),
+            '\t' => "\\<tab>".to_string(),
+            c => format!("\\{c}"),
+        };
+        self.string_notes.push(StringNote::UnknownEscape { line, text });
     }
 
     /// Record a bare `$name` in a double-quoted literal, for MIX-W2404.
