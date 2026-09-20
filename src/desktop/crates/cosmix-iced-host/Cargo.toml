@@ -17,11 +17,11 @@ xkb = ["dep:xkbcommon"]
 # fails to build on Linux with no backend, so its dlopen'd Wayland presenter is
 # enabled; this crate never calls it and nothing links libwayland for it.
 [dependencies]
-iced_core = "=0.14.0"
-iced_graphics = "=0.14.0"
-iced_renderer = { version = "=0.14.0", default-features = false, features = ["tiny-skia"] }
-iced_runtime = "=0.14.0"
-iced_tiny_skia = { version = "=0.14.1", default-features = false, features = ["wayland"] }
-iced_widget = { version = "=0.14.2", default-features = false }
+iced_core = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e" }
+iced_graphics = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e" }
+iced_renderer = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false, features = ["tiny-skia"] }
+iced_runtime = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e" }
+iced_tiny_skia = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false, features = ["wayland"] }
+iced_widget = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false }
 tiny-skia = { version = "=0.11.4", default-features = false, features = ["std", "simd"] }
 xkbcommon = { version = "=0.7.0", default-features = false, optional = true }

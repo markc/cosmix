@@ -15,11 +15,11 @@ gallery-wgpu = ["gallery", "wgpu"]
 gallery-tiny-skia = ["gallery", "tiny-skia"]
 
 [dependencies]
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "wayland", "thread-pool"] }
+iced = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false, features = ["advanced", "wayland", "thread-pool"] }
 cosmix-design = { path = "../cosmix-design", default-features = false }
 
 [dev-dependencies]
-iced_runtime = { version = "=0.14.0", default-features = false }
+iced_runtime = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false }
 
 [[example]]
 name = "gallery"
