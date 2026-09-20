@@ -38,6 +38,13 @@ impl Harness {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()))
             .init_asset::<Image>()
             .add_plugins(SceneIcedPlugin)
+            // `SceneIcedPlugin::finish` only installs the channel when there
+            // is a `RenderApp`, and there is none under `MinimalPlugins`.
+            // Since uploads are counted after the channel gate (round-2
+            // NEW-2: only what reaches the render world is counted), a
+            // harness without one reads zero bytes for every frame and the
+            // upload assertions below measure nothing.
+            .insert_resource(crate::gpu::GpuChannel::default())
             .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
                 16,
             )));

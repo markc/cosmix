@@ -429,7 +429,11 @@ fn plugin_mounts_iced_and_sends_handlers_on_the_scene_bus_path() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default()))
         .init_asset::<Image>()
-        .add_plugins((crate::SceneIcedPlugin, IcedRendererPlugin));
+        .add_plugins((crate::SceneIcedPlugin, IcedRendererPlugin))
+        // No RenderApp under MinimalPlugins, so SceneIcedPlugin::finish
+        // never installs the upload channel; uploads are counted after the
+        // channel gate, so without one every byte assertion below reads zero.
+        .insert_resource(crate::gpu::GpuChannel::default());
     let (bridge, peer) = ctk::bus::test_bridge("test");
     let (rc, reply) = app.world_mut().resource_mut::<SceneStore>().dispatch(
         SceneVerb::Load,
@@ -720,7 +724,11 @@ fn handler_calls_wait_for_the_bus() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default()))
         .init_asset::<Image>()
-        .add_plugins((crate::SceneIcedPlugin, IcedRendererPlugin));
+        .add_plugins((crate::SceneIcedPlugin, IcedRendererPlugin))
+        // No RenderApp under MinimalPlugins, so SceneIcedPlugin::finish
+        // never installs the upload channel; uploads are counted after the
+        // channel gate, so without one every byte assertion below reads zero.
+        .insert_resource(crate::gpu::GpuChannel::default());
     let outbox = app.world().resource::<IcedOutbox>().0.clone();
     outbox
         .lock()
@@ -785,7 +793,11 @@ fn the_renderer_plugin_mounts_the_bridge_itself() {
     let mut app = App::new();
     app.add_plugins((MinimalPlugins, AssetPlugin::default()))
         .init_asset::<Image>()
-        .add_plugins(IcedRendererPlugin);
+        .add_plugins(IcedRendererPlugin)
+        // No RenderApp under MinimalPlugins, so SceneIcedPlugin::finish
+        // never installs the upload channel; uploads are counted after the
+        // channel gate, so without one every byte assertion below reads zero.
+        .insert_resource(crate::gpu::GpuChannel::default());
     let (bridge, _peer) = ctk::bus::test_bridge("test");
     let (rc, reply) = app.world_mut().resource_mut::<SceneStore>().dispatch(
         SceneVerb::Load,
