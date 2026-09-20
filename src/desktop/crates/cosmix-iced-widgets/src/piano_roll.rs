@@ -5,7 +5,7 @@
 //! geometry is cached per zoom level (pixels per beat and row height) and
 //! scrolling only translates cached tiles. Grid, notes and playhead are
 //! separate layers, so moving the playhead never touches note geometry.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use iced_core::{
     Clipboard, Layout, Shell, Widget, layout, mouse, renderer,
@@ -224,13 +224,33 @@ pub(crate) fn tile_rects(
     index: i64,
     colours: usize,
 ) -> Vec<Vec<Rectangle>> {
+    tile_rects_observed(
+        notes,
+        pixels_per_beat,
+        row_height,
+        index,
+        colours,
+        |_, _| {},
+    )
+}
+
+fn tile_rects_observed(
+    notes: &RollNotes,
+    pixels_per_beat: f32,
+    row_height: f32,
+    index: i64,
+    colours: usize,
+    mut emitted: impl FnMut(usize, Rectangle),
+) -> Vec<Vec<Rectangle>> {
     let colours = colours.max(1);
     let x0 = index as f32 * TILE_WIDTH;
     let columns = TILE_WIDTH as usize;
     let mut covered = vec![0u64; (columns * PITCHES).div_ceil(64)];
     let mut out: Vec<Vec<Rectangle>> = vec![Vec::new(); colours * VELOCITY_LEVELS];
     let height = (row_height - 1.0).max(1.0);
-    for (_, note) in notes.visible(x0 / pixels_per_beat, (x0 + TILE_WIDTH) / pixels_per_beat) {
+    for (note_index, note) in
+        notes.visible(x0 / pixels_per_beat, (x0 + TILE_WIDTH) / pixels_per_beat)
+    {
         let start = (note.start * pixels_per_beat - x0).max(0.0);
         let end = ((note.start + note.length) * pixels_per_beat - x0).min(TILE_WIDTH);
         if end <= start {
@@ -255,6 +275,7 @@ pub(crate) fn tile_rects(
             };
             Rectangle::new(Point::new(start, y), Size::new(width, height))
         };
+        emitted(note_index, rect);
         out[usize::from(note.track) % colours * VELOCITY_LEVELS + level].push(rect);
     }
     out
@@ -325,6 +346,7 @@ impl<Renderer: geometry::Renderer> TileSet<Renderer> {
 }
 
 struct RollState<Renderer: geometry::Renderer> {
+    reported_size: Cell<Option<Size>>,
     tiles: RefCell<TileSet<Renderer>>,
     generation: u64,
     style: AudioStyle,
@@ -338,6 +360,7 @@ struct RollState<Renderer: geometry::Renderer> {
 /// around the pointer. Each change publishes the new `RollView`; store it
 /// and pass it back. A left press on a note publishes its index.
 pub struct PianoRoll<'a, Message> {
+    on_geometry: Option<Box<dyn Fn(RollView, Size, usize) + 'a>>,
     notes: &'a RollNotes,
     view: RollView,
     playhead: Option<f32>,
@@ -353,6 +376,7 @@ impl<'a, Message> PianoRoll<'a, Message> {
     /// Shows `notes` through `view`.
     pub fn new(notes: &'a RollNotes, view: RollView) -> Self {
         Self {
+            on_geometry: None,
             notes,
             view,
             playhead: None,
@@ -363,6 +387,14 @@ impl<'a, Message> PianoRoll<'a, Message> {
             height: Length::Fill,
             style: AudioStyle::default(),
         }
+    }
+
+    /// Reports the first draw at each resolved size. The count is distinct
+    /// notes with emitted tile rectangles intersecting the canvas, after
+    /// sub-pixel coalescing (tile seams do not count a note twice).
+    pub fn on_geometry(mut self, callback: impl Fn(RollView, Size, usize) + 'a) -> Self {
+        self.on_geometry = Some(Box::new(callback));
+        self
     }
 
     /// Playhead position in beats.
@@ -434,6 +466,7 @@ where
 
     fn state(&self) -> tree::State {
         tree::State::new(RollState::<Renderer> {
+            reported_size: Cell::new(None),
             tiles: RefCell::new(TileSet::new()),
             generation: self.notes.generation,
             style: self.style,
@@ -597,8 +630,34 @@ where
         let last = ((scroll_x + bounds.width) / TILE_WIDTH).floor() as i64;
         let tile_size = Size::new(TILE_WIDTH, PITCHES as f32 * view.row_height);
         let mut tiles = state.tiles.borrow_mut();
+        let report = self.on_geometry.is_some() && state.reported_size.get() != Some(bounds.size());
+        let mut drawn_notes = std::collections::HashSet::new();
         renderer.with_layer(bounds, |renderer| {
             for index in first..=last {
+                // Only on a first draw/resize: use the same emitter as the
+                // cached geometry, including clipping and coalescing.
+                if report {
+                    tile_rects_observed(
+                        self.notes,
+                        view.pixels_per_beat,
+                        view.row_height,
+                        index,
+                        self.track_colours.len(),
+                        |note_index, rect| {
+                            let rect = Rectangle {
+                                x: rect.x + index as f32 * TILE_WIDTH - scroll_x,
+                                y: rect.y - view.scroll_y,
+                                ..rect
+                            };
+                            if rect
+                                .intersection(&Rectangle::with_size(bounds.size()))
+                                .is_some()
+                            {
+                                drawn_notes.insert(note_index);
+                            }
+                        },
+                    );
+                }
                 let (cache, _) = tiles.get(view.key(), index);
                 let geometry = cache.draw(renderer, tile_size, |frame| {
                     let groups = tile_rects(
@@ -634,6 +693,13 @@ where
                 });
             }
         });
+
+        if report {
+            state.reported_size.set(Some(bounds.size()));
+            if let Some(callback) = &self.on_geometry {
+                callback(view, bounds.size(), drawn_notes.len());
+            }
+        }
 
         // Layer 3: the playhead.
         if let Some(beat) = self.playhead {
@@ -824,6 +890,39 @@ mod tests {
             Some(2)
         );
         assert_eq!(notes.notes()[1].pitch, 60);
+    }
+
+    #[test]
+    fn geometry_observer_counts_emitted_notes_after_clipping_and_coalescing() {
+        let notes = RollNotes::new(vec![
+            note(0.0, 20.0, 60), // crosses the tile seam: count once
+            note(1.0, 0.0001, 61),
+            note(1.0001, 0.0001, 61), // same sub-pixel column: coalesced
+            note(0.0, 20.0, 30), // vertically outside the canvas
+            note(25.6, 1.0, 60), // starts exactly at the right edge
+        ]);
+        let view = RollView {
+            scroll_beats: 0.0,
+            scroll_y: 66.0 * 10.0,
+            pixels_per_beat: 40.0,
+            row_height: 10.0,
+        };
+        let canvas = Rectangle::with_size(Size::new(1024.0, 20.0));
+        let mut drawn = std::collections::HashSet::new();
+        for tile in 0..=2 {
+            let observed = tile_rects_observed(&notes, 40.0, 10.0, tile, 1, |index, rect| {
+                let rect = Rectangle {
+                    x: rect.x + tile as f32 * TILE_WIDTH,
+                    y: rect.y - view.scroll_y,
+                    ..rect
+                };
+                if rect.intersection(&canvas).is_some() {
+                    drawn.insert(index);
+                }
+            });
+            assert_eq!(observed, tile_rects(&notes, 40.0, 10.0, tile, 1));
+        }
+        assert_eq!(drawn.len(), 2);
     }
 
     #[test]

@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bench-mixer-bevy"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bevy",
  "cosmix-bench-feed",
@@ -2893,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bench-mixer-iced"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "cosmix-bench-feed",
  "cosmix-design",
@@ -3023,7 +3023,7 @@ version = "0.1.0"
 
 [[package]]
 name = "cosmix-iced-widgets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cosmix-design",
  "iced",

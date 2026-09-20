@@ -3,7 +3,7 @@
 # app: it carries no [package.metadata.cosmix] and is never deployed.
 [package]
 name = "cosmix-bench-mixer-bevy"
-version = "0.1.0"
+version = "0.1.1"
 description = "Mixer + roll bake-off, Bevy/CTK arm: 64 CTK strips with animated meters and a pooled piano roll fed by cosmix-bench-feed"
 edition = "2024"
 rust-version = "1.95"

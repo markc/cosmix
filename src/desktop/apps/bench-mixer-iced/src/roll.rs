@@ -21,8 +21,8 @@ use cosmix_bench_feed::roll::{
 use cosmix_bench_feed::{BenchSong, RollViewport};
 use cosmix_iced_widgets::piano_roll::{MAX_PIXELS_PER_BEAT, MIN_PIXELS_PER_BEAT};
 use cosmix_iced_widgets::{Note, PianoRoll, RollNotes, RollView, Tokens};
-use iced::widget::container;
-use iced::{Element, Fill};
+use iced::widget::{container, responsive};
+use iced::{Element, Fill, Size};
 
 use crate::app::{Bench, Message};
 
@@ -60,6 +60,19 @@ pub fn roll_view(viewport: RollViewport, song: &BenchSong, width: f32, height: f
         pixels_per_beat: (width.max(1.0) / span_beats.max(f32::MIN_POSITIVE))
             .clamp(MIN_PIXELS_PER_BEAT, MAX_PIXELS_PER_BEAT),
         row_height,
+    }
+}
+
+/// Preserve the visible beats and pitch rows when the canvas changes size.
+/// This also preserves a hand-scrolled/zoomed view in idle mode.
+pub fn resize_view(view: RollView, from: Size, to: Size) -> RollView {
+    let y = to.height.max(1.0) / from.height.max(1.0);
+    RollView {
+        pixels_per_beat: (to.width.max(1.0) / (from.width.max(1.0) / view.pixels_per_beat))
+            .clamp(MIN_PIXELS_PER_BEAT, MAX_PIXELS_PER_BEAT),
+        row_height: view.row_height * y,
+        scroll_y: view.scroll_y * y,
+        ..view
     }
 }
 
@@ -106,19 +119,38 @@ pub fn report_note_cap(song: &BenchSong) {
 
 pub fn view<'a>(bench: &'a Bench, tokens: Tokens) -> Element<'a, Message> {
     let style = tokens.audio_style();
-    container(
-        PianoRoll::new(&bench.notes, bench.roll)
-            .track_colours(&bench.track_colours)
-            .width(Fill)
-            .height(Fill)
-            .on_view(Message::Roll)
-            .style(style),
-    )
-    .width(Fill)
-    .height(Fill)
-    .style(move |_| container::Style {
-        background: Some(tokens.surface.into()),
-        ..container::Style::default()
+    responsive(move |size| {
+        container(
+            PianoRoll::new(&bench.notes, bench.roll_at_size(size))
+                .on_geometry(move |view, size, notes| {
+                    let key_hi = view.pitch_at(0.001).unwrap_or(127);
+                    let key_lo = view.pitch_at(size.height - 0.001).unwrap_or(0);
+                    let ticks = bench.song.as_ref().map_or(1, |song| song.ticks_per_beat);
+                    eprintln!(
+                        "bench-mixer-iced: roll key_lo={key_lo} key_hi={key_hi} key_rows={} \
+                         row_height={:.6}px span={:.6}ticks pixels_per_beat={:.6} \
+                         rect={:.3}x{:.3}px notes={notes}",
+                        u32::from(key_hi - key_lo) + 1,
+                        view.row_height,
+                        size.width / view.pixels_per_beat * ticks as f32,
+                        view.pixels_per_beat,
+                        size.width,
+                        size.height,
+                    );
+                })
+                .track_colours(&bench.track_colours)
+                .width(Fill)
+                .height(Fill)
+                .on_view(move |view| Message::Roll(view, size))
+                .style(style),
+        )
+        .width(Fill)
+        .height(Fill)
+        .style(move |_| container::Style {
+            background: Some(tokens.surface.into()),
+            ..container::Style::default()
+        })
+        .into()
     })
     .into()
 }
@@ -201,6 +233,12 @@ mod tests {
             assert!(view.pixels_per_beat >= MIN_PIXELS_PER_BEAT);
             assert!(view.pixels_per_beat <= MAX_PIXELS_PER_BEAT);
             assert!(view.scroll_beats >= 0.0);
+            assert!(
+                (f64::from(view.beat_at(1024.0)) - viewport.end() / f64::from(song.ticks_per_beat))
+                    .abs()
+                    < 1e-3,
+                "the clamp must not silently change the scripted slice at tick {tick}"
+            );
         }
     }
 

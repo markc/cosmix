@@ -29,7 +29,7 @@ pub enum Message {
     Release,
     /// The roll was scrolled or zoomed by hand (not in `--mode roll`, whose
     /// script owns the viewport).
-    Roll(RollView),
+    Roll(RollView, Size),
     /// The window's logical size, so the roll's beats-per-pixel follows the
     /// surface the compositor actually gave us rather than what was asked for.
     Resized(Size),
@@ -57,6 +57,9 @@ pub struct Bench {
     /// One colour per track, the spread CTK's `channel_color` draws.
     pub track_colours: Vec<iced::Color>,
     pub roll: RollView,
+    /// Reference canvas for `roll`; idle resizes must not repeatedly round
+    /// its pixel scale or notes just beyond the right edge can leak in.
+    roll_size: Size,
     /// The shared board geometry for the current size; the Bevy arm and the
     /// driver read the same rectangles from the same function.
     pub layout: Layout,
@@ -92,6 +95,7 @@ impl Bench {
             song,
             notes,
             roll,
+            roll_size: size,
             layout: Layout::new((size.width, size.height), config.strips),
             size,
             config,
@@ -116,6 +120,13 @@ impl Bench {
             self.size.width,
             self.size.height,
         );
+        self.roll_size = self.size;
+    }
+
+    /// Resolve the same slice against the canvas's actual layout size, even
+    /// before the window resize subscription has delivered its message.
+    pub fn roll_at_size(&self, size: Size) -> RollView {
+        roll::resize_view(self.roll, self.roll_size, size)
     }
 
     pub fn update(&mut self, message: Message) {
@@ -144,9 +155,10 @@ impl Bench {
             Message::Release => {}
             Message::Mute(slot, on) => self.mutes[slot] = on,
             Message::Solo(slot, on) => self.solos[slot] = on,
-            Message::Roll(view) => {
+            Message::Roll(view, size) => {
                 if self.config.mode != Mode::Roll {
                     self.roll = view;
+                    self.roll_size = size;
                 }
             }
             Message::Resized(size) => {
@@ -206,6 +218,66 @@ mod tests {
             None,
             crate::theme::tokens().unwrap(),
         )
+    }
+
+    #[test]
+    fn idle_roll_preserves_its_slice_through_layout_and_resize() {
+        let mut source = cosmix_song::Song::new("resize-test");
+        let mut track = cosmix_song::Track::new("notes", 0);
+        for step in 0..128 {
+            track.add_note(cosmix_song::Note::new(
+                40 + (step % 30) as u8,
+                100,
+                step * 240,
+                200,
+            ));
+        }
+        source.add_track(track);
+        let song = BenchSong::from_song(&source);
+        let initial = RollViewport::initial(&song);
+        let mut visible = Vec::new();
+        initial.visible_notes_into(&song, &mut visible);
+        let mut bench = Bench::new(
+            config(Mode::Idle, View::Roll, 64),
+            Some(song.clone()),
+            crate::theme::tokens().unwrap(),
+        );
+        for size in [
+            Size::new(795.2, 420.0),
+            Size::new(1024.0, 576.0),
+            Size::new(900.0, 500.0),
+            Size::new(795.2, 420.0),
+            Size::new(1024.0, 576.0),
+        ] {
+            let expected = roll::roll_view(initial, &song, size.width, size.height);
+            // Layout may precede the resize message; both paths must agree.
+            for actual in [bench.roll_at_size(size), {
+                bench.update(Message::Resized(size));
+                bench.roll_at_size(size)
+            }] {
+                assert!((actual.row_height - expected.row_height).abs() < 1e-4);
+                assert!((actual.scroll_y - expected.scroll_y).abs() < 1e-3);
+                assert!((actual.pixels_per_beat - expected.pixels_per_beat).abs() < 1e-4);
+                assert_eq!(actual.scroll_beats, expected.scroll_beats);
+                assert_eq!(actual.beat_at(size.width), expected.beat_at(size.width),
+                    "even sub-pixel drift can admit the notes at the excluded right edge");
+                assert_eq!(bench.notes.visible(actual.scroll_beats, actual.beat_at(size.width)).count(),
+                    visible.len(), "resize must preserve the half-open note set");
+            }
+        }
+        let size = Size::new(795.0, 420.0);
+        let manual =
+            bench
+                .roll_at_size(size)
+                .zoomed(2.0, 200.0)
+                .scrolled(30.0, 20.0, size.height, 64.0);
+        bench.update(Message::Roll(manual, size));
+        bench.update(Message::Resized(size));
+        let actual = bench.roll_at_size(size);
+        assert!((actual.scroll_beats - manual.scroll_beats).abs() < 1e-4);
+        assert!((actual.scroll_y - manual.scroll_y).abs() < 1e-3);
+        assert!((actual.row_height - manual.row_height).abs() < 1e-4);
+        assert!((actual.pixels_per_beat - manual.pixels_per_beat).abs() < 1e-4);
     }
 
     #[test]
@@ -318,7 +390,10 @@ mod tests {
         bench.update(Message::Pan(0, 0.5));
         bench.update(Message::Release);
         assert!(bench.mutes[1] && bench.solos[2]);
-        assert_eq!(bench.pans[0], 0.5, "controls are controlled: store and echo");
+        assert_eq!(
+            bench.pans[0], 0.5,
+            "controls are controlled: store and echo"
+        );
         bench.update(Message::Tick(9));
         assert_eq!(bench.meters, before);
     }

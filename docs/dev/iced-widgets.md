@@ -1,6 +1,6 @@
 # Shared iced widgets
 
-`cosmix-iced-widgets` 0.1.0 provides a single-line `TextField`, a menu bar,
+`cosmix-iced-widgets` 0.1.1 provides a single-line `TextField`, a menu bar,
 context menus, pro-audio controls (fader, pan knob, level meter, toggle), a
 waveform and a piano roll, and a `cosmix-design` colour/metric adapter. It
 uses upstream iced 0.14 component crates, pinned exactly, with defaults
@@ -10,7 +10,7 @@ select `wgpu` or `tiny-skia`. Upstream iced_renderer requires a renderer
 feature for release builds. Only the gallery example uses iced's winit shell
 (Wayland-only).
 
-## Public API (0.1.0)
+## Public API (0.1.1)
 
 This is the whole surface other crates may rely on. Everything else is private.
 
@@ -129,6 +129,8 @@ PianoRoll::new(&RollNotes, RollView)        // fill x fill
     .playhead(Option<f32>)                  // beats
     .on_view(impl Fn(RollView) -> Message)  // wheel, Shift+wheel, Ctrl+wheel zoom
     .on_note(impl Fn(usize) -> Message)     // index into RollNotes::notes()
+    .on_geometry(impl Fn(RollView, Size, usize)) // first draw at each canvas size;
+                                            // resolved view, logical px, drawn notes
     .track_colours(&[Color])                // Note::track picks one, wrapping;
                                             // empty = AudioStyle::note
     .width(..) .height(..) .style(AudioStyle)
@@ -140,6 +142,21 @@ AudioStyle { background, track, fill, thumb, text, muted_text, border,
 ```
 
 Contracts a host must honour:
+
+- **Roll geometry.** Map beats and pitch rows against the canvas layout size,
+  not just the requested window size. The mixer benchmark resolves its view
+  during layout and preserves the visible slice across idle resizes, including
+  hand scrolling/zooming. It keeps a stable reference canvas rather than
+  repeatedly rescaling rounded pixel values: even a tiny right-edge drift
+  can admit notes at the next beat. Both benchmark arms log `roll key_lo=… key_hi=…
+  key_rows=… row_height=…px span=…ticks pixels_per_beat=… rect=…x…px notes=…`
+  on the first draw and on each canvas resize. Compare matching `rect` lines
+  after window negotiation. The widget's optional geometry callback counts
+  distinct notes whose emitted tile rectangles intersect the canvas, after
+  sub-pixel coalescing; a note spanning tile seams counts once. This diagnostic
+  repeats the tile emitter only on those reporting draws, not during steady
+  animation. The benchmark retains the widget's horizontal zoom limits;
+  the initial and scripted spans at the standard size fit inside them.
 
 - **Controlled value.** Store every `on_input` value; pass it back to
   `TextField::new` on the next view. A value that differs from the last one

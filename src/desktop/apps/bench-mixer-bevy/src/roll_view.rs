@@ -317,6 +317,9 @@ fn draw_roll(
     if state.drawn == Some(key) {
         return;
     }
+    let report = state
+        .drawn
+        .is_none_or(|old| old.width != key.width || old.height != key.height);
     state.drawn = Some(key);
 
     let accent = theme.color(&tokens::CONTROL_ACTIVE);
@@ -367,6 +370,20 @@ fn draw_roll(
         )
     });
     sync_pool(&mut layers.notes, notes, &mut commands, &mut items);
+    if report {
+        eprintln!(
+            "bench-mixer-bevy: roll key_lo={} key_hi={} key_rows={} row_height={:.6}px span={:.6}ticks pixels_per_beat={:.6} rect={:.3}x{:.3}px notes={}",
+            view.key_lo,
+            view.key_hi,
+            view.key_rows(),
+            view.row_height(height),
+            view.span,
+            f64::from(width) * f64::from(song.ticks_per_beat) / view.span,
+            width,
+            height,
+            layers.notes.shown
+        );
+    }
 }
 
 #[cfg(test)]
