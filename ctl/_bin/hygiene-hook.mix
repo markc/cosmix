@@ -114,26 +114,28 @@ end
 -- cosmix-lib-mix and end to end by T67/T68/T69. Two builtin calls, nothing
 -- written to disk — cheap enough to sit in front of every call, unlike the
 -- subprocess require_stdin_raises() needs.
--- The Mix RUNNING this, which is not necessarily $MIX and must not be described
--- as it: require_stdin_raises() probes $MIX in a subprocess and can name its
--- version, this probes the interpreter evaluating these lines and cannot name
--- its own. (There IS a `mix_version()` builtin now — which is precisely why the
--- local helper below had to be renamed: a user `fn` that collides with a builtin
--- name is never called, so every site here was silently answering with the
--- RUNNING interpreter's version instead of $MIX's — the exact confusion this
--- comment exists to prevent. `mix lint` reports the collision as MIX-E1303
--- since 0.90.0.) Normally
--- they are the same binary, because the installed stub invokes $MIX; when they
--- are not, printing $MIX's version as the culprit names the wrong one, and the
--- first draft did exactly that — "mix 0.39.0 ignores the second argument",
--- reported by a 0.38.0 build. So $MIX's version is given as context, labelled.
+-- The Mix RUNNING this is not necessarily $MIX and must not be described as it:
+-- require_stdin_raises() probes $MIX in a subprocess, this evaluates in whatever
+-- interpreter started the hook. An earlier version of this comment said there is
+-- no version()/mix_version() builtin and called one "worth adding"; that stopped
+-- being true in mix 0.78.0, and believing the stale note is what left this
+-- refusal unable to name its own culprit. It names both now, labelled.
+--
+-- Mind the two numbers. `mix_version()` is cosmix-lib-MIX's version and returns
+-- a MAP (take ["string"]); mix_bin_version() below shells out to $MIX --version
+-- and is the cosmix-mix BINARY's. The two crates version independently, so they
+-- routinely disagree on one install. Normally the two BINARIES are the same,
+-- because the installed stub invokes $MIX; when they are not, printing $MIX's
+-- version as the culprit names the wrong one, and the first draft did exactly
+-- that — "mix 0.39.0 ignores the second argument", reported by a 0.38.0 build.
 fn no_lstat_option($why)
   refuse(2, "the Mix running this hook " .. $why .. ", so it cannot be asked"
     .. " whether a name is an ENTRY rather than a readable file. Mix >= 0.39.0"
     .. " is required: without it a DANGLING <hook>.pre-hygiene reads as absent"
     .. " and the chained hook's veto is dropped in silence. Refusing rather"
-    .. " than scanning past it. (The stub runs this hook with " .. $MIX
-    .. ", currently " .. target_mix_version() .. "; if that reads >= 0.39.0 then this"
+    .. " than scanning past it. (This hook is running under cosmix-lib-mix "
+    .. mix_version()["string"] .. ". The stub runs this hook with " .. $MIX
+    .. ", currently " .. mix_bin_version() .. "; if that reads >= 0.39.0 then this"
     .. " hook was started by some other Mix)")
 end
 
@@ -199,14 +201,20 @@ end
 -- clean integers.
 $MIN_MIX = [0, 33, 0]
 
--- NOT `mix_version` — that is a BUILTIN, and a user `fn` of a builtin's name is
--- never called (the builtin wins at every call site). Under the old name this
--- whole helper was dead and every caller below quietly got the RUNNING
--- interpreter's version rather than $MIX's, which is the distinction the
--- comments here are at pains to keep. `mix lint` errors on the collision as
--- MIX-E1303 since 0.90.0; before that it was only a warning and this sat here
--- undetected.
-fn target_mix_version()
+-- NOT `mix_version` — that is a BUILTIN (0.78.0), and a user `fn` of a
+-- builtin's name is never called: the builtin wins at every call site. Under
+-- the old name this whole helper was DEAD and all three callers had been
+-- answered by the builtin for sixteen releases. That is worse than the wrong
+-- number, because the builtin returns a MAP: the refusals that exist to name
+-- the culprit were printing
+--
+--   currently {major: 0, minor: 88, patch: 0, string: 0.88.0}
+--
+-- mid-sentence, and 0.88.0 was cosmix-lib-mix's version while every call site
+-- wants the cosmix-mix BINARY at $MIX. The name says which of the two it is.
+-- `mix lint` errors on the collision as MIX-E1303 since 0.90.0; before that it
+-- was a warning, which is why this sat here undetected.
+fn mix_bin_version()
   $r = run_argv([$MIX, "--version"], {timeout: 60})
   if $r["ok"] != true then
     return "unknown"
@@ -227,8 +235,8 @@ end
 -- Both the installed hook's shebang and its body invoke $MIX, so probing that
 -- binary probes the interpreter actually running this — not a different one on
 -- PATH. (A script cannot read its own interpreter's BEHAVIOUR from inside Mix,
--- which is what this probe is for; `mix_version()` does report the running
--- interpreter's version, and that is a claim about behaviour, not behaviour.)
+-- which is what this probe is for; `mix_version()` reports cosmix-lib-mix's
+-- version, and a version is a claim ABOUT behaviour, not behaviour.)
 fn require_stdin_raises()
   $probe = join([
     "try",
@@ -242,12 +250,12 @@ fn require_stdin_raises()
   $r = run_argv([$MIX, "-c", $probe],
     {timeout: 60, stdin: freeze(buffer([0x80]))})
   if $r["ok"] != true then
-    refuse(2, "cannot probe " .. $MIX .. " (" .. target_mix_version() .. ") for its"
+    refuse(2, "cannot probe " .. $MIX .. " (" .. mix_bin_version() .. ") for its"
       .. " undecodable-stdin behaviour — refusing rather than assuming it"
       .. " raises")
   end
   if trim($r["stdout"]) != "RAISED" then
-    refuse(2, $MIX .. " (" .. target_mix_version() .. ") returns instead of raising on"
+    refuse(2, $MIX .. " (" .. mix_bin_version() .. ") returns instead of raising on"
       .. " stdin that is not UTF-8 (probe said: " .. sanitize(trim($r["stdout"]))
       .. "). This hook needs the raise: without it a ref name containing one"
       .. " such byte makes read_stdin() hand back \"\", which is"
