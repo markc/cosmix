@@ -148,15 +148,21 @@ impl Painter {
     /// on the SAME terminal; see [`Painter::invalidate`].
     pub fn repaint(&mut self, screen: &Screen, dirty: &[bool]) -> bool {
         let mut frame = self.frame.lock().expect("frame lock");
-        let before = frame.surface.grid();
+        // Whether the surface HAS pixels, not what shape they are in. The
+        // first cut compared `grid()`, which `invalidate` also resets to
+        // (0, 0) — so `repaint(nonempty) -> invalidate -> repaint(empty)`
+        // compared (0,0) against (0,0), reported no change, and left the CPU
+        // arm presenting a stale image (re-review residual, 2026-09-21). A
+        // geometry change that is not a clear always produces bands, so
+        // emptiness is the only no-band change there is.
+        let had_pixels = !frame.surface.is_empty();
         let bands = self.raster.render_into(screen, dirty, &mut frame.surface);
         if bands.is_empty() {
             // An empty band list usually means "nothing changed" — but a
             // screen with no paintable rows clears the surface and also
-            // returns nothing, and a renderer told "no change" would then go
-            // on presenting a texture whose source is gone (cold-review
-            // finding, 2026-09-21). The geometry is what distinguishes them.
-            if before != frame.surface.grid() {
+            // returns nothing, and a renderer told "no change" would go on
+            // presenting a texture whose source is gone.
+            if had_pixels && frame.surface.is_empty() {
                 frame.generation += 1;
                 frame.damage.clear();
                 return true;
@@ -311,10 +317,24 @@ mod tests {
         assert!(painter.repaint(&screen(8, 4, 'M'), &[]));
         let generation = shared.lock().unwrap().generation();
         assert!(painter.repaint(&screen(0, 0, ' '), &[]));
+        {
+            let frame = shared.lock().unwrap();
+            assert!(frame.surface().is_empty());
+            assert_eq!(frame.generation(), generation + 1);
+            assert!(frame.damage.is_empty(), "there is nothing left to upload");
+        }
+
+        // Re-review residual (2026-09-21): the first cut compared the
+        // surface's GRID, which `invalidate` also resets to (0, 0) — so an
+        // invalidate between the two repaints made the clear compare (0,0)
+        // against (0,0) and report no change at all.
+        assert!(painter.repaint(&screen(8, 4, 'M'), &[]));
+        let generation = shared.lock().unwrap().generation();
+        painter.invalidate();
+        assert!(painter.repaint(&screen(0, 0, ' '), &[]));
         let frame = shared.lock().unwrap();
         assert!(frame.surface().is_empty());
         assert_eq!(frame.generation(), generation + 1);
-        assert!(frame.damage.is_empty(), "there is nothing left to upload");
     }
 
     #[test]

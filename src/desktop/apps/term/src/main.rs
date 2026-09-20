@@ -14,6 +14,7 @@
 
 mod frame;
 mod input;
+mod keys;
 mod theme;
 
 #[cfg(feature = "wgpu")]
@@ -274,7 +275,10 @@ struct State {
 enum Message {
     /// Something in the core changed: PTY output, a resize, a pane exit.
     Wake,
-    Event(iced::Event),
+    /// Keys to put on the PTY, from the widget tree — NOT from an event
+    /// subscription, which drops them under load (see `keys.rs`).
+    Keys(Vec<cosmix_term_core::terminal::Key>),
+    Window(iced::window::Event),
     /// The window's device-pixel ratio, answered by the runtime.
     Scale(f32),
 }
@@ -282,10 +286,15 @@ enum Message {
 fn subscription(_state: &State) -> Subscription<Message> {
     Subscription::batch([
         Subscription::run(wakes),
-        // `listen_with` already drops RedrawRequested, so this cannot feed
-        // itself. Nothing in the widget tree captures, so key presses arrive
-        // here rather than being eaten by a focused widget.
-        iced::event::listen_with(|event, _status, _window| Some(Message::Event(event))),
+        // WINDOW events only. Keys go through the widget tree instead,
+        // because this path DROPS events under load — see `keys.rs`. Window
+        // events survive it: they are rare, and a lost resize is corrected by
+        // the next one. `listen_with` already filters RedrawRequested, so
+        // this cannot feed itself.
+        iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Window(event) => Some(Message::Window(event)),
+            _ => None,
+        }),
     ])
 }
 
@@ -385,13 +394,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Scale(scale) => state.rescale(scale),
-        Message::Event(iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-            key,
-            text,
-            modifiers,
-            ..
-        })) => state.type_keys(&key, text.as_deref(), modifiers),
-        Message::Event(iced::Event::Window(event)) => match event {
+        Message::Keys(keys) => state.send_keys(keys),
+        Message::Window(event) => match event {
             iced::window::Event::Opened { size, .. } => {
                 state.resize(size);
                 // Ask rather than wait: winit does not necessarily emit a
@@ -407,7 +411,6 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             iced::window::Event::CloseRequested => return iced::exit(),
             _ => {}
         },
-        Message::Event(_) => {}
     }
     Task::none()
 }
@@ -422,6 +425,19 @@ fn view(state: &State) -> Element<'_, Message> {
     let grid = renderer(state)
         .width(Length::Fixed(f32::from(cols) * cell_width))
         .height(Length::Fixed(f32::from(rows) * cell_height));
+    // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
+    let grid = keys::keys(grid, |event| match event {
+        iced::keyboard::Event::KeyPressed {
+            key,
+            text,
+            modifiers,
+            ..
+        } => {
+            let keys = input::keys_for(key, text.as_deref(), *modifiers);
+            (!keys.is_empty()).then_some(Message::Keys(keys))
+        }
+        _ => None,
+    });
     container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -542,8 +558,7 @@ impl State {
         // next `Message::Wake` rather than being duplicated here.
     }
 
-    fn type_keys(&mut self, key: &iced::keyboard::Key, text: Option<&str>, modifiers: iced::keyboard::Modifiers) {
-        let keys = input::keys_for(key, text, modifiers);
+    fn send_keys(&mut self, keys: Vec<cosmix_term_core::terminal::Key>) {
         if keys.is_empty() {
             return;
         }

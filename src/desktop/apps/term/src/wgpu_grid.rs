@@ -145,8 +145,14 @@ pub struct GridPipeline {
     textures: HashMap<GridId, GridTexture>,
     /// Grids that prepared this frame. `trim` drops everything else, so a
     /// closed pane's texture is freed on the next frame rather than living
-    /// until the process exits — and an `Arc` address reused by a new pane
-    /// cannot inherit the old pane's pixels.
+    /// until the process exits.
+    ///
+    /// It is NOT what stops a recycled `Arc` address inheriting the old
+    /// pane's pixels — a sweep can only run between frames, so a new `Frame`
+    /// at a dead one's address could reach `prepare` first. What makes that
+    /// harmless is that a fresh `Frame` starts with an empty surface, so its
+    /// first `render_into` is a full repaint and `ensure_texture` replaces
+    /// every pixel before anything is drawn.
     live: HashSet<GridId>,
 }
 
