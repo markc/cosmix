@@ -33,8 +33,9 @@
 //! An interrupted `mix edit` therefore leaves the old file intact
 //! rather than a truncated one.
 //!
-//! Companion to the `replace_must()` builtin — same semantics, CLI
-//! surface.
+//! In a script the nearest equivalent is `replace()` — but note it is
+//! SILENT when the needle is absent, returning the input unchanged, so
+//! a script doing this has to check for itself.
 
 use std::fs;
 use std::io::Write;
@@ -418,7 +419,20 @@ fn write_atomic(path: &Path, content: &str, before: Option<&fs::Metadata>) -> st
                  (re-run the edit)",
             ));
         }
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        // fsync the DIRECTORY so the rename itself is durable. Without
+        // it the file's contents survive a power loss but the directory
+        // entry may not, which reverts the edit — the safe direction,
+        // but "the edit silently did not happen" is still the failure
+        // this subcommand exists to refuse. Best-effort: a directory
+        // that cannot be opened for sync (some filesystems) must not
+        // fail an edit that has already landed.
+        if let Some(d) = dir
+            && let Ok(handle) = fs::File::open(d)
+        {
+            let _ = handle.sync_all();
+        }
+        Ok(())
     })();
 
     if write.is_err() {

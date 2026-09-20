@@ -22,12 +22,14 @@ must appear in the error.
 |---|---|---|---|
 | a bare name reads the variable | a bare word is a **string literal** — `$` is not optional, and omitting it is silent | `$x = 5; print(x)` | `x` |
 | `"hi $name"` interpolates | only `${...}` interpolates; a bare `$name` in a string is **literal text** | `$n = "world"; print("hi $n")` | `hi $n` |
-| — so use braces | `${name}` — same rule in heredocs | `$n = "world"; print("hi ${n}")` | `hi world` |
+| — so use braces | `${name}` — and it is the **same rule everywhere** a string is built, heredocs included | `$n = "world"; print("hi ${n}")` | `hi world` |
 | `elseif` | `elif` | `if 1 == 2 then print("a") elif 1 == 1 then print("b") end` | `b` |
 | `str(x)` | `to_string(x)` | `print(to_string(5))` | `5` |
-| `print(a, b)` | `print` takes **one** argument; join with `..` | `print("a" .. "b")` | `ab` |
-| `run()` returns a status | `run()` **raises** on a non-zero exit; `run_rc()` returns the code | `print(run_rc("false").rc)` | `1` |
-| `read_file()` returns nil when missing | it **raises**; test with `is_file()` first | `print(is_file("/no/such/file"))` | `false` |
+| `print(a, b)` | `print` is a **statement**, not a function, so `(a, b)` is read as an expression and fails | `print("a", "b")` | `!expected RParen` |
+| — so how do I print two things | `print a, b` — no parens, joined by a space; `print(x)` only works because `(x)` is parenthesised | `print "a", "b"` | `a b` |
+| `run()` returns a status | `run()` **raises** on a non-zero exit | `print(run("false"))` | `!failed (rc=1)` |
+| — so how do I get the code | `run_rc()` returns `{rc, stdout, stderr, …}` | `print(run_rc("false").rc)` | `1` |
+| `read_file()` returns nil when missing | it **raises**; test with `is_file()` first | `print(read_file("/no/such/file"))` | `!No such file or directory` |
 | `push` mutates any list | `push` writes through the **slot**; on a nested list it is a silent **no-op** | `$m = {a: [1]}; push($m.a, 2); print($m)` | `{a: [1]}` |
 | — so how | read it out, push, store it back | `$m = {a: [1]}; $i = $m.a; push($i, 2); $m["a"] = $i; print($m)` | `{a: [1, 2]}` |
 | a declared `fn` name is a value | a **lambda** is a real value, but a declared `fn`'s bare name is the **string** `"f"` | `fn f($x) return $x end; $g = f; print($g)` | `f` |
@@ -36,13 +38,16 @@ must appear in the error.
 | `catch $e` gives an error object | `$e` is the **message string**; use `catch $msg, $err` for `$err.code` | `try raise("E_X", "boom") catch $m, $e print($e.code) end` | `E_X` |
 | `raise("boom")` | `raise(CODE, MESSAGE)` — one argument is an arity error | `try raise("E_X", "boom") catch $m print($m) end` | `boom` |
 | `json_decode()` | `json_parse()` (and `json_encode()` the other way) | `print(json_parse("{\"a\":1}").a)` | `1` |
-| `==` compares two maps | it **raises** rather than answer a useless `false` | `print(deep_eq([1, 2], [1, 2]))` | `true` |
+| `==` compares two maps or lists | it **raises** rather than answer a useless `false` | `print([1, 2] == [1, 2])` | `!would always answer false` |
+| — so how do I compare them | `deep_eq(a, b)` | `print(deep_eq([1, 2], [1, 2]))` | `true` |
 | `re_replace(pattern, s, ...)` | **subject first**: `re_replace(s, pattern, replacement)` | `print(re_replace("a1b", "[0-9]", "#"))` | `a#b` |
 | `sort_by` takes a direction | ascending only, with a lambda; `reverse()` for descending | `print(sort_by([3, 1, 2], fn($x) = $x))` | `[1, 2, 3]` |
-| `'~/x'` expands | only a **double**-quoted `"~/x"` expands `~` | `print('~/x')` | `~/x` |
+| `'~/x'` expands | a **single**-quoted string is raw — no `~`, no `${...}` | `print('~/x')` | `~/x` |
+| — and `"~/x"`? | a double-quoted one expands `~` to `$HOME` | `print(starts_with("~/x", "/"))` | `true` |
 | `send svc-name verb` | a bare hyphenated target parses as **subtraction**; quote it or bind it | `send shell-ctl88 shell.debug.status timeout=1` | `!cannot use 'shell' as number` |
 | — so quote it | a quoted string or a `$var` takes the normal path | `$s = "shell-ctl88"; print($s)` | `shell-ctl88` |
-| `replace()` tells you it missed | it returns the input unchanged, silently — check, or use `mix edit` | `print(replace("abc", "zz", "!"))` | `abc` |
+| `replace()` tells you it missed | it returns the input unchanged, **silently** — check the result, or use `mix edit` from a prompt | `print(replace("abc", "zz", "!"))` | `abc` |
+| `replace()` replaces the first | it replaces **all** of them | `print(replace("a a a", "a", "b"))` | `b b b` |
 | `mix -c 'print(x)'` needs escaping gymnastics | it does not; a probe is one call and the binary is the oracle | `print(mix_version() != "")` | `true` |
 
 ## Three rules that are not a syntax trap

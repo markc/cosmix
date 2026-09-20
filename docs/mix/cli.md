@@ -527,7 +527,11 @@ Pass --all to edit every occurrence, or give a longer OLD.
 | 0 | edited | written |
 | 1 | OLD not found | untouched |
 | 2 | OLD occurs more than once and `--all` was not given | untouched |
-| 3 | usage error, unreadable/unwritable file, or non-UTF-8 input | untouched |
+| 3 | usage error, unreadable file, unwritable **directory**, non-UTF-8 input, or a file that changed since it was read | untouched |
+
+(rc 3 is about the *directory*, not the file's own write bit: the edit is a
+temp-file rename, so a read-only file in a writable directory is edited and
+keeps its read-only mode.)
 
 `--all` is the explicit opt-in to edit every occurrence. `-n` / `--dry-run`
 reports the matches and writes nothing.
@@ -563,8 +567,9 @@ Other properties worth knowing:
 `mix edit` works at the interactive Mix prompt as well as from the OS shell;
 there the exit code lands in `$status`.
 
-In a script, the equivalent is [`replace_must()`](strings.md) — same
-refuse-on-absent semantics, as a builtin.
+In a script the nearest equivalent is [`replace()`](strings.md) — but it is
+**silent** when the needle is absent, returning the input unchanged, so a
+script doing this has to check the result itself.
 
 ## Ecosystem — probe the Bus mesh
 

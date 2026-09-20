@@ -838,8 +838,11 @@ Pass --all to edit every occurrence, or give a longer OLD.
 <tr><td>0</td><td>edited</td><td>written</td></tr>
 <tr><td>1</td><td>OLD not found</td><td>untouched</td></tr>
 <tr><td>2</td><td>OLD occurs more than once and <code>--all</code> was not given</td><td>untouched</td></tr>
-<tr><td>3</td><td>usage error, unreadable/unwritable file, or non-UTF-8 input</td><td>untouched</td></tr>
+<tr><td>3</td><td>usage error, unreadable file, unwritable <strong>directory</strong>, non-UTF-8 input, or a file that changed since it was read</td><td>untouched</td></tr>
 </tbody></table>
+<p>(rc 3 is about the <em>directory</em>, not the file's own write bit: the edit is a
+temp-file rename, so a read-only file in a writable directory is edited and
+keeps its read-only mode.)</p>
 <p><code>--all</code> is the explicit opt-in to edit every occurrence. <code>-n</code> / <code>--dry-run</code>
 reports the matches and writes nothing.</p>
 <p><strong>Flags come first, then <code>FILE OLD NEW</code> verbatim.</strong> Option parsing stops at the
@@ -871,8 +874,9 @@ invariably a mistake.</li>
 </ul>
 <p><code>mix edit</code> works at the interactive Mix prompt as well as from the OS shell;
 there the exit code lands in <code>$status</code>.</p>
-<p>In a script, the equivalent is <a href="/mix/strings"><code>replace_must()</code></a> — same
-refuse-on-absent semantics, as a builtin.</p>
+<p>In a script the nearest equivalent is <a href="/mix/strings"><code>replace()</code></a> — but it is
+<strong>silent</strong> when the needle is absent, returning the input unchanged, so a
+script doing this has to check the result itself.</p>
 <h2 id="ecosystem--probe-the-bus-mesh">Ecosystem — probe the Bus mesh</h2>
 <p>These query the local <a href="/mix/bus">noded</a> broker for its registered Bus service
 roster (the mesh is TCP noded — <code>ws://&lt;wg-ip&gt;:4200/ws</code> — resolved the same way

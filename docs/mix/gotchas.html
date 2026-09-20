@@ -458,12 +458,14 @@ must appear in the error.</p>
 <table><thead><tr><th>you will guess</th><th>Mix is</th><th>probe</th><th>prints</th></tr></thead><tbody>
 <tr><td>a bare name reads the variable</td><td>a bare word is a <strong>string literal</strong> — <code>$</code> is not optional, and omitting it is silent</td><td><code>$x = 5; print(x)</code></td><td><code>x</code></td></tr>
 <tr><td><code>"hi $name"</code> interpolates</td><td>only <code>${...}</code> interpolates; a bare <code>$name</code> in a string is <strong>literal text</strong></td><td><code>$n = "world"; print("hi $n")</code></td><td><code>hi $n</code></td></tr>
-<tr><td>— so use braces</td><td><code>${name}</code> — same rule in heredocs</td><td><code>$n = "world"; print("hi ${n}")</code></td><td><code>hi world</code></td></tr>
+<tr><td>— so use braces</td><td><code>${name}</code> — and it is the <strong>same rule everywhere</strong> a string is built, heredocs included</td><td><code>$n = "world"; print("hi ${n}")</code></td><td><code>hi world</code></td></tr>
 <tr><td><code>elseif</code></td><td><code>elif</code></td><td><code>if 1 == 2 then print("a") elif 1 == 1 then print("b") end</code></td><td><code>b</code></td></tr>
 <tr><td><code>str(x)</code></td><td><code>to_string(x)</code></td><td><code>print(to_string(5))</code></td><td><code>5</code></td></tr>
-<tr><td><code>print(a, b)</code></td><td><code>print</code> takes <strong>one</strong> argument; join with <code>..</code></td><td><code>print("a" .. "b")</code></td><td><code>ab</code></td></tr>
-<tr><td><code>run()</code> returns a status</td><td><code>run()</code> <strong>raises</strong> on a non-zero exit; <code>run_rc()</code> returns the code</td><td><code>print(run_rc("false").rc)</code></td><td><code>1</code></td></tr>
-<tr><td><code>read_file()</code> returns nil when missing</td><td>it <strong>raises</strong>; test with <code>is_file()</code> first</td><td><code>print(is_file("/no/such/file"))</code></td><td><code>false</code></td></tr>
+<tr><td><code>print(a, b)</code></td><td><code>print</code> is a <strong>statement</strong>, not a function, so <code>(a, b)</code> is read as an expression and fails</td><td><code>print("a", "b")</code></td><td><code>!expected RParen</code></td></tr>
+<tr><td>— so how do I print two things</td><td><code>print a, b</code> — no parens, joined by a space; <code>print(x)</code> only works because <code>(x)</code> is parenthesised</td><td><code>print "a", "b"</code></td><td><code>a b</code></td></tr>
+<tr><td><code>run()</code> returns a status</td><td><code>run()</code> <strong>raises</strong> on a non-zero exit</td><td><code>print(run("false"))</code></td><td><code>!failed (rc=1)</code></td></tr>
+<tr><td>— so how do I get the code</td><td><code>run_rc()</code> returns <code>{rc, stdout, stderr, …}</code></td><td><code>print(run_rc("false").rc)</code></td><td><code>1</code></td></tr>
+<tr><td><code>read_file()</code> returns nil when missing</td><td>it <strong>raises</strong>; test with <code>is_file()</code> first</td><td><code>print(read_file("/no/such/file"))</code></td><td><code>!No such file or directory</code></td></tr>
 <tr><td><code>push</code> mutates any list</td><td><code>push</code> writes through the <strong>slot</strong>; on a nested list it is a silent <strong>no-op</strong></td><td><code>$m = {a: [1]}; push($m.a, 2); print($m)</code></td><td><code>{a: [1]}</code></td></tr>
 <tr><td>— so how</td><td>read it out, push, store it back</td><td><code>$m = {a: [1]}; $i = $m.a; push($i, 2); $m["a"] = $i; print($m)</code></td><td><code>{a: [1, 2]}</code></td></tr>
 <tr><td>a declared <code>fn</code> name is a value</td><td>a <strong>lambda</strong> is a real value, but a declared <code>fn</code>'s bare name is the <strong>string</strong> <code>"f"</code></td><td><code>fn f($x) return $x end; $g = f; print($g)</code></td><td><code>f</code></td></tr>
@@ -472,13 +474,16 @@ must appear in the error.</p>
 <tr><td><code>catch $e</code> gives an error object</td><td><code>$e</code> is the <strong>message string</strong>; use <code>catch $msg, $err</code> for <code>$err.code</code></td><td><code>try raise("E_X", "boom") catch $m, $e print($e.code) end</code></td><td><code>E_X</code></td></tr>
 <tr><td><code>raise("boom")</code></td><td><code>raise(CODE, MESSAGE)</code> — one argument is an arity error</td><td><code>try raise("E_X", "boom") catch $m print($m) end</code></td><td><code>boom</code></td></tr>
 <tr><td><code>json_decode()</code></td><td><code>json_parse()</code> (and <code>json_encode()</code> the other way)</td><td><code>print(json_parse("{\"a\":1}").a)</code></td><td><code>1</code></td></tr>
-<tr><td><code>==</code> compares two maps</td><td>it <strong>raises</strong> rather than answer a useless <code>false</code></td><td><code>print(deep_eq([1, 2], [1, 2]))</code></td><td><code>true</code></td></tr>
+<tr><td><code>==</code> compares two maps or lists</td><td>it <strong>raises</strong> rather than answer a useless <code>false</code></td><td><code>print([1, 2] == [1, 2])</code></td><td><code>!would always answer false</code></td></tr>
+<tr><td>— so how do I compare them</td><td><code>deep_eq(a, b)</code></td><td><code>print(deep_eq([1, 2], [1, 2]))</code></td><td><code>true</code></td></tr>
 <tr><td><code>re_replace(pattern, s, ...)</code></td><td><strong>subject first</strong>: <code>re_replace(s, pattern, replacement)</code></td><td><code>print(re_replace("a1b", "[0-9]", "#"))</code></td><td><code>a#b</code></td></tr>
 <tr><td><code>sort_by</code> takes a direction</td><td>ascending only, with a lambda; <code>reverse()</code> for descending</td><td><code>print(sort_by([3, 1, 2], fn($x) = $x))</code></td><td><code>[1, 2, 3]</code></td></tr>
-<tr><td><code>'~/x'</code> expands</td><td>only a <strong>double</strong>-quoted <code>"~/x"</code> expands <code>~</code></td><td><code>print('~/x')</code></td><td><code>~/x</code></td></tr>
+<tr><td><code>'~/x'</code> expands</td><td>a <strong>single</strong>-quoted string is raw — no <code>~</code>, no <code>${...}</code></td><td><code>print('~/x')</code></td><td><code>~/x</code></td></tr>
+<tr><td>— and <code>"~/x"</code>?</td><td>a double-quoted one expands <code>~</code> to <code>$HOME</code></td><td><code>print(starts_with("~/x", "/"))</code></td><td><code>true</code></td></tr>
 <tr><td><code>send svc-name verb</code></td><td>a bare hyphenated target parses as <strong>subtraction</strong>; quote it or bind it</td><td><code>send shell-ctl88 shell.debug.status timeout=1</code></td><td><code>!cannot use 'shell' as number</code></td></tr>
 <tr><td>— so quote it</td><td>a quoted string or a <code>$var</code> takes the normal path</td><td><code>$s = "shell-ctl88"; print($s)</code></td><td><code>shell-ctl88</code></td></tr>
-<tr><td><code>replace()</code> tells you it missed</td><td>it returns the input unchanged, silently — check, or use <code>mix edit</code></td><td><code>print(replace("abc", "zz", "!"))</code></td><td><code>abc</code></td></tr>
+<tr><td><code>replace()</code> tells you it missed</td><td>it returns the input unchanged, <strong>silently</strong> — check the result, or use <code>mix edit</code> from a prompt</td><td><code>print(replace("abc", "zz", "!"))</code></td><td><code>abc</code></td></tr>
+<tr><td><code>replace()</code> replaces the first</td><td>it replaces <strong>all</strong> of them</td><td><code>print(replace("a a a", "a", "b"))</code></td><td><code>b b b</code></td></tr>
 <tr><td><code>mix -c 'print(x)'</code> needs escaping gymnastics</td><td>it does not; a probe is one call and the binary is the oracle</td><td><code>print(mix_version() != "")</code></td><td><code>true</code></td></tr>
 </tbody></table>
 <h2 id="three-rules-that-are-not-a-syntax-trap">Three rules that are not a syntax trap</h2>
