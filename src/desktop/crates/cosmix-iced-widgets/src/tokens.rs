@@ -3,9 +3,10 @@
 //! to the design compiler's closed family registry.
 
 use cosmix_design::{LinearRgba, ResolvedColours, ResolvedDictionary, ResolvedMetricKind};
-use iced::{Border, Color, widget::text_input};
+use iced_core::{Border, Color};
+use iced_widget::text_input;
 
-use crate::MenuStyle;
+use crate::{AudioStyle, MenuStyle};
 
 /// Missing or invalid resolved dictionary entry. Never silently substitutes a
 /// fallback for a partially compiled design.
@@ -37,6 +38,12 @@ pub struct Tokens {
     pub text: Color,
     pub popover: Color,
     pub popover_text: Color,
+    pub card: Color,
+    pub card_text: Color,
+    pub primary: Color,
+    pub primary_text: Color,
+    pub destructive: Color,
+    pub destructive_text: Color,
     pub muted_surface: Color,
     pub muted_text: Color,
     pub selection: Color,
@@ -48,7 +55,8 @@ pub struct Tokens {
 }
 
 impl Tokens {
-    /// Maps the `base`, `popover`, `muted` and `accent` pairs plus the
+    /// Maps the `base`, `popover`, `card`, `primary`, `destructive`, `muted`
+    /// and `accent` pairs plus the
     /// `border`, `input` and `ring` colours. Radius is 6 px.
     pub fn from_colours(colours: &ResolvedColours) -> Result<Self, TokenError> {
         let pair = |name| colours.pairs.get(name).ok_or(TokenError(name));
@@ -63,11 +71,20 @@ impl Tokens {
         let popover = pair("popover")?;
         let muted = pair("muted")?;
         let accent = pair("accent")?;
+        let card = pair("card")?;
+        let primary = pair("primary")?;
+        let destructive = pair("destructive")?;
         Ok(Self {
             surface: colour(base.rendered_surface),
             text: colour(base.rendered_foreground),
             popover: colour(popover.rendered_surface),
             popover_text: colour(popover.rendered_foreground),
+            card: colour(card.rendered_surface),
+            card_text: colour(card.rendered_foreground),
+            primary: colour(primary.rendered_surface),
+            primary_text: colour(primary.rendered_foreground),
+            destructive: colour(destructive.rendered_surface),
+            destructive_text: colour(destructive.rendered_foreground),
             muted_surface: colour(muted.rendered_surface),
             muted_text: colour(muted.rendered_foreground),
             selection: colour(accent.rendered_surface),
@@ -136,6 +153,34 @@ impl Tokens {
             ..MenuStyle::default()
         }
     }
+
+    /// Style for the pro-audio controls and canvases. Meter zones run
+    /// primary (below -12 dB), accent (to -3 dB), destructive (above).
+    pub fn audio_style(self) -> AudioStyle {
+        AudioStyle {
+            background: self.card,
+            track: self.muted_surface,
+            fill: self.primary,
+            thumb: self.card_text,
+            text: self.card_text,
+            muted_text: self.muted_text,
+            border: self.border,
+            meter_low: self.primary,
+            meter_high: self.selection,
+            meter_clip: self.destructive,
+            peak: self.card_text,
+            active: self.selection,
+            active_text: self.selection_text,
+            alert: self.destructive,
+            alert_text: self.destructive_text,
+            grid: self.border,
+            lane: self.muted_surface,
+            note: self.primary,
+            waveform: self.primary,
+            playhead: self.ring,
+            radius: self.radius.min(4.0),
+        }
+    }
 }
 
 /// Standalone preview palette. Applications should use their resolved design.
@@ -146,6 +191,12 @@ impl Default for Tokens {
             text: Color::from_rgb8(230, 234, 241),
             popover: Color::from_rgb8(32, 36, 45),
             popover_text: Color::from_rgb8(230, 234, 241),
+            card: Color::from_rgb8(30, 33, 40),
+            card_text: Color::from_rgb8(230, 234, 241),
+            primary: Color::from_rgb8(64, 160, 110),
+            primary_text: Color::WHITE,
+            destructive: Color::from_rgb8(205, 64, 64),
+            destructive_text: Color::WHITE,
             muted_surface: Color::from_rgb8(38, 43, 53),
             muted_text: Color::from_rgb8(155, 163, 177),
             selection: Color::from_rgb8(47, 85, 130),
@@ -165,7 +216,15 @@ mod tests {
 
     fn dictionary() -> ResolvedDictionary {
         let mut colours = ResolvedColours::default();
-        for name in ["base", "popover", "muted", "accent"] {
+        for name in [
+            "base",
+            "popover",
+            "muted",
+            "accent",
+            "card",
+            "primary",
+            "destructive",
+        ] {
             colours.pairs.insert(
                 name.into(),
                 ResolvedPair {
@@ -235,6 +294,10 @@ mod tests {
             tokens.muted_text
         );
         assert_eq!(tokens.menu_style().selected_text, tokens.selection_text);
+        let audio = tokens.audio_style();
+        assert_eq!(audio.meter_clip, tokens.destructive);
+        assert_eq!(audio.background, tokens.card);
+        assert_eq!(audio.radius, 4.0);
     }
 
     #[test]
