@@ -85,14 +85,27 @@ and idempotent, so two bounded round trips are preferred to one ambiguous one.
 This is the same definition of "live" that `term-desktop.mix` uses, so the two
 control surfaces agree.
 
-The two failure modes are reported distinctly, because they call for opposite
-actions — start a terminal, versus find the stuck one:
+The failure modes are reported distinctly, because they call for different
+actions — start a terminal, find the stuck one, or go and look at the broker:
 
 - nothing registered → `ERROR: no CosMix terminal is registered on the Bus
   (looked for `term`, then `bterm`) — start one with `mix --gui``
 - registered but silent → `ERROR: CosMix terminal registered but unresponsive:
   `term` did not answer INFO within 3s (wedged, or shutting down). No other
   frontend is registered. Nothing was sent.`
+- the Bus itself went away mid-resolution → `ERROR: the broker stopped
+  answering while probing for a CosMix terminal (…) — this is a Bus problem,
+  not a wedged terminal. Check cosmix-noded. Nothing was sent.`
+
+The third exists because the client call deliberately conflates an
+application error with a transport one, so a silent probe is not by itself
+evidence about the *terminal*. If the connection drops after the registration
+listing, every probe fails for a reason that has nothing to do with a frontend
+— so before blaming the terminals the resolver spends one bounded ping on the
+broker and says which it was. That ping happens only on the failure path.
+
+All three say **nothing was sent**, so an agent whose mutation errored does not
+have to wonder whether it half-landed.
 
 | Tool | Arguments | Behaviour |
 |---|---|---|

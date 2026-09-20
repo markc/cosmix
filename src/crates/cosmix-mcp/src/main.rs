@@ -782,6 +782,22 @@ impl CosmixMcp {
                 return Ok(name);
             }
         }
+        // Every candidate stayed silent — but `call` deliberately conflates an
+        // application error with a transport one, so "no reply" is not yet
+        // evidence about the TERMINALS. If the connection died after
+        // `list_services` above, both probes would fail for a reason that has
+        // nothing to do with a wedged frontend, and blaming the terminals
+        // would send an operator hunting one that is perfectly healthy.
+        // One bounded ping settles which it was, and only on this path.
+        let ping = noded.call("noded", "noded.ping", serde_json::Value::Null);
+        if !matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, ping).await, Ok(Ok(_))) {
+            return Err(format!(
+                "the broker stopped answering while probing for a CosMix terminal \
+                 ({} registered, none reachable) — this is a Bus problem, not a wedged \
+                 terminal. Check cosmix-noded. Nothing was sent.",
+                candidates.join(", ")
+            ));
+        }
         Err(term_unresponsive(&candidates))
     }
 

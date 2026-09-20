@@ -510,12 +510,21 @@ a <strong>different</strong> terminal — keystrokes in the wrong window. <code>
 and idempotent, so two bounded round trips are preferred to one ambiguous one.
 This is the same definition of "live" that <code>term-desktop.mix</code> uses, so the two
 control surfaces agree.</p>
-<p>The two failure modes are reported distinctly, because they call for opposite
-actions — start a terminal, versus find the stuck one:</p>
+<p>The failure modes are reported distinctly, because they call for different
+actions — start a terminal, find the stuck one, or go and look at the broker:</p>
 <ul>
 <li>nothing registered → <code>ERROR: no CosMix terminal is registered on the Bus (looked for </code>term<code>, then </code>bterm<code>) — start one with </code>mix --gui``</li>
 <li>registered but silent → <code>ERROR: CosMix terminal registered but unresponsive: </code>term<code> did not answer INFO within 3s (wedged, or shutting down). No other frontend is registered. Nothing was sent.</code></li>
+<li>the Bus itself went away mid-resolution → <code>ERROR: the broker stopped answering while probing for a CosMix terminal (…) — this is a Bus problem, not a wedged terminal. Check cosmix-noded. Nothing was sent.</code></li>
 </ul>
+<p>The third exists because the client call deliberately conflates an
+application error with a transport one, so a silent probe is not by itself
+evidence about the <em>terminal</em>. If the connection drops after the registration
+listing, every probe fails for a reason that has nothing to do with a frontend
+— so before blaming the terminals the resolver spends one bounded ping on the
+broker and says which it was. That ping happens only on the failure path.</p>
+<p>All three say <strong>nothing was sent</strong>, so an agent whose mutation errored does not
+have to wonder whether it half-landed.</p>
 <table><thead><tr><th>Tool</th><th>Arguments</th><th>Behaviour</th></tr></thead><tbody>
 <tr><td><code>term_list</code></td><td><code>{}</code></td><td>Read-only JSON arrays <code>tabs</code> and <code>panes</code>: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic.</td></tr>
 <tr><td><code>term_snapshot</code></td><td><code>{}</code></td><td>Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings.</td></tr>
