@@ -67,12 +67,32 @@ per-call metrics. Replies are bounded to 1 MiB.
 TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
 `term` / `term.*`, the Bevy one is `bterm` / `bterm.*`, and a frontend
 *refuses* a verb from the other namespace. Before every tool call the MCP asks
-the broker which is registered and takes the first of `term`, then `bterm`,
+the broker which of `term`, then `bterm`, is registered, and **probes each in
+turn with a bounded `INFO`** — taking the first that actually answers and
 building the verb from that same name. Resolution is per call, never cached
 for the process: the MCP outlives any one terminal, and both frontends may be
-up at once for an A/B. With neither registered the tool answers `ERROR: no
-CosMix terminal is registered on the Bus (looked for `term`, then `bterm`)`
-rather than timing out against an unheld name.
+up at once for an A/B.
+
+*Live means answering, not merely registered.* A frontend whose event loop is
+stuck keeps its Bus name, so registration alone would hand every tool call to
+it and each would block for the client's 60s transport timeout while a healthy
+sibling sat unused. The probe costs about a millisecond against a responsive
+frontend and is capped at three seconds against a wedged one. It is a probe
+and never a retry-on-timeout: a timed-out *verb* may still have executed, so
+falling back after one would replay a mutation (`term_type`, `term_tab`) into
+a **different** terminal — keystrokes in the wrong window. `INFO` is read-only
+and idempotent, so two bounded round trips are preferred to one ambiguous one.
+This is the same definition of "live" that `term-desktop.mix` uses, so the two
+control surfaces agree.
+
+The two failure modes are reported distinctly, because they call for opposite
+actions — start a terminal, versus find the stuck one:
+
+- nothing registered → `ERROR: no CosMix terminal is registered on the Bus
+  (looked for `term`, then `bterm`) — start one with `mix --gui``
+- registered but silent → `ERROR: CosMix terminal registered but unresponsive:
+  `term` did not answer INFO within 3s (wedged, or shutting down). No other
+  frontend is registered. Nothing was sent.`
 
 | Tool | Arguments | Behaviour |
 |---|---|---|

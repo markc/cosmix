@@ -352,21 +352,50 @@ struct TermPaneParams {
 /// when both are up.
 const TERM_SERVICES: [&str; 2] = ["term", "bterm"];
 
+/// How long a frontend gets to answer the liveness probe.
+///
+/// Comfortably above the frontends' own two-second Bus reply budget, and two
+/// orders of magnitude below the client's 60s transport timeout — which is
+/// the whole point: the probe exists so a wedged frontend costs seconds, not
+/// a minute, and does not hide a healthy one behind itself.
+const TERM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// What to say when nothing is registered. It names both candidates: the most
 /// likely cause of this error for the rest of 2026 is a caller expecting the
 /// pre-rename `term` to be there, and an error that named only one of them
 /// would leave that reader guessing.
 const TERM_NO_FRONTEND: &str = "no CosMix terminal is registered on the Bus (looked for `term`, then `bterm`) — start one with `mix --gui`";
 
-/// Pick the frontend to address from the broker's registered-service list.
+/// The registered frontends, in preference order.
 ///
-/// Pure, so the preference order and the no-frontend message are testable
-/// without a live broker or a running terminal.
-fn pick_term_service(registered: &[String]) -> Result<&'static str, String> {
+/// Pure, so the order and the exact-match rule are testable without a live
+/// broker. Registration is the SHORTLIST, not the answer — [`term_service`]
+/// then asks each one whether it is actually answering.
+fn registered_term_services(registered: &[String]) -> Vec<&'static str> {
     TERM_SERVICES
         .into_iter()
-        .find(|name| registered.iter().any(|s| s == name))
-        .ok_or_else(|| TERM_NO_FRONTEND.to_string())
+        .filter(|name| registered.iter().any(|s| s == name))
+        .collect()
+}
+
+/// What to say when a frontend holds a name but will not answer on it.
+///
+/// Kept distinct from [`TERM_NO_FRONTEND`] on purpose. "Nothing is running"
+/// and "something is running and wedged" call for opposite actions — start a
+/// terminal, versus find and kill the one that is stuck — and an operator who
+/// is handed the first message while the second is true will go looking in
+/// the wrong place.
+fn term_unresponsive(candidates: &[&'static str]) -> String {
+    let names = candidates
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CosMix terminal registered but unresponsive: {names} did not answer INFO within {}s \
+         (wedged, or shutting down). No other frontend is registered. Nothing was sent.",
+        TERM_PROBE_TIMEOUT.as_secs()
+    )
 }
 
 /// The wire verb for `suffix` in `service`'s namespace.
@@ -707,13 +736,30 @@ impl CosmixMcp {
 
     /// Which terminal frontend is live RIGHT NOW, per call.
     ///
+    /// **Live means ANSWERING, not merely registered.** A frontend that holds
+    /// its name while its event loop is stuck stays in `noded.list` and would
+    /// win the pick on order alone; every tool call then blocks for the
+    /// client's 60s transport timeout
+    /// (`cosmix-lib-client/src/native.rs`) while a healthy `bterm` sits
+    /// unused. That is not a degrade an agent can work through, and it
+    /// defeats the point of having a fallback at all. So registration is the
+    /// shortlist and a bounded `INFO` probe is the answer — the same
+    /// definition `term-desktop.mix` uses, so the two control surfaces agree
+    /// on what "live" means rather than being a drift source between them.
+    ///
+    /// **A probe, never a retry-on-timeout.** Sending the real verb and
+    /// falling back when it times out would be one round trip instead of two,
+    /// but a timeout does not mean the verb did not execute — for a mutation
+    /// (`type`, `tab.new`) the fallback would replay it into a DIFFERENT
+    /// terminal, landing keystrokes in the wrong window. `INFO` is read-only
+    /// and idempotent, so two bounded round trips beat one ambiguous one.
+    ///
     /// Deliberately NOT cached on `self`: the MCP process outlives any one
     /// terminal, and which frontend holds a name changes under it (bterm
     /// quits, the iced `term` starts, a second one is launched for an A/B).
     /// A process-lifetime cache would pin the first answer and then address a
     /// dead name for the rest of the session — the exact failure this sweep
-    /// exists to remove, reintroduced one indirection deeper. One
-    /// `noded.list` per tool call is cheap against a local broker.
+    /// exists to remove, reintroduced one indirection deeper.
     ///
     /// A single tool that makes several calls resolves ONCE and reuses the
     /// answer, so a mid-tool frontend change cannot split one logical read
@@ -721,7 +767,22 @@ impl CosmixMcp {
     async fn term_service(&self) -> Result<&'static str, String> {
         let noded = self.noded().await?;
         let registered = noded.list_services().await.map_err(|e| e.to_string())?;
-        pick_term_service(&registered)
+        let candidates = registered_term_services(&registered);
+        if candidates.is_empty() {
+            return Err(TERM_NO_FRONTEND.to_string());
+        }
+        for name in &candidates {
+            // `call` collapses an application error into `Err`, so `Ok` here
+            // means this name answered INFO — which is exactly the question.
+            // The outer timeout cancels the call rather than waiting out the
+            // client's own; cancellation is safe because the pending-reply
+            // entry is removed by RAII.
+            let probe = noded.call(name, "INFO", serde_json::Value::Null);
+            if matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await, Ok(Ok(_))) {
+                return Ok(name);
+            }
+        }
+        Err(term_unresponsive(&candidates))
     }
 
     async fn indexd(&self) -> Result<cosmix_skills::IndexdClient, String> {
@@ -2822,34 +2883,156 @@ mod tests {
     /// D1 (TODO-term, 2026-09-21): the MCP addresses whichever frontend is
     /// live, preferring the default `term` over the Bevy `bterm`.
     ///
-    /// This gate is proven able to fail — the pre-sweep code hardcoded
-    /// `"term"`, which fails the bterm-only and neither-registered arms.
+    /// This is the SHORTLIST half — which names are candidates and in what
+    /// order. Whether a candidate is actually answering is decided by the
+    /// bounded `INFO` probe in `term_service`, which needs a broker.
+    ///
+    /// Proven able to fail — the pre-sweep code hardcoded `"term"`, which
+    /// fails the bterm-only and neither-registered arms.
     #[test]
     fn term_service_resolves_the_live_frontend() {
         use super::*;
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Both up (the T5 A/B case): the default frontend wins.
+        // Both up (the T5 A/B case): the default frontend is tried first, and
+        // the other REMAINS a candidate — dropping it here is what would put
+        // the wedged-`term` hang back.
         assert_eq!(
-            pick_term_service(&names(&["noded", "bterm", "term"])).unwrap(),
-            "term"
+            registered_term_services(&names(&["noded", "bterm", "term"])),
+            ["term", "bterm"]
         );
         // Only the iced/default one.
-        assert_eq!(pick_term_service(&names(&["noded", "term"])).unwrap(), "term");
+        assert_eq!(registered_term_services(&names(&["noded", "term"])), ["term"]);
         // Only the Bevy one — today's state after the rename, before the
         // iced frontend ships.
         assert_eq!(
-            pick_term_service(&names(&["noded", "bterm"])).unwrap(),
-            "bterm"
+            registered_term_services(&names(&["noded", "bterm"])),
+            ["bterm"]
         );
-        // Neither: a plain error naming both candidates, not a call into the
-        // void that comes back as an opaque broker timeout.
-        let err = pick_term_service(&names(&["noded", "webd"])).unwrap_err();
-        assert!(err.contains("`term`"), "{err}");
-        assert!(err.contains("`bterm`"), "{err}");
-        assert_eq!(pick_term_service(&[]).unwrap_err(), err);
+        // Neither.
+        assert!(registered_term_services(&names(&["noded", "webd"])).is_empty());
+        assert!(registered_term_services(&[]).is_empty());
         // A name that merely CONTAINS a candidate is not that candidate.
-        assert!(pick_term_service(&names(&["terminal", "bterm-2"])).is_err());
+        assert!(registered_term_services(&names(&["terminal", "bterm-2"])).is_empty());
+    }
+
+    /// The two properties `term_service`'s probe loop depends on, against a
+    /// REAL broker. Neither is provable from a pure test, and both are the
+    /// reason the loop is written as a probe rather than a retry.
+    ///
+    /// 1. A wedged service costs `TERM_PROBE_TIMEOUT`, not the client's 60s
+    ///    transport timeout — so a stuck `term` cannot hide a healthy
+    ///    `bterm` behind it.
+    /// 2. Cancelling that probe leaves the connection usable, so the NEXT
+    ///    candidate can actually be tried. If cancellation poisoned the
+    ///    client the fallback would be decorative.
+    ///
+    /// `#[ignore]`d, like the other broker-dependent fixtures in this tree:
+    /// it needs `cosmix-noded` and spawns a Mix citizen that wedges its own
+    /// event pump. Run it with
+    /// `cargo test -p cosmix-mcp -- --ignored --exact
+    ///  tests::probe_bounds_a_wedged_frontend_and_survives_cancellation`.
+    #[test]
+    #[ignore = "needs a live cosmix-noded broker and /opt/cosmix/bin/mix"]
+    fn probe_bounds_a_wedged_frontend_and_survives_cancellation() {
+        use super::*;
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("mcp-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("wedger.mix");
+        let mut f = std::fs::File::create(&script).unwrap();
+        // The handler blocks the serve runtime's pump, so the name stays
+        // registered while INFO stops being answered — exactly the state a
+        // registration-only resolver cannot see.
+        f.write_all(b"on wedge.hang desc \"block the pump\"\n  sleep(30)\n  reply(\"done\")\nend\n")
+            .unwrap();
+        drop(f);
+
+        let mut child = std::process::Command::new("/opt/cosmix/bin/mix")
+            .args(["--serve", script.to_str().unwrap(), "--name", "mcpprobetest"])
+            .spawn()
+            .expect("spawn wedger citizen");
+
+        let outcome = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = cosmix_config::client_helpers::connect_anonymous_default()
+                .await
+                .expect("broker");
+            // Wait for it to register and answer.
+            let mut healthy = false;
+            for _ in 0..40 {
+                if client.call("mcpprobetest", "INFO", serde_json::Value::Null).await.is_ok() {
+                    healthy = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            assert!(healthy, "citizen never answered INFO; nothing was proven");
+
+            // Wedge it, then probe.
+            let _ = client.send("mcpprobetest", "wedge.hang", serde_json::Value::Null).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            let start = std::time::Instant::now();
+            let probe = client.call("mcpprobetest", "INFO", serde_json::Value::Null);
+            let wedged = tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await;
+            let elapsed = start.elapsed();
+
+            // The connection must still work for the NEXT candidate.
+            let after = client.call("noded", "noded.ping", serde_json::Value::Null).await;
+            (wedged.is_err(), elapsed, after.is_ok())
+        });
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (timed_out, elapsed, connection_usable) = outcome;
+        assert!(
+            timed_out,
+            "our bound did not fire first after {elapsed:?}: either the citizen was not \
+             actually wedged (so the fixture proved nothing) or the client's own 60s \
+             transport timeout won the race, which is the hang this probe exists to prevent"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "probe took {elapsed:?} — it is not bounded by TERM_PROBE_TIMEOUT, \
+             so a wedged frontend still hides a healthy one"
+        );
+        assert!(
+            connection_usable,
+            "cancelling the probe poisoned the client; the fallback candidate could never be tried"
+        );
+    }
+
+    /// "Nothing is running" and "something is running and wedged" must not
+    /// read the same. They call for opposite actions — start a terminal,
+    /// versus find the stuck one — and the second is the case the bounded
+    /// probe exists to surface at all.
+    #[test]
+    fn unresponsive_is_distinguishable_from_absent() {
+        use super::*;
+        let absent = TERM_NO_FRONTEND;
+        assert!(absent.contains("`term`") && absent.contains("`bterm`"), "{absent}");
+        assert!(absent.contains("not registered") || absent.contains("no CosMix terminal is registered"));
+
+        let wedged_one = term_unresponsive(&["bterm"]);
+        let wedged_both = term_unresponsive(&["term", "bterm"]);
+        for message in [&wedged_one, &wedged_both] {
+            assert!(message.contains("unresponsive"), "{message}");
+            assert!(message.contains("INFO"), "{message}");
+            // The probe budget is stated, so a reader knows how long it waited.
+            assert!(
+                message.contains(&format!("{}s", TERM_PROBE_TIMEOUT.as_secs())),
+                "{message}"
+            );
+            // Nothing was sent — an agent must not assume a mutation landed.
+            assert!(message.contains("Nothing was sent"), "{message}");
+            assert_ne!(message.as_str(), absent);
+        }
+        // Each message names exactly the candidates that were tried.
+        assert!(wedged_one.contains("`bterm`") && !wedged_one.contains("`term`,"));
+        assert!(wedged_both.contains("`term`") && wedged_both.contains("`bterm`"));
     }
 
     /// The wire verb must follow the resolved service: `cosmix-term-core`

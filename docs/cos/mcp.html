@@ -494,11 +494,28 @@ per-call metrics. Replies are bounded to 1 MiB.</p>
 TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
 <code>term</code> / <code>term.*</code>, the Bevy one is <code>bterm</code> / <code>bterm.*</code>, and a frontend
 <em>refuses</em> a verb from the other namespace. Before every tool call the MCP asks
-the broker which is registered and takes the first of <code>term</code>, then <code>bterm</code>,
+the broker which of <code>term</code>, then <code>bterm</code>, is registered, and <strong>probes each in
+turn with a bounded <code>INFO</code></strong> — taking the first that actually answers and
 building the verb from that same name. Resolution is per call, never cached
 for the process: the MCP outlives any one terminal, and both frontends may be
-up at once for an A/B. With neither registered the tool answers <code>ERROR: no CosMix terminal is registered on the Bus (looked for </code>term<code>, then </code>bterm<code>)</code>
-rather than timing out against an unheld name.</p>
+up at once for an A/B.</p>
+<p><em>Live means answering, not merely registered.</em> A frontend whose event loop is
+stuck keeps its Bus name, so registration alone would hand every tool call to
+it and each would block for the client's 60s transport timeout while a healthy
+sibling sat unused. The probe costs about a millisecond against a responsive
+frontend and is capped at three seconds against a wedged one. It is a probe
+and never a retry-on-timeout: a timed-out <em>verb</em> may still have executed, so
+falling back after one would replay a mutation (<code>term_type</code>, <code>term_tab</code>) into
+a <strong>different</strong> terminal — keystrokes in the wrong window. <code>INFO</code> is read-only
+and idempotent, so two bounded round trips are preferred to one ambiguous one.
+This is the same definition of "live" that <code>term-desktop.mix</code> uses, so the two
+control surfaces agree.</p>
+<p>The two failure modes are reported distinctly, because they call for opposite
+actions — start a terminal, versus find the stuck one:</p>
+<ul>
+<li>nothing registered → <code>ERROR: no CosMix terminal is registered on the Bus (looked for </code>term<code>, then </code>bterm<code>) — start one with </code>mix --gui``</li>
+<li>registered but silent → <code>ERROR: CosMix terminal registered but unresponsive: </code>term<code> did not answer INFO within 3s (wedged, or shutting down). No other frontend is registered. Nothing was sent.</code></li>
+</ul>
 <table><thead><tr><th>Tool</th><th>Arguments</th><th>Behaviour</th></tr></thead><tbody>
 <tr><td><code>term_list</code></td><td><code>{}</code></td><td>Read-only JSON arrays <code>tabs</code> and <code>panes</code>: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic.</td></tr>
 <tr><td><code>term_snapshot</code></td><td><code>{}</code></td><td>Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings.</td></tr>
