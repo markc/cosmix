@@ -376,8 +376,24 @@ fn pick_term_service(registered: &[String]) -> Result<&'static str, String> {
 /// returns None — refused — for any other namespace, so sending `term.tabs`
 /// to `bterm` is not merely untidy, it is rejected. Building every verb here,
 /// from the resolved name, is what makes that impossible to get wrong.
-fn term_verb(service: &str, suffix: &str) -> String {
-    format!("{service}.{suffix}")
+///
+/// The `Err` arm catches the specific regression this sweep exists to remove:
+/// a call site that passes an already-namespaced verb (`"term.snapshot"`)
+/// instead of a suffix. Left to `format!` that silently produces
+/// `bterm.term.snapshot`, which the frontend refuses with a message about an
+/// unknown verb — a confusing symptom one indirection from its cause. Here it
+/// names the cause.
+fn term_verb(service: &str, suffix: &str) -> Result<String, String> {
+    if let Some(ns) = TERM_SERVICES
+        .into_iter()
+        .find(|name| suffix.starts_with(&format!("{name}.")))
+    {
+        return Err(format!(
+            "internal: Term verb suffix {suffix:?} already carries the `{ns}.` namespace; \
+             pass the suffix alone and let the resolved service supply the prefix"
+        ));
+    }
+    Ok(format!("{service}.{suffix}"))
 }
 
 /// The verb SUFFIX (namespace-free) and body for a tab operation. The
@@ -729,8 +745,8 @@ impl CosmixMcp {
         let result: Result<String, String> = async {
             let service = self.term_service().await?;
             let noded = self.noded().await?;
-            let tabs = term_reply(noded.call(service, &term_verb(service, "tabs"), serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
-            let panes = term_reply(noded.call(service, &term_verb(service, "panes"), serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let tabs = term_reply(noded.call(service, &term_verb(service, "tabs")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let panes = term_reply(noded.call(service, &term_verb(service, "panes")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
             term_reply(serde_json::json!({"tabs": term_listing(&tabs, true)?, "panes": term_listing(&panes, false)?}))
         }.await;
         result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
@@ -791,7 +807,7 @@ impl CosmixMcp {
             let noded = self.noded().await?;
             term_reply(
                 noded
-                    .call(service, &term_verb(service, verb_suffix), args)
+                    .call(service, &term_verb(service, verb_suffix)?, args)
                     .await
                     .map_err(|e| e.to_string())?,
             )
@@ -2847,10 +2863,23 @@ mod tests {
                 "tabs", "panes", "snapshot", "type", "tab.new", "tab.select", "tab.close",
                 "pane.split", "pane.select", "pane.close",
             ] {
-                let verb = term_verb(service, suffix);
+                let verb = term_verb(service, suffix).unwrap();
                 assert_eq!(verb, format!("{service}.{suffix}"));
                 assert!(verb.starts_with(&format!("{service}.")), "{verb}");
             }
+            // The regression this sweep removes, caught at the funnel: a call
+            // site that passes an already-namespaced verb is refused by name
+            // rather than silently producing `bterm.term.snapshot`.
+            for bad in TERM_SERVICES.map(|ns| format!("{ns}.snapshot")) {
+                let err = term_verb(service, &bad).unwrap_err();
+                assert!(err.contains("already carries"), "{err}");
+            }
+            // `bterm` must not be mistaken for the `term.` namespace by a
+            // naive prefix test — the dot is load-bearing.
+            assert_eq!(
+                term_verb(service, "btermish").unwrap(),
+                format!("{service}.btermish")
+            );
         }
         // Every suffix the request builders can emit is namespace-free, so
         // `term_verb` cannot double-prefix one.

@@ -32,9 +32,18 @@
 -- responsive and not merely registered — this script is about to drive verbs,
 -- not just report. Preference order matches `mix --gui`'s binary resolution
 -- (term, then bterm) so the launcher drives the same terminal it starts.
+--
+-- The per-send `timeout=` is load-bearing, not tidiness. Without it a
+-- REGISTERED BUT WEDGED `term` costs the default 60s transport timeout, and
+-- that timeout marks Mix's cached Bus connection Lost (cosmix-mix/src/bus.rs,
+-- "A transport failure … is an Err → transition to Lost"), so every later
+-- form raises `mesh unavailable` — the fallback probe could never reach a
+-- perfectly healthy `bterm`. A per-send timeout returns rc=-2 by cancelling
+-- the call in the evaluator instead, leaving the connection usable. Three
+-- seconds is comfortably above the frontends' own two-second reply budget.
 fn resolve_term_service()
   for $name in ["term", "bterm"]
-    $probe = send $name "INFO" body=""
+    $probe = send $name "INFO" body="" timeout=3
     if $rc == 0 then return $name end
   end
   return ""
@@ -117,17 +126,29 @@ if $need_launch then
   if $resolved.ok and trim($resolved.stdout) != "" then $mix = trim($resolved.stdout) end
   $pid = spawn(shell_quote($mix) .. " --gui", "/dev/null", "/dev/null")
   print("launched Term (pid " .. to_string($pid) .. ") with its shell in " .. $dir)
-  -- Wait (bounded) for the new instance to register before driving it, and
-  -- take its name from that same probe: which frontend `mix --gui` found is
-  -- not knowable until it answers.
-  $i = 0
+  -- Wait (bounded) for A frontend to be answering, and take the name to drive
+  -- from that probe: which binary `mix --gui` resolved is not knowable from
+  -- here until one answers.
+  --
+  -- Honest about what this proves and what it does not. It proves a frontend
+  -- is answering; it does NOT prove the child just launched is that frontend.
+  -- Where one was already running (`open` always launches, even then) the
+  -- pre-existing instance satisfies the probe immediately and a failed launch
+  -- goes unnoticed. Distinguishing the two needs per-instance identity, which
+  -- is P0-I and not available on this lane.
+  --
+  -- The deadline is WALL TIME, not an iteration count: each probe can now cost
+  -- up to its own timeout, so counting sleeps would have silently stretched a
+  -- stated 20s into minutes. (Mix has no monotonic clock builtin — `time()` is
+  -- Unix time, so a clock step during the wait skews this. Acceptable for a
+  -- 20s desktop launch; it would not be for a lease.)
+  $deadline = time() + 20
   $service = resolve_term_service()
-  while $i < 40 and $service == ""
+  while $service == "" and time() < $deadline
     sleep(0.5)
-    $i = $i + 1
     $service = resolve_term_service()
   end
-  if $service == "" then raise("TERM_NOREG", "Term did not register on the Bus within 20s (looked for `term`, then `bterm`)") end
+  if $service == "" then raise("TERM_NOREG", "no Term answered on the Bus within 20s (looked for `term`, then `bterm`)") end
   print("driving Bus service `" .. $service .. "`")
 end
 
