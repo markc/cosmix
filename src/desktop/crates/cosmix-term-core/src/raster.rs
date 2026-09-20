@@ -135,6 +135,17 @@ fn paintable_rows(screen: &Screen) -> usize {
     screen.rows.min(screen.cells.len() / screen.cols.max(1))
 }
 
+/// Physical pixels a target must be able to hold, and the cell rows behind
+/// them. The one place this arithmetic exists.
+fn target(raster: &Raster, screen: &Screen) -> (usize, usize, usize) {
+    let rows = paintable_rows(screen);
+    (
+        screen.cols * raster.width as usize,
+        rows * raster.height as usize,
+        rows,
+    )
+}
+
 /// Runs of `true` in `rows`, in device-pixel coordinates, into `out`.
 fn bands_into(rows: &[bool], cell_height: u32, out: &mut Vec<DamageBand>) {
     out.clear();
@@ -268,13 +279,28 @@ impl Raster {
     /// belongs to this function, not to the VT, so nothing else can be relied
     /// on to erase it — in particular when the caller turns the cursor off
     /// (an unfocused pane) without the grid changing at all.
+    /// Physical pixels a [`Raster::paint`] target must be able to hold for
+    /// `screen`, at this raster's cell size.
+    ///
+    /// **A caller that owns its own buffer sizes it from here**, never from
+    /// its own `cols * cell` arithmetic: the row count is clamped to the
+    /// whole rows the screen actually has cells for, and a caller that
+    /// reimplemented that clamp slightly differently would have its buffer
+    /// refused — or, worse, would drift from the painter one edit later. The
+    /// minimum stride is `width * 4`; the minimum length is
+    /// `stride * height`.
+    pub fn target_size(&self, screen: &Screen) -> (u32, u32) {
+        let (width, height, _) = target(self, screen);
+        (width as u32, height as u32)
+    }
+
     pub fn render_into<'a>(
         &mut self,
         screen: &Screen,
         dirty: &[bool],
         surface: &'a mut Surface,
     ) -> &'a [DamageBand] {
-        let rows = paintable_rows(screen);
+        let (width, height, rows) = target(self, screen);
         if screen.cols == 0 || rows == 0 {
             surface.rgba.clear();
             surface.width = 0;
@@ -283,8 +309,6 @@ impl Raster {
             surface.state.bands.clear();
             return &surface.state.bands;
         }
-        let width = screen.cols * self.width as usize;
-        let height = rows * self.height as usize;
         let bytes = width * height * 4;
         // Resizing is this wrapper's whole job; `paint` never touches the
         // caller's allocation. A grown buffer also changes its identity, so
@@ -339,10 +363,8 @@ impl Raster {
         // alternative is a returned band claiming a row was repainted while
         // the loop skipped it, which is a lie a renderer cannot detect and
         // which leaves the old pixels — including an old cursor — on screen.
-        let rows = paintable_rows(screen);
         let cell = (self.width, self.height);
-        let width = screen.cols * self.width as usize;
-        let height = rows * self.height as usize;
+        let (width, height, rows) = target(self, screen);
         if screen.cols == 0
             || rows == 0
             || stride < width * 4
@@ -807,6 +829,50 @@ mod tests {
             );
         }
         assert!(dst[..stride].iter().any(|byte| *byte != 0x5a));
+    }
+
+    /// `paint` refuses a buffer it cannot fill, so a caller that owns its
+    /// pixels needs the size rule exactly — including the clamp to whole
+    /// rows. `target_size` IS that rule, and a buffer sized from it must
+    /// never be refused. If these two ever diverge, a Bevy `Image` sized by
+    /// hand starts getting silently blank frames.
+    #[test]
+    fn a_buffer_sized_from_target_size_is_never_refused() {
+        let mut raster = raster();
+        let mut state = PaintState::default();
+        for (cols, rows, truncate) in [
+            (1_usize, 1_usize, 0_usize),
+            (4, 3, 0),
+            (80, 24, 0),
+            // A short cell array: the clamp is the part a caller would get
+            // wrong, so it is the part worth pinning.
+            (4, 3, 1),
+            (10, 5, 12),
+        ] {
+            let mut grid = screen(cols, rows, 'x');
+            grid.cells.truncate(grid.cells.len() - truncate);
+            let (width, height) = raster.target_size(&grid);
+            let stride = width as usize * 4;
+            let mut dst = vec![0_u8; stride * height as usize];
+            state.invalidate();
+            let bands = raster
+                .paint(&grid, &mut dst, stride, &mut state, &[])
+                .to_vec();
+            // Empty bands mean it refused the buffer; a different extent
+            // means the two disagree about how big the frame is. Both are
+            // the same bug and both fail here.
+            assert_eq!(
+                bands,
+                vec![DamageBand { y: 0, height }],
+                "{cols}x{rows} less {truncate} cells: target_size and paint disagree"
+            );
+            // And `Surface` agrees with the number it hands a slice caller.
+            let mut surface = Surface::default();
+            let _ = raster.render_into(&grid, &[], &mut surface);
+            assert_eq!((surface.width(), surface.height()), (width, height));
+            assert_eq!(surface.stride(), stride);
+            assert_eq!(surface.rgba(), dst);
+        }
     }
 
     /// Damage-bounded painting keeps whatever the target already held in the
