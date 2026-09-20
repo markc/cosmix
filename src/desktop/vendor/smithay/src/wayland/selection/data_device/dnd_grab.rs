@@ -42,6 +42,8 @@ pub struct DnDGrab<D: SeatHandler> {
     current_focus: Option<WlSurface>,
     pending_offers: Vec<wl_data_offer::WlDataOffer>,
     offer_data: Option<Arc<Mutex<OfferData>>>,
+    // cosmix patch: only the grab's own release handler may authorise a drop.
+    pending_drop: bool,
     icon: Option<WlSurface>,
     origin: WlSurface,
     seat: Seat<D>,
@@ -81,6 +83,8 @@ impl<D: SeatHandler> DnDGrab<D> {
             current_focus: None,
             pending_offers: Vec::with_capacity(1),
             offer_data: None,
+            // cosmix patch: external teardown cancels unless a release authorises a drop.
+            pending_drop: false,
             origin,
             icon,
             seat,
@@ -103,10 +107,17 @@ impl<D: SeatHandler> DnDGrab<D> {
             current_focus: None,
             pending_offers: Vec::with_capacity(1),
             offer_data: None,
+            // cosmix patch: external teardown cancels unless a release authorises a drop.
+            pending_drop: false,
             origin,
             icon,
             seat,
         }
+    }
+
+    // cosmix patch: source destruction must identify the matching active grab, not another grab.
+    pub(super) fn has_source(&self, source: &WlDataSource) -> bool {
+        self.data_source.as_ref() == Some(source)
     }
 }
 
@@ -224,6 +235,36 @@ where
         }
     }
 
+    // cosmix patch: teardown revokes offers and leaves the target without delivering a drop.
+    fn cancel(&mut self, _data: &mut D) {
+        self.pending_drop = false;
+        self.pending_offers.clear();
+        if let Some(offer_data) = self.offer_data.take() {
+            offer_data.lock().unwrap().active = false;
+        }
+        if let Some(surface) = self.current_focus.take() {
+            if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
+                let seat_data = self
+                    .seat
+                    .user_data()
+                    .get::<RefCell<SeatData<D::SelectionUserData>>>()
+                    .unwrap()
+                    .borrow();
+                for device in seat_data.known_data_devices() {
+                    if device.id().same_client_as(&surface.id()) {
+                        device.leave();
+                    }
+                }
+            }
+        }
+        if let Some(source) = self.data_source.take() {
+            if source.alive() && source.is_alive() {
+                source.cancelled();
+            }
+        }
+        self.icon = None;
+    }
+
     fn drop(&mut self, data: &mut D) {
         // the user dropped, proceed to the drop
         let seat_data = self
@@ -309,7 +350,8 @@ where
 
     fn button(&mut self, data: &mut D, handle: &mut PointerInnerHandle<'_, D>, event: &ButtonEvent) {
         if handle.current_pressed().is_empty() {
-            // the user dropped, proceed to the drop
+            // cosmix patch: only this release may turn synchronous unset into a drop.
+            self.pending_drop = true;
             handle.unset_grab(self, data, event.serial, event.time, true);
         }
     }
@@ -400,7 +442,12 @@ where
     }
 
     fn unset(&mut self, data: &mut D) {
-        self.drop(data);
+        // cosmix patch: unset from any teardown other than our own release must cancel.
+        if self.pending_drop {
+            self.drop(data);
+        } else {
+            self.cancel(data);
+        }
     }
 }
 
@@ -433,6 +480,8 @@ where
             return;
         }
 
+        // cosmix patch: only the initiating touch's release authorises a drop.
+        self.pending_drop = true;
         handle.unset_grab(self, data);
     }
 
@@ -465,7 +514,8 @@ where
         handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
         _seq: crate::utils::Serial,
     ) {
-        // TODO: should we cancel something here?
+        // cosmix patch: touch cancellation uses the shared cancellation path through unset.
+        self.pending_drop = false;
         handle.unset_grab(self, data);
     }
 
@@ -492,7 +542,12 @@ where
     }
 
     fn unset(&mut self, data: &mut D) {
-        self.drop(data);
+        // cosmix patch: unset from any teardown other than our own release must cancel.
+        if self.pending_drop {
+            self.drop(data);
+        } else {
+            self.cancel(data);
+        }
     }
 }
 

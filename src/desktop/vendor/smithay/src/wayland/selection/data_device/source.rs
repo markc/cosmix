@@ -80,8 +80,40 @@ where
         }
     }
 
-    fn destroyed(_state: &mut D, _client: ClientId, _resource: &WlDataSource, data: &DataSourceUserData) {
+    fn destroyed(state: &mut D, _client: ClientId, resource: &WlDataSource, data: &DataSourceUserData) {
         data.alive_tracker.destroy_notify();
+
+        // cosmix patch: Destroy and client disconnect must cancel matching active drags immediately.
+        // Inspect the existing seat grabs; release with_grab's lock before unsetting the grab.
+        // Downcast through Any to avoid imposing WaylandFocus bounds on source dispatch.
+        let seats = state.seat_state().seats.clone();
+        for seat in seats {
+            if let Some(pointer) = seat.get_pointer() {
+                let matches = pointer.with_grab(|_, grab| {
+                    grab.as_any()
+                        .downcast_ref::<super::dnd_grab::DnDGrab<D>>()
+                        .is_some_and(|grab| grab.has_source(resource))
+                });
+                if matches == Some(true) {
+                    // No input timestamp is available, and cached focus may have been destroyed.
+                    pointer.unset_grab_without_focus_restore(
+                        state,
+                        crate::utils::SERIAL_COUNTER.next_serial(),
+                        0,
+                    );
+                }
+            }
+            if let Some(touch) = seat.get_touch() {
+                let matches = touch.with_grab(|_, grab| {
+                    grab.as_any()
+                        .downcast_ref::<super::dnd_grab::DnDGrab<D>>()
+                        .is_some_and(|grab| grab.has_source(resource))
+                });
+                if matches == Some(true) {
+                    touch.unset_grab(state);
+                }
+            }
+        }
     }
 }
 
