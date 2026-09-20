@@ -219,8 +219,13 @@ straight back and the run reports success. `re_replace_must` (0.90.0) is the sam
 call that raises instead:
 
 ```mix
-write_file($p, re_replace_must(read_file($p), "^version = .*$", $new, {count: 1, path: $p}))
+write_file($p, re_replace_must(read_file($p), "(?m)^version = .*$", $new, {count: 1, path: $p}))
 ```
+
+Note the `(?m)` — without it `^`/`$` anchor to the whole text, not each line,
+so a line-oriented pattern over a file's contents matches nothing. Before
+`re_replace_must` that was a silent no-op that wrote the file back unchanged;
+now it is a `NEEDLE_ABSENT` that names the file.
 
 `NEEDLE_ABSENT` when nothing matched, `NEEDLE_COUNT` when `{count: n}` disagrees
 with how many matches there were. `mix lint` flags the unguarded chain as

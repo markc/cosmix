@@ -619,9 +619,13 @@ inf1
 <p>The fallback is scalars only. Give <code>+</code> a container or a function value on
 <strong>either</strong> side and it raises <code>TYPE_ERROR</code> naming the builtin that does what
 you meant:</p>
-<pre><code class="language-mix">print(["a"] + ["b"])      -- TYPE_ERROR: `+` does not join lists — use concat(a, b)
-print({a: 1} + {b: 2})    -- TYPE_ERROR: `+` does not merge maps — use merge(a, b)
-print([1] + 2)            -- TYPE_ERROR: use `..` to build text
+<pre><code class="language-mix">print(["a"] + ["b"])
+print({a: 1} + {b: 2})
+print([1] + 2)
+</code></pre>
+<pre><code class="language-text">Runtime error: `+` is not defined for list and list — it does not join lists. Use concat(a, b) to join, push(list, value) to append
+Runtime error: `+` is not defined for map and map — it does not merge maps. Use merge(a, b)
+Runtime error: `+` is not defined for list and number — `+` takes numbers or strings. Use `..` to build text, concat(a, b) for lists, merge(a, b) for maps
 </code></pre>
 <p>Before 0.90.0 each of those produced a <em>string</em> (<code>[a][b]</code>, <code>{a: 1}{b: 2}</code>, <code>[1]2</code>)
 with rc 0, and nothing failed until far from the cause — a helper that built

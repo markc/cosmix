@@ -609,8 +609,12 @@ eaten before the regex sees it — see <a href="/mix/regex#quoting-traps">Quotin
 subject unchanged, so in a read-modify-write file edit the input is written
 straight back and the run reports success. <code>re_replace_must</code> (0.90.0) is the same
 call that raises instead:</p>
-<pre><code class="language-mix">write_file($p, re_replace_must(read_file($p), "^version = .*$", $new, {count: 1, path: $p}))
+<pre><code class="language-mix">write_file($p, re_replace_must(read_file($p), "(?m)^version = .*$", $new, {count: 1, path: $p}))
 </code></pre>
+<p>Note the <code>(?m)</code> — without it <code>^</code>/<code>$</code> anchor to the whole text, not each line,
+so a line-oriented pattern over a file's contents matches nothing. Before
+<code>re_replace_must</code> that was a silent no-op that wrote the file back unchanged;
+now it is a <code>NEEDLE_ABSENT</code> that names the file.</p>
 <p><code>NEEDLE_ABSENT</code> when nothing matched, <code>NEEDLE_COUNT</code> when <code>{count: n}</code> disagrees
 with how many matches there were. <code>mix lint</code> flags the unguarded chain as
 <a href="/mix/lint">MIX-D3014</a>.</p>

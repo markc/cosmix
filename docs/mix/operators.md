@@ -235,9 +235,14 @@ The fallback is scalars only. Give `+` a container or a function value on
 you meant:
 
 ```mix
-print(["a"] + ["b"])      -- TYPE_ERROR: `+` does not join lists — use concat(a, b)
-print({a: 1} + {b: 2})    -- TYPE_ERROR: `+` does not merge maps — use merge(a, b)
-print([1] + 2)            -- TYPE_ERROR: use `..` to build text
+print(["a"] + ["b"])
+print({a: 1} + {b: 2})
+print([1] + 2)
+```
+```text
+Runtime error: `+` is not defined for list and list — it does not join lists. Use concat(a, b) to join, push(list, value) to append
+Runtime error: `+` is not defined for map and map — it does not merge maps. Use merge(a, b)
+Runtime error: `+` is not defined for list and number — `+` takes numbers or strings. Use `..` to build text, concat(a, b) for lists, merge(a, b) for maps
 ```
 
 Before 0.90.0 each of those produced a *string* (`[a][b]`, `{a: 1}{b: 2}`, `[1]2`)
