@@ -872,7 +872,12 @@ fn build_live_render_app(
         // inserts this (render_hud_probe.rs); the persistent native path
         // needs it too until the vblank-aligned pulse-admission fix
         // (kms_live.rs pulse skip+rebase, realignment doc finding #2) lands.
-        app.insert_resource(idle::ContinuousRendering);
+        // EXPERIMENT 2026-09-20: this insert is REMOVED to test whether the
+        // vblank-aligned pulse fix (kms_live.rs ~6001-6040) has made it
+        // unnecessary. It was forcing continuous rendering in the embedded
+        // path, which is what the 2026-09-15 trial measured as doubling
+        // comp frame cost (p50 16ms -> 33ms). Throwaway branch; not for merge.
+        // app.insert_resource(idle::ContinuousRendering);
     }
     app.insert_resource(FirstLiveRenderError::default())
         .insert_resource(RenderErrorHandler(stop_live_rendering_after_first_error));
