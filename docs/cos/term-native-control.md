@@ -1,11 +1,23 @@
 # Term native control
 
-The global TCP `term` registration sends completion notifications and, under
+> **Two lanes, and only one of them was renamed.** Since 2026-09-21 (TODO-term
+> D1) a frontend's **global registration is its own name** — `term` for the
+> iced+wgpu frontend, `bterm` for the Bevy one — and the verb namespace
+> follows it: bterm serves `bterm.tabs`, and *refuses* `term.tabs`. Two
+> binaries cannot both own `term`, and T5's A/B needs both running at once.
+> The **native-session lane below is unaffected**: its verbs are the canonical
+> `term.*` spellings on the broker-allocated Unix identity, they are not
+> rewritten per frontend, and both frontends speak them identically. Where
+> this page says `term.foo` under the global lane, read `<frontend>.foo`;
+> under the native-session lane, read it literally.
+
+The global TCP registration sends completion notifications and, under
 the default mesh-open posture (`COSMIX_MESH_OPEN` unset or any value other
 than `0`), serves the full **targetless** active-tab verb set to any mesh or
 local caller with no grant: `term.tabs`, `term.tab.new/select/close`,
 `term.panes`, `term.pane.split/select/close`, `term.snapshot`, `term.type`,
-plus `INFO`/`HELP` (term 0.8.5, per the 2026-09-15 full-mesh-access law).
+plus `INFO`/`HELP` (term 0.8.5, per the 2026-09-15 full-mesh-access law) — each
+in the holding frontend's own namespace.
 These verbs act on the active tab/pane of the instance holding the name at
 delivery time; they carry no target binding. `term.type` revokes any
 delegated control writer exactly as real keys do. Any mutating verb's body
@@ -331,8 +343,8 @@ real Mix child over a PTY, so a plain `cargo test` reports them as ignored and
 says nothing about enforcement. Run them mechanically from `src/`:
 
 ```sh
-mix desktop/apps/term/check-s4-gates.mix     # the 14 S4 enforcement fixtures
-mix desktop/apps/term/check-production-e2e.mix   # p0i-01, the production child-proof
+mix desktop/apps/bterm/check-s4-gates.mix     # the 14 S4 enforcement fixtures
+mix desktop/apps/bterm/check-production-e2e.mix   # p0i-01, the production child-proof
 ```
 
 It builds the current-HEAD Mix the fixtures demand — they refuse a stale or

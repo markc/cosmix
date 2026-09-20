@@ -1,7 +1,20 @@
-# CosMix Term tabs and panes
+# CosMix BTerm tabs and panes
 
-The `cosmix-term` package supplies the `term` binary and Wayland app ID
-`dev.cosmix.term`. Help → About shows the component and crate version.
+The `cosmix-bterm` package supplies the `bterm` binary, the Wayland app ID
+derived from its `bterm` identity slug, and the Bus name `bterm`.
+Help → About shows the component and crate version; `bterm --version` prints
+the version and build hash from a cold process and does nothing else — it
+registers no Bus name, needs no Wayland session, and works over ssh.
+
+**Renamed from `term` on 2026-09-21** (TODO-term T1/D1). The global Bus name
+`term` is reserved for the incoming iced+wgpu frontend, because two binaries
+cannot both own it and T5's A/B weight comparison needs both running at once.
+**This is not a deprecation.** Per D6 bterm is kept indefinitely: it is the
+reference implementation, the A/B control for every weight claim, and the only
+frontend proven against the native-session lane. It stops being the default; it
+does not stop existing. `mix --gui` resolves `term` first and falls back to
+`bterm`, so on a machine that has only this one it is still what you get.
+
 Children start in `$HOME` with the startup-selected `TERM` (see below).
 PTY damage wakes the reactive event loop (focused/unfocused: 16/33 ms).
 The preserved core retains `TERM_SPIKE_FONT`, ASCII input, a steady
@@ -37,36 +50,51 @@ shortcuts are intercepted before terminal input. Open menus suspend PTY input.
 Closing the active tab selects its right neighbour, or the left neighbour at
 the end. Closing the last tab quits after bounded terminal shutdown.
 
-The diagnostic `term` Bus service accepts JSON objects, including `{"id":42}` for
-`term.tab.select` and `term.tab.close`. `term.tab.new` opens and activates a tab;
-`term.tabs` lists stable IDs, selection, titles, dimensions and child PIDs.
-`term.snapshot` and `term.type` target the active pane. `term.panes` lists the
+The diagnostic `bterm` Bus service accepts JSON objects, including `{"id":42}` for
+`bterm.tab.select` and `bterm.tab.close`. `bterm.tab.new` opens and activates a tab;
+`bterm.tabs` lists stable IDs, selection, titles, dimensions and child PIDs.
+`bterm.snapshot` and `bterm.type` target the active pane. `bterm.panes` lists the
 active tab's pane IDs, active flags, cached dimensions/PIDs and logical x/y/w/h
-(zero geometry until layout). `term.pane.split` accepts
-`{"dir":"h"}` (also horizontal, v, vertical); `term.pane.select` accepts `{"id":42}` belonging
-to the active tab; `term.pane.close` closes its active pane. IDs are monotonic
+(zero geometry until layout). `bterm.pane.split` accepts
+`{"dir":"h"}` (also horizontal, v, vertical); `bterm.pane.select` accepts `{"id":42}` belonging
+to the active tab; `bterm.pane.close` closes its active pane. IDs are monotonic
 across tabs and never reused in the process. Pane verbs retain the diagnostic
 P0-I identity gate. Requests remain limited
 to 8192 bytes and replies to a two-second timeout. This self-asserted service
 is diagnostic only: authenticated per-instance identity remains gated on P0-I.
 
+**`bterm` answers `bterm.*` and NOTHING ELSE.** A `term.*` verb sent here is
+refused with the same message an unknown verb gets, so the reply is not an
+oracle for which frontends exist. The refusal is deliberate and tested
+(`bterm_serves_its_own_namespace_and_refuses_terms`): it is what stops the two
+frontends colliding on one namespace during an A/B. `INFO` and `HELP` are
+unprefixed and both frontends answer them, and `HELP` is rendered into this
+frontend's namespace so every verb it advertises is one you can actually send.
+The **native-session lane is a separate route and is NOT renamed** — its verbs
+stay the canonical `term.*` on the broker-allocated Unix identity, identical in
+both frontends (see [Term native control](../../../../docs/cos/term-native-control.md)).
+
 No-argument verbs require `{}` (an empty body is also accepted).
-`term.type` requires `{"text":"echo hello\n"}`; the JSON envelope and escaping
+`bterm.type` requires `{"text":"echo hello\n"}`; the JSON envelope and escaping
 count towards the 8192-byte request cap. Invalid JSON, non-object bodies,
 unexpected fields and missing or wrongly typed arguments are rejected before
 mutation. IDs are non-negative u64 integers. This breaks raw-body callers as
-of Term 0.3.0. See the [MCP Term contracts](../../../../docs/cos/mcp.md).
+of Term 0.3.0. See the [MCP Term contracts](../../../../docs/cos/mcp.md) —
+those tools resolve `term`, then `bterm`, and build the verb from whichever
+answers.
 
 Headless tab tests launch real Mix children where `/opt/cosmix/bin/mix` exists
 and print an explicit skip otherwise. The existing terminal core tests remain
 unchanged. GUI interaction and presented-frame evidence require runtime checks.
 
-From `src/`, run `mix desktop/apps/term/check-no-x11.mix` to check the locked
+From `src/`, run `mix desktop/apps/bterm/check-no-x11.mix` to check the locked
 feature graph. The gate rejects x11, xcb, rio-window and softbuffer.
 
 ## Startup configuration
 
-Copy [term.example.conf.mix](term.example.conf.mix) to
+Both frontends read the same `term.conf.mix`, so the example file lives with
+the parser that `include_str!`s it rather than with either app.
+Copy [term.example.conf.mix](../../crates/cosmix-term-core/term.example.conf.mix) to
 `$XDG_CONFIG_HOME/cosmix/term.conf.mix`, falling back to
 `~/.config/cosmix/term.conf.mix`. Empty or relative XDG paths fall back to HOME.
 The existing CosMix strict-data parser reads this file once; it cannot execute
@@ -87,7 +115,7 @@ Invalid environment values are ignored. The resolved size survives fractional
 scale changes. Every tab receives the configured history limit; zero disables
 history. Cursor styles are steady, without blinking or application style overrides.
 
-`term --print-config` prints resolved settings as JSON, including `TERM`, and
+`bterm --print-config` prints resolved settings as JSON, including `TERM`, and
 exits before checking Wayland or starting fonts, PTYs or the Bus. It works
 without a GUI; config diagnostics go to stderr, JSON to stdout.
 
@@ -100,12 +128,12 @@ Mix, use `run_argv_must(["tic", "-x", "rio.terminfo"])`. For an explicit
 per-user destination, pass `-o` and the absolute path to your `~/.terminfo`
 directory. Use `infocmp -x xterm-rio` to check the installed entry.
 
-At startup Term runs `infocmp -x xterm-rio` directly, without a shell, discarding
+At startup BTerm runs `infocmp -x xterm-rio` directly, without a shell, discarding
 its output. Success selects `TERM=xterm-rio` for every child; missing infocmp,
 missing terminfo or any probe failure selects `TERM=xterm-256color`. The probe
 has a one-second deadline; a timed-out child is killed and reaped before using
 the fallback. This uses
 infocmp's normal `TERMINFO`, `TERMINFO_DIRS`, user and system database lookup,
-including database formats handled by the installed ncurses tools. Term never
+including database formats handled by the installed ncurses tools. BTerm never
 runs tic or installs terminfo. The selected name is visible in `--print-config`;
 Bus verb shapes and HELP gating are unchanged.

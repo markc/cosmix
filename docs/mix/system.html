@@ -993,7 +993,7 @@ way to failing).</p>
 (v0.89.0), a <strong>list</strong> of strings run <strong>directly, with no shell</strong> — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force <code>run("setsid app &amp;")</code> through <code>sh</code>.</p>
-<pre><code class="language-mix">spawn(["cosmix-term", "--profile", "work"])           -- argv, no shell
+<pre><code class="language-mix">spawn(["bterm", "--profile", "work"])                 -- argv, no shell
 spawn(["mydaemon"], {detach: true})                   -- new session (setsid),
                                                       --   survives the caller,
                                                       --   drops the terminal

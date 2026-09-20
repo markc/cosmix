@@ -342,16 +342,56 @@ struct TermPaneParams {
     id: Option<u64>,
 }
 
+/// The Bus names a terminal frontend may hold, in preference order.
+///
+/// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global name
+/// `term`, so the Bevy frontend was renamed and now registers as `bterm` and
+/// serves `bterm.*`; `term` / `term.*` is reserved for the incoming iced+wgpu
+/// one. T5's A/B needs both running at once, so these tools RESOLVE the live
+/// frontend instead of hardcoding a name, and prefer `term` — the default —
+/// when both are up.
+const TERM_SERVICES: [&str; 2] = ["term", "bterm"];
+
+/// What to say when nothing is registered. It names both candidates: the most
+/// likely cause of this error for the rest of 2026 is a caller expecting the
+/// pre-rename `term` to be there, and an error that named only one of them
+/// would leave that reader guessing.
+const TERM_NO_FRONTEND: &str = "no CosMix terminal is registered on the Bus (looked for `term`, then `bterm`) — start one with `mix --gui`";
+
+/// Pick the frontend to address from the broker's registered-service list.
+///
+/// Pure, so the preference order and the no-frontend message are testable
+/// without a live broker or a running terminal.
+fn pick_term_service(registered: &[String]) -> Result<&'static str, String> {
+    TERM_SERVICES
+        .into_iter()
+        .find(|name| registered.iter().any(|s| s == name))
+        .ok_or_else(|| TERM_NO_FRONTEND.to_string())
+}
+
+/// The wire verb for `suffix` in `service`'s namespace.
+///
+/// **The verb prefix MUST follow the service.** `cosmix-term-core`'s
+/// `canonical_verb()` rewrites `<service>.` at the dispatch boundary and
+/// returns None — refused — for any other namespace, so sending `term.tabs`
+/// to `bterm` is not merely untidy, it is rejected. Building every verb here,
+/// from the resolved name, is what makes that impossible to get wrong.
+fn term_verb(service: &str, suffix: &str) -> String {
+    format!("{service}.{suffix}")
+}
+
+/// The verb SUFFIX (namespace-free) and body for a tab operation. The
+/// namespace is added by [`term_verb`] once the live frontend is resolved.
 fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value), String> {
     match p.op.as_str() {
-        "new" => Ok(("term.tab.new", serde_json::json!({}))),
+        "new" => Ok(("tab.new", serde_json::json!({}))),
         "select" | "close" => {
             let id = p.id.ok_or("id is required for select/close")?;
             Ok((
                 if p.op == "select" {
-                    "term.tab.select"
+                    "tab.select"
                 } else {
-                    "term.tab.close"
+                    "tab.close"
                 },
                 serde_json::json!({"id": id}),
             ))
@@ -360,11 +400,12 @@ fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value
     }
 }
 
+/// The verb SUFFIX (namespace-free) and body for a pane operation.
 fn term_pane_request(p: TermPaneParams) -> Result<(&'static str, serde_json::Value), String> {
     match p.op.as_str() {
-        "close" => Ok(("term.pane.close", serde_json::json!({}))),
+        "close" => Ok(("pane.close", serde_json::json!({}))),
         "select" => Ok((
-            "term.pane.select",
+            "pane.select",
             serde_json::json!({"id": p.id.ok_or("id is required for select")?}),
         )),
         "split" => {
@@ -372,7 +413,7 @@ fn term_pane_request(p: TermPaneParams) -> Result<(&'static str, serde_json::Val
             if !matches!(dir.as_str(), "h" | "v" | "horizontal" | "vertical") {
                 return Err("dir must be h|v|horizontal|vertical".into());
             }
-            Ok(("term.pane.split", serde_json::json!({"dir": dir})))
+            Ok(("pane.split", serde_json::json!({"dir": dir})))
         }
         _ => Err("op must be split|select|close".into()),
     }
@@ -648,6 +689,25 @@ impl CosmixMcp {
             .map_err(|e: String| e)
     }
 
+    /// Which terminal frontend is live RIGHT NOW, per call.
+    ///
+    /// Deliberately NOT cached on `self`: the MCP process outlives any one
+    /// terminal, and which frontend holds a name changes under it (bterm
+    /// quits, the iced `term` starts, a second one is launched for an A/B).
+    /// A process-lifetime cache would pin the first answer and then address a
+    /// dead name for the rest of the session — the exact failure this sweep
+    /// exists to remove, reintroduced one indirection deeper. One
+    /// `noded.list` per tool call is cheap against a local broker.
+    ///
+    /// A single tool that makes several calls resolves ONCE and reuses the
+    /// answer, so a mid-tool frontend change cannot split one logical read
+    /// across two terminals.
+    async fn term_service(&self) -> Result<&'static str, String> {
+        let noded = self.noded().await?;
+        let registered = noded.list_services().await.map_err(|e| e.to_string())?;
+        pick_term_service(&registered)
+    }
+
     async fn indexd(&self) -> Result<cosmix_skills::IndexdClient, String> {
         cosmix_skills::IndexdClient::from_config()
             .await
@@ -660,42 +720,43 @@ impl CosmixMcp {
     // ---- Bus tools ----
 
     /// Read-only tab and active-tab pane listing (ids, active flags, dimensions, pids,
-    /// geometry) from CosMix Term over ABP. Sequential reads are not atomic.
+    /// geometry) from the live CosMix terminal over ABP (`term`, else `bterm`).
+    /// Sequential reads are not atomic.
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
     async fn term_list(&self) -> String {
         let result: Result<String, String> = async {
+            let service = self.term_service().await?;
             let noded = self.noded().await?;
-            let tabs = term_reply(noded.call("term", "term.tabs", serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
-            let panes = term_reply(noded.call("term", "term.panes", serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let tabs = term_reply(noded.call(service, &term_verb(service, "tabs"), serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let panes = term_reply(noded.call(service, &term_verb(service, "panes"), serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
             term_reply(serde_json::json!({"tabs": term_listing(&tabs, true)?, "panes": term_listing(&panes, false)?}))
         }.await;
         result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
     }
 
     /// Read-only active screen text, dimensions, cursor, pid and diagnostic timings
-    /// from CosMix Term over ABP (reply bounded to 1 MiB).
+    /// from the live CosMix terminal over ABP (reply bounded to 1 MiB).
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
     async fn term_snapshot(&self) -> String {
-        self.term_request("term.snapshot", serde_json::json!({}))
-            .await
+        self.term_request("snapshot", serde_json::json!({})).await
     }
 
-    /// DIAGNOSTIC synthetic input to CosMix Term over ABP, not the authenticated
-    /// input API. The term service is a self-asserted diagnostic surface pending
-    /// authenticated per-instance identity (P0-I). Text uses the keyboard encoder;
-    /// newline is Enter. JSON request is limited to 8192 bytes.
+    /// DIAGNOSTIC synthetic input to the live CosMix terminal over ABP, not the
+    /// authenticated input API. The term service is a self-asserted diagnostic surface
+    /// pending authenticated per-instance identity (P0-I). Text uses the keyboard
+    /// encoder; newline is Enter. JSON request is limited to 8192 bytes.
     #[tool]
     async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> String {
         // VERIFY: MCP Term tool is a thin structured-argument ABP translation.
-        self.term_request("term.type", serde_json::json!({"text": p.text}))
+        self.term_request("type", serde_json::json!({"text": p.text}))
             .await
     }
 
-    /// Create, select or close a tab in CosMix Term over ABP; select/close require id.
+    /// Create, select or close a tab in the live CosMix terminal over ABP; select/close require id.
     /// Closing the last tab quits. The term service is a self-asserted diagnostic
     /// surface pending authenticated per-instance identity (P0-I).
     #[tool]
@@ -718,15 +779,19 @@ impl CosmixMcp {
         }
     }
 
-    async fn term_request(&self, verb: &str, args: serde_json::Value) -> String {
+    /// Send one verb, named by its namespace-free SUFFIX, to whichever
+    /// terminal frontend is live. The namespace comes from the resolved
+    /// service, never from the caller.
+    async fn term_request(&self, verb_suffix: &str, args: serde_json::Value) -> String {
         if args.to_string().len() > 8192 {
             return "ERROR: request exceeds 8192 bytes".into();
         }
         let result: Result<String, String> = async {
+            let service = self.term_service().await?;
             let noded = self.noded().await?;
             term_reply(
                 noded
-                    .call("term", verb, args)
+                    .call(service, &term_verb(service, verb_suffix), args)
                     .await
                     .map_err(|e| e.to_string())?,
             )
@@ -2642,9 +2707,9 @@ mod tests {
     fn term_translations_and_listing() {
         use super::*;
         for (op, verb) in [
-            ("new", "term.tab.new"),
-            ("select", "term.tab.select"),
-            ("close", "term.tab.close"),
+            ("new", "tab.new"),
+            ("select", "tab.select"),
+            ("close", "tab.close"),
         ] {
             let (actual, args) = term_tab_request(TermTabParams {
                 op: op.into(),
@@ -2678,7 +2743,7 @@ mod tests {
                     id: None
                 })
                 .unwrap(),
-                ("term.pane.split", serde_json::json!({"dir":dir}))
+                ("pane.split", serde_json::json!({"dir":dir}))
             );
         }
         for (op, dir) in [
@@ -2703,7 +2768,7 @@ mod tests {
                 id: None
             })
             .unwrap(),
-            ("term.pane.close", serde_json::json!({}))
+            ("pane.close", serde_json::json!({}))
         );
         assert_eq!(
             term_pane_request(TermPaneParams {
@@ -2712,7 +2777,7 @@ mod tests {
                 id: Some(9)
             })
             .unwrap(),
-            ("term.pane.select", serde_json::json!({"id":9}))
+            ("pane.select", serde_json::json!({"id":9}))
         );
         let tabs = term_listing(
             "id=1 active=true title=Mix shell cols=80 rows=24 child_pid=123",
@@ -2736,6 +2801,112 @@ mod tests {
         assert!(term_reply(serde_json::json!("x".repeat(TERM_REPLY_MAX + 1))).is_err());
         // An empty Bus reply arrives as Value::Null; render it as "", never "null".
         assert_eq!(term_reply(serde_json::Value::Null).unwrap(), "");
+    }
+
+    /// D1 (TODO-term, 2026-09-21): the MCP addresses whichever frontend is
+    /// live, preferring the default `term` over the Bevy `bterm`.
+    ///
+    /// This gate is proven able to fail — the pre-sweep code hardcoded
+    /// `"term"`, which fails the bterm-only and neither-registered arms.
+    #[test]
+    fn term_service_resolves_the_live_frontend() {
+        use super::*;
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Both up (the T5 A/B case): the default frontend wins.
+        assert_eq!(
+            pick_term_service(&names(&["noded", "bterm", "term"])).unwrap(),
+            "term"
+        );
+        // Only the iced/default one.
+        assert_eq!(pick_term_service(&names(&["noded", "term"])).unwrap(), "term");
+        // Only the Bevy one — today's state after the rename, before the
+        // iced frontend ships.
+        assert_eq!(
+            pick_term_service(&names(&["noded", "bterm"])).unwrap(),
+            "bterm"
+        );
+        // Neither: a plain error naming both candidates, not a call into the
+        // void that comes back as an opaque broker timeout.
+        let err = pick_term_service(&names(&["noded", "webd"])).unwrap_err();
+        assert!(err.contains("`term`"), "{err}");
+        assert!(err.contains("`bterm`"), "{err}");
+        assert_eq!(pick_term_service(&[]).unwrap_err(), err);
+        // A name that merely CONTAINS a candidate is not that candidate.
+        assert!(pick_term_service(&names(&["terminal", "bterm-2"])).is_err());
+    }
+
+    /// The wire verb must follow the resolved service: `cosmix-term-core`
+    /// refuses any other namespace, so a verb built from the wrong name is a
+    /// rejected call, not an untidy one.
+    #[test]
+    fn term_verbs_follow_the_resolved_service() {
+        use super::*;
+        for service in TERM_SERVICES {
+            for suffix in [
+                "tabs", "panes", "snapshot", "type", "tab.new", "tab.select", "tab.close",
+                "pane.split", "pane.select", "pane.close",
+            ] {
+                let verb = term_verb(service, suffix);
+                assert_eq!(verb, format!("{service}.{suffix}"));
+                assert!(verb.starts_with(&format!("{service}.")), "{verb}");
+            }
+        }
+        // Every suffix the request builders can emit is namespace-free, so
+        // `term_verb` cannot double-prefix one.
+        let mut suffixes = vec![
+            term_tab_request(TermTabParams {
+                op: "new".into(),
+                id: None,
+            })
+            .unwrap()
+            .0,
+        ];
+        for op in ["select", "close"] {
+            suffixes.push(
+                term_tab_request(TermTabParams {
+                    op: op.into(),
+                    id: Some(1),
+                })
+                .unwrap()
+                .0,
+            );
+        }
+        suffixes.push(
+            term_pane_request(TermPaneParams {
+                op: "split".into(),
+                dir: Some("h".into()),
+                id: None,
+            })
+            .unwrap()
+            .0,
+        );
+        suffixes.push(
+            term_pane_request(TermPaneParams {
+                op: "select".into(),
+                dir: None,
+                id: Some(1),
+            })
+            .unwrap()
+            .0,
+        );
+        suffixes.push(
+            term_pane_request(TermPaneParams {
+                op: "close".into(),
+                dir: None,
+                id: None,
+            })
+            .unwrap()
+            .0,
+        );
+        for suffix in suffixes {
+            for service in TERM_SERVICES {
+                assert!(
+                    !suffix.starts_with(&format!("{service}.")),
+                    "suffix carries a namespace: {suffix}"
+                );
+            }
+        }
     }
 
     use super::*;

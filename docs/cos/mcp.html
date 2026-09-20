@@ -487,9 +487,18 @@ lifecycle is Claude Code's.</p>
 retrieved skill → <code>*_feedback</code> to score the chunks you used.</p>
 <h2 id="term-diagnostic-tools">Term diagnostic tools</h2>
 <p>Since cosmix-mcp 0.5.0, five dedicated tools drive CosMix Term over ABP.
-The self-asserted <code>term</code> service is diagnostic pending authenticated
+The self-asserted terminal service is diagnostic pending authenticated
 per-instance identity (P0-I). These tools reuse the Bus client and central
 per-call metrics. Replies are bounded to 1 MiB.</p>
+<p><strong>Which frontend they address is RESOLVED, not fixed (cosmix-mcp 0.5.1).</strong>
+TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
+<code>term</code> / <code>term.*</code>, the Bevy one is <code>bterm</code> / <code>bterm.*</code>, and a frontend
+<em>refuses</em> a verb from the other namespace. Before every tool call the MCP asks
+the broker which is registered and takes the first of <code>term</code>, then <code>bterm</code>,
+building the verb from that same name. Resolution is per call, never cached
+for the process: the MCP outlives any one terminal, and both frontends may be
+up at once for an A/B. With neither registered the tool answers <code>ERROR: no CosMix terminal is registered on the Bus (looked for </code>term<code>, then </code>bterm<code>)</code>
+rather than timing out against an unheld name.</p>
 <table><thead><tr><th>Tool</th><th>Arguments</th><th>Behaviour</th></tr></thead><tbody>
 <tr><td><code>term_list</code></td><td><code>{}</code></td><td>Read-only JSON arrays <code>tabs</code> and <code>panes</code>: ids, active flags, dimensions, child pids, tab titles and pane geometry. Sequential reads are not atomic.</td></tr>
 <tr><td><code>term_snapshot</code></td><td><code>{}</code></td><td>Read-only active screen text, cols/rows, cursor, pid, byte counters and diagnostic timings.</td></tr>
@@ -500,7 +509,10 @@ per-call metrics. Replies are bounded to 1 MiB.</p>
 <p>The MCP schemas use String for text/op, optional u64 for id, and optional
 String for dir. Invalid operations, missing required ids/directions, and
 invalid split directions return errors without an ABP call.</p>
-<p>Term 0.3.0 changes every <code>term.*</code> request to a JSON object:</p>
+<p>Term 0.3.0 changes every request to a JSON object. The verb column is written
+in the canonical <code>term.</code> namespace; on the wire the prefix is the <strong>resolved
+frontend's name</strong>, so against the Bevy frontend these are <code>bterm.snapshot</code>,
+<code>bterm.tabs</code> and so on:</p>
 <table><thead><tr><th>Bus verb</th><th>JSON body</th></tr></thead><tbody>
 <tr><td><code>term.snapshot</code>, <code>term.tabs</code>, <code>term.tab.new</code>, <code>term.panes</code>, <code>term.pane.close</code></td><td><code>{}</code></td></tr>
 <tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td></tr>

@@ -7,8 +7,8 @@ API and the child-only `dup2`/source-close inside `pre_exec`.
 
 The parent-side CLOEXEC-clear/spawn/reset alternative was inspected and rejected.
 In `vendor/teletypewriter/src/unix/mod.rs`, `pre_exec` closes only the PTY
-ends (lines 682–683), not every non-stdio FD. However, Term's Core mutex
-(`apps/term/src/main.rs`) and Bus handler (`crates/cosmix-term-core/src/bus.rs`) serialise
+ends (lines 682–683), not every non-stdio FD. However, the frontend's Core mutex
+(`apps/bterm/src/main.rs`) and Bus handler (`crates/cosmix-term-core/src/bus.rs`) serialise
 one TabSet only. `Terminal::start_session` and independently constructed
 TabSets, including concurrent test fixtures, do not require that mutex.
 There is no process-wide spawn lock covering an inheritable-FD window.

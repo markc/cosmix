@@ -1,7 +1,8 @@
 -- Hard gate: the canonical `mix` binary links NO GUI/terminal-emulator
 -- crates. The shell runs as root's login shell fleet-wide; it must stay
--- small and boring. The graphical terminal is the SEPARATE `cosmix-term`
--- binary in the desktop workspace — `mix --gui` exec-replaces into it.
+-- small and boring. The graphical terminal is a SEPARATE binary in the
+-- desktop workspace (`cosmix-bterm`/`bterm` today, `term` once the iced
+-- frontend lands) — `mix --gui` exec-replaces into whichever it resolves.
 -- The single shared thing is the bus contract, never the ELF.
 -- (Standing decision, reaffirmed 2026-09-11 after an e2e briefly dragged
 -- teletypewriter/corcovado into the main lockfile; this gate makes the

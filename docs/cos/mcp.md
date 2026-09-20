@@ -59,9 +59,20 @@ retrieved skill → `*_feedback` to score the chunks you used.
 ## Term diagnostic tools
 
 Since cosmix-mcp 0.5.0, five dedicated tools drive CosMix Term over ABP.
-The self-asserted `term` service is diagnostic pending authenticated
+The self-asserted terminal service is diagnostic pending authenticated
 per-instance identity (P0-I). These tools reuse the Bus client and central
 per-call metrics. Replies are bounded to 1 MiB.
+
+**Which frontend they address is RESOLVED, not fixed (cosmix-mcp 0.5.1).**
+TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
+`term` / `term.*`, the Bevy one is `bterm` / `bterm.*`, and a frontend
+*refuses* a verb from the other namespace. Before every tool call the MCP asks
+the broker which is registered and takes the first of `term`, then `bterm`,
+building the verb from that same name. Resolution is per call, never cached
+for the process: the MCP outlives any one terminal, and both frontends may be
+up at once for an A/B. With neither registered the tool answers `ERROR: no
+CosMix terminal is registered on the Bus (looked for `term`, then `bterm`)`
+rather than timing out against an unheld name.
 
 | Tool | Arguments | Behaviour |
 |---|---|---|
@@ -75,7 +86,10 @@ The MCP schemas use String for text/op, optional u64 for id, and optional
 String for dir. Invalid operations, missing required ids/directions, and
 invalid split directions return errors without an ABP call.
 
-Term 0.3.0 changes every `term.*` request to a JSON object:
+Term 0.3.0 changes every request to a JSON object. The verb column is written
+in the canonical `term.` namespace; on the wire the prefix is the **resolved
+frontend's name**, so against the Bevy frontend these are `bterm.snapshot`,
+`bterm.tabs` and so on:
 
 | Bus verb | JSON body |
 |---|---|
