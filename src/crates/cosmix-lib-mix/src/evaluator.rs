@@ -15201,10 +15201,10 @@ fn add_is_scalar(value: &Value) -> bool {
 fn add_operand_error(left: &Value, right: &Value) -> MixError {
     let hint = match (left, right) {
         (Value::List(_), Value::List(_)) => {
-            "`+` does not join lists — use concat(a, b)".to_string()
+            "it does not join lists. Use concat(a, b) to join, push(list, value) to append"
         }
-        (Value::Map(_), Value::Map(_)) => "`+` does not merge maps — use merge(a, b)".to_string(),
-        _ => "`+` needs numbers or strings; use `..` to build text, concat(a, b) for lists, merge(a, b) for maps".to_string(),
+        (Value::Map(_), Value::Map(_)) => "it does not merge maps. Use merge(a, b)",
+        _ => "`+` takes numbers or strings. Use `..` to build text, concat(a, b) for lists, merge(a, b) for maps",
     };
     MixError::structured(
         "TYPE_ERROR",

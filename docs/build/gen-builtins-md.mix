@@ -14,7 +14,8 @@
 -- regenerated index always matches the binary that produced it. The
 -- prose header (everything before the first category section) and the
 -- tail (from "## Prelude" on) are preserved verbatim; only the category
--- listings between them are rebuilt. Requires mix >= 0.63.0 (re_replace).
+-- listings between them are rebuilt. Requires mix >= 0.90.0
+-- (re_replace_must — the version stamp must not be able to miss silently).
 
 $bin = realpath("/proc/self/exe")
 $argv = args()
@@ -30,6 +31,11 @@ $version = after($version_line, "mix ")
 if $version == nil then
   die("cannot read version from: " .. $version_line)
 end
+-- Since 0.89.1 `--version` appends a build stamp — "0.90.0 (abc123-dirty)".
+-- The DOC wants the release number only: a committed page that says
+-- "-dirty" records the state of one working tree, not the release, and the
+-- line 104 re_replace below would then never match its own output again.
+$version = word($version, 1)
 
 $raw = run_argv_must([$bin, "builtins", "--json"])
 $all = json_parse($raw)
@@ -100,8 +106,14 @@ if $tail_rest == nil then
 end
 $tail = "## Prelude" .. $tail_rest
 
--- Refresh the header's version stamp (re_replace: subject first).
-$head = re_replace($head, "\\(mix [0-9][0-9.]*\\)", "(mix " .. $version .. ")")
+-- Refresh the header's version stamp (re_replace_must: subject first, and
+-- it RAISES when the stamp is not there — a silent miss left the page
+-- claiming 0.82.0 for seven releases, and once a nested build stamp got
+-- written in ("0.89.1 (abc-dirty)") the old regex could never match its own
+-- output again. The optional group eats such a stamp if one survives.
+$head = re_replace_must($head,
+  "\\(mix [0-9][0-9.]*( \\([^)]*\\))?\\)", "(mix " .. $version .. ")",
+  {count: 1, path: $md_path})
 
 $mid = ""
 for $s in $sections

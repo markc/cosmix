@@ -633,8 +633,28 @@ print(pos("é", "café"))         -- 1-based codepoint position
 <tr><td>codepoints (default)</td><td><code>length</code>/<code>len</code>, <code>pos</code>, <code>lastpos</code>, <code>index_of</code>, <code>substr</code>, <code>reverse</code>, <code>left</code>, <code>right</code></td><td>Unicode scalar values</td></tr>
 <tr><td>raw bytes</td><td><code>byte_length</code>, <code>byte_pos</code>, <code>byte_lastpos</code>, <code>byte_index_of</code></td><td>UTF-8 bytes</td></tr>
 <tr><td>user-perceived chars</td><td><code>grapheme_count</code>, <code>grapheme_substr</code>, <code>grapheme_reverse</code></td><td>grapheme clusters (UAX #29)</td></tr>
-<tr><td>terminal columns</td><td><code>display_width</code>, <code>lpad_w</code>, <code>rpad_w</code>, <code>word_wrap_w</code></td><td>display cells (UAX #11)</td></tr>
 </tbody></table>
+<h3 id="ord--chr--codepoint--character-0900"><code>ord</code> / <code>chr</code> — codepoint ↔ character (0.90.0)</h3>
+<p><code>ord(s)</code> is the Unicode codepoint of the <strong>first character</strong>; <code>chr(n)</code> is the
+one-character string for a codepoint. They are the runtime twins of the <code>\u{…}</code>
+literal escape, and the only way to <em>ask</em> what a string holds —
+<code>bytes_to_hex(string_to_bytes($s))</code> answers in UTF-8 bytes, which is a different
+question.</p>
+<pre><code class="language-mix">print(ord("A"))
+print(ord("é"))          -- the CODEPOINT 233, not the first byte 0xC3
+print(chr(10084))
+print(chr(0x27))         -- the runtime twin of "\u{27}"
+</code></pre>
+<pre><code class="language-text">65
+233
+❤
+'
+</code></pre>
+<p><code>ord("")</code> raises: <code>0</code> is NUL, a real codepoint that <code>chr</code> round-trips, so it cannot
+also mean "absent". <code>chr</code> takes the <code>\u{…}</code> validity rule exactly — a surrogate
+(<code>chr(0xD800)</code>), anything above <code>0x10FFFF</code>, and a fractional or negative argument
+all raise rather than saturate to a plausible wrong character.
+| terminal columns | <code>display_width</code>, <code>lpad_w</code>, <code>rpad_w</code>, <code>word_wrap_w</code> | display cells (UAX #11) |</p>
 <p>All four rows are operations on <strong>text</strong>. Operations on a raw <code>bytes</code>/<code>buffer</code>
 <em>value</em> are a different family, <code>bytes_*</code> — see
 <a href="/mix/io#naming-byte_-vs-bytes_">io</a>. The two are easy to confuse and are not
@@ -723,6 +743,22 @@ you need NFC-insensitive matching.</p>
 byte-exact rule is about <em>matching</em>, not casing. For word extraction there are the
 ARexx-flavoured <code>words($s)</code> (count whitespace-delimited words) and <code>word($s, n)</code>
 (Nth word, 1-based); for pattern matching see <a href="/mix/regex">regex</a>.</p>
+<h3 id="editing-a-file-use-replace_must-0900">Editing a file? Use <code>replace_must</code> (0.90.0)</h3>
+<p><code>replace()</code> returns the subject <strong>unchanged</strong> when the needle is absent. That is
+the right contract for a transform and the wrong one for an <em>edit</em>: in the
+read-modify-write idiom a missed needle writes the input straight back and reports
+success.</p>
+<pre><code class="language-mix">$s = read_file($p)
+write_file($p, replace_must($s, "old", "new", {count: 1, path: $p}))
+</code></pre>
+<p><code>replace_must(s, old, new[, {count, path}])</code> raises <code>NEEDLE_ABSENT</code> when <code>old</code> does
+not occur, and <code>NEEDLE_COUNT</code> when <code>count</code> is given and the number of occurrences
+differs — so an edit that was meant to hit one site and would have rewritten two
+fails instead of shipping. <code>path</code> only names the file in the message, which is most
+of the diagnosis when the edit runs in a loop over several files.
+<code>re_replace_must(s, pattern, replacement[, {count, path}])</code> is the regex twin.</p>
+<p><code>replace()</code> and <code>re_replace()</code> are unchanged — <code>mix lint</code> flags the unguarded
+write-back chain as <a href="/mix/lint">MIX-D3014</a>.</p>
 <h2 id="ordering-and-equality">Ordering and equality</h2>
 <p>The comparison operators <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code> pick their mode from <strong>both</strong> operands:</p>
 <ol>

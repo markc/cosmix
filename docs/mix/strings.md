@@ -258,6 +258,32 @@ The three boundaries, in one table:
 | codepoints (default) | `length`/`len`, `pos`, `lastpos`, `index_of`, `substr`, `reverse`, `left`, `right` | Unicode scalar values |
 | raw bytes | `byte_length`, `byte_pos`, `byte_lastpos`, `byte_index_of` | UTF-8 bytes |
 | user-perceived chars | `grapheme_count`, `grapheme_substr`, `grapheme_reverse` | grapheme clusters (UAX #29) |
+
+### `ord` / `chr` — codepoint ↔ character (0.90.0)
+
+`ord(s)` is the Unicode codepoint of the **first character**; `chr(n)` is the
+one-character string for a codepoint. They are the runtime twins of the `\u{…}`
+literal escape, and the only way to *ask* what a string holds —
+`bytes_to_hex(string_to_bytes($s))` answers in UTF-8 bytes, which is a different
+question.
+
+```mix
+print(ord("A"))
+print(ord("é"))          -- the CODEPOINT 233, not the first byte 0xC3
+print(chr(10084))
+print(chr(0x27))         -- the runtime twin of "\u{27}"
+```
+```text
+65
+233
+❤
+'
+```
+
+`ord("")` raises: `0` is NUL, a real codepoint that `chr` round-trips, so it cannot
+also mean "absent". `chr` takes the `\u{…}` validity rule exactly — a surrogate
+(`chr(0xD800)`), anything above `0x10FFFF`, and a fractional or negative argument
+all raise rather than saturate to a plausible wrong character.
 | terminal columns | `display_width`, `lpad_w`, `rpad_w`, `word_wrap_w` | display cells (UAX #11) |
 
 All four rows are operations on **text**. Operations on a raw `bytes`/`buffer`
@@ -372,6 +398,28 @@ true
 byte-exact rule is about *matching*, not casing. For word extraction there are the
 ARexx-flavoured `words($s)` (count whitespace-delimited words) and `word($s, n)`
 (Nth word, 1-based); for pattern matching see [regex](regex.md).
+
+### Editing a file? Use `replace_must` (0.90.0)
+
+`replace()` returns the subject **unchanged** when the needle is absent. That is
+the right contract for a transform and the wrong one for an *edit*: in the
+read-modify-write idiom a missed needle writes the input straight back and reports
+success.
+
+```mix
+$s = read_file($p)
+write_file($p, replace_must($s, "old", "new", {count: 1, path: $p}))
+```
+
+`replace_must(s, old, new[, {count, path}])` raises `NEEDLE_ABSENT` when `old` does
+not occur, and `NEEDLE_COUNT` when `count` is given and the number of occurrences
+differs — so an edit that was meant to hit one site and would have rewritten two
+fails instead of shipping. `path` only names the file in the message, which is most
+of the diagnosis when the edit runs in a loop over several files.
+`re_replace_must(s, pattern, replacement[, {count, path}])` is the regex twin.
+
+`replace()` and `re_replace()` are unchanged — `mix lint` flags the unguarded
+write-back chain as [MIX-D3014](lint.md).
 
 ## Ordering and equality
 

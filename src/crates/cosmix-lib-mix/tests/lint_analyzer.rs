@@ -784,3 +784,71 @@ fn hand_built_value_binding_keyword_operands_keep_w2303() {
         "block-bodied function def must stay a legal operand"
     );
 }
+
+// ── MIX-D3014: write_file of an unchecked replace() result (0.90.0) ──
+
+#[test]
+fn unguarded_edit_chain_notes_both_the_nested_and_the_stepwise_shape() {
+    // The nested one-liner — the `mix -c` edit shape that shipped a commit
+    // which did not compile on 2026-09-18.
+    assert!(
+        codes("write_file(\"/tmp/f\", replace(read_file(\"/tmp/f\"), \"a\", \"b\"))\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+    // The same chain spread over statements, which is how scripts write it.
+    assert!(
+        codes("$s = read_file(\"/tmp/f\")\n$s = replace($s, \"a\", \"b\")\nwrite_file(\"/tmp/f\", $s)\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+    // Regex twin.
+    assert!(
+        codes("$s = read_file(\"/tmp/f\")\n$s = re_replace($s, \"a+\", \"b\")\nwrite_file(\"/tmp/f\", $s)\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+}
+
+#[test]
+fn a_guarded_or_must_edit_chain_stays_quiet() {
+    // A `contains` test anywhere means the author has the habit.
+    assert!(
+        !codes("$s = read_file(\"/tmp/f\")\nif contains($s, \"a\") then\n  $s = replace($s, \"a\", \"b\")\nend\nwrite_file(\"/tmp/f\", $s)\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+    // The `_must` twin IS the fix — it must not be the thing that is flagged.
+    assert!(
+        !codes("write_file(\"/tmp/f\", replace_must(read_file(\"/tmp/f\"), \"a\", \"b\"))\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+    // A write_file of something unrelated is not an edit chain.
+    assert!(
+        !codes("$s = \"hello\"\nwrite_file(\"/tmp/f\", $s)\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+    // Reassignment from a non-replace clears the fact.
+    assert!(
+        !codes("$s = replace(\"x\", \"a\", \"b\")\n$s = \"literal\"\nwrite_file(\"/tmp/f\", $s)\n")
+            .contains(&"MIX-D3014".to_string())
+    );
+}
+
+#[test]
+fn d3014_is_a_note_so_it_never_gates_deny_warnings() {
+    let out = lint("write_file(\"/tmp/f\", replace(read_file(\"/tmp/f\"), \"a\", \"b\"))\n");
+    assert!(out.iter().any(|(c, _)| c == "MIX-D3014"));
+    let tokens = Lexer::new("write_file(\"/tmp/f\", replace(read_file(\"/tmp/f\"), \"a\", \"b\"))\n")
+        .tokenize()
+        .unwrap();
+    let stmts = Parser::new(
+        tokens,
+        "write_file(\"/tmp/f\", replace(read_file(\"/tmp/f\"), \"a\", \"b\"))\n",
+    )
+    .parse_program()
+    .unwrap();
+    let analysis = analyze(&stmts, Some("test.mix"), &AnalyzerConfig::default());
+    let d = analysis
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "MIX-D3014")
+        .unwrap();
+    assert_eq!(d.severity, Severity::Note);
+}

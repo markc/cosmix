@@ -240,6 +240,11 @@ pub const LINT_DOCS: &[LintDoc] = &[
         detail: "An `ssh_mix` body (its second argument) that lint could not analyse — a non-literal argument (a variable, a concatenation, an interpolated string, a `read_file`), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist. Ship the remote half as a literal heredoc so lint (and inventories built from it) can see inside.",
     },
     LintDoc {
+        code: "MIX-D3014",
+        summary: "write_file of an unchecked replace() result",
+        detail: "The edit-a-file idiom — `write_file(path, replace(read_file(path), old, new))`, or the same chain across statements — with nothing anywhere in the file that could have noticed the needle was absent. `replace()` returns the subject UNCHANGED when the needle does not occur, so a missed edit writes the input straight back and reports success: on 2026-09-18 three such edits missed and one shipped a commit that did not compile, with no signal at any step. Use `replace_must()` / `re_replace_must()` (0.90.0), which raise `NEEDLE_ABSENT`, and whose `{count: n}` also asserts how many sites were rewritten. Conservative by design: it fires only on a `write_file` whose written value is a replace call or a variable the same straight-line block assigned from one, and ANY guard spelling anywhere in the file (`contains`, `pos`, `index_of`, `count_of`, `re_match`, a `_must` twin) silences it for the whole file.",
+    },
+    LintDoc {
         code: "MIX-D3013",
         summary: "hand-rolled padding loop",
         detail: "A hand-rolled padding loop — `while len($o) < $n … $o = $o .. \" \"` — pointing at `lpad`/`rpad` (and the display-cell `lpad_w`/`rpad_w`). Four independent sessions wrote this loop while the builtins sat in the binary; the note is the discoverability fix that reaches the author at authoring time. Narrow by design: only a `<`/`<=` comparison of `len`/`length` of the same variable the body self-appends a string literal to.",

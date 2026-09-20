@@ -1328,6 +1328,123 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
     check_implicit_nil_calls(stmts, ctx, a);
     check_truthiness_traps(stmts, ctx, a);
     check_ssh_escaped_quotes(stmts, ctx, a);
+    check_unguarded_edit_chain(stmts, ctx, a);
+}
+
+/// Deep-walk an expression and every descendant (lambda bodies excluded,
+/// same as `walk_expr_children`).
+fn for_each_expr(expr: &Expr, visit: &mut dyn FnMut(&Expr)) {
+    visit(expr);
+    walk_expr_children(expr, &mut |child| for_each_expr(child, visit));
+}
+
+/// The tolerant transforms whose no-op is invisible.
+const TOLERANT_REPLACES: &[&str] = &["replace", "re_replace", "replace_first"];
+
+/// Any spelling of "I checked whether the needle was there" — a `contains`
+/// test, a position/count probe, or a `_must` twin that raises by itself.
+const EDIT_GUARDS: &[&str] = &[
+    "contains",
+    "replace_must",
+    "re_replace_must",
+    "pos",
+    "lastpos",
+    "index_of",
+    "last_index_of",
+    "count_of",
+    "re_match",
+    "re_find",
+];
+
+/// MIX-D3014 (0.90.0): `write_file(path, replace(read_file(path), …))` with
+/// nothing anywhere in the file that could have noticed the needle was
+/// absent.
+///
+/// `replace()` returns the subject UNCHANGED when the needle does not occur,
+/// so this whole shape — the edit-a-file idiom — writes the input straight
+/// back and reports success. On 2026-09-18 three such edits missed, and one
+/// of them shipped a commit that did not compile; there was no signal at any
+/// step. `replace_must()` (0.90.0) is the fix.
+///
+/// Conservative in two directions, because the analyzer's bias is
+/// near-zero false positives. It fires only on a `write_file` whose written
+/// VALUE is a replace call, or a variable the same straight-line block
+/// assigned from one; and ANY guard spelling anywhere in the file silences
+/// it for the whole file — a script that guards one edit has the habit, and
+/// a note it has already answered is noise.
+fn check_unguarded_edit_chain(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    let mut guarded = false;
+    walk_stmts(stmts, &mut |stmt| {
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_expr(expr, &mut |e| {
+                if let Expr::FunctionCall { name, .. } = e
+                    && EDIT_GUARDS.contains(&name.as_str())
+                {
+                    guarded = true;
+                }
+            });
+        });
+    });
+    if guarded {
+        return;
+    }
+    scan_edit_chain_block(stmts, ctx, a, &mut HashMap::new());
+}
+
+/// True when `expr` is (or directly wraps) a tolerant replace call.
+fn is_tolerant_replace(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, .. } if TOLERANT_REPLACES.contains(&name.as_str()))
+}
+
+fn scan_edit_chain_block(
+    stmts: &[Stmt],
+    ctx: &FileContext,
+    a: &mut Analysis,
+    edited: &mut HashMap<String, usize>,
+) {
+    for stmt in stmts {
+        // Report BEFORE updating the facts, so `$s = replace(...)` followed
+        // by `write_file($p, $s)` is seen in order.
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_expr(expr, &mut |e| {
+                let Expr::FunctionCall { name, args } = e else {
+                    return;
+                };
+                if name.as_str() != "write_file" || args.len() < 2 {
+                    return;
+                }
+                let written = &args[1];
+                let hit = is_tolerant_replace(written)
+                    || matches!(written, Expr::Variable(v) if edited.contains_key(v));
+                if hit {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-D3014",
+                        Severity::Note,
+                        stmt.line,
+                        "write_file() of a replace() result with no check that the needle was there"
+                            .to_string(),
+                        Some(
+                            "replace() returns the subject UNCHANGED when the needle is absent, so a missed edit writes the input back and reports success — use replace_must()/re_replace_must() (they raise NEEDLE_ABSENT, and {count: n} asserts how many sites)"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            });
+        });
+
+        for body in stmt_bodies(&stmt.kind) {
+            scan_edit_chain_block(body, ctx, a, &mut edited.clone());
+        }
+
+        if let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } = &stmt.kind {
+            if is_tolerant_replace(value) {
+                edited.insert(name.clone(), stmt.line);
+            } else {
+                edited.remove(name);
+            }
+        }
+    }
 }
 
 /// Flag the narrow source shape that signals Mix source is being nested in an
