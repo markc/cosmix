@@ -32,17 +32,24 @@ impl Frame {
         &self.surface
     }
 
+    // Read by the CPU arm's handle cache and by the tests; the wgpu arm keys
+    // its uploads on damage bands instead, so it never asks.
+    #[cfg_attr(feature = "wgpu", allow(dead_code))]
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
     /// Damage since the last call, coalesced, and cleared.
+    // The CPU arm uploads nothing — tiny-skia blits the whole handle — so only
+    // the wgpu arm and the tests consume bands.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     pub fn take_damage(&mut self) -> Vec<DamageBand> {
         coalesce(std::mem::take(&mut self.damage))
     }
 
     /// Drop pending damage because the whole surface is about to be uploaded
     /// anyway (a renderer that just created its texture).
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     pub fn clear_damage(&mut self) {
         self.damage.clear();
     }

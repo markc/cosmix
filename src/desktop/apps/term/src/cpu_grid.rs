@@ -45,7 +45,10 @@ pub fn view(handle: Option<&Handle>) -> image::Image<Handle> {
     let handle = handle
         .cloned()
         .unwrap_or_else(|| Handle::from_rgba(1, 1, vec![0, 0, 0, 0]));
+    // `content_fit: Fill` because the widget is sized to the grid's LOGICAL
+    // extent while the handle carries PHYSICAL pixels: the default `Contain`
+    // would letterbox to preserve a ratio that is already exact.
     image::Image::new(handle)
         .filter_method(image::FilterMethod::Nearest)
-        .snap(true)
+        .content_fit(iced::ContentFit::Fill)
 }

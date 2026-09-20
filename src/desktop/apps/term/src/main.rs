@@ -171,6 +171,7 @@ fn run(settings: config::Settings) -> Result<(), String> {
         update,
         view,
     )
+        .executor::<SingleThread>()
         .title(DISPLAY_NAME)
         .subscription(subscription)
         .theme(iced::Theme::Dark)
@@ -196,6 +197,38 @@ fn run(settings: config::Settings) -> Result<(), String> {
     drop(cleanup);
     let _ = reaper.join();
     result.map_err(|error| error.to_string())
+}
+
+/// One background thread for iced's `Task`s, instead of one per core.
+///
+/// iced's default executor is `futures::executor::ThreadPool::new()`, which
+/// sizes itself to `num_cpus` — 18 threads on this workstation, measured, and
+/// the whole of T5's thread-budget miss (30 threads against a gate of 24).
+/// They are all parked: this frontend's only tasks are `window::scale_factor`
+/// at boot and `exit`. A terminal's concurrency is one PTY, and it is already
+/// handled by the `poll(2)` thread and the reaper.
+///
+/// A pool rather than a `LocalPool` because `Executor::spawn` takes `&self`
+/// and must not block the UI thread; pool_size(1) is the smallest thing that
+/// still satisfies that contract.
+struct SingleThread(iced::futures::executor::ThreadPool);
+
+impl iced::Executor for SingleThread {
+    fn new() -> Result<Self, iced::futures::io::Error> {
+        iced::futures::executor::ThreadPool::builder()
+            .pool_size(1)
+            .name_prefix("term-task")
+            .create()
+            .map(Self)
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        self.0.spawn_ok(future);
+    }
+
+    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
+        iced::futures::executor::block_on(future)
+    }
 }
 
 struct Waker {
