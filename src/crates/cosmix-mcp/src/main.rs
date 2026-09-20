@@ -772,11 +772,23 @@ impl CosmixMcp {
             return Err(TERM_NO_FRONTEND.to_string());
         }
         for name in &candidates {
-            // `call` collapses an application error into `Err`, so `Ok` here
-            // means this name answered INFO — which is exactly the question.
+            // `call` collapses an application error into `Err`, so strictly
+            // `Ok` means "answered SUCCESSFULLY", not "answered" — a frontend
+            // that replied to INFO with an rc>=10 would read as silent here.
+            // That is unreachable for these frontends: `diagnostic()` and
+            // `handle()` in cosmix-term-core both answer INFO with `Ok` under
+            // either posture, open or strict, so INFO has no error reply to
+            // give. Distinguishing properly would mean `call_typed`, which is
+            // a wider change than an unreachable case earns — but if a future
+            // frontend ever refuses INFO, this is the line that will call it
+            // wedged.
+            //
             // The outer timeout cancels the call rather than waiting out the
-            // client's own; cancellation is safe because the pending-reply
-            // entry is removed by RAII.
+            // client's own 60s. Cancellation is safe: `PendingGuard`'s Drop
+            // removes this request's entry synchronously (native.rs), ids come
+            // from a monotonic counter and are never reused, and `reader_loop`
+            // discards a reply with no pending entry — so a late answer to a
+            // cancelled probe cannot resolve a different request.
             let probe = noded.call(name, "INFO", serde_json::Value::Null);
             if matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await, Ok(Ok(_))) {
                 return Ok(name);
