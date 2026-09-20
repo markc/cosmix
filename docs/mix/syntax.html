@@ -842,6 +842,12 @@ Working variable subtraction is sigil-led (<code>$alpha-$beta</code>) and stays 
 Earlier exact head rules still win, so <code>mix not-a-command</code> remains the <code>mix</code>
 meta-command with one hyphenated argument, not a command named
 <code>not-a-command</code>.</p>
+<p>There is one other position where a tight hyphen is read whole rather than as
+subtraction, for the same reason: the TARGET of
+<a href="/mix/bus"><code>send</code>/<code>emit</code>/<code>address</code></a>, where hyphenated Bus service names
+(<code>comp-nested</code>, <code>desktop-vt1</code>) are the norm. The shape there is this one plus
+<code>.</code>, for dotted names. It is a target-position rule, not a second
+statement-head rule — everything in the list above is unaffected.</p>
 <p>A <code>KEY=VALUE</code> prefix is skipped to find the real head — this is an <em>external
 command</em> with an env var set for it:</p>
 <pre><code class="language-text">$ mix -c 'FOO=bar printenv FOO'

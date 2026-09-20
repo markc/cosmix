@@ -25,6 +25,7 @@ const MAX_COMPLETION_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_ENTRY_BYTES: usize = 1024 * 1024;
 
 pub const MIX_SUBCOMMANDS: &[&str] = &[
+    "edit",
     "vars",
     "aliases",
     "functions",

@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — mix/bus</title>
+    <title>CosMix — mix/gotchas</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,533 +441,74 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="mix/bus.md"><div class="prose"><h1 id="bus--cosmix-agent-bus-messaging-send--emit--address--on">bus — CosMix Agent Bus messaging (send / emit / address / on)</h1>
-<p><strong>Bus messaging is what makes Mix more than "a better shell."</strong> <code>send</code>, <code>emit</code>,
-<code>address</code>, and <code>on … end</code> are <em>language keywords</em>, not library calls — Mix talks
-to a local message broker (and, over the mesh, to remote brokers) with no SDK,
-no client object, no boilerplate. This is the ARexx lineage made native: every
-service is a named, addressable port; a Mix one-liner can drive any of them.</p>
-<blockquote>
-<p><strong>Most examples on this page need a live broker</strong> (<code>cosmix-noded</code>, from the
-<a href="https://github.com/markc/cosmix">cos repo</a>). Where a broker is running the output
-shown is real, captured from <code>mix 0.21.2</code>. Where no broker is present the Bus
-forms <strong>degrade gracefully</strong> (see <a href="/mix/bus#no-broker-graceful-degradation">No broker</a>) —
-that path is verified separately. Treat the networked examples as illustrative
-of the shape; the language facts (keywords, <code>$result</code>/<code>$rc</code>, RPC vs
-fire-and-forget, target syntax) are exact.</p>
-</blockquote>
-<pre><code class="language-mix">send noded noded.ping            -- RPC to the LOCAL broker
-print("rc=" .. $rc)
-print("" .. $result)
-</code></pre>
-<pre><code class="language-text">rc=0
-result={extensions: {core: 1.0, topic: 1.0}, pong: true}
-</code></pre>
-<hr />
-<h2 id="the-model-in-one-paragraph">The model in one paragraph</h2>
-<p>A <strong>broker</strong> (<code>cosmix-noded</code>) runs on the node. Services register a <strong>name</strong>
-(<code>noded</code>, <code>statecache</code>, <code>webd</code>, …). You <strong><code>send</code></strong> a service a <strong>command</strong> (a
-dotted verb like <code>noded.ping</code>) with optional <strong>key=value args</strong>; the reply lands
-in <code>$result</code> and the status code in <code>$rc</code>. That's an RPC. <strong><code>emit</code></strong> is the same
-shape but fire-and-forget — no reply, no wait. <strong><code>address</code></strong> is a block of
-implicit sends to one target. <strong><code>on … end</code></strong> is the other direction: it
-<em>subscribes</em> a handler that fires when a matching message arrives — the basis of
-a Mix <a href="/mix/bus#serve-mode-mix-as-a-daemon">citizen</a> that <em>is</em> an addressable service.</p>
-<p>The win over bash/python: there is no equivalent without a client library. In
-Mix it is grammar.</p>
-<hr />
-<h2 id="send--rpc-requestreply"><code>send</code> — RPC (request/reply)</h2>
-<p><code>send &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches a command and <strong>waits for the
-reply</strong>. Two result variables are set as a side effect:</p>
-<table><thead><tr><th>Var</th><th>Meaning</th></tr></thead><tbody>
-<tr><td><code>$result</code></td><td>the reply value (a <a href="/mix/collections">map</a>, list, string, … — field-accessible)</td></tr>
-<tr><td><code>$rc</code></td><td>numeric status in signed bands: <code>0</code> delivered+accepted · <code>1..9</code> delivered with a warning (still success) · <code>&gt;= 10</code> peer application error (the exact peer rc is kept) · <code>-1</code> transport failure · <code>-2</code> per-send <code>timeout=</code> exceeded · <code>-3</code> Bus unavailable (no broker). All negatives are non-fatal.</td></tr>
+        <div id="content-doc" data-prerendered="mix/gotchas.md"><div class="prose"><h1 id="gotchas--what-you-will-guess-wrong-on-your-first-try">gotchas — what you will guess wrong on your first try</h1>
+<p>Mix has almost no presence in any model's training data, so a new session
+extrapolates from bash, Python and JavaScript — and several of those guesses
+are <strong>silently wrong</strong>: they run, produce a value, and mean something else.
+This page is the list of them.</p>
+<p>Read it before writing Mix. It is the one page that pays for itself in a
+single session. <code>mix man syntax</code> is the mental model; this is the errata.</p>
+<p>Every row below is executed by <code>cargo test -p cosmix-mix --test man_gotchas</code>,
+which runs the <strong>probe</strong> column through <code>mix -c</code> and compares the <strong>prints</strong>
+column. A wrong row fails the build, so the page cannot rot into confident
+fiction.</p>
+<h2 id="the-table">The table</h2>
+<p>A <code>prints</code> cell starting with <code>!</code> means the probe <strong>fails</strong>, and that text
+must appear in the error.</p>
+<table><thead><tr><th>you will guess</th><th>Mix is</th><th>probe</th><th>prints</th></tr></thead><tbody>
+<tr><td>a bare name reads the variable</td><td>a bare word is a <strong>string literal</strong> — <code>$</code> is not optional, and omitting it is silent</td><td><code>$x = 5; print(x)</code></td><td><code>x</code></td></tr>
+<tr><td><code>"hi $name"</code> interpolates</td><td>only <code>${...}</code> interpolates; a bare <code>$name</code> in a string is <strong>literal text</strong></td><td><code>$n = "world"; print("hi $n")</code></td><td><code>hi $n</code></td></tr>
+<tr><td>— so use braces</td><td><code>${name}</code> — and it is the <strong>same rule everywhere</strong> a string is built, heredocs included</td><td><code>$n = "world"; print("hi ${n}")</code></td><td><code>hi world</code></td></tr>
+<tr><td><code>elseif</code></td><td><code>elif</code></td><td><code>if 1 == 2 then print("a") elif 1 == 1 then print("b") end</code></td><td><code>b</code></td></tr>
+<tr><td><code>str(x)</code></td><td><code>to_string(x)</code></td><td><code>print(to_string(5))</code></td><td><code>5</code></td></tr>
+<tr><td><code>print(a, b)</code></td><td><code>print</code> is a <strong>statement</strong>, not a function, so <code>(a, b)</code> is read as an expression and fails</td><td><code>print("a", "b")</code></td><td><code>!expected RParen</code></td></tr>
+<tr><td>— so how do I print two things</td><td><code>print a, b</code> — no parens, joined by a space; <code>print(x)</code> only works because <code>(x)</code> is parenthesised</td><td><code>print "a", "b"</code></td><td><code>a b</code></td></tr>
+<tr><td><code>run()</code> returns a status</td><td><code>run()</code> <strong>raises</strong> on a non-zero exit</td><td><code>print(run("false"))</code></td><td><code>!failed (rc=1)</code></td></tr>
+<tr><td>— so how do I get the code</td><td><code>run_rc()</code> returns <code>{rc, stdout, stderr, …}</code></td><td><code>print(run_rc("false").rc)</code></td><td><code>1</code></td></tr>
+<tr><td><code>read_file()</code> returns nil when missing</td><td>it <strong>raises</strong>; test with <code>is_file()</code> first</td><td><code>print(read_file("/no/such/file"))</code></td><td><code>!No such file or directory</code></td></tr>
+<tr><td><code>push</code> mutates any list</td><td><code>push</code> writes through the <strong>slot</strong>; on a nested list it is a silent <strong>no-op</strong></td><td><code>$m = {a: [1]}; push($m.a, 2); print($m)</code></td><td><code>{a: [1]}</code></td></tr>
+<tr><td>— so how</td><td>read it out, push, store it back</td><td><code>$m = {a: [1]}; $i = $m.a; push($i, 2); $m["a"] = $i; print($m)</code></td><td><code>{a: [1, 2]}</code></td></tr>
+<tr><td>a declared <code>fn</code> name is a value</td><td>a <strong>lambda</strong> is a real value, but a declared <code>fn</code>'s bare name is the <strong>string</strong> <code>"f"</code></td><td><code>fn f($x) return $x end; $g = f; print($g)</code></td><td><code>f</code></td></tr>
+<tr><td>— so how do I pass one</td><td>assign a lambda: <code>$f = fn($x) = …</code>, which is a <code>function</code> and works in <code>map</code>/<code>filter</code></td><td><code>$f = fn($x) = $x + 1; print(map([1, 2], $f))</code></td><td><code>[2, 3]</code></td></tr>
+<tr><td>a <code>fn</code> can write an outer variable</td><td>assignment inside <code>fn</code> binds a <strong>local</strong>; return the value instead</td><td><code>$n = 1; fn bump() $n = 99 end; bump(); print($n)</code></td><td><code>1</code></td></tr>
+<tr><td><code>catch $e</code> gives an error object</td><td><code>$e</code> is the <strong>message string</strong>; use <code>catch $msg, $err</code> for <code>$err.code</code></td><td><code>try raise("E_X", "boom") catch $m, $e print($e.code) end</code></td><td><code>E_X</code></td></tr>
+<tr><td><code>raise("boom")</code></td><td><code>raise(CODE, MESSAGE)</code> — one argument is an arity error</td><td><code>try raise("E_X", "boom") catch $m print($m) end</code></td><td><code>boom</code></td></tr>
+<tr><td><code>json_decode()</code></td><td><code>json_parse()</code> (and <code>json_encode()</code> the other way)</td><td><code>print(json_parse("{\"a\":1}").a)</code></td><td><code>1</code></td></tr>
+<tr><td><code>==</code> compares two maps or lists</td><td>it <strong>raises</strong> rather than answer a useless <code>false</code></td><td><code>print([1, 2] == [1, 2])</code></td><td><code>!would always answer false</code></td></tr>
+<tr><td>— so how do I compare them</td><td><code>deep_eq(a, b)</code></td><td><code>print(deep_eq([1, 2], [1, 2]))</code></td><td><code>true</code></td></tr>
+<tr><td><code>re_replace(pattern, s, ...)</code></td><td><strong>subject first</strong>: <code>re_replace(s, pattern, replacement)</code></td><td><code>print(re_replace("a1b", "[0-9]", "#"))</code></td><td><code>a#b</code></td></tr>
+<tr><td><code>sort_by</code> takes a direction</td><td>ascending only, with a lambda; <code>reverse()</code> for descending</td><td><code>print(sort_by([3, 1, 2], fn($x) = $x))</code></td><td><code>[1, 2, 3]</code></td></tr>
+<tr><td><code>'~/x'</code> expands</td><td>a <strong>single</strong>-quoted string is raw — no <code>~</code>, no <code>${...}</code></td><td><code>print('~/x')</code></td><td><code>~/x</code></td></tr>
+<tr><td>— and <code>"~/x"</code>?</td><td>a double-quoted one expands <code>~</code> to <code>$HOME</code></td><td><code>print(starts_with("~/x", "/"))</code></td><td><code>true</code></td></tr>
+<tr><td><code>send svc-name verb</code> needs quoting</td><td>it does not — a tight-hyphenated bare target is read whole, like the quoted and <code>$var</code> forms</td><td><code>send zz-no-such-svc ping timeout=1; print(type($result))</code></td><td><code>string</code></td></tr>
+<tr><td>— but <code>send a - b verb</code>?</td><td>a <strong>space</strong> makes it subtraction again, and a bareword is a string, so that is a type error</td><td><code>send a - b ping timeout=1</code></td><td><code>!as number</code></td></tr>
+<tr><td><code>replace()</code> tells you it missed</td><td>it returns the input unchanged, <strong>silently</strong> — check the result, or use <code>mix edit</code> from a prompt</td><td><code>print(replace("abc", "zz", "!"))</code></td><td><code>abc</code></td></tr>
+<tr><td><code>replace()</code> replaces the first</td><td>it replaces <strong>all</strong> of them</td><td><code>print(replace("a a a", "a", "b"))</code></td><td><code>b b b</code></td></tr>
+<tr><td><code>mix -c 'print(x)'</code> needs escaping gymnastics</td><td>it does not; a probe is one call and the binary is the oracle</td><td><code>print(mix_version() != "")</code></td><td><code>true</code></td></tr>
 </tbody></table>
-<pre><code class="language-mix">send noded noded.info
-print("rc=" .. $rc)
-print("" .. $result)
-</code></pre>
-<pre><code class="language-text">rc=0
-{node: node1, noded: {binary: cosmix-noded, name: noded, pid: 1342, version: 0.6.10, ...}, schema_version: 1, service_count: 8, uptime_s: 9445, wg_ip: 192.0.2.5}
-</code></pre>
-<p><code>$result</code> is structured data — reach into it with <code>.field</code> access or <code>["key"]</code>
-(see <a href="/mix/collections">collections</a>):</p>
-<pre><code class="language-mix">send noded noded.ping
-if $result.pong then
-  print("pong is true")
-end
-print("core ext: " .. ("" .. $result.extensions.core))
-</code></pre>
-<pre><code class="language-text">pong is true
-core ext: 1.0
-</code></pre>
-<h3 id="send-as-an-expression"><code>send</code> as an expression</h3>
-<p><code>send</code> also returns the reply, so you can capture it directly (it still sets
-<code>$result</code>/<code>$rc</code> too):</p>
-<pre><code class="language-mix">$r = send noded noded.ping
-print("captured: " .. ("" .. $r))
-</code></pre>
-<pre><code class="language-text">captured: {extensions: {core: 1.0, topic: 1.0}, pong: true}
-</code></pre>
-<h3 id="args-scalars-body-and-numbers">Args: scalars, <code>body=</code>, and numbers</h3>
-<p>For <code>send</code>, bare <code>key=value</code> args are serialized as a <strong>JSON body</strong> (RPC
-framing) by default — noded/indexd/maild verbs read their args from it — with
-two exceptions that select <strong>header routing</strong> (scalar args → Bus headers,
-<code>body=</code> → the body channel):</p>
-<ul>
-<li>a <code>body=</code> key is present (the caller is speaking the headers+body shape), or</li>
-<li>the command is a SPEC-12 namespace-mode property call — <code>&lt;svc&gt;.props.&lt;op&gt;</code> (incl. multi-segment ops like <code>props.audit.watch</code>) with a <code>namespace=</code> arg — which reads args from Bus headers, so a kv-only <code>send webd webd.props.get namespace=x key=y</code> works without an explicit <code>body=""</code>. (SPEC-07 flat-path reads — <code>noded.props.get path=…</code> — carry no <code>namespace=</code> and stay JSON-body, as their servers expect. Both triggers apply on the broker path only; the local Unix-port path has no header mode.)</li>
-</ul>
-<p>(<code>emit</code> header-routes <strong>all</strong> map args — RPC-style JSON body is a <code>send</code>/<code>call</code>
-shape.) Whole-number args serialize as JSON <strong>integers</strong>,
-not floats — so <code>limit=2</code> arrives as <code>2</code>, and a peer field typed <code>usize</code>/<code>i64</code>
-accepts it; a fractional value (<code>2.5</code>) stays a float.</p>
-<p>A <code>body=</code>-bearing <code>send</code> <strong>awaits its reply</strong> exactly like a positional or
-scalar-header send — the handler's <code>reply(...)</code> lands in <code>$rc</code>/<code>$result</code>. (Only
-<code>emit</code> is fire-and-forget; the arg shape never changes whether a reply is
-collected.)</p>
-<pre><code class="language-mix">send noded noded.ping limit=2 note="hello"
-print("rc=" .. $rc)
-</code></pre>
-<pre><code class="language-text">rc=0
-</code></pre>
-<h3 id="reading-rc-ok-vs-application-error-vs-transport-failure">Reading <code>$rc</code>: ok vs application error vs transport failure</h3>
-<p>A <code>$rc</code> of <code>&gt;= 10</code> from a <em>reachable</em> broker is an <strong>application</strong> error (e.g.
-unknown service, rejected command) — the peer's exact rc is preserved (a peer
-<code>rc=42</code> stays <code>42</code>, never flattened to <code>10</code>) and it does <strong>not</strong> mean the mesh is
-down. A <code>$rc</code> in <code>1..9</code> is a delivered-with-warning success:</p>
-<pre><code class="language-mix">send nonesuch some.cmd
-print("rc=" .. $rc)
-print("result=" .. ("" .. $result))
-</code></pre>
-<pre><code class="language-text">rc=10
-result=Service 'nonesuch' not found
-</code></pre>
-<p>A <strong>negative</strong> <code>$rc</code> is a <em>local</em>, non-fatal signal — the send never reached a
-peer, so <code>$result</code> carries the reason string and the script continues: <code>-1</code>
-transport failure (a broker was there but the send failed — lost or broken
-connection), <code>-2</code> a per-send <code>timeout=</code> budget exceeded, <code>-3</code> Bus unavailable (no
-broker was ever present, a bare host). See <a href="/mix/bus#per-send-timeout">timeout</a> and
-<a href="/mix/bus#no-broker-graceful-degradation">no broker</a>.</p>
-<p><strong>A structured refusal keeps its body.</strong> When a peer answers <code>rc &gt;= 10</code> with a
-JSON object naming an <code>error_code</code>, <code>$result</code> is that object — field-accessible,
-so <code>$result.error_code</code> and whatever else it carries (<code>reason</code>,
-<code>retry_requires</code>) are readable. Branching on those is the whole point of a
-refusal; flattened to prose it leaves a script parsing English to decide whether
-to retry. This is narrow on purpose: a peer that answers an error as plain text,
-or as JSON of some other shape, still produces exactly the string it always did.
-Only a body naming <code>error_code</code> takes the structured path. (0.87.0)</p>
-<h2 id="send-and-the-verified-session-lane"><code>send</code> and the verified session lane</h2>
-<p>A locally registered service can be addressed two ways, and only one of them
-carries an identity. A TCP connection is known by a name the caller asserts
-about itself, which is not an authority — which is why a session-enrolled
-service's protected verbs answer <code>FORBIDDEN</code> over it. A Unix connection to the
-local broker carries peer credentials the KERNEL supplies, so the broker learns
-who is calling without having to be told.</p>
-<p><code>send</code> now prefers that verified lane, with no change to how you write it:</p>
-<pre><code class="language-mix">$list = send noded "noded.list"          -- find the instance
-$r = send $name "term.session" body=$b   -- a protected verb, admitted
-</code></pre>
-<p>This grants no new authority. Any same-uid process can already open this
-connection — the pane shell and every test harness do — and a local
-<code>DefaultOpen</code> service admits the resulting session-less ambient principal for a
-matching uid/node/broker epoch. What was missing was a way for a SCRIPT to use
-it. (0.87.0)</p>
-<p><strong>The fallback is not an error path.</strong> Where no verified lane is available — a
-headless host with no local broker socket, a broker running under another
-account, a genuinely remote target — <code>send</code> falls back to exactly the path it
-used before and behaves exactly as it did. The attempt costs nothing when the
-socket is absent: a path that does not exist fails at the stat, not at a
-timeout. The lane is chosen once per connection, so a script can never end up
-with some sends authenticated and others not.</p>
-<p><strong>Discovery.</strong> <code>noded.list</code> projects by uid: a caller that owns a record gets
-its full <code>ServiceInfo</code> including the session details, while everyone else gets
-the bare name. A driver over the verified lane is same-uid by construction, so
-one <code>send noded "noded.list"</code> is enough to find a service's per-instance name
-and address it.</p>
-<hr />
-<h2 id="emit--fire-and-forget"><code>emit</code> — fire-and-forget</h2>
-<p><code>emit &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches and returns immediately. No
-reply is awaited and <strong><code>$rc</code>/<code>$result</code> are not set</strong> by <code>emit</code> — it is a
-statement that yields <code>nil</code>, used when you don't care about (or can't get) an
-answer, e.g. publishing to a topic or notifying a service.</p>
-<pre><code class="language-mix">emit noded noded.ping note=hi
--- no $rc is written by emit; do not read it after an emit
-print("emitted")
-</code></pre>
-<pre><code class="language-text">emitted
-</code></pre>
-<p>Gotchas:</p>
-<ul>
-<li><code>emit</code> is a <strong>statement</strong>, not an expression — <code>$x = emit …</code> is a parse error. (<code>send</code> <em>can</em> be an expression; <code>emit</code> cannot.)</li>
-<li>Because <code>emit</code> writes neither <code>$rc</code> nor <code>$result</code>, reading <code>$rc</code> right after an <code>emit</code> (with no prior <code>send</code>) raises <em>undefined variable <code>$rc</code></em> — pre-init it or just don't.</li>
-</ul>
-<hr />
-<h2 id="publishtopic-body-opts--one-call-topic-publish-0630"><code>publish(topic, body[, opts])</code> — one-call topic publish (0.63.0)</h2>
-<p>Publishing to a topic used to require two pieces of lore: the body handed
-to <code>noded topic.publish</code> must itself be a <strong>SPEC-02 wire frame</strong>
-(<code>---\ncommand: …\n---\npayload</code>), and the <code>send</code> needed <code>body=</code> spelled
-before <code>name=</code>/<code>retain=</code> would header-route. <code>publish()</code> does both:</p>
-<pre><code class="language-mix">$rc2 = publish("comp.corner.entered", json_encode({corner: "tl"}))
-if $rc2 != 0 then eprint("publish failed: " .. $result) end
-</code></pre>
-<ul>
-<li><code>topic</code> — the noded topic name; by default it is also the inner frame's
-<code>command:</code> header (what subscribers' <code>on</code> matches).</li>
-<li><code>body</code> — the payload <strong>string</strong> (<code>json_encode</code> a map first — the wire
-format is the caller's choice, never hidden). <code>nil</code>/absent → empty.</li>
-<li><code>opts</code> — <code>{retain: bool}</code> (default false); <code>{command: "corner.entered"}</code>
-overrides the inner frame header (the fleet publishes topic
-<code>comp.corner.entered</code> with inner command <code>corner.entered</code>);
-<code>{headers: {event_seq: 1042}}</code> adds frame header lines. Topic, command
-and headers are newline-checked — frame injection raises instead of
-corrupting the wire.</li>
-</ul>
-<p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> and returns the rc, so
-<code>if publish(..) != 0</code> reads naturally. Without a broker it degrades like
-<code>send</code>: <code>$rc = -3</code>, non-fatal.</p>
-<p><strong>Hyphenated targets need no quoting.</strong> <code>send comp-nested …</code>,
-<code>emit desktop-vt1 …</code> and <code>address shell-scenes-p2 … end</code> all read the
-hyphenated name whole. Hyphenated service names are the norm on the mesh, so
-the bare form has to work; quoting and <code>$var</code> remain exactly equivalent
-spellings.</p>
-<p>The accepted shape is deliberately narrow, and is the
-<a href="/mix/shell-mode">shell classifier</a>'s tight-hyphen rule for command heads plus
-<code>.</code> for dotted names: an ASCII letter or <code>_</code> first, at least one <code>-</code>,
-alphanumerics / <code>_</code> / <code>-</code> / <code>.</code> within, an alphanumeric or <code>_</code> last, and the
-whole thing delimited by whitespace, a newline, a <code>;</code>, or end of input.
-A first segment that is a Mix keyword is fine too (<code>next-hop</code>, <code>print-server</code>,
-<code>on-boot</code>), because a bare keyword in target position was never anything but a
-parse error.</p>
-<p>Anything else keeps the expression reading it always had — a call
-(<code>send env("DEST") …</code>), an index, a parenthesised expression, a <code>$var</code>, and a
-<strong>spaced</strong> <code>send a - b …</code>, where the space says an operator was meant. The one
-exception is a concat whose left operand is a bare hyphenated word
-(<code>send a-b .. "c" …</code>): that is now a <em>parse</em> error where it used to be a
-runtime one, because the word is taken as the target and the <code>..</code> is left with
-nowhere to go. It could never have been a working concat — the left operand of
-<code>..</code> there is a bareword, which is a string, so the subtraction ahead of it
-always failed first.</p>
-<p><strong>Quote a name the bare form cannot reach.</strong> Three shapes fall outside it, and
-quoting is the answer to all three:</p>
-<table><thead><tr><th>name</th><th>why</th><th>write</th></tr></thead><tbody>
-<tr><td><code>a--b</code></td><td><code>--</code> opens a <strong>comment</strong>, so the bare word stops there and the shape is refused</td><td><code>send "a--b" …</code></td></tr>
-<tr><td><code>svc-01</code>, <code>node-007</code>, <code>a-1.2.3</code></td><td>a segment that is <strong>all digits</strong> is lexed as a NUMBER, and the lexer rejects a leading zero or a second dot before the parser ever sees the line</td><td><code>send "svc-01" …</code></td></tr>
-<tr><td><code>fn-svc</code></td><td><code>fn</code> starts a lambda</td><td><code>send "fn-svc" …</code></td></tr>
-</tbody></table>
-<p>Only an all-digit segment is affected, and only a malformed one: <code>svc-1</code>,
-<code>svc-10</code>, <code>bterm-bevy-3164175</code> and <code>desktop-vt01</code> are all fine bare — <code>vt01</code>
-begins with a letter, so it is an identifier, not a number. The trap is
-<code>node-007</code>, whose error (<code>ambiguous leading-zero number '007'</code>) does not
-mention <code>send</code> at all.</p>
-<p>Nothing that worked before changed meaning: the shape <em>requires</em> a hyphen, so
-every target that already resolved still takes the expression path, and a
-bareword is a string, so <code>a - b</code> on two barewords was always the runtime type
-error "cannot use 'a' as number" rather than arithmetic. (Before this, the
-bare form died at runtime with exactly that message while <code>mix --check</code> and
-<code>mix lint</code> both passed the line — an earlier version of this paragraph told
-you to quote it and said the grammar would not change.)</p>
-<hr />
-<h2 id="address--a-block-of-implicit-sends-to-one-target"><code>address</code> — a block of implicit sends to one target</h2>
-<p><code>address &lt;target&gt; … end</code> opens a block where <strong>each line is an implicit send</strong>
-to that target. Drop the <code>send</code> keyword inside the block — writing it is a parse
-error (the runtime catches the typo deliberately). Each line sets <code>$rc</code>/<code>$result</code>
-in turn, so after the block they hold the <strong>last</strong> send's outcome.</p>
-<pre><code class="language-mix">address noded
-  noded.ping
-  noded.info
-end
-print("rc=" .. ("" .. $rc))
-</code></pre>
-<pre><code class="language-text">rc=0
-</code></pre>
-<p><code>address</code> is the ergonomic ARexx-style "talk to one port for a while" form. It is
-purely a shorthand for repeated <code>send &lt;same-target&gt; …</code> lines.</p>
-<hr />
-<h2 id="targets-static-dotted-bus-vs-dynamic-built">Targets: static dotted <code>.bus</code> vs dynamic built</h2>
-<p>The <strong>command position</strong> of <code>send</code>/<code>emit</code>/<code>address</code> accepts an expression, and so
-does the <strong>target</strong>. Two shapes matter:</p>
-<p><strong>1. A bare local service name</strong> — <code>noded</code>, <code>statecache</code>, <code>webd</code>. The broker
-routes it on the local node.</p>
-<pre><code class="language-mix">send statecache INFO
-print("" .. $result)
-</code></pre>
-<pre><code class="language-text">{description: Mix supervised Bus citizen (SPEC 18 Phase 1 runtime), name: statecache, version: 0.21.2}
-</code></pre>
-<p><strong>2. A static dotted <code>.bus</code> address</strong> — <code>&lt;service&gt;.&lt;node&gt;.bus</code> addresses a
-<em>remote</em> node's broker directly, mesh-routed, <strong>no ssh and no string building</strong>.
-This literal-address path fires only for a <strong>bare identifier immediately followed
-by a dot</strong> (e.g. <code>noded.node1.bus</code>); a single bareword, a <code>$var</code>, a <code>(paren expr)</code>,
-a bareword call like <code>env("X")</code>, an index, and a <code>..</code> concat all stay ordinary
-expressions.</p>
-<pre><code class="language-mix">-- illustrative (needs the named node to exist on the mesh):
-send noded.node1.bus noded.info
-print("" .. $result)
-</code></pre>
-<p>Self-addressing works — <code>send noded.&lt;thisnode&gt;.bus</code> resolves to the local broker.</p>
-<p><strong>3. A dynamic target from a loop/var</strong> — build the address (or the verb) with
-<code>..</code> concat. This is the path when the node name isn't a literal:</p>
-<pre><code class="language-mix">$node = "node1"
-$target = "noded." .. $node .. ".bus"
--- send $target noded.info   -- illustrative; routes to that node's broker
-
--- the verb is an expression too:
-$verb = "noded" .. ".ping"
-send noded $verb
-print("rc=" .. ("" .. $rc) .. " result=" .. ("" .. $result))
-</code></pre>
-<pre><code class="language-text">rc=0 result={extensions: {core: 1.0, topic: 1.0}, pong: true}
-</code></pre>
-<blockquote>
-<p>Edge: if an inline <code>(expr)</code> in command position collides with the parser,
-pre-build the verb into a <code>$var</code> (as above) and pass the var.</p>
-</blockquote>
-<hr />
-<h2 id="per-send-timeout">Per-send <code>timeout=</code></h2>
-<p><code>send … timeout=&lt;seconds&gt;</code> puts a wall-clock budget on the RPC (cooperative
-cancellation; the pending-reply slot is freed on expiry). On timeout you get
-<code>$rc = -2</code> (RC_TIMEOUT) — its <strong>own</strong> numeric band, distinct from <code>-1</code> transport
-— with a <code>timeout: …</code> reason in <code>$result</code>. Non-fatal: the script continues.</p>
-<pre><code class="language-mix">-- against a 2s-slow downstream:
-send slowsvc do.work timeout=0.5
--- $rc     == -2      (RC_TIMEOUT, numeric)
--- $result == "timeout: send to slowsvc exceeded 0.5s"
-</code></pre>
-<p>Rules (all raise a <code>RuntimeError</code> if violated): <code>timeout=</code> must be a <strong>finite,
-positive</strong> number; <strong>absence</strong> means "no timeout" (there is no sentinel value);
-<code>nil</code> is treated as absent (so <code>timeout=$t</code> is fine when <code>$t</code> may be unbound);
-duplicate <code>timeout=</code> is last-wins. The <code>timeout=</code> slot is consumed locally and
-does <strong>not</strong> appear in the args delivered to the peer.</p>
-<hr />
-<h2 id="port_existsname--is-a-service-registered"><code>port_exists(name)</code> — is a service registered?</h2>
-<p>A builtin (not a keyword) that asks the broker whether a named service is in its
-registry. Useful as a guard before an RPC.</p>
-<pre><code class="language-mix">print("statecache: " .. ("" .. port_exists("statecache")))
-print("ghost:      " .. ("" .. port_exists("ghostservice")))
-</code></pre>
-<pre><code class="language-text">statecache: true
-ghost:      false
-</code></pre>
-<blockquote>
-<p>Note: the broker need not list <em>itself</em> in its service registry, so
-<code>port_exists("noded")</code> can return <code>false</code> even while <code>send noded noded.ping</code>
-succeeds — <code>port_exists</code> reflects the <strong>registered-services list</strong>, not broker
-reachability.</p>
-</blockquote>
-<hr />
-<h2 id="on--end--receiving-messages-handlers"><code>on … end</code> — receiving messages (handlers)</h2>
-<p><code>on &lt;command&gt; [desc "doc-string"] [async] … end</code> (<code>desc</code> and <code>async</code> compose
-in either order) registers a <strong>handler</strong> that fires when a matching Bus
-message arrives. The handler body uses newline- or
-<code>;</code>-separated statements closed by <code>end</code> — <strong>no <code>do</code> keyword</strong>. The
-<code>&lt;command&gt;</code> matches the <em>inner command</em> of the inbound message (the verb the
-publisher sent), <strong>not</strong> the topic/target name — check the publisher to know
-what to match. The optional <code>desc "…"</code> doc-string (mix ≥ 0.87.1) is static
-metadata: a serve citizen surfaces it as the verb's <code>description</code> in its
-<code>HELP</code> reply — see <a href="/mix/serve">Serve citizens</a>.</p>
-<pre><code class="language-mix">on order.created desc "Acknowledge a new order"
-  print("got an order: " .. $event.body)
-  reply("ack")
-end
-</code></pre>
-<p>Legacy <code>done</code> still closes <code>on</code> (with a deprecation warning); prefer <code>end</code>.</p>
-<h3 id="the-event-map">The <code>$event</code> map</h3>
-<p>Inside a handler, the inbound message is available as <code>$event</code>, a map with four
-fields:</p>
-<table><thead><tr><th>Field</th><th>Type</th><th>Access</th></tr></thead><tbody>
-<tr><td><code>$event.command</code></td><td>string</td><td>the inbound verb</td></tr>
-<tr><td><code>$event.headers</code></td><td>map</td><td>scalar headers, e.g. <code>$event.headers["topic"]</code></td></tr>
-<tr><td><code>$event.body</code></td><td>string</td><td>the raw message body</td></tr>
-<tr><td><code>$event.args</code></td><td>parsed body | nil</td><td>the body pre-parsed as JSON, or <code>nil</code></td></tr>
-</tbody></table>
-<pre><code class="language-mix">on topic.delivery
-  $topic = $event.headers["topic"]
-  print("delivery on " .. $topic .. ": " .. $event.body)
-end
-</code></pre>
-<p><strong><code>$event</code> has dynamic extent</strong> (0.63.0): a <code>fn</code> the handler body calls —
-at any depth — sees the same <code>$event</code>, so helpers like
-<code>fn describe() return $event.headers["topic"] end</code> work. (Before 0.63.0
-the handler→fn hop lost it — function frames only fall through to globals
-— and the resulting <code>NAME_UNDEFINED</code> was swallowed by fault isolation:
-the blind-but-healthy citizen.) A fn's own <code>$event</code> parameter or local
-still shadows it; <code>$event</code> stays read-only inside the dispatch; after the
-dispatch a top-level <code>$event</code> global is restored (or reads <code>nil</code> if there
-was none).</p>
-<p><code>$event.args</code> is a convenience view of the body: when the sender used the
-JSON-body path — a <strong>positional</strong> <code>send svc cmd "a" "b"</code> (which arrives as
-<code>{"_0":"a","_1":"b"}</code>) or a <strong>map</strong> arg — the body is already-parsed JSON, so
-<code>$event.args["_0"]</code> / <code>$event.args.field</code> save you a <code>json_parse($event.body)</code>.
-It is symmetric with the already-parsed <code>$event.headers</code> map; <code>$event.body</code>
-stays the raw string regardless.</p>
-<p><code>$event.args</code> is <code>nil</code> when the body is empty or is <strong>not</strong> JSON — a raw
-<code>body="hi"</code> text payload reads back as <code>nil</code>, so a handler tells "structured
-args" from "raw text" and reaches for <code>$event.body</code> in the latter case:</p>
-<pre><code class="language-mix">on order.submit
-  if $event.args != nil then
-    reply("ok, item " .. ("" .. $event.args["_0"]))   -- send order.submit "widget"
-  else
-    reply(10, "expected structured args, got: " .. $event.body)
-  end
-end
-</code></pre>
-<h3 id="reply--answer-a-request"><code>reply(...)</code> — answer a request</h3>
-<p>From inside an <code>on</code> handler servicing a <strong>request</strong> (one expecting a reply), call
-<code>reply(body)</code> or <code>reply(rc, body)</code>:</p>
-<pre><code class="language-mix">on statecache.get
-  reply($current_value)         -- rc defaults to 0
-end
-
-on do.validate
-  if not $event.body then
-    reply(10, "missing input")  -- non-zero rc = application error to the caller
-  else
-    reply(0, "ok")
-  end
-end
-</code></pre>
-<p><code>reply</code> rules: <code>rc</code> must be an integer <code>0..=255</code>; it may only be called from
-inside an <code>on</code> handler; it errors loudly if the current event is <em>not</em> a request
-(a topic delivery has no caller to answer). A dropped reply would block the
-requester forever, so every <code>reply</code> failure path is a hard error by design.</p>
-<h3 id="async-handlers-class-c"><code>async</code> handlers (Class C)</h3>
-<p>A trailing <code>async</code> on the handler header marks it <strong>Class C</strong> — the dispatch
-<em>yields</em> at every <code>send</code>/<code>reply</code>/<code>sleep_ms</code> so concurrent invocations interleave
-instead of head-of-line-blocking each other behind a slow downstream call. Plain
-(non-<code>async</code>) handlers are <strong>Class S</strong>: run-to-completion, one at a time. Use
-<code>async</code> only when a handler makes a slow/remote downstream <code>send</code> and the citizen
-serves concurrent callers.</p>
-<pre><code class="language-mix">on aggregate.report async
-  send slow.upstream fetch.data          -- yields here; peers can interleave
-  reply($result)
-end
-</code></pre>
-<p><code>async</code> is a <em>contextual</em> modifier, not a reserved word — variables/keys named
-<code>async</code> elsewhere are unaffected. <strong>Synchronous request cycles (A→B→A) are
-prohibited and deadlock</strong> — <code>async</code> does not legalise them; break a cycle with
-fire-and-forget <code>emit</code> + a topic reply instead.</p>
-<h3 id="subscribe--unsubscribe--topic-pubsub"><code>subscribe</code> / <code>unsubscribe</code> — topic pub/sub</h3>
-<p><code>subscribe("topic.name")</code> registers interest in a <a href="/mix/bus">topic</a> so topic
-deliveries reach a matching <code>on</code> handler; <code>unsubscribe("topic.name")</code> drops it.
-Both are builtins that require a live broker — unlike <code>send</code>/<code>emit</code>, they
-<strong>raise</strong> rather than no-op when no broker is reachable (a script must not believe
-it subscribed when it didn't).</p>
-<pre><code class="language-mix">subscribe("metrics.cpu")
-on metrics.cpu
-  print("cpu sample: " .. $event.body)
-end
--- … then enter serve mode / the event pump to actually receive them
-</code></pre>
-<hr />
-<h2 id="serve-mode--mix-as-a-daemon-citizen">Serve mode — Mix as a daemon (citizen)</h2>
-<p><code>mix --serve &lt;script.mix&gt; [--name &lt;service&gt;]</code> runs a script as a <strong>first-class,
-supervised Bus citizen</strong>: the top-level body executes once as init (open
-resources, <code>subscribe</code>, register <code>on</code> handlers), then the runtime registers the
-service name and enters the event pump, dispatching inbound messages to your <code>on</code>
-handlers. This is the AmigaOS "application with an ARexx port" model — a
-long-lived, addressable Mix process that <em>is</em> a service. The full lifecycle
-contract (registration, reconnect/backoff, handler fault isolation, graceful
-<code>SIGTERM</code>/<code>QUIT</code> shutdown, health properties) is <strong>SPEC 18</strong>.</p>
-<p><strong>Handler faults are isolated but OBSERVABLE</strong> (0.63.0). A raise or panic
-in a handler body never kills the citizen (SPEC 18 §3.4) — but it no
-longer disappears either: one <code>mix: handler fault: &lt;command&gt;[N]: …</code> line
-reaches stderr, <code>lifecycle.health</code> flips to <code>degraded</code>, and
-<code>lifecycle.handler_faults</code> / <code>lifecycle.last_fault</code> count and name it in
-the props surface. Before 0.63.0 a faulting handler looked exactly like a
-healthy one (noded reported <code>delivered=1</code> while its side effects silently
-never happened).</p>
-<p>A live citizen answers the standard verbs like any Rust daemon:</p>
-<pre><code class="language-mix">send statecache HELP
-print("" .. $result)
-</code></pre>
-<pre><code class="language-text">[{args: [], description: List all commands this service accepts, name: HELP}, {args: [], description: Service identity and capabilities, name: INFO}, {args: [], description: Graceful shutdown: deregister, then exit 0 (SPEC 18 §3.5), name: QUIT}, {args: [path?], description: Property snapshot at an optional path, name: statecache.props.get}, ...]
-</code></pre>
-<p>A minimal state-holder citizen:</p>
-<pre><code class="language-mix">-- statecache.mix — run with: mix --serve statecache.mix
-$value = "(none)"
-
-subscribe("config.current")
-
-on config.current               -- a topic delivery updates our state
-  $value = $event.body
-end
-
-on statecache.get               -- a request reads it back
-  reply($value)
-end
-</code></pre>
-<blockquote>
-<p>A <em>transient</em> <code>mix &lt;script&gt;</code> (not <code>--serve</code>) can <code>send</code>/<code>emit</code> and even
-<code>subscribe</code>, but it has no service name, no reconnect, and the process ends when
-the script does — fine for one-shot orchestration drivers, not for a resident
-service.</p>
-</blockquote>
-<hr />
-<h2 id="orchestration--citizen--citizen">Orchestration — citizen ↔ citizen</h2>
-<p>A Mix citizen can <code>send</code>/<code>address</code> other citizens, so multi-service orchestration
-is native: <strong>pipeline</strong> (A→B→C), <strong>scatter-gather</strong> (fan a request to N workers,
-merge replies), <strong>supervisor/worker</strong>, and <strong>review-loop</strong> (a proposer and a
-critic iterating). A driver that is its own sole caller (a cron/oneshot/CLI
-invocation, no registered name) issuing sequential <code>send</code>s is correct under the
-cooperative loop. The hard rule: keep the synchronous-request graph <strong>acyclic</strong>;
-break any cycle with <code>emit</code> + topic replies (see <a href="/mix/bus#async-handlers-class-c">the deadlock note</a>).</p>
-<pre><code class="language-mix">-- scatter-gather sketch (illustrative)
-$replies = []
-for each $w in ["worker.a", "worker.b", "worker.c"]
-  send $w do.task input=$payload
-  push($replies, $result)
-end
--- merge $replies …
-</code></pre>
-<hr />
-<h2 id="no-broker--graceful-degradation">No broker — graceful degradation</h2>
-<p>The handler uses a <strong>lazy probe</strong> with a small state machine, so Bus forms behave
-predictably on a host that may or may not have a broker:</p>
-<ul>
-<li><strong>Never had a broker (<code>NeverPresent</code>).</strong> <code>send</code> returns <code>nil</code> with <code>$rc = -3</code> (RC_UNAVAILABLE — "Bus unavailable before delivery"), <code>emit</code> is silently dropped, <code>port_exists</code> returns <code>false</code> — <strong>no raise</strong>, and subsequent Bus forms don't re-probe (no per-call boot cost). The same binary becomes mesh-viable the moment a broker appears.</li>
-<li><strong>Had a broker, lost the connection (<code>Lost</code>).</strong> <code>send</code> returns <code>nil</code> with <code>$rc = -1</code> (RC_TRANSPORT) and <code>emit</code> is silently dropped — both <strong>non-fatal</strong>, so a mesh script survives a broker blip instead of crashing. <code>port_exists</code> <strong>raises</strong> <code>mesh unavailable: … (call bus_reconnect() to retry the probe)</code>.</li>
-<li><strong><code>subscribe</code>/<code>unsubscribe</code>/<code>reply</code></strong> raise in <em>both</em> states — these can't be faked; a script must know they didn't happen.</li>
-<li><strong><code>bus_reconnect()</code></strong> resets the probe to <code>Unprobed</code> so the next Bus form re-dials — the recovery primitive after installing a broker or after a broker bounce.</li>
-</ul>
-<p>This is deliberate: <code>send</code>/<code>emit</code> stay <strong>non-fatal in every state</strong> (a bare host
-reads <code>$rc = -3</code>, a lost broker <code>-1</code>), so a script isn't forced to guard Bus it
-may never use — and because the bare-host path no longer fakes <code>rc=0</code>, a
-<code>$rc == 0</code> now strictly means <em>delivered</em>. The forms that can't be faked
-(<code>port_exists</code> once a broker was lost, <code>subscribe</code>/<code>unsubscribe</code>/<code>reply</code> in either
-state) still raise, so a genuine outage is heard.</p>
-<hr />
-<h2 id="quick-reference">Quick reference</h2>
-<table><thead><tr><th>Form</th><th>Direction</th><th>Sets <code>$rc</code>/<code>$result</code>?</th><th>Waits?</th></tr></thead><tbody>
-<tr><td><code>send t cmd k=v</code></td><td>out, RPC</td><td>yes</td><td>yes (reply)</td></tr>
-<tr><td><code>$r = send t cmd</code></td><td>out, RPC (expr)</td><td>yes</td><td>yes</td></tr>
-<tr><td><code>emit t cmd k=v</code></td><td>out, fire-and-forget</td><td><strong>no</strong></td><td>no</td></tr>
-<tr><td><code>address t … end</code></td><td>out, block of sends</td><td>yes (last line)</td><td>yes per line</td></tr>
-<tr><td><code>on cmd … end</code></td><td>in, handler</td><td>—</td><td>event pump</td></tr>
-<tr><td><code>on cmd async … end</code></td><td>in, Class C handler</td><td>—</td><td>yields on <code>send</code></td></tr>
-<tr><td><code>reply(body)</code> / <code>reply(rc, body)</code></td><td>answer a request</td><td>—</td><td>no</td></tr>
-<tr><td><code>subscribe(t)</code> / <code>unsubscribe(t)</code></td><td>topic interest</td><td>—</td><td>yes (raises if no broker)</td></tr>
-<tr><td><code>port_exists(name)</code></td><td>registry query</td><td>—</td><td>yes</td></tr>
-<tr><td><code>bus_reconnect()</code></td><td>reset the probe</td><td>—</td><td>—</td></tr>
-</tbody></table>
-<p>Sharp edges:</p>
-<ul>
-<li>Command position matches the publisher's <strong>inner verb</strong>, not the topic/target.</li>
-<li><code>emit</code> is a statement only (no <code>$x = emit …</code>) and sets <strong>neither</strong> <code>$rc</code> nor <code>$result</code>.</li>
-<li>Inside <code>address</code>, do <strong>not</strong> write <code>send</code> (each line is already a send).</li>
-<li>Synchronous request cycles deadlock — keep the graph acyclic.</li>
-<li><code>send</code>/<code>emit</code> are <strong>non-fatal in every failure state</strong>: <code>send</code> writes a negative <code>$rc</code> (<code>-3</code> no broker, <code>-1</code> lost/transport, <code>-2</code> timeout) and returns <code>nil</code>, <code>emit</code> is silently dropped. <code>port_exists</code> raises once a broker was seen and lost; <code>subscribe</code>/<code>unsubscribe</code>/<code>reply</code> raise whenever the broker is unreachable.</li>
-</ul>
+<h2 id="three-rules-that-are-not-a-syntax-trap">Three rules that are not a syntax trap</h2>
+<p>These cost more than any row above, and no probe can catch them.</p>
+<ol>
+<li><strong>Never <code>sed -i</code>, never Python.</strong> A one-line edit is <code>mix edit FILE OLD NEW</code>
+— exact match, refuses an absent or ambiguous needle (see
+<a href="/mix/cli">the mix command</a>). A script is a <code>.mix</code> file. If Mix genuinely
+cannot do something, that is a <strong>reportable gap in Mix</strong>, not a licence to
+reach for another language.</li>
+<li><strong>Never <code>ssh host 'bash -c "…"'</code>.</strong> Use
+<code>ssh_mix(host, source, {bindings: {…}})</code> — it ships the source over ssh
+stdin into <code>mix -</code>, bypassing <strong>all</strong> shell quoting, and <code>bindings</code> passes
+values in as <code>$name</code> assignments instead of string-interpolating them.
+Quoting a remote loop by hand fails in ways that look remote and are local.
+See <a href="/mix/remote">remote execution</a>.</li>
+<li><strong>Probe, do not extrapolate.</strong> <code>mix -c '&lt;code&gt;'</code> answers in under a second
+and the binary outranks every document, including this one. <code>mix builtins NAME</code> gives the exact signature, <code>mix what NAME</code> the one-liner, <code>mix lint FILE</code> the call-contract check before you run anything non-trivial.</li>
+</ol>
 <h2 id="see-also">See also</h2>
 <ul>
-<li><a href="/mix/strings">strings</a> — <code>..</code> concat for building dynamic targets/verbs; <code>${…}</code> vs literal <code>$name</code></li>
-<li><a href="/mix/collections">collections</a> — field access into <code>$result</code> / <code>$event</code> maps</li>
-<li><a href="/mix/functions">functions</a> — handler bodies, lambdas, the pass-in/return/reassign state idiom</li>
-<li><a href="/mix/system">running commands</a> — <code>run</code> / <code>run_rc</code> / <code>ssh_run</code> for non-Bus I/O</li>
-<li><a href="/mix/builtins">builtins index</a> — <code>port_exists</code>, <code>subscribe</code>, <code>reply</code>, <code>bus_reconnect</code>, <code>sleep_ms</code></li>
-<li>The <a href="https://github.com/markc/cosmix">cos repo</a> — <code>cosmix-noded</code>, the Bus broker</li>
-<li>The <a href="https://github.com/markc/cosmix">mix repo</a> — <a href="https://github.com/markc/cosmix/blob/main/AGENTS.md">AGENTS.md</a> is the agent orientation sheet; this manual is the language reference</li>
-<li>ARexx background — <a href="https://en.wikipedia.org/wiki/ARexx">Wikipedia: ARexx</a></li>
-<li><code>mix help</code> · <code>mix what send</code> · <code>mix what emit</code> · <code>mix what address</code> (<code>on</code>/<code>reply</code> are handler forms <code>mix what</code> does not index)</li>
+<li><a href="/mix/syntax">syntax &amp; the classifier</a> — the mental model these are errata to.</li>
+<li><a href="/mix/cli">the mix command</a> — <code>mix edit</code>, <code>mix lint</code>, <code>mix what</code>, <code>mix man</code>.</li>
+<li><a href="/mix/errors">errors &amp; exit handling</a> — the full <code>try</code>/<code>catch</code>/<code>raise</code> model.</li>
+<li><a href="/mix/collections">collections</a> — why <code>push</code> writes through a slot.</li>
 </ul></div></div>
     </div>
 

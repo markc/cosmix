@@ -239,11 +239,53 @@ Sets `$rc`/`$result` exactly like `send` and returns the rc, so
 `if publish(..) != 0` reads naturally. Without a broker it degrades like
 `send`: `$rc = -3`, non-fatal.
 
-**Hyphenated targets — quote them.** `send comp-nested …` parses the bare
-hyphen as subtraction; write `send "comp-nested" …`. Hyphenated service
-names are the norm on the mesh, so this bites early — quoting is the
-supported spelling (a bare-hyphen grammar change would collide with
-arithmetic and is not planned).
+**Hyphenated targets need no quoting.** `send comp-nested …`,
+`emit desktop-vt1 …` and `address shell-scenes-p2 … end` all read the
+hyphenated name whole. Hyphenated service names are the norm on the mesh, so
+the bare form has to work; quoting and `$var` remain exactly equivalent
+spellings.
+
+The accepted shape is deliberately narrow, and is the
+[shell classifier](shell-mode.md)'s tight-hyphen rule for command heads plus
+`.` for dotted names: an ASCII letter or `_` first, at least one `-`,
+alphanumerics / `_` / `-` / `.` within, an alphanumeric or `_` last, and the
+whole thing delimited by whitespace, a newline, a `;`, or end of input.
+A first segment that is a Mix keyword is fine too (`next-hop`, `print-server`,
+`on-boot`), because a bare keyword in target position was never anything but a
+parse error.
+
+Anything else keeps the expression reading it always had — a call
+(`send env("DEST") …`), an index, a parenthesised expression, a `$var`, and a
+**spaced** `send a - b …`, where the space says an operator was meant. The one
+exception is a concat whose left operand is a bare hyphenated word
+(`send a-b .. "c" …`): that is now a *parse* error where it used to be a
+runtime one, because the word is taken as the target and the `..` is left with
+nowhere to go. It could never have been a working concat — the left operand of
+`..` there is a bareword, which is a string, so the subtraction ahead of it
+always failed first.
+
+**Quote a name the bare form cannot reach.** Three shapes fall outside it, and
+quoting is the answer to all three:
+
+| name | why | write |
+|---|---|---|
+| `a--b` | `--` opens a **comment**, so the bare word stops there and the shape is refused | `send "a--b" …` |
+| `svc-01`, `node-007`, `a-1.2.3` | a segment that is **all digits** is lexed as a NUMBER, and the lexer rejects a leading zero or a second dot before the parser ever sees the line | `send "svc-01" …` |
+| `fn-svc` | `fn` starts a lambda | `send "fn-svc" …` |
+
+Only an all-digit segment is affected, and only a malformed one: `svc-1`,
+`svc-10`, `bterm-bevy-3164175` and `desktop-vt01` are all fine bare — `vt01`
+begins with a letter, so it is an identifier, not a number. The trap is
+`node-007`, whose error (`ambiguous leading-zero number '007'`) does not
+mention `send` at all.
+
+Nothing that worked before changed meaning: the shape *requires* a hyphen, so
+every target that already resolved still takes the expression path, and a
+bareword is a string, so `a - b` on two barewords was always the runtime type
+error "cannot use 'a' as number" rather than arithmetic. (Before this, the
+bare form died at runtime with exactly that message while `mix --check` and
+`mix lint` both passed the line — an earlier version of this paragraph told
+you to quote it and said the grammar would not change.)
 
 ---
 
