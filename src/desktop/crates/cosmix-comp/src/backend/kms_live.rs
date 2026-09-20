@@ -506,18 +506,25 @@ fn authority_may_adjudicate_target_change(authority: &LiveSessionAuthority) -> b
 /// `select_live_target`. A target that really went away cannot reach the glass by
 /// having been deferred here.
 ///
-/// KNOWN GAP, deliberately left rather than papered over (0.62.1). A connector
-/// physically disconnected while the session stays `Active` and never resumes is
-/// NOT adjudicated by anything: this arm only records, and presentation evidence
-/// does not cover it — `SubmitWatchdog::observe_execution` clears
-/// `required_since` on `HealthyIdle`, so an idle desktop holds no deadline at all,
-/// and while rendering, page flips that keep succeeding refresh the watchdog
-/// without re-reading connector state. The previous behaviour did revoke there,
-/// but only as a side effect of revoking on every udev event, which is the defect
-/// this version exists to remove. Giving that case a real bounded verification
-/// path needs a mechanism that does not put a driver probe on this thread, and
-/// that is its own slice — see the 0.62.1 row in the hub's comp-version-claims.
-/// Do not "fix" it by restoring a scan here.
+/// KNOWN GAP (0.62.1), stated at its real width rather than wider. What IS still
+/// caught while `Active`: anything that makes the device itself unusable, because
+/// the next atomic commit fails and `AtomicCommitError::authority_was_revoked`
+/// classifies `EACCES`/`EPERM`/`ENODEV` as authority loss — so a yanked card or a
+/// revoked fd self-detects a frame later. What is NOT caught is narrower and real:
+/// a connector that goes *disconnected* while commits keep succeeding — a monitor
+/// power button, a KVM flip, a panel dropping HPD on sleep. Nothing adjudicates
+/// that now. Presentation evidence does not cover it either:
+/// `SubmitWatchdog::observe_execution` clears `required_since` on `HealthyIdle`,
+/// so an idle desktop holds no deadline, and flips that keep succeeding refresh
+/// the watchdog without re-reading connector state.
+///
+/// The previous code did revoke there — and that was itself harmful, not a
+/// feature worth restoring: pressing the monitor's power button ended the whole
+/// session, and in steady state that teardown exits 0, so `Restart=on-failure`
+/// left a dead VT. The shape of a real fix is to PAUSE on a proven disconnect and
+/// wait for the reconnect event, not to end authority, and it must not put a
+/// driver probe on this thread. That is its own slice — see the 0.62.1 row in the
+/// hub's comp-version-claims. Do not "fix" it by restoring a scan here.
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 fn classify_target_udev_event(kind: TargetUdevEventKind, active: bool) -> TargetUdevDecision {
     if !active {
@@ -4576,6 +4583,12 @@ fn build_session_device_owner(
             let active = authority_may_adjudicate_target_change(&state.authority);
             match classify_target_udev_event(kind, active) {
                 TargetUdevDecision::Ignore => {
+                    // Recorded as well as logged, even though it needs no action:
+                    // if udev ever drops a `Removed` and delivers only the
+                    // re-`Added` (monitor-socket overrun), this is the only trace
+                    // that the device moved under us, and the next resume's
+                    // verification is then the thing that answers for it.
+                    state.deferred_target_change = true;
                     tracing::info!(
                         device_id,
                         event = ?kind,
@@ -4583,6 +4596,22 @@ fn build_session_device_owner(
                     );
                 }
                 TargetUdevDecision::Revoke => {
+                    // The ONLY branch here that ends the session, so it must not
+                    // be the only one without a diagnostic. Downstream all that
+                    // appears is "live KMS authority ended terminally", which
+                    // cannot say which event caused it. Note the exit code this
+                    // leads to: in steady state the revocation is disposed of as
+                    // `Ok(teardown)`, so the process exits 0 and
+                    // `Restart=on-failure` does NOT rebuild the session — the
+                    // operator finds a dead VT rather than a restarted one. (The
+                    // 23:36 incident exited 1 because its revocation was consumed
+                    // on the resume path instead.)
+                    tracing::warn!(
+                        device_id,
+                        event = ?kind,
+                        "target DRM device was removed while driving it; revoking authority \
+                         (steady-state teardown exits 0, so the unit will not be restarted)"
+                    );
                     publish_live_revocation(state, LiveRevocation::TargetHotplug);
                 }
                 TargetUdevDecision::DeferToVerification => {
@@ -7809,13 +7838,22 @@ impl PreparedLiveOperation {
             .resume_mode
             .ok_or_else(|| KmsLiveError::Setup("prior live mode is unavailable".into()))?;
         let mut last_retry = None;
+        // Sticky across attempts on purpose. `begin_resume` reads and clears the
+        // session thread's flag, so attempt 0 consumes it — and 0.62.0's three
+        // retryable attempts are exactly when the correlation matters: without
+        // this, a target event deferred during the resume window is reported by
+        // attempt 0 and then the attempt that actually FAILS has no line tying its
+        // rejection to that event. The flag is diagnostic only, so OR-ing it is
+        // sound: it records "an unadjudicated target event preceded this resume",
+        // which stays true for every remaining attempt.
+        let mut deferred_target_change = false;
         for attempt in 0..3 {
             if now() >= deadline {
                 return Err(KmsLiveError::Setup(
                     "live resume reached its 30s overall deadline".into(),
                 ));
             }
-            let (session_generation, deferred_target_change) = self
+            let (session_generation, attempt_deferred_target_change) = self
                 .session
                 .as_ref()
                 .expect("live session exists during resume")
@@ -7826,6 +7864,7 @@ impl PreparedLiveOperation {
                     now(),
                     RUNNING_SESSION_COMMAND_TIMEOUT,
                 )?)?;
+            deferred_target_change |= attempt_deferred_target_change;
             if deferred_target_change {
                 tracing::info!(
                     generation = session_generation,
