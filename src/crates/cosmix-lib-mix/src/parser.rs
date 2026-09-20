@@ -1395,6 +1395,16 @@ impl Parser {
     /// (`env("DEST")`), an index, or a concat. Only `String` immediately
     /// followed by `Dot` takes the literal-address path.
     fn parse_send_target(&mut self) -> MixResult<Expr> {
+        // The hyphen scan runs FIRST. It only fires on a word that
+        // contains a `-`, which the dotted branch below can never handle
+        // (it stops at the hyphen and leaves `-c` to be read as the
+        // command), so `send a.b-c …` would otherwise be a parse error
+        // while its quoted form worked. A dotted name WITHOUT a hyphen
+        // fails the scan's shape test and falls through to the branch
+        // below exactly as before.
+        if let Some(name) = self.take_hyphenated_service_word() {
+            return Ok(Expr::StringLiteral(name));
+        }
         if let Token::String(_) = self.peek()
             && matches!(
                 self.tokens.get(self.pos + 1).map(|t| &t.token),
@@ -1404,6 +1414,102 @@ impl Parser {
             return self.parse_command_expr();
         }
         self.parse_expression()
+    }
+
+    /// A TIGHT-HYPHENATED bare service word (`shell-ctl88`, `comp-nested`,
+    /// `desktop-vt1`) read whole from the raw source, or `None` to leave
+    /// the target on the expression path untouched.
+    ///
+    /// Hyphens are ordinary in Bus service names, but `-` is also the
+    /// subtraction operator, so `send shell-ctl88 shell.debug.status`
+    /// parsed as `shell - ctl88` and died at RUNTIME with "cannot use
+    /// 'shell' as number" — while `mix --check` and `mix lint` both
+    /// passed the line. That failed for a large share of real targets,
+    /// and only when the script ran.
+    ///
+    /// **Nothing valid changes meaning.** The shape accepted here
+    /// REQUIRES at least one `-`; without one the expression path
+    /// already yields the identical `StringLiteral`, so every target
+    /// that works today is untouched. And a bareword is a string, so
+    /// `a - b` on two barewords was always a runtime type error — there
+    /// is no program that meant subtraction here. Same argument as the
+    /// dotted bare-address path above.
+    ///
+    /// The accepted shape deliberately mirrors
+    /// `cosmix-mix/src/shell.rs`'s `is_tight_hyphenated_command_head`,
+    /// the classifier that already makes this exact call for shell
+    /// command heads: an ASCII letter or `_` first, at least one `-`,
+    /// alphanumerics/`_`/`-`/`.` within, and an alphanumeric or `_`
+    /// last. Everything else — a call (`env("DEST")`), an index, a
+    /// concat, `$var`, a quoted string, a parenthesised expression —
+    /// fails the shape or the terminator check below and takes the
+    /// expression path exactly as before.
+    fn take_hyphenated_service_word(&mut self) -> Option<String> {
+        let Token::String(_) = self.peek() else {
+            return None;
+        };
+        let start = self.tokens.get(self.pos)?.offset;
+
+        let mut end = start;
+        while end < self.source.len() {
+            let c = self.source[end];
+            // `--` OPENS A COMMENT, and the lexer has already discarded
+            // everything after it. Scanning raw source would resurrect
+            // that text into the name: `address a--b` + body + `end`
+            // addressed service `a` (with `--b` a comment) and would now
+            // address `a--b` — a working script silently sending
+            // somewhere else, which is the one thing this change
+            // promises never to do. Stopping here leaves `end` on a `-`,
+            // which is not a delimiter, so the terminator check below
+            // rejects the whole shape and the target takes the
+            // expression path exactly as before. The cost is that a
+            // service name containing `--` must be quoted; the manual
+            // says so.
+            if c == '-' && self.source.get(end + 1) == Some(&'-') {
+                break;
+            }
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+
+        // The word must be the WHOLE whitespace-delimited token. This is
+        // what keeps `env("DEST")`, `svc[0]` and a quoted `"a-b"` on the
+        // expression path: each stops the scan on a character that is
+        // not a statement terminator, so the shape is rejected outright
+        // rather than silently truncated to its leading word.
+        //
+        // It is also the invariant the token fast-forward below depends
+        // on. The consumed range always ends at a delimiter, so no token
+        // can START inside the range and EXTEND past it — every token
+        // the loop skips is wholly subsumed, and the cursor can never
+        // land mid-expression.
+        let terminated = end >= self.source.len()
+            || matches!(self.source[end], '\n' | ';')
+            || self.source[end].is_whitespace();
+        if !terminated {
+            return None;
+        }
+
+        let word: String = self.source[start..end].iter().collect();
+        let first = word.chars().next()?;
+        let last = word.chars().last()?;
+        if !(first.is_ascii_alphabetic() || first == '_')
+            || !word.contains('-')
+            || !(last.is_ascii_alphanumeric() || last == '_')
+        {
+            return None;
+        }
+
+        // Consume every token the raw scan subsumed — the word was
+        // assembled from chars, so the individual String/Minus/Dot
+        // tokens underneath it are now spent.
+        while self.pos < self.tokens.len() && self.tokens[self.pos].offset < end {
+            self.pos += 1;
+        }
+        Some(word)
     }
 
     fn parse_send(&mut self) -> MixResult<StmtKind> {

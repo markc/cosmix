@@ -626,11 +626,36 @@ corrupting the wire.</li>
 <p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> and returns the rc, so
 <code>if publish(..) != 0</code> reads naturally. Without a broker it degrades like
 <code>send</code>: <code>$rc = -3</code>, non-fatal.</p>
-<p><strong>Hyphenated targets — quote them.</strong> <code>send comp-nested …</code> parses the bare
-hyphen as subtraction; write <code>send "comp-nested" …</code>. Hyphenated service
-names are the norm on the mesh, so this bites early — quoting is the
-supported spelling (a bare-hyphen grammar change would collide with
-arithmetic and is not planned).</p>
+<p><strong>Hyphenated targets need no quoting.</strong> <code>send comp-nested …</code>,
+<code>emit desktop-vt1 …</code> and <code>address shell-scenes-p2 … end</code> all read the
+hyphenated name whole. Hyphenated service names are the norm on the mesh, so
+the bare form has to work; quoting and <code>$var</code> remain exactly equivalent
+spellings.</p>
+<p>The accepted shape is deliberately narrow, and is the
+<a href="/mix/shell-mode">shell classifier</a>'s tight-hyphen rule for command heads plus
+<code>.</code> for dotted names: an ASCII letter or <code>_</code> first, at least one <code>-</code>,
+alphanumerics / <code>_</code> / <code>-</code> / <code>.</code> within, an alphanumeric or <code>_</code> last, and the
+whole thing delimited by whitespace, a newline, a <code>;</code>, or end of input.
+Anything else keeps the expression reading it always had — a call
+(<code>send env("DEST") …</code>), an index, a concat, a parenthesised expression, a
+<code>$var</code>, and a <strong>spaced</strong> <code>send a - b …</code>, where the space says an operator was
+meant.</p>
+<p><strong>Quote a name the bare form cannot reach.</strong> Three shapes fall outside it, and
+quoting is the answer to all three:</p>
+<table><thead><tr><th>name</th><th>why</th><th>write</th></tr></thead><tbody>
+<tr><td><code>a--b</code></td><td><code>--</code> opens a <strong>comment</strong>; the bare form stops there, so the target would be <code>a</code></td><td><code>send "a--b" …</code></td></tr>
+<tr><td><code>svc-01</code>, <code>node-007</code>, <code>svc-1.2.3</code></td><td>the LEXER reads the tail as a number and rejects <code>01</code> (ambiguous leading zero) or <code>1.2.3</code> (not a number) before the parser sees the line</td><td><code>send "svc-01" …</code></td></tr>
+<tr><td><code>if-service</code>, <code>true-b</code></td><td>the first word is a Mix keyword or literal, not a bare identifier</td><td><code>send "if-service" …</code></td></tr>
+</tbody></table>
+<p>The leading-zero case is the one worth remembering, because <code>desktop-vt01</code> is
+a plausible service name and the error it gives (<code>ambiguous leading-zero number '01'</code>) does not mention <code>send</code> at all.</p>
+<p>Nothing that worked before changed meaning: the shape <em>requires</em> a hyphen, so
+every target that already resolved still takes the expression path, and a
+bareword is a string, so <code>a - b</code> on two barewords was always the runtime type
+error "cannot use 'a' as number" rather than arithmetic. (Before this, the
+bare form died at runtime with exactly that message while <code>mix --check</code> and
+<code>mix lint</code> both passed the line — an earlier version of this paragraph told
+you to quote it and said the grammar would not change.)</p>
 <hr />
 <h2 id="address--a-block-of-implicit-sends-to-one-target"><code>address</code> — a block of implicit sends to one target</h2>
 <p><code>address &lt;target&gt; … end</code> opens a block where <strong>each line is an implicit send</strong>

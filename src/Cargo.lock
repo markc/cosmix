@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.89.3"
+version = "0.89.2"
 dependencies = [
  "blake3",
  "chrono",

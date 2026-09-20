@@ -239,11 +239,42 @@ Sets `$rc`/`$result` exactly like `send` and returns the rc, so
 `if publish(..) != 0` reads naturally. Without a broker it degrades like
 `send`: `$rc = -3`, non-fatal.
 
-**Hyphenated targets — quote them.** `send comp-nested …` parses the bare
-hyphen as subtraction; write `send "comp-nested" …`. Hyphenated service
-names are the norm on the mesh, so this bites early — quoting is the
-supported spelling (a bare-hyphen grammar change would collide with
-arithmetic and is not planned).
+**Hyphenated targets need no quoting.** `send comp-nested …`,
+`emit desktop-vt1 …` and `address shell-scenes-p2 … end` all read the
+hyphenated name whole. Hyphenated service names are the norm on the mesh, so
+the bare form has to work; quoting and `$var` remain exactly equivalent
+spellings.
+
+The accepted shape is deliberately narrow, and is the
+[shell classifier](shell-mode.md)'s tight-hyphen rule for command heads plus
+`.` for dotted names: an ASCII letter or `_` first, at least one `-`,
+alphanumerics / `_` / `-` / `.` within, an alphanumeric or `_` last, and the
+whole thing delimited by whitespace, a newline, a `;`, or end of input.
+Anything else keeps the expression reading it always had — a call
+(`send env("DEST") …`), an index, a concat, a parenthesised expression, a
+`$var`, and a **spaced** `send a - b …`, where the space says an operator was
+meant.
+
+**Quote a name the bare form cannot reach.** Three shapes fall outside it, and
+quoting is the answer to all three:
+
+| name | why | write |
+|---|---|---|
+| `a--b` | `--` opens a **comment**; the bare form stops there, so the target would be `a` | `send "a--b" …` |
+| `svc-01`, `node-007`, `svc-1.2.3` | the LEXER reads the tail as a number and rejects `01` (ambiguous leading zero) or `1.2.3` (not a number) before the parser sees the line | `send "svc-01" …` |
+| `if-service`, `true-b` | the first word is a Mix keyword or literal, not a bare identifier | `send "if-service" …` |
+
+The leading-zero case is the one worth remembering, because `desktop-vt01` is
+a plausible service name and the error it gives (`ambiguous leading-zero
+number '01'`) does not mention `send` at all.
+
+Nothing that worked before changed meaning: the shape *requires* a hyphen, so
+every target that already resolved still takes the expression path, and a
+bareword is a string, so `a - b` on two barewords was always the runtime type
+error "cannot use 'a' as number" rather than arithmetic. (Before this, the
+bare form died at runtime with exactly that message while `mix --check` and
+`mix lint` both passed the line — an earlier version of this paragraph told
+you to quote it and said the grammar would not change.)
 
 ---
 

@@ -544,6 +544,13 @@ Earlier exact head rules still win, so `mix not-a-command` remains the `mix`
 meta-command with one hyphenated argument, not a command named
 `not-a-command`.
 
+There is one other position where a tight hyphen is read whole rather than as
+subtraction, for the same reason: the TARGET of
+[`send`/`emit`/`address`](bus.md), where hyphenated Bus service names
+(`comp-nested`, `desktop-vt1`) are the norm. The shape there is this one plus
+`.`, for dotted names. It is a target-position rule, not a second
+statement-head rule — everything in the list above is unaffected.
+
 A `KEY=VALUE` prefix is skipped to find the real head — this is an *external
 command* with an env var set for it:
 
