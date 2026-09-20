@@ -8,7 +8,7 @@ use bevy::{
     },
     prelude::*,
 };
-use cosmix_quoin::native::{NativeOutput, NativePanelRegions, NativeQuoinPlugin, NativeWorkArea};
+use cosmix_quoin::embedded::{EmbeddedOutput, EmbeddedPanelRegions, EmbeddedQuoinPlugin, EmbeddedWorkArea};
 use cosmix_shell::{host::PanelRect, runtime::ShellRuntimeSet};
 use std::{
     collections::BTreeSet,
@@ -25,9 +25,9 @@ struct InputState {
 }
 
 #[derive(Resource, Clone, Default)]
-pub(crate) struct NativeShellBridge(Arc<Mutex<InputState>>);
+pub(crate) struct EmbeddedShellBridge(Arc<Mutex<InputState>>);
 
-impl NativeShellBridge {
+impl EmbeddedShellBridge {
     pub(crate) fn scroll(&self, delta: Vec2) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         state.scroll += delta;
@@ -86,12 +86,12 @@ fn covers(regions: &[PanelRect], x: f64, y: f64) -> bool {
 }
 
 pub(crate) fn install(app: &mut App) {
-    if std::env::var("COSMIX_COMP_NATIVE_QUOIN").as_deref() != Ok("1") {
+    if std::env::var("COSMIX_COMP_EMBEDDED_QUOIN").as_deref() != Ok("1") {
         return;
     }
-    let bridge = NativeShellBridge::default();
+    let bridge = EmbeddedShellBridge::default();
     app.insert_resource(bridge)
-        .add_plugins(NativeQuoinPlugin)
+        .add_plugins(EmbeddedQuoinPlugin)
         .add_systems(Startup, attach_protocol)
         .add_systems(
             PreUpdate,
@@ -103,18 +103,18 @@ pub(crate) fn install(app: &mut App) {
 fn attach_protocol(
     mut commands: Commands,
     feed: Res<crate::protocol::ClientSceneFeed>,
-    bridge: Res<NativeShellBridge>,
+    bridge: Res<EmbeddedShellBridge>,
 ) {
-    feed.install_native_shell(bridge.clone());
+    feed.install_embedded_shell(bridge.clone());
     commands.insert_resource(cosmix_shell::runtime::ShellQuitHandler(
         feed.native_quit_callback(),
     ));
 }
 
 fn publish_regions(
-    bridge: Res<NativeShellBridge>,
-    regions: Res<NativePanelRegions>,
-    area: Res<NativeWorkArea>,
+    bridge: Res<EmbeddedShellBridge>,
+    regions: Res<EmbeddedPanelRegions>,
+    area: Res<EmbeddedWorkArea>,
     feed: Res<crate::protocol::ClientSceneFeed>,
     mut previous: Local<Option<PanelRect>>,
 ) {
@@ -134,8 +134,8 @@ fn publish_regions(
 }
 
 fn pointer_input(
-    bridge: Res<NativeShellBridge>,
-    output: Res<NativeOutput>,
+    bridge: Res<EmbeddedShellBridge>,
+    output: Res<EmbeddedOutput>,
     feed: Res<crate::protocol::ClientSceneFeed>,
     scale: Res<UiScale>,
     targets: Query<&RenderTarget>,
@@ -221,7 +221,7 @@ mod tests {
     fn protocol_attachment_waits_until_startup_after_feed_installation() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
-            .init_resource::<NativeShellBridge>()
+            .init_resource::<EmbeddedShellBridge>()
             .add_systems(Startup, attach_protocol);
         assert!(
             !app.world()
@@ -237,7 +237,7 @@ mod tests {
     }
     #[test]
     fn native_press_owns_release_outside_panel_but_never_steals_client_drag() {
-        let bridge = NativeShellBridge::default();
+        let bridge = EmbeddedShellBridge::default();
         bridge.0.lock().unwrap().regions.push(PanelRect {
             x: 10.,
             y: 10.,
@@ -253,7 +253,7 @@ mod tests {
     }
     #[test]
     fn reset_clears_native_ownership_and_cancels_queued_actions() {
-        let bridge = NativeShellBridge::default();
+        let bridge = EmbeddedShellBridge::default();
         bridge.0.lock().unwrap().regions.push(PanelRect {
             x: 0.,
             y: 0.,

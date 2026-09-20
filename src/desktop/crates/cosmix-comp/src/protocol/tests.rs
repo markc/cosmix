@@ -29869,7 +29869,7 @@ fn port_observation_reports_exclusive_focus_and_layer_usable_geometry_in_order()
     assert!(focus_sequence < output_sequence);
 }
 
-#[cfg(all(feature = "bus", feature = "native-quoin"))]
+#[cfg(all(feature = "bus", feature = "embedded-quoin"))]
 #[test]
 fn native_panels_reconfigure_maximised_chrome_and_publish_work_area_changes() {
     let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();

@@ -23,11 +23,11 @@ use ctk::bus::{BusBridgeConfig, provenance_from_build, resolve_noded_url};
 use std::time::Duration;
 
 #[derive(Resource)]
-pub(crate) struct NativePanelMounts(pub QuoinPanelMounts);
+pub(crate) struct EmbeddedPanelMounts(pub QuoinPanelMounts);
 
 /// Host updates this before `ShellRuntimeSet::Input`. Coordinates are logical.
 #[derive(Resource, Default)]
-pub struct NativeOutput {
+pub struct EmbeddedOutput {
     pub camera: Option<Entity>,
     pub size: Vec2,
     pub name: String,
@@ -38,12 +38,12 @@ pub struct NativeOutput {
 /// Visible panel rectangles, including the chrome animation offset. Hosts use
 /// these for input ownership, never the full invisible mount rectangles.
 #[derive(Resource, Default)]
-pub struct NativePanelRegions(pub Vec<PanelRect>);
+pub struct EmbeddedPanelRegions(pub Vec<PanelRect>);
 #[derive(Resource, Default)]
-pub struct NativeWorkArea(pub Option<PanelRect>);
+pub struct EmbeddedWorkArea(pub Option<PanelRect>);
 
 #[derive(Resource)]
-struct NativeHost {
+struct EmbeddedHost {
     detector: CornerDetector,
     name: String,
     size: Vec2,
@@ -52,9 +52,9 @@ struct NativeHost {
 #[derive(Resource, Default)]
 struct GripDrag(Option<(Edge, f32)>);
 
-pub struct NativeQuoinPlugin;
+pub struct EmbeddedQuoinPlugin;
 
-impl Plugin for NativeQuoinPlugin {
+impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
         let registry = crate::page_registry();
         let store = crate::state::StateStore::startup(false);
@@ -74,14 +74,14 @@ impl Plugin for NativeQuoinPlugin {
                 ))
                 .id()
         });
-        app.insert_resource(NativePanelMounts(QuoinPanelMounts::new(
+        app.insert_resource(EmbeddedPanelMounts(QuoinPanelMounts::new(
             mounts[0], mounts[1], mounts[2], mounts[3],
         )))
-        .init_resource::<NativeOutput>()
-        .init_resource::<NativePanelRegions>()
-        .init_resource::<NativeWorkArea>()
+        .init_resource::<EmbeddedOutput>()
+        .init_resource::<EmbeddedPanelRegions>()
+        .init_resource::<EmbeddedWorkArea>()
         .init_resource::<GripDrag>()
-        .insert_resource(NativeHost {
+        .insert_resource(EmbeddedHost {
             detector: CornerDetector::new(
                 CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
                     .expect("valid corner tuning"),
@@ -219,7 +219,7 @@ fn grip_cancel(
 }
 
 fn tracing_notice() {
-    eprintln!("QUOIN_NATIVE_ENABLED renderer=comp panels=4 bus=shell");
+    eprintln!("QUOIN_EMBEDDED_ENABLED renderer=comp panels=4 bus=shell");
 }
 
 fn model(name: &str, size: Vec2, registry: &cosmix_shell::chrome::QuoinPageRegistry) -> ShellModel {
@@ -238,7 +238,7 @@ fn model(name: &str, size: Vec2, registry: &cosmix_shell::chrome::QuoinPageRegis
 }
 
 fn prepare(world: &mut World) {
-    let output = world.resource::<NativeOutput>();
+    let output = world.resource::<EmbeddedOutput>();
     let (active, size, name, pointer) = (
         output.active,
         output.size,
@@ -248,17 +248,17 @@ fn prepare(world: &mut World) {
     if !active || size.min_element() <= 0.0 || !size.is_finite() || OutputKey::new(&name).is_err() {
         return;
     }
-    let host = world.resource::<NativeHost>();
+    let host = world.resource::<EmbeddedHost>();
     if host.name != name || host.size != size {
         let replacement = model(&name, size, world.resource());
         replace_shell_model(world, replacement);
-        let mut host = world.resource_mut::<NativeHost>();
+        let mut host = world.resource_mut::<EmbeddedHost>();
         host.name = name.clone();
         host.size = size;
     }
     let now = world.resource::<Time<Real>>().elapsed();
     let events = {
-        let mut host = world.resource_mut::<NativeHost>();
+        let mut host = world.resource_mut::<EmbeddedHost>();
         match pointer {
             Some(p) => host.detector.sample(PointerSample::new(
                 now,
@@ -280,12 +280,12 @@ fn prepare(world: &mut World) {
 
 fn present(
     mut commands: Commands,
-    output: Res<NativeOutput>,
-    mounts: Res<NativePanelMounts>,
+    output: Res<EmbeddedOutput>,
+    mounts: Res<EmbeddedPanelMounts>,
     frame: Res<ShellFrameState>,
-    mut regions: ResMut<NativePanelRegions>,
+    mut regions: ResMut<EmbeddedPanelRegions>,
     mut nodes: Query<(&mut Node, Option<&UiTargetCamera>)>,
-    mut work_area: ResMut<NativeWorkArea>,
+    mut work_area: ResMut<EmbeddedWorkArea>,
 ) {
     regions.0.clear();
     let layout = panel_layout(&frame.0);
@@ -345,24 +345,24 @@ mod tests {
         model
             .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
             .unwrap();
-        app.insert_resource(NativeOutput {
+        app.insert_resource(EmbeddedOutput {
             camera: Some(camera),
             size: Vec2::new(1000., 800.),
             name: "test".into(),
             active: true,
             pointer: None,
         })
-        .insert_resource(NativePanelMounts(QuoinPanelMounts::new(
+        .insert_resource(EmbeddedPanelMounts(QuoinPanelMounts::new(
             mounts[0], mounts[1], mounts[2], mounts[3],
         )))
         .insert_resource(ShellFrameState(
             cosmix_shell::runtime::ShellFrame::from_model(&model),
         ))
-        .init_resource::<NativePanelRegions>()
-        .init_resource::<NativeWorkArea>()
+        .init_resource::<EmbeddedPanelRegions>()
+        .init_resource::<EmbeddedWorkArea>()
         .add_systems(Update, present);
         app.update();
-        assert!(!app.world().resource::<NativePanelRegions>().0.is_empty());
+        assert!(!app.world().resource::<EmbeddedPanelRegions>().0.is_empty());
         app.world_mut().clear_trackers();
         app.update();
         assert_eq!(
@@ -372,10 +372,10 @@ mod tests {
                 .count(),
             0
         );
-        app.world_mut().resource_mut::<NativeOutput>().active = false;
+        app.world_mut().resource_mut::<EmbeddedOutput>().active = false;
         app.update();
-        assert!(app.world().resource::<NativePanelRegions>().0.is_empty());
-        assert!(app.world().resource::<NativeWorkArea>().0.is_none());
+        assert!(app.world().resource::<EmbeddedPanelRegions>().0.is_empty());
+        assert!(app.world().resource::<EmbeddedWorkArea>().0.is_none());
         for mount in mounts {
             assert_eq!(
                 app.world().get::<Node>(mount).unwrap().display,

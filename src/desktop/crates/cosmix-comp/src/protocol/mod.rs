@@ -970,12 +970,12 @@ impl HostInput {
 }
 
 enum ProtocolCommand {
-    #[cfg(feature = "native-quoin")]
-    NativeShell(crate::native_shell::NativeShellBridge),
-    #[cfg(feature = "native-quoin")]
-    NativeWorkArea(Option<cosmix_shell::host::PanelRect>),
-    #[cfg(feature = "native-quoin")]
-    NativeShellQuit,
+    #[cfg(feature = "embedded-quoin")]
+    EmbeddedShell(crate::embedded_shell::EmbeddedShellBridge),
+    #[cfg(feature = "embedded-quoin")]
+    EmbeddedWorkArea(Option<cosmix_shell::host::PanelRect>),
+    #[cfg(feature = "embedded-quoin")]
+    EmbeddedShellQuit,
     Frame {
         inputs: Vec<HostInput>,
     },
@@ -1305,23 +1305,23 @@ pub(crate) struct ClientSceneFeed {
 static_assertions::assert_not_impl_any!(ClientSceneFeed: Clone, Copy);
 
 impl ClientSceneFeed {
-    #[cfg(feature = "native-quoin")]
-    pub(crate) fn install_native_shell(&self, bridge: crate::native_shell::NativeShellBridge) {
+    #[cfg(feature = "embedded-quoin")]
+    pub(crate) fn install_embedded_shell(&self, bridge: crate::embedded_shell::EmbeddedShellBridge) {
         self.commands
-            .send(ProtocolCommand::NativeShell(bridge))
+            .send(ProtocolCommand::EmbeddedShell(bridge))
             .expect("live protocol thread for native shell");
     }
-    #[cfg(feature = "native-quoin")]
+    #[cfg(feature = "embedded-quoin")]
     pub(crate) fn native_work_area(&self, area: Option<cosmix_shell::host::PanelRect>) {
-        let _ = self.commands.send(ProtocolCommand::NativeWorkArea(area));
+        let _ = self.commands.send(ProtocolCommand::EmbeddedWorkArea(area));
     }
-    #[cfg(feature = "native-quoin")]
+    #[cfg(feature = "embedded-quoin")]
     pub(crate) fn native_quit_callback(&self) -> Arc<dyn Fn() + Send + Sync> {
         let commands = self.commands.clone();
         let requested = std::sync::atomic::AtomicBool::new(false);
         Arc::new(move || {
             if !requested.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                let _ = commands.send(ProtocolCommand::NativeShellQuit);
+                let _ = commands.send(ProtocolCommand::EmbeddedShellQuit);
             }
         })
     }
@@ -3278,9 +3278,9 @@ impl ProtocolServer {
             backend,
             cursor_position: (0.0, 0.0),
             cursor_position_snapshot: cursor_position,
-            #[cfg(feature = "native-quoin")]
-            native_shell: None,
-            #[cfg(feature = "native-quoin")]
+            #[cfg(feature = "embedded-quoin")]
+            embedded_shell: None,
+            #[cfg(feature = "embedded-quoin")]
             native_work_area: None,
             cursor_selection: CursorSelection::Default,
             chrome_cursor_override: None,
@@ -3528,16 +3528,16 @@ impl ProtocolServer {
         event_loop
             .handle()
             .insert_source(command_source, |event, (), state| match event {
-                #[cfg(feature = "native-quoin")]
-                ChannelEvent::Msg(ProtocolCommand::NativeShell(bridge)) => {
-                    state.native_shell = Some(bridge);
+                #[cfg(feature = "embedded-quoin")]
+                ChannelEvent::Msg(ProtocolCommand::EmbeddedShell(bridge)) => {
+                    state.embedded_shell = Some(bridge);
                 }
-                #[cfg(feature = "native-quoin")]
-                ChannelEvent::Msg(ProtocolCommand::NativeWorkArea(area)) => {
+                #[cfg(feature = "embedded-quoin")]
+                ChannelEvent::Msg(ProtocolCommand::EmbeddedWorkArea(area)) => {
                     state.set_native_work_area(area);
                 }
-                #[cfg(feature = "native-quoin")]
-                ChannelEvent::Msg(ProtocolCommand::NativeShellQuit) => {
+                #[cfg(feature = "embedded-quoin")]
+                ChannelEvent::Msg(ProtocolCommand::EmbeddedShellQuit) => {
                     // KMS teardown belongs to the live coordinator; nested
                     // ECS exit actions are not consumed by that coordinator.
                     // The callback sends this request at most once.
@@ -6146,9 +6146,9 @@ struct WaylandState {
     backend: BackendData,
     cursor_position: (f64, f64),
     cursor_position_snapshot: Arc<Mutex<CursorPositionSnapshot>>,
-    #[cfg(feature = "native-quoin")]
-    native_shell: Option<crate::native_shell::NativeShellBridge>,
-    #[cfg(feature = "native-quoin")]
+    #[cfg(feature = "embedded-quoin")]
+    embedded_shell: Option<crate::embedded_shell::EmbeddedShellBridge>,
+    #[cfg(feature = "embedded-quoin")]
     native_work_area: Option<cosmix_shell::host::PanelRect>,
     cursor_selection: CursorSelection,
     chrome_cursor_override: Option<ChromeCursorIcon>,
@@ -8005,8 +8005,8 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
-        #[cfg(feature = "native-quoin")]
-        if let Some(bridge) = &self.native_shell {
+        #[cfg(feature = "embedded-quoin")]
+        if let Some(bridge) = &self.embedded_shell {
             bridge.reset();
         }
         #[cfg(feature = "bus")]
@@ -11711,8 +11711,8 @@ impl WaylandState {
     }
 
     fn pointer_button(&mut self, button: u32, state: HostButtonState, time: u32) {
-        #[cfg(feature = "native-quoin")]
-        if let Some(bridge) = &self.native_shell
+        #[cfg(feature = "embedded-quoin")]
+        if let Some(bridge) = &self.embedded_shell
             && bridge.button(
                 self.cursor_position.0,
                 self.cursor_position.1,
@@ -12071,9 +12071,9 @@ impl WaylandState {
             return;
         }
         // Finger and continuous sources have a defined end of sequence, so a
-        #[cfg(feature = "native-quoin")]
+        #[cfg(feature = "embedded-quoin")]
         if !self.pointer.is_grabbed()
-            && let Some(bridge) = &self.native_shell
+            && let Some(bridge) = &self.embedded_shell
             && bridge.covers(self.cursor_position.0, self.cursor_position.1)
         {
             bridge.scroll(bevy::prelude::Vec2::new(
@@ -12652,10 +12652,10 @@ impl WaylandState {
     }
 
     fn pointer_target_at(&self, x: f64, y: f64) -> Option<PointerTarget> {
-        #[cfg(feature = "native-quoin")]
+        #[cfg(feature = "embedded-quoin")]
         if !self.session_lock_active()
             && self
-                .native_shell
+                .embedded_shell
                 .as_ref()
                 .is_some_and(|bridge| bridge.covers(x, y))
         {
@@ -13808,7 +13808,7 @@ impl WaylandState {
         self.native_usable_rect(self.layer_usable_output_rect())
     }
 
-    #[cfg(feature = "native-quoin")]
+    #[cfg(feature = "embedded-quoin")]
     fn set_native_work_area(&mut self, area: Option<cosmix_shell::host::PanelRect>) {
         if self.native_work_area == area {
             return;
@@ -13826,7 +13826,7 @@ impl WaylandState {
     }
 
     fn native_usable_rect(&self, rect: LogicalOutputRect) -> LogicalOutputRect {
-        #[cfg(feature = "native-quoin")]
+        #[cfg(feature = "embedded-quoin")]
         if let Some(area) = self.native_work_area {
             let x = rect.x.max(area.x);
             let y = rect.y.max(area.y);
@@ -13860,7 +13860,7 @@ impl WaylandState {
 
     #[cfg(feature = "bus")]
     fn port_usable_output_rect_for(&self, output: &Output) -> Option<LogicalOutputRect> {
-        #[cfg(feature = "native-quoin")]
+        #[cfg(feature = "embedded-quoin")]
         if self.native_work_area.is_some() && self.backend.default_output().as_ref() == Some(output)
         {
             return Some(self.usable_output_rect());

@@ -46,13 +46,13 @@ fn install(app: &mut App) {
             phase: None,
         })
         .add_systems(Update, update);
-    #[cfg(feature = "native-quoin")]
+    #[cfg(feature = "embedded-quoin")]
     {
         app.configure_sets(
             Update,
             cosmix_shell::runtime::ShellRuntimeSet::Input.after(update),
         );
-        crate::native_shell::install(app);
+        crate::embedded_shell::install(app);
     }
     tracing::warn!("Native Boing/HUD comparison enabled; first output only, automatic panel cycle");
 }
@@ -181,9 +181,9 @@ fn update(world: &mut World) {
         probe.output = Some(create(world, *owner, target.clone()));
         probe.started = Instant::now();
     }
-    #[cfg(feature = "native-quoin")]
+    #[cfg(feature = "embedded-quoin")]
     if probe.output.is_none()
-        && let Some(mut native) = world.get_resource_mut::<cosmix_quoin::native::NativeOutput>()
+        && let Some(mut native) = world.get_resource_mut::<cosmix_quoin::embedded::EmbeddedOutput>()
     {
         native.camera = None;
         native.active = false;
@@ -195,8 +195,8 @@ fn update(world: &mut World) {
             && world
                 .get::<Camera>(output.owner)
                 .is_some_and(|c| c.is_active);
-        #[cfg(feature = "native-quoin")]
-        if world.contains_resource::<cosmix_quoin::native::NativeOutput>() {
+        #[cfg(feature = "embedded-quoin")]
+        if world.contains_resource::<cosmix_quoin::embedded::EmbeddedOutput>() {
             let fullscreen = world
                 .get_resource::<crate::compositor_scene::SurfaceEntities>()
                 .is_some_and(|surfaces| {
@@ -217,7 +217,7 @@ fn update(world: &mut World) {
                 .get::<crate::capture::CaptureOutputSource>(output.owner)
                 .map(|source| source.output_name.clone())
                 .unwrap_or_else(|| "primary".into());
-            if let Some(mut native) = world.get_resource_mut::<cosmix_quoin::native::NativeOutput>()
+            if let Some(mut native) = world.get_resource_mut::<cosmix_quoin::embedded::EmbeddedOutput>()
             {
                 native.camera = Some(output.owner);
                 native.size = size;
@@ -249,9 +249,9 @@ fn update(world: &mut World) {
             };
         }
         let (phase, amount) = panel_cycle(probe.started.elapsed().as_secs_f32());
-        #[cfg(feature = "native-quoin")]
-        let active_hud = active && !world.contains_resource::<cosmix_quoin::native::NativeOutput>();
-        #[cfg(not(feature = "native-quoin"))]
+        #[cfg(feature = "embedded-quoin")]
+        let active_hud = active && !world.contains_resource::<cosmix_quoin::embedded::EmbeddedOutput>();
+        #[cfg(not(feature = "embedded-quoin"))]
         let active_hud = active;
         if let Some(mut node) = world.get_mut::<Node>(output.panel) {
             node.display = if active_hud {

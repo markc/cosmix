@@ -24,7 +24,7 @@ explicit-sync-live-test = []
 # Gate G1s only: a nested scene quad registered as content source `probe`.
 content-source-probe = []
 hud-probe = ["dep:cosmix-bg-boing", "bevy/bevy_pbr", "bevy/bevy_ui_render"]
-native-quoin = ["hud-probe", "dep:cosmix-quoin", "dep:cosmix-shell"]
+embedded-quoin = ["hud-probe", "dep:cosmix-quoin", "dep:cosmix-shell"]
 frame-capture = ["dep:signal-hook"]
 kms-live = [
     "dep:signal-hook",

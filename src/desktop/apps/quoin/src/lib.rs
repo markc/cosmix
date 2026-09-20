@@ -4,7 +4,7 @@ mod bus_service;
 mod demos;
 mod desktop_font;
 mod launcher;
-pub mod native;
+pub mod embedded;
 mod power;
 mod state;
 mod wallpaper;
@@ -290,7 +290,7 @@ fn setup(
     mut commands: Commands,
     mounts: (
         Option<Res<LayerPanelMounts>>,
-        Option<Res<native::NativePanelMounts>>,
+        Option<Res<embedded::EmbeddedPanelMounts>>,
     ),
     mut theme: ResMut<UiTheme>,
     mut theme_state: ResMut<ThemeState>,

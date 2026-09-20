@@ -14,8 +14,8 @@ mod decoration_scene;
 mod frame_capture;
 mod frame_content;
 mod frame_trace;
-#[cfg(feature = "native-quoin")]
-mod native_shell;
+#[cfg(feature = "embedded-quoin")]
+mod embedded_shell;
 mod occlusion;
 #[cfg(feature = "bus")]
 mod port;
