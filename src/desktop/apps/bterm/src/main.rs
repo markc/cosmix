@@ -137,6 +137,12 @@ struct PaneView {
     rows: u16,
     rendered: bool,
     active: bool,
+    /// Cursor cell and visibility as of the last frame painted into this
+    /// pane's texture. A damage-rect repaint only touches the rows the grid
+    /// reports dirty, so the row the cursor LEFT has to be re-marked by hand
+    /// or its inverted block stays on screen.
+    cursor: (usize, usize),
+    cursor_visible: bool,
 }
 
 // VERIFY: precedence — the only font override resolution, reused at every scale.
@@ -975,6 +981,8 @@ fn spawn_pane_tree(
                 rows: 24,
                 rendered: false,
                 active: false,
+                cursor: (0, 0),
+                cursor_visible: false,
             });
             container
         }
@@ -1202,36 +1210,56 @@ fn refresh(
             continue;
         }
         // VERIFY: per-leaf render — all visible leaves consume their own damage.
-        let mut screen = terminal.screen(true);
+        // `grid_snapshot` is `screen(true)` plus the dirty-row flags, so the
+        // raster repaints the rows that changed instead of every glyph on the
+        // grid; `switched` (first frame, focus change, rebuilt Raster) still
+        // forces the lot.
+        let snapshot = terminal.grid_snapshot();
+        let mut screen = snapshot.screen;
+        let mut dirty = snapshot.dirty_rows;
         screen.cursor_visible &= active;
+        // The cursor's old cell is not necessarily damage the grid reports —
+        // it is our own inversion, painted over whatever the grid holds there.
+        if pane.cursor != screen.cursor || pane.cursor_visible != screen.cursor_visible {
+            for row in [pane.cursor.1, screen.cursor.1] {
+                if let Some(flag) = dirty.get_mut(row) {
+                    *flag = true;
+                }
+            }
+        }
         pane.active = active;
         pane.rendered = true;
-        let rgba = painter.render(&screen);
-        let converted = Instant::now();
-        terminal
-            .stats
-            .lock()
-            .unwrap()
-            .vt_rgba
-            .add(converted - screen.updated);
+        pane.cursor = screen.cursor;
+        pane.cursor_visible = screen.cursor_visible;
         let width = screen.cols as u32 * painter.width;
         let height = screen.rows as u32 * painter.height;
+        let bytes = painter.frame_bytes(&screen);
         if let Some(mut image) = images.get_mut(&pane.image) {
-            let mut next = Image::new(
-                Extent3d {
+            // Mutate the texture the pane already owns. Building a fresh
+            // `Image` per damaged frame threw away a full-frame buffer (~12 MB
+            // at 2.5x scale) every time, and a stream damages at up to 60 fps.
+            if image.texture_descriptor.size.width != width
+                || image.texture_descriptor.size.height != height
+            {
+                image.texture_descriptor.size = Extent3d {
                     width,
                     height,
                     depth_or_array_layers: 1,
-                },
-                TextureDimension::D2,
-                rgba,
-                TextureFormat::Rgba8UnormSrgb,
-                RenderAssetUsages::default(),
-            );
-            next.sampler = ImageSampler::nearest();
-            *image = next;
+                };
+            }
+            let rgba = image.data.get_or_insert_with(Vec::new);
+            // A buffer that is not already the frame size (first frame, any
+            // resize) repaints in full inside `render_into`, whatever we pass.
+            let full = switched || rgba.len() != bytes;
+            let started = Instant::now();
+            painter.render_into(&screen, rgba, (!full).then_some(dirty.as_slice()));
+            let converted = Instant::now();
             let mut stats = terminal.stats.lock().unwrap();
-            stats.rgba_upload.add(converted.elapsed());
+            stats.vt_rgba.add(converted - screen.updated);
+            // The raster now writes straight into the asset's own buffer, so
+            // there is no separate convert-then-upload step left to time; the
+            // rasterisation itself is what this frame cost the main thread.
+            stats.rgba_upload.add(converted - started);
             stats.uploads += 1;
         }
         let node_w = px(width as f32 / painter.scale);
