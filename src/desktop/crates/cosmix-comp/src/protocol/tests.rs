@@ -43911,3 +43911,8 @@ mod window_control_tests {
     use super::*;
     include!("window_control_tests.rs");
 }
+
+mod dnd_cancel_tests {
+    use super::*;
+    include!("dnd_cancel_tests.rs");
+}
