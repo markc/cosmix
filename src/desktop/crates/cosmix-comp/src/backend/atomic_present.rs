@@ -100,7 +100,72 @@ impl AtomicCandidateRejection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AtomicRejectionMatrix {
     pub(crate) route_rejection: Option<String>,
-    pub(crate) candidates: Vec<AtomicCandidateRejection>,
+    pub(crate) candidates: Vec<AtomicRejectedCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AtomicRouteRejection {
+    Claimed(Vec<(u32, String)>),
+    // Defence in depth for future enumeration refactors: today possible_crtcs
+    // and crtcs come from the same resource_handles() list, so this cannot occur.
+    Disappeared,
+    Unsupported(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AtomicRejectedCandidate {
+    Route {
+        crtc_id: u32,
+        reason: AtomicRouteRejection,
+    },
+    Format {
+        crtc_id: u32,
+        rejection: AtomicCandidateRejection,
+    },
+}
+
+impl AtomicRejectionMatrix {
+    fn retryable(&self) -> bool {
+        self.candidates.iter().any(|candidate| {
+            matches!(
+                candidate,
+                AtomicRejectedCandidate::Route {
+                    reason: AtomicRouteRejection::Claimed(_) | AtomicRouteRejection::Disappeared,
+                    ..
+                }
+            )
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum AtomicAdmissionError {
+    Retryable(String),
+    Terminal(String),
+}
+
+impl AtomicAdmissionError {
+    pub(crate) fn probe(context: &str, error: io::Error) -> Self {
+        let detail = format!("{context}: {error}");
+        match error.raw_os_error() {
+            Some(libc::EAGAIN | libc::EBUSY | libc::EINTR) => Self::Retryable(detail),
+            _ => Self::Terminal(detail),
+        }
+    }
+}
+
+impl From<String> for AtomicAdmissionError {
+    fn from(detail: String) -> Self {
+        Self::Terminal(detail)
+    }
+}
+
+impl std::fmt::Display for AtomicAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(detail) | Self::Terminal(detail) => formatter.write_str(detail),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,7 +238,7 @@ impl AtomicPropertyTable {
 struct EnumeratedConnector {
     id: u32,
     name: String,
-    connected: bool,
+    state: control::connector::State,
     modes: Vec<ConnectorMode>,
     possible_crtcs: BTreeSet<u32>,
     properties: AtomicPropertyTable,
@@ -463,8 +528,9 @@ pub(crate) fn admit_atomic_output_from_fd(
     drm_device: u64,
     connector_id: u32,
     connector_name: &str,
+    preferred_crtc: Option<u32>,
     scanout: ScanoutImportCapabilities,
-) -> Result<AtomicOutputSelection, String> {
+) -> Result<AtomicOutputSelection, AtomicAdmissionError> {
     let card_fd = drm_fd
         .try_clone_to_owned()
         .map_err(|error| format!("atomic live admission fd duplication failed: {error}"))?;
@@ -476,30 +542,49 @@ pub(crate) fn admit_atomic_output_from_fd(
     let gbm_fd = card
         .try_clone_fd()
         .map_err(|error| format!("atomic live admission GBM fd duplication failed: {error}"))?;
-    let enumeration = enumerate_atomic_device(&card)
-        .map_err(|error| format!("atomic live DRM enumeration failed: {error}"))?;
+    let enumeration = enumerate_atomic_device(&card).map_err(|error| {
+        AtomicAdmissionError::probe("atomic live DRM enumeration failed", error)
+    })?;
     let gbm = GbmDevice::new(gbm_fd)
         .map_err(|error| format!("atomic live GBM capability setup failed: {error}"))?;
     let mut capabilities = ProductionCapabilityOracle {
         scanout,
         gbm: GbmAllocator::new(gbm, GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING),
     };
-    let admissions = negotiate_atomic_outputs(&enumeration, &mut capabilities);
-    let admission = admissions
-        .into_iter()
-        .find(|admission| {
-            admission.connector_id == connector_id && admission.connector_name == connector_name
-        })
+    let connector = enumeration
+        .connectors
+        .iter()
+        .find(|connector| connector.id == connector_id && connector.name == connector_name)
         .ok_or_else(|| {
             format!(
                 "atomic live admission found no connector {connector_name} object {connector_id}"
             )
         })?;
+    let admission = negotiate_connector_with_preference(
+        &enumeration,
+        connector,
+        &mut capabilities,
+        preferred_crtc,
+    );
+    admitted_selection(admission)
+}
+
+fn admitted_selection(
+    admission: AtomicConnectorAdmission,
+) -> Result<AtomicOutputSelection, AtomicAdmissionError> {
     match admission.outcome {
         AtomicAdmissionOutcome::Selected(selected) => Ok(selected.selection),
-        AtomicAdmissionOutcome::Rejected(matrix) => Err(format!(
-            "atomic live admission rejected {connector_name} object {connector_id}: {matrix:?}"
-        )),
+        AtomicAdmissionOutcome::Rejected(matrix) => {
+            let detail = format!(
+                "atomic live admission rejected {} object {}: {matrix:?}",
+                admission.connector_name, admission.connector_id
+            );
+            Err(if matrix.retryable() {
+                AtomicAdmissionError::Retryable(detail)
+            } else {
+                AtomicAdmissionError::Terminal(detail)
+            })
+        }
     }
 }
 
@@ -524,7 +609,7 @@ fn enumerate_atomic_device(card: &ReadOnlyCard) -> io::Result<AtomicEnumeration>
             Ok(EnumeratedConnector {
                 id: u32::from(*handle),
                 name: info.to_string(),
-                connected: info.state() == control::connector::State::Connected,
+                state: info.state(),
                 modes: info.modes().iter().map(connector_mode).collect(),
                 possible_crtcs,
                 properties: properties(card, *handle)?,
@@ -595,6 +680,7 @@ fn negotiate_atomic_outputs(
     enumeration: &AtomicEnumeration,
     capabilities: &mut dyn AtomicCapabilityOracle,
 ) -> Vec<AtomicConnectorAdmission> {
+    // Each report is per-connector feasibility, not a simultaneously realisable set.
     enumeration
         .connectors
         .iter()
@@ -607,15 +693,31 @@ fn negotiate_connector(
     connector: &EnumeratedConnector,
     capabilities: &mut dyn AtomicCapabilityOracle,
 ) -> AtomicConnectorAdmission {
+    negotiate_connector_with_preference(enumeration, connector, capabilities, None)
+}
+
+fn negotiate_connector_with_preference(
+    enumeration: &AtomicEnumeration,
+    connector: &EnumeratedConnector,
+    capabilities: &mut dyn AtomicCapabilityOracle,
+    preferred_crtc: Option<u32>,
+) -> AtomicConnectorAdmission {
     let rejected = |reason: String| AtomicConnectorAdmission {
         connector_name: connector.name.clone(),
         connector_id: connector.id,
         outcome: AtomicAdmissionOutcome::Rejected(AtomicRejectionMatrix {
-            route_rejection: Some(reason),
-            candidates: Vec::new(),
+            route_rejection: Some(reason.clone()),
+            candidates: connector
+                .possible_crtcs
+                .iter()
+                .map(|&crtc_id| AtomicRejectedCandidate::Route {
+                    crtc_id,
+                    reason: AtomicRouteRejection::Unsupported(reason.clone()),
+                })
+                .collect(),
         }),
     };
-    if !connector.connected {
+    if connector.state != control::connector::State::Connected {
         return rejected("connector is not connected".into());
     }
     let Some(mode) = preferred_mode(&connector.modes) else {
@@ -634,26 +736,138 @@ fn negotiate_connector(
         .get("CRTC_ID")
         .and_then(nonzero_u32)
         .filter(|crtc| connector.possible_crtcs.contains(crtc));
-    let crtc_id = match current_crtc {
-        Some(crtc) => crtc,
-        None if connector.possible_crtcs.len() == 1 => *connector
-            .possible_crtcs
-            .first()
-            .expect("one possible CRTC exists"),
-        None if connector.possible_crtcs.is_empty() => {
-            return rejected("connector has no compatible CRTC route".into());
+    if connector.possible_crtcs.is_empty() {
+        return rejected("connector has no compatible CRTC route".into());
+    }
+    let mut routes = connector
+        .possible_crtcs
+        .iter()
+        .map(|&crtc_id| {
+            let owners = enumeration
+                .connectors
+                .iter()
+                .filter(|other| {
+                    other.id != connector.id
+                        && other.properties.get("CRTC_ID").and_then(nonzero_u32) == Some(crtc_id)
+                })
+                .collect::<Vec<_>>();
+            // Unknown is not evidence of disconnection: only explicitly disconnected
+            // owners can supply a stale route for last-resort admission.
+            let protected = owners
+                .iter()
+                .any(|owner| owner.state != control::connector::State::Disconnected);
+            let mut owners = owners
+                .into_iter()
+                .map(|owner| (owner.id, owner.name.clone()))
+                .collect::<Vec<_>>();
+            owners.sort();
+            (crtc_id, owners, protected)
+        })
+        .collect::<Vec<_>>();
+    routes.sort_by_key(|(id, owners, _)| {
+        (
+            Some(*id) != current_crtc,
+            !owners.is_empty(),
+            Some(*id) != preferred_crtc,
+            *id,
+        )
+    });
+    let mut matrix = AtomicRejectionMatrix {
+        route_rejection: None,
+        candidates: Vec::new(),
+    };
+    let mut reasons = Vec::new();
+    let route_count = routes.len();
+    for (route_index, (crtc_id, owners, protected)) in routes.into_iter().enumerate() {
+        // A peer property cannot evict our current route. For other routes,
+        // connected owners may be our own second head; disconnected owners may
+        // be leftovers from an earlier master and rank after every free route.
+        let stale_claim = if Some(crtc_id) != current_crtc && !owners.is_empty() {
+            reasons.push(format!("CRTC {crtc_id} claimed by {owners:?}"));
+            let claim = AtomicRouteRejection::Claimed(owners);
+            matrix.candidates.push(AtomicRejectedCandidate::Route {
+                crtc_id,
+                reason: claim.clone(),
+            });
+            if protected {
+                continue;
+            }
+            Some(claim)
+        } else {
+            None
+        };
+        let outcome = negotiate_crtc(enumeration, connector, capabilities, mode, crtc_id);
+        match outcome {
+            AtomicAdmissionOutcome::Selected(mut selected) => {
+                if let Some(claim) = stale_claim {
+                    tracing::warn!(
+                        connector_id = connector.id,
+                        connector_name = %connector.name,
+                        crtc_id,
+                        claim = ?claim,
+                        "atomic admission selected route with stale claim"
+                    );
+                }
+                // Include probes spent on earlier routes in the lazy-admission
+                // counters. Later routes may still contain an untested survivor.
+                let earlier_probes = matrix
+                    .candidates
+                    .iter()
+                    .filter(|candidate| matches!(candidate, AtomicRejectedCandidate::Format { .. }))
+                    .count();
+                selected.total_candidates += earlier_probes;
+                selected.evaluated_candidates += earlier_probes;
+                if route_index + 1 < route_count {
+                    selected.other_admissible_survivors = AtomicSurvivorStatus::UnknownNotEvaluated;
+                }
+                return AtomicConnectorAdmission {
+                    connector_id: connector.id,
+                    connector_name: connector.name.clone(),
+                    outcome: AtomicAdmissionOutcome::Selected(selected),
+                };
+            }
+            AtomicAdmissionOutcome::Rejected(mut rejected) => {
+                if let Some(reason) = rejected.route_rejection {
+                    reasons.push(reason);
+                }
+                matrix.candidates.append(&mut rejected.candidates);
+            }
         }
-        None => {
-            return rejected(format!(
-                "connector route is ambiguous across CRTCs {:?}",
-                connector.possible_crtcs
-            ));
-        }
+    }
+    if !reasons.is_empty() {
+        matrix.route_rejection = Some(reasons.join("; "));
+    }
+    AtomicConnectorAdmission {
+        connector_id: connector.id,
+        connector_name: connector.name.clone(),
+        outcome: AtomicAdmissionOutcome::Rejected(matrix),
+    }
+}
+
+fn negotiate_crtc(
+    enumeration: &AtomicEnumeration,
+    connector: &EnumeratedConnector,
+    capabilities: &mut dyn AtomicCapabilityOracle,
+    mode: ConnectorMode,
+    crtc_id: u32,
+) -> AtomicAdmissionOutcome {
+    let rejected = |reason: String| {
+        AtomicAdmissionOutcome::Rejected(AtomicRejectionMatrix {
+            route_rejection: Some(reason.clone()),
+            candidates: vec![AtomicRejectedCandidate::Route {
+                crtc_id,
+                reason: AtomicRouteRejection::Unsupported(reason),
+            }],
+        })
     };
     let Some(crtc) = enumeration.crtcs.iter().find(|crtc| crtc.id == crtc_id) else {
-        return rejected(format!(
-            "selected CRTC {crtc_id} disappeared during enumeration"
-        ));
+        return AtomicAdmissionOutcome::Rejected(AtomicRejectionMatrix {
+            route_rejection: Some(format!("CRTC {crtc_id} disappeared during enumeration")),
+            candidates: vec![AtomicRejectedCandidate::Route {
+                crtc_id,
+                reason: AtomicRouteRejection::Disappeared,
+            }],
+        });
     };
     let missing = crtc.properties.missing(REQUIRED_CRTC_PROPERTIES);
     if !missing.is_empty() {
@@ -730,6 +944,12 @@ fn negotiate_connector(
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| candidate_rank(*candidate));
     let total_candidates = candidates.len();
+    if total_candidates == 0 {
+        return rejected(format!(
+            "primary plane {} exposes no format/modifier candidates",
+            plane.id
+        ));
+    }
     let mut matrix = Vec::with_capacity(total_candidates);
     // Admission stops at the first winner to avoid one mode-sized GBM
     // allocation for every later candidate. Individual driver ioctls remain
@@ -739,39 +959,34 @@ fn negotiate_connector(
         if row.admitted() {
             let evaluated_candidates = index + 1;
             let unevaluated_candidates = total_candidates - evaluated_candidates;
-            return AtomicConnectorAdmission {
-                connector_name: connector.name.clone(),
-                connector_id: connector.id,
-                outcome: AtomicAdmissionOutcome::Selected(AtomicSelectedAdmission {
-                    selection: AtomicOutputSelection {
-                        connector_id: connector.id,
-                        crtc_id,
-                        primary_plane_id: plane.id,
-                        mode,
-                        format: candidate.fourcc,
-                        modifier: candidate.modifier,
-                    },
-                    total_candidates,
-                    evaluated_candidates,
-                    unevaluated_candidates,
-                    other_admissible_survivors: if unevaluated_candidates == 0 {
-                        AtomicSurvivorStatus::None
-                    } else {
-                        AtomicSurvivorStatus::UnknownNotEvaluated
-                    },
-                }),
-            };
+            return AtomicAdmissionOutcome::Selected(AtomicSelectedAdmission {
+                selection: AtomicOutputSelection {
+                    connector_id: connector.id,
+                    crtc_id,
+                    primary_plane_id: plane.id,
+                    mode,
+                    format: candidate.fourcc,
+                    modifier: candidate.modifier,
+                },
+                total_candidates,
+                evaluated_candidates,
+                unevaluated_candidates,
+                other_admissible_survivors: if unevaluated_candidates == 0 {
+                    AtomicSurvivorStatus::None
+                } else {
+                    AtomicSurvivorStatus::UnknownNotEvaluated
+                },
+            });
         }
-        matrix.push(row);
+        matrix.push(AtomicRejectedCandidate::Format {
+            crtc_id,
+            rejection: row,
+        });
     }
-    AtomicConnectorAdmission {
-        connector_name: connector.name.clone(),
-        connector_id: connector.id,
-        outcome: AtomicAdmissionOutcome::Rejected(AtomicRejectionMatrix {
-            route_rejection: None,
-            candidates: matrix,
-        }),
-    }
+    AtomicAdmissionOutcome::Rejected(AtomicRejectionMatrix {
+        route_rejection: None,
+        candidates: matrix,
+    })
 }
 
 fn evaluate_candidate(
@@ -1078,7 +1293,7 @@ mod tests {
             connectors: vec![EnumeratedConnector {
                 id: connector_id,
                 name: "HDMI-A-1".into(),
-                connected: true,
+                state: control::connector::State::Connected,
                 modes: vec![mode()],
                 possible_crtcs: BTreeSet::from([crtc_id]),
                 properties: connector_properties,
@@ -1222,7 +1437,9 @@ mod tests {
             panic!("empty intersection must reject");
         };
         assert_eq!(matrix.candidates.len(), 1);
-        let row = &matrix.candidates[0];
+        let AtomicRejectedCandidate::Format { rejection: row, .. } = &matrix.candidates[0] else {
+            panic!("expected a format diagnostic")
+        };
         assert_eq!(row.plane_in_formats, AtomicCapabilityState::Supported);
         assert!(matches!(
             row.gbm_allocation,
@@ -1304,8 +1521,11 @@ mod tests {
             panic!("alpha-only plane must reject");
         };
         assert_eq!(matrix.candidates.len(), 1);
+        let AtomicRejectedCandidate::Format { rejection: row, .. } = &matrix.candidates[0] else {
+            panic!("expected a format diagnostic")
+        };
         assert!(matches!(
-            &matrix.candidates[0].selection_policy,
+            &row.selection_policy,
             AtomicCapabilityState::Rejected(reason) if reason.contains("opaque")
         ));
     }
@@ -1338,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_and_incompatible_routes_are_rejected_before_format_queries() {
+    fn unsupported_and_incompatible_routes_are_diagnosed() {
         let mut ambiguous = enumeration(10, 20, 30, blob(&[XRGB], &[(1, 0, TILED)]));
         ambiguous.connectors[0]
             .properties
@@ -1361,7 +1581,7 @@ mod tests {
         let incompatible = negotiate_atomic_outputs(&incompatible, &mut capabilities);
         let ambiguous_planes = negotiate_atomic_outputs(&ambiguous_planes, &mut capabilities);
         assert!(
-            matches!(&ambiguous[0].outcome, AtomicAdmissionOutcome::Rejected(matrix) if matrix.route_rejection.as_deref().is_some_and(|reason| reason.contains("ambiguous")))
+            matches!(&ambiguous[0].outcome, AtomicAdmissionOutcome::Rejected(matrix) if matrix.route_rejection.as_deref().is_some_and(|reason| reason.contains("no compatible primary plane")))
         );
         assert!(
             matches!(&incompatible[0].outcome, AtomicAdmissionOutcome::Rejected(matrix) if matrix.route_rejection.as_deref().is_some_and(|reason| reason.contains("no compatible CRTC")))
@@ -1369,6 +1589,418 @@ mod tests {
         assert!(
             matches!(&ambiguous_planes[0].outcome, AtomicAdmissionOutcome::Rejected(matrix) if matrix.route_rejection.as_deref().is_some_and(|reason| reason.contains("ambiguous primary planes")))
         );
+    }
+
+    #[test]
+    fn unrouted_connector_uses_lowest_free_crtc() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        // Both routes must admit, and vector order must not favour the winner.
+        snapshot.crtcs.reverse();
+        snapshot.planes.reverse();
+        let reports = negotiate_atomic_outputs(&snapshot, &mut capabilities);
+        assert!(
+            matches!(&reports[0].outcome, AtomicAdmissionOutcome::Selected(selected) if selected.selection.crtc_id == 20)
+        );
+    }
+
+    #[test]
+    fn admission_probe_retries_only_transient_errno() {
+        for code in [libc::EAGAIN, libc::EBUSY, libc::EINTR] {
+            assert!(matches!(
+                AtomicAdmissionError::probe("enumeration", io::Error::from_raw_os_error(code)),
+                AtomicAdmissionError::Retryable(_)
+            ));
+        }
+        for code in [
+            libc::ENODEV,
+            libc::ENOENT,
+            libc::EINVAL,
+            libc::EACCES,
+            libc::EPERM,
+        ] {
+            assert!(matches!(
+                AtomicAdmissionError::probe("enumeration", io::Error::from_raw_os_error(code)),
+                AtomicAdmissionError::Terminal(_)
+            ));
+        }
+    }
+
+    fn two_free_routes() -> (AtomicEnumeration, FakeCapabilities) {
+        let mut snapshot = enumeration(10, 20, 30, blob(&[XRGB], &[(1, 0, TILED)]));
+        snapshot.connectors[0]
+            .properties
+            .0
+            .insert("CRTC_ID".into(), 0);
+        snapshot.connectors[0].possible_crtcs.insert(21);
+        let mut crtc = snapshot.crtcs[0].clone();
+        crtc.id = 21;
+        snapshot.crtcs.push(crtc);
+        let mut plane = snapshot.planes[0].clone();
+        plane.id = 31;
+        plane.possible_crtcs = BTreeSet::from([21]);
+        plane.properties.0.insert("CRTC_ID".into(), 21);
+        snapshot.planes.push(plane);
+        let candidate = AtomicFormatModifier {
+            fourcc: XRGB,
+            modifier: TILED,
+        };
+        (
+            snapshot,
+            FakeCapabilities {
+                scanout: BTreeMap::from([(candidate, supported(ScanoutWgpuFormat::Bgra8Unorm))]),
+                gbm: BTreeSet::from([candidate]),
+                ..FakeCapabilities::default()
+            },
+        )
+    }
+
+    #[test]
+    fn crtc_preference_is_stable_and_free_routes_precede_stale_claims() {
+        for reverse in [false, true] {
+            for (current, preferred, claimed, expected) in [
+                (0, None, 0, 20),
+                (0, Some(21), 0, 21),
+                (20, Some(21), 0, 20),
+                (0, Some(99), 0, 20),
+                (0, Some(21), 21, 20),
+                (20, Some(20), 20, 20),
+                (0, None, 20, 21),
+            ] {
+                let (mut snapshot, mut capabilities) = two_free_routes();
+                snapshot.connectors[0]
+                    .properties
+                    .0
+                    .insert("CRTC_ID".into(), current);
+                let mut owner = snapshot.connectors[0].clone();
+                owner.id = 11;
+                owner.name = "DP-1".into();
+                owner.state = control::connector::State::Disconnected;
+                owner.properties.0.insert("CRTC_ID".into(), claimed);
+                snapshot.connectors.push(owner);
+                if reverse {
+                    snapshot.connectors.reverse();
+                    snapshot.crtcs.reverse();
+                    snapshot.planes.reverse();
+                }
+                let connector = snapshot
+                    .connectors
+                    .iter()
+                    .find(|connector| connector.id == 10)
+                    .unwrap();
+                let report = negotiate_connector_with_preference(
+                    &snapshot,
+                    connector,
+                    &mut capabilities,
+                    preferred,
+                );
+                let selection = admitted_selection(report).expect("an unclaimed route exists");
+                assert_eq!(
+                    selection.crtc_id, expected,
+                    "current={current} preferred={preferred:?} claimed={claimed} reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_round_one_current_route_survives_foreign_claims() {
+        for connected in [false, true] {
+            let (mut snapshot, mut capabilities) = two_free_routes();
+            snapshot.connectors[0]
+                .properties
+                .0
+                .insert("CRTC_ID".into(), 20);
+            // No fallback can mask loss of our currently driven pipe.
+            snapshot.connectors[0].possible_crtcs = BTreeSet::from([20]);
+            let mut owner = snapshot.connectors[0].clone();
+            owner.id = 11;
+            owner.name = "DP-1".into();
+            owner.state = if connected {
+                control::connector::State::Connected
+            } else {
+                control::connector::State::Disconnected
+            };
+            snapshot.connectors.push(owner);
+            let report = negotiate_connector_with_preference(
+                &snapshot,
+                &snapshot.connectors[0],
+                &mut capabilities,
+                Some(21),
+            );
+            assert_eq!(
+                admitted_selection(report)
+                    .expect("our current route survives peer properties")
+                    .crtc_id,
+                20
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RouteLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for RouteLogCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn review_round_one_stale_claim_fallback_is_logged() {
+        for reverse in [false, true] {
+            let (mut snapshot, mut capabilities) = two_free_routes();
+            for (id, crtc_id, name) in [(11, 20, "DP-1"), (12, 21, "DP-2")] {
+                let mut owner = snapshot.connectors[0].clone();
+                owner.id = id;
+                owner.name = name.into();
+                owner.state = control::connector::State::Disconnected;
+                owner.properties.0.insert("CRTC_ID".into(), crtc_id);
+                snapshot.connectors.push(owner);
+            }
+            if reverse {
+                snapshot.connectors.reverse();
+                snapshot.crtcs.reverse();
+                snapshot.planes.reverse();
+            }
+            let capture = RouteLogCapture::default();
+            let writer = capture.clone();
+            let subscriber = bevy::log::tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_target(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let connector = snapshot
+                .connectors
+                .iter()
+                .find(|connector| connector.id == 10)
+                .unwrap();
+            let report = tracing::subscriber::with_default(subscriber, || {
+                negotiate_connector_with_preference(
+                    &snapshot,
+                    connector,
+                    &mut capabilities,
+                    Some(21),
+                )
+            });
+            assert_eq!(
+                admitted_selection(report)
+                    .expect("disconnected claims can be reclaimed")
+                    .crtc_id,
+                21
+            );
+            let logged = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logged.contains("stale claim")
+                    && logged.contains("crtc_id=21")
+                    && logged.contains("Claimed")
+                    && logged.contains("DP-2")
+                    && logged.contains("12"),
+                "{logged}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_round_one_free_routes_are_exhausted_before_stale_fallback() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        let mut owner = snapshot.connectors[0].clone();
+        owner.id = 11;
+        owner.state = control::connector::State::Disconnected;
+        owner.properties.0.insert("CRTC_ID".into(), 20);
+        snapshot.connectors.push(owner);
+        // The preferred stale route is usable; the free route must be probed first.
+        snapshot.blobs.insert(8, blob(&[ARGB], &[(1, 0, TILED)]));
+        snapshot.planes[1]
+            .properties
+            .0
+            .insert("IN_FORMATS".into(), 8);
+        let report = negotiate_connector_with_preference(
+            &snapshot,
+            &snapshot.connectors[0],
+            &mut capabilities,
+            Some(20),
+        );
+        assert_eq!(admitted_selection(report).unwrap().crtc_id, 20);
+        assert_eq!(capabilities.gbm_queries, 2);
+    }
+
+    #[test]
+    fn review_round_one_connected_claim_blocks_a_mixed_owner_route() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        snapshot.connectors[0].possible_crtcs = BTreeSet::from([20]);
+        for (id, connected) in [(11, false), (12, true)] {
+            let mut owner = snapshot.connectors[0].clone();
+            owner.id = id;
+            owner.state = if connected {
+                control::connector::State::Connected
+            } else {
+                control::connector::State::Disconnected
+            };
+            owner.properties.0.insert("CRTC_ID".into(), 20);
+            snapshot.connectors.push(owner);
+        }
+        let report = negotiate_connector_with_preference(
+            &snapshot,
+            &snapshot.connectors[0],
+            &mut capabilities,
+            Some(20),
+        );
+        let AtomicAdmissionOutcome::Rejected(matrix) = report.outcome else {
+            panic!("connected owner disqualifies fallback")
+        };
+        assert!(
+            matches!(&matrix.candidates[0], AtomicRejectedCandidate::Route { reason: AtomicRouteRejection::Claimed(owners), .. } if owners.len() == 2)
+        );
+        assert_eq!(capabilities.gbm_queries, 0);
+    }
+
+    #[test]
+    fn review_round_one_unknown_owner_is_not_treated_as_disconnected() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        snapshot.connectors[0].possible_crtcs = BTreeSet::from([20]);
+        let mut owner = snapshot.connectors[0].clone();
+        owner.id = 11;
+        owner.state = control::connector::State::Unknown;
+        owner.properties.0.insert("CRTC_ID".into(), 20);
+        snapshot.connectors.push(owner);
+        let report = negotiate_connector_with_preference(
+            &snapshot,
+            &snapshot.connectors[0],
+            &mut capabilities,
+            None,
+        );
+        assert!(matches!(
+            report.outcome,
+            AtomicAdmissionOutcome::Rejected(_)
+        ));
+        assert_eq!(capabilities.gbm_queries, 0);
+    }
+
+    #[test]
+    fn unusable_first_crtc_does_not_hide_a_working_route() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        snapshot.crtcs[0].properties.0.remove("MODE_ID");
+        let report = negotiate_connector_with_preference(
+            &snapshot,
+            &snapshot.connectors[0],
+            &mut capabilities,
+            Some(20),
+        );
+        assert_eq!(admitted_selection(report).unwrap().crtc_id, 21);
+    }
+
+    #[test]
+    fn format_fallback_counts_probes_on_the_rejected_route() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        snapshot.blobs.insert(8, blob(&[ARGB], &[(1, 0, TILED)]));
+        snapshot.planes[0]
+            .properties
+            .0
+            .insert("IN_FORMATS".into(), 8);
+        let report = negotiate_connector_with_preference(
+            &snapshot,
+            &snapshot.connectors[0],
+            &mut capabilities,
+            None,
+        );
+        let AtomicAdmissionOutcome::Selected(selected) = report.outcome else {
+            panic!("second route supports an opaque format")
+        };
+        assert_eq!(selected.selection.crtc_id, 21);
+        assert_eq!(selected.evaluated_candidates, 2);
+        assert_eq!(selected.total_candidates, 2);
+        assert_eq!(selected.unevaluated_candidates, 0);
+        assert_eq!(capabilities.gbm_queries, 2);
+    }
+
+    #[test]
+    fn all_claimed_routes_have_typed_owner_diagnostics_and_can_retry() {
+        let (mut snapshot, mut capabilities) = two_free_routes();
+        for (id, crtc_id) in [(11, 20), (12, 21)] {
+            let mut owner = snapshot.connectors[0].clone();
+            owner.id = id;
+            owner.properties.0.insert("CRTC_ID".into(), crtc_id);
+            snapshot.connectors.push(owner);
+        }
+        let report = negotiate_connector_with_preference(
+            &snapshot,
+            &snapshot.connectors[0],
+            &mut capabilities,
+            None,
+        );
+        let AtomicAdmissionOutcome::Rejected(matrix) = &report.outcome else {
+            panic!("every route is claimed")
+        };
+        assert_eq!(matrix.candidates.len(), 2);
+        for (candidate, expected) in matrix.candidates.iter().zip([(20, 11), (21, 12)]) {
+            assert!(
+                matches!(candidate, AtomicRejectedCandidate::Route { crtc_id, reason: AtomicRouteRejection::Claimed(owners) } if *crtc_id == expected.0 && owners[0].0 == expected.1)
+            );
+        }
+        assert!(matches!(
+            admitted_selection(report),
+            Err(AtomicAdmissionError::Retryable(_))
+        ));
+        assert_eq!(capabilities.gbm_queries, 0);
+    }
+
+    #[test]
+    fn permanent_admission_refusals_stay_terminal() {
+        for condition in 0..5 {
+            let (mut snapshot, mut capabilities) = two_free_routes();
+            match condition {
+                0 => snapshot.connectors[0].state = control::connector::State::Disconnected,
+                1 => snapshot.connectors[0].modes.clear(),
+                2 => {
+                    snapshot.connectors[0].properties.0.remove("CRTC_ID");
+                }
+                3 => snapshot.connectors[0].possible_crtcs.clear(),
+                _ => capabilities.gbm.clear(),
+            }
+            let report = negotiate_connector_with_preference(
+                &snapshot,
+                &snapshot.connectors[0],
+                &mut capabilities,
+                None,
+            );
+            assert!(
+                matches!(
+                    admitted_selection(report),
+                    Err(AtomicAdmissionError::Terminal(_))
+                ),
+                "condition {condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn claimed_crtc_is_rejected_with_candidates() {
+        let mut snapshot = enumeration(10, 20, 30, blob(&[XRGB], &[(1, 0, TILED)]));
+        let mut owner = snapshot.connectors[0].clone();
+        owner.id = 11;
+        owner.name = "DP-1".into();
+        snapshot.connectors.push(owner);
+        snapshot.connectors[0]
+            .properties
+            .0
+            .insert("CRTC_ID".into(), 0);
+        let reports = negotiate_atomic_outputs(&snapshot, &mut FakeCapabilities::default());
+        let AtomicAdmissionOutcome::Rejected(matrix) = &reports[0].outcome else {
+            panic!("claimed route must reject")
+        };
+        assert!(
+            matrix
+                .route_rejection
+                .as_deref()
+                .is_some_and(|reason| reason.contains("claimed"))
+        );
+        assert!(!matrix.candidates.is_empty());
     }
 
     #[test]

@@ -958,6 +958,21 @@ fn push_atomic_admission(out: &mut String, report: Option<&AtomicAdmissionReport
                         ","
                     };
                     out.push_str("          {\n");
+                    use super::atomic_present::AtomicRejectedCandidate;
+                    let row = match row {
+                        AtomicRejectedCandidate::Route { crtc_id, reason } => {
+                            push_string_field(out, 12, "kind", "route", true);
+                            push_field(out, 12, "crtc_id", &crtc_id.to_string(), true);
+                            push_string_field(out, 12, "reason", &format!("{reason:?}"), false);
+                            out.push_str(&format!("          }}{row_comma}\n"));
+                            continue;
+                        }
+                        AtomicRejectedCandidate::Format { crtc_id, rejection } => {
+                            push_string_field(out, 12, "kind", "format", true);
+                            push_field(out, 12, "crtc_id", &crtc_id.to_string(), true);
+                            rejection
+                        }
+                    };
                     push_field(out, 12, "format", &row.candidate.fourcc.to_string(), true);
                     push_string_field(out, 12, "format_name", &row.candidate.format_name(), true);
                     push_string_field(
@@ -1411,30 +1426,48 @@ mod tests {
 
     #[test]
     fn strict_data_populated_atomic_rejection_matrix_is_parseable() {
+        use super::super::atomic_present::{AtomicRejectedCandidate, AtomicRouteRejection};
         let mut report = successful_report();
         report.atomic_admission.as_mut().unwrap().connectors = vec![AtomicConnectorAdmission {
             connector_name: "HDMI-A-1".into(),
             connector_id: 540,
             outcome: AtomicAdmissionOutcome::Rejected(AtomicRejectionMatrix {
                 route_rejection: None,
-                candidates: vec![AtomicCandidateRejection {
-                    candidate: AtomicFormatModifier {
-                        fourcc: drm_fourcc::DrmFourcc::Argb8888 as u32,
-                        modifier: 0,
+                candidates: vec![
+                    AtomicRejectedCandidate::Route {
+                        crtc_id: 20,
+                        reason: AtomicRouteRejection::Claimed(vec![(11, "DP-1".into())]),
                     },
-                    plane_in_formats: AtomicCapabilityState::Supported,
-                    gbm_allocation: AtomicCapabilityState::Rejected("allocation refused".into()),
-                    vulkan_colour_attachment: AtomicCapabilityState::Rejected(
-                        "TRANSFER_SRC rejected".into(),
-                    ),
-                    wgpu_render_attachment: AtomicCapabilityState::Supported,
-                    selection_policy: AtomicCapabilityState::Rejected("opaque formats only".into()),
-                }],
+                    AtomicRejectedCandidate::Format {
+                        crtc_id: 21,
+                        rejection: AtomicCandidateRejection {
+                            candidate: AtomicFormatModifier {
+                                fourcc: drm_fourcc::DrmFourcc::Argb8888 as u32,
+                                modifier: 0,
+                            },
+                            plane_in_formats: AtomicCapabilityState::Supported,
+                            gbm_allocation: AtomicCapabilityState::Rejected(
+                                "allocation refused".into(),
+                            ),
+                            vulkan_colour_attachment: AtomicCapabilityState::Rejected(
+                                "TRANSFER_SRC rejected".into(),
+                            ),
+                            wgpu_render_attachment: AtomicCapabilityState::Supported,
+                            selection_policy: AtomicCapabilityState::Rejected(
+                                "opaque formats only".into(),
+                            ),
+                        },
+                    },
+                ],
             }),
         }];
         let listing = report.to_strict_data();
         assert!(listing.contains("\"selected_count\": 0"));
         assert!(listing.contains("\"rejection_matrix\": ["));
+        assert!(listing.contains("\"kind\": \"route\""));
+        assert!(listing.contains("\"crtc_id\": 20"));
+        assert!(listing.contains("Claimed"));
+        assert!(listing.contains("\"kind\": \"format\""));
         assert!(listing.contains("\"selection_policy\": \"rejected: opaque formats only\""));
         assert_strict_data_parses(&listing);
     }

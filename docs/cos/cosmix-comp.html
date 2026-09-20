@@ -533,7 +533,27 @@ vblank. Offline checks cannot establish real-KMS presentation cadence.</p>
 <h2 id="kms-hardware-cursor">KMS hardware cursor</h2>
 <p>The <code>kms-live</code> build (with the default Bus, frame-capture and XWayland
 features) uses an optional DRM cursor plane. <code>native-quoin</code> is not required.
-The live atomic presenter enumerates ARGB8888 cursor planes compatible with
+Live KMS admission tries a compatible current CRTC first; other connectors'
+<code>CRTC_ID</code> properties cannot evict it from that route. For an unrouted connector,
+resume prefers its previous CRTC among free routes, then tries the remaining
+free CRTCs in ascending object-ID order. Only after all free routes fail may
+it reclaim a route claimed solely by disconnected connectors, again preferring
+the previous CRTC and then ascending IDs. Such a selection logs the stale claim
+and its former owners. Routes claimed by connected or unknown-status connectors
+remain blocked, except for the current route. Rejected admission reports retain typed claim
+diagnostics alongside other route and format/modifier failures.
+The probe's <code>rejection_matrix</code> rows carry <code>kind</code> (<code>route</code> or <code>format</code>) and
+<code>crtc_id</code>; route rows carry a <code>reason</code>, and format rows retain the capability
+fields. Probe counters include format attempts on rejected routes.</p>
+<p>Resume retries temporary route contention and transient DRM enumeration errors
+through the existing three-attempt, 30-second recovery budget. Each failed
+attempt returns to paused before retrying. Missing or disconnected connectors,
+missing prior modes, unsupported atomic properties and incompatible formats
+remain terminal. These retries cover target admission, before presentation;
+they do not change atomic commit failure handling.
+Connector probe failures use <code>kms-live-connector-scan-failed</code>; the
+<code>kms-live-atomic-admission-failed</code> prefix is reserved for admission failures.</p>
+<p>The live atomic presenter enumerates ARGB8888 cursor planes compatible with
 the selected CRTC, checks their atomic properties, and queries the driver's
 cursor width/height caps (64×64 for older drivers without these caps).</p>
 <p>Cursor images use two transparent, pitch-aware ARGB dumb buffers. Image

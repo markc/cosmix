@@ -105,6 +105,28 @@ vblank. Offline checks cannot establish real-KMS presentation cadence.
 
 The `kms-live` build (with the default Bus, frame-capture and XWayland
 features) uses an optional DRM cursor plane. `native-quoin` is not required.
+Live KMS admission tries a compatible current CRTC first; other connectors'
+`CRTC_ID` properties cannot evict it from that route. For an unrouted connector,
+resume prefers its previous CRTC among free routes, then tries the remaining
+free CRTCs in ascending object-ID order. Only after all free routes fail may
+it reclaim a route claimed solely by disconnected connectors, again preferring
+the previous CRTC and then ascending IDs. Such a selection logs the stale claim
+and its former owners. Routes claimed by connected or unknown-status connectors
+remain blocked, except for the current route. Rejected admission reports retain typed claim
+diagnostics alongside other route and format/modifier failures.
+The probe's `rejection_matrix` rows carry `kind` (`route` or `format`) and
+`crtc_id`; route rows carry a `reason`, and format rows retain the capability
+fields. Probe counters include format attempts on rejected routes.
+
+Resume retries temporary route contention and transient DRM enumeration errors
+through the existing three-attempt, 30-second recovery budget. Each failed
+attempt returns to paused before retrying. Missing or disconnected connectors,
+missing prior modes, unsupported atomic properties and incompatible formats
+remain terminal. These retries cover target admission, before presentation;
+they do not change atomic commit failure handling.
+Connector probe failures use `kms-live-connector-scan-failed`; the
+`kms-live-atomic-admission-failed` prefix is reserved for admission failures.
+
 The live atomic presenter enumerates ARGB8888 cursor planes compatible with
 the selected CRTC, checks their atomic properties, and queries the driver's
 cursor width/height caps (64×64 for older drivers without these caps).

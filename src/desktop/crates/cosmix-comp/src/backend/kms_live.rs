@@ -2035,6 +2035,10 @@ pub(crate) enum KmsLiveError {
     #[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
     Setup(String),
     #[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
+    TargetSelection(super::atomic_present::AtomicAdmissionError),
+    #[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
+    TargetScan(super::atomic_present::AtomicAdmissionError),
+    #[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
     PumpDetached(String),
     #[cfg_attr(not(any(feature = "kms-live", test)), allow(dead_code))]
     ExternalPauseRequested {
@@ -2066,6 +2070,12 @@ impl fmt::Display for KmsLiveError {
             }
             Self::TerminalFrame(detail) => formatter.write_str(detail),
             Self::Setup(detail) => formatter.write_str(detail),
+            Self::TargetSelection(error) => {
+                write!(formatter, "kms-live-atomic-admission-failed: {error}")
+            }
+            Self::TargetScan(error) => {
+                write!(formatter, "kms-live-connector-scan-failed: {error}")
+            }
             Self::PumpDetached(detail) => formatter.write_str(detail),
             Self::ExternalPauseRequested { generation, .. } => write!(
                 formatter,
@@ -2082,7 +2092,9 @@ impl KmsLiveError {
             Self::Refused(refusal) => refusal.reason_code(),
             Self::AuthorityLost(_) => "kms-live-authority-lost",
             Self::TerminalFrame(_) => "kms-live-terminal-frame",
-            Self::Setup(_) => "kms-live-setup-failed",
+            Self::Setup(_) | Self::TargetSelection(_) | Self::TargetScan(_) => {
+                "kms-live-setup-failed"
+            }
             Self::PumpDetached(_) => "kms-live-pump-detached",
             Self::ExternalPauseRequested { .. } => "kms-live-external-pause-requested",
             Self::Signal(_) => "kms-live-signal",
@@ -2101,6 +2113,8 @@ fn preferred_live_exit_code(error: &KmsLiveError, latched: Option<LiveSignal>) -
         | KmsLiveError::AuthorityLost(_)
         | KmsLiveError::TerminalFrame(_)
         | KmsLiveError::Setup(_)
+        | KmsLiveError::TargetSelection(_)
+        | KmsLiveError::TargetScan(_)
         | KmsLiveError::PumpDetached(_)
         | KmsLiveError::ExternalPauseRequested { .. } => None,
     })
@@ -7747,9 +7761,12 @@ impl PreparedLiveOperation {
                     &reopened,
                     self.output_scale,
                     Some(required_mode),
+                    self.selected_output
+                        .as_ref()
+                        .map(|output| output.display.crtc_id),
                     Some(ResumeSynchronousBudget { deadline, now }),
                 )
-                .map_err(ResumeAttemptFailure::Terminal)?;
+                .map_err(ResumeAttemptFailure::from)?;
                 let lease = self
                     .session
                     .as_ref()
@@ -7878,8 +7895,8 @@ impl PreparedLiveOperation {
                     );
                     return Ok(resumed);
                 }
-                Err(ResumeAttemptFailure::Terminal(error)) => return Err(error),
-                Err(ResumeAttemptFailure::Retry(error)) => {
+                Err(failure) => {
+                    let error = failure.into_retry()?;
                     last_retry = Some(error);
                     paused_generation = self.return_failed_resume_to_paused(
                         adapter,
@@ -8245,10 +8262,20 @@ impl PreparedLiveOperation {
     }
 }
 
-#[cfg(all(feature = "kms-live", not(test)))]
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
 enum ResumeAttemptFailure {
     Retry(KmsLiveError),
     Terminal(KmsLiveError),
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+impl ResumeAttemptFailure {
+    fn into_retry(self) -> Result<KmsLiveError, KmsLiveError> {
+        match self {
+            Self::Retry(error) => Ok(error),
+            Self::Terminal(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -8261,10 +8288,18 @@ fn resume_authority_open_is_retryable(error: &KmsLiveError) -> bool {
     )
 }
 
-#[cfg(all(feature = "kms-live", not(test)))]
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
 impl From<KmsLiveError> for ResumeAttemptFailure {
     fn from(error: KmsLiveError) -> Self {
-        Self::Terminal(error)
+        match error {
+            KmsLiveError::TargetSelection(
+                super::atomic_present::AtomicAdmissionError::Retryable(_),
+            )
+            | KmsLiveError::TargetScan(super::atomic_present::AtomicAdmissionError::Retryable(_)) => {
+                Self::Retry(error)
+            }
+            _ => Self::Terminal(error),
+        }
     }
 }
 
@@ -8312,6 +8347,7 @@ impl LiveActPlatform for PreparedLiveOperation {
             verification_fd.as_fd(),
             verified,
             self.output_scale,
+            None,
             None,
             None,
         )
@@ -8786,6 +8822,7 @@ fn select_live_target(
     verified: &VerifiedDrmFd,
     output_scale: OutputScale120,
     required_mode: Option<super::kms::ConnectorMode>,
+    preferred_crtc: Option<u32>,
     mut resume_budget: Option<ResumeSynchronousBudget<'_>>,
 ) -> Result<LiveSelectedTarget, KmsLiveError> {
     // Like the post-open validation above, these synchronous driver probes have
@@ -8803,7 +8840,7 @@ fn select_live_target(
         |_| panic!("the sealed live adapter scans only its libseat lease"),
         borrowed_master_state,
     )
-    .map_err(|error| KmsLiveError::Setup(format!("live connector scan failed: {error}")))?;
+    .map_err(live_target_scan_error)?;
     let mut connector = scan
         .connectors()
         .find(|connector| {
@@ -8824,9 +8861,10 @@ fn select_live_target(
         verified.device_id,
         verified.connector_id,
         &verified.connector_name,
+        preferred_crtc,
         selector.0.clone(),
     )
-    .map_err(|error| KmsLiveError::Setup(format!("kms-live-atomic-admission-failed: {error}")))?;
+    .map_err(KmsLiveError::TargetSelection)?;
     if !connector.modes.contains(&selection.mode) {
         return Err(KmsLiveError::Setup(format!(
             "kms-live-atomic-mode-mismatch: admitted mode {}x{}@{}mHz is not the required connector timing",
@@ -8855,6 +8893,23 @@ fn select_live_target(
         topology,
         bootstrap_extent,
     })
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn live_target_scan_error(error: super::scan::ConnectorScanError) -> KmsLiveError {
+    use super::scan::ConnectorScanError;
+    // Only live DRM probes can be timing-sensitive here. Identity, path and
+    // sysfs failures do not gain retries simply by occurring during selection.
+    match error {
+        ConnectorScanError::Connector { source, .. }
+        | ConnectorScanError::MasterCheck { source, .. } => {
+            KmsLiveError::TargetScan(super::atomic_present::AtomicAdmissionError::probe(
+                "live connector scan failed",
+                source,
+            ))
+        }
+        other => KmsLiveError::Setup(format!("live connector scan failed: {other}")),
+    }
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -12579,10 +12634,7 @@ mod tests {
             |_| reports.set(reports.get() + 1),
         )
         .expect_err("a flip from another generation is refused");
-        assert!(
-            error.to_string().contains("kms-live-stale"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("kms-live-stale"), "{error}");
         assert_eq!(reports.get(), 0);
     }
 
@@ -14571,6 +14623,170 @@ mod tests {
             KmsLiveError::PumpDetached("render worker detached".into()),
         ] {
             assert!(!resume_authority_open_is_retryable(&terminal));
+        }
+    }
+
+    #[test]
+    fn transient_target_admission_enters_resume_retry() {
+        let error = KmsLiveError::TargetSelection(
+            super::super::atomic_present::AtomicAdmissionError::Retryable(
+                "CRTC temporarily claimed".into(),
+            ),
+        );
+        assert!(matches!(
+            ResumeAttemptFailure::from(error),
+            ResumeAttemptFailure::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn permanent_resume_failure_exits_before_another_attempt() {
+        let mut attempts = 0;
+        let mut compensations = 0;
+        let result = (|| -> Result<(), KmsLiveError> {
+            for _ in 0..3 {
+                attempts += 1;
+                let failure = ResumeAttemptFailure::from(KmsLiveError::TargetSelection(
+                    super::super::atomic_present::AtomicAdmissionError::Terminal(
+                        "connector is not connected".into(),
+                    ),
+                ));
+                let _retry = failure.into_retry()?;
+                compensations += 1;
+            }
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+        assert_eq!(compensations, 0);
+    }
+
+    #[test]
+    fn transient_target_failure_retries_after_returning_to_paused() {
+        let mut lifecycle = LiveCoordinatorLifecycle::active(2, Duration::ZERO);
+        // Start from the same paused boundary as a real activation.
+        lifecycle.state = LiveCoordinatorLifecycleState::Paused { generation: 3 };
+        let mut attempts = 0;
+        let mut compensations = 0;
+        let result = (|| -> Result<(), KmsLiveError> {
+            for _ in 0..3 {
+                let generation = 4;
+                attempts += 1;
+                lifecycle
+                    .apply(LiveCoordinatorLifecycleEvent::BeginResume { generation })
+                    .unwrap();
+                if attempts == 2 {
+                    lifecycle
+                        .apply(LiveCoordinatorLifecycleEvent::OutputReady {
+                            generation: generation + 1,
+                            observed_at: Duration::from_secs(1),
+                        })
+                        .unwrap();
+                    return Ok(());
+                }
+                let error = KmsLiveError::TargetSelection(
+                    super::super::atomic_present::AtomicAdmissionError::Retryable(
+                        "route claimed".into(),
+                    ),
+                );
+                let _retry = ResumeAttemptFailure::from(error).into_retry()?;
+                assert_eq!(
+                    lifecycle
+                        .apply(LiveCoordinatorLifecycleEvent::ResumeFailed {
+                            generation: generation - 1
+                        })
+                        .unwrap(),
+                    LiveCoordinatorLifecycleAction::Paused
+                );
+                compensations += 1;
+            }
+            panic!("second attempt must succeed")
+        })();
+        assert!(result.is_ok());
+        assert_eq!((attempts, compensations), (2, 1));
+    }
+
+    #[test]
+    fn review_round_one_scan_failure_has_its_own_prefix() {
+        use super::super::scan::ConnectorScanError;
+        for code in [libc::EINTR, libc::EBUSY, libc::ENODEV] {
+            for master in [false, true] {
+                let path = PathBuf::from("/dev/dri/card0");
+                let source = std::io::Error::from_raw_os_error(code);
+                let error = live_target_scan_error(if master {
+                    ConnectorScanError::MasterCheck { path, source }
+                } else {
+                    ConnectorScanError::Connector {
+                        path,
+                        connector_id: 10,
+                        source,
+                    }
+                });
+                let detail = error.to_string();
+                assert!(
+                    detail.starts_with("kms-live-connector-scan-failed:"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("kms-live-atomic-admission-failed"));
+                assert_eq!(error.reason_code(), "kms-live-setup-failed");
+                assert_eq!(
+                    matches!(
+                        ResumeAttemptFailure::from(error),
+                        ResumeAttemptFailure::Retry(_)
+                    ),
+                    code != libc::ENODEV
+                );
+            }
+        }
+        let admission = KmsLiveError::TargetSelection(
+            super::super::atomic_present::AtomicAdmissionError::Retryable("route claimed".into()),
+        );
+        assert!(
+            admission
+                .to_string()
+                .starts_with("kms-live-atomic-admission-failed:")
+        );
+        assert_eq!(admission.reason_code(), "kms-live-setup-failed");
+    }
+
+    #[test]
+    fn target_scan_retry_does_not_widen_authority_or_identity_policy() {
+        use super::super::scan::ConnectorScanError;
+        let error = live_target_scan_error(ConnectorScanError::Connector {
+            path: PathBuf::from("/dev/dri/card0"),
+            connector_id: 10,
+            source: std::io::Error::from_raw_os_error(libc::EBUSY),
+        });
+        assert!(!resume_authority_open_is_retryable(&error));
+        assert!(matches!(
+            ResumeAttemptFailure::from(error),
+            ResumeAttemptFailure::Retry(_)
+        ));
+        let error = live_target_scan_error(ConnectorScanError::DeviceIdentity {
+            path: PathBuf::from("/dev/dri/card0"),
+            expected: 1,
+            actual: 2,
+        });
+        assert!(matches!(
+            ResumeAttemptFailure::from(error),
+            ResumeAttemptFailure::Terminal(_)
+        ));
+        let error =
+            retain_exact_prior_mode(&mut Vec::new(), selected_output_for_test(10).connector_mode)
+                .unwrap_err();
+        assert!(matches!(
+            ResumeAttemptFailure::from(error),
+            ResumeAttemptFailure::Terminal(_)
+        ));
+        for error in [
+            KmsLiveError::Refused(KmsLiveRefusal::RevokedBeforeAuthorityOpen),
+            KmsLiveError::Setup("authorised connector was revoked".into()),
+            KmsLiveError::Setup("kms-live-atomic-admission-failed: untyped detail".into()),
+        ] {
+            assert!(matches!(
+                ResumeAttemptFailure::from(error),
+                ResumeAttemptFailure::Terminal(_)
+            ));
         }
     }
 
