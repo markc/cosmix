@@ -156,8 +156,18 @@ impl Painter {
         // geometry change that is not a clear always produces bands, so
         // emptiness is the only no-band change there is.
         let had_pixels = !frame.surface.is_empty();
-        let bands = self.raster.render_into(screen, dirty, &mut frame.surface);
-        if bands.is_empty() {
+        // Scoped, because the bands borrow the surface: copying them into
+        // `damage` here ends that borrow, and `frame` is whole again below.
+        // `damage` and `surface` are disjoint fields, so both are reachable.
+        let painted = {
+            let Frame {
+                surface, damage, ..
+            } = &mut *frame;
+            let bands = self.raster.render_into(screen, dirty, surface);
+            damage.extend_from_slice(bands);
+            !bands.is_empty()
+        };
+        if !painted {
             // An empty band list usually means "nothing changed" — but a
             // screen with no paintable rows clears the surface and also
             // returns nothing, and a renderer told "no change" would go on
@@ -169,7 +179,6 @@ impl Painter {
             }
             return false;
         }
-        frame.damage.extend(bands);
         // Coalesced on the way IN, not only on the way out: the CPU arm never
         // drains bands (tiny-skia re-blits the whole handle), so without this
         // the list would grow for the life of the process. Merging bounds it

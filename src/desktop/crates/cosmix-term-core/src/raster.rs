@@ -6,10 +6,13 @@ use swash::{
     zeno::Format,
 };
 
-/// A contiguous run of damaged device-pixel rows in a [`Surface`].
+/// A contiguous run of damaged device-pixel rows.
 ///
-/// `y` and `height` are in the surface's own physical pixels, which is what
-/// both `wgpu::Queue::write_texture` and a `wl_shm` damage rectangle want.
+/// `y` and `height` are in the target buffer's own physical pixels, which is
+/// what `wgpu::Queue::write_texture`, a `wl_shm` damage rectangle and a Bevy
+/// `Image`'s byte range all want. Full-width by construction: the raster's
+/// damage granularity is the cell ROW, so a consumer that could use a
+/// narrower rectangle gains nothing from this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DamageBand {
     pub y: u32,
@@ -17,38 +20,83 @@ pub struct DamageBand {
 }
 
 impl DamageBand {
-    /// Byte range of this band in a surface whose rows are `stride` bytes.
+    /// Byte range of this band in a buffer whose rows are `stride` bytes.
     pub fn byte_range(&self, stride: usize) -> std::ops::Range<usize> {
         self.y as usize * stride..(self.y as usize + self.height as usize) * stride
     }
 }
 
-/// A persistent RGBA8 surface that [`Raster::render_into`] mutates in place.
+/// What [`Raster::paint`] must remember between frames about **one** target
+/// buffer, for a caller that owns its pixels itself.
 ///
-/// The point of this type is what it is *not*: a `Vec<u8>` returned by value
-/// per frame. `Raster::render` allocates one whole grid image on every call
-/// (~12 MB at 2.5x scale), which is what made the Bevy frontend build a brand
-/// new `Image` per damaged frame — three GEM objects holding 320 MB of its
-/// 344 MB of mapped device memory (`_journal/2026-09-20-term-vs-foot-memory-
-/// anatomy.md`). A frontend owns one of these per pane for the pane's life and
-/// re-rasterises only the rows the grid reports dirty.
+/// [`Surface`] is this plus the buffer. A frontend whose pixels must live
+/// somewhere else — a Bevy `Image`'s own `Vec<u8>`, a `wl_shm` pool mapping —
+/// keeps one of these beside that buffer and calls `paint` directly, so
+/// neither frontend copies a frame to reach its renderer.
 ///
-/// It carries the geometry it was last drawn at, so it — not the caller —
-/// decides when a full repaint is owed, and the cursor cell it last drew, so
-/// the old cursor is always erased even across a frame the caller skipped.
+/// The state is per-target, not per-[`Raster`]: two panes share one glyph
+/// cache and must not share damage, geometry or cursor bookkeeping.
 #[derive(Default)]
-pub struct Surface {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+pub struct PaintState {
     cols: usize,
     rows: usize,
     cell: (u32, u32),
     cursor: Option<(usize, usize)>,
+    /// Identity of the buffer last painted; see [`Raster::paint`]'s note on
+    /// what it can and cannot detect.
+    buffer: (usize, usize),
+    /// Scratch, reused so a frame costs no allocation.
+    bands: Vec<DamageBand>,
+    rows_scratch: Vec<bool>,
+}
+
+impl PaintState {
+    /// Cells, as of the last paint.
+    pub fn grid(&self) -> (usize, usize) {
+        (self.cols, self.rows)
+    }
+    /// Forget what was drawn, so the next paint repaints every row.
+    ///
+    /// **Required** when the caller changes which terminal it is painting, or
+    /// loses the target's contents (a recreated GPU texture, a new shm pool).
+    /// `dirty` describes the NEW terminal's damage, and a terminal that has
+    /// been sitting still reports nothing dirty.
+    pub fn invalidate(&mut self) {
+        self.cols = 0;
+        self.rows = 0;
+        self.cell = (0, 0);
+        self.cursor = None;
+        self.buffer = (0, 0);
+    }
+}
+
+/// A persistent RGBA8 surface that owns its buffer.
+///
+/// The point of this type is what it is *not*: a `Vec<u8>` returned by value
+/// per frame. `Raster::render` allocates one whole grid image on every call
+/// (~12 MB at 2.5x scale), which is what made the Bevy frontend build a brand
+/// new `Image` per damaged frame. A frontend owns one of these per pane for
+/// the pane's life and re-rasterises only the rows the grid reports dirty.
+///
+/// Owning the buffer is what makes that churn unrepresentable *for this
+/// path*: a `Surface` user cannot hand in a fresh allocation per frame. A
+/// caller whose pixels must live elsewhere uses [`Raster::paint`] with its own
+/// [`PaintState`] instead — same painting code, different owner.
+#[derive(Default)]
+pub struct Surface {
+    state: PaintState,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 impl Surface {
-    /// Premultiplication-free RGBA8, row-major, `width * height * 4` bytes.
+    /// RGBA8, row-major, tightly packed at `width * 4` bytes per row.
+    ///
+    /// Straight alpha, not premultiplied — and moot either way, because the
+    /// raster writes 255 into every alpha byte. Channel order is R, G, B, A
+    /// in ascending address order, sRGB-**encoded** (the VT's palette is
+    /// 8-bit sRGB, not linear light).
     pub fn rgba(&self) -> &[u8] {
         &self.rgba
     }
@@ -64,31 +112,38 @@ impl Surface {
     }
     /// Cells, as of the last `render_into`.
     pub fn grid(&self) -> (usize, usize) {
-        (self.cols, self.rows)
+        self.state.grid()
     }
     pub fn is_empty(&self) -> bool {
         self.rgba.is_empty()
     }
     /// Forget the drawn content without freeing the allocation, so the next
-    /// `render_into` repaints every row. For a frontend that lost its GPU
-    /// texture (surface recreation) and must re-upload the whole grid.
+    /// `render_into` repaints every row. See [`PaintState::invalidate`] for
+    /// when a caller MUST do this.
     pub fn invalidate(&mut self) {
-        self.cols = 0;
-        self.rows = 0;
-        self.cell = (0, 0);
-        self.cursor = None;
+        self.state.invalidate();
     }
 }
 
-/// Runs of `true` in `rows`, in device-pixel coordinates.
-fn bands(rows: &[bool], cell_height: u32) -> Vec<DamageBand> {
-    let mut bands: Vec<DamageBand> = Vec::new();
+/// Whole cell rows the screen actually has cells for.
+///
+/// `Screen`'s fields are public, so a cell array shorter than `cols * rows`
+/// is constructible even though `Terminal::capture` never produces one. The
+/// painter paints only the rows that exist, so a returned band can never
+/// claim a row the loop skipped.
+fn paintable_rows(screen: &Screen) -> usize {
+    screen.rows.min(screen.cells.len() / screen.cols.max(1))
+}
+
+/// Runs of `true` in `rows`, in device-pixel coordinates, into `out`.
+fn bands_into(rows: &[bool], cell_height: u32, out: &mut Vec<DamageBand>) {
+    out.clear();
     let mut start: Option<usize> = None;
     for (index, dirty) in rows.iter().chain(std::iter::once(&false)).enumerate() {
         match (dirty, start) {
             (true, None) => start = Some(index),
             (false, Some(first)) => {
-                bands.push(DamageBand {
+                out.push(DamageBand {
                     y: first as u32 * cell_height,
                     height: (index - first) as u32 * cell_height,
                 });
@@ -97,7 +152,6 @@ fn bands(rows: &[bool], cell_height: u32) -> Vec<DamageBand> {
             _ => {}
         }
     }
-    bands
 }
 
 pub struct Raster {
@@ -189,7 +243,7 @@ impl Raster {
     pub fn render(&mut self, screen: &Screen) -> Vec<u8> {
         let mut surface = Surface::default();
         let _ = self.render_into(screen, &[], &mut surface);
-        surface.rgba
+        std::mem::take(&mut surface.rgba)
     }
 
     /// Rasterise `screen` into `surface` **in place**, repainting only the
@@ -214,55 +268,117 @@ impl Raster {
     /// belongs to this function, not to the VT, so nothing else can be relied
     /// on to erase it — in particular when the caller turns the cursor off
     /// (an unfocused pane) without the grid changing at all.
-    pub fn render_into(
+    pub fn render_into<'a>(
         &mut self,
         screen: &Screen,
         dirty: &[bool],
-        surface: &mut Surface,
-    ) -> Vec<DamageBand> {
+        surface: &'a mut Surface,
+    ) -> &'a [DamageBand] {
+        let rows = paintable_rows(screen);
+        if screen.cols == 0 || rows == 0 {
+            surface.rgba.clear();
+            surface.width = 0;
+            surface.height = 0;
+            surface.state.invalidate();
+            surface.state.bands.clear();
+            return &surface.state.bands;
+        }
+        let width = screen.cols * self.width as usize;
+        let height = rows * self.height as usize;
+        let bytes = width * height * 4;
+        // Resizing is this wrapper's whole job; `paint` never touches the
+        // caller's allocation. A grown buffer also changes its identity, so
+        // `paint` repaints it whole without being told.
+        if surface.rgba.len() != bytes {
+            surface.rgba.clear();
+            surface.rgba.resize(bytes, 0);
+        }
+        surface.width = width as u32;
+        surface.height = height as u32;
+        let Surface { state, rgba, .. } = surface;
+        self.paint(screen, rgba, width * 4, state, dirty)
+    }
+
+    /// The painting implementation, writing into a buffer the **caller**
+    /// owns. [`Raster::render_into`] is this with the buffer owned for you;
+    /// there is exactly one copy of the glyph loop and both frontends run it.
+    ///
+    /// `stride` is the target's row length in bytes, so a caller whose rows
+    /// are padded (a `wl_shm` pool, a texture with an alignment requirement)
+    /// paints straight into it. `dst` must be at least `stride * height`
+    /// bytes and `stride` at least `width * 4`, where `width` and `height`
+    /// come from the grid and the cell size; a buffer that is not is
+    /// **refused** — no bands, nothing written, state invalidated — because
+    /// nothing here can resize a buffer it does not own.
+    ///
+    /// Pixel format is [`Surface::rgba`]'s: straight RGBA8, sRGB-encoded,
+    /// alpha always 255.
+    ///
+    /// ## What the caller must guarantee
+    ///
+    /// **The same buffer, frame after frame.** Damage-bounded painting means
+    /// the rows this call skips keep whatever the target already held. The
+    /// state records the buffer's address and length and forces a full
+    /// repaint when either changes, which catches the ordinary cases — but an
+    /// allocator may hand back the same address and length for a genuinely
+    /// different buffer, so it is a mitigation and not a guarantee. On any
+    /// doubt, and whenever the painted terminal changes, call
+    /// [`PaintState::invalidate`].
+    pub fn paint<'a>(
+        &mut self,
+        screen: &Screen,
+        dst: &mut [u8],
+        stride: usize,
+        state: &'a mut PaintState,
+        dirty: &[bool],
+    ) -> &'a [DamageBand] {
+        state.bands.clear();
         // `Screen`'s fields are public, so a cell array shorter than
         // `cols * rows` is constructible even though `Terminal::capture` never
         // produces one. Paint only the whole rows that actually exist: the
         // alternative is a returned band claiming a row was repainted while
         // the loop skipped it, which is a lie a renderer cannot detect and
         // which leaves the old pixels — including an old cursor — on screen.
-        let rows = screen.rows.min(screen.cells.len() / screen.cols.max(1));
-        if screen.cols == 0 || rows == 0 {
-            *surface = Surface::default();
-            return Vec::new();
-        }
+        let rows = paintable_rows(screen);
         let cell = (self.width, self.height);
         let width = screen.cols * self.width as usize;
         let height = rows * self.height as usize;
-        let bytes = width * height * 4;
-        // The surface's own record decides, never the caller's: a Raster
+        if screen.cols == 0
+            || rows == 0
+            || stride < width * 4
+            || dst.len() < stride * height
+        {
+            state.invalidate();
+            return &state.bands;
+        }
+        let buffer = (dst.as_ptr() as usize, dst.len());
+        // The state's own record decides, never the caller's: a Raster
         // rebuilt at a new scale changes `cell` while cols/rows stay put, and
         // that must still force a full repaint.
-        let full = surface.cols != screen.cols
-            || surface.rows != rows
-            || surface.cell != cell
-            || surface.rgba.len() != bytes;
+        let full = state.cols != screen.cols
+            || state.rows != rows
+            || state.cell != cell
+            || state.buffer != buffer;
         if full {
-            surface.rgba.clear();
-            surface.rgba.resize(bytes, 0);
-            surface.cols = screen.cols;
-            surface.rows = rows;
-            surface.cell = cell;
-            surface.width = width as u32;
-            surface.height = height as u32;
-            surface.cursor = None;
+            state.cols = screen.cols;
+            state.rows = rows;
+            state.cell = cell;
+            state.buffer = buffer;
+            state.cursor = None;
         }
-        let mut dirty_rows = vec![full; rows];
+        let dirty_rows = &mut state.rows_scratch;
+        dirty_rows.clear();
+        dirty_rows.resize(rows, full);
         if !full {
             // `dirty` is indexed against the VT's row count; a short cell
-            // array shrinks the surface but not the snapshot, so the slice is
-            // only trustworthy when both agree.
+            // array shrinks the painted area but not the snapshot, so the
+            // slice is only trustworthy when both agree.
             if dirty.len() == screen.rows && screen.rows == rows {
                 dirty_rows.copy_from_slice(dirty);
             } else {
                 dirty_rows.fill(true);
             }
-            if let Some((_, previous)) = surface.cursor
+            if let Some((_, previous)) = state.cursor
                 && previous < rows
             {
                 dirty_rows[previous] = true;
@@ -271,7 +387,7 @@ impl Raster {
                 dirty_rows[screen.cursor.1] = true;
             }
         }
-        let rgba = &mut surface.rgba;
+        let rgba = dst;
         for (i, cell) in screen.cells.iter().take(screen.cols * rows).enumerate() {
             if !dirty_rows[i / screen.cols] {
                 continue;
@@ -280,7 +396,7 @@ impl Raster {
             let y = (i / screen.cols) as i32 * self.height as i32;
             for cy in 0..self.height as usize {
                 for cx in 0..self.width as usize {
-                    let offset = ((y as usize + cy) * width + x as usize + cx) * 4;
+                    let offset = (y as usize + cy) * stride + (x as usize + cx) * 4;
                     rgba[offset..offset + 4]
                         .copy_from_slice(&[cell.bg[0], cell.bg[1], cell.bg[2], 255]);
                 }
@@ -316,7 +432,7 @@ impl Raster {
                             continue;
                         }
                         let alpha = glyph.data[(gy as u32 * p.width + gx as u32) as usize] as u32;
-                        let offset = (dy as usize * width + dx as usize) * 4;
+                        let offset = dy as usize * stride + dx as usize * 4;
                         for channel in 0..3 {
                             rgba[offset + channel] = ((cell.fg[channel] as u32 * alpha
                                 + rgba[offset + channel] as u32 * (255 - alpha))
@@ -337,7 +453,7 @@ impl Raster {
             };
             for y in top..bottom {
                 for x in cx * self.width as usize..(cx + 1) * self.width as usize {
-                    let offset = (y * width + x) * 4;
+                    let offset = y * stride + x * 4;
                     match self.cursor {
                         crate::config::Cursor::Block => {
                             for channel in &mut rgba[offset..offset + 3] {
@@ -351,8 +467,9 @@ impl Raster {
                 }
             }
         }
-        surface.cursor = drawn.then_some(screen.cursor);
-        bands(&dirty_rows, self.height)
+        state.cursor = drawn.then_some(screen.cursor);
+        bands_into(dirty_rows, self.height, &mut state.bands);
+        &state.bands
     }
 }
 
@@ -388,11 +505,23 @@ mod tests {
             .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
     }
 
+    /// `bands_into` through a Vec, for asserting on runs directly.
+    fn runs(rows: &[bool], cell_height: u32) -> Vec<DamageBand> {
+        let mut out = Vec::new();
+        bands_into(rows, cell_height, &mut out);
+        out
+    }
+
+    /// Bands copied out, so the surface is readable in the same assertion.
+    fn into(raster: &mut Raster, screen: &Screen, dirty: &[bool], surface: &mut Surface) -> Vec<DamageBand> {
+        raster.render_into(screen, dirty, surface).to_vec()
+    }
+
     #[test]
     fn runs_of_dirty_rows_coalesce_into_bands() {
-        assert_eq!(bands(&[false, false], 10), vec![]);
+        assert_eq!(runs(&[false, false], 10), vec![]);
         assert_eq!(
-            bands(&[true, true, false, true], 10),
+            runs(&[true, true, false, true], 10),
             vec![
                 DamageBand { y: 0, height: 20 },
                 DamageBand { y: 30, height: 10 },
@@ -400,7 +529,7 @@ mod tests {
         );
         // A run that reaches the last row must still be closed.
         assert_eq!(
-            bands(&[false, true, true], 4),
+            runs(&[false, true, true], 4),
             vec![DamageBand { y: 4, height: 8 }]
         );
         assert_eq!(
@@ -567,7 +696,7 @@ mod tests {
         // must not be part of the surface or of the reported damage.
         grid.cells.truncate(8);
         grid.cursor_visible = false;
-        let bands = raster.render_into(&grid, &[true; 3], &mut surface);
+        let bands = raster.render_into(&grid, &[true; 3], &mut surface).to_vec();
         assert_eq!(surface.grid(), (3, 2));
         assert_eq!(
             bands,
@@ -596,6 +725,157 @@ mod tests {
         let grid = screen(3, 2, 'M');
         let _ = raster.render_into(&grid, &[], &mut surface);
         assert_eq!(raster.render_into(&grid, &[false; 2], &mut surface), vec![]);
+    }
+
+    /// The property the whole damage model rests on: however a frame is
+    /// reached — one full repaint, or a sequence of partial ones — the pixels
+    /// are identical. Anything that breaks damage bookkeeping breaks this.
+    #[test]
+    fn a_sequence_of_partial_repaints_equals_one_full_repaint() {
+        let mut incremental = raster();
+        let mut surface = Surface::default();
+        let mut grid = screen(10, 5, ' ');
+        grid.cursor_visible = true;
+        let _ = into(&mut incremental, &grid, &[], &mut surface);
+
+        // Walk a cursor down the screen, changing one row's text each step,
+        // telling the raster only about that row — exactly what the VT does.
+        for row in 0..5 {
+            for column in 0..10 {
+                grid.cells[row * 10 + column].c =
+                    char::from(b'a' + ((row * 10 + column) % 26) as u8);
+            }
+            grid.cursor = (row, row);
+            let mut dirty = vec![false; 5];
+            dirty[row] = true;
+            let _ = into(&mut incremental, &grid, &dirty, &mut surface);
+        }
+
+        // The same final screen, painted once from nothing.
+        let mut whole = raster();
+        assert_eq!(
+            surface.rgba(),
+            whole.render(&grid),
+            "an incremental sequence diverged from a full repaint"
+        );
+    }
+
+    /// `paint` writes into a buffer it does not own, so — unlike `Surface` —
+    /// a wrong-sized one is representable. It must refuse rather than write
+    /// out of range or report bands it did not write.
+    #[test]
+    fn paint_refuses_a_buffer_it_cannot_fill() {
+        let mut raster = raster();
+        let mut state = PaintState::default();
+        let grid = screen(4, 3, 'x');
+        let width = 4 * raster.width as usize;
+        let height = 3 * raster.height as usize;
+        let stride = width * 4;
+
+        for (label, len, stride) in [
+            ("one byte short", stride * height - 1, stride),
+            ("stride narrower than a row", stride * height, stride - 4),
+            ("empty", 0, stride),
+        ] {
+            let mut dst = vec![0x5a_u8; len];
+            let bands = raster.paint(&grid, &mut dst, stride, &mut state, &[]);
+            assert!(bands.is_empty(), "{label}: reported damage it did not write");
+            assert!(
+                dst.iter().all(|byte| *byte == 0x5a),
+                "{label}: wrote into a buffer it should have refused"
+            );
+        }
+
+        // A correctly sized buffer is painted, and a padded stride is
+        // honoured rather than assumed away: the pad bytes stay untouched.
+        let pad = 16;
+        let padded = stride + pad;
+        let mut dst = vec![0x5a_u8; padded * height];
+        let bands = raster.paint(&grid, &mut dst, padded, &mut state, &[]).to_vec();
+        assert_eq!(
+            bands,
+            vec![DamageBand {
+                y: 0,
+                height: height as u32
+            }]
+        );
+        for row in 0..height {
+            let tail = row * padded + stride..row * padded + padded;
+            assert!(
+                dst[tail].iter().all(|byte| *byte == 0x5a),
+                "row {row}: painted over the caller's row padding"
+            );
+        }
+        assert!(dst[..stride].iter().any(|byte| *byte != 0x5a));
+    }
+
+    /// Damage-bounded painting keeps whatever the target already held in the
+    /// rows it skips, so a caller that swaps the buffer underneath must get
+    /// everything back — not a half-drawn frame.
+    #[test]
+    fn paint_repaints_whole_when_the_caller_swaps_the_buffer() {
+        let mut raster = raster();
+        let mut state = PaintState::default();
+        let grid = screen(4, 3, 'x');
+        let stride = 4 * raster.width as usize * 4;
+        let height = 3 * raster.height as usize;
+
+        let mut first = vec![0_u8; stride * height];
+        let _ = raster.paint(&grid, &mut first, stride, &mut state, &[]);
+
+        // A different allocation, same geometry, nothing dirty.
+        let mut second = vec![0x5a_u8; stride * height];
+        let bands = raster
+            .paint(&grid, &mut second, stride, &mut state, &[false; 3])
+            .to_vec();
+        assert_eq!(
+            bands,
+            vec![DamageBand {
+                y: 0,
+                height: height as u32
+            }],
+            "a new buffer must be owed the whole frame"
+        );
+        assert!(!second.contains(&0x5a));
+        assert_eq!(first, second);
+    }
+
+    /// The cursor is drawn by INVERTING, so it must only ever land on a row
+    /// this call repainted — otherwise the second of two calls inverts an
+    /// already-inverted cell and the cursor vanishes. Painting is a full
+    /// overwrite of the rows it touches, so repeating a paint is a no-op.
+    #[test]
+    fn a_repaint_is_idempotent_and_the_cursor_only_inverts_a_painted_row() {
+        let mut raster = raster();
+        let mut state = PaintState::default();
+        let mut grid = screen(4, 3, 'M');
+        grid.cursor_visible = true;
+        grid.cursor = (1, 1);
+        let stride = 4 * raster.width as usize * 4;
+        let height = 3 * raster.height as usize;
+
+        let mut once = vec![0_u8; stride * height];
+        let _ = raster.paint(&grid, &mut once, stride, &mut state, &[]);
+        let after_first = once.clone();
+
+        // Same screen, every row dirty, same buffer: the cursor row is
+        // repainted before it is inverted, so the result must not move.
+        let _ = raster.paint(&grid, &mut once, stride, &mut state, &[true; 3]);
+        assert_eq!(once, after_first, "repainting the same frame changed it");
+
+        // The cursor's row must differ from its neighbours, or the inversion
+        // is not happening at all and this test proves nothing.
+        let band = raster.height as usize * stride;
+        let row = move |buffer: &[u8], r: usize| buffer[r * band..(r + 1) * band].to_vec();
+        assert_ne!(row(&once, 1), row(&once, 0));
+        assert_eq!(row(&once, 0), row(&once, 2));
+
+        // Move it with nothing else dirty: the row it left comes back to
+        // exactly what an uninverted row looks like, and the new one inverts.
+        grid.cursor = (1, 2);
+        let _ = raster.paint(&grid, &mut once, stride, &mut state, &[false; 3]);
+        assert_eq!(row(&once, 1), row(&once, 0), "the old cursor was not erased");
+        assert_ne!(row(&once, 2), row(&once, 0));
     }
 
     #[test]
