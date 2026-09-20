@@ -453,8 +453,17 @@ line runs as Mix code or dispatches a shell command.</p>
 lives in <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-mix/src/main.rs"><code>cosmix-mix/src/main.rs</code></a>;
 the shell-first classifier is in <code>cosmix-mix/src/shell.rs</code>.</p>
 <pre><code class="language-text">$ mix --version
-mix 0.21.2
+mix 0.89.1 (f886d310df76)
 </code></pre>
+<p>The line carries the short git sha of the build, suffixed <code>-dirty</code> when the
+tree was modified at compile time — a semver alone cannot tell a stale binary
+from a fresh one. <code>mix --version --json</code> gives the same provenance
+machine-readably, including the full 40-hex <code>git_sha_full</code>.</p>
+<p><strong>A version query does nothing else.</strong> It is answered before the base-env
+capture, the native-session lane, Bus dispatch and the evaluation thread, so it
+neither starts a session nor disturbs one: <code>mix --version</code> is truthful and
+side-effect-free while other mix processes are running (0.89.1). Only <code>argv[1]</code>
+is a version query — <code>mix -c 'print("--version")'</code> runs the program, as before.</p>
 <h2 id="modes-at-a-glance">Modes at a glance</h2>
 <table><thead><tr><th>Form</th><th>What it does</th></tr></thead><tbody>
 <tr><td><code>mix</code></td><td>Interactive REPL (loads <code>~/.mixrc</code>)</td></tr>
@@ -469,7 +478,7 @@ mix 0.21.2
 <tr><td><code>mix --no-traceback …</code></td><td>Uncaught errors print the legacy single line instead of a traceback (0.29.0 — see <a href="/mix/errors">errors</a>)</td></tr>
 <tr><td><code>mix --strict-arity …</code></td><td>Strict call arity: wrong-arity user-function/builtin calls raise catchable <code>ARITY_MISMATCH</code> instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see <a href="/mix/functions">functions</a>)</td></tr>
 <tr><td><code>mix --serve &lt;script&gt; [--name &lt;svc&gt;]</code></td><td>Run the script as a supervised Bus daemon citizen — see <a href="/mix/serve">serve</a></td></tr>
-<tr><td><code>mix --version</code> / <code>-V</code></td><td>Print version</td></tr>
+<tr><td><code>mix --version</code> / <code>-V</code></td><td>Print version + build hash, and nothing else — no session lane, no Bus (0.89.1)</td></tr>
 <tr><td><code>mix --help</code> / <code>-h</code></td><td>Usage summary</td></tr>
 <tr><td><code>mix stats [sub…]</code></td><td>Window-labelled usage reports and static authorship coverage — see <a href="/mix/stats">stats</a></td></tr>
 <tr><td><code>mix help</code> / <code>mix what &lt;name&gt;</code> / <code>mix man [topic]</code></td><td>Builtin/keyword reference and this manual — see <a href="/mix/cli">the <code>mix</code> meta-command</a></td></tr>

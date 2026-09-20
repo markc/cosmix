@@ -14,8 +14,19 @@ the shell-first classifier is in `cosmix-mix/src/shell.rs`.
 
 ```text
 $ mix --version
-mix 0.21.2
+mix 0.89.1 (f886d310df76)
 ```
+
+The line carries the short git sha of the build, suffixed `-dirty` when the
+tree was modified at compile time — a semver alone cannot tell a stale binary
+from a fresh one. `mix --version --json` gives the same provenance
+machine-readably, including the full 40-hex `git_sha_full`.
+
+**A version query does nothing else.** It is answered before the base-env
+capture, the native-session lane, Bus dispatch and the evaluation thread, so it
+neither starts a session nor disturbs one: `mix --version` is truthful and
+side-effect-free while other mix processes are running (0.89.1). Only `argv[1]`
+is a version query — `mix -c 'print("--version")'` runs the program, as before.
 
 ## Modes at a glance
 
@@ -33,7 +44,7 @@ mix 0.21.2
 | `mix --no-traceback …` | Uncaught errors print the legacy single line instead of a traceback (0.29.0 — see [errors](errors.md)) |
 | `mix --strict-arity …` | Strict call arity: wrong-arity user-function/builtin calls raise catchable `ARITY_MISMATCH` instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see [functions](functions.md)) |
 | `mix --serve <script> [--name <svc>]` | Run the script as a supervised Bus daemon citizen — see [serve](serve.md) |
-| `mix --version` / `-V` | Print version |
+| `mix --version` / `-V` | Print version + build hash, and nothing else — no session lane, no Bus (0.89.1) |
 | `mix --help` / `-h` | Usage summary |
 | `mix stats [sub…]` | Window-labelled usage reports and static authorship coverage — see [stats](stats.md) |
 | `mix help` / `mix what <name>` / `mix man [topic]` | Builtin/keyword reference and this manual — see [the `mix` meta-command](cli.md) |

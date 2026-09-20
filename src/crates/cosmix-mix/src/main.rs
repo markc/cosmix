@@ -1707,6 +1707,20 @@ fn check_syntax(source: &str, filename: &str) -> i32 {
 const MAIN_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 fn main() {
+    // `--version` answers from a COLD process, before anything below runs:
+    // no base-env capture, no session lane, no Bus dispatch, no evaluation
+    // thread, no prelude, no rc. Mark's contract (2026-09-21) is that a
+    // version query does nothing except report the version and the build
+    // hash — including while another mix is already running, which is the
+    // case that made the old placement wrong: the arm lived inside
+    // `real_main`, so `mix --version` had already started a native session.
+    {
+        let args: Vec<String> = env::args().collect();
+        if let Some(text) = meta::version_request(&args, VERSION) {
+            println!("{text}");
+            return;
+        }
+    }
     // Before native_session::start(), because that begins Bus dispatch and a
     // shell.task.submit can arrive immediately. Every invocation mode serves
     // the task verbs, so capturing this from the REPL alone would leave a
@@ -1748,25 +1762,16 @@ fn real_main() -> i32 {
                 print_help();
                 return 0;
             }
+            // Normally unreachable: `main()` answers a version query before
+            // this thread exists. Kept so the flag is still honoured if
+            // `real_main` is ever reached another way, and delegating to the
+            // same function so the two can never drift.
             "--version" | "-V" => {
-                // `--version --json` (0.63.0): machine-readable build
-                // provenance. The release-B gate compares a recorded
-                // 40-hex source_commit against git_sha_full — the short
-                // sha can never satisfy an equality check, and the plain
-                // version line names neither commit nor dirtiness.
-                if args.get(i + 1).map(String::as_str) == Some("--json") {
-                    let bi = cosmix_buildinfo::build_info!();
-                    let v = serde_json::json!({
-                        "version": VERSION,
-                        "git_sha": bi.git_sha,
-                        "git_sha_full": bi.git_sha_full,
-                        "git_dirty": bi.git_dirty,
-                        "build_time": bi.build_time,
-                    });
-                    println!("{v}");
-                    return 0;
-                }
-                println!("{}", meta::version_line(VERSION));
+                println!(
+                    "{}",
+                    meta::version_request(&args, VERSION)
+                        .unwrap_or_else(|| meta::version_line_build(VERSION))
+                );
                 return 0;
             }
             "--builtins" => {

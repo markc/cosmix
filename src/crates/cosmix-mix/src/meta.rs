@@ -477,6 +477,57 @@ pub fn version_line(version: &str) -> String {
     format!("mix {version}")
 }
 
+/// The version line plus this build's provenance: `mix 0.89.0 (a1b2c3d)`,
+/// suffixed `-dirty` when the tree was modified at compile time.
+///
+/// A semver alone is too weak a "what build is this?" signal — a forgotten
+/// bump hides a real change (the 2026-06-01 stale-binary incident, which is
+/// why `cosmix-lib-buildinfo` exists). `--version` is the one place every
+/// operator and deploy gate looks, so it carries the hash.
+///
+/// `build_info!()` must expand in THIS crate so the sha is cosmix-mix's own
+/// HEAD, captured by its `build.rs`.
+pub fn version_line_build(version: &str) -> String {
+    let bi = cosmix_buildinfo::build_info!();
+    let dirty = if bi.git_dirty { "-dirty" } else { "" };
+    format!("mix {version} ({}{dirty})", bi.git_sha)
+}
+
+/// Answer a version query, or `None` when argv is not one.
+///
+/// **The contract Mark set (2026-09-21): `--version` does NOTHING except
+/// report the version and the build hash, even while another mix is
+/// running.** `main()` calls this before `session_task::capture_base_env()`,
+/// `native_session::start()` and the evaluation thread, so a version query
+/// opens no session lane, begins no Bus dispatch, spawns no thread, loads no
+/// prelude and touches no rc file. It reads argv and prints.
+///
+/// Only `argv[1]` is considered, which is exactly the reach the CLI flag loop
+/// had: any earlier arm (`-c`, `--check`, a script path) consumes the rest, so
+/// a later `--version` never reached this arm before either.
+pub fn version_request(args: &[String], version: &str) -> Option<String> {
+    if !matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
+        return None;
+    }
+    // `--version --json` (0.63.0): machine-readable build provenance. The
+    // release-B gate compares a recorded 40-hex source_commit against
+    // git_sha_full — the short sha can never satisfy an equality check.
+    if args.get(2).map(String::as_str) == Some("--json") {
+        let bi = cosmix_buildinfo::build_info!();
+        return Some(
+            serde_json::json!({
+                "version": version,
+                "git_sha": bi.git_sha,
+                "git_sha_full": bi.git_sha_full,
+                "git_dirty": bi.git_dirty,
+                "build_time": bi.build_time,
+            })
+            .to_string(),
+        );
+    }
+    Some(version_line_build(version))
+}
+
 /// Dispatch a `mix` meta-command. `args` contains the tokens after "mix".
 /// Returns Some(path) if the REPL should save history and exec into a new binary.
 /// Subcommands whose `dispatch` arm reads the live `Evaluator` (vars,
@@ -547,7 +598,7 @@ pub fn dispatch(args: &[&str], eval: &Evaluator, version: &str) -> Option<String
         // matching the CLI `mix --version`. Without an explicit arm it fell through
         // to `_ => cmd_help_overview()` and dumped the whole meta-command help
         // instead of the version (2026-07-14 report).
-        "--version" | "-V" | "version" => println!("{}", version_line(version)),
+        "--version" | "-V" | "version" => println!("{}", version_line_build(version)),
         "check" => {
             if args.len() < 2 {
                 eprintln!("mix check: requires a filename");
@@ -3428,5 +3479,53 @@ mod version_line_tests {
     fn version_line_matches_the_cli_mix_prefix_format() {
         assert_eq!(version_line("9.9.9"), "mix 9.9.9");
         assert_eq!(version_line("0.32.1"), "mix 0.32.1");
+    }
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("mix")
+            .chain(rest.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The plain line carries the build hash, because a semver alone cannot
+    /// tell a stale binary from a fresh one.
+    #[test]
+    fn version_request_reports_version_and_build_hash() {
+        let out = version_request(&argv(&["--version"]), "9.9.9").expect("a version request");
+        assert!(out.starts_with("mix 9.9.9 ("), "got {out:?}");
+        assert!(out.ends_with(')'), "got {out:?}");
+        let sha = out
+            .trim_start_matches("mix 9.9.9 (")
+            .trim_end_matches(')')
+            .trim_end_matches("-dirty");
+        assert!(!sha.is_empty(), "build hash must not be blank: {out:?}");
+        assert_eq!(version_request(&argv(&["-V"]), "9.9.9"), Some(out));
+    }
+
+    /// The machine-readable form keeps the full 40-hex sha the release-B
+    /// provenance gate compares against.
+    #[test]
+    fn version_request_json_keeps_the_full_sha() {
+        let out =
+            version_request(&argv(&["--version", "--json"]), "9.9.9").expect("a version request");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["version"], "9.9.9");
+        for key in ["git_sha", "git_sha_full", "git_dirty", "build_time"] {
+            assert!(!v[key].is_null(), "missing {key} in {out}");
+        }
+    }
+
+    /// Reach is exactly `argv[1]`, matching what the CLI flag loop could ever
+    /// see — an earlier arm consumes the rest of the line. Widening this would
+    /// make `mix -c 'print("--version")'` print a version instead of running.
+    #[test]
+    fn version_request_ignores_a_later_version_token() {
+        assert_eq!(version_request(&argv(&[]), "9.9.9"), None);
+        assert_eq!(version_request(&argv(&["-c", "--version"]), "9.9.9"), None);
+        assert_eq!(
+            version_request(&argv(&["script.mix", "--version"]), "9.9.9"),
+            None
+        );
     }
 }
