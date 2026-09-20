@@ -8,7 +8,7 @@
 # empty (ADR §3.7).
 [package]
 name = "cosmix-bench-mixer-iced"
-version = "0.1.0"
+version = "0.1.1"
 description = "Mixer + roll bake-off, iced arm: 64 cosmix-iced-widgets strips with animated meters and a piano-roll canvas fed by cosmix-bench-feed"
 edition = "2024"
 rust-version = "1.95"

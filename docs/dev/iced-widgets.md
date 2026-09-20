@@ -237,6 +237,14 @@ Contracts a host must honour:
 
 ## Behaviour
 
+The mixer + roll benchmark host (`cosmix-bench-mixer-iced` 0.1.1) mounts
+its zero-sized feed clock with `Stack::from_vec`. iced 0.14's `stack!`,
+`with_children` and `push` discard children with void size hints, preventing
+such a clock from receiving redraw events. The retained clock requests
+continuous redraws for the first second, then wakes at feed tick boundaries
+(30 Hz) in animated modes and requests no further redraws in idle mode.
+This uses widget redraw requests without an async timer runtime.
+
 The text field wraps iced's `text_input`: selection, clipboard, placeholder,
 password presentation and IME remain in the upstream widget. Focused fields
 handle Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y (resolved like iced's clipboard

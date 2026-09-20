@@ -2892,6 +2892,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cosmix-bench-mixer-iced"
+version = "0.1.1"
+dependencies = [
+ "cosmix-bench-feed",
+ "cosmix-design",
+ "cosmix-iced-widgets",
+ "cosmix-song",
+ "iced",
+ "iced_core",
+]
+
+[[package]]
 name = "cosmix-bg-boing"
 version = "0.1.0"
 dependencies = [

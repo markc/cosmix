@@ -9,7 +9,7 @@
 use cosmix_bench_feed::layout::Layout;
 use cosmix_bench_feed::{BenchSong, MeterFrame, MixerFeed, Mode, RollViewport, roll_script};
 use cosmix_iced_widgets::{RollNotes, RollView, Tokens};
-use iced::widget::stack;
+use iced::widget::Stack;
 use iced::{Element, Fill, Size, Subscription};
 
 use crate::ticker::Ticker;
@@ -166,10 +166,15 @@ impl Bench {
         };
         // The clock is zero-sized and stacked over the surface, so it costs
         // the layout nothing and cannot shift a strip by a pixel.
-        stack![body, Ticker::new(self.tick, self.animated(), Message::Tick)]
-            .width(Fill)
-            .height(Fill)
-            .into()
+        // `stack!` / `with_children` / `push` discard void size hints in
+        // iced 0.14. `from_vec` retains the clock so it receives redraws.
+        Stack::from_vec(vec![
+            body,
+            Ticker::new(self.tick, self.animated(), Message::Tick).into(),
+        ])
+        .width(Fill)
+        .height(Fill)
+        .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -201,6 +206,31 @@ mod tests {
             None,
             crate::theme::tokens().unwrap(),
         )
+    }
+
+    #[test]
+    fn both_views_mount_the_clock_even_though_it_has_no_area() {
+        for (mode, view) in [
+            (Mode::Idle, View::Mixer),
+            (Mode::Meters, View::Mixer),
+            (Mode::Drag, View::Mixer),
+            (Mode::Idle, View::Roll),
+            (Mode::Roll, View::Roll),
+        ] {
+            let bench = Bench::new(config(mode, view, 4), None, crate::theme::tokens().unwrap());
+            assert_eq!(bench.animated(), mode != Mode::Idle);
+            let view = bench.view();
+            let tree = iced::advanced::widget::Tree::new(view.as_widget());
+            assert_eq!(
+                tree.children.len(),
+                2,
+                "body and clock must both be mounted"
+            );
+            let ticker: Element<'_, Message> =
+                Ticker::new(bench.tick, bench.animated(), Message::Tick).into();
+            assert_eq!(tree.children[1].tag, ticker.as_widget().tag());
+            assert!(ticker.as_widget().size().is_void());
+        }
     }
 
     #[test]
