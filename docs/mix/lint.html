@@ -487,7 +487,7 @@ in their own summary field, and <strong>never</strong> gating. Current D-codes:<
 to the same call at parse time.</p>
 <pre><code class="language-text">MIX-E1001  lexical error                    MIX-E1301  duplicate function parameter
 MIX-E1002  script parse error               MIX-E1302  duplicate function definition in one scope
-MIX-E1003  strict-data parse error          MIX-W2301  `+` stringifies a proven list
+MIX-E1003  strict-data parse error          MIX-W2301  `+` on a proven list/map raises
 MIX-E1101  undefined variable               MIX-E1401  require() target missing/unreadable
 MIX-E1102  undefined function               MIX-E1402  require() target invalid Mix
 MIX-E1201  builtin arity mismatch           MIX-E1501  dead mutation (write is lost)
@@ -528,10 +528,15 @@ content; the suffix is only a tiebreak when neither grammar succeeds.</p>
 <p><strong>MIX-W2201</strong> fires when an operation whose failure signal lives in its RETURN VALUE (<code>effects.must_use</code>: <code>run_rc</code>, <code>run_argv</code>, <code>run_pipeline</code>, <code>run_parallel</code>, <code>ssh_run</code>, <code>ssh_exec</code>, <code>ssh_mix</code>, <code>http_*</code>, <code>kill</code>, <code>run_stream</code>) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (<code>run_argv</code>→<code>run_argv_must</code>, <code>run_pipeline</code>→<code>run_pipeline_must</code>, <code>ssh_run</code>→<code>ssh_must</code>). The last statement of a block is exempt (it may be the block's value).</p>
 </li>
 <li>
-<p><strong>MIX-W2301</strong> warns that <code>+</code> coerces lists to strings; it does not append or
-concatenate list values. It fires for a list literal operand, or a variable
-proven by straight-line analysis to hold a directly assigned list literal.
-Use <code>concat(list_a, list_b)</code> or <code>push(list, value)</code>.</p>
+<p><strong>MIX-W2301</strong> warns that <code>+</code> is not defined for lists or maps. Since 0.90.0
+the runtime <strong>raises</strong> <code>TYPE_ERROR</code> there rather than silently stringifying,
+so this fires ahead of the run for a list/map <strong>literal</strong> operand, or a
+variable proven by straight-line analysis to hold a directly assigned one —
+which is the only gate there is on an <code>ssh_mix</code> body, or on a branch a local
+run never takes. Use <code>concat(a, b)</code> for lists, <code>merge(a, b)</code> for maps,
+<code>push(list, value)</code> to append, <code>..</code> to build text. It stays a <em>warning</em>, not
+an error: the proven-value facts are straight-line, so a reassigned variable
+can make the prediction wrong.</p>
 </li>
 <li>
 <p><strong>MIX-W2302</strong> warns when the result of a uniquely defined named function is

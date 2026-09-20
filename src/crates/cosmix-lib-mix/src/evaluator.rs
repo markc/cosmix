@@ -12303,6 +12303,31 @@ impl Evaluator {
             }
         }
         match op {
+            // `+` is arithmetic, with a SCALAR string fallback. A List, Map,
+            // Bytes, Buffer or Function operand RAISES (0.90.0) — it used to
+            // fall into the same `format!` fallback, so `["a"] + ["b"]` was
+            // the STRING `[a][b]` with rc 0 and nothing failing until far
+            // from the cause (found 2026-09-17: a helper built
+            // `["runuser", …, $db] + $argv` and handed the string to
+            // `run_argv`; on a mail server that is a wrong command, not an
+            // error).
+            //
+            // EITHER operand is enough to raise — deliberately wider than the
+            // `==`/`!=` rule below, which needs BOTH. The narrowing there
+            // exists to protect `$map[$key] == nil`, the key-absence idiom;
+            // `+` has no such idiom, and the mixed shapes (`[1] + 2`,
+            // `1 + [2]`) are exactly the accidents worth catching.
+            //
+            // Nil stays a scalar: `nil + 1` is "nil1" today, which is its own
+            // footgun but not this one, and changing it would break the
+            // absent-key-into-a-message shape data-dependently.
+            //
+            // `+` is NOT being made to mean list concatenation. `concat()`
+            // and `merge()` already exist; one spelling per operation is what
+            // keeps the language learnable, so the diagnostic names them.
+            BinOp::Add if !add_is_scalar(left) || !add_is_scalar(right) => {
+                Err(add_operand_error(left, right))
+            }
             BinOp::Add => {
                 // If both can be numbers, do arithmetic; otherwise concat
                 if let (Some(l), Some(r)) = (left.to_number(), right.to_number()) {
@@ -15159,6 +15184,36 @@ fn number_operand(value: &Value) -> MixResult<f64> {
         span: None,
         msg: format!("cannot use '{}' as number", value.to_mix_string()),
     })
+}
+
+/// Operands `+` will still coerce: the four scalars. Everything else is a
+/// container or a function, for which the old `format!` fallback produced a
+/// plausible-looking string instead of an error (0.90.0).
+fn add_is_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Nil
+    )
+}
+
+/// The instructional `+` diagnostic (0.79.0 style): name the operator, say
+/// what it does NOT do, and point at the builtin that does.
+fn add_operand_error(left: &Value, right: &Value) -> MixError {
+    let hint = match (left, right) {
+        (Value::List(_), Value::List(_)) => {
+            "`+` does not join lists — use concat(a, b)".to_string()
+        }
+        (Value::Map(_), Value::Map(_)) => "`+` does not merge maps — use merge(a, b)".to_string(),
+        _ => "`+` needs numbers or strings; use `..` to build text, concat(a, b) for lists, merge(a, b) for maps".to_string(),
+    };
+    MixError::structured(
+        "TYPE_ERROR",
+        format!(
+            "`+` is not defined for {} and {} — {hint}",
+            left.type_name(),
+            right.type_name()
+        ),
+    )
 }
 
 fn num_op(left: &Value, right: &Value, op: fn(f64, f64) -> f64) -> MixResult<Value> {

@@ -145,8 +145,8 @@ pub const LINT_DOCS: &[LintDoc] = &[
     },
     LintDoc {
         code: "MIX-W2301",
-        summary: "`+` stringifies a proven list",
-        detail: "`+` coerces lists to strings; it does not append or concatenate list VALUES. Fires for a list literal operand, or a variable proven by straight-line analysis to hold a directly assigned list literal. Use `concat(list_a, list_b)` or `push(list, value)`.",
+        summary: "`+` on a proven list/map raises at runtime",
+        detail: "`+` is arithmetic with a SCALAR string fallback: since 0.90.0 a List, Map, Bytes, Buffer or Function operand raises `TYPE_ERROR` instead of silently stringifying (it used to make `[\"a\"] + [\"b\"]` the string `[a][b]` with rc 0). This note fires for a list/map LITERAL operand, or a variable proven by straight-line analysis to hold a directly assigned one, so the failure is visible at authoring time — which for an `ssh_mix` body, or for a branch the local run never takes, is the only gate there is. Use `concat(a, b)` for lists, `merge(a, b)` for maps, `push(list, value)` to append, `..` to build text. Still a warning, not an error: the proven-value facts are straight-line, so a reassigned variable can make the prediction wrong.",
     },
     LintDoc {
         code: "MIX-W2302",

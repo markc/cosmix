@@ -55,7 +55,7 @@ to the same call at parse time.
 ```text
 MIX-E1001  lexical error                    MIX-E1301  duplicate function parameter
 MIX-E1002  script parse error               MIX-E1302  duplicate function definition in one scope
-MIX-E1003  strict-data parse error          MIX-W2301  `+` stringifies a proven list
+MIX-E1003  strict-data parse error          MIX-W2301  `+` on a proven list/map raises
 MIX-E1101  undefined variable               MIX-E1401  require() target missing/unreadable
 MIX-E1102  undefined function               MIX-E1402  require() target invalid Mix
 MIX-E1201  builtin arity mismatch           MIX-E1501  dead mutation (write is lost)
@@ -81,10 +81,15 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
 - **MIX-E1501** flags a discarded `push`/`pop`/`shift` whose first argument is **not a bare variable** — `push($m["a"], $v)`, `push($m.a, $v)`, `$m["a"].push($v)`. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is **lost in silence**. It is an ERROR, not a warning: the statement does nothing while reading as though it did. The fix **differs by builtin**: `push` returns the appended list, so assign it back (`$m["a"] = push($m["a"], $v)`); `pop`/`shift` return the **removed element**, not the list, so assigning that back replaces the list with the element (data corruption) — hoist first instead (`$l = $m[$k]; $x = pop($l); $m[$k] = $l`). For maps of maps, write the [nested assignment](collections.md) directly. A by-value **parameter** is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.
 - **MIX-E1502** flags a discarded `delete` / `merge` — both are **pure** (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: `$m = delete($m, "k")`.
 - **MIX-W2201** fires when an operation whose failure signal lives in its RETURN VALUE (`effects.must_use`: `run_rc`, `run_argv`, `run_pipeline`, `run_parallel`, `ssh_run`, `ssh_exec`, `ssh_mix`, `http_*`, `kill`, `run_stream`) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (`run_argv`→`run_argv_must`, `run_pipeline`→`run_pipeline_must`, `ssh_run`→`ssh_must`). The last statement of a block is exempt (it may be the block's value).
-- **MIX-W2301** warns that `+` coerces lists to strings; it does not append or
-  concatenate list values. It fires for a list literal operand, or a variable
-  proven by straight-line analysis to hold a directly assigned list literal.
-  Use `concat(list_a, list_b)` or `push(list, value)`.
+- **MIX-W2301** warns that `+` is not defined for lists or maps. Since 0.90.0
+  the runtime **raises** `TYPE_ERROR` there rather than silently stringifying,
+  so this fires ahead of the run for a list/map **literal** operand, or a
+  variable proven by straight-line analysis to hold a directly assigned one —
+  which is the only gate there is on an `ssh_mix` body, or on a branch a local
+  run never takes. Use `concat(a, b)` for lists, `merge(a, b)` for maps,
+  `push(list, value)` to append, `..` to build text. It stays a *warning*, not
+  an error: the proven-value facts are straight-line, so a reassigned variable
+  can make the prediction wrong.
 - **MIX-W2302** warns when the result of a uniquely defined named function is
   consumed, its block body's final statement is a bare expression, and the
   body contains no value-returning `return`. Block functions implicitly return

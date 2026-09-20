@@ -206,28 +206,61 @@ There is **no string `*` repeat and no list `+` merge** — use the
 [`repeat()`](builtins.md) builtin for strings and [`push()`](collections.md) /
 [`concat`-style helpers](collections.md) for lists.
 
-### `+` has a string fallback — prefer `..` for text
+### `+` has a **scalar** string fallback — prefer `..` for text
 
 `+` first tries to coerce **both** sides to numbers. If both succeed it adds; only
-when at least one side is non-numeric does it fall back to string concatenation.
-This makes `+` ambiguous on data of unknown type — **always use `..` for text**:
+when at least one side is a non-numeric **scalar** (string, bool, nil) does it fall
+back to string concatenation. This makes `+` ambiguous on data of unknown type —
+**always use `..` for text**:
 
 ```mix
 print("5" + 3)            -- both numeric -> 8
 print("5" + "10")         -- both numeric strings -> 15, NOT "510"
 print("a" + "b")          -- not numeric -> string concat
 print("inf" + 1)          -- "inf" is NOT a numeric string -> concat
-print([1] + [2])          -- neither numeric -> renders + joins as text
 ```
 ```text
 8
 15
 ab
 inf1
-[1][2]
 ```
 
 That `"5" + "10"` → `15` surprise is exactly why the concat operator is separate.
+
+### `+` on a list, map, bytes, buffer or function **raises** (0.90.0)
+
+The fallback is scalars only. Give `+` a container or a function value on
+**either** side and it raises `TYPE_ERROR` naming the builtin that does what
+you meant:
+
+```mix
+print(["a"] + ["b"])      -- TYPE_ERROR: `+` does not join lists — use concat(a, b)
+print({a: 1} + {b: 2})    -- TYPE_ERROR: `+` does not merge maps — use merge(a, b)
+print([1] + 2)            -- TYPE_ERROR: use `..` to build text
+```
+
+Before 0.90.0 each of those produced a *string* (`[a][b]`, `{a: 1}{b: 2}`, `[1]2`)
+with rc 0, and nothing failed until far from the cause — a helper that built
+`["runuser", …, $db] + $argv` and handed the result to `run_argv` was the filing
+case. Note this is deliberately wider than the [`==` rule](#equality--and-):
+**either** operand being a container is enough, because `+` has no counterpart to
+the `$map[$key] == nil` key-absence idiom that rule has to protect.
+
+`nil` is still a scalar: `nil + 1` is `"nil1"`. That is its own trap, but it is
+not this one, and moving it would break absent-key-into-a-message lines whose
+behaviour depends on the data.
+
+Indexing a container and adding the **element** is unaffected — the operand there
+is a scalar:
+
+```mix
+$tally["pass"] = $tally["pass"] + 1   -- fine: the element is a number
+```
+
+`mix lint` flags the statically provable shapes ahead of the run as
+[MIX-W2301](lint.md) — the only gate there is on an `ssh_mix` body, or on a
+branch the local run never takes.
 
 ## Concatenation: `..`
 
@@ -542,7 +575,8 @@ an [`if` statement](control-flow.md).
 ```text
 +  -  *  /  %  **      arithmetic  (f64; coerces numeric strings/bools; / or % by 0 errors)
 ..                     string concat (always stringifies both sides)  <-- use for text
-+                      string-concat FALLBACK only when not both numeric (avoid for text)
++                      string-concat FALLBACK only when not both numeric (avoid for text);
+                       a list/map/bytes/buffer/function operand RAISES (0.90.0)
 == !=                  value equality (Number<->String coerces; List/Map always !=)
 <  >  <=  >=           ordering: numeric-first, else lexicographic strings, else error
 eq ne                  textual equality on the printed Mix string forms

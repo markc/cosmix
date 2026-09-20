@@ -24,6 +24,18 @@ fn codes(src: &str) -> Vec<String> {
     lint(src).into_iter().map(|(c, _)| c).collect()
 }
 
+/// Like `lint`, but keeps the code + hint so a test can pin the FIX a
+/// diagnostic names, not just that it fired.
+fn lint_full(src: &str) -> Vec<(String, Option<String>)> {
+    let tokens = Lexer::new(src).tokenize().expect("lexes");
+    let stmts = Parser::new(tokens, src).parse_program().expect("parses");
+    analyze(&stmts, Some("test.mix"), &AnalyzerConfig::default())
+        .diagnostics
+        .into_iter()
+        .map(|d| (d.code.to_string(), d.hint))
+        .collect()
+}
+
 // ── detections ──────────────────────────────────────────────────────
 
 #[test]
@@ -74,6 +86,35 @@ fn list_addition_warns_for_literal_and_proven_variable() {
     assert_eq!(
         codes("$items = [\"x\"]\n$joined = $items + [\"y\"]\n"),
         vec!["MIX-W2301"]
+    );
+}
+
+/// 0.90.0: the same rule now covers MAP operands, which it never did —
+/// `$m + {b: 2}` passed lint silently while the runtime string-concatenated
+/// it, and now raises.
+#[test]
+fn map_addition_warns_and_names_merge() {
+    assert_eq!(codes("$joined = {a: 1} + {b: 2}\n"), vec!["MIX-W2301"]);
+    assert_eq!(
+        codes("$m = {a: 1}\n$joined = $m + {b: 2}\n"),
+        vec!["MIX-W2301"]
+    );
+    let (_, hint) = lint_full("$joined = {a: 1} + {b: 2}\n")
+        .into_iter()
+        .next()
+        .expect("one diagnostic");
+    assert!(
+        hint.as_deref().unwrap_or("").contains("merge(map_a, map_b)"),
+        "map+map must point at merge: {hint:?}"
+    );
+    // A map on ONE side is not a merge — the hint must not say it is.
+    let (_, hint) = lint_full("$m = {a: 1}\n$joined = $m + \"x\"\n")
+        .into_iter()
+        .next()
+        .expect("one diagnostic");
+    assert!(
+        !hint.as_deref().unwrap_or("").contains("merge("),
+        "map+string must not suggest merge: {hint:?}"
     );
 }
 

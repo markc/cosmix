@@ -1980,6 +1980,11 @@ fn expr_is_proven_list(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> boo
         || matches!(expr, Expr::Variable(name) if matches!(facts.get(name), Some(ProvenValue::List)))
 }
 
+fn expr_is_proven_map(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> bool {
+    matches!(expr, Expr::MapLiteral(_))
+        || matches!(expr, Expr::Variable(name) if matches!(facts.get(name), Some(ProvenValue::Map)))
+}
+
 // `expr_is_proven_collection` was the D3007 operand test and went with the
 // note in 0.68.0. Its job — "is this operand provably a map or list" — is
 // now done by the runtime raise in `eval_binop`, which sees the actual
@@ -2016,21 +2021,54 @@ fn check_proven_expr(
     a: &mut Analysis,
     facts: &HashMap<String, ProvenValue>,
 ) {
+    // MIX-W2301. Since 0.90.0 the RUNTIME raises on a collection operand of
+    // `+`, so this is no longer "it will silently stringify" — it is "this
+    // line will raise when it runs". Kept (unlike MIX-D3007, retired when
+    // the `==` raise shipped) for one reason the `==` case did not have:
+    // lint is the ONLY gate on an `ssh_mix` body and on a branch that the
+    // local test run never takes, so catching it at authoring time still
+    // buys something a runtime raise cannot. Still a WARNING, not an error:
+    // the "proven" facts are straight-line, so a reassigned variable can
+    // make the prediction wrong, and a wrong ERROR would refuse a working
+    // script.
     if let Expr::BinaryOp {
         left,
         op: BinOp::Add,
         right,
     } = expr
-        && (expr_is_proven_list(left, facts) || expr_is_proven_list(right, facts))
     {
-        a.diagnostics.push(diag(
-            ctx,
-            "MIX-W2301",
-            Severity::Warning,
-            line,
-            "`+` stringifies lists instead of joining them".to_string(),
-            Some("use concat(list_a, list_b) or push(list, value)".to_string()),
-        ));
+        let (l_list, r_list) = (
+            expr_is_proven_list(left, facts),
+            expr_is_proven_list(right, facts),
+        );
+        let (l_map, r_map) = (
+            expr_is_proven_map(left, facts),
+            expr_is_proven_map(right, facts),
+        );
+        let hint = if l_map || r_map {
+            if l_map && r_map {
+                Some("use merge(map_a, map_b)".to_string())
+            } else {
+                Some("`+` needs numbers or strings; use `..` to build text".to_string())
+            }
+        } else if l_list && r_list {
+            Some("use concat(list_a, list_b)".to_string())
+        } else if l_list || r_list {
+            Some("use push(list, value) to append, or `..` to build text".to_string())
+        } else {
+            None
+        };
+        if let Some(hint) = hint {
+            let kind = if l_map || r_map { "maps" } else { "lists" };
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-W2301",
+                Severity::Warning,
+                line,
+                format!("`+` is not defined for {kind} — this raises TYPE_ERROR at runtime"),
+                Some(hint),
+            ));
+        }
     }
 
     // MIX-D3007 RETIRED in 0.68.0 — the equality flip it watched has
