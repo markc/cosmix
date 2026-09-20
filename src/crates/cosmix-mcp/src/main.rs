@@ -2949,10 +2949,31 @@ mod tests {
             .unwrap();
         drop(f);
 
-        let mut child = std::process::Command::new("/opt/cosmix/bin/mix")
-            .args(["--serve", script.to_str().unwrap(), "--name", "mcpprobetest"])
-            .spawn()
-            .expect("spawn wedger citizen");
+        // Unique per run: the name is a GLOBAL Bus registration, so a fixed
+        // one would collide with a concurrent run (or a leaked citizen from a
+        // previous one) and the probe would be measuring the wrong process.
+        let service = format!("mcpprobe{}", std::process::id());
+
+        // Cleanup by RAII, not by trailing statements. Every assert below the
+        // spawn — including the ones INSIDE `block_on`, which panic straight
+        // out of it — would otherwise skip the kill and leave a `mix --serve`
+        // citizen registered on the developer's broker, wedged for 30s, under
+        // a name the next run then probes.
+        struct Reap(std::process::Child, std::path::PathBuf);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _reap = Reap(
+            std::process::Command::new("/opt/cosmix/bin/mix")
+                .args(["--serve", script.to_str().unwrap(), "--name", &service])
+                .spawn()
+                .expect("spawn wedger citizen"),
+            dir.clone(),
+        );
 
         let outcome = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let client = cosmix_config::client_helpers::connect_anonymous_default()
@@ -2961,33 +2982,35 @@ mod tests {
             // Wait for it to register and answer.
             let mut healthy = false;
             for _ in 0..40 {
-                if client.call("mcpprobetest", "INFO", serde_json::Value::Null).await.is_ok() {
+                if client.call(&service, "INFO", serde_json::Value::Null).await.is_ok() {
                     healthy = true;
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            assert!(healthy, "citizen never answered INFO; nothing was proven");
+            // Returned, not asserted: a panic here would unwind through
+            // `block_on` and the three real assertions below would never run,
+            // reporting a setup failure as if it were a finding.
+            if !healthy {
+                return None;
+            }
 
             // Wedge it, then probe.
-            let _ = client.send("mcpprobetest", "wedge.hang", serde_json::Value::Null).await;
+            let _ = client.send(&service, "wedge.hang", serde_json::Value::Null).await;
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             let start = std::time::Instant::now();
-            let probe = client.call("mcpprobetest", "INFO", serde_json::Value::Null);
+            let probe = client.call(&service, "INFO", serde_json::Value::Null);
             let wedged = tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await;
             let elapsed = start.elapsed();
 
             // The connection must still work for the NEXT candidate.
             let after = client.call("noded", "noded.ping", serde_json::Value::Null).await;
-            (wedged.is_err(), elapsed, after.is_ok())
+            Some((wedged.is_err(), elapsed, after.is_ok()))
         });
 
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let (timed_out, elapsed, connection_usable) = outcome;
+        let (timed_out, elapsed, connection_usable) =
+            outcome.expect("citizen never answered INFO — setup failed, nothing was proven");
         assert!(
             timed_out,
             "our bound did not fire first after {elapsed:?}: either the citizen was not \
