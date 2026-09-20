@@ -134,11 +134,16 @@ impl Raster {
             painted += 1;
             let y = (row * self.height as usize) as i32;
             for col in 0..screen.cols {
-                let Some(cell) = screen.cells.get(row * screen.cols + col) else {
-                    break;
-                };
+                // A `Screen` whose `cells` is shorter than cols*rows is
+                // malformed — `Terminal::capture` never produces one — but the
+                // type is public, and the cell still gets CLEARED rather than
+                // skipped: leaving the previous frame's pixels in a row this
+                // call claims to have repainted is the one outcome a partial
+                // repaint must never produce.
+                let cell = screen.cells.get(row * screen.cols + col);
                 let x = (col * self.width as usize) as i32;
-                let fill = [cell.bg[0], cell.bg[1], cell.bg[2], 255];
+                let bg = cell.map_or([0, 0, 0], |cell| cell.bg);
+                let fill = [bg[0], bg[1], bg[2], 255];
                 for cy in 0..self.height as usize {
                     let start = ((y as usize + cy) * width + x as usize) * 4;
                     let end = start + self.width as usize * 4;
@@ -146,9 +151,9 @@ impl Raster {
                         pixel.copy_from_slice(&fill);
                     }
                 }
-                if cell.c == ' ' || cell.c == '\0' {
+                let Some(cell) = cell.filter(|cell| cell.c != ' ' && cell.c != '\0') else {
                     continue;
-                }
+                };
                 let key = (cell.c, cell.bold, cell.fg);
                 if !self.cache.contains_key(&key) {
                     if self.cache.len() >= 4096 {
@@ -327,6 +332,27 @@ mod tests {
     /// `render_into` reuses the caller's allocation. The old render path built
     /// a fresh full-frame `Vec` (~12 MB at 2.5x) for every damaged frame, which
     /// is the allocation D5 removes.
+    /// `Screen` is public, so a caller can hand over fewer cells than the
+    /// dimensions claim. A repainted row must still come out CLEAN: the one
+    /// thing a partial repaint must never do is leave the previous frame's
+    /// pixels in a row it reported as painted.
+    #[test]
+    fn a_short_cells_vector_still_clears_every_cell_of_a_painted_row() {
+        let mut painter = raster();
+        let busy = screen(6, 2);
+        let mut buffer = painter.render(&busy);
+        let mut truncated = screen(6, 2);
+        truncated.cells.truncate(8);
+        truncated.cursor = (5, 1);
+        truncated.cursor_visible = true;
+        painter.render_into(&truncated, &mut buffer, None);
+        assert_eq!(buffer, painter.render(&truncated), "no pixel survives");
+        // And the cursor's inversion is not applied twice to the same pixels.
+        let once = buffer.clone();
+        painter.render_into(&truncated, &mut buffer, None);
+        assert_eq!(buffer, once, "a repaint is idempotent, inversion included");
+    }
+
     #[test]
     fn a_same_size_frame_reuses_the_callers_allocation() {
         let mut painter = raster();

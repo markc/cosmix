@@ -38,7 +38,11 @@ pub struct Metrics {
     pub key_write: Samples,
     pub read_vt_bound: Samples,
     pub vt_rgba: Samples,
-    pub rgba_upload: Samples,
+    /// Time the render thread spent rasterising the frame into the texture's
+    /// own buffer. It measured "build a replacement Image and swap it in" until
+    /// bterm 0.9.1 stopped doing that; there is no separate convert-then-upload
+    /// step left to time, and the name and the label say so.
+    pub raster_paint: Samples,
     pub frame: Samples,
     pub frames: u64,
     pub reads: u64,
@@ -67,7 +71,7 @@ impl Metrics {
             self.read_vt_bound
                 .summary("PTY_last_read_to_damage_notification_upper_bound"),
             self.vt_rgba.summary("VT_notification_to_RGBA"),
-            self.rgba_upload.summary("RGBA_to_Assets_replaced"),
+            self.raster_paint.summary("raster_paint_into_texture"),
             self.frame.summary("process_frame_interval")
         )
     }

@@ -1228,9 +1228,6 @@ fn refresh(
             }
         }
         pane.active = active;
-        pane.rendered = true;
-        pane.cursor = screen.cursor;
-        pane.cursor_visible = screen.cursor_visible;
         let width = screen.cols as u32 * painter.width;
         let height = screen.rows as u32 * painter.height;
         let bytes = painter.frame_bytes(&screen);
@@ -1254,12 +1251,20 @@ fn refresh(
             let started = Instant::now();
             painter.render_into(&screen, rgba, (!full).then_some(dirty.as_slice()));
             let converted = Instant::now();
+            // Damage was consumed by `grid_snapshot` above, so the record of
+            // what this texture holds is only updated once the paint actually
+            // happened. If the asset were missing, those rows are gone for
+            // good — leaving `rendered` false makes the next frame repaint the
+            // whole pane instead of trusting a buffer nothing painted into.
+            pane.rendered = true;
+            pane.cursor = screen.cursor;
+            pane.cursor_visible = screen.cursor_visible;
             let mut stats = terminal.stats.lock().unwrap();
             stats.vt_rgba.add(converted - screen.updated);
             // The raster now writes straight into the asset's own buffer, so
             // there is no separate convert-then-upload step left to time; the
             // rasterisation itself is what this frame cost the main thread.
-            stats.rgba_upload.add(converted - started);
+            stats.raster_paint.add(converted - started);
             stats.uploads += 1;
         }
         let node_w = px(width as f32 / painter.scale);
