@@ -282,27 +282,44 @@ fn resolve_term(
     // new `term` ships — and it stays as the fallback for a machine that has
     // only bterm, which D6 says will keep existing. `COSMIX_TERM_BIN` still
     // overrides everything and still fails closed.
-    for name in ["term", "bterm"] {
+    for name in TERM_FRONTENDS {
         if let Some(root) = &cosmix
             && let Some(path) = lookup(&Path::new(root).join("bin").join(name))
         {
             return Ok(path);
         }
     }
-    for name in ["term", "bterm"] {
+    for name in TERM_FRONTENDS {
         if let Some(path) = lookup(&Path::new("/opt/cosmix/bin").join(name)) {
             return Ok(path);
         }
     }
-    lookup(Path::new("term"))
-        .or_else(|| lookup(Path::new("bterm")))
+    TERM_FRONTENDS
+        .into_iter()
+        .find_map(|name| lookup(Path::new(name)))
         .ok_or_else(|| "mix --gui: no CosMix terminal frontend is installed (looked for term then bterm in $COSMIX/bin, /opt/cosmix/bin, and on PATH). Install the desktop package.".to_string())
 }
 
+/// The frontend binary names, in resolution order. Shared with [`term_lookup`]
+/// so the PATH tier cannot search for a name the lookup then refuses to treat
+/// as a PATH name — which is exactly what happened to `bterm` between the T1
+/// rename and this fix: the list gained a second name and the lookup's
+/// bare-name exemption did not, so a `bterm` installed only on PATH was looked
+/// for at `<cwd>/bterm` and never found.
+const TERM_FRONTENDS: [&str; 2] = ["term", "bterm"];
+
+/// Is `path` an unqualified frontend name — one that must reach `which`
+/// untouched so PATH is actually searched?
+fn is_bare_frontend_name(path: &Path) -> bool {
+    TERM_FRONTENDS.iter().any(|name| path == Path::new(name))
+}
+
 /// Reuse the public `which` builtin's regular-file + kernel X_OK check,
-/// including ACLs. Absolute candidates bypass PATH inside that same builtin.
+/// including ACLs. Absolute candidates bypass PATH inside that same builtin,
+/// so an unqualified frontend name must be handed over UNCHANGED or it becomes
+/// a `<cwd>`-relative path and PATH is never consulted.
 fn term_lookup(path: &Path) -> Option<std::path::PathBuf> {
-    let path = if path == Path::new("term") {
+    let path = if is_bare_frontend_name(path) {
         path.to_path_buf()
     } else {
         std::path::absolute(path).ok()?
@@ -2039,6 +2056,41 @@ mod gui_tests {
         // A missing path is not launchable.
         assert!(require_executable_image(&dir.join("nope")).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The PATH tier's candidates must reach `which` as BARE names.
+    ///
+    /// `which` treats an absolute argument as the candidate itself, so a name
+    /// that gets absolutised is looked for at `<cwd>/<name>` and PATH is never
+    /// consulted. That is exactly what shipped with the T1 rename: the
+    /// resolution list gained `bterm` while the lookup's exemption still named
+    /// only `term`, so a `bterm` installed solely on PATH could not be found
+    /// and `mix --gui` reported no frontend installed at all.
+    ///
+    /// Proven able to fail: restore the old literal `path == Path::new("term")`
+    /// in `is_bare_frontend_name` and the `bterm` candidate reds.
+    #[test]
+    fn path_tier_candidates_reach_which_as_bare_names() {
+        let mut seen = Vec::new();
+        let _ = resolve_term(None, Some("/test-root".into()), |path| {
+            seen.push(path.to_path_buf());
+            None
+        });
+        let path_tier = &seen[seen.len() - TERM_FRONTENDS.len()..];
+        for candidate in path_tier {
+            assert_eq!(
+                candidate.parent(),
+                Some(Path::new("")),
+                "PATH tier handed a qualified path: {candidate:?}"
+            );
+            assert!(
+                is_bare_frontend_name(candidate),
+                "{candidate:?} would be absolutised, so PATH is never searched"
+            );
+        }
+        // And a qualified path is still absolutised rather than PATH-searched.
+        assert!(!is_bare_frontend_name(Path::new("/opt/cosmix/bin/bterm")));
+        assert!(!is_bare_frontend_name(Path::new("./term")));
     }
 
     #[test]

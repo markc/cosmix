@@ -2,9 +2,15 @@
 --
 -- Drives CosMix Term over the Bus with NO AI agent in the loop: the desktop
 -- "open a terminal here", "focus the running one", and "lay a project out"
--- workflows, done offline and model-independently through term.* verbs plus a
--- detached launch. This is the sovereign control path — the same surface an
--- agent reaches through MCP is reachable here from a plain script.
+-- workflows, done offline and model-independently through the live frontend's
+-- verbs plus a detached launch. This is the sovereign control path — the same
+-- surface an agent reaches through MCP is reachable here from a plain script.
+--
+-- WHICH frontend is resolved, never hardcoded (D1, TODO-term 2026-09-21): the
+-- Bevy terminal was renamed and now registers as `bterm` / serves `bterm.*`,
+-- and the global name `term` belongs to the iced+wgpu one. Both may be running
+-- at once, and cosmix-term-core REFUSES a verb from the other namespace — so
+-- the name is resolved once and every verb is built from it.
 --
 -- usage:
 --   mix term-desktop.mix open [DIR]           open Term with its shell in DIR (default: cwd)
@@ -19,26 +25,64 @@
 -- running instance by adding a tab rather than spawning a second window — the
 -- desktop-legible "don't proliferate windows" half of focus-existing.
 
-fn term_running()
-  -- INFO is answered by any live Term; rc != 0 means no instance registered.
-  $probe = send "term" "INFO" body=""
-  return $rc == 0
+-- The Bus name of a LIVE CosMix terminal: `term` (the default frontend) if it
+-- answers, else `bterm` (the Bevy one), else "" when neither does.
+--
+-- INFO is answered by any live frontend, so this proves the instance is
+-- responsive and not merely registered — this script is about to drive verbs,
+-- not just report. Preference order matches `mix --gui`'s binary resolution
+-- (term, then bterm) so the launcher drives the same terminal it starts.
+--
+-- The per-send `timeout=` is load-bearing, not tidiness. Without it a
+-- REGISTERED BUT WEDGED `term` costs the default 60s transport timeout, and
+-- that timeout marks Mix's cached Bus connection Lost (cosmix-mix/src/bus.rs,
+-- "A transport failure … is an Err → transition to Lost"), so every later
+-- form raises `mesh unavailable` — the fallback probe could never reach a
+-- perfectly healthy `bterm`. A per-send timeout returns rc=-2 by cancelling
+-- the call in the evaluator instead, leaving the connection usable. Three
+-- seconds is comfortably above the frontends' own two-second reply budget.
+--
+-- `$deadline` is an ABSOLUTE wall-clock instant, and each probe is capped by
+-- what is LEFT of it rather than by a fixed 3s. A caller's stated budget must
+-- bound the whole resolution, not each probe within it: two wedged frontends
+-- at a flat 3s cost 6s per call, which is how a 20s wait loop was measured
+-- overrunning to ~25s.
+fn resolve_term_service($deadline)
+  for $name in ["term", "bterm"]
+    $left = $deadline - time()
+    if $left <= 0 then return "" end
+    if $left > 3 then $left = 3 end
+    $probe = send $name "INFO" body="" timeout=$left
+    if $rc == 0 then return $name end
+  end
+  return ""
 end
 
 fn usage()
   raise("TERM_ARGS", "usage: open [DIR] | focus [DIR] | layout NAME [DIR]")
 end
 
-fn apply_layout($name)
+-- Every verb is built from the RESOLVED service. `cosmix-term-core`'s
+-- canonical_verb() refuses a verb whose namespace is not the frontend's own
+-- name, so a hardcoded `term.` prefix sent to bterm is a rejected call, not an
+-- untidy one.
+fn apply_layout($name, $svc)
+  -- Unreachable today (every caller either resolved a service or raised), and
+  -- the guard is here so it stays that way: an empty name would build the verb
+  -- `.pane.split` and send it to the empty target, surfacing as a broker
+  -- "unknown service" wrapped in TERM_SEND — one indirection from its cause.
+  if $svc == "" then raise("TERM_NOSVC", "internal: apply_layout called with no resolved Term service") end
   if $name == "split" then
-    $r = send "term" "term.pane.split" dir="v"
+    $verb = $svc .. ".pane.split"
+    $r = send $svc $verb dir="v"
     if $rc != 0 then raise("TERM_SEND", "split failed: " .. to_string($rc) .. " " .. to_string($r)) end
     print("layout split — " .. trim("" .. $r))
   elif $name == "dev" then
     -- One tab exists at launch; two more make the edit/build/run trio.
-    $r1 = send "term" "term.tab.new" body=""
+    $verb = $svc .. ".tab.new"
+    $r1 = send $svc $verb body=""
     if $rc != 0 then raise("TERM_SEND", "first new tab failed: " .. to_string($rc) .. " " .. to_string($r1)) end
-    $r2 = send "term" "term.tab.new" body=""
+    $r2 = send $svc $verb body=""
     if $rc != 0 then raise("TERM_SEND", "second new tab failed (first tab remains): " .. to_string($rc) .. " " .. to_string($r2)) end
     print("layout dev — added two tabs (" .. trim("" .. $r1) .. "; " .. trim("" .. $r2) .. ")")
   else
@@ -66,7 +110,11 @@ else
   usage()
 end
 
-$running = term_running()
+-- Resolved ONCE here, and again after a launch (below) because before the
+-- launch there is by definition nothing to resolve. Seven seconds is enough
+-- for both probes to take their full cap and still answer.
+$service = resolve_term_service(time() + 7)
+$running = $service != ""
 if $running and (($cmd == "focus" and len($a) >= 2) or ($cmd == "layout" and len($a) >= 3)) then
   print("requested directory not applied: " .. $dir .. " — running Term's diagnostic verbs cannot carry cwd; this lands with P3a identity")
 end
@@ -83,6 +131,9 @@ if $need_launch then
   end
   -- TERM_CWD is inherited by the detached child (space-safe, no shell quoting);
   -- `mix --gui` resolves the Term frontend and the child shell starts in $dir.
+  -- The BINARY resolution lives in `mix --gui` (COSMIX_TERM_BIN, then term then
+  -- bterm at each tier) and is deliberately not duplicated here: a second copy
+  -- of that search would be a second thing to keep in step with the first.
   export TERM_CWD = $dir
   -- Resolve while this launcher is alive; another Term may answer INFO at once.
   $resolved = run_argv(["readlink", "-f", "/proc/" .. to_string(pid()) .. "/exe"])
@@ -90,23 +141,43 @@ if $need_launch then
   if $resolved.ok and trim($resolved.stdout) != "" then $mix = trim($resolved.stdout) end
   $pid = spawn(shell_quote($mix) .. " --gui", "/dev/null", "/dev/null")
   print("launched Term (pid " .. to_string($pid) .. ") with its shell in " .. $dir)
-  -- Wait (bounded) for the new instance to register before driving it.
-  $i = 0
-  while $i < 40 and not term_running()
+  -- Wait (bounded) for A frontend to be answering, and take the name to drive
+  -- from that probe: which binary `mix --gui` resolved is not knowable from
+  -- here until one answers.
+  --
+  -- Honest about what this proves and what it does not. It proves a frontend
+  -- is answering; it does NOT prove the child just launched is that frontend.
+  -- Where one was already running (`open` always launches, even then) the
+  -- pre-existing instance satisfies the probe immediately and a failed launch
+  -- goes unnoticed. Distinguishing the two needs per-instance identity, which
+  -- is P0-I and not available on this lane.
+  --
+  -- The deadline is WALL TIME, not an iteration count: each probe can now cost
+  -- up to its own timeout, so counting sleeps would have silently stretched a
+  -- stated 20s into minutes. The deadline is handed DOWN to each probe, so the
+  -- overrun is bounded by one sleep rather than by two probe timeouts per
+  -- iteration. (Mix has no monotonic clock builtin — `time()` is Unix time, so
+  -- a clock step during the wait skews this. Acceptable for a 20s desktop
+  -- launch; it would not be for a lease.)
+  $deadline = time() + 20
+  $service = resolve_term_service($deadline)
+  while $service == "" and time() < $deadline
     sleep(0.5)
-    $i = $i + 1
+    $service = resolve_term_service($deadline)
   end
-  if not term_running() then raise("TERM_NOREG", "Term did not register on the Bus within 20s") end
+  if $service == "" then raise("TERM_NOREG", "no Term answered on the Bus within 20s (looked for `term`, then `bterm`)") end
+  print("driving Bus service `" .. $service .. "`")
 end
 
 if $cmd == "focus" then
   if $running then
-    $r = send "term" "term.tab.new" body=""
+    $verb = $service .. ".tab.new"
+    $r = send $service $verb body=""
     if $rc != 0 then raise("TERM_SEND", "new tab failed: " .. to_string($rc) .. " " .. to_string($r)) end
-    print("reused running Term — opened a new tab (" .. trim("" .. $r) .. ")")
+    print("reused running Term `" .. $service .. "` — opened a new tab (" .. trim("" .. $r) .. ")")
   else
     print("no running Term — opened a new one in " .. $dir)
   end
 elif $cmd == "layout" then
-  apply_layout($layout)
+  apply_layout($layout, $service)
 end

@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mcp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chrono",
  "cosmix-lib-buildinfo",
@@ -1798,7 +1798,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-mix"
-version = "0.89.2"
+version = "0.89.3"
 dependencies = [
  "blake3",
  "chrono",

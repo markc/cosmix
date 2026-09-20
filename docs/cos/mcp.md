@@ -59,9 +59,53 @@ retrieved skill → `*_feedback` to score the chunks you used.
 ## Term diagnostic tools
 
 Since cosmix-mcp 0.5.0, five dedicated tools drive CosMix Term over ABP.
-The self-asserted `term` service is diagnostic pending authenticated
+The self-asserted terminal service is diagnostic pending authenticated
 per-instance identity (P0-I). These tools reuse the Bus client and central
 per-call metrics. Replies are bounded to 1 MiB.
+
+**Which frontend they address is RESOLVED, not fixed (cosmix-mcp 0.5.1).**
+TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
+`term` / `term.*`, the Bevy one is `bterm` / `bterm.*`, and a frontend
+*refuses* a verb from the other namespace. Before every tool call the MCP asks
+the broker which of `term`, then `bterm`, is registered, and **probes each in
+turn with a bounded `INFO`** — taking the first that actually answers and
+building the verb from that same name. Resolution is per call, never cached
+for the process: the MCP outlives any one terminal, and both frontends may be
+up at once for an A/B.
+
+*Live means answering, not merely registered.* A frontend whose event loop is
+stuck keeps its Bus name, so registration alone would hand every tool call to
+it and each would block for the client's 60s transport timeout while a healthy
+sibling sat unused. The probe costs about a millisecond against a responsive
+frontend and is capped at three seconds against a wedged one. It is a probe
+and never a retry-on-timeout: a timed-out *verb* may still have executed, so
+falling back after one would replay a mutation (`term_type`, `term_tab`) into
+a **different** terminal — keystrokes in the wrong window. `INFO` is read-only
+and idempotent, so two bounded round trips are preferred to one ambiguous one.
+This is the same definition of "live" that `term-desktop.mix` uses, so the two
+control surfaces agree.
+
+The failure modes are reported distinctly, because they call for different
+actions — start a terminal, find the stuck one, or go and look at the broker:
+
+- nothing registered → `ERROR: no CosMix terminal is registered on the Bus
+  (looked for `term`, then `bterm`) — start one with `mix --gui``
+- registered but silent → `ERROR: CosMix terminal registered but unresponsive:
+  `term` did not answer INFO within 3s (wedged, or shutting down). No other
+  frontend is registered. Nothing was sent.`
+- the Bus itself went away mid-resolution → `ERROR: the broker stopped
+  answering while probing for a CosMix terminal (…) — this is a Bus problem,
+  not a wedged terminal. Check cosmix-noded. Nothing was sent.`
+
+The third exists because the client call deliberately conflates an
+application error with a transport one, so a silent probe is not by itself
+evidence about the *terminal*. If the connection drops after the registration
+listing, every probe fails for a reason that has nothing to do with a frontend
+— so before blaming the terminals the resolver spends one bounded ping on the
+broker and says which it was. That ping happens only on the failure path.
+
+All three say **nothing was sent**, so an agent whose mutation errored does not
+have to wonder whether it half-landed.
 
 | Tool | Arguments | Behaviour |
 |---|---|---|
@@ -75,7 +119,10 @@ The MCP schemas use String for text/op, optional u64 for id, and optional
 String for dir. Invalid operations, missing required ids/directions, and
 invalid split directions return errors without an ABP call.
 
-Term 0.3.0 changes every `term.*` request to a JSON object:
+Term 0.3.0 changes every request to a JSON object. The verb column is written
+in the canonical `term.` namespace; on the wire the prefix is the **resolved
+frontend's name**, so against the Bevy frontend these are `bterm.snapshot`,
+`bterm.tabs` and so on:
 
 | Bus verb | JSON body |
 |---|---|

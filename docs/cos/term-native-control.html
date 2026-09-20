@@ -442,12 +442,25 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="cos/term-native-control.md"><div class="prose"><h1 id="term-native-control">Term native control</h1>
-<p>The global TCP <code>term</code> registration sends completion notifications and, under
+<blockquote>
+<p><strong>Two lanes, and only one of them was renamed.</strong> Since 2026-09-21 (TODO-term
+D1) a frontend's <strong>global registration is its own name</strong> — <code>term</code> for the
+iced+wgpu frontend, <code>bterm</code> for the Bevy one — and the verb namespace
+follows it: bterm serves <code>bterm.tabs</code>, and <em>refuses</em> <code>term.tabs</code>. Two
+binaries cannot both own <code>term</code>, and T5's A/B needs both running at once.
+The <strong>native-session lane below is unaffected</strong>: its verbs are the canonical
+<code>term.*</code> spellings on the broker-allocated Unix identity, they are not
+rewritten per frontend, and both frontends speak them identically. Where
+this page says <code>term.foo</code> under the global lane, read <code>&lt;frontend&gt;.foo</code>;
+under the native-session lane, read it literally.</p>
+</blockquote>
+<p>The global TCP registration sends completion notifications and, under
 the default mesh-open posture (<code>COSMIX_MESH_OPEN</code> unset or any value other
 than <code>0</code>), serves the full <strong>targetless</strong> active-tab verb set to any mesh or
 local caller with no grant: <code>term.tabs</code>, <code>term.tab.new/select/close</code>,
 <code>term.panes</code>, <code>term.pane.split/select/close</code>, <code>term.snapshot</code>, <code>term.type</code>,
-plus <code>INFO</code>/<code>HELP</code> (term 0.8.5, per the 2026-09-15 full-mesh-access law).
+plus <code>INFO</code>/<code>HELP</code> (term 0.8.5, per the 2026-09-15 full-mesh-access law) — each
+in the holding frontend's own namespace.
 These verbs act on the active tab/pane of the instance holding the name at
 delivery time; they carry no target binding. <code>term.type</code> revokes any
 delegated control writer exactly as real keys do. Any mutating verb's body
@@ -727,8 +740,8 @@ orchestrator; this page describes implementation, not a claim of passing gates.<
 <p>The enforcement fixtures are <code>#[ignore]</code>d because each spawns a real broker and a
 real Mix child over a PTY, so a plain <code>cargo test</code> reports them as ignored and
 says nothing about enforcement. Run them mechanically from <code>src/</code>:</p>
-<pre><code class="language-sh">mix desktop/apps/term/check-s4-gates.mix     # the 14 S4 enforcement fixtures
-mix desktop/apps/term/check-production-e2e.mix   # p0i-01, the production child-proof
+<pre><code class="language-sh">mix desktop/apps/bterm/check-s4-gates.mix     # the 14 S4 enforcement fixtures
+mix desktop/apps/bterm/check-production-e2e.mix   # p0i-01, the production child-proof
 </code></pre>
 <p>It builds the current-HEAD Mix the fixtures demand — they refuse a stale or
 installed binary — runs them by exact test path, and requires the precise

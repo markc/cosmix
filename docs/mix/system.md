@@ -666,7 +666,7 @@ word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force `run("setsid app &")` through `sh`.
 
 ```mix
-spawn(["cosmix-term", "--profile", "work"])           -- argv, no shell
+spawn(["bterm", "--profile", "work"])                 -- argv, no shell
 spawn(["mydaemon"], {detach: true})                   -- new session (setsid),
                                                       --   survives the caller,
                                                       --   drops the terminal

@@ -39,7 +39,7 @@ Mix — the language and shell
 | crate | version |
 |---|---|
 | `cosmix-lib-mix` | 0.89.1 |
-| `cosmix-mix` | 0.89.0 |
+| `cosmix-mix` | 0.89.3 |
 | `mix-bench` | 0.1.0 |
 
 ## cos
@@ -80,7 +80,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-maild-auth` | 0.2.0 |
 | `cosmix-maild-bayesian` | 0.6.1 |
 | `cosmix-maild-rules` | 0.2.2 |
-| `cosmix-mcp` | 0.5.0 |
+| `cosmix-mcp` | 0.5.1 |
 | `cosmix-mds` | 0.2.2 |
 | `cosmix-mesh-sign` | 0.8.0 |
 | `cosmix-midicomp` | 0.3.0 |
@@ -102,9 +102,10 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 |---|---|
 | `cosmix-bg-boing` | 0.1.0 |
 | `cosmix-bg-showcase` | 0.2.5 |
+| `cosmix-bterm` | 0.9.0 |
 | `cosmix-busviewer` | 0.1.1 |
 | `cosmix-capture` | 0.1.2 |
-| `cosmix-comp` | 0.61.1 |
+| `cosmix-comp` | 0.62.0 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
@@ -120,8 +121,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-shell` | 0.12.1 |
 | `cosmix-shell-host` | 0.6.10 |
 | `cosmix-studio` | 0.4.7 |
-| `cosmix-term` | 0.8.6 |
-| `cosmix-term-core` | 0.1.0 |
+| `cosmix-term-core` | 0.2.0 |
 | `cosmix-tower` | 0.5.4 |
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |

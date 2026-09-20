@@ -342,16 +342,101 @@ struct TermPaneParams {
     id: Option<u64>,
 }
 
+/// The Bus names a terminal frontend may hold, in preference order.
+///
+/// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global name
+/// `term`, so the Bevy frontend was renamed and now registers as `bterm` and
+/// serves `bterm.*`; `term` / `term.*` is reserved for the incoming iced+wgpu
+/// one. T5's A/B needs both running at once, so these tools RESOLVE the live
+/// frontend instead of hardcoding a name, and prefer `term` — the default —
+/// when both are up.
+const TERM_SERVICES: [&str; 2] = ["term", "bterm"];
+
+/// How long a frontend gets to answer the liveness probe.
+///
+/// Comfortably above the frontends' own two-second Bus reply budget, and two
+/// orders of magnitude below the client's 60s transport timeout — which is
+/// the whole point: the probe exists so a wedged frontend costs seconds, not
+/// a minute, and does not hide a healthy one behind itself.
+const TERM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What to say when nothing is registered. It names both candidates: the most
+/// likely cause of this error for the rest of 2026 is a caller expecting the
+/// pre-rename `term` to be there, and an error that named only one of them
+/// would leave that reader guessing.
+const TERM_NO_FRONTEND: &str = "no CosMix terminal is registered on the Bus (looked for `term`, then `bterm`) — start one with `mix --gui`";
+
+/// The registered frontends, in preference order.
+///
+/// Pure, so the order and the exact-match rule are testable without a live
+/// broker. Registration is the SHORTLIST, not the answer — [`term_service`]
+/// then asks each one whether it is actually answering.
+fn registered_term_services(registered: &[String]) -> Vec<&'static str> {
+    TERM_SERVICES
+        .into_iter()
+        .filter(|name| registered.iter().any(|s| s == name))
+        .collect()
+}
+
+/// What to say when a frontend holds a name but will not answer on it.
+///
+/// Kept distinct from [`TERM_NO_FRONTEND`] on purpose. "Nothing is running"
+/// and "something is running and wedged" call for opposite actions — start a
+/// terminal, versus find and kill the one that is stuck — and an operator who
+/// is handed the first message while the second is true will go looking in
+/// the wrong place.
+fn term_unresponsive(candidates: &[&'static str]) -> String {
+    let names = candidates
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CosMix terminal registered but unresponsive: {names} did not answer INFO within {}s \
+         (wedged, or shutting down). No other frontend is registered. Nothing was sent.",
+        TERM_PROBE_TIMEOUT.as_secs()
+    )
+}
+
+/// The wire verb for `suffix` in `service`'s namespace.
+///
+/// **The verb prefix MUST follow the service.** `cosmix-term-core`'s
+/// `canonical_verb()` rewrites `<service>.` at the dispatch boundary and
+/// returns None — refused — for any other namespace, so sending `term.tabs`
+/// to `bterm` is not merely untidy, it is rejected. Building every verb here,
+/// from the resolved name, is what makes that impossible to get wrong.
+///
+/// The `Err` arm catches the specific regression this sweep exists to remove:
+/// a call site that passes an already-namespaced verb (`"term.snapshot"`)
+/// instead of a suffix. Left to `format!` that silently produces
+/// `bterm.term.snapshot`, which the frontend refuses with a message about an
+/// unknown verb — a confusing symptom one indirection from its cause. Here it
+/// names the cause.
+fn term_verb(service: &str, suffix: &str) -> Result<String, String> {
+    if let Some(ns) = TERM_SERVICES
+        .into_iter()
+        .find(|name| suffix.starts_with(&format!("{name}.")))
+    {
+        return Err(format!(
+            "internal: Term verb suffix {suffix:?} already carries the `{ns}.` namespace; \
+             pass the suffix alone and let the resolved service supply the prefix"
+        ));
+    }
+    Ok(format!("{service}.{suffix}"))
+}
+
+/// The verb SUFFIX (namespace-free) and body for a tab operation. The
+/// namespace is added by [`term_verb`] once the live frontend is resolved.
 fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value), String> {
     match p.op.as_str() {
-        "new" => Ok(("term.tab.new", serde_json::json!({}))),
+        "new" => Ok(("tab.new", serde_json::json!({}))),
         "select" | "close" => {
             let id = p.id.ok_or("id is required for select/close")?;
             Ok((
                 if p.op == "select" {
-                    "term.tab.select"
+                    "tab.select"
                 } else {
-                    "term.tab.close"
+                    "tab.close"
                 },
                 serde_json::json!({"id": id}),
             ))
@@ -360,11 +445,12 @@ fn term_tab_request(p: TermTabParams) -> Result<(&'static str, serde_json::Value
     }
 }
 
+/// The verb SUFFIX (namespace-free) and body for a pane operation.
 fn term_pane_request(p: TermPaneParams) -> Result<(&'static str, serde_json::Value), String> {
     match p.op.as_str() {
-        "close" => Ok(("term.pane.close", serde_json::json!({}))),
+        "close" => Ok(("pane.close", serde_json::json!({}))),
         "select" => Ok((
-            "term.pane.select",
+            "pane.select",
             serde_json::json!({"id": p.id.ok_or("id is required for select")?}),
         )),
         "split" => {
@@ -372,7 +458,7 @@ fn term_pane_request(p: TermPaneParams) -> Result<(&'static str, serde_json::Val
             if !matches!(dir.as_str(), "h" | "v" | "horizontal" | "vertical") {
                 return Err("dir must be h|v|horizontal|vertical".into());
             }
-            Ok(("term.pane.split", serde_json::json!({"dir": dir})))
+            Ok(("pane.split", serde_json::json!({"dir": dir})))
         }
         _ => Err("op must be split|select|close".into()),
     }
@@ -648,6 +734,85 @@ impl CosmixMcp {
             .map_err(|e: String| e)
     }
 
+    /// Which terminal frontend is live RIGHT NOW, per call.
+    ///
+    /// **Live means ANSWERING, not merely registered.** A frontend that holds
+    /// its name while its event loop is stuck stays in `noded.list` and would
+    /// win the pick on order alone; every tool call then blocks for the
+    /// client's 60s transport timeout
+    /// (`cosmix-lib-client/src/native.rs`) while a healthy `bterm` sits
+    /// unused. That is not a degrade an agent can work through, and it
+    /// defeats the point of having a fallback at all. So registration is the
+    /// shortlist and a bounded `INFO` probe is the answer — the same
+    /// definition `term-desktop.mix` uses, so the two control surfaces agree
+    /// on what "live" means rather than being a drift source between them.
+    ///
+    /// **A probe, never a retry-on-timeout.** Sending the real verb and
+    /// falling back when it times out would be one round trip instead of two,
+    /// but a timeout does not mean the verb did not execute — for a mutation
+    /// (`type`, `tab.new`) the fallback would replay it into a DIFFERENT
+    /// terminal, landing keystrokes in the wrong window. `INFO` is read-only
+    /// and idempotent, so two bounded round trips beat one ambiguous one.
+    ///
+    /// Deliberately NOT cached on `self`: the MCP process outlives any one
+    /// terminal, and which frontend holds a name changes under it (bterm
+    /// quits, the iced `term` starts, a second one is launched for an A/B).
+    /// A process-lifetime cache would pin the first answer and then address a
+    /// dead name for the rest of the session — the exact failure this sweep
+    /// exists to remove, reintroduced one indirection deeper.
+    ///
+    /// A single tool that makes several calls resolves ONCE and reuses the
+    /// answer, so a mid-tool frontend change cannot split one logical read
+    /// across two terminals.
+    async fn term_service(&self) -> Result<&'static str, String> {
+        let noded = self.noded().await?;
+        let registered = noded.list_services().await.map_err(|e| e.to_string())?;
+        let candidates = registered_term_services(&registered);
+        if candidates.is_empty() {
+            return Err(TERM_NO_FRONTEND.to_string());
+        }
+        for name in &candidates {
+            // `call` collapses an application error into `Err`, so strictly
+            // `Ok` means "answered SUCCESSFULLY", not "answered" — a frontend
+            // that replied to INFO with an rc>=10 would read as silent here.
+            // That is unreachable for these frontends: `diagnostic()` and
+            // `handle()` in cosmix-term-core both answer INFO with `Ok` under
+            // either posture, open or strict, so INFO has no error reply to
+            // give. Distinguishing properly would mean `call_typed`, which is
+            // a wider change than an unreachable case earns — but if a future
+            // frontend ever refuses INFO, this is the line that will call it
+            // wedged.
+            //
+            // The outer timeout cancels the call rather than waiting out the
+            // client's own 60s. Cancellation is safe: `PendingGuard`'s Drop
+            // removes this request's entry synchronously (native.rs), ids come
+            // from a monotonic counter and are never reused, and `reader_loop`
+            // discards a reply with no pending entry — so a late answer to a
+            // cancelled probe cannot resolve a different request.
+            let probe = noded.call(name, "INFO", serde_json::Value::Null);
+            if matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await, Ok(Ok(_))) {
+                return Ok(name);
+            }
+        }
+        // Every candidate stayed silent — but `call` deliberately conflates an
+        // application error with a transport one, so "no reply" is not yet
+        // evidence about the TERMINALS. If the connection died after
+        // `list_services` above, both probes would fail for a reason that has
+        // nothing to do with a wedged frontend, and blaming the terminals
+        // would send an operator hunting one that is perfectly healthy.
+        // One bounded ping settles which it was, and only on this path.
+        let ping = noded.call("noded", "noded.ping", serde_json::Value::Null);
+        if !matches!(tokio::time::timeout(TERM_PROBE_TIMEOUT, ping).await, Ok(Ok(_))) {
+            return Err(format!(
+                "the broker stopped answering while probing for a CosMix terminal \
+                 ({} registered, none reachable) — this is a Bus problem, not a wedged \
+                 terminal. Check cosmix-noded. Nothing was sent.",
+                candidates.join(", ")
+            ));
+        }
+        Err(term_unresponsive(&candidates))
+    }
+
     async fn indexd(&self) -> Result<cosmix_skills::IndexdClient, String> {
         cosmix_skills::IndexdClient::from_config()
             .await
@@ -660,42 +825,43 @@ impl CosmixMcp {
     // ---- Bus tools ----
 
     /// Read-only tab and active-tab pane listing (ids, active flags, dimensions, pids,
-    /// geometry) from CosMix Term over ABP. Sequential reads are not atomic.
+    /// geometry) from the live CosMix terminal over ABP (`term`, else `bterm`).
+    /// Sequential reads are not atomic.
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
     async fn term_list(&self) -> String {
         let result: Result<String, String> = async {
+            let service = self.term_service().await?;
             let noded = self.noded().await?;
-            let tabs = term_reply(noded.call("term", "term.tabs", serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
-            let panes = term_reply(noded.call("term", "term.panes", serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let tabs = term_reply(noded.call(service, &term_verb(service, "tabs")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
+            let panes = term_reply(noded.call(service, &term_verb(service, "panes")?, serde_json::json!({})).await.map_err(|e| e.to_string())?)?;
             term_reply(serde_json::json!({"tabs": term_listing(&tabs, true)?, "panes": term_listing(&panes, false)?}))
         }.await;
         result.unwrap_or_else(|e| format!("ERROR: {}", truncate_chars(&e, 4096)))
     }
 
     /// Read-only active screen text, dimensions, cursor, pid and diagnostic timings
-    /// from CosMix Term over ABP (reply bounded to 1 MiB).
+    /// from the live CosMix terminal over ABP (reply bounded to 1 MiB).
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
     #[tool]
     async fn term_snapshot(&self) -> String {
-        self.term_request("term.snapshot", serde_json::json!({}))
-            .await
+        self.term_request("snapshot", serde_json::json!({})).await
     }
 
-    /// DIAGNOSTIC synthetic input to CosMix Term over ABP, not the authenticated
-    /// input API. The term service is a self-asserted diagnostic surface pending
-    /// authenticated per-instance identity (P0-I). Text uses the keyboard encoder;
-    /// newline is Enter. JSON request is limited to 8192 bytes.
+    /// DIAGNOSTIC synthetic input to the live CosMix terminal over ABP, not the
+    /// authenticated input API. The term service is a self-asserted diagnostic surface
+    /// pending authenticated per-instance identity (P0-I). Text uses the keyboard
+    /// encoder; newline is Enter. JSON request is limited to 8192 bytes.
     #[tool]
     async fn term_type(&self, Parameters(p): Parameters<TermTypeParams>) -> String {
         // VERIFY: MCP Term tool is a thin structured-argument ABP translation.
-        self.term_request("term.type", serde_json::json!({"text": p.text}))
+        self.term_request("type", serde_json::json!({"text": p.text}))
             .await
     }
 
-    /// Create, select or close a tab in CosMix Term over ABP; select/close require id.
+    /// Create, select or close a tab in the live CosMix terminal over ABP; select/close require id.
     /// Closing the last tab quits. The term service is a self-asserted diagnostic
     /// surface pending authenticated per-instance identity (P0-I).
     #[tool]
@@ -718,15 +884,19 @@ impl CosmixMcp {
         }
     }
 
-    async fn term_request(&self, verb: &str, args: serde_json::Value) -> String {
+    /// Send one verb, named by its namespace-free SUFFIX, to whichever
+    /// terminal frontend is live. The namespace comes from the resolved
+    /// service, never from the caller.
+    async fn term_request(&self, verb_suffix: &str, args: serde_json::Value) -> String {
         if args.to_string().len() > 8192 {
             return "ERROR: request exceeds 8192 bytes".into();
         }
         let result: Result<String, String> = async {
+            let service = self.term_service().await?;
             let noded = self.noded().await?;
             term_reply(
                 noded
-                    .call("term", verb, args)
+                    .call(service, &term_verb(service, verb_suffix)?, args)
                     .await
                     .map_err(|e| e.to_string())?,
             )
@@ -2642,9 +2812,9 @@ mod tests {
     fn term_translations_and_listing() {
         use super::*;
         for (op, verb) in [
-            ("new", "term.tab.new"),
-            ("select", "term.tab.select"),
-            ("close", "term.tab.close"),
+            ("new", "tab.new"),
+            ("select", "tab.select"),
+            ("close", "tab.close"),
         ] {
             let (actual, args) = term_tab_request(TermTabParams {
                 op: op.into(),
@@ -2678,7 +2848,7 @@ mod tests {
                     id: None
                 })
                 .unwrap(),
-                ("term.pane.split", serde_json::json!({"dir":dir}))
+                ("pane.split", serde_json::json!({"dir":dir}))
             );
         }
         for (op, dir) in [
@@ -2703,7 +2873,7 @@ mod tests {
                 id: None
             })
             .unwrap(),
-            ("term.pane.close", serde_json::json!({}))
+            ("pane.close", serde_json::json!({}))
         );
         assert_eq!(
             term_pane_request(TermPaneParams {
@@ -2712,7 +2882,7 @@ mod tests {
                 id: Some(9)
             })
             .unwrap(),
-            ("term.pane.select", serde_json::json!({"id":9}))
+            ("pane.select", serde_json::json!({"id":9}))
         );
         let tabs = term_listing(
             "id=1 active=true title=Mix shell cols=80 rows=24 child_pid=123",
@@ -2736,6 +2906,270 @@ mod tests {
         assert!(term_reply(serde_json::json!("x".repeat(TERM_REPLY_MAX + 1))).is_err());
         // An empty Bus reply arrives as Value::Null; render it as "", never "null".
         assert_eq!(term_reply(serde_json::Value::Null).unwrap(), "");
+    }
+
+    /// D1 (TODO-term, 2026-09-21): the MCP addresses whichever frontend is
+    /// live, preferring the default `term` over the Bevy `bterm`.
+    ///
+    /// This is the SHORTLIST half — which names are candidates and in what
+    /// order. Whether a candidate is actually answering is decided by the
+    /// bounded `INFO` probe in `term_service`, which needs a broker.
+    ///
+    /// Proven able to fail — the pre-sweep code hardcoded `"term"`, which
+    /// fails the bterm-only and neither-registered arms.
+    #[test]
+    fn term_service_resolves_the_live_frontend() {
+        use super::*;
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Both up (the T5 A/B case): the default frontend is tried first, and
+        // the other REMAINS a candidate — dropping it here is what would put
+        // the wedged-`term` hang back.
+        assert_eq!(
+            registered_term_services(&names(&["noded", "bterm", "term"])),
+            ["term", "bterm"]
+        );
+        // Only the iced/default one.
+        assert_eq!(registered_term_services(&names(&["noded", "term"])), ["term"]);
+        // Only the Bevy one — today's state after the rename, before the
+        // iced frontend ships.
+        assert_eq!(
+            registered_term_services(&names(&["noded", "bterm"])),
+            ["bterm"]
+        );
+        // Neither.
+        assert!(registered_term_services(&names(&["noded", "webd"])).is_empty());
+        assert!(registered_term_services(&[]).is_empty());
+        // A name that merely CONTAINS a candidate is not that candidate.
+        assert!(registered_term_services(&names(&["terminal", "bterm-2"])).is_empty());
+    }
+
+    /// The two properties `term_service`'s probe loop depends on, against a
+    /// REAL broker. Neither is provable from a pure test, and both are the
+    /// reason the loop is written as a probe rather than a retry.
+    ///
+    /// 1. A wedged service costs `TERM_PROBE_TIMEOUT`, not the client's 60s
+    ///    transport timeout — so a stuck `term` cannot hide a healthy
+    ///    `bterm` behind it.
+    /// 2. Cancelling that probe leaves the connection usable, so the NEXT
+    ///    candidate can actually be tried. If cancellation poisoned the
+    ///    client the fallback would be decorative.
+    ///
+    /// `#[ignore]`d, like the other broker-dependent fixtures in this tree:
+    /// it needs `cosmix-noded` and spawns a Mix citizen that wedges its own
+    /// event pump. Run it with
+    /// `cargo test -p cosmix-mcp -- --ignored --exact
+    ///  tests::probe_bounds_a_wedged_frontend_and_survives_cancellation`.
+    #[test]
+    #[ignore = "needs a live cosmix-noded broker and /opt/cosmix/bin/mix"]
+    fn probe_bounds_a_wedged_frontend_and_survives_cancellation() {
+        use super::*;
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("mcp-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("wedger.mix");
+        let mut f = std::fs::File::create(&script).unwrap();
+        // The handler blocks the serve runtime's pump, so the name stays
+        // registered while INFO stops being answered — exactly the state a
+        // registration-only resolver cannot see.
+        f.write_all(b"on wedge.hang desc \"block the pump\"\n  sleep(30)\n  reply(\"done\")\nend\n")
+            .unwrap();
+        drop(f);
+
+        // Unique per run: the name is a GLOBAL Bus registration, so a fixed
+        // one would collide with a concurrent run (or a leaked citizen from a
+        // previous one) and the probe would be measuring the wrong process.
+        let service = format!("mcpprobe{}", std::process::id());
+
+        // Cleanup by RAII, not by trailing statements. Every assert below the
+        // spawn — including the ones INSIDE `block_on`, which panic straight
+        // out of it — would otherwise skip the kill and leave a `mix --serve`
+        // citizen registered on the developer's broker, wedged for 30s, under
+        // a name the next run then probes.
+        struct Reap(std::process::Child, std::path::PathBuf);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        let _reap = Reap(
+            std::process::Command::new("/opt/cosmix/bin/mix")
+                .args(["--serve", script.to_str().unwrap(), "--name", &service])
+                .spawn()
+                .expect("spawn wedger citizen"),
+            dir.clone(),
+        );
+
+        let outcome = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let client = cosmix_config::client_helpers::connect_anonymous_default()
+                .await
+                .expect("broker");
+            // Wait for it to register and answer.
+            let mut healthy = false;
+            for _ in 0..40 {
+                if client.call(&service, "INFO", serde_json::Value::Null).await.is_ok() {
+                    healthy = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            // Returned, not asserted: a panic here would unwind through
+            // `block_on` and the three real assertions below would never run,
+            // reporting a setup failure as if it were a finding.
+            if !healthy {
+                return None;
+            }
+
+            // Wedge it, then probe.
+            let _ = client.send(&service, "wedge.hang", serde_json::Value::Null).await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+            let start = std::time::Instant::now();
+            let probe = client.call(&service, "INFO", serde_json::Value::Null);
+            let wedged = tokio::time::timeout(TERM_PROBE_TIMEOUT, probe).await;
+            let elapsed = start.elapsed();
+
+            // The connection must still work for the NEXT candidate.
+            let after = client.call("noded", "noded.ping", serde_json::Value::Null).await;
+            Some((wedged.is_err(), elapsed, after.is_ok()))
+        });
+
+        let (timed_out, elapsed, connection_usable) =
+            outcome.expect("citizen never answered INFO — setup failed, nothing was proven");
+        assert!(
+            timed_out,
+            "our bound did not fire first after {elapsed:?}: either the citizen was not \
+             actually wedged (so the fixture proved nothing) or the client's own 60s \
+             transport timeout won the race, which is the hang this probe exists to prevent"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "probe took {elapsed:?} — it is not bounded by TERM_PROBE_TIMEOUT, \
+             so a wedged frontend still hides a healthy one"
+        );
+        assert!(
+            connection_usable,
+            "cancelling the probe poisoned the client; the fallback candidate could never be tried"
+        );
+    }
+
+    /// "Nothing is running" and "something is running and wedged" must not
+    /// read the same. They call for opposite actions — start a terminal,
+    /// versus find the stuck one — and the second is the case the bounded
+    /// probe exists to surface at all.
+    #[test]
+    fn unresponsive_is_distinguishable_from_absent() {
+        use super::*;
+        let absent = TERM_NO_FRONTEND;
+        assert!(absent.contains("`term`") && absent.contains("`bterm`"), "{absent}");
+        assert!(absent.contains("not registered") || absent.contains("no CosMix terminal is registered"));
+
+        let wedged_one = term_unresponsive(&["bterm"]);
+        let wedged_both = term_unresponsive(&["term", "bterm"]);
+        for message in [&wedged_one, &wedged_both] {
+            assert!(message.contains("unresponsive"), "{message}");
+            assert!(message.contains("INFO"), "{message}");
+            // The probe budget is stated, so a reader knows how long it waited.
+            assert!(
+                message.contains(&format!("{}s", TERM_PROBE_TIMEOUT.as_secs())),
+                "{message}"
+            );
+            // Nothing was sent — an agent must not assume a mutation landed.
+            assert!(message.contains("Nothing was sent"), "{message}");
+            assert_ne!(message.as_str(), absent);
+        }
+        // Each message names exactly the candidates that were tried.
+        assert!(wedged_one.contains("`bterm`") && !wedged_one.contains("`term`,"));
+        assert!(wedged_both.contains("`term`") && wedged_both.contains("`bterm`"));
+    }
+
+    /// The wire verb must follow the resolved service: `cosmix-term-core`
+    /// refuses any other namespace, so a verb built from the wrong name is a
+    /// rejected call, not an untidy one.
+    #[test]
+    fn term_verbs_follow_the_resolved_service() {
+        use super::*;
+        for service in TERM_SERVICES {
+            for suffix in [
+                "tabs", "panes", "snapshot", "type", "tab.new", "tab.select", "tab.close",
+                "pane.split", "pane.select", "pane.close",
+            ] {
+                let verb = term_verb(service, suffix).unwrap();
+                assert_eq!(verb, format!("{service}.{suffix}"));
+                assert!(verb.starts_with(&format!("{service}.")), "{verb}");
+            }
+            // The regression this sweep removes, caught at the funnel: a call
+            // site that passes an already-namespaced verb is refused by name
+            // rather than silently producing `bterm.term.snapshot`.
+            for bad in TERM_SERVICES.map(|ns| format!("{ns}.snapshot")) {
+                let err = term_verb(service, &bad).unwrap_err();
+                assert!(err.contains("already carries"), "{err}");
+            }
+            // `bterm` must not be mistaken for the `term.` namespace by a
+            // naive prefix test — the dot is load-bearing.
+            assert_eq!(
+                term_verb(service, "btermish").unwrap(),
+                format!("{service}.btermish")
+            );
+        }
+        // Every suffix the request builders can emit is namespace-free, so
+        // `term_verb` cannot double-prefix one.
+        let mut suffixes = vec![
+            term_tab_request(TermTabParams {
+                op: "new".into(),
+                id: None,
+            })
+            .unwrap()
+            .0,
+        ];
+        for op in ["select", "close"] {
+            suffixes.push(
+                term_tab_request(TermTabParams {
+                    op: op.into(),
+                    id: Some(1),
+                })
+                .unwrap()
+                .0,
+            );
+        }
+        suffixes.push(
+            term_pane_request(TermPaneParams {
+                op: "split".into(),
+                dir: Some("h".into()),
+                id: None,
+            })
+            .unwrap()
+            .0,
+        );
+        suffixes.push(
+            term_pane_request(TermPaneParams {
+                op: "select".into(),
+                dir: None,
+                id: Some(1),
+            })
+            .unwrap()
+            .0,
+        );
+        suffixes.push(
+            term_pane_request(TermPaneParams {
+                op: "close".into(),
+                dir: None,
+                id: None,
+            })
+            .unwrap()
+            .0,
+        );
+        for suffix in suffixes {
+            for service in TERM_SERVICES {
+                assert!(
+                    !suffix.starts_with(&format!("{service}.")),
+                    "suffix carries a namespace: {suffix}"
+                );
+            }
+        }
     }
 
     use super::*;

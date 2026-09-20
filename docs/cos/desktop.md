@@ -34,7 +34,9 @@ callers through admitted noded connections.
 
 ## How it hangs together
 
-CosMix Term (`apps/term`) has a menu bar and tabs, with one Mix terminal pane
+CosMix BTerm (`apps/bterm`, the Bevy frontend — renamed from `term` 2026-09-21,
+TODO-term D1, so the global Bus name `term` is free for the incoming iced+wgpu
+frontend) has a menu bar and tabs, with one Mix terminal pane
 per tab. It admits at most 32 terminals, including pending closes. Closing
 removes a tab immediately; one cleanup worker performs bounded terminal
 shutdown outside the shared tab lock. Closing the last tab exits the app.
