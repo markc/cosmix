@@ -7,7 +7,7 @@
     <meta name="description" content="CosMix — an agent-operable computing system: legible, modifiable, and reconstructible by design. The umbrella site and manual for Bus (CosMix Agent Bus), CoS (Cooperative Operating System, the daemon family), and MIX (Mesh & Interprocess eXchange, the language you drive it with).">
     <link rel="icon" type="image/svg+xml" href="/web/favicon.svg">
     <link rel="prefetch" href="/ai.txt">
-    <title>CosMix — mix/</title>
+    <title>CosMix — mix/gotchas</title>
     <link rel="stylesheet" href="/web/fonts.css"><!-- vendored Inter / Quicksand / JetBrains Mono (woff2 in web/fonts/) -->
     <!-- FOUC prevention: paint theme/scheme synchronously before first paint (dcs.spa convention). -->
     <script>(function(){var s=JSON.parse(localStorage.getItem('base-state')||'{}'),t=s.theme,c=(s.scheme||'mono'),h=document.documentElement;h.className='preload '+(t||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'))+(c&&c!=='default'?' scheme-'+c:'')+(s.width==='wide'?' wide':(s.width==='narrow'?' narrow':''));})()</script>
@@ -441,80 +441,70 @@
     <div id="brochure" data-stub style="display:none"></div>
 
     <div id="doc-view" class="content-section">
-        <div id="content-doc" data-prerendered="mix/README.md"><div class="prose"><h1 id="mix--manual">Mix — manual</h1>
-<p>The reference manual for the <strong>Mix</strong> language, one page per topic. The canonical
-home of these pages is
-<a href="https://github.com/markc/cosmix/tree/main/docs/mix"><code>docs/_man/</code></a> in the public
-<a href="https://github.com/markc/cosmix">markc/mix</a> repo; add a page by dropping <code>TOPIC.md</code>
-there. The same files render everywhere:</p>
-<ul>
-<li><strong>Terminal</strong> — <code>mix man TOPIC</code> (<code>mix man</code> alone prints this index).</li>
-<li><strong><code>mix man</code></strong> — reads <a href="https://cosmix.dev/mix/overview">cosmix.dev/mix</a>, a mirror of this directory in the <code>cosmix</code> repo (<code>$COSMIX/mix/</code>). It is kept in step automatically: the mix repo's post-commit hook runs <code>$COSMIX/build/sync-man.mix</code> whenever a page here is committed (copy, prune, regenerate HTML stubs, commit, push). If <code>mix man</code> looks stale, run that script by hand and check <code>~/.cache/cosmix/man/</code> (24 h cache).</li>
-<li><strong>Web</strong> — <a href="https://markc.github.io/mix/#_man/overview.md">markc.github.io/mix</a> serves the manual in the site's left-hand <strong>Manual</strong> pane; any page deep-links as <code>#_man/PAGE.md</code>.</li>
-<li><strong>GitHub</strong> — browse <a href="https://github.com/markc/cosmix/tree/main/docs/mix"><code>docs/_man/</code></a> directly; this file doubles as the directory README.</li>
-<li><strong>Local clone</strong> — plain markdown with relative links; any editor or viewer works.</li>
-</ul>
-<h2 id="start-here">Start here</h2>
-<ul>
-<li><strong><a href="/mix/overview">overview</a></strong> — what Mix is, why it exists, where it came from.</li>
-<li><strong><a href="/mix/invocation">invocation &amp; CLI</a></strong> — <code>mix file</code>, <code>-c</code>, <code>-</code>, <code>-i</code>, login shell, <code>--serve</code>, flags.</li>
-<li><strong><a href="/mix/cli">the mix command</a></strong> — <code>mix help</code>/<code>man</code>/<code>builtins</code>/<code>what</code>/<code>status</code>/<code>trace</code>/… meta-commands.</li>
-<li><strong><a href="/mix/syntax">syntax &amp; the classifier</a></strong> — tokens, the newline rule, shell-vs-Mix dispatch.</li>
-<li><strong><a href="/mix/gotchas">gotchas</a></strong> — the guesses from bash/Python/JS that are silently wrong here. Read it first.</li>
-</ul>
-<h2 id="the-language">The language</h2>
-<ul>
-<li><strong><a href="/mix/variables">variables, sigils &amp; scope</a></strong> — <code>$</code> sigils, <code>${...}</code>, function-local binding.</li>
-<li><strong><a href="/mix/strings">strings</a></strong> — <code>'raw'</code> vs <code>"interp"</code>, <code>..</code> concat, codepoint/byte/grapheme ops.</li>
-<li><strong><a href="/mix/numbers">numbers</a></strong> — f64, radix literals, ordering, coercion.</li>
-<li><strong><a href="/mix/operators">operators</a></strong> — arithmetic, comparison, <code>and</code>/<code>or</code>/<code>not</code>, <code>..</code>, <code>?:</code>, <code>??</code>.</li>
-<li><strong><a href="/mix/control-flow">control flow</a></strong> — <code>if</code>/<code>while</code>/<code>for</code>/<code>loop</code>, if-as-expression, <code>break</code>/<code>continue</code>.</li>
-<li><strong><a href="/mix/functions">functions, lambdas &amp; modules</a></strong> — <code>fn</code>, closures, the pass-in/return/reassign triad.</li>
-<li><strong><a href="/mix/modules">modules — require/include/source</a></strong> — <code>require()</code> isolated module loading vs the splice loaders.</li>
-<li><strong><a href="/mix/collections">lists &amp; maps</a></strong> — literals, indexing, <code>push</code>/<code>pop</code>, the base footguns.</li>
-<li><strong><a href="/mix/hof">higher-order functions</a></strong> — <code>map</code>/<code>filter</code>/<code>reduce</code>/<code>sort_by</code>/<code>group_by</code>/…</li>
-<li><strong><a href="/mix/errors">errors &amp; exit handling</a></strong> — <code>try</code>/<code>catch</code>/<code>die</code>/<code>panic</code>, <code>run_rc().rc</code>, timeouts.</li>
-</ul>
-<h2 id="builtins--io">Builtins &amp; I/O</h2>
-<ul>
-<li><strong><a href="/mix/math">math</a></strong> — rounding, powers, logs, trig, <code>min</code>/<code>max</code>/<code>clamp</code>, constants.</li>
-<li><strong><a href="/mix/io">files &amp; I/O</a></strong> — <code>read_file</code>/<code>write_file</code>/<code>glob</code>/<code>stat</code>/<code>chmod</code>/<code>walk</code>/…</li>
-<li><strong><a href="/mix/system">processes &amp; system</a></strong> — <code>run</code>/<code>run_rc</code>/<code>run_stream</code>/<code>spawn</code>/<code>env</code>/<code>exit</code>/…</li>
-<li><strong><a href="/mix/data">data &amp; serialization</a></strong> — JSON, TOML, <code>jq</code>, <code>data_encode</code>, strict-data <code>.mix</code>.</li>
-<li><strong><a href="/mix/buffer">byte buffers</a></strong> — <code>buffer</code>/<code>buffer_push</code>/<code>freeze</code>, the one reference-semantic type.</li>
-<li><strong><a href="/mix/regex">regular expressions</a></strong> — <code>re_match</code>/<code>re_find</code>/<code>re_replace</code>/<code>re_split</code>/<code>grep_lines</code> (subject first).</li>
-<li><strong><a href="/mix/datetime">dates &amp; time</a></strong> — <code>time</code>/<code>date_format</code>/<code>now_iso</code>/<code>duration_format</code>.</li>
-<li><strong><a href="/mix/http">http</a></strong> — <code>http_get</code>/<code>http_post</code>/<code>http_request</code>, deadlines.</li>
-<li><strong><a href="/mix/datastar">datastar</a></strong> — <code>ds_*</code> SSE event framing.</li>
-</ul>
-<h2 id="mesh--runtime">Mesh &amp; runtime</h2>
-<ul>
-<li><strong><a href="/mix/bus">Bus messaging</a></strong> — <code>send</code>/<code>emit</code>/<code>address</code>/<code>on</code>, <code>$result</code>/<code>$rc</code> bands, the mesh.</li>
-<li><strong><a href="/mix/serve">serving as a citizen</a></strong> — <code>mix --serve service.mix</code>, the supervised runtime.</li>
-<li><strong><a href="/mix/remote">remote execution (ssh)</a></strong> — <code>ssh_run</code>/<code>ssh_must</code>/<code>ssh_mix</code>, env transports.</li>
-<li><strong><a href="/mix/capabilities">capabilities &amp; embedding</a></strong> — the capability classes + sandbox model.</li>
-<li><strong><a href="/mix/expr-eval">expression evaluation mode</a></strong> — <code>eval_expr_string()</code>, the single-expression rule, the static deny walk.</li>
-</ul>
-<h2 id="reference">Reference</h2>
-<ul>
-<li><strong><a href="/mix/builtins">builtin index</a></strong> — every builtin by category.</li>
-<li><strong><a href="/mix/keywords">reserved words</a></strong> — the keyword set, keywords-as-names.</li>
-<li><strong><a href="/mix/shell-mode">shell-dispatch mode</a></strong> — pipes, <code>&amp;&amp;</code>, brace expansion, <code>$(...)</code>, redirects.</li>
-<li><strong><a href="/mix/stats">usage statistics</a></strong> — runtime modes, report windows, persistence, kill switch, static coverage.</li>
-</ul>
-<h2 id="design-docs--specs">Design docs &amp; specs</h2>
-<p>Design docs, background rationale, and the formal specs (04 language
-reference, 18 citizen runtime) all live in the operator control repo since
-2026-07-23; this manual is the complete public reference.</p>
+        <div id="content-doc" data-prerendered="mix/gotchas.md"><div class="prose"><h1 id="gotchas--what-you-will-guess-wrong-on-your-first-try">gotchas — what you will guess wrong on your first try</h1>
+<p>Mix has almost no presence in any model's training data, so a new session
+extrapolates from bash, Python and JavaScript — and several of those guesses
+are <strong>silently wrong</strong>: they run, produce a value, and mean something else.
+This page is the list of them.</p>
+<p>Read it before writing Mix. It is the one page that pays for itself in a
+single session. <code>mix man syntax</code> is the mental model; this is the errata.</p>
+<p>Every row below is executed by <code>cargo test -p cosmix-mix --test man_gotchas</code>,
+which runs the <strong>probe</strong> column through <code>mix -c</code> and compares the <strong>prints</strong>
+column. A wrong row fails the build, so the page cannot rot into confident
+fiction.</p>
+<h2 id="the-table">The table</h2>
+<p>A <code>prints</code> cell starting with <code>!</code> means the probe <strong>fails</strong>, and that text
+must appear in the error.</p>
+<table><thead><tr><th>you will guess</th><th>Mix is</th><th>probe</th><th>prints</th></tr></thead><tbody>
+<tr><td>a bare name reads the variable</td><td>a bare word is a <strong>string literal</strong> — <code>$</code> is not optional, and omitting it is silent</td><td><code>$x = 5; print(x)</code></td><td><code>x</code></td></tr>
+<tr><td><code>"hi $name"</code> interpolates</td><td>only <code>${...}</code> interpolates; a bare <code>$name</code> in a string is <strong>literal text</strong></td><td><code>$n = "world"; print("hi $n")</code></td><td><code>hi $n</code></td></tr>
+<tr><td>— so use braces</td><td><code>${name}</code> — same rule in heredocs</td><td><code>$n = "world"; print("hi ${n}")</code></td><td><code>hi world</code></td></tr>
+<tr><td><code>elseif</code></td><td><code>elif</code></td><td><code>if 1 == 2 then print("a") elif 1 == 1 then print("b") end</code></td><td><code>b</code></td></tr>
+<tr><td><code>str(x)</code></td><td><code>to_string(x)</code></td><td><code>print(to_string(5))</code></td><td><code>5</code></td></tr>
+<tr><td><code>print(a, b)</code></td><td><code>print</code> takes <strong>one</strong> argument; join with <code>..</code></td><td><code>print("a" .. "b")</code></td><td><code>ab</code></td></tr>
+<tr><td><code>run()</code> returns a status</td><td><code>run()</code> <strong>raises</strong> on a non-zero exit; <code>run_rc()</code> returns the code</td><td><code>print(run_rc("false").rc)</code></td><td><code>1</code></td></tr>
+<tr><td><code>read_file()</code> returns nil when missing</td><td>it <strong>raises</strong>; test with <code>is_file()</code> first</td><td><code>print(is_file("/no/such/file"))</code></td><td><code>false</code></td></tr>
+<tr><td><code>push</code> mutates any list</td><td><code>push</code> writes through the <strong>slot</strong>; on a nested list it is a silent <strong>no-op</strong></td><td><code>$m = {a: [1]}; push($m.a, 2); print($m)</code></td><td><code>{a: [1]}</code></td></tr>
+<tr><td>— so how</td><td>read it out, push, store it back</td><td><code>$m = {a: [1]}; $i = $m.a; push($i, 2); $m["a"] = $i; print($m)</code></td><td><code>{a: [1, 2]}</code></td></tr>
+<tr><td>a declared <code>fn</code> name is a value</td><td>a <strong>lambda</strong> is a real value, but a declared <code>fn</code>'s bare name is the <strong>string</strong> <code>"f"</code></td><td><code>fn f($x) return $x end; $g = f; print($g)</code></td><td><code>f</code></td></tr>
+<tr><td>— so how do I pass one</td><td>assign a lambda: <code>$f = fn($x) = …</code>, which is a <code>function</code> and works in <code>map</code>/<code>filter</code></td><td><code>$f = fn($x) = $x + 1; print(map([1, 2], $f))</code></td><td><code>[2, 3]</code></td></tr>
+<tr><td>a <code>fn</code> can write an outer variable</td><td>assignment inside <code>fn</code> binds a <strong>local</strong>; return the value instead</td><td><code>$n = 1; fn bump() $n = 99 end; bump(); print($n)</code></td><td><code>1</code></td></tr>
+<tr><td><code>catch $e</code> gives an error object</td><td><code>$e</code> is the <strong>message string</strong>; use <code>catch $msg, $err</code> for <code>$err.code</code></td><td><code>try raise("E_X", "boom") catch $m, $e print($e.code) end</code></td><td><code>E_X</code></td></tr>
+<tr><td><code>raise("boom")</code></td><td><code>raise(CODE, MESSAGE)</code> — one argument is an arity error</td><td><code>try raise("E_X", "boom") catch $m print($m) end</code></td><td><code>boom</code></td></tr>
+<tr><td><code>json_decode()</code></td><td><code>json_parse()</code> (and <code>json_encode()</code> the other way)</td><td><code>print(json_parse("{\"a\":1}").a)</code></td><td><code>1</code></td></tr>
+<tr><td><code>==</code> compares two maps</td><td>it <strong>raises</strong> rather than answer a useless <code>false</code></td><td><code>print(deep_eq([1, 2], [1, 2]))</code></td><td><code>true</code></td></tr>
+<tr><td><code>re_replace(pattern, s, ...)</code></td><td><strong>subject first</strong>: <code>re_replace(s, pattern, replacement)</code></td><td><code>print(re_replace("a1b", "[0-9]", "#"))</code></td><td><code>a#b</code></td></tr>
+<tr><td><code>sort_by</code> takes a direction</td><td>ascending only, with a lambda; <code>reverse()</code> for descending</td><td><code>print(sort_by([3, 1, 2], fn($x) = $x))</code></td><td><code>[1, 2, 3]</code></td></tr>
+<tr><td><code>'~/x'</code> expands</td><td>only a <strong>double</strong>-quoted <code>"~/x"</code> expands <code>~</code></td><td><code>print('~/x')</code></td><td><code>~/x</code></td></tr>
+<tr><td><code>send svc-name verb</code></td><td>a bare hyphenated target parses as <strong>subtraction</strong>; quote it or bind it</td><td><code>send shell-ctl88 shell.debug.status timeout=1</code></td><td><code>!cannot use 'shell' as number</code></td></tr>
+<tr><td>— so quote it</td><td>a quoted string or a <code>$var</code> takes the normal path</td><td><code>$s = "shell-ctl88"; print($s)</code></td><td><code>shell-ctl88</code></td></tr>
+<tr><td><code>replace()</code> tells you it missed</td><td>it returns the input unchanged, silently — check, or use <code>mix edit</code></td><td><code>print(replace("abc", "zz", "!"))</code></td><td><code>abc</code></td></tr>
+<tr><td><code>mix -c 'print(x)'</code> needs escaping gymnastics</td><td>it does not; a probe is one call and the binary is the oracle</td><td><code>print(mix_version() != "")</code></td><td><code>true</code></td></tr>
+</tbody></table>
+<h2 id="three-rules-that-are-not-a-syntax-trap">Three rules that are not a syntax trap</h2>
+<p>These cost more than any row above, and no probe can catch them.</p>
+<ol>
+<li><strong>Never <code>sed -i</code>, never Python.</strong> A one-line edit is <code>mix edit FILE OLD NEW</code>
+— exact match, refuses an absent or ambiguous needle (see
+<a href="/mix/cli">the mix command</a>). A script is a <code>.mix</code> file. If Mix genuinely
+cannot do something, that is a <strong>reportable gap in Mix</strong>, not a licence to
+reach for another language.</li>
+<li><strong>Never <code>ssh host 'bash -c "…"'</code>.</strong> Use
+<code>ssh_mix(host, source, {bindings: {…}})</code> — it ships the source over ssh
+stdin into <code>mix -</code>, bypassing <strong>all</strong> shell quoting, and <code>bindings</code> passes
+values in as <code>$name</code> assignments instead of string-interpolating them.
+Quoting a remote loop by hand fails in ways that look remote and are local.
+See <a href="/mix/remote">remote execution</a>.</li>
+<li><strong>Probe, do not extrapolate.</strong> <code>mix -c '&lt;code&gt;'</code> answers in under a second
+and the binary outranks every document, including this one. <code>mix builtins NAME</code> gives the exact signature, <code>mix what NAME</code> the one-liner, <code>mix lint FILE</code> the call-contract check before you run anything non-trivial.</li>
+</ol>
 <h2 id="see-also">See also</h2>
-<pre><code>mix help              the full categorized builtin reference
-mix builtins [CAT]    list builtins, optionally by category
-mix what NAME         one-line description of a builtin or keyword
-mix man TOPIC         read any of the pages above in the terminal
-</code></pre>
-<p>For AI agents: <a href="https://github.com/markc/cosmix/blob/main/AGENTS.md"><code>AGENTS.md</code></a> at
-the repo root is a short orientation sheet whose canonical reference is this
-manual.</p></div></div>
+<ul>
+<li><a href="/mix/syntax">syntax &amp; the classifier</a> — the mental model these are errata to.</li>
+<li><a href="/mix/cli">the mix command</a> — <code>mix edit</code>, <code>mix lint</code>, <code>mix what</code>, <code>mix man</code>.</li>
+<li><a href="/mix/errors">errors &amp; exit handling</a> — the full <code>try</code>/<code>catch</code>/<code>raise</code> model.</li>
+<li><a href="/mix/collections">collections</a> — why <code>push</code> writes through a slot.</li>
+</ul></div></div>
     </div>
 
 </main>

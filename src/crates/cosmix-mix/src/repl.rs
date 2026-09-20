@@ -964,6 +964,24 @@ pub fn run_repl() -> i32 {
                                             println!("Usage: mix diagnose on|off");
                                         }
                                     },
+                                    // `mix edit` owns an exit code, so like
+                                    // the one-shot CLI it cannot ride
+                                    // `meta::dispatch` (which returns
+                                    // nothing and would report the name as
+                                    // an unknown meta-command). The whole
+                                    // point of the subcommand is a one-line
+                                    // edit FROM A PROMPT, and Mix is the
+                                    // login shell here — so the REPL is the
+                                    // prompt it has to work at. The rc lands
+                                    // in `$status` like any other command.
+                                    Some("edit") => {
+                                        let owned: Vec<String> = meta_args[1..]
+                                            .iter()
+                                            .map(|s| (*s).to_string())
+                                            .collect();
+                                        let rc = crate::edit::run_edit(&owned);
+                                        eval.set_global("status", Value::Number(f64::from(rc)));
+                                    }
                                     Some("stats") => match eval.stats_mut() {
                                         Some(mut stats) => {
                                             let _ = stats_io::cmd_stats_dispatch(
@@ -1042,7 +1060,7 @@ pub fn run_repl() -> i32 {
                                 // meta name and keeps plain command
                                 // tracking.
                                 let is_meta_name =
-                                    matches!(sub, "stats" | "lint" | "--version" | "-V")
+                                    matches!(sub, "stats" | "lint" | "edit" | "--version" | "-V")
                                         || crate::META_CLI_COMMANDS.contains(&sub);
                                 if is_meta_name {
                                     plumbed_meta_recorded = true;

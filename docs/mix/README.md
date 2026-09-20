@@ -18,6 +18,7 @@ there. The same files render everywhere:
 - **[invocation & CLI](invocation.md)** — `mix file`, `-c`, `-`, `-i`, login shell, `--serve`, flags.
 - **[the mix command](cli.md)** — `mix help`/`man`/`builtins`/`what`/`status`/`trace`/… meta-commands.
 - **[syntax & the classifier](syntax.md)** — tokens, the newline rule, shell-vs-Mix dispatch.
+- **[gotchas](gotchas.md)** — the guesses from bash/Python/JS that are silently wrong here. Read it first.
 
 ## The language
 

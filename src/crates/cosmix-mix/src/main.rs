@@ -25,6 +25,7 @@ macro_rules! eprintln {
 mod bus;
 mod completion;
 mod cosmix_paths;
+mod edit;
 pub mod editor;
 mod exec;
 mod job_control;
@@ -1977,6 +1978,15 @@ fn real_main() -> i32 {
                 // is shadowed like the meta names — run it as ./lint.
                 let sub_args: Vec<String> = args[i + 1..].to_vec();
                 return lint::run_lint(&sub_args, VERSION);
+            }
+            "edit" => {
+                // `mix edit` owns its exit code (0 edited / 1 absent /
+                // 2 ambiguous / 3 usage), which is the whole point of
+                // the subcommand — so like `lint` it cannot ride the
+                // meta path, which exits 0 unconditionally. A CWD
+                // script named `edit` is shadowed; run it as ./edit.
+                let sub_args: Vec<String> = args[i + 1..].to_vec();
+                return edit::run_edit(&sub_args);
             }
             name if META_CLI_COMMANDS.contains(&name) => {
                 // One-shot meta command — `mix help`, `mix builtins`,

@@ -805,6 +805,74 @@ mix stats meta         meta-command counts               mix stats all        ag
 mix stats errors       error-kind counts                 mix stats week W     one week (e.g. 2026-W27)
 mix stats trend NAME / since DATE / query SQL            SQLite history
 </code></pre>
+<h2 id="files--mix-edit-the-one-line-edit-that-refuses-to-guess">Files — <code>mix edit</code>, the one-line edit that refuses to guess</h2>
+<pre><code>mix edit [--all] [-n|--dry-run] FILE OLD NEW
+</code></pre>
+<p>Replace <strong>OLD</strong> with <strong>NEW</strong> in <strong>FILE</strong>. OLD is matched <em>exactly</em> —
+byte-for-byte, no pattern syntax, no delimiter to choose, nothing to escape.</p>
+<p>This exists to remove the <code>sed -i</code> reflex, which was never about the language:
+a one-line edit <em>from a prompt</em> had no Mix shape shorter than writing a <code>.mix</code>
+file. So the contract is the opposite of <code>sed</code>'s on the two axes that actually
+bite:</p>
+<table><thead><tr><th></th><th><code>sed -i 's/OLD/NEW/'</code></th><th><code>mix edit</code></th></tr></thead><tbody>
+<tr><td>OLD is not present</td><td>exit <strong>0</strong>, file unchanged, says nothing</td><td>exit <strong>1</strong>, file unchanged, says so</td></tr>
+<tr><td>OLD occurs twice</td><td>edits the first match <strong>on every line</strong> (all of them with <code>g</code>), silently</td><td>exit <strong>2</strong>, <strong>writes nothing</strong>, names every matching line</td></tr>
+<tr><td>OLD contains <code>.</code> <code>*</code> <code>/</code> <code>[</code></td><td>matches other text, or is a syntax error</td><td>a literal dot, star, slash, bracket</td></tr>
+<tr><td>what changed</td><td>nothing printed</td><td>the changed line, as <code>-</code>/<code>+</code></td></tr>
+</tbody></table>
+<pre><code>$ mix edit src/main.rs "0.89.2" "0.89.3"
+src/main.rs:3
+- version = "0.89.2"
++ version = "0.89.3"
+</code></pre>
+<p>An ambiguous needle is a refusal, not a choice:</p>
+<pre><code>$ mix edit conf.mix "port = 8080" "port = 9090"
+mix edit: conf.mix: OLD occurs 2 times; file unchanged
+  conf.mix:4: port = 8080
+  conf.mix:19: port = 8080
+Pass --all to edit every occurrence, or give a longer OLD.
+</code></pre>
+<p><strong>Exit codes</strong> — the reason this is a subcommand and not a meta-command
+(meta-commands all exit 0):</p>
+<table><thead><tr><th>rc</th><th>meaning</th><th>file</th></tr></thead><tbody>
+<tr><td>0</td><td>edited</td><td>written</td></tr>
+<tr><td>1</td><td>OLD not found</td><td>untouched</td></tr>
+<tr><td>2</td><td>OLD occurs more than once and <code>--all</code> was not given</td><td>untouched</td></tr>
+<tr><td>3</td><td>usage error, unreadable/unwritable file, or non-UTF-8 input</td><td>untouched</td></tr>
+</tbody></table>
+<p><code>--all</code> is the explicit opt-in to edit every occurrence. <code>-n</code> / <code>--dry-run</code>
+reports the matches and writes nothing.</p>
+<p><strong>Flags come first, then <code>FILE OLD NEW</code> verbatim.</strong> Option parsing stops at the
+first non-flag argument, so OLD and NEW can be any text at all —
+<code>mix edit f.rs "=&gt;" "-&gt;"</code> and <code>mix edit f.rs 1 -1</code> are ordinary edits, not
+unknown options. <code>--</code> forces the switch early, for a FILE that starts with a
+dash. A flag <em>after</em> FILE is a usage error that says so.</p>
+<p>Other properties worth knowing:</p>
+<ul>
+<li><strong>OLD may span lines.</strong> Pass a <code>"one\ntwo"</code> and the two-line block is one
+needle. The printed diff shows every line the edit touches, on both sides.</li>
+<li><strong>Overlapping candidates are not an ambiguity.</strong> <code>aa</code> in <code>aaa</code> is one
+occurrence, because that is what the edit will actually replace — counting
+overlaps would refuse an edit that was never ambiguous.</li>
+<li><strong>The write is atomic.</strong> A sibling temp file is created <code>O_EXCL</code> at 0600,
+written, fsynced, given the original's permission bits and renamed over it.
+An interrupted run leaves the old file intact, an edited script keeps its
+executable bit, and a pre-placed file or symlink at the temp path is refused
+rather than followed.</li>
+<li><strong>A symlinked FILE is followed.</strong> The edit lands on the target and the link
+survives as a link — renaming over the link itself would silently replace it
+with a regular file and leave the real target stale.</li>
+<li><strong>A file that changed since it was read is refused</strong> (rc 3, nothing written),
+so a concurrent edit or an editor save is a refusal rather than a silent
+overwrite. This narrows the race to the gap between the re-check and the
+rename; it is not a lock, and a writer landing inside that gap still wins.</li>
+<li><strong><code>OLD == NEW</code> is a usage error</strong> (rc 3), not a no-op, because it is
+invariably a mistake.</li>
+</ul>
+<p><code>mix edit</code> works at the interactive Mix prompt as well as from the OS shell;
+there the exit code lands in <code>$status</code>.</p>
+<p>In a script, the equivalent is <a href="/mix/strings"><code>replace_must()</code></a> — same
+refuse-on-absent semantics, as a builtin.</p>
 <h2 id="ecosystem--probe-the-bus-mesh">Ecosystem — probe the Bus mesh</h2>
 <p>These query the local <a href="/mix/bus">noded</a> broker for its registered Bus service
 roster (the mesh is TCP noded — <code>ws://&lt;wg-ip&gt;:4200/ws</code> — resolved the same way

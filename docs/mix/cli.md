@@ -481,6 +481,91 @@ mix stats errors       error-kind counts                 mix stats week W     on
 mix stats trend NAME / since DATE / query SQL            SQLite history
 ```
 
+## Files — `mix edit`, the one-line edit that refuses to guess
+
+```
+mix edit [--all] [-n|--dry-run] FILE OLD NEW
+```
+
+Replace **OLD** with **NEW** in **FILE**. OLD is matched *exactly* —
+byte-for-byte, no pattern syntax, no delimiter to choose, nothing to escape.
+
+This exists to remove the `sed -i` reflex, which was never about the language:
+a one-line edit *from a prompt* had no Mix shape shorter than writing a `.mix`
+file. So the contract is the opposite of `sed`'s on the two axes that actually
+bite:
+
+| | `sed -i 's/OLD/NEW/'` | `mix edit` |
+|---|---|---|
+| OLD is not present | exit **0**, file unchanged, says nothing | exit **1**, file unchanged, says so |
+| OLD occurs twice | edits the first match **on every line** (all of them with `g`), silently | exit **2**, **writes nothing**, names every matching line |
+| OLD contains `.` `*` `/` `[` | matches other text, or is a syntax error | a literal dot, star, slash, bracket |
+| what changed | nothing printed | the changed line, as `-`/`+` |
+
+```
+$ mix edit src/main.rs "0.89.2" "0.89.3"
+src/main.rs:3
+- version = "0.89.2"
++ version = "0.89.3"
+```
+
+An ambiguous needle is a refusal, not a choice:
+
+```
+$ mix edit conf.mix "port = 8080" "port = 9090"
+mix edit: conf.mix: OLD occurs 2 times; file unchanged
+  conf.mix:4: port = 8080
+  conf.mix:19: port = 8080
+Pass --all to edit every occurrence, or give a longer OLD.
+```
+
+**Exit codes** — the reason this is a subcommand and not a meta-command
+(meta-commands all exit 0):
+
+| rc | meaning | file |
+|---|---|---|
+| 0 | edited | written |
+| 1 | OLD not found | untouched |
+| 2 | OLD occurs more than once and `--all` was not given | untouched |
+| 3 | usage error, unreadable/unwritable file, or non-UTF-8 input | untouched |
+
+`--all` is the explicit opt-in to edit every occurrence. `-n` / `--dry-run`
+reports the matches and writes nothing.
+
+**Flags come first, then `FILE OLD NEW` verbatim.** Option parsing stops at the
+first non-flag argument, so OLD and NEW can be any text at all —
+`mix edit f.rs "=>" "->"` and `mix edit f.rs 1 -1` are ordinary edits, not
+unknown options. `--` forces the switch early, for a FILE that starts with a
+dash. A flag *after* FILE is a usage error that says so.
+
+Other properties worth knowing:
+
+- **OLD may span lines.** Pass a `"one\ntwo"` and the two-line block is one
+  needle. The printed diff shows every line the edit touches, on both sides.
+- **Overlapping candidates are not an ambiguity.** `aa` in `aaa` is one
+  occurrence, because that is what the edit will actually replace — counting
+  overlaps would refuse an edit that was never ambiguous.
+- **The write is atomic.** A sibling temp file is created `O_EXCL` at 0600,
+  written, fsynced, given the original's permission bits and renamed over it.
+  An interrupted run leaves the old file intact, an edited script keeps its
+  executable bit, and a pre-placed file or symlink at the temp path is refused
+  rather than followed.
+- **A symlinked FILE is followed.** The edit lands on the target and the link
+  survives as a link — renaming over the link itself would silently replace it
+  with a regular file and leave the real target stale.
+- **A file that changed since it was read is refused** (rc 3, nothing written),
+  so a concurrent edit or an editor save is a refusal rather than a silent
+  overwrite. This narrows the race to the gap between the re-check and the
+  rename; it is not a lock, and a writer landing inside that gap still wins.
+- **`OLD == NEW` is a usage error** (rc 3), not a no-op, because it is
+  invariably a mistake.
+
+`mix edit` works at the interactive Mix prompt as well as from the OS shell;
+there the exit code lands in `$status`.
+
+In a script, the equivalent is [`replace_must()`](strings.md) — same
+refuse-on-absent semantics, as a builtin.
+
 ## Ecosystem — probe the Bus mesh
 
 These query the local [noded](bus.md) broker for its registered Bus service

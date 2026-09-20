@@ -376,6 +376,7 @@ Run `mix builtins` for the full remit of all {count} built-in functions
 - Introspect   `vars`  `functions`  `aliases`  `all`  `type`  `config`  `status`
 - Build        `build`  `clean`  `update`  `test`
 - Diagnostics  `doctor`  `stats`  `time`  `check`  `lint`  `trace`  `history`  `reload`
+- Files        `edit <file> <old> <new>`  exact-match one-line edit (refuses an ambiguous or absent needle)
 - Ecosystem    `mesh`  `ports`  `ping <svc>`
 - AI-powered   `fix`  `extend`  `review`  `explain`  `evolve`  `dogfood`  `fuzz`  `teach`
 
