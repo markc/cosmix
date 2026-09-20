@@ -1,0 +1,54 @@
+[package]
+name = "cosmix-term"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+description = "CosMix Wayland terminal on iced + wgpu (lightweight frontend)"
+
+[[bin]]
+name = "term"
+path = "src/main.rs"
+
+# The global Bus name `term` and the `term.*` verb namespace belong to this
+# frontend (TODO-term D1, 2026-09-21); the Bevy one is `bterm` / `bterm.*`.
+# Neither is registered yet — T2 is the render loop and the weight budget, and
+# the verb surface is T6.
+[package.metadata.cosmix]
+kind = "app"
+component = "term"
+display = "CosMix Term"
+engine = "iced"
+
+[features]
+default = ["wgpu"]
+# The shader-widget path: one persistent wgpu texture, damage-band uploads.
+wgpu = ["iced/wgpu"]
+# D7's booked second arm: iced's CPU rasteriser into `wl_shm`, no DRM fd at
+# all. Build it ALONE (`--no-default-features --features tiny-skia`) — with
+# both compiled in, iced_renderer picks wgpu and the arm measures nothing.
+tiny-skia = ["iced/tiny-skia", "iced/image"]
+
+[build-dependencies]
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+
+[dependencies]
+# iced 0.14 (D3), its own winit/Wayland backend (D2). default-features off is
+# not tidiness: `x11`, `tiny-skia`, `fira-sans` and the theme-detection D-Bus
+# client are all dead weight in a Wayland-only terminal that renders a texture
+# and draws no iced text, and the binary budget is 25 MB (T5).
+iced = { version = "=0.14.0", default-features = false, features = [
+    "advanced",
+    "crisp",
+    "thread-pool",
+    "wayland",
+] }
+# PTY, VT grid, damage-rect raster, config, `--version`. No Wayland, no Bevy.
+cosmix-term-core = { path = "../../crates/cosmix-term-core" }
+# Every colour on screen that is not the VT's own comes from here (mandatory
+# theming, Mark 2026-09-18). `compiler` resolves the embedded default design.
+cosmix-design = { path = "../../crates/cosmix-design", features = ["compiler"] }
+cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets" }
+cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
+libc = "0.2.189"
+serde_json = "1"

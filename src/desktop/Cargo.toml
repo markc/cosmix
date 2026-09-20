@@ -16,6 +16,7 @@ members = [
     "apps/capture",
     "apps/media",
     "apps/bterm",
+    "apps/term",
     "crates/cosmix-design",
     "crates/cosmix-iced-widgets",
     "crates/cosmix-scene",
