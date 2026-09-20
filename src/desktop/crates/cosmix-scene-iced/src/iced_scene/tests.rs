@@ -876,3 +876,49 @@ fn the_pre_bridge_queue_is_bounded() {
     assert_eq!(actions.len(), MAX_QUEUED_ACTIONS);
     assert!(actions.iter().all(|action| action.handler == "go"));
 }
+
+/// Renders the same scene at scale 1.0 and at 2.5 and writes both pixmaps,
+/// so a sharpness check has the control it needs.
+///
+/// The nested harness cannot produce this pair: its output scale is the
+/// host's, `cosmix-comp` has no nested `--scale`, and nested screencopy
+/// captures at logical resolution, which makes a screenshot-based check
+/// vacuous. Both renders here go through the real `IcedSceneRenderer`, so
+/// the 2.5 arm is the same code the live surface runs; the live dump
+/// (`COSMIX_SCENE_ICED_DUMP`) is what ties the two together.
+///
+/// Ignored by default; run it as
+/// `COSMIX_SCENE_ICED_DUMP=<dir> cargo test -p cosmix-scene-iced --features iced
+///  -- --ignored dump_sharpness_pixmaps --nocapture`.
+#[test]
+#[ignore = "writes pixmaps for the 250% sharpness comparison"]
+fn dump_sharpness_pixmaps() {
+    const LOGICAL_W: u32 = 400;
+    const LOGICAL_H: u32 = 300;
+    let dir = std::path::PathBuf::from(
+        std::env::var("COSMIX_SCENE_ICED_DUMP").expect("COSMIX_SCENE_ICED_DUMP=<dir>"),
+    );
+    std::fs::create_dir_all(&dir).expect("dump directory");
+    for scale in [1.0f32, 2.5f32] {
+        let width = (LOGICAL_W as f32 * scale).round() as u32;
+        let height = (LOGICAL_H as f32 * scale).round() as u32;
+        let mut rig = Rig::new(CONFORMANCE, width, height, scale);
+        rig.settle();
+        let text = rig.physical("text", 0.0);
+        let stem = format!("sharpness-{scale}");
+        std::fs::write(dir.join(format!("{stem}.rgba")), &rig.buffer).expect("pixels");
+        std::fs::write(
+            dir.join(format!("{stem}.geometry")),
+            format!(
+                "{width} {height} {scale} premultiplied-rgba8\ntext {} {} {} {}\n",
+                text.x, text.y, text.w, text.h
+            ),
+        )
+        .expect("geometry");
+        println!(
+            "SHARPNESS_DUMP scale={scale} surface={width}x{height} \
+             text_node={}x{}+{}+{}",
+            text.w, text.h, text.x, text.y
+        );
+    }
+}

@@ -298,6 +298,38 @@ pub(crate) fn roll_counters(
     }
 }
 
+/// `COSMIX_SCENE_ICED_DUMP=<dir>` writes the CPU surface each draw leaves
+/// behind, so a gate can read the pixels the renderer actually produced
+/// rather than a compositor's rescaled copy of them. Nested screencopy
+/// captures at logical resolution, which makes a screenshot-based sharpness
+/// check vacuous; this is the same escape test B used (dump the client's own
+/// buffer). Off unless the variable is set, and never read in production.
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("COSMIX_SCENE_ICED_DUMP").map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+/// Writes the visible part of `buffer` (premultiplied RGBA8, `stride` bytes
+/// per row) as raw pixels plus a one-line sidecar naming the geometry.
+fn dump_surface(entity: Entity, buffer: &[u8], size: UVec2, stride: u32, scale: f32) {
+    let Some(dir) = dump_dir() else { return };
+    let mut pixels = Vec::with_capacity((size.x as usize) * (size.y as usize) * 4);
+    for y in 0..size.y {
+        let start = (y * stride) as usize;
+        pixels.extend_from_slice(&buffer[start..start + size.x as usize * 4]);
+    }
+    let stem = dir.join(format!("surface-{}", entity.index()));
+    if let Err(error) = std::fs::write(stem.with_extension("rgba"), &pixels) {
+        warn!("scene-iced dump: {error}");
+        return;
+    }
+    let _ = std::fs::write(
+        stem.with_extension("geometry"),
+        format!("{} {} {} premultiplied-rgba8\n", size.x, size.y, scale),
+    );
+}
+
 pub(crate) struct Trace(bool);
 
 impl Default for Trace {
@@ -1103,6 +1135,7 @@ pub(crate) fn frame(
         let state = &mut *state;
         let stride = state.texture.x * 4;
         let damage = renderer.draw(&mut state.buffer, size.x, size.y, stride);
+        dump_surface(entity, &state.buffer, size, stride, state.scale);
         let damage = if state.repaint {
             vec![Rect::new(0, 0, size.x, size.y)]
         } else {
