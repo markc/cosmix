@@ -47,9 +47,8 @@ impl Frame {
         coalesce(std::mem::take(&mut self.damage))
     }
 
-    /// Drop pending damage because the whole surface is about to be uploaded
-    /// anyway (a renderer that just created its texture).
-    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+    /// Drop pending damage: the wgpu arm calls it when it is about to upload
+    /// the whole surface anyway, the CPU arm on every rebuilt handle.
     pub fn clear_damage(&mut self) {
         self.damage.clear();
     }
@@ -112,22 +111,64 @@ impl Painter {
         self.raster.scale
     }
 
-    /// Swap in a raster built for a new scale or font size. The next repaint
-    /// redraws everything, because the surface's recorded cell size no longer
-    /// matches — that check lives in `render_into`, not here.
+    /// Swap in a raster built for a new scale or font size, and force a full
+    /// repaint.
+    ///
+    /// The invalidation is NOT belt-and-braces. `render_into` decides "is a
+    /// full repaint owed?" from the surface's recorded cell size, and two
+    /// different font sizes can round to the same integer cell — 13.0 px and
+    /// 12.9 px both give an 8x16 DejaVuSansMono cell, with visibly different
+    /// glyphs inside it (cold-review finding, 2026-09-21, reproduced). The
+    /// swap is the only place that knows the raster changed, so it is the
+    /// only place that can say so.
     pub fn replace_raster(&mut self, raster: Raster) {
         self.raster = raster;
+        self.invalidate();
+    }
+
+    /// Force the next repaint to redraw every row.
+    ///
+    /// **A caller that changes which terminal it feeds this Painter MUST call
+    /// this first.** `dirty` describes the NEW terminal's damage, and a
+    /// terminal that has been sitting still reports nothing dirty — so a
+    /// same-geometry switch (a tab or pane change, T3) would leave the
+    /// previous occupant's pixels on every row the newcomer did not happen to
+    /// touch. Nothing in the types ties a surface to a terminal, which is why
+    /// this is stated rather than enforced (cold-review finding, 2026-09-21);
+    /// T2 holds by construction, with one terminal for the process's life.
+    pub fn invalidate(&mut self) {
+        let mut frame = self.frame.lock().expect("frame lock");
+        frame.surface.invalidate();
     }
 
     /// Rasterise `screen` into the shared surface, repainting only the rows
-    /// `dirty` marks. Returns whether anything was written.
+    /// `dirty` marks. Returns whether the frame changed.
+    ///
+    /// `screen` and `dirty` must come from consecutive `grid_snapshot` calls
+    /// on the SAME terminal; see [`Painter::invalidate`].
     pub fn repaint(&mut self, screen: &Screen, dirty: &[bool]) -> bool {
         let mut frame = self.frame.lock().expect("frame lock");
+        let before = frame.surface.grid();
         let bands = self.raster.render_into(screen, dirty, &mut frame.surface);
         if bands.is_empty() {
+            // An empty band list usually means "nothing changed" — but a
+            // screen with no paintable rows clears the surface and also
+            // returns nothing, and a renderer told "no change" would then go
+            // on presenting a texture whose source is gone (cold-review
+            // finding, 2026-09-21). The geometry is what distinguishes them.
+            if before != frame.surface.grid() {
+                frame.generation += 1;
+                frame.damage.clear();
+                return true;
+            }
             return false;
         }
         frame.damage.extend(bands);
+        // Coalesced on the way IN, not only on the way out: the CPU arm never
+        // drains bands (tiny-skia re-blits the whole handle), so without this
+        // the list would grow for the life of the process. Merging bounds it
+        // to at most one entry per two rows however long presentation stalls.
+        frame.damage = coalesce(std::mem::take(&mut frame.damage));
         frame.generation += 1;
         true
     }
@@ -208,6 +249,72 @@ mod tests {
         // so a renderer woken for an unrelated reason uploads nothing.
         assert!(!painter.repaint(&grid, &[false; 6]));
         assert_eq!(shared.lock().unwrap().generation(), 2);
+    }
+
+    /// Cold-review finding (2026-09-21, both arms): two font sizes can round
+    /// to the same integer cell — 13.0 px and 12.9 px are both 8x16 in
+    /// DejaVuSansMono — so `render_into`'s cell-size check cannot see the
+    /// swap. Only the swap site can.
+    #[test]
+    fn swapping_the_raster_repaints_even_when_the_cell_size_is_unchanged() {
+        let mut painter = painter();
+        let shared = painter.frame();
+        let grid = screen(8, 4, 'M');
+        let _ = painter.repaint(&grid, &[]);
+        let cell = painter.cell();
+
+        let other = Raster::new(1.0, 12.9, Cursor::Underline).expect("a monospace font");
+        assert_eq!(
+            (other.width, other.height),
+            cell,
+            "this test is only meaningful while the two sizes share a cell"
+        );
+        painter.replace_raster(other);
+        // Nothing dirty, same geometry — and it must still repaint whole.
+        assert!(painter.repaint(&grid, &[false; 4]));
+        assert_eq!(
+            shared.lock().unwrap().take_damage(),
+            vec![band(0, 4 * cell.1)]
+        );
+    }
+
+    /// The CPU arm never takes bands, so without coalescing on append the
+    /// list would grow for the life of the process (cold-review finding).
+    #[test]
+    fn damage_stays_bounded_when_nobody_drains_it() {
+        let mut painter = painter();
+        let shared = painter.frame();
+        let grid = screen(8, 4, 'M');
+        let _ = painter.repaint(&grid, &[]);
+        shared.lock().unwrap().clear_damage();
+        for _ in 0..500 {
+            let mut dirty = vec![false; 4];
+            dirty[1] = true;
+            assert!(painter.repaint(&grid, &dirty));
+        }
+        // Assert on the STORED list, not on `take_damage`'s output: that
+        // coalesces on the way out, so it would report one band however many
+        // are held, and the test would pass while the leak ran.
+        assert_eq!(
+            shared.lock().unwrap().damage.len(),
+            1,
+            "500 repaints of one row must be merged as they arrive, not held"
+        );
+    }
+
+    /// A surface cleared to nothing is a change, and a renderer told "no
+    /// change" would keep presenting pixels whose source is gone.
+    #[test]
+    fn clearing_the_surface_counts_as_a_change() {
+        let mut painter = painter();
+        let shared = painter.frame();
+        assert!(painter.repaint(&screen(8, 4, 'M'), &[]));
+        let generation = shared.lock().unwrap().generation();
+        assert!(painter.repaint(&screen(0, 0, ' '), &[]));
+        let frame = shared.lock().unwrap();
+        assert!(frame.surface().is_empty());
+        assert_eq!(frame.generation(), generation + 1);
+        assert!(frame.damage.is_empty(), "there is nothing left to upload");
     }
 
     #[test]

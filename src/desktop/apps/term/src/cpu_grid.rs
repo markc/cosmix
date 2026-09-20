@@ -21,7 +21,18 @@ pub fn refresh(
     cached: Option<(u64, Handle)>,
     frame: &Arc<Mutex<Frame>>,
 ) -> Option<(u64, Handle)> {
-    let frame = frame.lock().expect("frame lock");
+    let mut frame = frame.lock().expect("frame lock");
+    // Bands are the GPU arm's currency; tiny-skia re-blits the whole handle,
+    // so this arm consumes them purely to stop them accumulating for the life
+    // of the process (cold-review finding, 2026-09-21).
+    frame.clear_damage();
+    // Emptiness FIRST: a surface cleared by a zero-row screen must drop the
+    // handle even if the generation happened to match, or the widget keeps
+    // presenting pixels whose source no longer exists.
+    let surface = frame.surface();
+    if surface.width() == 0 || surface.height() == 0 {
+        return None;
+    }
     let generation = frame.generation();
     if let Some((cached_generation, _)) = &cached
         && *cached_generation == generation
@@ -29,9 +40,6 @@ pub fn refresh(
         return cached;
     }
     let surface = frame.surface();
-    if surface.width() == 0 || surface.height() == 0 {
-        return None;
-    }
     Some((
         generation,
         Handle::from_rgba(surface.width(), surface.height(), surface.rgba().to_vec()),

@@ -15,12 +15,28 @@
 use crate::frame::Frame;
 use iced::wgpu;
 use iced::widget::shader;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 /// The `Shader` program: it owns nothing but the handle to the shared frame.
 #[derive(Clone)]
 pub struct GridProgram {
     frame: Arc<Mutex<Frame>>,
+}
+
+/// Which grid a primitive is for.
+///
+/// iced keeps **one** `Pipeline` per `Primitive` TYPE, in a `Storage` keyed on
+/// that type's id — so every `GridPrimitive` in the tree shares one
+/// `GridPipeline`, and a single `texture` field on it would mean pane B's
+/// `prepare` overwriting pane A's texture and both `draw`s binding B's
+/// (cold-review finding, 2026-09-21). T3 puts two of these on screen, so the
+/// pipeline holds a texture per grid and each primitive addresses its own by
+/// the identity of the `Frame` it renders.
+type GridId = usize;
+
+fn grid_id(frame: &Arc<Mutex<Frame>>) -> GridId {
+    Arc::as_ptr(frame) as GridId
 }
 
 impl GridProgram {
@@ -68,16 +84,22 @@ impl shader::Primitive for GridPrimitive {
         _bounds: &iced::Rectangle,
         _viewport: &shader::Viewport,
     ) {
+        let id = grid_id(&self.frame);
+        pipeline.live.insert(id);
         let mut frame = self.frame.lock().expect("frame lock");
         let (width, height) = (frame.surface().width(), frame.surface().height());
         if width == 0 || height == 0 {
+            // The grid has no paintable rows. Drop the texture rather than
+            // keep presenting pixels whose source is gone.
+            pipeline.textures.remove(&id);
+            frame.clear_damage();
             return;
         }
         let stride = frame.surface().stride();
         // A texture that was just created holds nothing, so pending damage is
         // not merely stale, it is wrong: upload the lot and drop it.
-        if pipeline.ensure_texture(device, width, height) {
-            pipeline.upload(queue, frame.surface().rgba(), stride, 0, height);
+        if pipeline.ensure_texture(device, id, width, height) {
+            pipeline.upload(queue, id, frame.surface().rgba(), stride, 0, height);
             frame.clear_damage();
             return;
         }
@@ -87,13 +109,13 @@ impl shader::Primitive for GridPrimitive {
             let y = band.y.min(height);
             let rows = band.height.min(height - y);
             if rows > 0 {
-                pipeline.upload(queue, frame.surface().rgba(), stride, y, rows);
+                pipeline.upload(queue, id, frame.surface().rgba(), stride, y, rows);
             }
         }
     }
 
     fn draw(&self, pipeline: &Self::Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
-        let Some(texture) = &pipeline.texture else {
+        let Some(texture) = pipeline.textures.get(&grid_id(&self.frame)) else {
             // True regardless: the fallback `render` path would begin a whole
             // extra render pass to draw the nothing we have.
             return true;
@@ -119,16 +141,28 @@ pub struct GridPipeline {
     /// The texture's own format, chosen to make the sample -> write path an
     /// identity transform against whatever surface format iced gave us.
     format: wgpu::TextureFormat,
-    texture: Option<GridTexture>,
+    /// One entry per live grid; see [`GridId`].
+    textures: HashMap<GridId, GridTexture>,
+    /// Grids that prepared this frame. `trim` drops everything else, so a
+    /// closed pane's texture is freed on the next frame rather than living
+    /// until the process exits — and an `Arc` address reused by a new pane
+    /// cannot inherit the old pane's pixels.
+    live: HashSet<GridId>,
 }
 
 impl GridPipeline {
-    /// Creates or resizes the grid texture. Returns true when the caller now
+    /// Creates or resizes a grid's texture. Returns true when the caller now
     /// owes a full upload.
-    fn ensure_texture(&mut self, device: &wgpu::Device, width: u32, height: u32) -> bool {
+    fn ensure_texture(
+        &mut self,
+        device: &wgpu::Device,
+        id: GridId,
+        width: u32,
+        height: u32,
+    ) -> bool {
         if self
-            .texture
-            .as_ref()
+            .textures
+            .get(&id)
             .is_some_and(|texture| texture.width == width && texture.height == height)
         {
             return false;
@@ -162,20 +196,31 @@ impl GridPipeline {
                 },
             ],
         });
-        self.texture = Some(GridTexture {
-            bind_group,
-            texture,
-            width,
-            height,
-        });
+        self.textures.insert(
+            id,
+            GridTexture {
+                bind_group,
+                texture,
+                width,
+                height,
+            },
+        );
         true
     }
 
     /// Writes `rows` rows starting at `y` from the CPU surface. `rgba` is the
     /// whole surface; the row offset rides in the copy layout, so no slice and
     /// no temporary buffer is made for a band.
-    fn upload(&self, queue: &wgpu::Queue, rgba: &[u8], stride: usize, y: u32, rows: u32) {
-        let Some(target) = &self.texture else {
+    fn upload(
+        &self,
+        queue: &wgpu::Queue,
+        id: GridId,
+        rgba: &[u8],
+        stride: usize,
+        y: u32,
+        rows: u32,
+    ) {
+        let Some(target) = self.textures.get(&id) else {
             return;
         };
         queue.write_texture(
@@ -293,7 +338,14 @@ impl shader::Pipeline for GridPipeline {
             layout,
             sampler,
             format: texture_format,
-            texture: None,
+            textures: HashMap::new(),
+            live: HashSet::new(),
         }
+    }
+
+    /// Called by iced at the end of each frame.
+    fn trim(&mut self) {
+        self.textures.retain(|id, _| self.live.contains(id));
+        self.live.clear();
     }
 }

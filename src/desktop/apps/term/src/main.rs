@@ -135,6 +135,8 @@ fn run(settings: config::Settings) -> Result<(), String> {
     let waker = Arc::new(Waker {
         fd: WakeFd::new().map_err(|e| format!("wake descriptor: {e}"))?,
         pending: AtomicBool::new(false),
+        sender: Mutex::new(None),
+        polling: AtomicBool::new(false),
     });
     tabs.lock().expect("tabs").set_wake(waker.fd.waker());
     WAKER
@@ -231,6 +233,8 @@ impl iced::Executor for SingleThread {
     }
 }
 
+type WakeSender = iced::futures::channel::mpsc::UnboundedSender<Message>;
+
 struct Waker {
     fd: WakeFd,
     /// True between "the poll thread published a wake" and "the UI thread
@@ -239,6 +243,13 @@ struct Waker {
     /// nothing is ever dropped — a change landing after the UI thread cleared
     /// the flag publishes a fresh wake rather than being swallowed.
     pending: AtomicBool,
+    /// Where the poll thread publishes. Swapped, not recreated, when iced
+    /// rebuilds the subscription: a second poll thread would race the first
+    /// for the same eventfd, and the loser's drain would silently eat wakes
+    /// the winner never hears about (cold-review finding, 2026-09-21).
+    sender: Mutex<Option<WakeSender>>,
+    /// Set once, so exactly one thread ever owns the descriptor.
+    polling: AtomicBool,
 }
 
 static WAKER: OnceLock<Arc<Waker>> = OnceLock::new();
@@ -287,8 +298,24 @@ fn subscription(_state: &State) -> Subscription<Message> {
 fn wakes() -> impl iced::futures::Stream<Item = Message> {
     let (sender, receiver) = iced::futures::channel::mpsc::unbounded();
     let Some(waker) = WAKER.get().cloned() else {
+        // Only reachable if the wiring order in `run` changes. The window
+        // would come up and then never repaint, which reads as a hung shell
+        // rather than a broken terminal — so say which it is.
+        eprintln!("term: wake descriptor not installed before the event loop; the grid cannot repaint");
         return receiver;
     };
+    // Re-arm before publishing anywhere: if a previous subscription was torn
+    // down between the thread's `swap(true)` and the UI thread's clear, the
+    // flag would be stuck true and every later wake silently suppressed.
+    *waker.sender.lock().expect("wake sender") = Some(sender);
+    waker.pending.store(false, Ordering::Release);
+    // Also re-arm the descriptor: any wake the dropped receiver was holding
+    // is gone, so ask for one unconditionally rather than wait for the next
+    // PTY byte. A spurious repaint finds no damage and costs nothing.
+    waker.fd.waker()();
+    if waker.polling.swap(true, Ordering::AcqRel) {
+        return receiver; // The one poll thread is already running.
+    }
     let spawned = std::thread::Builder::new()
         .name("term-wake".into())
         .spawn(move || {
@@ -305,6 +332,15 @@ fn wakes() -> impl iced::futures::Stream<Item = Message> {
                     }
                     return;
                 }
+                // Ready-but-not-readable means the descriptor is broken, not
+                // that a wake arrived: `drain` would return false and the loop
+                // would re-poll instantly, spinning a core forever. Stop
+                // instead, and say so — a terminal that stops repainting is a
+                // visible failure; one that pins a core is a mystery.
+                if fds.revents & libc::POLLIN == 0 {
+                    eprintln!("term: wake descriptor failed (revents {}); repaints have stopped", fds.revents);
+                    return;
+                }
                 // Drain BEFORE publishing, never after: a change that lands
                 // while the UI thread reads the grid then leaves the
                 // descriptor readable for the next turn (one redundant,
@@ -312,17 +348,31 @@ fn wakes() -> impl iced::futures::Stream<Item = Message> {
                 if !waker.fd.drain() {
                     continue;
                 }
-                if !waker.pending.swap(true, Ordering::AcqRel)
-                    && sender.unbounded_send(Message::Wake).is_err()
-                {
-                    return; // iced has shut down.
+                if waker.pending.swap(true, Ordering::AcqRel) {
+                    continue; // A wake is already queued; this one coalesces.
+                }
+                let sender = waker.sender.lock().expect("wake sender").clone();
+                match sender {
+                    Some(sender) if sender.unbounded_send(Message::Wake).is_ok() => {}
+                    // The receiver is gone. Leave `pending` false so the next
+                    // subscription is not born latched shut, and keep polling:
+                    // this thread owns the descriptor for the process's life.
+                    _ => waker.pending.store(false, Ordering::Release),
                 }
             }
         });
     if let Err(error) = spawned {
-        eprintln!("term: no wake thread ({error}); the grid will not repaint");
+        waker_spawn_failed(&error);
     }
     receiver
+}
+
+fn waker_spawn_failed(error: &std::io::Error) {
+    // Not a warning to carry on past: with no poll thread the grid never
+    // repaints and the window is a frozen picture of the first frame, which
+    // looks like a hung shell rather than a failed terminal.
+    eprintln!("term: cannot start the wake thread ({error}); the grid would never repaint");
+    std::process::exit(1);
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
@@ -419,7 +469,14 @@ impl State {
     }
 
     fn resize(&mut self, window: Size) {
-        if self.window == window {
+        // `self.grid == (0, 0)` means no layout has happened yet, and it must
+        // force one even when the size is unchanged. Otherwise a compositor
+        // that grants exactly the requested 900x560 on a scale-1 output takes
+        // BOTH early returns — this one and `rescale`'s — and the grid stays
+        // zero-sized: a terminal window with nothing in it, forever
+        // (cold-review finding, 2026-09-21; invisible here only because the
+        // nested harness tiles and never grants the requested size).
+        if self.window == window && self.grid != (0, 0) {
             return;
         }
         self.window = window;
@@ -460,11 +517,15 @@ impl State {
         if (cols, rows) == self.grid {
             return;
         }
-        self.grid = (cols, rows);
         let tabs = self.tabs.lock().expect("tabs");
+        // Record the new grid only once it has reached a PTY. Recording it
+        // first and then bailing on an empty tab set would leave `self.grid`
+        // describing a resize nothing was told about, and the equality guard
+        // above would suppress the retry.
         if tabs.is_empty() {
             return;
         }
+        self.grid = (cols, rows);
         let id = tabs.active_tab().active_pane;
         let terminal = tabs.active_terminal();
         drop(tabs);

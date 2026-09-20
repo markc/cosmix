@@ -200,6 +200,10 @@ impl Raster {
     /// so a caller that cannot supply damage (`&[]`) still gets a correct
     /// frame — only a slower one.
     ///
+    /// A `screen` whose `cells` are shorter than `cols * rows` is painted as
+    /// the whole rows it does contain, and the surface is sized to those. The
+    /// returned bands therefore never claim a row this call did not write.
+    ///
     /// The returned bands are exactly the regions of `surface.rgba()` this
     /// call wrote. An empty result means the surface already holds the frame
     /// and the caller owes the GPU (or the compositor) nothing at all, which
@@ -216,50 +220,60 @@ impl Raster {
         dirty: &[bool],
         surface: &mut Surface,
     ) -> Vec<DamageBand> {
-        if screen.cols == 0 || screen.rows == 0 {
+        // `Screen`'s fields are public, so a cell array shorter than
+        // `cols * rows` is constructible even though `Terminal::capture` never
+        // produces one. Paint only the whole rows that actually exist: the
+        // alternative is a returned band claiming a row was repainted while
+        // the loop skipped it, which is a lie a renderer cannot detect and
+        // which leaves the old pixels — including an old cursor — on screen.
+        let rows = screen.rows.min(screen.cells.len() / screen.cols.max(1));
+        if screen.cols == 0 || rows == 0 {
             *surface = Surface::default();
             return Vec::new();
         }
         let cell = (self.width, self.height);
         let width = screen.cols * self.width as usize;
-        let height = screen.rows * self.height as usize;
+        let height = rows * self.height as usize;
         let bytes = width * height * 4;
         // The surface's own record decides, never the caller's: a Raster
         // rebuilt at a new scale changes `cell` while cols/rows stay put, and
         // that must still force a full repaint.
         let full = surface.cols != screen.cols
-            || surface.rows != screen.rows
+            || surface.rows != rows
             || surface.cell != cell
             || surface.rgba.len() != bytes;
         if full {
             surface.rgba.clear();
             surface.rgba.resize(bytes, 0);
             surface.cols = screen.cols;
-            surface.rows = screen.rows;
+            surface.rows = rows;
             surface.cell = cell;
             surface.width = width as u32;
             surface.height = height as u32;
             surface.cursor = None;
         }
-        let mut rows = vec![full; screen.rows];
+        let mut dirty_rows = vec![full; rows];
         if !full {
-            if dirty.len() == screen.rows {
-                rows.copy_from_slice(dirty);
+            // `dirty` is indexed against the VT's row count; a short cell
+            // array shrinks the surface but not the snapshot, so the slice is
+            // only trustworthy when both agree.
+            if dirty.len() == screen.rows && screen.rows == rows {
+                dirty_rows.copy_from_slice(dirty);
             } else {
-                rows.fill(true);
+                dirty_rows.fill(true);
             }
             if let Some((_, previous)) = surface.cursor
-                && previous < screen.rows
+                && previous < rows
             {
-                rows[previous] = true;
+                dirty_rows[previous] = true;
             }
-            if screen.cursor_visible && screen.cursor.1 < screen.rows {
-                rows[screen.cursor.1] = true;
+            if screen.cursor_visible && screen.cursor.1 < rows {
+                dirty_rows[screen.cursor.1] = true;
             }
         }
         let rgba = &mut surface.rgba;
-        for (i, cell) in screen.cells.iter().enumerate() {
-            if !rows.get(i / screen.cols).copied().unwrap_or(false) {
+        for (i, cell) in screen.cells.iter().take(screen.cols * rows).enumerate() {
+            if !dirty_rows[i / screen.cols] {
                 continue;
             }
             let x = (i % screen.cols) as i32 * self.width as i32;
@@ -314,7 +328,7 @@ impl Raster {
         }
         // Steady cursor; invert a block so its glyph remains readable.
         let (cx, cy) = screen.cursor;
-        let drawn = screen.cursor_visible && cx < screen.cols && cy < screen.rows;
+        let drawn = screen.cursor_visible && cx < screen.cols && cy < rows;
         if drawn {
             let bottom = (cy + 1) * self.height as usize;
             let top = match self.cursor {
@@ -338,7 +352,7 @@ impl Raster {
             }
         }
         surface.cursor = drawn.then_some(screen.cursor);
-        bands(&rows, self.height)
+        bands(&dirty_rows, self.height)
     }
 }
 
@@ -438,7 +452,7 @@ mod tests {
         surface.rgba.fill(0x5a);
         let third = raster.render_into(&grid, &[true, true, true], &mut surface);
         assert_eq!(third.len(), 1);
-        assert!(!surface.rgba.iter().any(|b| *b == 0x5a));
+        assert!(!surface.rgba.contains(&0x5a));
 
         // Nothing dirty, no cursor: no work and no damage at all.
         assert_eq!(
@@ -532,6 +546,56 @@ mod tests {
         let mut surface = Surface::default();
         let _ = raster.render_into(&grid, &[], &mut surface);
         assert_eq!(raster.render(&grid), surface.rgba());
+    }
+
+    /// Cold-review finding (2026-09-21): `Screen`'s fields are public, so a
+    /// caller can hand over fewer cells than `cols * rows`. The loop then
+    /// skipped the missing cells while `bands` still reported their row as
+    /// repainted — a hidden cursor stayed on screen and no renderer could
+    /// tell. The surface now shrinks to the rows that exist.
+    #[test]
+    fn a_short_cell_array_shrinks_the_surface_rather_than_lying_about_it() {
+        let mut raster = raster();
+        let mut surface = Surface::default();
+        let mut grid = screen(3, 3, 'M');
+        grid.cursor = (2, 2);
+        grid.cursor_visible = true;
+        let _ = raster.render_into(&grid, &[], &mut surface);
+        assert_eq!(surface.grid(), (3, 3));
+
+        // One cell short of the last row: that row cannot be painted, so it
+        // must not be part of the surface or of the reported damage.
+        grid.cells.truncate(8);
+        grid.cursor_visible = false;
+        let bands = raster.render_into(&grid, &[true; 3], &mut surface);
+        assert_eq!(surface.grid(), (3, 2));
+        assert_eq!(
+            bands,
+            vec![DamageBand {
+                y: 0,
+                height: 2 * raster.height
+            }]
+        );
+        assert_eq!(
+            surface.rgba().len(),
+            surface.stride() * surface.height() as usize
+        );
+
+        // A malformed screen also forfeits the damage fast path: `dirty` is
+        // indexed against the VT's row count, which no longer matches the
+        // surface's, so every frame repaints whole rather than trusting a
+        // slice that may be describing different rows.
+        assert_eq!(
+            raster.render_into(&grid, &[false; 3], &mut surface),
+            vec![DamageBand {
+                y: 0,
+                height: 2 * raster.height
+            }]
+        );
+        // Restore a well-formed screen and the fast path comes back.
+        let grid = screen(3, 2, 'M');
+        let _ = raster.render_into(&grid, &[], &mut surface);
+        assert_eq!(raster.render_into(&grid, &[false; 2], &mut surface), vec![]);
     }
 
     #[test]
