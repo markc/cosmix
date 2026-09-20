@@ -244,7 +244,27 @@ impl IcedDemo {
             self.raw.log(format_args!("menu action {action:?}"));
             self.run(cx, action);
         }
-        self.after_menu_change(cx);
+        // The navigator drops the anchors a step makes stale — ALL of them
+        // when the root changes — and only the bar widget can compute the new
+        // ones. It does that in its `update`, and `Surface::process` returns
+        // early without touching the tree when no event is queued, so a
+        // host-driven step (every keyboard step) left the next panel
+        // unanchored, and `open_panels` skips an unanchored level. The panel
+        // then appeared only when the NEXT input happened to arrive: measured
+        // at 1.9 s and 3.1 s in the gate, against ~90 ms on the pointer path,
+        // where the widget makes the change itself and publishes the anchors
+        // with it. By then no input action is live, so the compositor refuses
+        // the grab and dismisses the panel.
+        //
+        // One housekeeping event makes it republish; `process` reconciles the
+        // popups on its way out.
+        self.chrome
+            .queue_event(cosmix_iced_host::core::Event::Window(
+                cosmix_iced_host::core::window::Event::RedrawRequested(
+                    std::time::Instant::now(),
+                ),
+            ));
+        self.process(cx);
     }
 
     /// Drive the navigator with `step`, which borrows the items and the

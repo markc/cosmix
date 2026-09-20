@@ -3487,7 +3487,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-wl-iced-demo"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cosmix-iced-host",
  "cosmix-iced-widgets",
