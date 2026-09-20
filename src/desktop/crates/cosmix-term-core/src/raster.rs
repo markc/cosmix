@@ -329,9 +329,6 @@ mod tests {
         assert_eq!(wrong, full, "a dirty slice of the wrong length repaints all");
     }
 
-    /// `render_into` reuses the caller's allocation. The old render path built
-    /// a fresh full-frame `Vec` (~12 MB at 2.5x) for every damaged frame, which
-    /// is the allocation D5 removes.
     /// `Screen` is public, so a caller can hand over fewer cells than the
     /// dimensions claim. A repainted row must still come out CLEAN: the one
     /// thing a partial repaint must never do is leave the previous frame's
@@ -353,6 +350,9 @@ mod tests {
         assert_eq!(buffer, once, "a repaint is idempotent, inversion included");
     }
 
+    /// `render_into` reuses the caller's allocation. The old render path built
+    /// a fresh full-frame `Vec` (6.9 MB at the VT5 desktop's 2.5x scale and a
+    /// 99x23 grid) for every damaged frame, which is the allocation D5 removes.
     #[test]
     fn a_same_size_frame_reuses_the_callers_allocation() {
         let mut painter = raster();

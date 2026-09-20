@@ -143,6 +143,12 @@ struct PaneView {
     /// or its inverted block stays on screen.
     cursor: (usize, usize),
     cursor_visible: bool,
+    /// Grid shape the texture's pixels are laid out for. A partial repaint is
+    /// only sound against a buffer painted for THIS shape, and byte length
+    /// cannot tell 96x25 from 80x30 — both are 2400 cells and the same number
+    /// of bytes. Without this, correctness would rest on rio marking the whole
+    /// grid dirty after a resize, which is another crate's internal decision.
+    shape: (usize, usize),
 }
 
 // VERIFY: precedence — the only font override resolution, reused at every scale.
@@ -255,7 +261,7 @@ fn main() {
     assert!(identity.validate().is_ok());
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "CosMix BTerm: tabbed Wayland Mix terminal (Bevy frontend)\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--version: print version and build hash, and nothing else\n--print-config: print resolved startup settings and exit\nBus: serves `{SERVICE}` / `{SERVICE}.*`; the global name `term` belongs to the iced frontend"
+            "CosMix BTerm: tabbed Wayland Mix terminal (Bevy frontend)\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\nTERM_RASTER_TRACE=1: one stderr line per damaged frame — rows painted, full or partial, and what it cost\n--version: print version and build hash, and nothing else\n--print-config: print resolved startup settings and exit\nBus: serves `{SERVICE}` / `{SERVICE}.*`; the global name `term` belongs to the iced frontend"
         );
         return;
     }
@@ -983,6 +989,7 @@ fn spawn_pane_tree(
                 active: false,
                 cursor: (0, 0),
                 cursor_visible: false,
+                shape: (0, 0),
             });
             container
         }
@@ -1097,6 +1104,22 @@ fn sync_panes(
             focus.set(entity, FocusCause::Navigated);
         }
     }
+}
+
+/// `TERM_RASTER_TRACE=1`: one stderr line per damaged frame with the rows
+/// painted, whether the repaint was full, and what it cost.
+///
+/// It exists because the damage-rect work was easy to *assume* effective and
+/// the process-level CPU says nothing about it either way — under a scrolling
+/// stream every row is dirty and the rect saves nothing, while a
+/// carriage-returned line is one row in twenty-three. This is how that
+/// distinction is observed rather than argued about. Read once: a per-frame
+/// `env::var_os` walks the environment.
+fn raster_trace() -> &'static bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| {
+        std::env::var_os("TERM_RASTER_TRACE").is_some_and(|value| value != "0")
+    })
 }
 
 /// Layout resolves and rounds each border in physical pixels independently.
@@ -1246,11 +1269,22 @@ fn refresh(
             }
             let rgba = image.data.get_or_insert_with(Vec::new);
             // A buffer that is not already the frame size (first frame, any
-            // resize) repaints in full inside `render_into`, whatever we pass.
-            let full = switched || rgba.len() != bytes;
+            // resize) repaints in full inside `render_into`, whatever we pass —
+            // and so does one whose pixels are laid out for a different grid
+            // SHAPE, which the byte length alone cannot see.
+            let full =
+                switched || rgba.len() != bytes || pane.shape != (screen.cols, screen.rows);
             let started = Instant::now();
-            painter.render_into(&screen, rgba, (!full).then_some(dirty.as_slice()));
+            let painted = painter.render_into(&screen, rgba, (!full).then_some(dirty.as_slice()));
             let converted = Instant::now();
+            if *raster_trace() {
+                eprintln!(
+                    "RASTER rows={}/{} full={full} paint={:?}",
+                    painted,
+                    screen.rows,
+                    converted - started
+                );
+            }
             // Damage was consumed by `grid_snapshot` above, so the record of
             // what this texture holds is only updated once the paint actually
             // happened. If the asset were missing, those rows are gone for
@@ -1259,6 +1293,7 @@ fn refresh(
             pane.rendered = true;
             pane.cursor = screen.cursor;
             pane.cursor_visible = screen.cursor_visible;
+            pane.shape = (screen.cols, screen.rows);
             let mut stats = terminal.stats.lock().unwrap();
             stats.vt_rgba.add(converted - screen.updated);
             // The raster now writes straight into the asset's own buffer, so

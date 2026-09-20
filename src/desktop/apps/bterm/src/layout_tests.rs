@@ -200,8 +200,9 @@ fn a_repaint_mutates_the_pane_texture_in_place() {
         len > 4,
         "the 1x1 placeholder was never replaced by a real frame"
     );
-    // Force a repaint without changing the geometry: `rendered = false` is the
-    // same flag a first frame, a focus change and a Raster rebuild all set.
+    // Force a repaint without changing the geometry. Clearing `rendered` is one
+    // of the three inputs to `switched`, alongside a focus change and a Raster
+    // rebuild, and it is the one a test can set without moving the geometry.
     app.world_mut().resource_mut::<View>().pane_views[0].rendered = false;
     app.update();
     let images = app.world().resource::<Assets<Image>>();
