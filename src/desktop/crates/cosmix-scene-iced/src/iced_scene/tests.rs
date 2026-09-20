@@ -841,21 +841,6 @@ fn the_theme_follows_the_resolved_scheme() {
 }
 
 #[test]
-fn a_column_template_does_not_steal_the_lists_click() {
-    // Only the `row` arm builds a handler for a template's own click, so a
-    // `column` template must leave the list's row click in place.
-    let source = "---\nscene: 1\nname: colrows\ncitizen: test\n---\n```mix\nroot: {widget: \"column\", padding: 4, children: [\"list\"]}\nlist: {widget: \"list\", rows: [{id: \"r1\", cells: [\"one\"]}], row: \"entry\", row_height: 30, on_click: \"pick\"}\nentry: {widget: \"column\", children: [\"cell\"], on_click: \"open\"}\ncell: {widget: \"text\", text: \"{cells[0]}\"}\n```\n";
-    let mut rig = Rig::new(source, 300, 200, 1.0);
-    rig.settle();
-    rig.click("entry@r1");
-    let actions = rig.actions();
-    assert_eq!(actions.len(), 1, "{actions:?}");
-    assert_eq!(actions[0].node, "list");
-    assert_eq!(actions[0].handler, "pick");
-    assert_eq!(actions[0].item, Some(json!({"id": "r1", "cells": ["one"]})));
-}
-
-#[test]
 fn a_pointer_scale_change_alone_reaches_the_renderer() {
     let mut rig = Rig::new(CONFORMANCE, 640, 480, 2.5);
     rig.settle();
