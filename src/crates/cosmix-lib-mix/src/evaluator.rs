@@ -7814,7 +7814,13 @@ impl Evaluator {
                             self.ctx
                                 .var_slot_cache_f64
                                 .push((assign_name as *const str, assign_f64 as *const f64));
-                            let inner: MixResult<()> = (|| {
+                            // Snapshot the accumulator before any mutation,
+                            // exactly as take_mixed does: on a non-numeric
+                            // body we restore it and let the generic loop
+                            // run from scratch, so completed iterations are
+                            // not double-counted.
+                            let saved_assign = unsafe { *assign_f64 };
+                            let inner: MixResult<bool> = (|| {
                                 for item in items.iter() {
                                     let v = match item {
                                         Value::Number(n) => *n,
@@ -7826,35 +7832,44 @@ impl Evaluator {
                                     let n = match self.try_eval_expr_num(assign_value) {
                                         Some(Ok(n)) => n,
                                         Some(Err(e)) => return Err(e),
-                                        None => {
-                                            // Body produced a non-numeric
-                                            // value (Concat/Eq/bound non-
-                                            // Number/unbound positional).
-                                            // The take_fast path here exits
-                                            // Ok(()) and the caller returns
-                                            // Ok(Value::Nil) WITHOUT running
-                                            // the generic loop — a latent
-                                            // silent-no-body-execution shape
-                                            // pre-dating the sync-fastpath
-                                            // panic fix. Fully resolving it
-                                            // requires either inner_kind
-                                            // ("not applicable" vs "done")
-                                            // or wiring a true fall-through
-                                            // back to the generic loop.
-                                            // Tracked for a focused refactor.
-                                            return Ok(());
-                                        }
+                                        // Body produced a non-numeric value
+                                        // (Concat/Eq/bound non-Number/
+                                        // unbound positional). This used to
+                                        // `return Ok(())`, and the caller
+                                        // then returned Value::Nil WITHOUT
+                                        // running the generic loop — the
+                                        // body never executed AT ALL, rc 0.
+                                        // `$sum = 0` + `for $i in [1,2,3]:
+                                        // $sum = $sum + $l` printed 0 and
+                                        // raised nothing, and the LEGAL
+                                        // scalar case (`+ "x"`) was skipped
+                                        // the same way; the identical body
+                                        // in a `while` loop was correct.
+                                        // The sibling take_mixed path a
+                                        // screen above has always had the
+                                        // fall-through; this one never got
+                                        // it (its own comment called it "a
+                                        // latent silent-no-body-execution
+                                        // shape … tracked for a focused
+                                        // refactor"). Found by the GLM arm
+                                        // of the 0.90.0 cold review.
+                                        None => return Ok(false),
                                     };
                                     unsafe {
                                         *assign_f64 = n;
                                     }
                                 }
-                                Ok(())
+                                Ok(true)
                             })();
                             self.ctx.var_slot_cache_f64.truncate(f64_cache_start);
                             self.ctx.var_slot_cache.truncate(cache_start);
-                            inner?;
-                            return Ok(Value::Nil);
+                            match inner {
+                                Ok(true) => return Ok(Value::Nil),
+                                Ok(false) => unsafe {
+                                    *assign_f64 = saved_assign;
+                                },
+                                Err(e) => return Err(e),
+                            }
                         }
                     }
 
@@ -12303,6 +12318,31 @@ impl Evaluator {
             }
         }
         match op {
+            // `+` is arithmetic, with a SCALAR string fallback. A List, Map,
+            // Bytes, Buffer or Function operand RAISES (0.90.0) — it used to
+            // fall into the same `format!` fallback, so `["a"] + ["b"]` was
+            // the STRING `[a][b]` with rc 0 and nothing failing until far
+            // from the cause (found 2026-09-17: a helper built
+            // `["runuser", …, $db] + $argv` and handed the string to
+            // `run_argv`; on a mail server that is a wrong command, not an
+            // error).
+            //
+            // EITHER operand is enough to raise — deliberately wider than the
+            // `==`/`!=` rule below, which needs BOTH. The narrowing there
+            // exists to protect `$map[$key] == nil`, the key-absence idiom;
+            // `+` has no such idiom, and the mixed shapes (`[1] + 2`,
+            // `1 + [2]`) are exactly the accidents worth catching.
+            //
+            // Nil stays a scalar: `nil + 1` is "nil1" today, which is its own
+            // footgun but not this one, and changing it would break the
+            // absent-key-into-a-message shape data-dependently.
+            //
+            // `+` is NOT being made to mean list concatenation. `concat()`
+            // and `merge()` already exist; one spelling per operation is what
+            // keeps the language learnable, so the diagnostic names them.
+            BinOp::Add if !add_is_scalar(left) || !add_is_scalar(right) => {
+                Err(add_operand_error(left, right))
+            }
             BinOp::Add => {
                 // If both can be numbers, do arithmetic; otherwise concat
                 if let (Some(l), Some(r)) = (left.to_number(), right.to_number()) {
@@ -15159,6 +15199,36 @@ fn number_operand(value: &Value) -> MixResult<f64> {
         span: None,
         msg: format!("cannot use '{}' as number", value.to_mix_string()),
     })
+}
+
+/// Operands `+` will still coerce: the four scalars. Everything else is a
+/// container or a function, for which the old `format!` fallback produced a
+/// plausible-looking string instead of an error (0.90.0).
+fn add_is_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Nil
+    )
+}
+
+/// The instructional `+` diagnostic (0.79.0 style): name the operator, say
+/// what it does NOT do, and point at the builtin that does.
+fn add_operand_error(left: &Value, right: &Value) -> MixError {
+    let hint = match (left, right) {
+        (Value::List(_), Value::List(_)) => {
+            "it does not join lists. Use concat(a, b) to join, push(list, value) to append"
+        }
+        (Value::Map(_), Value::Map(_)) => "it does not merge maps. Use merge(a, b)",
+        _ => "`+` takes numbers or strings. Use `..` to build text, concat(a, b) for lists, merge(a, b) for maps",
+    };
+    MixError::structured(
+        "TYPE_ERROR",
+        format!(
+            "`+` is not defined for {} and {} — {hint}",
+            left.type_name(),
+            right.type_name()
+        ),
+    )
 }
 
 fn num_op(left: &Value, right: &Value, op: fn(f64, f64) -> f64) -> MixResult<Value> {

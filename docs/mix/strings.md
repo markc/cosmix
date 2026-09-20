@@ -28,7 +28,7 @@ The split mirrors bash's quoting, with one trap that bites everyone:
 
 | Form | Interpolates `${x}` | Bare `$x` | `$(...)` | leading `~` | Escapes |
 |---|---|---|---|---|---|
-| `"double"` | yes (scope → env) | **literal text** | **literal text** | expands to `$HOME` | `\n \t \r \e \" \\ \$ \~ \u{…}` |
+| `"double"` | yes (scope → env) | **literal text** | **literal text** | expands to `$HOME` | `\n \t \r \e \a \b \f \v \0 \xHH \" \\ \$ \~ \u{…}` |
 | `'single'` | no | literal | literal | literal | only `\'` and `\\` |
 
 **Only `${...}` interpolates** inside double quotes. A bare `$name` is the literal
@@ -83,6 +83,23 @@ Runtime error: undefined variable '$NOPE_NOT_SET' in interpolation (use ${NOPE_N
 A variable whose **value** is nil is bound, so it still renders the literal
 `nil` (`$x = nil` → `${x}` → `nil`); likewise a missing map key in a dotted path
 (`${a.b}` → `nil`), matching `$a.b`.
+
+**A bare `$name` is literal — this is the opposite of bash.** Only `${name}`
+interpolates, so `read_file("$sp/prompt.md")` opens a file called
+`$sp/prompt.md`. The rule is deliberate (it lets a string carry shell text and
+nested Mix source untouched), but it is also the first thing anyone arriving from
+bash gets wrong, so `mix lint` reports it as [MIX-D3015](lint.md) when the name is
+bound in the same file:
+
+```mix
+$sp = "/tmp/x"
+print("$sp/a")      -- literal:  $sp/a      (MIX-D3015)
+print("${sp}/a")    -- /tmp/x/a
+print('$sp/a')      -- literal, and says so
+print("\$sp/a")     -- literal, and says so
+```
+
+`\$name` and single quotes are the two ways to mean it, and neither is reported.
 
 ### Defaults — `${x ?? default}` and `${x ?: default}`
 
@@ -139,8 +156,9 @@ hi $user
 
 ## Escapes and `\u{XXXX}`
 
-Double-quoted strings honour `\n \t \r`, `\e` (ESC, `\x1b`), `\" \\ \$ \~`, and the
-braced unicode escape `\u{XXXX}` (1–6 hex digits):
+Double-quoted strings honour `\n \t \r`, `\e` (ESC), `\a \b \f \v` (BEL, BS, FF, VT),
+`\0` (NUL), `\" \\ \$ \~`, the two-hex-digit `\xHH`, and the braced unicode escape
+`\u{XXXX}` (1–6 hex digits):
 
 ```mix
 print("tab\there")
@@ -160,8 +178,45 @@ strip BOM:[﻿]
 `\u{…}` literal too. A surrogate or out-of-range codepoint is a loud lex error
 (`\u{D800} is not a valid unicode codepoint`), never a silent pass-through.
 
+### `\xHH`, `\0` and the control escapes (0.90.0)
+
+`\xHH` takes **exactly two hex digits** and its value is the **codepoint** U+00HH —
+never a raw byte. A Mix string is UTF-8, so `"\xff"` is U+00FF (one character, two
+bytes on the wire), not the byte `0xFF`. For bytes, use `bytes_from_hex` /
+`bytes_from`, which keep a different spelling on purpose.
+
+```mix
+print("isn\x27t")
+print("\x41\x42")
+print(len("a\0b"))          -- \0 is NUL, a real character
+print("\a" == chr(7))       -- BEL; \b \f \v are BS, FF, VT
+```
+```text
+isn't
+AB
+3
+true
+```
+
+`\0` is NUL **exactly**, never the start of an octal escape: octal is ambiguous
+next to digits, so `"\012"` is NUL followed by the text `12`. Octal and `\U` are
+deliberately absent — `\u{…}` covers what they would have been for.
+
+Fewer than two hex digits is **not** a lex error: `"\x4"` stays the three
+characters `\x4`, so a regex pattern meaning the engine's own `\x` never becomes a
+hard failure of the whole file. `mix lint` reports it as
+[MIX-W2405](lint.md) instead.
+
+Before 0.90.0 all of these were kept literally, which is how a `replace()` once
+wrote `isn\x27t` into a committed journal entry with no gate noticing.
+
+### Unrecognised escapes are still literal — and now linted
+
 Any **unrecognised** escape keeps the backslash literally: `"\d"` is the two
-characters `\d`, not an error. Strip a BOM with the real codepoint:
+characters `\d`, not an error. That is deliberate (it protects regex patterns and
+Windows paths), but it is also how a habit from another language becomes silently
+wrong output, so `mix lint` flags it as [MIX-W2405](lint.md). A deliberate
+backslash is written `\\`, which never warns. Strip a BOM with the real codepoint:
 `replace($s, "\u{FEFF}", "")`.
 
 ## Leading `~` expansion
@@ -266,6 +321,31 @@ All four rows are operations on **text**. Operations on a raw `bytes`/`buffer`
 interchangeable: `byte_length($some_bytes)` stringifies its argument first and
 so measures the `<bytes:N>` placeholder, not the bytes.
 
+### `ord` / `chr` — codepoint ↔ character (0.90.0)
+
+`ord(s)` is the Unicode codepoint of the **first character**; `chr(n)` is the
+one-character string for a codepoint. They are the runtime twins of the `\u{…}`
+literal escape, and the only way to *ask* what a string holds —
+`bytes_to_hex(string_to_bytes($s))` answers in UTF-8 bytes, which is a different
+question.
+
+```mix
+print(ord("A"))
+print(ord("é"))          -- the CODEPOINT 233, not the first byte 0xC3
+print(chr(10084))
+print(chr(0x27))         -- the runtime twin of "\u{27}"
+```
+```text
+65
+233
+❤
+'
+```
+
+`ord("")` raises: `0` is NUL, a real codepoint that `chr` round-trips, so it cannot
+also mean "absent". `chr` takes the `\u{…}` validity rule exactly — a surrogate
+(`chr(0xD800)`), anything above `0x10FFFF`, and a fractional or negative argument
+all raise rather than saturate to a plausible wrong character.
 A plain `substr`/`reverse` is codepoint-based and **splits** an emoji ZWJ sequence or
 combining cluster; the `grapheme_*` ops keep it whole:
 
@@ -372,6 +452,28 @@ true
 byte-exact rule is about *matching*, not casing. For word extraction there are the
 ARexx-flavoured `words($s)` (count whitespace-delimited words) and `word($s, n)`
 (Nth word, 1-based); for pattern matching see [regex](regex.md).
+
+### Editing a file? Use `replace_must` (0.90.0)
+
+`replace()` returns the subject **unchanged** when the needle is absent. That is
+the right contract for a transform and the wrong one for an *edit*: in the
+read-modify-write idiom a missed needle writes the input straight back and reports
+success.
+
+```mix
+$s = read_file($p)
+write_file($p, replace_must($s, "old", "new", {count: 1, path: $p}))
+```
+
+`replace_must(s, old, new[, {count, path}])` raises `NEEDLE_ABSENT` when `old` does
+not occur, and `NEEDLE_COUNT` when `count` is given and the number of occurrences
+differs — so an edit that was meant to hit one site and would have rewritten two
+fails instead of shipping. `path` only names the file in the message, which is most
+of the diagnosis when the edit runs in a loop over several files.
+`re_replace_must(s, pattern, replacement[, {count, path}])` is the regex twin.
+
+`replace()` and `re_replace()` are unchanged — `mix lint` flags the unguarded
+write-back chain as [MIX-D3014](lint.md).
 
 ## Ordering and equality
 

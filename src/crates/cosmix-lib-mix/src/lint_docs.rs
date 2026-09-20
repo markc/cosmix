@@ -110,7 +110,12 @@ pub const LINT_DOCS: &[LintDoc] = &[
     LintDoc {
         code: "MIX-E1302",
         summary: "duplicate function definition in one scope",
-        detail: "Two `function` definitions with the same name in one scope — the later wins and the earlier is dead. A definition-time error (distinct from MIX-W2403, which is about a function whose name collides with a BUILTIN).",
+        detail: "Two `function` definitions with the same name in one scope — the later wins and the earlier is dead. A definition-time error (distinct from MIX-E1303, which is about a function whose name collides with a BUILTIN).",
+    },
+    LintDoc {
+        code: "MIX-E1303",
+        summary: "function name shadows a builtin",
+        detail: "At the DEFINITION of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name — only an extracted function value or an exports-map index still reaches it. The worst shape is a script that keeps running while its own function quietly stops being called, and every release that adds a builtin name arms it again for older scripts. An ERROR since 0.90.0 (it was MIX-W2403 from 0.74.0, a warning on the theory that a compat shim for an older mix is legitimate authoring). The fleet refuted that theory: two sites across 785 scripts and neither was a shim — one a hand-rolled `ends_with` duplicating the builtin, the other an `fn mix_version()` in a pre-commit hook written to report a NAMED interpreter's version and silently answering with the running one's, a live wrong answer that sat behind a warning for sixteen releases. Lint is also the only gate an `ssh_mix` body passes through, and a warning stops nothing by default. The RUNTIME is unchanged — the builtin still wins; the fix is to rename. Distinct from MIX-E1302, which is two user definitions colliding with each other.",
     },
     LintDoc {
         code: "MIX-E1401",
@@ -145,8 +150,8 @@ pub const LINT_DOCS: &[LintDoc] = &[
     },
     LintDoc {
         code: "MIX-W2301",
-        summary: "`+` stringifies a proven list",
-        detail: "`+` coerces lists to strings; it does not append or concatenate list VALUES. Fires for a list literal operand, or a variable proven by straight-line analysis to hold a directly assigned list literal. Use `concat(list_a, list_b)` or `push(list, value)`.",
+        summary: "`+` on a proven list/map raises at runtime",
+        detail: "`+` is arithmetic with a SCALAR string fallback: since 0.90.0 a List, Map, Bytes, Buffer or Function operand raises `TYPE_ERROR` instead of silently stringifying (it used to make `[\"a\"] + [\"b\"]` the string `[a][b]` with rc 0). This note fires for a list/map LITERAL operand, or a variable proven by straight-line analysis to hold a directly assigned one, so the failure is visible at authoring time — which for an `ssh_mix` body, or for a branch the local run never takes, is the only gate there is. Use `concat(a, b)` for lists, `merge(a, b)` for maps, `push(list, value)` to append, `..` to build text. Still a warning, not an error: the proven-value facts are straight-line, so a reassigned variable can make the prediction wrong.",
     },
     LintDoc {
         code: "MIX-W2302",
@@ -185,8 +190,13 @@ pub const LINT_DOCS: &[LintDoc] = &[
     },
     LintDoc {
         code: "MIX-W2403",
-        summary: "function name shadows a builtin",
-        detail: "At the DEFINITION of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name (only an extracted function value or an exports-map index still reaches it). The worst shape is a script that keeps running while its own function quietly stops being called — every release that adds a builtin name arms it again for older scripts. Deliberately a warning, never an error: a compat shim written for an older mix that lacks the builtin is legitimate, but on the mix doing the linting it is dead, and the author should know.",
+        summary: "RETIRED 0.90.0 — see MIX-E1303",
+        detail: "Retired, never reused. This was the builtin-shadowing definition check from 0.74.0, born a warning on the theory that a compat shim for an older mix is legitimate authoring. The fleet refuted it, so the rule was promoted to an ERROR — and because a code's letter encodes its severity permanently, the promotion had to MOVE it rather than change it in place. The live code is MIX-E1303; `mix explain MIX-E1303` has the reasoning and the fix.",
+    },
+    LintDoc {
+        code: "MIX-W2405",
+        summary: "unknown escape kept literally",
+        detail: "A double-quoted literal contains a backslash escape the lexer does not recognise, so the backslash is KEPT: `\"isn\\x27t\"` printed `isn\\x27t` and nothing said so, which is how a `replace()` wrote that into a committed journal entry (2026-09-17). 0.90.0 added `\\xHH` (exactly two hex digits; the value is the codepoint U+00HH, never a raw byte), `\\0`, and `\\a \\b \\f \\v`, so what remains is genuinely unrecognised — including `\\x` with fewer than two hex digits, and `\\'` (double quotes need no escape for a single quote). A deliberate backslash is written `\\\\`, so the warning has a clean escape. `\\u` without a brace is EXEMPT: that literal is documented design (it protects embedded JSON and `C:\\users`). Single-quoted strings and heredocs keep their own rules and are not scanned. Same source requirement as MIX-W2404.",
     },
     // ---- Deprecations / release-transition advisories (MIX-D3xxx, severity note) ----
     LintDoc {
@@ -238,6 +248,16 @@ pub const LINT_DOCS: &[LintDoc] = &[
         code: "MIX-D3012",
         summary: "ssh_mix body that could not be analysed",
         detail: "An `ssh_mix` body (its second argument) that lint could not analyse — a non-literal argument (a variable, a concatenation, an interpolated string, a `read_file`), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist. Ship the remote half as a literal heredoc so lint (and inventories built from it) can see inside.",
+    },
+    LintDoc {
+        code: "MIX-D3015",
+        summary: "bare bound variable in a double-quoted string",
+        detail: "A double-quoted literal contains bare `$NAME` where `NAME` is bound somewhere in the same file. Double quotes interpolate `${NAME}`, not `$NAME`, and the bare form is literal BY DESIGN — which is the opposite of bash, so anyone arriving from bash writes it (four occurrences in one file passed lint and all four failed at runtime, 2026-09-17). The heredoc twin is MIX-W2402. Does not fire for `${NAME}`, an escaped `\\$NAME`, a single-quoted `'…'` string, all-digit positionals like `$1`, a `$` followed by anything that is not an identifier (`\"$5.00\"`), or a name bound nowhere — `\"Total: $USD\"` in prose stays silent. The lexer also drops the whole batch for a MULTI-LINE string and for one whose spelling contains `\\\"`: both are the mark of NESTED source (an `ssh_mix` body, a `mix -c` program, a test fixture), where a bare `$rc` is the inner program's variable and correctly literal. Severity `note`, where the heredoc twin is a warning, and the asymmetry is measured: over 785 fleet scripts MIX-W2402 costs 4 findings and this rule an order of magnitude more even after those exclusions, so shipping it as a warning would fail `--deny-warnings` — a live fleet deploy gate — on scripts that are not wrong. D3xxx is the severity-independent namespace precisely so it can be promoted, code unchanged, once the residue is worked off. Needs the source text, so it runs under `mix lint` (and inside an `ssh_mix` body) but not for an embedder that calls `analyze()` without setting `AnalyzerConfig::source`.",
+    },
+    LintDoc {
+        code: "MIX-D3014",
+        summary: "write_file of an unchecked replace() result",
+        detail: "The edit-a-file idiom — `write_file(path, replace(read_file(path), old, new))`, or the same chain across statements — with nothing anywhere in the file that could have noticed the needle was absent. `replace()` returns the subject UNCHANGED when the needle does not occur, so a missed edit writes the input straight back and reports success: on 2026-09-18 three such edits missed and one shipped a commit that did not compile, with no signal at any step. Use `replace_must()` / `re_replace_must()` (0.90.0), which raise `NEEDLE_ABSENT`, and whose `{count: n}` also asserts how many sites were rewritten. Conservative by design: it fires only on a `write_file` whose written value is a replace call or a variable the same straight-line block assigned from one, and ANY guard spelling anywhere in the file (`contains`, `pos`, `index_of`, `count_of`, `re_match`, a `_must` twin) silences it for the whole file.",
     },
     LintDoc {
         code: "MIX-D3013",

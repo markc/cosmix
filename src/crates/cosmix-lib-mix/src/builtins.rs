@@ -88,6 +88,7 @@ builtin_table! {
     ("strip", CapabilityClass::Pure,           "string",  "Remove leading/trailing whitespace, or codepoints in charset: strip(s[, charset]) (0.63.0 — the 2nd arg was silently IGNORED before)", contract!((s: string, charset?: string) -> string)),
     ("trim", CapabilityClass::Pure,            "string",  "Alias for strip(): trim(s[, charset]) — charset is a SET of codepoints to strip from both ends (0.63.0; was silently ignored). One-sided: ltrim/rtrim", contract!((s: string, charset?: string) -> string)),
     ("replace", CapabilityClass::Pure,         "string",  "Replace all occurrences of old with new in string", contract!((s: string, old: string, new: string) -> string)),
+    ("replace_must", CapabilityClass::Pure,    "string",  "replace() that REFUSES a no-op: raises NEEDLE_ABSENT when old does not occur, and NEEDLE_COUNT when {count: n} is given and the occurrence count differs. Optional {path} names the file in the message. The form to use in a read_file -> edit -> write_file chain (0.90.0)", contract!((s: string, old: string, new: string, opts?: map) -> string; failure[raises])),
     ("split", CapabilityClass::Pure,           "string",  "Split string into list by delimiter (default: space)", contract!((s: string, delim?: string) -> list(string))),
     ("join", CapabilityClass::Pure,            "string",  "Join list into string with delimiter (default: space)", contract!((list: list, delim?: string) -> string)),
     ("starts_with", CapabilityClass::Pure,     "string",  "Test if string starts with prefix", contract!((s: string, prefix: string) -> bool)),
@@ -101,6 +102,12 @@ builtin_table! {
     ("reverse", CapabilityClass::Pure,         "string",  "Reverse a string (by codepoint; splits emoji — see grapheme_reverse), list, or bytes/buffer (byte-wise → a new value-semantic bytes, v0.70.0)", contract!((v: any_of(string, list, bytes, buffer)) -> any_of(string, list, bytes))),
     ("words", CapabilityClass::Pure,           "string",  "Count whitespace-delimited words in string", contract!((s: string) -> number)),
     ("word", CapabilityClass::Pure,            "string",  "Extract Nth word from string (1-based)", contract!((s: string, n: number) -> any_of(string, nil); failure[raises])),
+    // --- Codepoint <-> character (0.90.0). The runtime twins of the `\u{...}`
+    // literal escape, and the only way to ASK what a string holds: before
+    // these, `bytes_to_hex(string_to_bytes($s))` was it, and that answers in
+    // UTF-8 bytes, not codepoints.
+    ("ord", CapabilityClass::Pure,             "string",  "Unicode codepoint of the FIRST character: ord(\"A\") -> 65, ord(\"é\") -> 233. Empty string raises. Inverse: chr()", contract!((s: string) -> number; failure[raises])),
+    ("chr", CapabilityClass::Pure,             "string",  "The 1-character string for a Unicode codepoint: chr(65) -> \"A\", chr(10084) -> \"❤\". Surrogates (D800-DFFF) and >0x10FFFF raise, same rule as \\u{...}. Inverse: ord()", contract!((n: number) -> string; failure[raises])),
     // --- Subject-first string helpers (0.63.0). Tier 1 (delimiter family):
     // absent delimiter/marker -> nil, "" is a REAL result (delimiter at the
     // edge), empty delimiter raises — nil and "" never blur. Tier 2
@@ -137,6 +144,7 @@ builtin_table! {
     ("re_match", CapabilityClass::Pure,        "string",  "Subject-first regex test: re_match(s, pattern) -> bool, true if pattern matches anywhere in s", contract!((s: string, pattern: string) -> bool; failure[raises])),
     ("re_find", CapabilityClass::Pure,         "string",  "All matches as {match, start, end[, groups]} maps with CODEPOINT offsets (compose with substr/slice/index_of; the deleted legacy regex_find answered in UTF-8 BYTE offsets). [] when none", contract!((s: string, pattern: string) -> list(map); failure[raises])),
     ("re_replace", CapabilityClass::Pure,      "string",  "Replace ALL matches: re_replace(s, pattern, replacement) — subject FIRST; $1/${name} backrefs in replacement", contract!((s: string, pattern: string, replacement: string) -> string; failure[raises])),
+    ("re_replace_must", CapabilityClass::Pure, "string",  "re_replace() that REFUSES a no-op: raises NEEDLE_ABSENT when the pattern does not match, and NEEDLE_COUNT when {count: n} is given and the match count differs. Optional {path} names the file in the message (0.90.0)", contract!((s: string, pattern: string, replacement: string, opts?: map) -> string; failure[raises])),
     ("re_split", CapabilityClass::Pure,        "string",  "Split s on each match of pattern (subject first)", contract!((s: string, pattern: string) -> list(string); failure[raises])),
     ("grep_lines", CapabilityClass::Pure,      "string",  "Lines of text matching pattern (subject first; regex when enabled, else substring) — the line filter (its pattern-first predecessor grep() was deleted in release B)", contract!((text: string, pattern: string) -> list(string); failure[raises])),
     ("csv_parse", CapabilityClass::Pure,       "string",  "Parse CSV string into a list of header-keyed row maps", contract!((s: string, delim?: string) -> list(map))),
@@ -417,6 +425,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "pos" => builtin_pos(args),
         "strip" | "trim" => builtin_strip(args),
         "replace" => builtin_replace(args),
+        "replace_must" => builtin_replace_must(args),
         "split" => builtin_split(args),
         "join" => builtin_join(args),
         "starts_with" => builtin_starts_with(args),
@@ -430,6 +439,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "reverse" => builtin_reverse(args),
         "words" => builtin_words(args),
         "word" => builtin_word(args),
+        "ord" => builtin_ord(args),
+        "chr" => builtin_chr(args),
         // Char-aware string ops (P0) — see the registry block above.
         "byte_length" => builtin_byte_length(args),
         "byte_pos" => builtin_byte_pos(args),
@@ -608,6 +619,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         #[cfg(feature = "regex")]
         "re_replace" => builtin_re_replace(args),
         #[cfg(feature = "regex")]
+        "re_replace_must" => builtin_re_replace_must(args),
+        #[cfg(feature = "regex")]
         "re_split" => builtin_re_split(args),
         // The registry lists these names unconditionally (is_builtin,
         // capability_category, `mix help` are all table-driven), so a
@@ -617,7 +630,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         // MAJOR 1). The legacy regex_* names this arm once covered were
         // deleted outright in release B (0.73.0).
         #[cfg(not(feature = "regex"))]
-        "re_match" | "re_find" | "re_replace" | "re_split" => Err(MixError::RuntimeError {
+        "re_match" | "re_find" | "re_replace" | "re_replace_must" | "re_split" => Err(MixError::RuntimeError {
             span: None,
             msg: format!("{name}() requires the `regex` feature"),
         }),
@@ -1448,6 +1461,163 @@ fn builtin_replace(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::String(s.replace(&old, &new))))
 }
 
+// --- The fail-loud edit twins (0.90.0) -----------------------------------
+//
+// `replace()` returning the subject UNCHANGED when the needle is absent is
+// the correct contract for a transform and the wrong one for an EDIT: on
+// 2026-09-18 three `mix -c` edits missed their needle, `write_file` wrote the
+// input straight back, and one of them shipped a commit that did not compile.
+// There was no signal at any step. `contains()` before every `replace()` is
+// the workaround; these are the builtin that does it for you.
+//
+// `replace()` and `re_replace()` are UNTOUCHED — a transform that tolerates
+// a no-op is a real use, and changing them would break it fleet-wide. The
+// `_must` suffix is the same promise it already carries on
+// `run_argv_must` / `run_pipeline_must` / `ssh_must`: same operation, raises
+// instead of handing back a value you have to remember to check.
+
+/// The largest `{count: n}` a `_must` twin will accept. An f64 holds every
+/// integer up to 2^53 exactly, and no subject can contain more occurrences
+/// than it has bytes, so this is far above any real assertion while staying
+/// inside the range where `as usize` is a faithful conversion rather than a
+/// saturating one.
+const MAX_MUST_COUNT: f64 = 9_007_199_254_740_992.0; // 2^53
+
+/// Shared option parsing for the `_must` twins: `{count: n, path: "…"}`.
+/// Unknown keys RAISE — a silently ignored `{counts: 2}` would turn the
+/// count assertion off at exactly the moment the caller was being careful
+/// (the `mkdir({parents})` rule).
+fn must_replace_opts(name: &str, opts: Option<&Value>) -> MixResult<(Option<usize>, Option<String>)> {
+    let Some(opts) = opts else {
+        return Ok((None, None));
+    };
+    let m = match opts {
+        Value::Nil => return Ok((None, None)),
+        Value::Map(m) => m,
+        other => {
+            return Err(MixError::RuntimeError {
+                span: None,
+                msg: format!(
+                    "{name}(): 4th argument must be an options map, got {}",
+                    other.type_name()
+                ),
+            });
+        }
+    };
+    let mut count = None;
+    let mut path = None;
+    for (k, v) in m.iter() {
+        match k.as_str() {
+            "count" => {
+                let n = v.to_number().ok_or_else(|| MixError::RuntimeError {
+                    span: None,
+                    msg: format!("{name}(): count must be a number, got {}", v.type_name()),
+                })?;
+                // The upper bound is not pedantry: `as usize` SATURATES, so
+                // without it `{count: 1e300}` became usize::MAX and the
+                // mismatch message read "not the 18446744073709551615
+                // asserted" — a number the caller never wrote. A subject
+                // cannot hold more occurrences than it has bytes, so
+                // anything past that is a typo, not an assertion.
+                if !n.is_finite() || n.fract() != 0.0 || !(0.0..=MAX_MUST_COUNT).contains(&n) {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "{name}(): count must be a whole number in 0..={MAX_MUST_COUNT}, got {n}"
+                        ),
+                    });
+                }
+                count = Some(n as usize);
+            }
+            "path" => path = Some(v.to_mix_string()),
+            other => {
+                return Err(MixError::RuntimeError {
+                    span: None,
+                    msg: format!(
+                        "{name}(): unknown option '{other}' (the options are 'count' and 'path')"
+                    ),
+                });
+            }
+        }
+    }
+    Ok((count, path))
+}
+
+/// `" in <path>"` when the caller named the file being edited, else empty.
+/// The 2026-09-18 case was a loop over several files: knowing WHICH edit
+/// missed is most of the diagnosis.
+fn must_replace_where(path: &Option<String>) -> String {
+    match path {
+        Some(p) => format!(" in {p}"),
+        None => String::new(),
+    }
+}
+
+/// Shared verdict for both `_must` twins, given how many occurrences were
+/// found and what the caller asserted.
+fn must_replace_check(
+    name: &str,
+    needle_label: &str,
+    needle: &str,
+    found: usize,
+    want: Option<usize>,
+    path: &Option<String>,
+) -> MixResult<()> {
+    let at = must_replace_where(path);
+    if found == 0 {
+        return Err(MixError::structured(
+            "NEEDLE_ABSENT",
+            format!("{name}(): {needle_label} {needle:?} does not occur{at} — nothing was replaced"),
+        ));
+    }
+    if let Some(want) = want
+        && found != want
+    {
+        return Err(MixError::structured(
+            "NEEDLE_COUNT",
+            format!(
+                "{name}(): {needle_label} {needle:?} occurs {found} time(s){at}, not the {want} asserted"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn builtin_replace_must(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("replace_must", &args, 3, 4)?;
+    let s = args[0].to_mix_string();
+    let old = args[1].to_mix_string();
+    let new = args[2].to_mix_string();
+    let (want, path) = must_replace_opts("replace_must", args.get(3))?;
+    // An empty needle matches between every character, so `s.matches("")`
+    // answers len+1 and `replace` splices everywhere — never what an edit
+    // meant, and it would make the count assertion meaningless.
+    if old.is_empty() {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: "replace_must(): empty needle (it matches between every character — pass a real needle)".to_string(),
+        });
+    }
+    let found = s.matches(old.as_str()).count();
+    must_replace_check("replace_must", "needle", &old, found, want, &path)?;
+    Ok(Some(Value::String(s.replace(&old, &new))))
+}
+
+#[cfg(feature = "regex")]
+fn builtin_re_replace_must(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args_between("re_replace_must", &args, 3, 4)?;
+    let text = args[0].to_mix_string();
+    let pattern = args[1].to_mix_string();
+    let re = compile_regex(&pattern)?;
+    let replacement = args[2].to_mix_string();
+    let (want, path) = must_replace_opts("re_replace_must", args.get(3))?;
+    let found = re.find_iter(&text).count();
+    must_replace_check("re_replace_must", "pattern", &pattern, found, want, &path)?;
+    Ok(Some(Value::String(
+        re.replace_all(&text, replacement.as_str()).into_owned(),
+    )))
+}
+
 // --- Subject-first string helpers (0.63.0) -------------------------------
 // Tier 1 contract: absent delimiter -> Nil (never "" and never the whole
 // subject — "" is a REAL result, the delimiter at the edge); empty
@@ -2064,6 +2234,56 @@ fn builtin_word(args: Vec<Value>) -> MixResult<Option<Value>> {
     } else {
         Ok(Some(Value::Nil))
     }
+}
+
+// --- Codepoint <-> character (0.90.0) ------------------------------------
+//
+// CODEPOINTS, not bytes. `ord`/`chr` are the runtime twins of the `\u{...}`
+// literal escape and take exactly its validity rule, so `chr(0xD800)` raises
+// for the same reason `"\u{D800}"` does: a lone surrogate is not a `char`,
+// and Mix strings are UTF-8. The byte view stays with
+// `string_to_bytes`/`bytes_to_hex` — that is a different question and it
+// deliberately keeps a different spelling.
+
+fn builtin_ord(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("ord", &args, 1)?;
+    let s = args[0].to_mix_string();
+    // Empty RAISES rather than answering 0 or nil: `ord("")` has no honest
+    // number, and 0 is a real codepoint (NUL) that `chr` round-trips.
+    let c = s.chars().next().ok_or_else(|| MixError::structured(
+        "VALUE_ERROR",
+        "ord(): empty string has no codepoint — guard with `if $s != \"\"` (0 is NUL, a real codepoint, so it cannot be the absent answer)",
+    ))?;
+    Ok(Some(Value::Number(c as u32 as f64)))
+}
+
+fn builtin_chr(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("chr", &args, 1)?;
+    let n = number_arg("chr", &args, 0)?;
+    // Mix numbers are f64, so a fractional or out-of-range argument has to be
+    // refused explicitly — `as u32` would saturate/truncate silently and hand
+    // back a plausible wrong character.
+    if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > f64::from(u32::MAX) {
+        return Err(MixError::structured(
+            "VALUE_ERROR",
+            format!("chr(): {n} is not a whole codepoint in 0..=0x10FFFF"),
+        ));
+    }
+    let cp = n as u32;
+    let c = char::from_u32(cp).ok_or_else(|| {
+        MixError::structured(
+            "VALUE_ERROR",
+            format!(
+                "chr(): U+{cp:04X} is not a valid codepoint — {} (same rule as \\u{{...}})",
+                if (0xD800..=0xDFFF).contains(&cp) {
+                    "surrogates D800-DFFF exist only inside UTF-16, never in a Mix string"
+                } else {
+                    "the maximum is 0x10FFFF"
+                }
+            ),
+        )
+    })?;
+    Ok(Some(Value::String(c.to_string())))
 }
 
 fn builtin_type(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -26436,6 +26656,9 @@ mod char_aware_tests {
             "merge",
             "mix_version",
             "now_iso",
+            // Codepoint <-> character (0.90.0) — pure string arithmetic.
+            "ord",
+            "chr",
             "parse_form",
             "parse_query",
             "password_hash",
@@ -26464,6 +26687,10 @@ mod char_aware_tests {
             "relative_time",
             "repeat",
             "replace",
+            // The fail-loud edit twins (0.90.0) — pure, same as their
+            // tolerant originals.
+            "replace_must",
+            "re_replace_must",
             "reverse",
             // Pure string transforms — they are behind the `crypto` feature
             // only because the B encoding is base64, not because they touch

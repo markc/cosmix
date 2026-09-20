@@ -599,23 +599,50 @@ unparseable left operand no longer becomes a plausible numeric <code>0</code> re
 <p>There is <strong>no string <code>*</code> repeat and no list <code>+</code> merge</strong> — use the
 <a href="/mix/builtins"><code>repeat()</code></a> builtin for strings and <a href="/mix/collections"><code>push()</code></a> /
 <a href="/mix/collections"><code>concat</code>-style helpers</a> for lists.</p>
-<h3 id="-has-a-string-fallback--prefer--for-text"><code>+</code> has a string fallback — prefer <code>..</code> for text</h3>
+<h3 id="-has-a-scalar-string-fallback--prefer--for-text"><code>+</code> has a <strong>scalar</strong> string fallback — prefer <code>..</code> for text</h3>
 <p><code>+</code> first tries to coerce <strong>both</strong> sides to numbers. If both succeed it adds; only
-when at least one side is non-numeric does it fall back to string concatenation.
-This makes <code>+</code> ambiguous on data of unknown type — <strong>always use <code>..</code> for text</strong>:</p>
+when at least one side is a non-numeric <strong>scalar</strong> (string, bool, nil) does it fall
+back to string concatenation. This makes <code>+</code> ambiguous on data of unknown type —
+<strong>always use <code>..</code> for text</strong>:</p>
 <pre><code class="language-mix">print("5" + 3)            -- both numeric -&gt; 8
 print("5" + "10")         -- both numeric strings -&gt; 15, NOT "510"
 print("a" + "b")          -- not numeric -&gt; string concat
 print("inf" + 1)          -- "inf" is NOT a numeric string -&gt; concat
-print([1] + [2])          -- neither numeric -&gt; renders + joins as text
 </code></pre>
 <pre><code class="language-text">8
 15
 ab
 inf1
-[1][2]
 </code></pre>
 <p>That <code>"5" + "10"</code> → <code>15</code> surprise is exactly why the concat operator is separate.</p>
+<h3 id="-on-a-list-map-bytes-buffer-or-function-raises-0900"><code>+</code> on a list, map, bytes, buffer or function <strong>raises</strong> (0.90.0)</h3>
+<p>The fallback is scalars only. Give <code>+</code> a container or a function value on
+<strong>either</strong> side and it raises <code>TYPE_ERROR</code> naming the builtin that does what
+you meant:</p>
+<pre><code class="language-mix">print(["a"] + ["b"])
+print({a: 1} + {b: 2})
+print([1] + 2)
+</code></pre>
+<pre><code class="language-text">Runtime error: `+` is not defined for list and list — it does not join lists. Use concat(a, b) to join, push(list, value) to append
+Runtime error: `+` is not defined for map and map — it does not merge maps. Use merge(a, b)
+Runtime error: `+` is not defined for list and number — `+` takes numbers or strings. Use `..` to build text, concat(a, b) for lists, merge(a, b) for maps
+</code></pre>
+<p>Before 0.90.0 each of those produced a <em>string</em> (<code>[a][b]</code>, <code>{a: 1}{b: 2}</code>, <code>[1]2</code>)
+with rc 0, and nothing failed until far from the cause — a helper that built
+<code>["runuser", …, $db] + $argv</code> and handed the result to <code>run_argv</code> was the filing
+case. Note this is deliberately wider than the <a href="/mix/operators#equality--and-"><code>==</code> rule</a>:
+<strong>either</strong> operand being a container is enough, because <code>+</code> has no counterpart to
+the <code>$map[$key] == nil</code> key-absence idiom that rule has to protect.</p>
+<p><code>nil</code> is still a scalar: <code>nil + 1</code> is <code>"nil1"</code>. That is its own trap, but it is
+not this one, and moving it would break absent-key-into-a-message lines whose
+behaviour depends on the data.</p>
+<p>Indexing a container and adding the <strong>element</strong> is unaffected — the operand there
+is a scalar:</p>
+<pre><code class="language-mix">$tally["pass"] = $tally["pass"] + 1   -- fine: the element is a number
+</code></pre>
+<p><code>mix lint</code> flags the statically provable shapes ahead of the run as
+<a href="/mix/lint">MIX-W2301</a> — the only gate there is on an <code>ssh_mix</code> body, or on a
+branch the local run never takes.</p>
 <h2 id="concatenation-">Concatenation: <code>..</code></h2>
 <p><code>..</code> always converts <strong>both</strong> operands to their Mix string form and joins them.
 It never does arithmetic — this is the unambiguous way to build text. (In <code>"…"</code>
@@ -849,7 +876,8 @@ an <a href="/mix/control-flow"><code>if</code> statement</a>.</p>
 <h2 id="quick-reference">Quick reference</h2>
 <pre><code class="language-text">+  -  *  /  %  **      arithmetic  (f64; coerces numeric strings/bools; / or % by 0 errors)
 ..                     string concat (always stringifies both sides)  &lt;-- use for text
-+                      string-concat FALLBACK only when not both numeric (avoid for text)
++                      string-concat FALLBACK only when not both numeric (avoid for text);
+                       a list/map/bytes/buffer/function operand RAISES (0.90.0)
 == !=                  value equality (Number&lt;-&gt;String coerces; List/Map always !=)
 &lt;  &gt;  &lt;=  &gt;=           ordering: numeric-first, else lexicographic strings, else error
 eq ne                  textual equality on the printed Mix string forms

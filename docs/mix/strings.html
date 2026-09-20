@@ -464,7 +464,7 @@ raw ${name} $(date)
 </code></pre>
 <p>The split mirrors bash's quoting, with one trap that bites everyone:</p>
 <table><thead><tr><th>Form</th><th>Interpolates <code>${x}</code></th><th>Bare <code>$x</code></th><th><code>$(...)</code></th><th>leading <code>~</code></th><th>Escapes</th></tr></thead><tbody>
-<tr><td><code>"double"</code></td><td>yes (scope → env)</td><td><strong>literal text</strong></td><td><strong>literal text</strong></td><td>expands to <code>$HOME</code></td><td><code>\n \t \r \e \" \\ \$ \~ \u{…}</code></td></tr>
+<tr><td><code>"double"</code></td><td>yes (scope → env)</td><td><strong>literal text</strong></td><td><strong>literal text</strong></td><td>expands to <code>$HOME</code></td><td><code>\n \t \r \e \a \b \f \v \0 \xHH \" \\ \$ \~ \u{…}</code></td></tr>
 <tr><td><code>'single'</code></td><td>no</td><td>literal</td><td>literal</td><td>literal</td><td>only <code>\'</code> and <code>\\</code></td></tr>
 </tbody></table>
 <p><strong>Only <code>${...}</code> interpolates</strong> inside double quotes. A bare <code>$name</code> is the literal
@@ -503,6 +503,19 @@ text:</p>
 <p>A variable whose <strong>value</strong> is nil is bound, so it still renders the literal
 <code>nil</code> (<code>$x = nil</code> → <code>${x}</code> → <code>nil</code>); likewise a missing map key in a dotted path
 (<code>${a.b}</code> → <code>nil</code>), matching <code>$a.b</code>.</p>
+<p><strong>A bare <code>$name</code> is literal — this is the opposite of bash.</strong> Only <code>${name}</code>
+interpolates, so <code>read_file("$sp/prompt.md")</code> opens a file called
+<code>$sp/prompt.md</code>. The rule is deliberate (it lets a string carry shell text and
+nested Mix source untouched), but it is also the first thing anyone arriving from
+bash gets wrong, so <code>mix lint</code> reports it as <a href="/mix/lint">MIX-D3015</a> when the name is
+bound in the same file:</p>
+<pre><code class="language-mix">$sp = "/tmp/x"
+print("$sp/a")      -- literal:  $sp/a      (MIX-D3015)
+print("${sp}/a")    -- /tmp/x/a
+print('$sp/a')      -- literal, and says so
+print("\$sp/a")     -- literal, and says so
+</code></pre>
+<p><code>\$name</code> and single quotes are the two ways to mean it, and neither is reported.</p>
 <h3 id="defaults--x--default-and-x--default">Defaults — <code>${x ?? default}</code> and <code>${x ?: default}</code></h3>
 <p>Supply a fallback with the same coalescing operators Mix uses in expressions.
 The default is any Mix expression, evaluated <strong>only</strong> when the fallback fires:</p>
@@ -543,8 +556,9 @@ print("hi $user")               -- literal "hi $user" — usually NOT what you m
 hi $user
 </code></pre>
 <h2 id="escapes-and-uxxxx">Escapes and <code>\u{XXXX}</code></h2>
-<p>Double-quoted strings honour <code>\n \t \r</code>, <code>\e</code> (ESC, <code>\x1b</code>), <code>\" \\ \$ \~</code>, and the
-braced unicode escape <code>\u{XXXX}</code> (1–6 hex digits):</p>
+<p>Double-quoted strings honour <code>\n \t \r</code>, <code>\e</code> (ESC), <code>\a \b \f \v</code> (BEL, BS, FF, VT),
+<code>\0</code> (NUL), <code>\" \\ \$ \~</code>, the two-hex-digit <code>\xHH</code>, and the braced unicode escape
+<code>\u{XXXX}</code> (1–6 hex digits):</p>
 <pre><code class="language-mix">print("tab\there")
 print("price: \$5")             -- \$ for a literal dollar
 print("\u{2764} love")          -- U+2764 HEAVY BLACK HEART
@@ -559,8 +573,36 @@ strip BOM:[﻿]
 <code>"C:\users"</code> or an embedded JSON <code>\uXXXX</code> is unchanged. Single-quoted strings keep
 <code>\u{…}</code> literal too. A surrogate or out-of-range codepoint is a loud lex error
 (<code>\u{D800} is not a valid unicode codepoint</code>), never a silent pass-through.</p>
+<h3 id="xhh-0-and-the-control-escapes-0900"><code>\xHH</code>, <code>\0</code> and the control escapes (0.90.0)</h3>
+<p><code>\xHH</code> takes <strong>exactly two hex digits</strong> and its value is the <strong>codepoint</strong> U+00HH —
+never a raw byte. A Mix string is UTF-8, so <code>"\xff"</code> is U+00FF (one character, two
+bytes on the wire), not the byte <code>0xFF</code>. For bytes, use <code>bytes_from_hex</code> /
+<code>bytes_from</code>, which keep a different spelling on purpose.</p>
+<pre><code class="language-mix">print("isn\x27t")
+print("\x41\x42")
+print(len("a\0b"))          -- \0 is NUL, a real character
+print("\a" == chr(7))       -- BEL; \b \f \v are BS, FF, VT
+</code></pre>
+<pre><code class="language-text">isn't
+AB
+3
+true
+</code></pre>
+<p><code>\0</code> is NUL <strong>exactly</strong>, never the start of an octal escape: octal is ambiguous
+next to digits, so <code>"\012"</code> is NUL followed by the text <code>12</code>. Octal and <code>\U</code> are
+deliberately absent — <code>\u{…}</code> covers what they would have been for.</p>
+<p>Fewer than two hex digits is <strong>not</strong> a lex error: <code>"\x4"</code> stays the three
+characters <code>\x4</code>, so a regex pattern meaning the engine's own <code>\x</code> never becomes a
+hard failure of the whole file. <code>mix lint</code> reports it as
+<a href="/mix/lint">MIX-W2405</a> instead.</p>
+<p>Before 0.90.0 all of these were kept literally, which is how a <code>replace()</code> once
+wrote <code>isn\x27t</code> into a committed journal entry with no gate noticing.</p>
+<h3 id="unrecognised-escapes-are-still-literal--and-now-linted">Unrecognised escapes are still literal — and now linted</h3>
 <p>Any <strong>unrecognised</strong> escape keeps the backslash literally: <code>"\d"</code> is the two
-characters <code>\d</code>, not an error. Strip a BOM with the real codepoint:
+characters <code>\d</code>, not an error. That is deliberate (it protects regex patterns and
+Windows paths), but it is also how a habit from another language becomes silently
+wrong output, so <code>mix lint</code> flags it as <a href="/mix/lint">MIX-W2405</a>. A deliberate
+backslash is written <code>\\</code>, which never warns. Strip a BOM with the real codepoint:
 <code>replace($s, "\u{FEFF}", "")</code>.</p>
 <h2 id="leading--expansion">Leading <code>~</code> expansion</h2>
 <p>A <code>~</code> at the <strong>very start</strong> of a double-quoted string expands to <code>$HOME</code> at
@@ -640,7 +682,27 @@ print(pos("é", "café"))         -- 1-based codepoint position
 <a href="/mix/io#naming-byte_-vs-bytes_">io</a>. The two are easy to confuse and are not
 interchangeable: <code>byte_length($some_bytes)</code> stringifies its argument first and
 so measures the <code>&lt;bytes:N&gt;</code> placeholder, not the bytes.</p>
-<p>A plain <code>substr</code>/<code>reverse</code> is codepoint-based and <strong>splits</strong> an emoji ZWJ sequence or
+<h3 id="ord--chr--codepoint--character-0900"><code>ord</code> / <code>chr</code> — codepoint ↔ character (0.90.0)</h3>
+<p><code>ord(s)</code> is the Unicode codepoint of the <strong>first character</strong>; <code>chr(n)</code> is the
+one-character string for a codepoint. They are the runtime twins of the <code>\u{…}</code>
+literal escape, and the only way to <em>ask</em> what a string holds —
+<code>bytes_to_hex(string_to_bytes($s))</code> answers in UTF-8 bytes, which is a different
+question.</p>
+<pre><code class="language-mix">print(ord("A"))
+print(ord("é"))          -- the CODEPOINT 233, not the first byte 0xC3
+print(chr(10084))
+print(chr(0x27))         -- the runtime twin of "\u{27}"
+</code></pre>
+<pre><code class="language-text">65
+233
+❤
+'
+</code></pre>
+<p><code>ord("")</code> raises: <code>0</code> is NUL, a real codepoint that <code>chr</code> round-trips, so it cannot
+also mean "absent". <code>chr</code> takes the <code>\u{…}</code> validity rule exactly — a surrogate
+(<code>chr(0xD800)</code>), anything above <code>0x10FFFF</code>, and a fractional or negative argument
+all raise rather than saturate to a plausible wrong character.
+A plain <code>substr</code>/<code>reverse</code> is codepoint-based and <strong>splits</strong> an emoji ZWJ sequence or
 combining cluster; the <code>grapheme_*</code> ops keep it whole:</p>
 <pre><code class="language-mix">print(reverse("a👍🏽b"))          -- codepoint reverse splits the skin-tone modifier
 print(grapheme_reverse("a👍🏽b")) -- grapheme reverse keeps it whole
@@ -723,6 +785,22 @@ you need NFC-insensitive matching.</p>
 byte-exact rule is about <em>matching</em>, not casing. For word extraction there are the
 ARexx-flavoured <code>words($s)</code> (count whitespace-delimited words) and <code>word($s, n)</code>
 (Nth word, 1-based); for pattern matching see <a href="/mix/regex">regex</a>.</p>
+<h3 id="editing-a-file-use-replace_must-0900">Editing a file? Use <code>replace_must</code> (0.90.0)</h3>
+<p><code>replace()</code> returns the subject <strong>unchanged</strong> when the needle is absent. That is
+the right contract for a transform and the wrong one for an <em>edit</em>: in the
+read-modify-write idiom a missed needle writes the input straight back and reports
+success.</p>
+<pre><code class="language-mix">$s = read_file($p)
+write_file($p, replace_must($s, "old", "new", {count: 1, path: $p}))
+</code></pre>
+<p><code>replace_must(s, old, new[, {count, path}])</code> raises <code>NEEDLE_ABSENT</code> when <code>old</code> does
+not occur, and <code>NEEDLE_COUNT</code> when <code>count</code> is given and the number of occurrences
+differs — so an edit that was meant to hit one site and would have rewritten two
+fails instead of shipping. <code>path</code> only names the file in the message, which is most
+of the diagnosis when the edit runs in a loop over several files.
+<code>re_replace_must(s, pattern, replacement[, {count, path}])</code> is the regex twin.</p>
+<p><code>replace()</code> and <code>re_replace()</code> are unchanged — <code>mix lint</code> flags the unguarded
+write-back chain as <a href="/mix/lint">MIX-D3014</a>.</p>
 <h2 id="ordering-and-equality">Ordering and equality</h2>
 <p>The comparison operators <code>&lt;</code> <code>&gt;</code> <code>&lt;=</code> <code>&gt;=</code> pick their mode from <strong>both</strong> operands:</p>
 <ol>

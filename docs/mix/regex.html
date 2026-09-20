@@ -442,12 +442,12 @@
 
     <div id="doc-view" class="content-section">
         <div id="content-doc" data-prerendered="mix/regex.md"><div class="prose"><h1 id="regular-expressions">Regular expressions</h1>
-<p>Mix ships five regex builtins — <code>re_match</code>, <code>re_find</code>, <code>re_replace</code>,
-<code>re_split</code>, <code>grep_lines</code> — built on the Rust
+<p>Mix ships six regex builtins — <code>re_match</code>, <code>re_find</code>, <code>re_replace</code>,
+<code>re_replace_must</code>, <code>re_split</code>, <code>grep_lines</code> — built on the Rust
 <a href="https://docs.rs/regex"><code>regex</code></a> crate, all taking their <strong>subject first</strong>
 like every literal-string builtin. The <code>mix</code> binary compiles with the
 <code>regex</code> feature <strong>on</strong>, so they're always available; a library build
-without that feature won't have the four <code>re_*</code> (and <code>grep_lines</code> falls
+without that feature won't have the five <code>re_*</code> (and <code>grep_lines</code> falls
 back to a literal substring test per line). The plain string ops <code>replace</code>
 / <code>split</code> / <code>contains</code> are <strong>always present</strong> (not feature-gated) and treat
 their needle <strong>literally</strong> — <code>split("a1b22c", "[0-9]+")</code> does not split —
@@ -489,6 +489,7 @@ h_ll_ w_rld
 <tr><td><code>re_match(s, pattern)</code></td><td><strong>bool</strong></td><td>true if <code>pattern</code> matches <em>anywhere</em> in <code>s</code> (not anchored)</td></tr>
 <tr><td><code>re_find(s, pattern)</code></td><td><strong>list of maps</strong></td><td>every non-overlapping match, <code>{match, start, end[, groups]}</code> — <strong>codepoint</strong> offsets, so <code>start</code>/<code>end</code> compose with <code>substr</code>/<code>slice</code>/<code>index_of</code>; <code>[]</code> when none</td></tr>
 <tr><td><code>re_replace(s, pattern, repl)</code></td><td><strong>string</strong></td><td>replaces <strong>all</strong> matches; <code>$1</code>/<code>${name}</code> backrefs in <code>repl</code></td></tr>
+<tr><td><code>re_replace_must(s, pattern, repl[, {count, path}])</code></td><td><strong>string</strong></td><td>same, but <strong>raises</strong> <code>NEEDLE_ABSENT</code> when nothing matched and <code>NEEDLE_COUNT</code> when <code>count</code> disagrees — the form for editing a file (0.90.0)</td></tr>
 <tr><td><code>re_split(s, pattern)</code></td><td><strong>list of strings</strong></td><td>splits on each match; keeps empty leading/trailing parts</td></tr>
 <tr><td><code>grep_lines(text, pattern)</code></td><td><strong>list of strings</strong></td><td>the lines of <code>text</code> matching <code>pattern</code>; <code>[]</code> when none</td></tr>
 </tbody></table>
@@ -604,6 +605,19 @@ eaten before the regex sees it — see <a href="/mix/regex#quoting-traps">Quotin
 <li><strong>Group names parse greedily.</strong> <code>$1x</code> reads as one reference to the (nonexistent) group <em>named</em> <code>1x</code> — <code>re_replace('10', '(\d+)', '$1x')</code> returns <code>""</code>, not <code>10x</code>. Brace the number whenever a word character follows: <code>'${1}x'</code> → <code>10x</code>. (<code>'$2.$1'</code> works only because <code>.</code> isn't a word char.)</li>
 <li><strong>An unknown group substitutes the empty string</strong>, never an error — a typoed backref silently deletes the match.</li>
 </ul>
+<p><strong>A pattern that matches nothing is also silent</strong> — <code>re_replace</code> hands back the
+subject unchanged, so in a read-modify-write file edit the input is written
+straight back and the run reports success. <code>re_replace_must</code> (0.90.0) is the same
+call that raises instead:</p>
+<pre><code class="language-mix">write_file($p, re_replace_must(read_file($p), "(?m)^version = .*$", $new, {count: 1, path: $p}))
+</code></pre>
+<p>Note the <code>(?m)</code> — without it <code>^</code>/<code>$</code> anchor to the whole text, not each line,
+so a line-oriented pattern over a file's contents matches nothing. Before
+<code>re_replace_must</code> that was a silent no-op that wrote the file back unchanged;
+now it is a <code>NEEDLE_ABSENT</code> that names the file.</p>
+<p><code>NEEDLE_ABSENT</code> when nothing matched, <code>NEEDLE_COUNT</code> when <code>{count: n}</code> disagrees
+with how many matches there were. <code>mix lint</code> flags the unguarded chain as
+<a href="/mix/lint">MIX-D3014</a>.</p>
 <h3 id="re_split--split-on-a-pattern">re_split — split on a pattern</h3>
 <p><code>re_split(s, pattern)</code> splits <code>s</code> at each match and returns the pieces
 as a list. Empty leading/trailing/adjacent pieces are <strong>kept</strong> (unlike a naive

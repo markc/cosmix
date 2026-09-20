@@ -1037,13 +1037,11 @@ function ssh_prune($table, $keep)
   end
 end
 
--- Cheap suffix test (no regex).
-function ends_with($s, $suffix)
-  $sl = length($s)
-  $ql = length($suffix)
-  if $ql > $sl then return false end
-  return substr($s, $sl - $ql) == $suffix
-end
+-- A hand-rolled `ends_with` used to sit here. It was DEAD: `ends_with` is a
+-- builtin, and a user function of a builtin's name is never called, so both
+-- call sites above have always gone to the builtin — which does the same
+-- thing. Deleting it changes nothing at runtime and clears the MIX-E1303 the
+-- collision earns since 0.90.0.
 
 -- ── drift check ─────────────────────────────────────────────────────────────
 

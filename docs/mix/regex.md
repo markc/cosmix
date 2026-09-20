@@ -1,11 +1,11 @@
 # Regular expressions
 
-Mix ships five regex builtins — `re_match`, `re_find`, `re_replace`,
-`re_split`, `grep_lines` — built on the Rust
+Mix ships six regex builtins — `re_match`, `re_find`, `re_replace`,
+`re_replace_must`, `re_split`, `grep_lines` — built on the Rust
 [`regex`](https://docs.rs/regex) crate, all taking their **subject first**
 like every literal-string builtin. The `mix` binary compiles with the
 `regex` feature **on**, so they're always available; a library build
-without that feature won't have the four `re_*` (and `grep_lines` falls
+without that feature won't have the five `re_*` (and `grep_lines` falls
 back to a literal substring test per line). The plain string ops `replace`
 / `split` / `contains` are **always present** (not feature-gated) and treat
 their needle **literally** — `split("a1b22c", "[0-9]+")` does not split —
@@ -52,6 +52,7 @@ h_ll_ w_rld
 | `re_match(s, pattern)` | **bool** | true if `pattern` matches *anywhere* in `s` (not anchored) |
 | `re_find(s, pattern)` | **list of maps** | every non-overlapping match, `{match, start, end[, groups]}` — **codepoint** offsets, so `start`/`end` compose with `substr`/`slice`/`index_of`; `[]` when none |
 | `re_replace(s, pattern, repl)` | **string** | replaces **all** matches; `$1`/`${name}` backrefs in `repl` |
+| `re_replace_must(s, pattern, repl[, {count, path}])` | **string** | same, but **raises** `NEEDLE_ABSENT` when nothing matched and `NEEDLE_COUNT` when `count` disagrees — the form for editing a file (0.90.0) |
 | `re_split(s, pattern)` | **list of strings** | splits on each match; keeps empty leading/trailing parts |
 | `grep_lines(text, pattern)` | **list of strings** | the lines of `text` matching `pattern`; `[]` when none |
 
@@ -211,6 +212,24 @@ Two more replacement-parser rules (both verified):
 
 - **Group names parse greedily.** `$1x` reads as one reference to the (nonexistent) group *named* `1x` — `re_replace('10', '(\d+)', '$1x')` returns `""`, not `10x`. Brace the number whenever a word character follows: `'${1}x'` → `10x`. (`'$2.$1'` works only because `.` isn't a word char.)
 - **An unknown group substitutes the empty string**, never an error — a typoed backref silently deletes the match.
+
+**A pattern that matches nothing is also silent** — `re_replace` hands back the
+subject unchanged, so in a read-modify-write file edit the input is written
+straight back and the run reports success. `re_replace_must` (0.90.0) is the same
+call that raises instead:
+
+```mix
+write_file($p, re_replace_must(read_file($p), "(?m)^version = .*$", $new, {count: 1, path: $p}))
+```
+
+Note the `(?m)` — without it `^`/`$` anchor to the whole text, not each line,
+so a line-oriented pattern over a file's contents matches nothing. Before
+`re_replace_must` that was a silent no-op that wrote the file back unchanged;
+now it is a `NEEDLE_ABSENT` that names the file.
+
+`NEEDLE_ABSENT` when nothing matched, `NEEDLE_COUNT` when `{count: n}` disagrees
+with how many matches there were. `mix lint` flags the unguarded chain as
+[MIX-D3014](lint.md).
 
 ### re_split — split on a pattern
 

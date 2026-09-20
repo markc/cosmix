@@ -2,6 +2,28 @@ use crate::continuation::{ContinuationSite, continuation_sites};
 use crate::error::{MixError, MixResult, Span};
 use crate::token::{SpannedToken, StringPart, Token};
 
+/// Something a DOUBLE-quoted string literal contained that `mix lint`
+/// wants to report, recorded while lexing.
+///
+/// It has to be collected here because the token stream cannot say it
+/// later: a single-quoted `'$sp/x'` and a double-quoted `"$sp/x"` both
+/// lex to `Token::String("$sp/x")`, and the AST must NOT grow a variant
+/// to tell them apart — `Token::String` is what strict-data parsing
+/// accepts (`Token::InterpString` is a hard StrictDataViolation) and what
+/// the `send target a.b` bareword path keys off, so a shape change there
+/// would refuse data files and command forms that work today.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringNote {
+    /// A bare `$name` inside `"…"`. Literal by design (only `${name}`
+    /// interpolates) — which is the opposite of bash, so anyone arriving
+    /// from bash writes it. `\$name` and `'…'` take the escape arms and
+    /// are never recorded.
+    BareDollar { line: usize, name: String },
+    /// An escape the lexer does not recognise, kept as backslash + char.
+    /// `text` is the source spelling (`\x27`, `\q`, `\'`).
+    UnknownEscape { line: usize, text: String },
+}
+
 pub struct Lexer {
     source: Vec<char>,
     pos: usize,
@@ -13,6 +35,7 @@ pub struct Lexer {
     brace_depth: usize,
     continuation_sites: Vec<ContinuationSite>,
     continuation_error: Option<MixError>,
+    string_notes: Vec<StringNote>,
 }
 
 impl Lexer {
@@ -32,6 +55,25 @@ impl Lexer {
             brace_depth: 0,
             continuation_sites,
             continuation_error,
+            string_notes: Vec::new(),
+        }
+    }
+
+    /// What the double-quoted string literals in this source contained that
+    /// lint wants to see. Populated by `tokenize`; empty before it runs.
+    pub fn string_notes(&self) -> &[StringNote] {
+        &self.string_notes
+    }
+
+    /// Lex `source` purely to harvest [`StringNote`]s. A lex error yields
+    /// an empty list on purpose: the caller already reports it (MIX-E1001),
+    /// and half a note list from a file that does not tokenise is worse
+    /// than none.
+    pub fn notes_for(source: &str) -> Vec<StringNote> {
+        let mut lexer = Lexer::new(source);
+        match lexer.tokenize() {
+            Ok(_) => lexer.string_notes,
+            Err(_) => Vec::new(),
         }
     }
 
@@ -529,6 +571,23 @@ impl Lexer {
         self.advance(); // skip opening "
         let mut parts: Vec<StringPart> = Vec::new();
         let mut current = String::new();
+        // MIX-W2404 candidates for THIS string, and whether the string
+        // spans lines. A multi-line double-quoted string is, overwhelmingly,
+        // NESTED PROGRAM TEXT — an `ssh_mix` body or a `mix -c` program —
+        // in which `$rc`/`$result`/`$stamp` are the INNER program's
+        // variables and being literal is exactly right. Measured on 785
+        // fleet scripts: without this test the rule fired 560 times, nearly
+        // all of them that shape; with it, the count is what the heredoc
+        // twin MIX-W2402 costs. The filing case (`read_file("$sp/x.md")`)
+        // is single-line, as every instance of this mistake is.
+        // A `\"` in the spelling is this repo's established mark of nested
+        // Mix/shell source (it is the whole basis of MIX-W2306), and a
+        // one-line fragment like `"$CMCTL .. \"/_etc/x.mix\""` is the same
+        // inner-program case as the multi-line one. Suppressing on it took
+        // the fleet count from 398 to the residue below.
+        let mut dollars: Vec<StringNote> = Vec::new();
+        let mut multiline = false;
+        let mut nested_source = false;
 
         // Leading `~` expansion: a bare `~` or `~/...` at the very start of
         // a double-quoted string expands to `$HOME` at runtime. Mid-string
@@ -557,13 +616,24 @@ impl Lexer {
                     break;
                 }
                 Some('\\') => {
+                    // The line of the BACKSLASH, not of whatever follows:
+                    // `self.advance()` over an escaped physical newline has
+                    // already moved `self.line` on, which reported the
+                    // escape one line below where it was written.
+                    let esc_line = self.line;
                     self.advance();
                     match self.advance() {
-                        Some('n') => current.push('\n'),
+                        Some('n') => {
+                            multiline = true;
+                            current.push('\n');
+                        }
                         Some('t') => current.push('\t'),
                         Some('r') => current.push('\r'),
                         Some('e') => current.push('\x1b'),
-                        Some('"') => current.push('"'),
+                        Some('"') => {
+                            nested_source = true;
+                            current.push('"');
+                        }
                         Some('\\') => current.push('\\'),
                         Some('$') => current.push('$'),
                         Some('~') => current.push('~'),
@@ -579,7 +649,60 @@ impl Lexer {
                         Some('u') if self.peek() == Some('{') => {
                             self.lex_unicode_escape(line, col, &mut current)?
                         }
+                        // The C/Rust/JS control escapes (0.90.0). Every
+                        // other language has these, so the "unrecognised
+                        // escape keeps the backslash" rule turned a habit
+                        // into silently wrong output that no gate saw — a
+                        // `replace()` wrote a literal `isn\x27t` into a
+                        // committed journal entry (2026-09-17).
+                        //
+                        // `\0` is NUL exactly, never the start of an octal
+                        // escape: octal is ambiguous next to digits
+                        // (`"\012"` is NUL then "12"), and `\u{…}` already
+                        // covers what octal would have been for.
+                        Some('0') => current.push('\0'),
+                        Some('a') => current.push('\u{07}'),
+                        Some('b') => current.push('\u{08}'),
+                        Some('f') => current.push('\u{0C}'),
+                        Some('v') => current.push('\u{0B}'),
+                        // `\xHH` — EXACTLY two hex digits, and the value is
+                        // the CODEPOINT U+00HH, never a raw byte: a Mix
+                        // String is UTF-8, so `"\xff"` is U+00FF (two bytes
+                        // on the wire), not the byte 0xFF. `bytes_from`/
+                        // `bytes_from_hex` are the byte route, and they keep
+                        // a different spelling on purpose. Fewer than two
+                        // hex digits is NOT an error — it stays literal and
+                        // lint reports it, so a pattern that meant the
+                        // regex's own `\x` is not turned into a lex failure.
+                        Some('x') => {
+                            if let (Some(h1), Some(h2)) = (self.peek(), self.peek_ahead(1))
+                                && h1.is_ascii_hexdigit()
+                                && h2.is_ascii_hexdigit()
+                            {
+                                self.advance();
+                                self.advance();
+                                let cp = (h1.to_digit(16).unwrap() * 16) + h2.to_digit(16).unwrap();
+                                // 0x00..=0xFF is always a valid char.
+                                current.push(char::from_u32(cp).expect("0x00..=0xFF is a char"));
+                            } else {
+                                self.note_unknown_escape(esc_line, 'x');
+                                current.push('\\');
+                                current.push('x');
+                            }
+                        }
                         Some(c) => {
+                            // A backslash before a PHYSICAL newline: the
+                            // string really does span lines (so the bare-`$`
+                            // batch must be dropped with every other
+                            // multi-line string), and its diagnostic cannot
+                            // quote the escape verbatim without putting a
+                            // raw newline inside the message — which would
+                            // break the one-finding-per-line human format
+                            // and the `--json` text alike.
+                            if c == '\n' || c == '\r' {
+                                multiline = true;
+                            }
+                            self.note_unknown_escape(esc_line, c);
                             current.push('\\');
                             current.push(c);
                         }
@@ -633,13 +756,21 @@ impl Lexer {
                         // and heredoc `$(...)` are unaffected — separate forms.)
                         current.push('$');
                         self.advance();
+                        self.note_bare_dollar(&mut dollars);
                     }
                 }
                 Some(c) => {
+                    if c == '\n' {
+                        multiline = true;
+                    }
                     current.push(c);
                     self.advance();
                 }
             }
+        }
+
+        if !multiline && !nested_source {
+            self.string_notes.append(&mut dollars);
         }
 
         if !current.is_empty() {
@@ -657,6 +788,58 @@ impl Lexer {
         } else {
             Ok(self.spanned(Token::InterpString(parts), line, col))
         }
+    }
+
+    /// Record an escape the lexer kept literally, for MIX-W2405.
+    ///
+    /// `u` is EXEMPT: an unbraced `\uXXXX` staying literal is a documented
+    /// design decision (it protects embedded JSON and `C:\users`), so
+    /// warning about it would be noise on code that is already correct.
+    /// `\u{…}` never reaches here at all.
+    fn note_unknown_escape(&mut self, line: usize, c: char) {
+        if c == 'u' {
+            return;
+        }
+        // Never put a raw control character in a diagnostic: `text` is
+        // quoted straight into the message, and a literal newline there
+        // splits one finding across two output lines.
+        let text = match c {
+            '\n' => "\\<newline>".to_string(),
+            '\r' => "\\<carriage-return>".to_string(),
+            '\t' => "\\<tab>".to_string(),
+            c => format!("\\{c}"),
+        };
+        self.string_notes.push(StringNote::UnknownEscape { line, text });
+    }
+
+    /// Record a bare `$name` in a double-quoted literal, for MIX-W2404.
+    /// Called with the `$` already consumed and `self.pos` on the first
+    /// character after it. A `$` followed by anything that is not an
+    /// identifier start (`"$5.00"`, `"cost: $"`) is not a spelling of a
+    /// variable and is never recorded.
+    ///
+    /// Buffered rather than recorded directly: the caller discards the
+    /// whole batch for a MULTI-LINE string. See `lex_double_string`.
+    fn note_bare_dollar(&mut self, out: &mut Vec<StringNote>) {
+        let mut name = String::new();
+        let mut i = 0;
+        while let Some(c) = self.peek_ahead(i) {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                name.push(c);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        // All-digit names are the positional `$1`-style reads, which are
+        // never a `${name}` mistake.
+        if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+            return;
+        }
+        out.push(StringNote::BareDollar {
+            line: self.line,
+            name,
+        });
     }
 
     /// Parse a `\u{XXXX}` unicode escape (the `\u` is already consumed) and

@@ -102,6 +102,19 @@ pub struct AnalyzerConfig {
     /// inner file's universe would be pure noise. Reuses the existing
     /// `dynamic` suppression rather than inventing a second switch.
     pub suppress_name_checks: bool,
+    /// The file's SOURCE text, when the caller has it (0.90.0).
+    ///
+    /// Two rules need what the token stream deliberately forgets: a bare
+    /// `$name` and an unrecognised escape are both properties of a
+    /// DOUBLE-quoted literal's spelling, and `'…'` and `"…"` lex to the
+    /// same `Token::String`. The AST must not grow a variant to say which
+    /// (strict-data parsing refuses `Token::InterpString` outright), so the
+    /// analyzer re-lexes for [`crate::lexer::Lexer::notes_for`] instead.
+    ///
+    /// `None` simply skips those two rules — every other rule is
+    /// unaffected, so an embedder that does not set it loses nothing it
+    /// had before.
+    pub source: Option<String>,
 }
 
 /// The result of one file's analysis.
@@ -390,6 +403,7 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
         true,
     );
     check_recurring_silent_bugs(stmts, &ctx, &mut a);
+    check_string_literal_spelling(stmts, &ctx, &mut a, cfg);
     check_release_transition_advisories(stmts, &ctx, &mut a);
     // Guarded against unbounded recursion: a remote body may itself contain
     // an `ssh_mix`, and nothing stops that nesting from being circular
@@ -399,6 +413,179 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
     }
     collect_capabilities(stmts, &mut a);
     a
+}
+
+/// MIX-D3015 + MIX-W2405 (0.90.0) — the two rules about how a
+/// DOUBLE-quoted literal was SPELLED, which the token stream no longer
+/// knows (see `AnalyzerConfig::source`).
+///
+/// D3015, bare `$name`: double quotes interpolate `${name}` only, and a
+/// bare `$name` is literal BY DESIGN — the opposite of bash, so anyone
+/// arriving from bash writes it. Four occurrences in one file passed lint
+/// and all four failed at runtime (2026-09-17). Gated on the name being
+/// bound somewhere in the file, exactly as MIX-W2402 gates the heredoc
+/// twin: `"Total: $USD"` in prose must stay silent. `\$name` and `'…'`
+/// never reach the lexer's note.
+///
+/// A NOTE, where the heredoc twin is a warning, and that asymmetry is
+/// measured rather than assumed. Over 785 fleet scripts MIX-W2402 costs 4
+/// findings; this rule costs an order of magnitude more even after the
+/// lexer drops multi-line and escaped-quote strings, because a
+/// double-quoted literal is where scripts carry NESTED source (an
+/// `ssh_mix` body, a `mix -c` program, a test fixture) and a bare `$rc`
+/// in one is the inner program's variable, correctly literal. Shipping
+/// that as a warning would fail `--deny-warnings`, which is a live fleet
+/// deploy gate, on scripts that are not wrong. D3xxx is the
+/// severity-independent namespace precisely so this can be promoted to a
+/// warning, code unchanged, once the residue is worked off.
+///
+/// W2405, unrecognised escape: `"isn\x27t"` printed `isn\x27t` and lint
+/// said nothing, so a `replace()` wrote that into a committed journal
+/// entry. A deliberate backslash is `\\`, so the warning has a clean
+/// escape. `\u` without a brace is exempt — that literal is documented
+/// design, not an accident. This one IS a warning: the same fleet sweep
+/// found two findings, both real.
+fn check_string_literal_spelling(
+    stmts: &[Stmt],
+    ctx: &FileContext,
+    a: &mut Analysis,
+    cfg: &AnalyzerConfig,
+) {
+    let Some(source) = cfg.source.as_deref() else {
+        return;
+    };
+    // A note carries only a line, so the "is this name bound" test is
+    // `top_level_names` plus any PARAMETER whose function's line range
+    // contains that line. Parameters are not file-wide names — without
+    // them a helper's own `print("$p/file")`, the commonest shape of this
+    // mistake, went unreported; with them file-wide, prose that merely
+    // spelled an unrelated helper's parameter became a finding.
+    let scopes = collect_param_scopes(stmts);
+    for note in crate::lexer::Lexer::notes_for(source) {
+        match note {
+            crate::lexer::StringNote::BareDollar { line, name } => {
+                let bound = ctx.top_level_names.contains(&name)
+                    || scopes.iter().any(|s| {
+                        (s.start..=s.end).contains(&line) && s.params.contains(&name)
+                    });
+                if !bound {
+                    continue;
+                }
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-D3015",
+                    Severity::Note,
+                    line,
+                    format!("bare `${name}` in a double-quoted string is literal, not interpolated"),
+                    // Both spellings, neither presented as THE answer. The
+                    // review arm found `raise(…, "… and $root_docs here")`
+                    // in this repo's own generator, where `${root_docs}`
+                    // would splice a LIST into the message and make it
+                    // worse — a hint that leads with the interpolating form
+                    // recommends corruption in exactly the case the rule is
+                    // least sure about.
+                    Some(format!(
+                        "if the value was meant, write `${{{name}}}`; if the text was meant, write `\\${name}` or use a single-quoted '…' string — a note, because only you know which"
+                    )),
+                ));
+            }
+            crate::lexer::StringNote::UnknownEscape { line, text } => {
+                let hint = match text.as_str() {
+                    "\\x" => "`\\xHH` takes exactly two hex digits (0.90.0) — `\\x27`, not `\\x2`; for a literal backslash write `\\\\x`".to_string(),
+                    "\\'" => "double quotes need no escape for `'` — write `'` alone, or `\\\\'` for a literal backslash-quote".to_string(),
+                    // A backslash at end of line. Mix has no in-string line
+                    // continuation, so this keeps BOTH characters — which is
+                    // almost never what a shell/C habit intended.
+                    "\\<newline>" | "\\<carriage-return>" => "a backslash before a line break is NOT a continuation in Mix — both characters are kept; join the pieces with `..`, or write `\\\\` for a literal backslash".to_string(),
+                    _ => format!(
+                        "`{text}` is kept literally (backslash included) — write `\\\\{}` if that is what you want, or use `\\u{{…}}` for a codepoint",
+                        &text[1..]
+                    ),
+                };
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-W2405",
+                    Severity::Warning,
+                    line,
+                    format!("unknown escape `{text}` in a double-quoted string is kept literally"),
+                    Some(hint),
+                ));
+            }
+        }
+    }
+}
+
+/// One parameter scope: the LINE RANGE a `function`/`fn`/lambda covers,
+/// and the names its parameters bind inside it.
+///
+/// A parameter is not a file-wide name — it binds in one frame — but a
+/// [`crate::lexer::StringNote`] carries only a line, so MIX-D3015 has no
+/// scope to resolve against. A line range is the closest thing the note's
+/// coordinates can be matched to: a function's body is contiguous, so
+/// "inside these lines" and "inside this frame" coincide except for source
+/// that interleaves definitions, which Mix cannot express.
+///
+/// Admitting every parameter FILE-WIDE instead was the first cut, and the
+/// round-2 re-review caught what it cost: `fn unrelated($price)` made a
+/// top-level `"The price is $price per item"` a finding, because the name
+/// existed somewhere. Prose that happens to spell an unrelated helper's
+/// parameter must stay silent.
+struct ParamScope {
+    start: usize,
+    end: usize,
+    params: Vec<String>,
+}
+
+/// The maximum statement line anywhere inside `stmts`, including nested
+/// bodies and lambda bodies. `None` for an empty body — a function with no
+/// statements binds its parameters over no lines, so it admits nothing,
+/// which is the safe direction.
+fn max_stmt_line(stmts: &[Stmt]) -> Option<usize> {
+    let mut max = None;
+    walk_stmts(stmts, &mut |stmt| {
+        max = Some(max.map_or(stmt.line, |m: usize| m.max(stmt.line)));
+    });
+    max
+}
+
+fn collect_param_scopes(stmts: &[Stmt]) -> Vec<ParamScope> {
+    let mut out = Vec::new();
+    walk_stmts(stmts, &mut |stmt| {
+        if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind
+            && !params.is_empty()
+        {
+            let end = match body {
+                FunctionBody::Block(b) => max_stmt_line(b).unwrap_or(stmt.line),
+                FunctionBody::Expression(_) => stmt.line,
+            };
+            out.push(ParamScope {
+                start: stmt.line,
+                end: end.max(stmt.line),
+                params: params.iter().map(|p| p.name.clone()).collect(),
+            });
+        }
+        // A lambda has no line of its own, so it is bracketed by the
+        // statement that contains it and the last line of its own body.
+        let line = stmt.line;
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_expr(expr, &mut |e| {
+                if let Expr::FunctionLiteral { params, body } = e
+                    && !params.is_empty()
+                {
+                    let end = match &**body {
+                        FunctionBody::Block(b) => max_stmt_line(b).unwrap_or(line),
+                        FunctionBody::Expression(_) => line,
+                    };
+                    out.push(ParamScope {
+                        start: line,
+                        end: end.max(line),
+                        params: params.iter().map(|p| p.name.clone()).collect(),
+                    });
+                }
+            });
+        });
+    });
+    out
 }
 
 /// Immutable per-file facts shared by the passes.
@@ -702,16 +889,36 @@ fn check_pad_loop_idiom(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     });
 }
 
-/// MIX-W2403 (0.74.0): a user function named after a builtin is silently
-/// dead code — the builtin wins at every call site (and a builtin-named
-/// dot-call even desugars at parse time), so the definition can never be
-/// called. The worst shape of failure this produces is a script that keeps
-/// running while its own function quietly stops being called — every
-/// release that adds a builtin name arms it again (print_raw, bytes_find,
-/// sprintf… were all plausible names for older scripts to have defined).
-/// Deliberately a WARNING, never an error: a compat shim written for an
-/// older mix that lacks the builtin is a legitimate authoring pattern —
-/// but on THIS mix it is dead, and the author should know.
+/// MIX-E1303 (0.90.0, was MIX-W2403 from 0.74.0): a user function named
+/// after a builtin is silently dead code — the builtin wins at every call
+/// site (and a builtin-named dot-call even desugars at parse time), so the
+/// definition can never be called. The worst shape of failure this produces
+/// is a script that keeps running while its own function quietly stops
+/// being called — every release that adds a builtin name arms it again
+/// (print_raw, bytes_find, sprintf… were all plausible names for older
+/// scripts to have defined).
+///
+/// PROMOTED TO AN ERROR in 0.90.0, and the 0.74.0 case for keeping it a
+/// warning — "a compat shim written for an older mix is legitimate
+/// authoring" — did not survive contact with the fleet. Two sites existed
+/// across 785 scripts and NEITHER was a shim: one was a hand-rolled
+/// `ends_with` duplicating the builtin (dead, harmless), and the other was
+/// `fn mix_version()` in a pre-commit hook, written to report the version
+/// of a NAMED interpreter and silently answering with the running one's
+/// instead — a live wrong answer that had sat behind a warning for
+/// sixteen releases. Lint is also the only gate an `ssh_mix` body ever
+/// passes through, and a warning does not stop anything by default.
+///
+/// The RUNTIME is deliberately unchanged: the builtin still wins. Letting
+/// the user definition win would flip the behaviour of every existing
+/// shadowing script silently, which is the exact failure mode being
+/// removed here — the fix is to rename, and now the tool says so in a way
+/// that stops the run.
+///
+/// The code MOVED rather than changing severity in place: a code's letter
+/// encodes its severity permanently (`MIX-W2xxx` are warnings that were
+/// BORN warnings), so W2403 is retired, never reused, and its `mix explain`
+/// entry points here.
 fn check_builtin_shadowing(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     walk_stmts(stmts, &mut |stmt| {
         if let StmtKind::FunctionDef { name, .. } = &stmt.kind
@@ -719,8 +926,8 @@ fn check_builtin_shadowing(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) 
         {
             a.diagnostics.push(diag(
                 ctx,
-                "MIX-W2403",
-                Severity::Warning,
+                "MIX-E1303",
+                Severity::Error,
                 stmt.line,
                 format!(
                     "function '{name}' shadows the builtin of the same name and cannot be called BY NAME — the builtin wins at every call site"
@@ -1328,6 +1535,177 @@ fn check_recurring_silent_bugs(stmts: &[Stmt], ctx: &FileContext, a: &mut Analys
     check_implicit_nil_calls(stmts, ctx, a);
     check_truthiness_traps(stmts, ctx, a);
     check_ssh_escaped_quotes(stmts, ctx, a);
+    check_unguarded_edit_chain(stmts, ctx, a);
+}
+
+/// Deep-walk an expression and every descendant (lambda bodies excluded,
+/// same as `walk_expr_children`).
+///
+/// `walk_expr_children` skips `Expr::If` ENTIRELY — its branches are
+/// statement lists, which is the scope pass's business — so the
+/// expression-position `if`'s CONDITIONS would otherwise never be seen by
+/// any caller of this walker. They are ordinary expressions evaluated in
+/// the current scope, so they are visited here; the branch statements are
+/// left to `for_each_embedded_stmt_list`, which is what the statement
+/// walkers use.
+fn for_each_expr(expr: &Expr, visit: &mut dyn FnMut(&Expr)) {
+    visit(expr);
+    if let Expr::If(ifexpr) = expr {
+        for_each_expr(&ifexpr.condition, visit);
+        for (c, _) in &ifexpr.else_ifs {
+            for_each_expr(c, visit);
+        }
+        return;
+    }
+    walk_expr_children(expr, &mut |child| for_each_expr(child, visit));
+}
+
+/// The tolerant transforms whose no-op is invisible.
+const TOLERANT_REPLACES: &[&str] = &["replace", "re_replace", "replace_first"];
+
+/// Any spelling of "I checked whether the needle was there" — a `contains`
+/// test, a position/count probe, or a `_must` twin that raises by itself.
+const EDIT_GUARDS: &[&str] = &[
+    "contains",
+    "replace_must",
+    "re_replace_must",
+    "pos",
+    "lastpos",
+    "index_of",
+    "last_index_of",
+    "count_of",
+    "re_match",
+    "re_find",
+];
+
+/// MIX-D3014 (0.90.0): `write_file(path, replace(read_file(path), …))` with
+/// nothing anywhere in the file that could have noticed the needle was
+/// absent.
+///
+/// `replace()` returns the subject UNCHANGED when the needle does not occur,
+/// so this whole shape — the edit-a-file idiom — writes the input straight
+/// back and reports success. On 2026-09-18 three such edits missed, and one
+/// of them shipped a commit that did not compile; there was no signal at any
+/// step. `replace_must()` (0.90.0) is the fix.
+///
+/// Conservative in two directions, because the analyzer's bias is
+/// near-zero false positives. It fires only on a `write_file` whose written
+/// VALUE is a replace call, or a variable the same straight-line block
+/// assigned from one; and ANY guard spelling anywhere in the file silences
+/// it for the whole file — a script that guards one edit has the habit, and
+/// a note it has already answered is noise.
+fn check_unguarded_edit_chain(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
+    let mut guarded = false;
+    walk_stmts(stmts, &mut |stmt| {
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_expr(expr, &mut |e| {
+                if let Expr::FunctionCall { name, .. } = e
+                    && EDIT_GUARDS.contains(&name.as_str())
+                {
+                    guarded = true;
+                }
+            });
+        });
+    });
+    if guarded {
+        return;
+    }
+    scan_edit_chain_block(stmts, ctx, a, &mut HashMap::new());
+}
+
+/// True when `expr` is (or directly wraps) a tolerant replace call.
+fn is_tolerant_replace(expr: &Expr) -> bool {
+    matches!(expr, Expr::FunctionCall { name, .. } if TOLERANT_REPLACES.contains(&name.as_str()))
+}
+
+fn scan_edit_chain_block(
+    stmts: &[Stmt],
+    ctx: &FileContext,
+    a: &mut Analysis,
+    edited: &mut HashMap<String, usize>,
+) {
+    for stmt in stmts {
+        // Report BEFORE updating the facts, so `$s = replace(...)` followed
+        // by `write_file($p, $s)` is seen in order.
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_expr(expr, &mut |e| {
+                let Expr::FunctionCall { name, args } = e else {
+                    return;
+                };
+                if name.as_str() != "write_file" || args.len() < 2 {
+                    return;
+                }
+                let written = &args[1];
+                let hit = is_tolerant_replace(written)
+                    || matches!(written, Expr::Variable(v) if edited.contains_key(v));
+                if hit {
+                    a.diagnostics.push(diag(
+                        ctx,
+                        "MIX-D3014",
+                        Severity::Note,
+                        stmt.line,
+                        "write_file() of a replace() result with no check that the needle was there"
+                            .to_string(),
+                        Some(
+                            "replace() returns the subject UNCHANGED when the needle is absent, so a missed edit writes the input back and reports success — use replace_must()/re_replace_must() (they raise NEEDLE_ABSENT, and {count: n} asserts how many sites)"
+                                .to_string(),
+                        ),
+                    ));
+                }
+            });
+        });
+
+        // A `function`/`fn` body is a FRESH frame: its parameters SHADOW
+        // whatever the enclosing block bound, so carrying the facts in
+        // reported a write of an unrelated parameter that merely reused
+        // the name. Every other body (if/while/for/try) runs in the same
+        // scope and does inherit.
+        let nested_is_frame = matches!(&stmt.kind, StmtKind::FunctionDef { .. });
+        for body in stmt_bodies(&stmt.kind) {
+            let mut inner = if nested_is_frame {
+                HashMap::new()
+            } else {
+                edited.clone()
+            };
+            scan_edit_chain_block(body, ctx, a, &mut inner);
+        }
+        // Branch statements of an expression-position `if` run in the
+        // CURRENT scope; lambda bodies do not, so they are left alone
+        // (a conservative false negative, which is this analyzer's bias).
+        walk_stmt_exprs(stmt, &mut |expr| {
+            for_each_embedded_stmt_list(expr, false, &mut |body| {
+                scan_edit_chain_block(body, ctx, a, &mut edited.clone());
+            });
+        });
+
+        // A conditional body that reassigns a name makes the outer fact
+        // UNKNOWN, not still-true: `$s = replace(..)` then `if c then $s =
+        // "x" end` must not keep reporting the write as a replace result.
+        // Facts only ever cause a note, so dropping them is the safe way
+        // to be wrong.
+        if !nested_is_frame {
+            let mut written = HashSet::new();
+            for body in stmt_bodies(&stmt.kind) {
+                collect_bound_names(body, false, &mut written);
+            }
+            walk_stmt_exprs(stmt, &mut |expr| {
+                for_each_embedded_stmt_list(expr, false, &mut |body| {
+                    collect_bound_names(body, false, &mut written);
+                });
+            });
+            for name in written {
+                edited.remove(&name);
+            }
+        }
+
+        if let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } = &stmt.kind {
+            if is_tolerant_replace(value) {
+                edited.insert(name.clone(), stmt.line);
+            } else {
+                edited.remove(name);
+            }
+        }
+    }
 }
 
 /// Flag the narrow source shape that signals Mix source is being nested in an
@@ -1724,6 +2102,10 @@ fn analyse_remote_body(
         allow_globals: cfg.allow_globals.clone(),
         allow_functions: cfg.allow_functions.clone(),
         suppress_name_checks: true,
+        // The BODY's own text, never the enclosing file's — the spelling
+        // rules must read the source they are reporting lines against.
+        // Lint is the only gate this remote program ever passes through.
+        source: Some(src.to_string()),
     };
     let nested = analyze(&inner, None, &inner_cfg);
     for mut d in nested.diagnostics {
@@ -1980,6 +2362,11 @@ fn expr_is_proven_list(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> boo
         || matches!(expr, Expr::Variable(name) if matches!(facts.get(name), Some(ProvenValue::List)))
 }
 
+fn expr_is_proven_map(expr: &Expr, facts: &HashMap<String, ProvenValue>) -> bool {
+    matches!(expr, Expr::MapLiteral(_))
+        || matches!(expr, Expr::Variable(name) if matches!(facts.get(name), Some(ProvenValue::Map)))
+}
+
 // `expr_is_proven_collection` was the D3007 operand test and went with the
 // note in 0.68.0. Its job — "is this operand provably a map or list" — is
 // now done by the runtime raise in `eval_binop`, which sees the actual
@@ -2016,21 +2403,54 @@ fn check_proven_expr(
     a: &mut Analysis,
     facts: &HashMap<String, ProvenValue>,
 ) {
+    // MIX-W2301. Since 0.90.0 the RUNTIME raises on a collection operand of
+    // `+`, so this is no longer "it will silently stringify" — it is "this
+    // line will raise when it runs". Kept (unlike MIX-D3007, retired when
+    // the `==` raise shipped) for one reason the `==` case did not have:
+    // lint is the ONLY gate on an `ssh_mix` body and on a branch that the
+    // local test run never takes, so catching it at authoring time still
+    // buys something a runtime raise cannot. Still a WARNING, not an error:
+    // the "proven" facts are straight-line, so a reassigned variable can
+    // make the prediction wrong, and a wrong ERROR would refuse a working
+    // script.
     if let Expr::BinaryOp {
         left,
         op: BinOp::Add,
         right,
     } = expr
-        && (expr_is_proven_list(left, facts) || expr_is_proven_list(right, facts))
     {
-        a.diagnostics.push(diag(
-            ctx,
-            "MIX-W2301",
-            Severity::Warning,
-            line,
-            "`+` stringifies lists instead of joining them".to_string(),
-            Some("use concat(list_a, list_b) or push(list, value)".to_string()),
-        ));
+        let (l_list, r_list) = (
+            expr_is_proven_list(left, facts),
+            expr_is_proven_list(right, facts),
+        );
+        let (l_map, r_map) = (
+            expr_is_proven_map(left, facts),
+            expr_is_proven_map(right, facts),
+        );
+        let hint = if l_map || r_map {
+            if l_map && r_map {
+                Some("use merge(map_a, map_b)".to_string())
+            } else {
+                Some("`+` needs numbers or strings; use `..` to build text".to_string())
+            }
+        } else if l_list && r_list {
+            Some("use concat(list_a, list_b)".to_string())
+        } else if l_list || r_list {
+            Some("use push(list, value) to append, or `..` to build text".to_string())
+        } else {
+            None
+        };
+        if let Some(hint) = hint {
+            let kind = if l_map || r_map { "maps" } else { "lists" };
+            a.diagnostics.push(diag(
+                ctx,
+                "MIX-W2301",
+                Severity::Warning,
+                line,
+                format!("`+` is not defined for {kind} — this raises TYPE_ERROR at runtime"),
+                Some(hint),
+            ));
+        }
     }
 
     // MIX-D3007 RETIRED in 0.68.0 — the equality flip it watched has

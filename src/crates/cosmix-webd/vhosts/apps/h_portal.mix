@@ -244,7 +244,7 @@ function pt_forgot_page($q)
   end
   $b = $b .. '<div class="card"><form method="post" action="/portal/forgot">'
   $b = $b .. '<input type="hidden" name="csrf" value="' .. esc("" .. $CSRF) .. '">'
-  $b = $b .. fm_text("email", "Email", { required: true, autofocus: true, help: "We\'ll email a link to reset your password.", help_tip: true })
+  $b = $b .. fm_text("email", "Email", { required: true, autofocus: true, help: "We'll email a link to reset your password.", help_tip: true })
   $b = $b .. '<div class="fm-actions"><button class="btn btn-primary" type="submit">Email me a reset link</button></div>'
   $b = $b .. '</form><p class="muted small"><a href="/portal/login">Back to sign in</a></p></div>'
   return doc(200, "Reset password", nil, $b)

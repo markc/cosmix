@@ -46,8 +46,10 @@ in their own summary field, and **never** gating. Current D-codes:
 | ~~`MIX-D3006`~~ | **RETIRED in 0.68.0.** Watch note for the map-binding flip, which has landed: a two-variable loop over a MAP now binds (key, value). Code permanently spent, never reused |
 | ~~`MIX-D3007`~~ | **RETIRED in 0.68.0.** Watch note for the equality flip, which has landed: `==`/`!=` with a map or list on **both** sides now raises `TYPE_ERROR` naming `deep_eq`. The shipped rule is narrower than this note's "either operand" wording — a collection compared to a *scalar* still answers, so `$m[$k] == nil` keeps working. Code permanently spent, never reused |
 | `MIX-D3012` | an **`ssh_mix` body that could not be analysed** (0.69.0) — a non-literal second argument (a variable, a concatenation, an interpolated string, a `read_file`), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist |
-| `MIX-D3013` | a **hand-rolled padding loop** (0.74.0) — `while len($o) < $n … $o = $o .. " "` — pointing at `lpad`/`rpad` (and the display-cell `lpad_w`/`rpad_w`). Four independent sessions wrote this loop while the builtins sat in the binary; the note is the discoverability fix that reaches the author at authoring time. Narrow by design: only a `<`/`<=` comparison of `len`/`length` of the same variable the body self-appends a string literal to |
 | `MIX-D3008`–`D3011` | the REXX-style `pos lastpos byte_pos byte_lastpos` family, declared legacy — with a sharper message when composed as `substr(.., pos(..))` in one expression (the 1-based/0-based off-by-one). These stay notes until their own fleet count reads zero; they are NOT deleted in release B |
+| `MIX-D3014` | **`write_file()` of an unchecked `replace()` result** (0.90.0) — the edit-a-file idiom with nothing anywhere in the file that could have noticed the needle was absent. `replace()` returns the subject unchanged when it misses, so the input is written straight back and the run reports success. Use `replace_must()`/`re_replace_must()`, which raise `NEEDLE_ABSENT` (and assert the site count with `{count: n}`). Conservative: only a `write_file` whose written value is a replace call or a variable the same straight-line block assigned from one, and any guard spelling anywhere in the file (`contains`, `pos`, `index_of`, `count_of`, `re_match`, a `_must` twin) silences it for the whole file |
+| `MIX-D3013` | a **hand-rolled padding loop** (0.74.0) — `while len($o) < $n … $o = $o .. " "` — pointing at `lpad`/`rpad` (and the display-cell `lpad_w`/`rpad_w`). Four independent sessions wrote this loop while the builtins sat in the binary; the note is the discoverability fix that reaches the author at authoring time. Narrow by design: only a `<`/`<=` comparison of `len`/`length` of the same variable the body self-appends a string literal to |
+| `MIX-D3015` | a **bare `$NAME` in a double-quoted string** (0.90.0) where `NAME` is bound in the same file. Double quotes interpolate `${NAME}` only; the bare form is literal BY DESIGN, which is the opposite of bash — four occurrences in one file passed lint and all four failed at runtime. `\$NAME` and a single-quoted `'…'` string are the two clean spellings and neither is reported. The lexer drops the whole batch for a MULTI-LINE string and for one whose spelling contains `\"`: both mark NESTED source (an `ssh_mix` body, a `mix -c` program), where a bare `$rc` is the inner program's variable and correctly literal. A **note** where the heredoc twin `MIX-W2402` is a warning, and the asymmetry is measured — over 785 fleet scripts W2402 costs 4 findings and this one an order of magnitude more even after those exclusions, so a warning would fail `--deny-warnings` on scripts that are not wrong. D3xxx is the promotable namespace precisely so that can change once the residue is worked off |
 
 Member-call spellings are covered too: a builtin-named `.name(` desugars
 to the same call at parse time.
@@ -55,13 +57,14 @@ to the same call at parse time.
 ```text
 MIX-E1001  lexical error                    MIX-E1301  duplicate function parameter
 MIX-E1002  script parse error               MIX-E1302  duplicate function definition in one scope
-MIX-E1003  strict-data parse error          MIX-W2301  `+` stringifies a proven list
+MIX-E1003  strict-data parse error          MIX-E1303  function name shadows a builtin
 MIX-E1101  undefined variable               MIX-E1401  require() target missing/unreadable
 MIX-E1102  undefined function               MIX-E1402  require() target invalid Mix
 MIX-E1201  builtin arity mismatch           MIX-E1501  dead mutation (write is lost)
 MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
                                             MIX-W2101  unreachable statement
                                             MIX-W2201  discarded must-use result
+                                            MIX-W2301  `+` on a proven list/map raises
                                             MIX-W2302  used implicit-nil function result
                                             MIX-W2303  assignment operand in hand-built chain AST
                                             MIX-W2304  unknown builtin-result key
@@ -69,7 +72,13 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
                                             MIX-W2306  escaped quotes in ssh command source
                                             MIX-W2401  source/include defeats analysis
                                             MIX-W2402  bare bound variable in heredoc
+                                            MIX-W2405  unknown escape kept literally
 ```
+
+`MIX-W2403` is **retired** (0.90.0), never reused: the builtin-shadowing
+definition check was promoted from warning to error and therefore had to
+move, since a code's letter fixes its severity permanently. It is now
+`MIX-E1303`.
 
 - **MIX-E1003** means the source was recognisably intended as strict data but
   failed the literal-data grammar. It is distinct from a broken executable
@@ -81,10 +90,15 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
 - **MIX-E1501** flags a discarded `push`/`pop`/`shift` whose first argument is **not a bare variable** — `push($m["a"], $v)`, `push($m.a, $v)`, `$m["a"].push($v)`. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is **lost in silence**. It is an ERROR, not a warning: the statement does nothing while reading as though it did. The fix **differs by builtin**: `push` returns the appended list, so assign it back (`$m["a"] = push($m["a"], $v)`); `pop`/`shift` return the **removed element**, not the list, so assigning that back replaces the list with the element (data corruption) — hoist first instead (`$l = $m[$k]; $x = pop($l); $m[$k] = $l`). For maps of maps, write the [nested assignment](collections.md) directly. A by-value **parameter** is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.
 - **MIX-E1502** flags a discarded `delete` / `merge` — both are **pure** (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: `$m = delete($m, "k")`.
 - **MIX-W2201** fires when an operation whose failure signal lives in its RETURN VALUE (`effects.must_use`: `run_rc`, `run_argv`, `run_pipeline`, `run_parallel`, `ssh_run`, `ssh_exec`, `ssh_mix`, `http_*`, `kill`, `run_stream`) is a bare expression statement — the bug class where a failed remote step silently vanishes. Bind the result and branch on it; some have a fail-fast twin that raises (`run_argv`→`run_argv_must`, `run_pipeline`→`run_pipeline_must`, `ssh_run`→`ssh_must`). The last statement of a block is exempt (it may be the block's value).
-- **MIX-W2301** warns that `+` coerces lists to strings; it does not append or
-  concatenate list values. It fires for a list literal operand, or a variable
-  proven by straight-line analysis to hold a directly assigned list literal.
-  Use `concat(list_a, list_b)` or `push(list, value)`.
+- **MIX-W2301** warns that `+` is not defined for lists or maps. Since 0.90.0
+  the runtime **raises** `TYPE_ERROR` there rather than silently stringifying,
+  so this fires ahead of the run for a list/map **literal** operand, or a
+  variable proven by straight-line analysis to hold a directly assigned one —
+  which is the only gate there is on an `ssh_mix` body, or on a branch a local
+  run never takes. Use `concat(a, b)` for lists, `merge(a, b)` for maps,
+  `push(list, value)` to append, `..` to build text. It stays a *warning*, not
+  an error: the proven-value facts are straight-line, so a reassigned variable
+  can make the prediction wrong.
 - **MIX-W2302** warns when the result of a uniquely defined named function is
   consumed, its block body's final statement is a bare expression, and the
   body contains no value-returning `return`. Block functions implicitly return
@@ -133,7 +147,9 @@ MIX-E1202  user-function arity mismatch     MIX-E1502  discarded pure transform
   single-quoted strings containing ordinary `"` stay quiet.
 - **MIX-W2401**: one `source`/`include` anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer `require()`: it is isolated, statically resolvable, and E1401/E1402 verify literal-path modules parse.
 - **MIX-W2402** warns when a heredoc literal contains bare `$NAME` and `NAME` is bound somewhere in the same visible universe. Heredocs interpolate `${NAME}`, not `$NAME`, so the bare form often means a generated config was silently corrupted. It does not fire for `${NAME}`, `$(` command substitution, explicitly escaped `\$NAME`, all-digit names such as `$1`, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare `$NAME` still evaluates to literal `$NAME`, and intentional literal output requires no change.
-- **MIX-W2403** (0.74.0) warns at the *definition* of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name (only an extracted function value or an exports-map index still reaches it). The worst shape this produces is a script that keeps running while its own function quietly stops being called — every release that adds a builtin name arms it again for older scripts. Deliberately a warning, never an error: a compat shim written for an older mix that lacks the builtin is legitimate authoring — but on the mix doing the linting it is dead, and the author should know.
+- **MIX-E1303** (0.90.0; was `MIX-W2403` from 0.74.0) errors at the *definition* of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name — only an extracted function value or an exports-map index still reaches it. The worst shape this produces is a script that keeps running while its own function quietly stops being called, and every release that adds a builtin name arms it again for older scripts. It was a warning on the theory that a compat shim for an older mix is legitimate authoring; the fleet refuted that — two sites across 785 scripts, neither a shim: one a hand-rolled `ends_with` duplicating the builtin, the other an `fn mix_version()` in a pre-commit hook written to report a *named* interpreter's version and silently answering with the running one's, a live wrong answer that sat behind a warning for sixteen releases. Lint is also the only gate an `ssh_mix` body passes through, and a warning stops nothing by default. The **runtime is unchanged** — the builtin still wins; the fix is to rename.
+- **MIX-W2405** warns when a double-quoted literal contains a backslash escape the lexer does not recognise, so the backslash is kept: `"isn\x27t"` printed `isn\x27t` and nothing said so, which is how a `replace()` wrote that into a committed journal entry. 0.90.0 added `\xHH` (exactly two hex digits), `\0` and `\a \b \f \v`, so what remains is genuinely unrecognised — including `\x` with fewer than two hex digits and `\'`. A deliberate backslash is `\\`, so the warning has a clean escape. An unbraced `\u` is **exempt**: that literal is documented design (it protects embedded JSON and `C:\users`). Single-quoted strings and heredocs keep their own rules and are not scanned.
+- **MIX-D3015** and **MIX-W2405** ask how a literal was *spelled*, which the token stream deliberately forgets (`'$sp/x'` and `"$sp/x"` lex to the same token). They therefore need the source text: `mix lint` supplies it, and so does the nested analysis of an `ssh_mix` body, but an embedder calling `analyze()` without setting `AnalyzerConfig::source` simply does not get these two rules.
 
 ## `mix explain MIX-XXXX` — the offline diagnostics explainer
 
