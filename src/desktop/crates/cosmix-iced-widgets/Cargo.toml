@@ -13,9 +13,6 @@ license = "MIT"
 default = []
 wgpu = ["iced_renderer/wgpu", "iced_renderer/geometry"]
 tiny-skia = ["iced_renderer/tiny-skia", "iced_renderer/geometry"]
-gallery = ["dep:iced"]
-gallery-wgpu = ["gallery", "wgpu", "iced/wgpu"]
-gallery-tiny-skia = ["gallery", "tiny-skia", "iced/tiny-skia"]
 
 [dependencies]
 iced_core = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false, features = ["advanced"] }
@@ -23,11 +20,7 @@ iced_widget = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a7491
 iced_graphics = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false, features = ["geometry"] }
 iced_renderer = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false }
 cosmix-design = { path = "../cosmix-design", default-features = false }
-iced = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false, optional = true, features = ["advanced", "canvas", "wayland", "thread-pool", "fira-sans"] }
 
 [dev-dependencies]
 iced_runtime = { git = "https://github.com/iced-rs/iced", rev = "0e911834a42a749197758a52885935ce31c0322e", default-features = false }
 
-[[example]]
-name = "gallery"
-required-features = ["gallery"]
