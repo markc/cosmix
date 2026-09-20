@@ -510,10 +510,16 @@ fn authority_may_adjudicate_target_change(authority: &LiveSessionAuthority) -> b
 /// caught while `Active`: anything that makes the device itself unusable, because
 /// the next atomic commit fails and `AtomicCommitError::authority_was_revoked`
 /// classifies `EACCES`/`EPERM`/`ENODEV` as authority loss — so a yanked card or a
-/// revoked fd self-detects a frame later. What is NOT caught is narrower and real:
-/// a connector that goes *disconnected* while commits keep succeeding — a monitor
-/// power button, a KVM flip, a panel dropping HPD on sleep. Nothing adjudicates
-/// that now. Presentation evidence does not cover it either:
+/// revoked fd self-detects a frame later. A commit that fails any other way is not
+/// silent either: it becomes a platform failure and ends the operation.
+///
+/// So the uncovered case is not "disconnected" specifically — it is ANY change to
+/// the target's topology that leaves commits still succeeding against the binding
+/// we already hold. Two reachable shapes: a connector going disconnected while its
+/// ids remain committable (a monitor power button, a KVM flip, a panel dropping
+/// HPD on sleep), and a re-enumeration that moves the display to another connector
+/// or renumbers ids while the old binding keeps committing. Nothing adjudicates
+/// either until the next resume. Presentation evidence does not cover them:
 /// `SubmitWatchdog::observe_execution` clears `required_since` on `HealthyIdle`,
 /// so an idle desktop holds no deadline, and flips that keep succeeding refresh
 /// the watchdog without re-reading connector state.
