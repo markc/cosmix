@@ -39,7 +39,7 @@ Mix — the language and shell
 | crate | version |
 |---|---|
 | `cosmix-lib-mix` | 0.89.1 |
-| `cosmix-mix` | 0.89.2 |
+| `cosmix-mix` | 0.89.3 |
 | `mix-bench` | 0.1.0 |
 
 ## cos
