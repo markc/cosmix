@@ -426,6 +426,7 @@ struct LiveSessionState {
     target_device: u64,
     authority: LiveSessionAuthority,
     owner: Option<SessionDeviceOwner>,
+    deferred_target_change: bool,
     pending_open: Option<PendingLiveOpen>,
     pending_input_open: Option<PendingInputOpen>,
     revocations: LiveCoordinatorSender,
@@ -442,6 +443,91 @@ struct LiveSessionState {
     /// coordinator would then `join` a thread that can still block.
     shutdown_ack: Option<HeldShutdownAck>,
     stop: bool,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetUdevEventKind {
+    Added,
+    Changed,
+    Removed,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetUdevDecision {
+    Ignore,
+    Revoke,
+    DeferToVerification,
+}
+
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+/// Whether this authority may adjudicate a target udev event itself.
+///
+/// Only `Active` holds a display this thread could answer for at all. It is a
+/// named function rather than an inline `matches!` so the regression test can
+/// DERIVE the flag from a real authority; passing it as a literal makes that test
+/// a tautology that survives a regression in this mapping, which is exactly how
+/// its first cut was written.
+///
+/// Note what this predicate is NOT sufficient for, because the 2026-09-20 23:36
+/// session loss turned on it. `latch_live_revocation` latches on `Preparing` AND
+/// on `Active`, and [`open_authorised_session_device`] flips the authority to
+/// `Active` the moment the resume's fd is opened — before identity, VT, master or
+/// connector verification has run. The incident's fatal udev change arrived 1ms
+/// after that open, so it was adjudicated against an `Active` authority that had
+/// verified nothing yet. Refusing to adjudicate only in `Preparing` would
+/// therefore NOT have prevented it; what prevents it is that a `Changed` never
+/// revokes on this thread in either state.
+fn authority_may_adjudicate_target_change(authority: &LiveSessionAuthority) -> bool {
+    matches!(authority, LiveSessionAuthority::Active { .. })
+}
+
+/// Decide what a udev event on the target DRM device means.
+///
+/// Deliberately takes no connector observation and performs no I/O: see the
+/// closure in [`build_session_device_owner`] for why the session thread must not
+/// call into the driver. The rule is therefore:
+///
+/// - `Removed` while `Active` — the device we are driving is gone. Unambiguous
+///   with no query needed, so revoke here.
+/// - `Added` while `Active` — a device appearing is not authority loss.
+/// - anything else, including every `Changed` — record it and let verification
+///   decide. A `Changed` is what an ordinary VT round trip through a text
+///   console produces (the kernel modesets the card for fbcon), and taking it as
+///   proof of a hotplug is the 2026-09-20 23:36 session loss.
+///
+/// What this does NOT do is claim a `Changed` is benign. It claims only that this
+/// thread is the wrong place to adjudicate one. The identity invariant is enforced
+/// where the code already budgets for a synchronous driver call: every path from a
+/// pause back to admitted output runs `reopen_verified`, which re-checks stable
+/// device path, incarnation, VT, DRM master state and connector presence and is
+/// terminal on `ConnectorNotPresent`, followed by a forced connector scan in
+/// `select_live_target`. A target that really went away cannot reach the glass by
+/// having been deferred here.
+///
+/// KNOWN GAP, deliberately left rather than papered over (0.62.1). A connector
+/// physically disconnected while the session stays `Active` and never resumes is
+/// NOT adjudicated by anything: this arm only records, and presentation evidence
+/// does not cover it — `SubmitWatchdog::observe_execution` clears
+/// `required_since` on `HealthyIdle`, so an idle desktop holds no deadline at all,
+/// and while rendering, page flips that keep succeeding refresh the watchdog
+/// without re-reading connector state. The previous behaviour did revoke there,
+/// but only as a side effect of revoking on every udev event, which is the defect
+/// this version exists to remove. Giving that case a real bounded verification
+/// path needs a mechanism that does not put a driver probe on this thread, and
+/// that is its own slice — see the 0.62.1 row in the hub's comp-version-claims.
+/// Do not "fix" it by restoring a scan here.
+#[cfg(any(all(feature = "kms-live", not(test)), test))]
+fn classify_target_udev_event(kind: TargetUdevEventKind, active: bool) -> TargetUdevDecision {
+    if !active {
+        return TargetUdevDecision::DeferToVerification;
+    }
+    match kind {
+        TargetUdevEventKind::Added => TargetUdevDecision::Ignore,
+        TargetUdevEventKind::Removed => TargetUdevDecision::Revoke,
+        TargetUdevEventKind::Changed => TargetUdevDecision::DeferToVerification,
+    }
 }
 
 /// A shutdown answer, and the channel it will be sent on once the teardown it
@@ -512,7 +598,7 @@ enum LiveSessionCommand {
         reply: SyncSender<Result<(), String>>,
     },
     BeginResume {
-        reply: SyncSender<Result<u64, String>>,
+        reply: SyncSender<Result<(u64, bool), String>>,
     },
     ReturnPaused {
         generation: u64,
@@ -3169,7 +3255,7 @@ impl SessionDeviceClient {
         }
     }
 
-    fn begin_resume(&self, timeout: Duration) -> Result<u64, KmsLiveError> {
+    fn begin_resume(&self, timeout: Duration) -> Result<(u64, bool), KmsLiveError> {
         let (reply, result) = startup_reply_channel();
         self.commands
             .send(LiveSessionCommand::BeginResume { reply })
@@ -4466,13 +4552,55 @@ fn build_session_device_owner(
     event_loop
         .handle()
         .insert_source(udev, |event, (), state: &mut LiveSessionState| {
-            let device_id = match event {
-                UdevEvent::Added { device_id, .. }
-                | UdevEvent::Changed { device_id }
-                | UdevEvent::Removed { device_id } => device_id,
+            let (kind, device_id) = match event {
+                UdevEvent::Added { device_id, .. } => (TargetUdevEventKind::Added, device_id),
+                UdevEvent::Changed { device_id } => (TargetUdevEventKind::Changed, device_id),
+                UdevEvent::Removed { device_id } => (TargetUdevEventKind::Removed, device_id),
             };
-            if device_id == state.target_device {
-                publish_live_revocation(state, LiveRevocation::TargetHotplug);
+            if device_id != state.target_device {
+                return;
+            }
+            // NOTHING in this closure may probe the driver — it logs and it may
+            // publish a revocation, and that is all it may do. This thread owns
+            // the libseat pause acknowledgement (EXTERNAL_PAUSE_ACK_TIMEOUT, 45s)
+            // and answers every LiveSessionCommand inside
+            // RUNNING_SESSION_COMMAND_TIMEOUT (3s), and a synchronous DRM probe
+            // cannot be interrupted once it is inside the driver — this file says
+            // so itself where the resume path budgets those same calls ("expose
+            // no internal timeout … cannot interrupt a call already inside the
+            // driver"). A connector scan here would therefore trade the bug this
+            // version fixes for a worse one: a wedged probe stalls the pause ack
+            // and logind force-deactivates the seat, which loses the session
+            // harder than exit 1 did. The decision below is pure and allocation-
+            // free for that reason.
+            let active = authority_may_adjudicate_target_change(&state.authority);
+            match classify_target_udev_event(kind, active) {
+                TargetUdevDecision::Ignore => {
+                    tracing::info!(
+                        device_id,
+                        event = ?kind,
+                        "target DRM device event needs no action; retaining authority"
+                    );
+                }
+                TargetUdevDecision::Revoke => {
+                    publish_live_revocation(state, LiveRevocation::TargetHotplug);
+                }
+                TargetUdevDecision::DeferToVerification => {
+                    // Recorded for DIAGNOSIS ONLY — nothing reads it to make a
+                    // decision. The verdict comes from the resume chain's
+                    // unconditional verification. `active` is logged because the
+                    // same line otherwise cannot tell a paused deferral from an
+                    // Active one when the next incident is read back — and an
+                    // Active deferral is the case with the known gap, so it is
+                    // the one a reader most needs to be able to find.
+                    state.deferred_target_change = true;
+                    tracing::info!(
+                        device_id,
+                        event = ?kind,
+                        active,
+                        "target DRM device event recorded; verification decides, not this thread"
+                    );
+                }
             }
         })
         .map_err(|error| KmsLiveError::Setup(format!("udev registration failed: {error}")))?;
@@ -4591,9 +4719,12 @@ fn build_session_device_owner(
                     let _ = reply.send(result);
                 }
                 channel::Event::Msg(LiveSessionCommand::BeginResume { reply }) => {
+                    let deferred_target_change = state.deferred_target_change;
+                    state.deferred_target_change = false;
                     let result = state
                         .authority
                         .begin_resume()
+                        .map(|generation| (generation, deferred_target_change))
                         .map_err(|error| error.to_string());
                     let _ = reply.send(result);
                 }
@@ -4667,6 +4798,7 @@ fn build_session_device_owner(
                 session,
                 original: None,
             }),
+            deferred_target_change: false,
             pending_open: None,
             pending_input_open: None,
             revocations,
@@ -7683,7 +7815,7 @@ impl PreparedLiveOperation {
                     "live resume reached its 30s overall deadline".into(),
                 ));
             }
-            let session_generation = self
+            let (session_generation, deferred_target_change) = self
                 .session
                 .as_ref()
                 .expect("live session exists during resume")
@@ -7694,6 +7826,12 @@ impl PreparedLiveOperation {
                     now(),
                     RUNNING_SESSION_COMMAND_TIMEOUT,
                 )?)?;
+            if deferred_target_change {
+                tracing::info!(
+                    generation = session_generation,
+                    "resuming after a deferred target DRM device event; resume verification will decide its outcome"
+                );
+            }
             self.lifecycle
                 .as_mut()
                 .expect("live lifecycle exists after adapter start")
@@ -7885,6 +8023,12 @@ impl PreparedLiveOperation {
 
             match attempt_result {
                 Ok(resumed) => {
+                    if deferred_target_change {
+                        tracing::info!(
+                            generation = resumed.generation,
+                            "resume verification accepted the target DRM device after the deferred event"
+                        );
+                    }
                     self.log_resume_scanout_classification(scanout_after.as_ref());
                     self.log_resumed_active_boundary(
                         cycle_paused_generation,
@@ -7896,7 +8040,26 @@ impl PreparedLiveOperation {
                     return Ok(resumed);
                 }
                 Err(failure) => {
-                    let error = failure.into_retry()?;
+                    let error = match failure.into_retry() {
+                        Ok(error) => error,
+                        Err(error) => {
+                            if deferred_target_change {
+                                tracing::warn!(
+                                    generation = session_generation,
+                                    %error,
+                                    "resume verification rejected the target DRM device after the deferred event"
+                                );
+                            }
+                            return Err(error);
+                        }
+                    };
+                    if deferred_target_change {
+                        tracing::warn!(
+                            generation = session_generation,
+                            %error,
+                            "resume verification could not complete after the deferred target DRM device event; retrying"
+                        );
+                    }
                     last_retry = Some(error);
                     paused_generation = self.return_failed_resume_to_paused(
                         adapter,
@@ -14223,6 +14386,131 @@ mod tests {
             assert_eq!(authority, LiveSessionAuthority::Preparing { generation });
             authority = LiveSessionAuthority::Active { generation };
         }
+    }
+
+    #[test]
+    fn target_udev_removed_while_active_revokes() {
+        assert_eq!(
+            classify_target_udev_event(TargetUdevEventKind::Removed, true),
+            TargetUdevDecision::Revoke,
+            "the device being driven is gone; that needs no query to establish"
+        );
+    }
+
+    #[test]
+    fn target_udev_removed_while_not_active_defers_to_verification() {
+        assert_eq!(
+            classify_target_udev_event(TargetUdevEventKind::Removed, false),
+            TargetUdevDecision::DeferToVerification,
+            "exiting while the operator is on another VT costs the session the \
+             restart it is trying to avoid; resume's own checks refuse a device \
+             that really went away"
+        );
+    }
+
+    #[test]
+    fn target_udev_added_does_not_revoke() {
+        assert_eq!(
+            classify_target_udev_event(TargetUdevEventKind::Added, true),
+            TargetUdevDecision::Ignore
+        );
+    }
+
+    #[test]
+    fn target_udev_changed_never_revokes_on_the_session_thread() {
+        // The whole defect in one line: a `Changed` is what an ordinary VT round
+        // trip through a text console produces, so it can never be a revocation
+        // by itself — in EITHER state. Adjudicating it here would mean a
+        // synchronous driver probe on the thread that owns the pause
+        // acknowledgement, which is a worse failure than the one being fixed.
+        for active in [true, false] {
+            assert_eq!(
+                classify_target_udev_event(TargetUdevEventKind::Changed, active),
+                TargetUdevDecision::DeferToVerification,
+                "a target `Changed` must defer (active = {active})"
+            );
+        }
+    }
+
+    #[test]
+    fn no_target_udev_event_revokes_unless_the_device_was_removed_while_active() {
+        // Exhaustive over the decision surface, so a future arm cannot quietly
+        // reintroduce a revocation path: Removed-while-Active is the ONLY
+        // combination that may revoke.
+        for kind in [
+            TargetUdevEventKind::Added,
+            TargetUdevEventKind::Changed,
+            TargetUdevEventKind::Removed,
+        ] {
+            for active in [true, false] {
+                let revokes = classify_target_udev_event(kind, active) == TargetUdevDecision::Revoke;
+                assert_eq!(
+                    revokes,
+                    kind == TargetUdevEventKind::Removed && active,
+                    "unexpected revocation surface for {kind:?} (active = {active})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vt_round_trip_change_during_pause_and_preparing_is_deferred_to_resume() {
+        let mut authority = LiveSessionAuthority::Active { generation: 1 };
+        assert_eq!(
+            authority.request_pause().expect("external pause request"),
+            LivePauseRequestDisposition::External { generation: 2 }
+        );
+        authority.complete_pause(true).expect("pause completes");
+        // 23:35:56 — the change that arrived while paused. Note the OLD code
+        // already survived this one: `latch_live_revocation` returns false on a
+        // `Paused` authority, so it published nothing. A test that covers only
+        // this half passes against the defect.
+        assert_eq!(
+            classify_target_udev_event(
+                TargetUdevEventKind::Changed,
+                authority_may_adjudicate_target_change(&authority),
+            ),
+            TargetUdevDecision::DeferToVerification
+        );
+        assert_eq!(authority.begin_resume().expect("resume begins"), 3);
+        assert_eq!(authority, LiveSessionAuthority::Preparing { generation: 3 });
+        // The flag MUST be derived from the authority rather than passed as a
+        // literal: hardcoding it would leave the mapping untested and the test
+        // green against a regression.
+        assert!(!authority_may_adjudicate_target_change(&authority));
+        assert_eq!(
+            classify_target_udev_event(
+                TargetUdevEventKind::Changed,
+                authority_may_adjudicate_target_change(&authority),
+            ),
+            TargetUdevDecision::DeferToVerification
+        );
+
+        // 23:36:18.762 — the resume's DRM open succeeds, and THIS is the state
+        // the incident's fatal event actually met: `open_authorised_session_device`
+        // flips Preparing -> Active at the open, before identity, VT, master or
+        // connector verification has run. Reproduced here by driving the same
+        // transition rather than by asserting a state name.
+        let mut original = None;
+        open_authorised_session_device(&mut authority, true, &mut original, || {
+            Ok::<OwnedFd, String>(harmless_fd())
+        })
+        .expect("the resume's authorised open succeeds from Preparing");
+        assert_eq!(authority, LiveSessionAuthority::Active { generation: 3 });
+        assert!(authority_may_adjudicate_target_change(&authority));
+
+        // 23:36:18.763, 1ms later — the event that destroyed the session. It was
+        // adjudicated against an Active authority that had verified nothing yet,
+        // so refusing to adjudicate only in `Preparing` would NOT have saved it.
+        // This assertion is the one that pins the actual fix.
+        assert_eq!(
+            classify_target_udev_event(
+                TargetUdevEventKind::Changed,
+                authority_may_adjudicate_target_change(&authority),
+            ),
+            TargetUdevDecision::DeferToVerification,
+            "the incident's post-open udev change must not publish TargetHotplug"
+        );
     }
 
     #[test]

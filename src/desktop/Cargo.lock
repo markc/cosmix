@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.62.0"
+version = "0.62.1"
 dependencies = [
  "bevy",
  "chrono",
