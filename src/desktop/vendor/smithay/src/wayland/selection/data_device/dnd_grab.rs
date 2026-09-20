@@ -42,8 +42,26 @@ pub struct DnDGrab<D: SeatHandler> {
     current_focus: Option<WlSurface>,
     pending_offers: Vec<wl_data_offer::WlDataOffer>,
     offer_data: Option<Arc<Mutex<OfferData>>>,
-    // cosmix patch: only the grab's own release handler may authorise a drop.
+    // cosmix patch: only the grab's own release handler may authorise a drop — see
+    // `conclude_pointer_release_as_drop`/`conclude_touch_release_as_drop`, the ONLY
+    // two places in this file allowed to set this true. Every other path that reaches
+    // `unset()` leaves it false, so `unset()` cancels. That set includes six call
+    // sites outside this module, generic to every grab type, not just DnD:
+    // input/pointer/mod.rs:544,560,762,783,909 and input/touch/mod.rs:424,433,530,537,676.
+    // None of today's six violates the contract — they replace whatever grab happens
+    // to be active for an unrelated reason (session lock, popup install, a new grab
+    // superseding this one, ...) and never intend to "deliver" a drag. This is safe
+    // only because no caller outside this file can reach a concrete `&mut DnDGrab` at
+    // all — it is boxed inside a private `GrabStatus` — so nothing external can even
+    // attempt to force a drop today. If a public "commit this drag's drop" API is
+    // ever added, it MUST go through one of the two `conclude_*_release_as_drop`
+    // helpers (or an equivalent atomic set-flag-then-unset step); never add a second,
+    // ad hoc `pending_drop = true; handle.unset_grab(...)` pair anywhere.
     pending_drop: bool,
+    // cosmix patch: cancel()/drop() each run at most once, guaranteeing the
+    // ClientDndGrabHandler::dropped() callback fires exactly once per grab even
+    // if some future teardown path were to reach unset() a second time.
+    finished: bool,
     icon: Option<WlSurface>,
     origin: WlSurface,
     seat: Seat<D>,
@@ -59,6 +77,10 @@ impl<D: SeatHandler + 'static> fmt::Debug for DnDGrab<D> {
             .field("current_focus", &self.current_focus)
             .field("pending_offers", &self.pending_offers)
             .field("offer_data", &self.offer_data)
+            // cosmix patch: without these two, a trace dump of a mid-teardown grab
+            // misrepresents which arm `unset()` is about to take.
+            .field("pending_drop", &self.pending_drop)
+            .field("finished", &self.finished)
             .field("icon", &self.icon)
             .field("origin", &self.origin)
             .field("seat", &self.seat)
@@ -85,6 +107,7 @@ impl<D: SeatHandler> DnDGrab<D> {
             offer_data: None,
             // cosmix patch: external teardown cancels unless a release authorises a drop.
             pending_drop: false,
+            finished: false,
             origin,
             icon,
             seat,
@@ -109,6 +132,7 @@ impl<D: SeatHandler> DnDGrab<D> {
             offer_data: None,
             // cosmix patch: external teardown cancels unless a release authorises a drop.
             pending_drop: false,
+            finished: false,
             origin,
             icon,
             seat,
@@ -236,13 +260,19 @@ where
     }
 
     // cosmix patch: teardown revokes offers and leaves the target without delivering a drop.
-    fn cancel(&mut self, _data: &mut D) {
+    fn cancel(&mut self, data: &mut D) {
+        // cosmix patch: cancel()/drop() must each run at most once — see `finished`.
+        if self.finished {
+            return;
+        }
+        self.finished = true;
         self.pending_drop = false;
         self.pending_offers.clear();
         if let Some(offer_data) = self.offer_data.take() {
             offer_data.lock().unwrap().active = false;
         }
-        if let Some(surface) = self.current_focus.take() {
+        let focus = self.current_focus.take();
+        if let Some(ref surface) = focus {
             if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
                 let seat_data = self
                     .seat
@@ -258,14 +288,28 @@ where
             }
         }
         if let Some(source) = self.data_source.take() {
-            if source.alive() && source.is_alive() {
-                source.cancelled();
-            }
+            // cosmix patch: no liveness guard, matching drop()'s unvalidated branch
+            // below — sending an event to an already-destroyed resource is a no-op
+            // in wayland-server (the object id no longer resolves, so the event is
+            // simply never encoded), not a panic risk. Upstream's own `drop()`
+            // calls `cancelled()` here completely unguarded already.
+            source.cancelled();
         }
         self.icon = None;
+        // cosmix patch (MAJOR fix): cancel is an end-of-session too, exactly like drop() —
+        // the handler must be told so per-drag cleanup (e.g. removing a composited drag
+        // icon) runs on every teardown, not only on a successful release. `validated` is
+        // false, the same value an unaccepted drop already passes.
+        ClientDndGrabHandler::dropped(data, focus, false, self.seat.clone());
     }
 
     fn drop(&mut self, data: &mut D) {
+        // cosmix patch: cancel()/drop() must each run at most once — see `finished`.
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.pending_drop = false;
         // the user dropped, proceed to the drop
         let seat_data = self
             .seat
@@ -273,14 +317,16 @@ where
             .get::<RefCell<SeatData<D::SelectionUserData>>>()
             .unwrap()
             .borrow_mut();
-        let validated = if let Some(ref data) = self.offer_data {
-            let data = data.lock().unwrap();
-            data.accepted && (!data.chosen_action.is_empty())
+        let validated = if let Some(ref offer_data) = self.offer_data {
+            let offer_data = offer_data.lock().unwrap();
+            offer_data.accepted && (!offer_data.chosen_action.is_empty())
         } else {
             false
         };
-        if let Some(ref surface) = self.current_focus {
-            if self.data_source.is_some() || self.origin.id().same_client_as(&surface.id()) {
+        let has_source = self.data_source.is_some();
+        let focus = self.current_focus.take();
+        if let Some(ref surface) = focus {
+            if has_source || self.origin.id().same_client_as(&surface.id()) {
                 for device in seat_data.known_data_devices() {
                     if device.id().same_client_as(&surface.id()) && validated {
                         device.drop();
@@ -288,15 +334,15 @@ where
                 }
             }
         }
-        if let Some(ref offer_data) = self.offer_data {
-            let mut data = offer_data.lock().unwrap();
+        if let Some(offer_data) = self.offer_data.take() {
+            let mut offer_data = offer_data.lock().unwrap();
             if validated {
-                data.dropped = true;
+                offer_data.dropped = true;
             } else {
-                data.active = false;
+                offer_data.active = false;
             }
         }
-        if let Some(ref source) = self.data_source {
+        if let Some(source) = self.data_source.take() {
             if !validated {
                 source.cancelled();
             } else if source.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
@@ -304,17 +350,46 @@ where
             }
         }
 
-        ClientDndGrabHandler::dropped(data, self.current_focus.clone(), validated, self.seat.clone());
+        ClientDndGrabHandler::dropped(data, focus.clone(), validated, self.seat.clone());
         self.icon = None;
         // in all cases abandon the drop
         // no more buttons are pressed, release the grab
-        if let Some(ref surface) = self.current_focus {
+        if let Some(ref surface) = focus {
             for device in seat_data.known_data_devices() {
                 if device.id().same_client_as(&surface.id()) {
                     device.leave();
                 }
             }
         }
+    }
+
+    // cosmix patch: the ONLY sanctioned way to end this grab as a drop from a pointer
+    // release. Bundles setting `pending_drop` with the generic `unset_grab` call so the
+    // two cannot be split, forgotten, or reordered — see `pending_drop`'s doc comment
+    // for the full contract this protects.
+    fn conclude_pointer_release_as_drop(
+        &mut self,
+        data: &mut D,
+        handle: &mut PointerInnerHandle<'_, D>,
+        serial: Serial,
+        time: u32,
+    ) where
+        <D as SeatHandler>::PointerFocus: WaylandFocus,
+    {
+        self.pending_drop = true;
+        handle.unset_grab(self, data, serial, time, true);
+    }
+
+    // cosmix patch: the touch twin of `conclude_pointer_release_as_drop` — see there.
+    fn conclude_touch_release_as_drop(
+        &mut self,
+        data: &mut D,
+        handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
+    ) where
+        <D as SeatHandler>::TouchFocus: WaylandFocus,
+    {
+        self.pending_drop = true;
+        handle.unset_grab(self, data);
     }
 }
 
@@ -350,9 +425,7 @@ where
 
     fn button(&mut self, data: &mut D, handle: &mut PointerInnerHandle<'_, D>, event: &ButtonEvent) {
         if handle.current_pressed().is_empty() {
-            // cosmix patch: only this release may turn synchronous unset into a drop.
-            self.pending_drop = true;
-            handle.unset_grab(self, data, event.serial, event.time, true);
+            self.conclude_pointer_release_as_drop(data, handle, event.serial, event.time);
         }
     }
 
@@ -481,8 +554,7 @@ where
         }
 
         // cosmix patch: only the initiating touch's release authorises a drop.
-        self.pending_drop = true;
-        handle.unset_grab(self, data);
+        self.conclude_touch_release_as_drop(data, handle);
     }
 
     fn motion(
@@ -512,9 +584,14 @@ where
         &mut self,
         data: &mut D,
         handle: &mut crate::input::touch::TouchInnerHandle<'_, D>,
-        _seq: crate::utils::Serial,
+        seq: crate::utils::Serial,
     ) {
-        // cosmix patch: touch cancellation uses the shared cancellation path through unset.
+        // cosmix patch: an external touch-cancel (the stream was claimed as a gesture)
+        // must still send wl_touch.cancel and drain touch focus — `unset_grab` alone
+        // only tears down this grab, it never reaches `TouchInternal::cancel`, which is
+        // exactly the existing cosmix fix at input/touch/mod.rs:637 that this call site
+        // was leaving dead whenever a DnD grab was active. Do both.
+        handle.cancel(data, seq);
         self.pending_drop = false;
         handle.unset_grab(self, data);
     }

@@ -89,14 +89,37 @@ where
         let seats = state.seat_state().seats.clone();
         for seat in seats {
             if let Some(pointer) = seat.get_pointer() {
+                // cosmix patch assumption: this only recognises a BARE `DnDGrab`. If a
+                // future feature ever interposes a wrapper grab around DnD (logging, an
+                // accessibility layer, gesture arbitration — anything that boxes a
+                // `DnDGrab` inside another `PointerGrab` impl rather than installing it
+                // directly), this downcast silently misses it, `matches` stays `Some(false)`
+                // or `None`, and the zombie-drag bug this file exists to fix comes back
+                // with no error signal. A wrapper author must either forward `as_any()`/
+                // `has_source()` through to the inner grab, or extend this match.
                 let matches = pointer.with_grab(|_, grab| {
                     grab.as_any()
                         .downcast_ref::<super::dnd_grab::DnDGrab<D>>()
                         .is_some_and(|grab| grab.has_source(resource))
                 });
                 if matches == Some(true) {
-                    // No input timestamp is available, and cached focus may have been destroyed.
-                    pointer.unset_grab_without_focus_restore(
+                    // cosmix patch: restore focus (unlike the other unset_grab_without_focus_restore
+                    // call sites in comp, which pair it with their own explicit reconcile
+                    // immediately after — mod.rs:8032/8048, :12618, :12630). This vendored
+                    // Dispatch::destroyed() hook has no way to call back into comp's reconcile
+                    // logic, so without_focus_restore here would leave the pointer with no
+                    // focus for the rest of the drag: e.g. Escape mid-drag destroys the source,
+                    // this unsets the grab with focus still None, and the button release the
+                    // user is still holding is swallowed (PointerInnerHandle::button no-ops
+                    // with no focus) — the source client never sees it.
+                    // restore_focus re-enters compositor code (cursor_image, PointerTarget
+                    // enter/leave) while PointerHandle's inner Mutex is held, same as every
+                    // ordinary DnD release already does via this same public unset_grab; the
+                    // incremental risk here is doing so from inside Dispatch::destroyed()
+                    // rather than from pointer-event processing. No deadlock is possible unless
+                    // that reentered code calls back into this same PointerHandle, which normal
+                    // SeatHandler impls do not do.
+                    pointer.unset_grab(
                         state,
                         crate::utils::SERIAL_COUNTER.next_serial(),
                         0,
@@ -104,6 +127,7 @@ where
                 }
             }
             if let Some(touch) = seat.get_touch() {
+                // cosmix patch assumption: same bare-`DnDGrab`-only caveat as above.
                 let matches = touch.with_grab(|_, grab| {
                     grab.as_any()
                         .downcast_ref::<super::dnd_grab::DnDGrab<D>>()
