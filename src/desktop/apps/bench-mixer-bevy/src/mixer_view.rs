@@ -26,7 +26,7 @@ pub struct MixerViewPlugin;
 
 impl Plugin for MixerViewPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_mixer)
+        app.add_systems(Startup, (spawn_mixer, report_layout).chain())
             .add_systems(Update, apply_feed_tick);
     }
 }
@@ -77,10 +77,34 @@ fn spawn_mixer(mut commands: Commands, bench: Res<Bench>) {
     commands.insert_resource(entities);
 }
 
-/// The resolved board, kept so tests and any later input wiring read the same
-/// rectangles the widgets were placed at.
+/// The resolved board, kept so the run can report what it drew and any later
+/// input wiring reads the same rectangles the widgets were placed at.
 #[derive(Resource)]
 pub struct MixerLayout(pub Layout);
+
+/// Echo the resolved geometry, and in drag mode where the dragged fader's
+/// travel starts and ends — what the driver aims injected input at
+/// (`cosmix-bench-layout` prints the same numbers as JSON).
+fn report_layout(layout: Res<MixerLayout>, mixer: Res<MixerEntities>) {
+    let layout = &layout.0;
+    eprintln!(
+        "bench-mixer-bevy: board {}x{} rows={} per_row={} strip_h={:.1} fader_h={:.1}",
+        layout.width,
+        layout.height,
+        layout.rows,
+        layout.strips_per_row,
+        layout.strip_height,
+        layout.fader_height,
+    );
+    if let Some(slot) = mixer.feed.drag_strip() {
+        let bottom = layout.fader_point(slot, 0.0);
+        let top = layout.fader_point(slot, 1.0);
+        eprintln!(
+            "bench-mixer-bevy: drag strip {slot} travel ({:.1},{:.1})..({:.1},{:.1})",
+            bottom.0, bottom.1, top.0, top.1,
+        );
+    }
+}
 
 /// An absolutely-placed node at `rect`, in the coordinates of a parent that
 /// spans the same space (the board root, or a strip panel for its children).
@@ -192,7 +216,6 @@ fn spawn_strip(
             TextLayout {
                 justify: Justify::Center,
                 linebreak: LineBreak::NoWrap,
-                ..default()
             },
         ))
         .id();
