@@ -84,6 +84,23 @@ A variable whose **value** is nil is bound, so it still renders the literal
 `nil` (`$x = nil` → `${x}` → `nil`); likewise a missing map key in a dotted path
 (`${a.b}` → `nil`), matching `$a.b`.
 
+**A bare `$name` is literal — this is the opposite of bash.** Only `${name}`
+interpolates, so `read_file("$sp/prompt.md")` opens a file called
+`$sp/prompt.md`. The rule is deliberate (it lets a string carry shell text and
+nested Mix source untouched), but it is also the first thing anyone arriving from
+bash gets wrong, so `mix lint` reports it as [MIX-D3015](lint.md) when the name is
+bound in the same file:
+
+```mix
+$sp = "/tmp/x"
+print("$sp/a")      -- literal:  $sp/a      (MIX-D3015)
+print("${sp}/a")    -- /tmp/x/a
+print('$sp/a')      -- literal, and says so
+print("\$sp/a")     -- literal, and says so
+```
+
+`\$name` and single quotes are the two ways to mean it, and neither is reported.
+
 ### Defaults — `${x ?? default}` and `${x ?: default}`
 
 Supply a fallback with the same coalescing operators Mix uses in expressions.
@@ -139,8 +156,9 @@ hi $user
 
 ## Escapes and `\u{XXXX}`
 
-Double-quoted strings honour `\n \t \r`, `\e` (ESC, `\x1b`), `\" \\ \$ \~`, and the
-braced unicode escape `\u{XXXX}` (1–6 hex digits):
+Double-quoted strings honour `\n \t \r`, `\e` (ESC), `\a \b \f \v` (BEL, BS, FF, VT),
+`\0` (NUL), `\" \\ \$ \~`, the two-hex-digit `\xHH`, and the braced unicode escape
+`\u{XXXX}` (1–6 hex digits):
 
 ```mix
 print("tab\there")
@@ -160,8 +178,45 @@ strip BOM:[﻿]
 `\u{…}` literal too. A surrogate or out-of-range codepoint is a loud lex error
 (`\u{D800} is not a valid unicode codepoint`), never a silent pass-through.
 
+### `\xHH`, `\0` and the control escapes (0.90.0)
+
+`\xHH` takes **exactly two hex digits** and its value is the **codepoint** U+00HH —
+never a raw byte. A Mix string is UTF-8, so `"\xff"` is U+00FF (one character, two
+bytes on the wire), not the byte `0xFF`. For bytes, use `bytes_from_hex` /
+`bytes_from`, which keep a different spelling on purpose.
+
+```mix
+print("isn\x27t")
+print("\x41\x42")
+print(len("a\0b"))          -- \0 is NUL, a real character
+print("\a" == chr(7))       -- BEL; \b \f \v are BS, FF, VT
+```
+```text
+isn't
+AB
+3
+true
+```
+
+`\0` is NUL **exactly**, never the start of an octal escape: octal is ambiguous
+next to digits, so `"\012"` is NUL followed by the text `12`. Octal and `\U` are
+deliberately absent — `\u{…}` covers what they would have been for.
+
+Fewer than two hex digits is **not** a lex error: `"\x4"` stays the three
+characters `\x4`, so a regex pattern meaning the engine's own `\x` never becomes a
+hard failure of the whole file. `mix lint` reports it as
+[MIX-W2405](lint.md) instead.
+
+Before 0.90.0 all of these were kept literally, which is how a `replace()` once
+wrote `isn\x27t` into a committed journal entry with no gate noticing.
+
+### Unrecognised escapes are still literal — and now linted
+
 Any **unrecognised** escape keeps the backslash literally: `"\d"` is the two
-characters `\d`, not an error. Strip a BOM with the real codepoint:
+characters `\d`, not an error. That is deliberate (it protects regex patterns and
+Windows paths), but it is also how a habit from another language becomes silently
+wrong output, so `mix lint` flags it as [MIX-W2405](lint.md). A deliberate
+backslash is written `\\`, which never warns. Strip a BOM with the real codepoint:
 `replace($s, "\u{FEFF}", "")`.
 
 ## Leading `~` expansion

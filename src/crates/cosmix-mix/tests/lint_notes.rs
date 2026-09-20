@@ -111,17 +111,22 @@ fn output_orders_error_then_warning_then_note() {
 }
 
 #[test]
-fn builtin_shadowing_definition_warns() {
-    // MIX-W2403 (0.74.0): a function named after a builtin is dead code —
-    // the builtin wins at every call site. Warning severity (a compat
-    // shim for an older mix is legitimate), so it DOES deny under
-    // --deny-warnings; a non-colliding name stays quiet.
+fn builtin_shadowing_definition_errors() {
+    // MIX-E1303 (0.90.0, was MIX-W2403): a function named after a builtin
+    // is dead code — the builtin wins at every call site. Promoted from
+    // warning to ERROR, so it now fails a PLAIN lint, not only
+    // --deny-warnings: the two sites the fleet actually had were a
+    // duplicated `ends_with` and a pre-commit hook's `fn mix_version()`
+    // silently answering with the wrong interpreter's version, not the
+    // compat shims the warning severity was reserved for.
     let src = "function upper($s)\n  return \"no\"\nend\nprint(upper(\"a\"))\n";
     let path = write_temp("shadow", src);
-    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
-    assert_ne!(code, 0, "shadow definition denies: {out}");
-    assert!(out.contains("MIX-W2403"), "{out}");
+    let (code, out) = lint(&[path.to_str().unwrap()]);
+    assert_ne!(code, 0, "shadow definition fails a plain lint: {out}");
+    assert!(out.contains("MIX-E1303"), "{out}");
     assert!(out.contains("cannot be called BY NAME"), "{out}");
+    let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);
+    assert_ne!(code, 0, "and still under --deny-warnings: {out}");
     let clean = "function upper_snake($s)\n  return upper($s)\nend\nprint(upper_snake(\"a\"))\n";
     let path = write_temp("shadow_clean", clean);
     let (code, out) = lint(&["--deny-warnings", path.to_str().unwrap()]);

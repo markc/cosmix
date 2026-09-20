@@ -852,3 +852,87 @@ fn d3014_is_a_note_so_it_never_gates_deny_warnings() {
         .unwrap();
     assert_eq!(d.severity, Severity::Note);
 }
+
+// ── MIX-D3015 / MIX-W2405: how a double-quoted literal was SPELLED ──
+//
+// Both need the source text (`AnalyzerConfig::source`) because `'$sp/x'`
+// and `"$sp/x"` lex to the same `Token::String` and the AST must not grow
+// a variant to say which — `Token::InterpString` is a hard
+// StrictDataViolation, so the shape change would refuse data files that
+// work today.
+
+fn codes_with_source(src: &str) -> Vec<String> {
+    let cfg = AnalyzerConfig {
+        source: Some(src.to_string()),
+        ..AnalyzerConfig::default()
+    };
+    lint_cfg(src, &cfg).into_iter().map(|(c, _)| c).collect()
+}
+
+#[test]
+fn bare_dollar_in_a_double_quoted_string_notes_when_the_name_is_bound() {
+    // The filing repro: four occurrences in one file passed lint and all
+    // four failed at runtime.
+    assert_eq!(
+        codes_with_source("$sp = \"/tmp/x\"\nprint(read_file(\"$sp/prompt.md\"))\n"),
+        vec!["MIX-D3015"]
+    );
+}
+
+#[test]
+fn bare_dollar_near_misses_stay_quiet() {
+    for src in [
+        // The three clean spellings the hint offers.
+        "$sp = \"/tmp/x\"\nprint(\"${sp}/x\")\n",
+        "$sp = \"/tmp/x\"\nprint('$sp/x')\n",
+        "$sp = \"/tmp/x\"\nprint(\"\\$sp/x\")\n",
+        // A name bound nowhere is prose, not a mistake.
+        "print(\"Total: $USD\")\n",
+        // `$` followed by a non-identifier, or by digits only, is not a
+        // variable spelling.
+        "$x = 1\nprint(\"cost $5.00 plus $ tax\")\n",
+        // NESTED source: a multi-line string, or one whose spelling has
+        // `\"`, carries an inner program whose `$rc` is correctly literal.
+        "$rc = 1\nprint(\"print($rc)\\nprint(1)\")\n",
+        "$CMCTL = \"/x\"\nprint(\"$CMCTL .. \\\"/etc\\\"\")\n",
+    ] {
+        assert!(
+            !codes_with_source(src).contains(&"MIX-D3015".to_string()),
+            "must stay quiet: {src}"
+        );
+    }
+}
+
+#[test]
+fn unknown_escapes_warn_and_the_deliberate_literals_do_not() {
+    assert_eq!(codes_with_source("print(\"bad \\q\")\n"), vec!["MIX-W2405"]);
+    // `\x` with fewer than two hex digits is the whole point of keeping it
+    // literal rather than a lex error.
+    assert_eq!(codes_with_source("print(\"\\x4\")\n"), vec!["MIX-W2405"]);
+    assert_eq!(codes_with_source("print(\"\\'\")\n"), vec!["MIX-W2405"]);
+    for src in [
+        // Added in 0.90.0 — these must NOT warn.
+        "print(\"\\x27\")\n",
+        "print(\"\\0\")\n",
+        "print(\"\\a\\b\\f\\v\")\n",
+        // Always recognised.
+        "print(\"\\n\\t\\r\\e\\\"\\\\\\$\\~\")\n",
+        "print(\"\\u{27}\")\n",
+        // Unbraced `\u` is a DOCUMENTED literal (embedded JSON, C:\users).
+        "print(\"json \\uABCD\")\n",
+        // Single quotes keep their own rules and are not scanned.
+        "print('raw \\x27')\n",
+    ] {
+        assert!(
+            !codes_with_source(src).contains(&"MIX-W2405".to_string()),
+            "must stay quiet: {src}"
+        );
+    }
+}
+
+#[test]
+fn the_spelling_rules_are_silent_without_a_source() {
+    // An embedder calling analyze() without AnalyzerConfig::source loses
+    // these two rules and nothing else.
+    assert!(codes("$sp = \"/tmp/x\"\nprint(\"$sp/x\")\nprint(\"bad \\q\")\n").is_empty());
+}

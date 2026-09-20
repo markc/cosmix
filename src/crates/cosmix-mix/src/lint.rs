@@ -316,7 +316,13 @@ fn lint_one(
             return strict_data_fallback(source, file, to_diag("MIX-E1002", e.to_string(), None));
         }
     };
-    Ok(LintOutcome::Script(analyzer::analyze(&stmts, file, cfg)))
+    // Hand the analyzer this file's source so the two spelling rules
+    // (MIX-D3015 bare `$name`, MIX-W2405 unknown escape) can run — they
+    // ask how a double-quoted literal was WRITTEN, which the token stream
+    // deliberately forgets. Per-file, never the accumulated flags.
+    let mut cfg = cfg.clone();
+    cfg.source = Some(source.to_string());
+    Ok(LintOutcome::Script(analyzer::analyze(&stmts, file, &cfg)))
 }
 
 fn strict_data_fallback(

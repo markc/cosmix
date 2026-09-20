@@ -102,6 +102,19 @@ pub struct AnalyzerConfig {
     /// inner file's universe would be pure noise. Reuses the existing
     /// `dynamic` suppression rather than inventing a second switch.
     pub suppress_name_checks: bool,
+    /// The file's SOURCE text, when the caller has it (0.90.0).
+    ///
+    /// Two rules need what the token stream deliberately forgets: a bare
+    /// `$name` and an unrecognised escape are both properties of a
+    /// DOUBLE-quoted literal's spelling, and `'…'` and `"…"` lex to the
+    /// same `Token::String`. The AST must not grow a variant to say which
+    /// (strict-data parsing refuses `Token::InterpString` outright), so the
+    /// analyzer re-lexes for [`crate::lexer::Lexer::notes_for`] instead.
+    ///
+    /// `None` simply skips those two rules — every other rule is
+    /// unaffected, so an embedder that does not set it loses nothing it
+    /// had before.
+    pub source: Option<String>,
 }
 
 /// The result of one file's analysis.
@@ -390,6 +403,7 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
         true,
     );
     check_recurring_silent_bugs(stmts, &ctx, &mut a);
+    check_string_literal_spelling(&ctx, &mut a, cfg);
     check_release_transition_advisories(stmts, &ctx, &mut a);
     // Guarded against unbounded recursion: a remote body may itself contain
     // an `ssh_mix`, and nothing stops that nesting from being circular
@@ -399,6 +413,79 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
     }
     collect_capabilities(stmts, &mut a);
     a
+}
+
+/// MIX-D3015 + MIX-W2405 (0.90.0) — the two rules about how a
+/// DOUBLE-quoted literal was SPELLED, which the token stream no longer
+/// knows (see `AnalyzerConfig::source`).
+///
+/// D3015, bare `$name`: double quotes interpolate `${name}` only, and a
+/// bare `$name` is literal BY DESIGN — the opposite of bash, so anyone
+/// arriving from bash writes it. Four occurrences in one file passed lint
+/// and all four failed at runtime (2026-09-17). Gated on the name being
+/// bound somewhere in the file, exactly as MIX-W2402 gates the heredoc
+/// twin: `"Total: $USD"` in prose must stay silent. `\$name` and `'…'`
+/// never reach the lexer's note.
+///
+/// A NOTE, where the heredoc twin is a warning, and that asymmetry is
+/// measured rather than assumed. Over 785 fleet scripts MIX-W2402 costs 4
+/// findings; this rule costs an order of magnitude more even after the
+/// lexer drops multi-line and escaped-quote strings, because a
+/// double-quoted literal is where scripts carry NESTED source (an
+/// `ssh_mix` body, a `mix -c` program, a test fixture) and a bare `$rc`
+/// in one is the inner program's variable, correctly literal. Shipping
+/// that as a warning would fail `--deny-warnings`, which is a live fleet
+/// deploy gate, on scripts that are not wrong. D3xxx is the
+/// severity-independent namespace precisely so this can be promoted to a
+/// warning, code unchanged, once the residue is worked off.
+///
+/// W2405, unrecognised escape: `"isn\x27t"` printed `isn\x27t` and lint
+/// said nothing, so a `replace()` wrote that into a committed journal
+/// entry. A deliberate backslash is `\\`, so the warning has a clean
+/// escape. `\u` without a brace is exempt — that literal is documented
+/// design, not an accident. This one IS a warning: the same fleet sweep
+/// found two findings, both real.
+fn check_string_literal_spelling(ctx: &FileContext, a: &mut Analysis, cfg: &AnalyzerConfig) {
+    let Some(source) = cfg.source.as_deref() else {
+        return;
+    };
+    for note in crate::lexer::Lexer::notes_for(source) {
+        match note {
+            crate::lexer::StringNote::BareDollar { line, name } => {
+                if !ctx.top_level_names.contains(&name) {
+                    continue;
+                }
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-D3015",
+                    Severity::Note,
+                    line,
+                    format!("bare `${name}` in a double-quoted string is literal, not interpolated"),
+                    Some(format!(
+                        "did you mean `${{{name}}}`? an intentional literal is `\\${name}` or a single-quoted '…' string"
+                    )),
+                ));
+            }
+            crate::lexer::StringNote::UnknownEscape { line, text } => {
+                let hint = match text.as_str() {
+                    "\\x" => "`\\xHH` takes exactly two hex digits (0.90.0) — `\\x27`, not `\\x2`; for a literal backslash write `\\\\x`".to_string(),
+                    "\\'" => "double quotes need no escape for `'` — write `'` alone, or `\\\\'` for a literal backslash-quote".to_string(),
+                    _ => format!(
+                        "`{text}` is kept literally (backslash included) — write `\\\\{}` if that is what you want, or use `\\u{{…}}` for a codepoint",
+                        &text[1..]
+                    ),
+                };
+                a.diagnostics.push(diag(
+                    ctx,
+                    "MIX-W2405",
+                    Severity::Warning,
+                    line,
+                    format!("unknown escape `{text}` in a double-quoted string is kept literally"),
+                    Some(hint),
+                ));
+            }
+        }
+    }
 }
 
 /// Immutable per-file facts shared by the passes.
@@ -702,16 +789,36 @@ fn check_pad_loop_idiom(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     });
 }
 
-/// MIX-W2403 (0.74.0): a user function named after a builtin is silently
-/// dead code — the builtin wins at every call site (and a builtin-named
-/// dot-call even desugars at parse time), so the definition can never be
-/// called. The worst shape of failure this produces is a script that keeps
-/// running while its own function quietly stops being called — every
-/// release that adds a builtin name arms it again (print_raw, bytes_find,
-/// sprintf… were all plausible names for older scripts to have defined).
-/// Deliberately a WARNING, never an error: a compat shim written for an
-/// older mix that lacks the builtin is a legitimate authoring pattern —
-/// but on THIS mix it is dead, and the author should know.
+/// MIX-E1303 (0.90.0, was MIX-W2403 from 0.74.0): a user function named
+/// after a builtin is silently dead code — the builtin wins at every call
+/// site (and a builtin-named dot-call even desugars at parse time), so the
+/// definition can never be called. The worst shape of failure this produces
+/// is a script that keeps running while its own function quietly stops
+/// being called — every release that adds a builtin name arms it again
+/// (print_raw, bytes_find, sprintf… were all plausible names for older
+/// scripts to have defined).
+///
+/// PROMOTED TO AN ERROR in 0.90.0, and the 0.74.0 case for keeping it a
+/// warning — "a compat shim written for an older mix is legitimate
+/// authoring" — did not survive contact with the fleet. Two sites existed
+/// across 785 scripts and NEITHER was a shim: one was a hand-rolled
+/// `ends_with` duplicating the builtin (dead, harmless), and the other was
+/// `fn mix_version()` in a pre-commit hook, written to report the version
+/// of a NAMED interpreter and silently answering with the running one's
+/// instead — a live wrong answer that had sat behind a warning for
+/// sixteen releases. Lint is also the only gate an `ssh_mix` body ever
+/// passes through, and a warning does not stop anything by default.
+///
+/// The RUNTIME is deliberately unchanged: the builtin still wins. Letting
+/// the user definition win would flip the behaviour of every existing
+/// shadowing script silently, which is the exact failure mode being
+/// removed here — the fix is to rename, and now the tool says so in a way
+/// that stops the run.
+///
+/// The code MOVED rather than changing severity in place: a code's letter
+/// encodes its severity permanently (`MIX-W2xxx` are warnings that were
+/// BORN warnings), so W2403 is retired, never reused, and its `mix explain`
+/// entry points here.
 fn check_builtin_shadowing(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     walk_stmts(stmts, &mut |stmt| {
         if let StmtKind::FunctionDef { name, .. } = &stmt.kind
@@ -719,8 +826,8 @@ fn check_builtin_shadowing(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) 
         {
             a.diagnostics.push(diag(
                 ctx,
-                "MIX-W2403",
-                Severity::Warning,
+                "MIX-E1303",
+                Severity::Error,
                 stmt.line,
                 format!(
                     "function '{name}' shadows the builtin of the same name and cannot be called BY NAME — the builtin wins at every call site"
@@ -1841,6 +1948,10 @@ fn analyse_remote_body(
         allow_globals: cfg.allow_globals.clone(),
         allow_functions: cfg.allow_functions.clone(),
         suppress_name_checks: true,
+        // The BODY's own text, never the enclosing file's — the spelling
+        // rules must read the source they are reporting lines against.
+        // Lint is the only gate this remote program ever passes through.
+        source: Some(src.to_string()),
     };
     let nested = analyze(&inner, None, &inner_cfg);
     for mut d in nested.diagnostics {
