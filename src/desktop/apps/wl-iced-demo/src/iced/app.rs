@@ -196,6 +196,13 @@ impl IcedDemo {
         for (selection, text) in writes {
             cx.set_selection(selection, text);
         }
+        // The bar widget opens and closes menus on its own (F10, a click or a
+        // hover on a title) and publishes the new `MenuState` through
+        // `external_popups`. That is the only way a menu ever STARTS, and it
+        // arrives here, not through the navigator, so the popups must be
+        // reconciled on this path too — `outcome()` only sees steps the host
+        // drove itself. Idempotent: with nothing open it does no work.
+        self.after_menu_change(cx);
         update
     }
 
@@ -523,7 +530,24 @@ impl App for IcedDemo {
             }
             Event::PopupDone { surface } => {
                 self.raw.log(format_args!("panel done {surface:?}"));
-                self.menus.dismissed(surface);
+                // The compositor dismissed this panel and every one above it.
+                // The menu STATE has to forget those levels as well: while it
+                // still says they are open, the next reconcile recreates
+                // exactly the panel that was just dismissed, is dismissed
+                // again, and the two spin against each other in a hot loop
+                // (observed: 467k create/dismiss cycles from one refused
+                // grab). Level 0 means the whole menu is gone.
+                if let Some(level) = self.menus.dismissed(surface) {
+                    self.navigate(cx, |nav, state| {
+                        if level == 0 {
+                            nav.close(state)
+                        } else {
+                            state.path.truncate(level);
+                            state.anchors.truncate(level);
+                            NavOutcome::None
+                        }
+                    });
+                }
                 self.after_menu_change(cx);
             }
             ev @ Event::KeyboardFocus { surface, focused }

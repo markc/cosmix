@@ -808,6 +808,35 @@ impl FlushOps for State {
 }
 
 impl State {
+    /// Take `seat` as the one seat this runtime uses, and build everything
+    /// that hangs off it: the data device, the primary-selection device and
+    /// the text input.
+    ///
+    /// Called from `SeatHandler::new_seat` AND from `new_capability`,
+    /// because sctk's `SeatState::new` binds the seats that already exist at
+    /// connect time itself and never calls `new_seat` for them (it has no
+    /// `D` to call it with — only `RegistryHandler::new_global`, for a seat
+    /// that appears LATER, does). A compositor's seat is always already
+    /// there, so a `new_seat`-only hook-up leaves the runtime with no
+    /// keyboard, no pointer, no clipboard and no input method.
+    pub(crate) fn adopt_seat(&mut self, qh: &QueueHandle<Self>, seat: WlSeat) {
+        let rt = &mut self.rt;
+        rt.seat.data_device = rt
+            .data_manager
+            .as_ref()
+            .map(|m| m.get_data_device(qh, &seat));
+        rt.seat.primary_device = rt
+            .primary_manager
+            .as_ref()
+            .map(|m| m.get_selection_device(qh, &seat));
+        rt.seat.text_input = rt
+            .text_input_manager
+            .as_ref()
+            .map(|m| m.get_text_input(&seat, qh, ()));
+        rt.ime.reset();
+        rt.seat.seat = Some(seat);
+    }
+
     pub(crate) fn emit(&mut self, event: Event) {
         self.rt.queue.push_back(event);
         self.drain();
@@ -1239,6 +1268,18 @@ impl Runtime {
         // The serial is taken here, where the grab is actually sent: a
         // serial picked when the popup was asked for could have been
         // invalidated by a release while the popup waited for its parent.
+        //
+        // A chain only lives as long as a grabbing popup does — xdg-shell
+        // ends the grab when the topmost grabbing popup is destroyed, and a
+        // compositor then refuses a new popup that still carries the old
+        // serial. Switching root menus destroys the open panel BEFORE
+        // creating the next one, so by the time we get here that chain is
+        // over and this popup must grab with the press that asked for it
+        // (the arrow key, the click). A submenu leaves its parent popup
+        // alive, so the chain survives and the serial is reused as before.
+        if !self.surfaces.values().any(|s| s.role.grabbing()) {
+            self.grabs.dismissed();
+        }
         let serial = grab_wanted.then(|| self.grabs.for_grab()).flatten();
         let grab = match (serial, &self.seat.seat) {
             (Some(serial), Some(seat)) => {
@@ -1672,21 +1713,7 @@ impl SeatHandler for State {
         if self.rt.seat.seat.is_some() {
             return;
         }
-        let rt = &mut self.rt;
-        rt.seat.data_device = rt
-            .data_manager
-            .as_ref()
-            .map(|m| m.get_data_device(qh, &seat));
-        rt.seat.primary_device = rt
-            .primary_manager
-            .as_ref()
-            .map(|m| m.get_selection_device(qh, &seat));
-        rt.seat.text_input = rt
-            .text_input_manager
-            .as_ref()
-            .map(|m| m.get_text_input(&seat, qh, ()));
-        rt.ime.reset();
-        rt.seat.seat = Some(seat);
+        self.adopt_seat(qh, seat);
     }
 
     fn new_capability(
@@ -1696,6 +1723,13 @@ impl SeatHandler for State {
         seat: WlSeat,
         capability: Capability,
     ) {
+        // A seat that existed before we connected never reaches `new_seat`
+        // (see `adopt_seat`): its capabilities are the first we hear of it,
+        // so adopt it here. Still one seat — the first to speak wins, and
+        // every other seat is ignored exactly as before.
+        if self.rt.seat.seat.is_none() {
+            self.adopt_seat(qh, seat.clone());
+        }
         if self.rt.seat.seat.as_ref() != Some(&seat) {
             return;
         }

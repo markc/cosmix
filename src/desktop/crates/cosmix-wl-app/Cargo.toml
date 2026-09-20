@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-wl-app"
-version = "0.3.1"
+version = "0.3.2"
 description = "Widget-free raw Wayland client runtime: toplevels, popups, shm buffers, input, IME, clipboard"
 edition = "2024"
 rust-version = "1.95"

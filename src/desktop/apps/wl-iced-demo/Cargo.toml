@@ -6,7 +6,7 @@
 # iced costs term.
 [package]
 name = "cosmix-wl-iced-demo"
-version = "0.1.1"
+version = "0.1.2"
 description = "Raw Wayland demo clients for cosmix-wl-app, without and with iced chrome"
 edition = "2024"
 rust-version = "1.95"
