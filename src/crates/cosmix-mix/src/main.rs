@@ -270,14 +270,33 @@ fn resolve_term(
             "mix --gui: COSMIX_TERM_BIN must name an executable frontend file".to_string()
         });
     }
-    if let Some(root) = cosmix
-        && let Some(path) = lookup(&Path::new(&root).join("bin/term"))
-    {
-        return Ok(path);
+    // `term` first, then `bterm`, at each tier before moving to the next — a
+    // $COSMIX dev build must win over an installed one whichever frontend it
+    // is, or `mix --gui` silently runs the system terminal while you are
+    // testing a local one.
+    //
+    // The `bterm` arm is the T1 rename's bridge (2026-09-21): the Bevy
+    // frontend became `bterm` and the name `term` is reserved for the
+    // incoming iced one, so for as long as only bterm is installed this is
+    // the only thing `mix --gui` can find. It stops mattering the moment the
+    // new `term` ships — and it stays as the fallback for a machine that has
+    // only bterm, which D6 says will keep existing. `COSMIX_TERM_BIN` still
+    // overrides everything and still fails closed.
+    for name in ["term", "bterm"] {
+        if let Some(root) = &cosmix
+            && let Some(path) = lookup(&Path::new(root).join("bin").join(name))
+        {
+            return Ok(path);
+        }
     }
-    lookup(Path::new("/opt/cosmix/bin/term"))
-        .or_else(|| lookup(Path::new("term")))
-        .ok_or_else(|| "mix --gui: the CosMix Term frontend is not installed (looked for $COSMIX/bin/term, /opt/cosmix/bin/term, term on PATH). Install the desktop package.".to_string())
+    for name in ["term", "bterm"] {
+        if let Some(path) = lookup(&Path::new("/opt/cosmix/bin").join(name)) {
+            return Ok(path);
+        }
+    }
+    lookup(Path::new("term"))
+        .or_else(|| lookup(Path::new("bterm")))
+        .ok_or_else(|| "mix --gui: no CosMix terminal frontend is installed (looked for term then bterm in $COSMIX/bin, /opt/cosmix/bin, and on PATH). Install the desktop package.".to_string())
 }
 
 /// Reuse the public `which` builtin's regular-file + kernel X_OK check,
@@ -2030,11 +2049,22 @@ mod gui_tests {
             None
         })
         .unwrap_err();
+        // Tier before name: a $COSMIX dev build of EITHER frontend beats an
+        // installed one, so `mix --gui` never silently runs the system
+        // terminal while a local build is what is under test.
         assert_eq!(
             seen,
-            ["/test-root/bin/term", "/opt/cosmix/bin/term", "term"].map(std::path::PathBuf::from)
+            [
+                "/test-root/bin/term",
+                "/test-root/bin/bterm",
+                "/opt/cosmix/bin/term",
+                "/opt/cosmix/bin/bterm",
+                "term",
+                "bterm",
+            ]
+            .map(std::path::PathBuf::from)
         );
-        assert!(error.starts_with("mix --gui: the CosMix Term frontend is not installed"));
+        assert!(error.starts_with("mix --gui: no CosMix terminal frontend is installed"));
         assert!(error.ends_with("Install the desktop package."));
         for (winner, expected) in seen.iter().enumerate() {
             let mut index = 0;

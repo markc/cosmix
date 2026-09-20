@@ -1,19 +1,25 @@
 [package]
-name = "cosmix-term"
-version = "0.8.6"
+name = "cosmix-bterm"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "Native CosMix Wayland terminal with CTK menus"
+description = "Native CosMix Wayland terminal with CTK menus (Bevy frontend)"
 
 [[bin]]
-name = "term"
+name = "bterm"
 path = "src/main.rs"
 
+# Renamed from `term` 2026-09-21 (TODO-term T1/D1). The name `term` belongs to
+# the incoming iced+wgpu frontend; this Bevy one becomes `bterm` and serves
+# `bterm.*`, so the two can run side by side — which is what T5's A/B weight
+# comparison requires. bterm is KEPT indefinitely as the reference
+# implementation and the A/B control (D6); it stops being the default, it does
+# not stop existing.
 [package.metadata.cosmix]
 kind = "app"
-component = "term"
-display = "CosMix Term"
+component = "bterm"
+display = "CosMix BTerm"
 engine = "bevy"
 
 [build-dependencies]

@@ -19,6 +19,7 @@ pub mod raster;
 pub mod session_fd;
 pub mod tabs;
 pub mod terminal;
+pub mod version;
 pub mod wake;
 
 #[cfg(test)]

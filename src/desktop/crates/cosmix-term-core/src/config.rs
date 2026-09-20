@@ -163,10 +163,13 @@ mod tests {
     fn optional_keys_and_example() {
         assert_eq!(parse("{}").unwrap(), Config::default());
         assert_eq!(
-            // The example ships with the term app; the parser it must satisfy lives here.
-            // Reaching into a sibling package only works because this crate is
-            // publish = false: a packaged crate would not contain that file.
-            parse(include_str!("../../../apps/term/term.example.conf.mix")).unwrap(),
+            // The example lives beside the parser it must satisfy. It used to
+            // sit in the term app and be reached across the package boundary,
+            // which only worked because this crate is publish = false — and
+            // which broke the moment that app was renamed to `bterm`. Both
+            // frontends read the same `term.conf.mix`, so the example belongs
+            // to neither of them.
+            parse(include_str!("../term.example.conf.mix")).unwrap(),
             Config::default()
         );
         assert_eq!(parse("font_px: 18.5").unwrap().font_px, 18.5);

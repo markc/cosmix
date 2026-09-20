@@ -6,12 +6,73 @@ use std::{
 };
 
 pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+/// The one spelling the handlers in this crate are written in.
+///
+/// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
+/// name `term`, and T5's A/B weight comparison requires both frontends
+/// running at once — so the Bevy frontend registers as `bterm` and serves
+/// `bterm.*`, the incoming iced one as `term` / `term.*`. **Nothing in this
+/// crate may hardcode either name**: the frontend passes its own in, and the
+/// wire namespace follows it.
+///
+/// The 147 handler arms keep this single canonical spelling instead of being
+/// rewritten to build verb strings; [`canonical_verb`] rewrites an incoming
+/// `<service>.` prefix to it at the dispatch boundary. So the wire name is a
+/// parameter while the handlers stay one implementation, which is also what
+/// keeps the two frontends behaviourally identical rather than merely
+/// similar.
+pub const CANONICAL: &str = "term";
+
+/// Rewrite a verb from the wire namespace (`<service>.foo`) into the
+/// canonical one (`term.foo`), or `None` when it belongs to some other
+/// namespace and this frontend must not answer it.
+///
+/// Unprefixed verbs — `INFO`, `HELP` — pass through: they are discovery, not
+/// a namespace, and both frontends answer them.
+///
+/// **The `None` arm is the whole point of D1, and it was missing on the first
+/// cut.** Rewriting only `<service>.` while letting a bare `term.` fall
+/// through left bterm answering BOTH namespaces, which is the collision the
+/// rename exists to prevent: a mesh caller sending `term.tab.new` would be
+/// served by whichever frontend happened to hold the name, and T5's A/B would
+/// be comparing one terminal wearing two hats.
+/// `bterm_serves_its_own_namespace_and_refuses_terms` is the gate, and it
+/// failed before this arm existed.
+fn canonical_verb<'a>(service: &str, verb: &'a str) -> Option<std::borrow::Cow<'a, str>> {
+    if let Some(rest) = verb.strip_prefix(service).and_then(|r| r.strip_prefix('.')) {
+        return Some(if service == CANONICAL {
+            std::borrow::Cow::Borrowed(verb)
+        } else {
+            std::borrow::Cow::Owned(format!("{CANONICAL}.{rest}"))
+        });
+    }
+    // A dot means the caller aimed at a namespace, and it is not ours.
+    match verb.contains('.') {
+        true => None,
+        false => Some(std::borrow::Cow::Borrowed(verb)),
+    }
+}
+
+/// [`HELP`] rendered into `service`'s namespace, so a caller reads the verb
+/// names it can actually send. `help_renames_every_verb` pins that the
+/// rewrite is total — a future HELP edit that spells a verb some other way
+/// fails that test rather than advertising an unroutable name.
+pub fn help(service: &str) -> String {
+    if service == CANONICAL {
+        return HELP.to_string();
+    }
+    HELP.replace(&format!("{CANONICAL}."), &format!("{service}."))
+        .replace(&format!("{CANONICAL}:"), &format!("{service}:"))
+}
+
 pub fn start(
+    service: &'static str,
     terminal: Arc<Mutex<TabSet>>,
     cleanup: Cleanup,
     notify_rx: tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
 ) -> std::thread::JoinHandle<()> {
     start_at(
+        service,
         terminal,
         cleanup,
         notify_rx,
@@ -20,16 +81,17 @@ pub fn start(
 }
 
 pub(crate) fn start_at(
+    service: &'static str,
     terminal: Arc<Mutex<TabSet>>,
     cleanup: Cleanup,
     mut notify_rx: tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
     url: String,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new().name("term-bus".into()).spawn(move || {
+    std::thread::Builder::new().name(format!("{service}-bus")).spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("Bus runtime");
         runtime.block_on(async move {
-            let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options("term", &url).bounded_incoming(16).connect()).await;
-            let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("term Bus unavailable or connection timed out"); return; } };
+            let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options(service, &url).bounded_incoming(16).connect()).await;
+            let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("{service} Bus unavailable or connection timed out"); return; } };
             let Some(mut incoming) = client.incoming_bounded() else { return; };
             // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
             // or closes at shutdown. `recv()` on a closed channel returns `None`
@@ -58,11 +120,12 @@ pub(crate) fn start_at(
                     event = incoming.recv() => {
                         let command = match event {
                             Some(BoundedIncomingEvent::Command(c)) => c,
-                            Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("term Bus incoming overflow"); continue; },
+                            Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
                             None => break,
                         };
                         let result = dispatch(
                             crate::control::mesh_open(),
+                            service,
                             &terminal,
                             &cleanup,
                             &mut replies,
@@ -238,15 +301,32 @@ fn mutates(verb: &str) -> bool {
 /// retry replay the recorded reply instead of re-executing the verb.
 fn dispatch(
     open: bool,
+    service: &str,
     set: &Mutex<TabSet>,
     cleanup: &Cleanup,
     replies: &mut ReplyCache,
-    verb: &str,
+    wire_verb: &str,
     body: &str,
 ) -> Result<String, String> {
+    // Into the canonical namespace once, at the boundary, and never back out:
+    // the replay cache, the mutation gate, argument validation and every
+    // handler below all see `term.*` whatever name this frontend serves
+    // under. Doing it here rather than per-handler is what keeps `bterm` and
+    // `term` the same implementation instead of two that drift (D1).
+    // Posture gate first, and on the WIRE verb, so the strict lane keeps its
+    // stated contract exactly: INFO/HELP answer, everything else is
+    // FORBIDDEN — including a foreign namespace, which must not be able to
+    // tell itself apart from a refused one.
     if !open {
-        return diagnostic(verb);
+        return diagnostic(service, wire_verb);
     }
+    let Some(verb) = canonical_verb(service, wire_verb) else {
+        // Another frontend's namespace. Refused with the same message an
+        // unknown verb in our OWN namespace gets, so the reply is not an
+        // oracle for which other frontends exist.
+        return Err("unknown verb; use HELP".into());
+    };
+    let verb = verb.as_ref();
     // The envelope size limit applies before any parse, lookup or caching:
     // an oversized body must neither hit the replay cache nor leave its
     // request_id resident in it.
@@ -271,7 +351,7 @@ fn dispatch(
             return reply;
         }
     }
-    let result = handle(set, cleanup, verb, body);
+    let result = handle(service, set, cleanup, verb, body);
     if let Some(args) = parsed {
         let id = args["request_id"].as_str().expect("filtered as string");
         replies.put(id.to_owned(), verb, args, result.clone());
@@ -282,16 +362,17 @@ fn dispatch(
 /// The global, self-asserted TCP name is never an authority boundary.
 /// Keep discovery/notification compatibility, but fail closed for all data and
 /// controls, including when native bootstrap is unavailable.
-fn diagnostic(verb: &str) -> Result<String, String> {
+fn diagnostic(service: &str, verb: &str) -> Result<String, String> {
     match verb {
-        "INFO" | "HELP" | "info" | "help" => Ok(
-            "term: diagnostic discovery only; protected controls require the allocated native-session route".into(),
-        ),
+        "INFO" | "HELP" | "info" | "help" => Ok(format!(
+            "{service}: diagnostic discovery only; protected controls require the allocated native-session route"
+        )),
         _ => Err("{\"error_code\":\"FORBIDDEN\"}".into()),
     }
 }
 
 fn handle(
+    service: &str,
     set: &Mutex<TabSet>,
     cleanup: &Cleanup,
     verb: &str,
@@ -302,7 +383,8 @@ fn handle(
     let mut tabs = set.lock().unwrap();
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
-            "{HELP}\nterm.session {{}}: native identity and per-pane binding diagnostics (not live authority)"
+            "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)",
+            help(service)
         )),
         "term.session" => Ok(tabs.session_status().to_string()),
         "term.tabs" => Ok(tabs
@@ -492,6 +574,34 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The existing suite predates the service-name parameter and exercises
+    /// the canonical `term` frontend, so it reads unchanged through this
+    /// shim. `bterm`'s own routing is covered by the namespace tests below,
+    /// which call the real `super::dispatch` with a service name.
+    fn dispatch(
+        open: bool,
+        set: &Mutex<TabSet>,
+        cleanup: &Cleanup,
+        replies: &mut ReplyCache,
+        verb: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        super::dispatch(open, CANONICAL, set, cleanup, replies, verb, body)
+    }
+
+    fn diagnostic(verb: &str) -> Result<String, String> {
+        super::diagnostic(CANONICAL, verb)
+    }
+
+    fn handle(
+        set: &Mutex<TabSet>,
+        cleanup: &Cleanup,
+        verb: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        super::handle(CANONICAL, set, cleanup, verb, body)
+    }
     #[test]
     fn diagnostic_lane_has_no_protected_controls() {
         for verb in [
@@ -909,5 +1019,96 @@ mod tests {
             .is_err()
         );
         assert!(parse_args("term.snapshot", &" ".repeat(8193)).is_err());
+    }
+
+    /// D1: the wire namespace follows the frontend name, the handlers do not.
+    /// `canonical_verb` answers Some(canonical) for a verb this frontend
+    /// serves, and None for a namespace it must not answer.
+    fn routed(service: &str, verb: &str) -> Option<String> {
+        canonical_verb(service, verb).map(|v| v.into_owned())
+    }
+
+    #[test]
+    fn a_service_prefix_is_rewritten_to_the_canonical_one() {
+        assert_eq!(routed("bterm", "bterm.tab.new").as_deref(), Some("term.tab.new"));
+        assert_eq!(routed("bterm", "bterm.pane.split").as_deref(), Some("term.pane.split"));
+        // Prefixless verbs pass through, whichever name we serve under.
+        for service in ["term", "bterm"] {
+            assert_eq!(routed(service, "INFO").as_deref(), Some("INFO"));
+            assert_eq!(routed(service, "HELP").as_deref(), Some("HELP"));
+        }
+        // Serving as `term` is the identity, so the iced frontend pays
+        // nothing for bterm existing.
+        assert_eq!(routed("term", "term.tabs").as_deref(), Some("term.tabs"));
+    }
+
+    /// A caller talking to bterm must not reach a handler by sending the
+    /// OTHER frontend's namespace: `term.tab.new` at bterm is an unknown
+    /// verb, not a hidden alias. Both names routing to the same instance is
+    /// exactly the collision D1 exists to prevent.
+    #[test]
+    fn the_other_frontends_namespace_is_not_an_alias() {
+        assert_eq!(routed("bterm", "term.tab.new"), None);
+        // …and that is rejected at the argument boundary, because a verb only
+        // reaches a handler after parse_args accepts it. The guard here is
+        // that nothing REWRITES it into the served namespace.
+        assert_eq!(routed("bterm", "termite.tab.new"), None);
+        assert_eq!(routed("bterm", "bterm").as_deref(), Some("bterm"));
+    }
+
+    /// The whole D1 point, end to end through the real dispatch: a bterm
+    /// frontend answers `bterm.*` and does NOT answer `term.*`. If it
+    /// answered both, the two frontends would still collide on every verb a
+    /// mesh caller sends to the name `term`, which is exactly what the rename
+    /// exists to prevent — and the A/B in T5 would be measuring one terminal
+    /// wearing two hats.
+    #[test]
+    fn bterm_serves_its_own_namespace_and_refuses_terms() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP bterm namespace test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let mut replies = ReplyCache::default();
+        let mut call = |service: &str, verb: &str| {
+            super::dispatch(true, service, &set, &cleanup, &mut replies, verb, "")
+        };
+        assert!(call("bterm", "bterm.tabs").is_ok());
+        assert_eq!(
+            call("bterm", "term.tabs").unwrap_err(),
+            "unknown verb; use HELP",
+            "bterm must not answer the iced frontend's namespace"
+        );
+        // …and the mirror image, so the guard is not one-sided: the iced
+        // frontend answers `term.*` and not `bterm.*`.
+        assert!(call("term", "term.tabs").is_ok());
+        assert_eq!(call("term", "bterm.tabs").unwrap_err(), "unknown verb; use HELP");
+        // HELP is prefixless, so it answers under either name — and names
+        // the verbs that name's callers can actually send.
+        assert!(call("bterm", "HELP").unwrap().contains("bterm.tab.new"));
+        assert!(call("term", "HELP").unwrap().contains("term.tab.new"));
+        drop(cleanup);
+        let _ = worker.join();
+    }
+
+    /// HELP advertises verb names a caller can actually send. The loop is the
+    /// point: it fails if a future HELP edit spells a verb in a way the
+    /// rewrite misses, rather than shipping an unroutable name in the docs
+    /// every agent reads first.
+    #[test]
+    fn help_renames_every_verb() {
+        let rendered = help("bterm");
+        for (at, _) in rendered.match_indices("term.") {
+            assert!(
+                at > 0 && rendered.as_bytes()[at - 1] == b'b',
+                "HELP still advertises a bare `term.` verb at byte {at}: {:?}",
+                &rendered[at.saturating_sub(40)..(at + 20).min(rendered.len())]
+            );
+        }
+        assert!(rendered.contains("bterm.tab.new"));
+        assert!(rendered.starts_with("bterm: "));
+        // Serving as `term` renders the canonical text unchanged.
+        assert_eq!(help(CANONICAL), HELP);
     }
 }

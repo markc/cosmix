@@ -1091,6 +1091,7 @@ fn p0i_10_real_tcp_fallback_is_control_free() {
     let (notify, receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(notify);
     let service = crate::bus::start_at(
+        crate::bus::CANONICAL,
         fixture.tabs.clone(),
         fixture.cleanup.clone(),
         receiver,
@@ -1233,7 +1234,13 @@ fn p0i_10_parent_bootstrap_outage_has_only_diagnostic_lane() {
     let (notify, receiver) = tokio::sync::mpsc::unbounded_channel();
     drop(notify);
     let diagnostic =
-        crate::bus::start_at(tabs.clone(), cleanup.clone(), receiver, broker.url.clone());
+        crate::bus::start_at(
+            crate::bus::CANONICAL,
+            tabs.clone(),
+            cleanup.clone(),
+            receiver,
+            broker.url.clone(),
+        );
     runtime().block_on(async {
         let owner = verified(&broker).await;
         assert!(

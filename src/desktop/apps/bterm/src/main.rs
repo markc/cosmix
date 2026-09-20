@@ -6,7 +6,9 @@ mod input_tests;
 mod layout_tests;
 mod mouse_input;
 
-use cosmix_term_core::{bus, config, native_session, panes, raster, session_fd, tabs};
+use cosmix_term_core::{
+    bus, config, native_session, panes, raster, session_fd, tabs, version::version_request,
+};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -217,16 +219,37 @@ fn app_port_plugins(identity: &AppIdentity, noded_url: String) -> (BusBridgePlug
     )
 }
 
+/// The Bus name this frontend serves under, and the prefix of its verb
+/// namespace (D1, TODO-term 2026-09-21). The Bevy frontend is `bterm`; the
+/// global name `term` belongs to the iced+wgpu one, so the two can run at
+/// once — which is what T5's A/B weight comparison requires.
+/// `cosmix_term_core::bus` takes this as a parameter and hardcodes neither.
+const SERVICE: &str = "bterm";
+
 fn main() {
+    // `--version` first, before the inherited-fd quarantine, the config read,
+    // the Wayland check and every other thing below: Mark's contract
+    // (2026-09-21) is that a version query does NOTHING except report the
+    // version and the build hash. It must answer identically whether or not a
+    // bterm is already running, and whether or not there is a display to open
+    // — `bterm --version` over ssh with no WAYLAND_DISPLAY used to be an
+    // `exit(1)` with "term requires a native Wayland session".
+    if let Some(text) = version_request(
+        &std::env::args().collect::<Vec<_>>(),
+        cosmix_buildinfo::build_info!(),
+    ) {
+        println!("{text}");
+        return;
+    }
     session_fd::quarantine_inherited();
     let identity = AppIdentity {
-        slug: "term",
-        display_name: "CosMix Term",
+        slug: SERVICE,
+        display_name: "CosMix BTerm",
     };
     assert!(identity.validate().is_ok());
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "CosMix Term: tabbed Wayland Mix terminal\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--print-config: print resolved startup settings and exit\nBus: the global `term` name is diagnostic discovery only; protected controls use the allocated native-session route"
+            "CosMix BTerm: tabbed Wayland Mix terminal (Bevy frontend)\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--version: print version and build hash, and nothing else\n--print-config: print resolved startup settings and exit\nBus: serves `{SERVICE}` / `{SERVICE}.*`; the global name `term` belongs to the iced frontend"
         );
         return;
     }
@@ -282,7 +305,7 @@ fn main() {
         .map(|value| value != "0")
         .unwrap_or(true);
     let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
-    let bus = bus::start(terminal.clone(), cleanup.clone(), notify_rx);
+    let bus = bus::start(SERVICE, terminal.clone(), cleanup.clone(), notify_rx);
     // Display-only hints for CTK's accelerator column; keyboard() dispatches keys.
     let keymap = Keymap {
         defaults: [
