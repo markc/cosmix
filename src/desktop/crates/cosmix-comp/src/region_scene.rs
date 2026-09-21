@@ -45,15 +45,24 @@ impl RegionBridge {
     }
     pub(crate) fn clean(&self, id: u64) -> bool {
         let s = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let selected_survives = s
+            .view
+            .outputs
+            .iter()
+            .any(|o| s.view.selected.as_ref() == Some(&o.name));
         s.view.id == id
             && !s.view.active
             && s.clean_revision.is_some()
+            // No remaining output means no presentation proof. A selected
+            // result must then expire as Busy, never succeed vacuously.
+            && !s.view.outputs.is_empty()
             && s.view
                 .outputs
                 .iter()
                 // A selected rectangle is captured from this output only. A
                 // sleeping unrelated monitor must not hold its reply hostage.
-                .filter(|o| s.view.selected.as_ref().is_none_or(|name| *name == o.name))
+                // If it disappeared, require all surviving overlay outputs.
+                .filter(|o| !selected_survives || s.view.selected.as_ref() == Some(&o.name))
                 .all(|o| s.clean_outputs.contains(&o.name))
     }
     pub(crate) fn presented(&self, output: &str, generation: u64, revision: Option<u64>) {
@@ -213,6 +222,60 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn region_removed_selected_output_requires_surviving_frames() {
+        let bridge = RegionBridge::default();
+        let output = |name: &str| OutputGeometry {
+            name: name.into(),
+            source_id: crate::backend::CaptureSourceId::Nested {
+                output_name: name.into(),
+            },
+            bounds: crate::occlusion::Bounds::new(0., 0., 320., 240.),
+            scale: 1.,
+            scale_y: 1.,
+            generation: 1,
+            transform: smithay::utils::Transform::Normal,
+        };
+        // poll_region_selection keeps the selection name but rewrites outputs
+        // to the surviving ready outputs when the selected connector disappears.
+        bridge.set(View {
+            id: 11,
+            active: false,
+            selected: Some("Unplugged".into()),
+            outputs: vec![output("Survivor-1"), output("Survivor-2")],
+            ..Default::default()
+        });
+        let revision = test_remove_frame(&bridge);
+        assert!(!bridge.clean(11), "empty selected subset is not proof");
+        bridge.presented("Survivor-1", 1, Some(revision - 1));
+        bridge.presented("Survivor-2", 2, Some(revision));
+        assert!(
+            !bridge.clean(11),
+            "stale frames and wrong generations do not count"
+        );
+        bridge.presented("Survivor-1", 1, Some(revision));
+        assert!(!bridge.clean(11), "every survivor must retire its overlay");
+        bridge.presented("Survivor-2", 1, Some(revision));
+        assert!(bridge.clean(11));
+    }
+
+    #[test]
+    fn region_no_surviving_outputs_is_not_clean() {
+        let bridge = RegionBridge::default();
+        bridge.set(View {
+            id: 12,
+            active: false,
+            selected: Some("Unplugged".into()),
+            ..Default::default()
+        });
+        let revision = test_remove_frame(&bridge);
+        bridge.presented("Unplugged", 1, Some(revision));
+        assert!(
+            !bridge.clean(12),
+            "no output means no presentation evidence"
+        );
+    }
+
     #[test]
     fn region_clean_frame_only_requires_selected_output() {
         let bridge = RegionBridge::default();

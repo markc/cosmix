@@ -260,16 +260,20 @@ end
 -- both arms). Subtract the output's own origin, and round: window geometry is
 -- f32, and under fractional scaling a `100.5` is rejected outright by the
 -- capture app's integer-only region parser.
-fn output_origin($name)
+-- comp.windows.list reports `output` as the PROPS SLUG (`o_hdmi_a_1`), not the
+-- connector name (`HDMI-A-1`) -- and the outputs props tree is keyed by that
+-- same slug, with the real name in the entry. Look up by key and read the name
+-- back out: matching the slug against `.name` never hits, which broke every
+-- window screenshot in the first cut of this fix (round-2 review 2026-09-21).
+-- capture.screenshot and comp.region.select both want the connector NAME.
+fn output_of_slug($slug)
+  if $slug == "" then return nil end
   $outs = rpc($COMP, "comp.props.get", {path: "outputs"})
   if $outs == nil or type($outs) != "map" then return nil end
-  for each $key in keys($outs)
-    $o = $outs[$key]
-    if type($o) == "map" and to_string($o.name ?? "") == $name then
-      return $o
-    end
-  end
-  return nil
+  $o = $outs[$slug]
+  if $o == nil or type($o) != "map" then return nil end
+  if to_string($o.name ?? "") == "" then return nil end
+  return $o
 end
 
 fn shoot_window()
@@ -278,16 +282,17 @@ fn shoot_window()
     set_status("No focused window to capture", "err")
     return nil
   end
-  $name = to_string($w.output ?? "")
-  if $name == "" then
+  $slug = to_string($w.output ?? "")
+  if $slug == "" then
     set_status("Focused window is on no output", "err")
     return nil
   end
-  $out = output_origin($name)
+  $out = output_of_slug($slug)
   if $out == nil then
-    set_status("Output " .. $name .. " has no geometry", "err")
+    set_status("Output " .. $slug .. " has no geometry", "err")
     return nil
   end
+  $name = to_string($out.name)
   $x = round(to_number($w.x) - to_number($out.x))
   $y = round(to_number($w.y) - to_number($out.y))
   $rw = round(to_number($w.width))

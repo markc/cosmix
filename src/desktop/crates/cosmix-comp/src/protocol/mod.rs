@@ -3710,6 +3710,13 @@ impl ProtocolServer {
                     let resumed = matches!(&event, KmsTopologyLifecycleEvent::Resume(_));
                     let previous_kms_outputs = state.backend.kms_registered_outputs();
                     if pause {
+                        // Pause retires output generations. Latch that specific
+                        // cause before generic input-authority cleanup tries Busy.
+                        #[cfg(feature = "bus")]
+                        state.finish_region_selection(crate::port::ControlReply::Refused {
+                            error: "output_changed",
+                            detail: serde_json::json!({}),
+                        });
                         let kms_captures = state
                             .capture_frames
                             .iter()

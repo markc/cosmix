@@ -98,6 +98,71 @@ fn region_normalise_rejects_coordinates_beyond_i32() {
 }
 
 #[test]
+fn region_touch_device_removal_aborts_pointer_drag() {
+    let mut h = KeybindingHarness::new(true);
+    h.server
+        .state
+        .handle_host_input(HostInput::TouchDeviceAdded);
+    let mut rx = begin(&mut h);
+    motion(&mut h, 20., 20.);
+    button(&mut h, 0x110, HostButtonState::Pressed);
+    motion(&mut h, 80., 80.);
+    assert!(h.server.state.region.suspended);
+    h.server
+        .state
+        .handle_host_input(HostInput::TouchDeviceRemoved);
+    assert_eq!(rx.try_recv().unwrap(), ControlReply::Busy);
+    assert!(!h.server.state.region.suspended);
+    let mut next = begin(&mut h);
+    assert!(
+        next.try_recv().is_err(),
+        "device loss must clear held input"
+    );
+    assert!(h.server.state.region.suspended);
+}
+
+#[test]
+fn region_cancel_and_timeout_need_no_presentation() {
+    for started_drag in [false, true] {
+        for timeout in [false, true] {
+            let mut h = KeybindingHarness::new(true);
+            let mut rx = begin(&mut h);
+            if started_drag {
+                motion(&mut h, 20., 20.);
+                button(&mut h, 0x110, HostButtonState::Pressed);
+                motion(&mut h, 80., 80.);
+            }
+            if timeout {
+                h.server
+                    .state
+                    .poll_region_selection(Instant::now() + Duration::from_secs(31));
+            } else {
+                h.server.state.handle_host_input(HostInput::Key {
+                    keycode: Keycode::new(9),
+                    state: HostButtonState::Pressed,
+                    time: 1,
+                });
+            }
+            // No output has submitted anything, including the selected output
+            // in the started-drag case. This is stronger than a sleeping peer.
+            assert_eq!(
+                body(&mut rx)["status"],
+                if timeout { "timeout" } else { "cancelled" }
+            );
+            assert!(!h.server.state.region.suspended);
+            let bridge = h.server.state.region.bridge.as_ref().unwrap();
+            assert!(!bridge.clean(1), "reply must not depend on removal proof");
+            // Removal is still published, and later cleanup cannot reply twice.
+            clean_frame(&mut h);
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ));
+        }
+    }
+}
+
+#[test]
 fn region_focus_loss_after_cancel_drains_held_keys_and_buttons() {
     for event in [
         HostInput::KeyboardFocusLost,
@@ -199,6 +264,10 @@ fn region_reply_deadline_is_timeout_plus_three_seconds() {
         tx,
         admitted,
     );
+    motion(&mut h, 20., 20.);
+    button(&mut h, 0x110, HostButtonState::Pressed);
+    motion(&mut h, 80., 80.);
+    button(&mut h, 0x110, HostButtonState::Released);
     h.server
         .state
         .poll_region_selection(admitted + Duration::from_millis(57_999));
@@ -277,7 +346,7 @@ fn region_escape_and_right_button_cancel_and_swallow_release_tails() {
         } else {
             button(&mut h, 0x111, HostButtonState::Pressed);
         }
-        clean_frame(&mut h);
+        // No frame is submitted: cancellation must reply immediately.
         assert_eq!(
             body(&mut rx),
             serde_json::json!({"version":1,"status":"cancelled","reason":if escape {"escape"}else{"right_button"}})
@@ -306,8 +375,6 @@ fn region_timeout_and_disappeared_waiter_restore_seat() {
         .state
         .poll_region_selection(Instant::now() + Duration::from_secs(31));
     assert!(!h.server.state.region.suspended);
-    assert!(rx.try_recv().is_err());
-    clean_frame(&mut h);
     assert_eq!(body(&mut rx)["status"], "timeout");
     let rx = begin(&mut h);
     drop(rx);
@@ -323,11 +390,6 @@ fn region_output_geometry_change_refuses_and_restores_seat() {
     let mut rx = begin(&mut h);
     h.server.state.resize_output(800, 600);
     h.server.state.poll_region_selection(Instant::now());
-    assert!(
-        rx.try_recv().is_err(),
-        "output errors also wait for overlay removal"
-    );
-    clean_frame(&mut h);
     assert!(matches!(
         rx.try_recv().unwrap(),
         ControlReply::Refused {
@@ -342,6 +404,10 @@ fn region_output_geometry_change_refuses_and_restores_seat() {
 fn region_no_clean_frame_never_reports_success() {
     let mut h = KeybindingHarness::new(true);
     let mut rx = begin(&mut h);
+    motion(&mut h, 20., 20.);
+    button(&mut h, 0x110, HostButtonState::Pressed);
+    motion(&mut h, 80., 80.);
+    button(&mut h, 0x110, HostButtonState::Released);
     h.server
         .state
         .poll_region_selection(Instant::now() + Duration::from_secs(34));
@@ -429,15 +495,15 @@ fn region_kms_generation_loss_cancels_in_flight_selection() {
     let mut rx = begin(&mut h);
     assert!(h.server.state.region.suspended);
     submit_kms_security_lifecycle(&mut h, KmsTopologyLifecycleEvent::Pause);
-    h.server.state.poll_region_selection(Instant::now());
-    clean_frame(&mut h);
-    assert!(matches!(
+    // The lifecycle itself must latch the specific reason before generic
+    // authority-loss cleanup. No later poll or clean frame should be needed.
+    assert_eq!(
         rx.try_recv().unwrap(),
         ControlReply::Refused {
             error: "output_changed",
-            ..
+            detail: serde_json::json!({}),
         }
-    ));
+    );
     assert!(!h.server.state.region.suspended);
 }
 

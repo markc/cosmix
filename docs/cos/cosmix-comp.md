@@ -435,7 +435,10 @@ to physical pixels. Cancellation returns
 timeout returns `{"version":1,"status":"timeout"}`. These are rc 0 outcomes.
 Successful completion waits for a submitted frame without the overlay on the
 selected output; an unrelated sleeping monitor does not delay that reply.
-Cancellation/timeout before an output is chosen still waits on all candidate outputs.
+If the selected output disappears during cleanup, all surviving overlay outputs
+must submit clean frames; no surviving output means success cannot be proven.
+Cancellation, timeout and refusal restore focus and publish overlay removal, then
+reply without waiting for presentation: they do not authorise a capture.
 Failure to prove removal within the margin returns rc 10 `busy`, never success.
 
 A second selector, an existing pointer/popup grab, touch sequence, native panel
@@ -447,6 +450,8 @@ Session lock returns `locked`. These are lifecycle/correctness rules, not caller
 permissions. Temporary seat focus does not deactivate or restack fullscreen windows.
 Pointer constraints are released for selection and reconsidered on focus restoration.
 VT/focus/device loss and a closed local responder clean up input ownership.
+Touchscreen removal aborts even a pointer-driven selection with `busy`; KMS
+session pause reports `output_changed` before generic input-loss cleanup.
 Remote caller disappearance is bounded by the deadline; immediate remote request
 cancellation is not currently propagated to the local responder.
 

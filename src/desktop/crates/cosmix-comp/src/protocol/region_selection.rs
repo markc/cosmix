@@ -226,6 +226,11 @@ impl WaylandState {
         }
         if !self.region_outputs_current() {
             self.finish_region_selection(refused("output_changed"));
+            // An undecided run has now replied with the refusal. Only an
+            // already-selected result remains to wait for removal evidence.
+            if self.region.run.is_none() {
+                return;
+            }
             let current = self.backend.occlusion_outputs();
             if let Some(run) = &mut self.region.run {
                 // Removed/inactive outputs cannot submit another frame. Require
@@ -278,10 +283,17 @@ impl WaylandState {
         if run.result.is_some() {
             return;
         }
+        let needs_clean_frame = matches!(&result,
+            ControlReply::Body(body) if body["status"] == "selected");
         run.result = Some(result);
         run.view.active = false;
         self.publish_region_view();
         self.restore_region_focus();
+        if !needs_clean_frame {
+            // Only a selected rectangle authorises capture. Other replies need
+            // focus restored and removal published, not presentation evidence.
+            self.complete_region_selection(None);
+        }
     }
 
     pub(super) fn abandon_region_input(&mut self) {
