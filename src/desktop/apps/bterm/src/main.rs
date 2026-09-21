@@ -1348,7 +1348,10 @@ fn refresh(
             // detection and the render world re-uploads the WHOLE image
             // (bevy_render texture/gpu_image.rs). Damage bounds what the CPU
             // paints, not what the GPU is handed — cutting the second one is
-            // its own piece of work, and this counter is what would show it.
+            // its own piece of work, and `uploads` would NOT show it landing:
+            // it counts frames that mutated the asset, not bytes transferred,
+            // so a move to band-sized uploads leaves this number identical.
+            // Measuring that needs an instrument that does not exist yet.
             stats.raster_paint.add(converted - started);
             stats.uploads += 1;
         } else {
