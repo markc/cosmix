@@ -47,8 +47,13 @@
 -- bound the whole resolution, not each probe within it: two wedged frontends
 -- at a flat 3s cost 6s per call, which is how a 20s wait loop was measured
 -- overrunning to ~25s.
+-- Name order is TODO-term D10 (Mark, 2026-09-21): prefer `bterm`, the tabbed
+-- verb-complete frontend, over `term`, which since T2 is an iced skeleton.
+-- Flip back at T6 together with `cosmix-mix`'s TERM_FRONTENDS and
+-- `cosmix-mcp`'s TERM_SERVICES — three lists, one rule, and T6a exists to
+-- make them one list.
 fn resolve_term_service($deadline)
-  for $name in ["term", "bterm"]
+  for $name in ["bterm", "term"]
     $left = $deadline - time()
     if $left <= 0 then return "" end
     if $left > 3 then $left = 3 end

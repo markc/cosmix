@@ -348,9 +348,19 @@ struct TermPaneParams {
 /// `term`, so the Bevy frontend was renamed and now registers as `bterm` and
 /// serves `bterm.*`; `term` / `term.*` is reserved for the incoming iced+wgpu
 /// one. T5's A/B needs both running at once, so these tools RESOLVE the live
-/// frontend instead of hardcoding a name, and prefer `term` — the default —
-/// when both are up.
-const TERM_SERVICES: [&str; 2] = ["term", "bterm"];
+/// frontend instead of hardcoding a name.
+///
+/// **`bterm` is preferred while both are up** (D10, Mark 2026-09-21). It was
+/// `term` on the reasoning that the new frontend is "the default" — true of
+/// the NAME, not yet of the thing holding it: since T2 that is a skeleton
+/// that draws a grid and answers no verbs, so preferring it would point every
+/// MCP term tool at the frontend least able to serve one the moment it starts
+/// registering a partial `term.*`. D6 says bterm stays the default until full
+/// verb parity (T6) plus a month of daily driving, and this list is one of
+/// three places that sentence has to be true — with `cosmix-mix`'s
+/// TERM_FRONTENDS and `scripts/term-desktop.mix`. Flip all three at T6, and
+/// see TODO-term T6a, which exists to make them one list.
+const TERM_SERVICES: [&str; 2] = ["bterm", "term"];
 
 /// How long a frontend gets to answer the liveness probe.
 ///
@@ -2922,14 +2932,19 @@ mod tests {
         use super::*;
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Both up (the T5 A/B case): the default frontend is tried first, and
-        // the other REMAINS a candidate — dropping it here is what would put
-        // the wedged-`term` hang back.
+        // Both up (the T5 A/B case): the PREFERRED frontend is tried first,
+        // and the other REMAINS a candidate — dropping it here is what would
+        // put the wedged-frontend hang back.
+        //
+        // Preferred is `bterm` until T6 (D10). This assertion is what holds
+        // that: if it failed because you reordered TERM_SERVICES, the test is
+        // doing its job — preferring the iced frontend is a decision that
+        // belongs with verb parity, not a tidy-up.
         assert_eq!(
             registered_term_services(&names(&["noded", "bterm", "term"])),
-            ["term", "bterm"]
+            ["bterm", "term"]
         );
-        // Only the iced/default one.
+        // Only the iced one.
         assert_eq!(registered_term_services(&names(&["noded", "term"])), ["term"]);
         // Only the Bevy one — today's state after the rename, before the
         // iced frontend ships.
