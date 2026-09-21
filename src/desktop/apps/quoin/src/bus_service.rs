@@ -581,9 +581,17 @@ fn dispatch_shell_request(
     // which made `send "shell" shell.panel.pin edge="right"` from a plain
     // `mix -c` fail with `UnregisteredCaller` — locking out the agentless
     // one-shot, which is the sovereign control path, while the panel citizen
-    // beside it worked fine. That is a "who may" gate by the law's own test,
-    // and it protected nothing: a caller already on the local Bus can signal
-    // this process directly.
+    // beside it worked fine. That is a "who may" gate by the law's own test.
+    //
+    // It also protected nothing, though NOT for the reason first recorded
+    // here. "Anyone on the local Bus could signal this process anyway" is
+    // false — the ingress socket is world read-write, so a different-uid or
+    // kill-sandboxed caller can reach the Bus without being able to signal
+    // anything. The true reason is that the check was lexical: it tested the
+    // SHAPE of `from`, and same-node registration is itself ungated, so
+    // anything that wanted to pass it registered a two-character name and
+    // did. See `ctk::app_control::verify_caller_provenance` for the full
+    // argument.
     //
     // CROSS-COMPONENT TRUST DEPENDENCY, unchanged and still load-bearing:
     // what remains is only as strong as noded's guarantee to strip
@@ -901,13 +909,48 @@ mod tests {
             "shell.panel.toggle",
             "shell.panel.unpin",
         ] {
-            let (rc, body, _) = dispatch_shell_request(
+            let (rc, body, command_out) = dispatch_shell_request(
                 &unregistered(command),
                 &frame,
                 std::time::Duration::ZERO,
             );
             assert_eq!(rc, 0, "{command} refused an unregistered local caller: {body}");
+            // rc alone is not acceptance. A regression that answered
+            // `(0, accepted, None)` for anonymous callers specifically would
+            // report success and do nothing, which is the shape a gate tends
+            // to fail into.
+            assert!(
+                command_out.is_some(),
+                "{command} returned rc=0 but enqueued no shell command"
+            );
         }
+
+        // The OTHER two relaxed sites. Each has its own `verify_caller_provenance`
+        // call ahead of the shared one, so reverting either ALONE would restore
+        // half the defect with every other test in both crates still green.
+        let (rc, body, command_out) = dispatch_shell_request(
+            &unregistered("shell.quit"),
+            &frame,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(rc, 0, "shell.quit refused an unregistered local caller: {body}");
+        assert_eq!(command_out.map(|c| c.kind), Some(ShellCommandKind::Quit));
+
+        let mut resize = unregistered("shell.panel.resize");
+        resize.body = r#"{"edge":"left","thickness_px":240}"#.into();
+        let (rc, body, command_out) =
+            dispatch_shell_request(&resize, &frame, std::time::Duration::ZERO);
+        assert_eq!(
+            rc, 0,
+            "shell.panel.resize refused an unregistered local caller: {body}"
+        );
+        assert_eq!(
+            command_out.map(|c| c.kind),
+            Some(ShellCommandKind::ResizeCommit {
+                edge: cosmix_shell::core::Edge::Left,
+                thickness_px: 240.0
+            })
+        );
 
         // Correctness checks are NOT authorization and must still refuse: a
         // bad edge is a malformed operation whoever sends it.
@@ -1015,8 +1058,14 @@ mod tests {
         request
     }
 
+    /// Renamed 2026-09-21: the refusal below is a MISSING BROKER STAMP, not a
+    /// missing registration. `request()` builds a frame with no
+    /// `broker_origin` at all, so it fails provenance — which is what it
+    /// always actually tested; the old name
+    /// (`…_require_local_registration`) described a check that no longer
+    /// exists on this path.
     #[test]
-    fn read_surface_is_open_but_semantic_verbs_require_local_registration() {
+    fn read_surface_is_open_but_semantic_verbs_require_a_broker_stamped_origin() {
         let frame = test_frame();
         assert_eq!(
             dispatch_shell_request(&request("shell.ping"), &frame, Default::default()).0,
@@ -1032,8 +1081,12 @@ mod tests {
         );
     }
 
+    /// Renamed 2026-09-21 for the same reason as its neighbour: what this
+    /// pins is that a corner verb behaves exactly like the panel verb it
+    /// delegates to, under a broker-stamped caller. Registration stopped
+    /// being part of the contract.
     #[test]
-    fn corner_actions_share_panel_semantics_and_require_registered_callers() {
+    fn corner_actions_share_panel_semantics_under_a_stamped_caller() {
         let frame = test_frame();
         for (corner, edge) in [
             ("top-left", "left"),

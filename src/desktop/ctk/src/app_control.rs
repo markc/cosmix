@@ -109,18 +109,38 @@ pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCalle
 /// test — "does this gate exist to stop an agent doing something wrong, or
 /// only to make someone vouch for it?":
 ///
-/// - a client that spells its own `source_peer` / `permissions` /
-///   `signed_ident` is still refused, because the broker owns those and a
-///   request carrying a self-asserted one cannot be adjudicated at all;
-/// - a request with no broker-stamped origin, or more than one, is still
-///   refused, for the same reason. Absence fails closed.
+/// - on the LOCAL lane, a client that spells its own `source_peer` /
+///   `permissions` / `signed_ident` is refused, because the broker owns those
+///   and a request carrying a self-asserted one cannot be adjudicated at all;
+/// - a request with no broker-stamped origin, or more than one, is refused,
+///   for the same reason. Absence fails closed.
 ///
-/// What goes is [`is_bus_service_name`] on `request.from`. For a verb an
-/// agent must be able to drive from a one-shot `mix -c 'send "shell" …'`,
-/// that check buys nothing: the caller is already on the local Bus, and
-/// anything that can open the local Bus can already signal the process it is
-/// talking to. It only made the unregistered one-shot — the sovereign
-/// agentless control path — the one caller that could not drive the app.
+/// Note the mesh lane returns before that identity check, so a
+/// broker-stamped `broker_origin: mesh` frame carrying a `signed_ident` is
+/// admitted. That is this module's deliberate pre-existing behaviour — mesh
+/// membership needs no principal attestation — and nothing downstream grants
+/// authority from the header; it is called out here because the bullet above
+/// reads like an unconditional promise and is not one.
+///
+/// What goes is [`is_bus_service_name`] on `request.from`.
+///
+/// **Why that costs nothing, stated carefully** — the obvious argument, that
+/// anyone on the local Bus could signal the process anyway, is FALSE and
+/// should not be reused: the local ingress socket is deliberately world
+/// read-write, so a different-uid or `kill`-sandboxed process can reach the
+/// Bus and cannot signal anything. The real argument is that the check was
+/// **lexical, not authenticated**: [`is_bus_service_name`] tests the SHAPE of
+/// `request.from`, and same-node `noded.register` is itself ungated, so any
+/// local process that wanted to pass this gate registered a two-character
+/// name and passed it. It discriminated "bothered to register" from "did
+/// not" — never "is allowed to" — while duplicating, weakly, a question the
+/// broker already answers authoritatively from `SO_PEERCRED` and which this
+/// gate never read. Removing it is privilege-neutral, and the verbs it
+/// guarded were already reachable by anyone who could open the socket.
+///
+/// What it did accomplish was making the unregistered one-shot — the
+/// sovereign agentless control path, and the only thing an agent with no
+/// keyboard has — the single caller that could not drive the app.
 pub fn verify_caller_provenance(request: &InboundRequest) -> Result<(), LocalCallerError> {
     authorize_with_mesh_policy(
         request,
@@ -1196,6 +1216,57 @@ mod tests {
         assert_eq!(
             authorize_with_mesh_policy(&mesh, false, false),
             Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
+
+        // An origin that is neither "local" nor "mesh" fails closed, in any
+        // casing. Both lanes match the value EXACTLY while matching the key
+        // case-insensitively, so this is the one refusal shape where a
+        // "tidy-up" to case-insensitive values would go unnoticed.
+        for value in ["remote", "MESH", "Local", ""] {
+            let mut odd = unregistered.clone();
+            odd.headers.insert("broker_origin".into(), value.into());
+            assert_eq!(
+                authorize_with_mesh_policy(&odd, true, false),
+                Err(LocalCallerError::RemoteIdentityUnavailable),
+                "broker_origin={value:?} must fail closed"
+            );
+        }
+
+        // The identity-header check is case-insensitive on the KEY. Making it
+        // case-sensitive is a plausible refactor and would silently admit a
+        // self-asserted header.
+        let mut shouty = unregistered.clone();
+        shouty.headers.insert("SIGNED_IDENT".into(), "i-said-so".into());
+        assert_eq!(
+            authorize_with_mesh_policy(&shouty, true, false),
+            Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
+    }
+
+    /// The public wrapper is the thing quoin actually calls, and its whole
+    /// contribution is passing `false`. Nothing in this crate pinned that:
+    /// flipping it back to `true` — a one-word copy-paste regression —
+    /// re-broke the defect while every CTK test stayed green, because the
+    /// test above drives the private helper directly. Only a quoin test
+    /// caught it, one crate away.
+    #[test]
+    fn the_public_wrapper_admits_an_unregistered_local_caller() {
+        let mut unregistered = request("shell.panel.pin", &[]);
+        unregistered.from.clear();
+        assert_eq!(verify_caller_provenance(&unregistered), Ok(()));
+        // And it is still a gate: the same caller with a self-asserted
+        // identity header is refused through the public entry point too.
+        let mut spoofed = unregistered.clone();
+        spoofed.headers.insert("signed_ident".into(), "i-said-so".into());
+        assert_eq!(
+            verify_caller_provenance(&spoofed),
+            Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
+        // The sibling that KEEPS the name check must still refuse it, or the
+        // two functions have collapsed into one.
+        assert_eq!(
+            authorize_local_caller(&unregistered),
+            Err(LocalCallerError::UnregisteredCaller)
         );
     }
 
