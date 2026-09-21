@@ -137,6 +137,18 @@ struct PaneView {
     rows: u16,
     rendered: bool,
     active: bool,
+    /// What `Raster::paint` remembers about THIS pane's texture between
+    /// frames: grid shape, cell size, the buffer's identity, and the cursor
+    /// cell it last inverted. All four decide whether the next paint may be
+    /// damage-bounded, and all four were bookkept here by hand until
+    /// term-core 0.3.0 — including the two that are easy to get wrong, the
+    /// row the cursor LEFT (our own inversion, which the grid never reports
+    /// as damage) and a shape change that byte length cannot see, 96x25 and
+    /// 80x30 being the same 2400 cells and the same number of bytes.
+    ///
+    /// It is per-target by construction: panes share one glyph cache through
+    /// `Painter` and must not share damage bookkeeping.
+    paint: raster::PaintState,
 }
 
 // VERIFY: precedence — the only font override resolution, reused at every scale.
@@ -249,7 +261,7 @@ fn main() {
     assert!(identity.validate().is_ok());
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "CosMix BTerm: tabbed Wayland Mix terminal (Bevy frontend)\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\n--version: print version and build hash, and nothing else\n--print-config: print resolved startup settings and exit\nBus: serves `{SERVICE}` / `{SERVICE}.*`; the global name `term` belongs to the iced frontend"
+            "CosMix BTerm: tabbed Wayland Mix terminal (Bevy frontend)\nFont: TERM_SPIKE_FONT=/path/to/font.ttf\nTERM_RASTER_TRACE=1: one stderr line per damaged frame — rows painted, full or partial, and what it cost\n--version: print version and build hash, and nothing else\n--print-config: print resolved startup settings and exit\nBus: serves `{SERVICE}` / `{SERVICE}.*`; the global name `term` belongs to the iced frontend"
         );
         return;
     }
@@ -975,6 +987,7 @@ fn spawn_pane_tree(
                 rows: 24,
                 rendered: false,
                 active: false,
+                paint: raster::PaintState::default(),
             });
             container
         }
@@ -1091,6 +1104,22 @@ fn sync_panes(
     }
 }
 
+/// `TERM_RASTER_TRACE=1`: one stderr line per damaged frame with the rows
+/// painted, whether the repaint was full, and what it cost.
+///
+/// It exists because the damage-rect work was easy to *assume* effective and
+/// the process-level CPU says nothing about it either way — under a scrolling
+/// stream every row is dirty and the rect saves nothing, while a
+/// carriage-returned line is one row in twenty-three. This is how that
+/// distinction is observed rather than argued about. Read once: a per-frame
+/// `env::var_os` walks the environment.
+fn raster_trace() -> &'static bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| {
+        std::env::var_os("TERM_RASTER_TRACE").is_some_and(|value| value != "0")
+    })
+}
+
 /// Layout resolves and rounds each border in physical pixels independently.
 fn pane_interior(computed: &ComputedNode) -> Vec2 {
     let border = computed.border();
@@ -1202,37 +1231,94 @@ fn refresh(
             continue;
         }
         // VERIFY: per-leaf render — all visible leaves consume their own damage.
-        let mut screen = terminal.screen(true);
+        // `grid_snapshot` is `screen(true)` plus the dirty-row flags, so the
+        // raster repaints the rows that changed instead of every glyph on the
+        // grid; `switched` (first frame, focus change, rebuilt Raster) still
+        // forces the lot.
+        let snapshot = terminal.grid_snapshot();
+        let mut screen = snapshot.screen;
+        let dirty = snapshot.dirty_rows;
+        // Masking the cursor by focus is a change to what gets painted, and
+        // the row it vacates is our own inversion rather than grid damage —
+        // `paint` re-marks the row its own recorded cursor was on, so both
+        // halves of a focus change are covered without bookkeeping here.
         screen.cursor_visible &= active;
         pane.active = active;
-        pane.rendered = true;
-        let rgba = painter.render(&screen);
-        let converted = Instant::now();
-        terminal
-            .stats
-            .lock()
-            .unwrap()
-            .vt_rgba
-            .add(converted - screen.updated);
-        let width = screen.cols as u32 * painter.width;
-        let height = screen.rows as u32 * painter.height;
+        // One source of truth for the target's extent. The part a hand-rolled
+        // `rows * cell_height` gets wrong is the clamp to the whole cell rows
+        // the screen actually has cells for, and it fails quietly: `paint`
+        // refuses a buffer it cannot fill, writes nothing, and the frame is
+        // blank.
+        let (width, height) = painter.target_size(&screen);
+        let stride = width as usize * 4;
+        let bytes = stride * height as usize;
         if let Some(mut image) = images.get_mut(&pane.image) {
-            let mut next = Image::new(
-                Extent3d {
+            // Mutate the texture the pane already owns. Building a fresh
+            // `Image` per damaged frame threw away a full-frame buffer (~12 MB
+            // at 2.5x scale) every time, and a stream damages at up to 60 fps.
+            if image.texture_descriptor.size.width != width
+                || image.texture_descriptor.size.height != height
+            {
+                image.texture_descriptor.size = Extent3d {
                     width,
                     height,
                     depth_or_array_layers: 1,
-                },
-                TextureDimension::D2,
-                rgba,
-                TextureFormat::Rgba8UnormSrgb,
-                RenderAssetUsages::default(),
-            );
-            next.sampler = ImageSampler::nearest();
-            *image = next;
+                };
+            }
+            let rgba = image.data.get_or_insert_with(Vec::new);
+            // `paint` never resizes a buffer it does not own, so sizing it is
+            // this caller's job — and a buffer that moves or changes length
+            // loses the identity the state recorded, which is what makes the
+            // paint after a resize a full one without being told.
+            if rgba.len() != bytes {
+                rgba.clear();
+                rgba.resize(bytes, 0);
+            }
+            // `switched` is a first frame, a focus change, or a Raster rebuilt
+            // at a new scale. The last of those the state catches by itself
+            // (the cell size is part of what it compares); the others are the
+            // caller's knowledge, and this is the call that hands it over.
+            if switched {
+                pane.paint.invalidate();
+            }
+            let started = Instant::now();
+            // The bands borrow the state, so the sum ends the borrow on this
+            // statement — everything below wants `pane` back.
+            let painted_px: u32 = painter
+                .paint(&screen, rgba, stride, &mut pane.paint, &dirty)
+                .iter()
+                .map(|band| band.height)
+                .sum();
+            let converted = Instant::now();
+            // A refusal is not reported as an error: `paint` invalidates its
+            // state and writes nothing. We sized the buffer from `target_size`
+            // immediately above, so a refusal here means those two disagree.
+            // Either way the texture holds pixels nothing wrote, and leaving
+            // `rendered` false is what makes the next frame repaint it whole
+            // rather than trust it.
+            let rows = painted_px / painter.height.max(1);
+            let total = height / painter.height.max(1);
+            let refused = pane.paint.grid() == (0, 0) && total > 0;
+            if *raster_trace() {
+                eprintln!(
+                    "RASTER rows={rows}/{total} full={} refused={refused} paint={:?}",
+                    rows == total,
+                    converted - started
+                );
+            }
+            pane.rendered = !refused;
             let mut stats = terminal.stats.lock().unwrap();
-            stats.rgba_upload.add(converted.elapsed());
+            stats.vt_rgba.add(converted - screen.updated);
+            // The raster now writes straight into the asset's own buffer, so
+            // there is no separate convert-then-upload step left to time; the
+            // rasterisation itself is what this frame cost the main thread.
+            stats.raster_paint.add(converted - started);
             stats.uploads += 1;
+        } else {
+            // No asset to paint into, and `grid_snapshot` has already consumed
+            // the damage that said which rows changed. Those rows are gone, so
+            // the pane owes a full repaint whenever its texture comes back.
+            pane.rendered = false;
         }
         let node_w = px(width as f32 / painter.scale);
         let node_h = px(height as f32 / painter.scale);

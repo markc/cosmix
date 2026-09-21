@@ -174,6 +174,55 @@ fn layout_app() -> App {
     app
 }
 
+/// D5 (TODO-term, 2026-09-21): a repaint MUTATES the pane's texture; it does
+/// not build a new one.
+///
+/// `refresh` used to construct a fresh `Image` for every damaged frame and
+/// assign it over the asset — a full-frame RGBA buffer (~7 MB at this display's
+/// 2.5x scale, 99x23 grid) allocated, filled and dropped at up to 60 fps while
+/// a pane streams. The observable difference is the address of the asset's own
+/// pixel buffer: the old path allocated the replacement BEFORE dropping the
+/// original, so the two could never share an address.
+#[test]
+fn a_repaint_mutates_the_pane_texture_in_place() {
+    let mut app = layout_app();
+    app.insert_resource(NotifyTx(None));
+    app.update();
+    assert_synced(&app);
+    let handle = app.world().resource::<View>().pane_views[0].image.clone();
+    let (address, len, size) = {
+        let images = app.world().resource::<Assets<Image>>();
+        let image = images.get(&handle).unwrap();
+        let data = image.data.as_ref().expect("a rendered pane owns its pixels");
+        (data.as_ptr(), data.len(), image.texture_descriptor.size)
+    };
+    assert!(
+        len > 4,
+        "the 1x1 placeholder was never replaced by a real frame"
+    );
+    // Force a repaint without changing the geometry. Clearing `rendered` is one
+    // of the three inputs to `switched`, alongside a focus change and a Raster
+    // rebuild, and it is the one a test can set without moving the geometry.
+    app.world_mut().resource_mut::<View>().pane_views[0].rendered = false;
+    app.update();
+    let images = app.world().resource::<Assets<Image>>();
+    let image = images.get(&handle).unwrap();
+    let data = image.data.as_ref().unwrap();
+    assert_eq!(
+        data.as_ptr(),
+        address,
+        "the pane's frame buffer was reallocated — the texture is being rebuilt \
+         per frame rather than mutated in place"
+    );
+    assert_eq!(data.len(), len);
+    assert_eq!(image.texture_descriptor.size, size);
+    // The descriptor and the buffer must agree by the time the render world
+    // extracts the asset, or `write_texture` reads past the end of the data.
+    assert_eq!(data.len(), (size.width * size.height * 4) as usize);
+    let removed = app.world().resource::<Core>().0.lock().unwrap().shutdown();
+    app.world().resource::<Core>().1.submit(removed);
+}
+
 fn assert_synced(app: &App) {
     let view = app.world().resource::<View>();
     let tabs = app.world().resource::<Core>().0.lock().unwrap();
