@@ -10,7 +10,7 @@ use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
     ShellSemanticVerb, semantic_shell_command,
 };
-use ctk::app_control::authorize_local_caller;
+use ctk::app_control::verify_caller_provenance;
 use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, InboundRequest};
 use serde_json::{Value, json};
 
@@ -498,10 +498,11 @@ fn dispatch_shell_request(
         );
     }
     if request.command == "shell.quit" {
-        if let Err(error) = authorize_local_caller(request) {
+        if let Err(error) = verify_caller_provenance(request) {
             return (
                 10,
-                json!({"error":format!("local registered caller required: {error:?}")}).to_string(),
+                json!({"error":format!("caller provenance could not be established: {error:?}")})
+                    .to_string(),
                 None,
             );
         }
@@ -516,10 +517,11 @@ fn dispatch_shell_request(
         );
     }
     if request.command == "shell.panel.resize" {
-        if let Err(error) = authorize_local_caller(request) {
+        if let Err(error) = verify_caller_provenance(request) {
             return (
                 10,
-                json!({"error":format!("local registered caller required: {error:?}")}).to_string(),
+                json!({"error":format!("caller provenance could not be established: {error:?}")})
+                    .to_string(),
                 None,
             );
         }
@@ -572,15 +574,31 @@ fn dispatch_shell_request(
             None,
         );
     };
-    // The mutation gate. CROSS-COMPONENT TRUST DEPENDENCY: this authorization
-    // is only as strong as noded's guarantee to strip client-supplied
-    // `broker_origin`/identity headers and restamp them from connection
-    // state. Mesh membership admits every verb; local callers must have a
-    // registered service identity. The broker owns the provenance stamp.
-    if let Err(error) = authorize_local_caller(request) {
+    // The PROVENANCE gate — no longer a "who may" one (TODO-cos, filed
+    // 2026-09-20; full-mesh-access law, 2026-09-15).
+    //
+    // It used to require local callers to hold a registered service identity,
+    // which made `send "shell" shell.panel.pin edge="right"` from a plain
+    // `mix -c` fail with `UnregisteredCaller` — locking out the agentless
+    // one-shot, which is the sovereign control path, while the panel citizen
+    // beside it worked fine. That is a "who may" gate by the law's own test,
+    // and it protected nothing: a caller already on the local Bus can signal
+    // this process directly.
+    //
+    // CROSS-COMPONENT TRUST DEPENDENCY, unchanged and still load-bearing:
+    // what remains is only as strong as noded's guarantee to strip
+    // client-supplied `broker_origin`/identity headers and restamp them from
+    // connection state. A self-asserted `source_peer`/`permissions`/
+    // `signed_ident`, a missing stamp, or a duplicated one is still refused,
+    // because each says the stamp cannot be trusted — not that the caller is
+    // the wrong one. Absence fails closed. The correctness checks below (edge
+    // valid, page id known on that edge) are what decide whether the
+    // operation is well formed and aimed correctly, and they stay.
+    if let Err(error) = verify_caller_provenance(request) {
         return (
             10,
-            json!({"error":format!("local registered caller required: {error:?}")}).to_string(),
+            json!({"error":format!("caller provenance could not be established: {error:?}")})
+                .to_string(),
             None,
         );
     }
@@ -664,7 +682,7 @@ fn parse_args(request: &InboundRequest) -> Option<Value> {
 ///
 /// Deliberately not a header-stripping change in the transport: `InboundRequest`
 /// hands the app the wire verbatim on purpose (`broker_origin` and
-/// `signed_ident` are read straight off it by [`authorize_local_caller`]), so
+/// `signed_ident` are read straight off it by [`verify_caller_provenance`]), so
 /// the rule belongs at the one place that maps headers to caller arguments.
 const WIRE_OWNED_HEADERS: &[&str] = &[
     "bus",
@@ -854,6 +872,63 @@ mod tests {
         assert_eq!(
             dispatch_shell_request(&request, &frame, std::time::Duration::ZERO).0,
             0
+        );
+    }
+
+    /// The filed defect (TODO-cos, 2026-09-20): `send "shell"
+    /// shell.panel.pin edge="right"` from a plain `mix -c` answered
+    /// `local registered caller required: UnregisteredCaller`, so the
+    /// agentless one-shot — the sovereign control path — was the one caller
+    /// that could not drive the panel, while the registered panel citizen
+    /// beside it worked.
+    ///
+    /// `local()` alone does not exercise this: its `from` is `"peer"`, which
+    /// IS a well-formed Bus service name and passed the old check. The caller
+    /// that failed is one with no registered name at all.
+    #[test]
+    fn an_unregistered_local_one_shot_can_drive_the_panel_verbs() {
+        let frame = test_frame();
+        let unregistered = |command: &str| {
+            let mut request = local(command);
+            request.from.clear();
+            request
+        };
+
+        for command in [
+            "shell.panel.pin",
+            "shell.panel.show",
+            "shell.panel.hide",
+            "shell.panel.toggle",
+            "shell.panel.unpin",
+        ] {
+            let (rc, body, _) = dispatch_shell_request(
+                &unregistered(command),
+                &frame,
+                std::time::Duration::ZERO,
+            );
+            assert_eq!(rc, 0, "{command} refused an unregistered local caller: {body}");
+        }
+
+        // Correctness checks are NOT authorization and must still refuse: a
+        // bad edge is a malformed operation whoever sends it.
+        let mut bad_edge = unregistered("shell.panel.pin");
+        bad_edge.body = r#"{"edge":"sideways"}"#.into();
+        assert_eq!(
+            dispatch_shell_request(&bad_edge, &frame, std::time::Duration::ZERO).0,
+            10,
+            "an invalid edge must still be refused"
+        );
+
+        // And provenance still fails closed for the same caller: a
+        // self-asserted identity header is the broker's to stamp.
+        let mut spoofed = unregistered("shell.panel.pin");
+        spoofed
+            .headers
+            .insert("signed_ident".into(), "i-said-so".into());
+        assert_eq!(
+            dispatch_shell_request(&spoofed, &frame, std::time::Duration::ZERO).0,
+            10,
+            "a self-asserted signed_ident must still be refused"
         );
     }
 

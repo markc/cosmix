@@ -96,12 +96,43 @@ pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCalle
     authorize_with_mesh_policy(
         request,
         std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0"),
+        true,
+    )
+}
+
+/// Accept any caller whose PROVENANCE the broker vouches for — registered or
+/// not.
+///
+/// This is [`authorize_local_caller`] minus the single check that asks *who*
+/// the caller is. Everything it keeps is a correctness check rather than an
+/// authorization one, and the distinction is the full-mesh-access law's own
+/// test — "does this gate exist to stop an agent doing something wrong, or
+/// only to make someone vouch for it?":
+///
+/// - a client that spells its own `source_peer` / `permissions` /
+///   `signed_ident` is still refused, because the broker owns those and a
+///   request carrying a self-asserted one cannot be adjudicated at all;
+/// - a request with no broker-stamped origin, or more than one, is still
+///   refused, for the same reason. Absence fails closed.
+///
+/// What goes is [`is_bus_service_name`] on `request.from`. For a verb an
+/// agent must be able to drive from a one-shot `mix -c 'send "shell" …'`,
+/// that check buys nothing: the caller is already on the local Bus, and
+/// anything that can open the local Bus can already signal the process it is
+/// talking to. It only made the unregistered one-shot — the sovereign
+/// agentless control path — the one caller that could not drive the app.
+pub fn verify_caller_provenance(request: &InboundRequest) -> Result<(), LocalCallerError> {
+    authorize_with_mesh_policy(
+        request,
+        std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0"),
+        false,
     )
 }
 
 fn authorize_with_mesh_policy(
     request: &InboundRequest,
     mesh_open: bool,
+    require_registered_name: bool,
 ) -> Result<(), LocalCallerError> {
     let mut origins = request
         .headers
@@ -127,7 +158,7 @@ fn authorize_with_mesh_policy(
     if origins.next() != Some("local") || origins.next().is_some() {
         return Err(LocalCallerError::RemoteIdentityUnavailable);
     }
-    if !is_bus_service_name(&request.from) {
+    if require_registered_name && !is_bus_service_name(&request.from) {
         return Err(LocalCallerError::UnregisteredCaller);
     }
     Ok(())
@@ -1096,19 +1127,76 @@ mod tests {
         let mut mesh = local.clone();
         mesh.from.clear();
         mesh.headers.insert("broker_origin".into(), "mesh".into());
-        assert_eq!(authorize_with_mesh_policy(&mesh, true), Ok(()));
+        assert_eq!(authorize_with_mesh_policy(&mesh, true, true), Ok(()));
         assert_eq!(
-            authorize_with_mesh_policy(&mesh, false),
+            authorize_with_mesh_policy(&mesh, false, true),
             Err(LocalCallerError::RemoteIdentityUnavailable)
         );
         for open in [false, true] {
-            assert_eq!(authorize_with_mesh_policy(&local, open), Ok(()));
+            assert_eq!(authorize_with_mesh_policy(&local, open, true), Ok(()));
             let mut duplicate = mesh.clone();
             duplicate
                 .headers
                 .insert("BROKER_ORIGIN".into(), "mesh".into());
-            assert!(authorize_with_mesh_policy(&duplicate, open).is_err());
+            assert!(authorize_with_mesh_policy(&duplicate, open, true).is_err());
         }
+    }
+
+    /// The full-mesh-access law's test, applied to one flag: dropping the
+    /// registered-name requirement must drop the "who are you" check AND
+    /// NOTHING ELSE. Every provenance refusal has to survive, because those
+    /// say the broker's stamp cannot be trusted — not that the caller is the
+    /// wrong one.
+    #[test]
+    fn provenance_only_admission_drops_the_name_check_and_keeps_every_other_refusal() {
+        // The case the whole change exists for: an unregistered local
+        // one-shot, which `mix -c 'send "shell" …'` is.
+        let mut unregistered = request("shell.panel.pin", &[]);
+        unregistered.from.clear();
+        assert_eq!(
+            authorize_with_mesh_policy(&unregistered, true, true),
+            Err(LocalCallerError::UnregisteredCaller),
+            "precondition: this is what the law calls a who-may gate"
+        );
+        assert_eq!(
+            authorize_with_mesh_policy(&unregistered, true, false),
+            Ok(()),
+            "provenance-only admission must accept the agentless one-shot"
+        );
+
+        // A self-asserted identity header is still refused: the broker owns
+        // those, so a request carrying its own cannot be adjudicated at all.
+        for header in ["source_peer", "permissions", "signed_ident"] {
+            let mut spoofed = unregistered.clone();
+            spoofed.headers.insert(header.into(), "whatever".into());
+            assert_eq!(
+                authorize_with_mesh_policy(&spoofed, true, false),
+                Err(LocalCallerError::RemoteIdentityUnavailable),
+                "{header} is broker-owned and must still be refused"
+            );
+        }
+
+        // No origin stamp, and a duplicated one, both still fail closed.
+        let mut unstamped = unregistered.clone();
+        unstamped.headers.remove("broker_origin");
+        assert_eq!(
+            authorize_with_mesh_policy(&unstamped, true, false),
+            Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
+        let mut duplicate = unregistered.clone();
+        duplicate
+            .headers
+            .insert("BROKER_ORIGIN".into(), "local".into());
+        assert!(authorize_with_mesh_policy(&duplicate, true, false).is_err());
+
+        // And the mesh lane is untouched in both directions.
+        let mut mesh = unregistered.clone();
+        mesh.headers.insert("broker_origin".into(), "mesh".into());
+        assert_eq!(authorize_with_mesh_policy(&mesh, true, false), Ok(()));
+        assert_eq!(
+            authorize_with_mesh_policy(&mesh, false, false),
+            Err(LocalCallerError::RemoteIdentityUnavailable)
+        );
     }
 
     #[test]
