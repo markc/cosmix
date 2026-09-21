@@ -39,20 +39,6 @@ naga27 = { package = "naga", version = "27", default-features = false, features 
 
 [dev-dependencies]
 iced_runtime = { version = "=0.14.0", default-features = false }
-# The lib's own tests need a RENDERER BACKEND. `default = []` plus
-# `iced_renderer { default-features = false }` leaves iced_renderer with neither
-# `wgpu` nor `tiny-skia`, so its `Renderer` degrades to the fallback over `()`
-# and every widget bound fails with "the trait bound `(): iced_core::text::
-# Renderer` is not satisfied" -- 8 errors, lib test only. The workspace BUILD
-# never saw it because another crate selects `wgpu` and feature unification
-# carried it; `cargo test -p cosmix-iced-widgets` gets no such help, so the
-# crate's tests have been unbuildable on their own.
-# Declared as a DEV-dependency on purpose: it feeds this crate's test target
-# without adding a backend to the production feature graph, which is tuned
-# around the naga 27 / codespan-reporting conflict documented above and in
-# apps/term. tiny-skia rather than wgpu for the same reason -- it is CPU-only
-# and never reaches naga at all.
-iced_renderer = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "geometry"] }
 
 [[example]]
 name = "gallery"
