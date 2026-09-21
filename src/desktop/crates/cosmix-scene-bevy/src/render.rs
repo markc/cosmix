@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 use super::SceneStore;
 
 mod icons;
+#[cfg(test)]
+mod layout_tests;
 use icons::IconCache;
 
 #[derive(Resource)]
