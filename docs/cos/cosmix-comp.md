@@ -497,7 +497,7 @@ surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 generation}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid,workspace,
+               window_x,window_y,window_width,window_height,visible,pid,workspace,
                presentation.{presented,discarded,last_presented_us,
                  interval_p50_us,interval_p99_us,interval_max_us,
                  commit_to_present_p50_us,commit_to_present_p99_us,
@@ -533,9 +533,15 @@ sequence watermark across every topic, and `port.lost_count` is cumulative.
 `retrying`. `port.reply_timeouts` and `port.publish_timeouts` count their
 separate bounded lanes; both abandon a sink wait after two seconds.
 
-Window rows add five read-only leaves. `generation` is the window's role
-generation (below). `window_x`/`window_y` are the window-geometry origin; `x`/`y`
-stay the buffer origin, which includes any client-side shadow. `visible` is
+Window rows add seven read-only leaves. `generation` is the window's role
+generation (below). `window_x`/`window_y` are the window-geometry origin and
+`window_width`/`window_height` its extent, all in logical pixels. Use all four
+for window screenshots that exclude client-side shadow margins. `x`/`y` remain
+the buffer origin and `width`/`height` the buffer extent, including those margins.
+Without explicit client geometry, all four `window_*` fields use the effective
+committed surface-tree bounds, including mapped subsurfaces; shadow margins
+cannot then be distinguished. If no geometry is cached, the fallback is the
+root buffer with zero geometry offset and its full extent. `visible` is
 effective on-screen visibility: use it to ask "is this on screen", and
 `minimized` for the user's minimise state. `pid` is the process id of the
 client's socket peer, or null when the compositor cannot read it. A client

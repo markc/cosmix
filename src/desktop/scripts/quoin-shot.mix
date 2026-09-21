@@ -293,10 +293,21 @@ fn shoot_window()
     return nil
   end
   $name = to_string($out.name)
-  $x = round(to_number($w.x) - to_number($out.x))
-  $y = round(to_number($w.y) - to_number($out.y))
-  $rw = round(to_number($w.width))
-  $rh = round(to_number($w.height))
+  -- x/y/width/height are the BUFFER rectangle, which includes the client's
+  -- transparent CSD shadow margin -- a window shot taken from them has fat
+  -- translucent borders. window_x/window_y/window_width/window_height are the
+  -- window-geometry rectangle, i.e. what the user calls "the window" (Mark's
+  -- call 2026-09-21: no shadow). comp publishes the extent as of 0.63.3; fall
+  -- back to the buffer rectangle against an older comp rather than capturing
+  -- nothing, since a shadowed shot beats no shot.
+  $gx = $w.window_x ?? $w.x
+  $gy = $w.window_y ?? $w.y
+  $gw = $w.window_width ?? $w.width
+  $gh = $w.window_height ?? $w.height
+  $x = round(to_number($gx) - to_number($out.x))
+  $y = round(to_number($gy) - to_number($out.y))
+  $rw = round(to_number($gw))
+  $rh = round(to_number($gh))
   -- Clip to the output; a window straddling two monitors or hanging off the
   -- left/top edge otherwise produces a region comp will refuse.
   if $x < 0 then

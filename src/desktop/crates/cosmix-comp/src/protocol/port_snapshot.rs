@@ -193,6 +193,8 @@ pub(crate) struct SurfaceSnapshot {
 pub(crate) struct WindowExtras {
     pub(crate) window_x: f32,
     pub(crate) window_y: f32,
+    pub(crate) window_width: f32,
+    pub(crate) window_height: f32,
     pub(crate) pid: Option<u64>,
     pub(crate) workspace: u32,
 }
@@ -252,6 +254,8 @@ pub(crate) struct WindowSnapshot {
     pub(crate) generation: u64,
     pub(crate) window_x: f32,
     pub(crate) window_y: f32,
+    pub(crate) window_width: f32,
+    pub(crate) window_height: f32,
     pub(crate) visible: bool,
     pub(crate) pid: Option<u64>,
     /// The window's 1-based workspace (writable; a move never switches).
@@ -633,8 +637,28 @@ macro_rules! window_snapshot {
 }
 
 window_snapshot!(
-    id, foreign_id, title, app_id, x, y, width, height, focused, maximized, fullscreen, minimized,
-    output, band, generation, window_x, window_y, visible, pid, workspace,
+    id,
+    foreign_id,
+    title,
+    app_id,
+    x,
+    y,
+    width,
+    height,
+    focused,
+    maximized,
+    fullscreen,
+    minimized,
+    output,
+    band,
+    generation,
+    window_x,
+    window_y,
+    window_width,
+    window_height,
+    visible,
+    pid,
+    workspace,
 );
 flat_snapshot!(FocusWindowSnapshot, id, generation);
 
@@ -911,6 +935,15 @@ fn project_surface_row(
         }),
         _ => None,
     };
+    // Use the same committed effective geometry that positions window_origin.
+    // Without explicit xdg geometry it contains the committed surface-tree
+    // bounds (including mapped subsurfaces). If no geometry is cached, the
+    // origin uses zero offset and the matching extent is the full root buffer.
+    let (window_width, window_height) = record
+        .committed_window_geometry
+        .map_or((record.layout.width, record.layout.height), |geometry| {
+            (geometry.width, geometry.height)
+        });
     SurfaceSnapshot {
         occlusion: crate::occlusion::Props {
             occluded: state.occlusion.is_occluded(record.id),
@@ -969,6 +1002,8 @@ fn project_surface_row(
         window: WindowExtras {
             window_x: record.window_origin.0,
             window_y: record.window_origin.1,
+            window_width,
+            window_height,
             // Only rows that become windows pay for the credentials lookup.
             pid: (record.mapped && matches!(record.role, SurfaceRole::Toplevel(_)))
                 .then(|| {
@@ -1005,6 +1040,8 @@ pub(super) fn project_window_row(surface: &SurfaceSnapshot) -> WindowSnapshot {
         generation: surface.generation,
         window_x: surface.window.window_x,
         window_y: surface.window.window_y,
+        window_width: surface.window.window_width,
+        window_height: surface.window.window_height,
         visible: surface.visible,
         pid: surface.window.pid,
         workspace: surface.window.workspace,
@@ -1898,13 +1935,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("width")],
         Number,
-        "Toplevel width",
+        "Toplevel buffer width, CSD shadow included; window_width is the window-geometry extent",
         format = "logical_px"
     ),
     descriptor!(
         &[L("windows"), S, L("height")],
         Number,
-        "Toplevel height",
+        "Toplevel buffer height, CSD shadow included; window_height is the window-geometry extent",
         format = "logical_px"
     ),
     descriptor!(
@@ -1955,6 +1992,18 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         &[L("windows"), S, L("window_y")],
         Number,
         "Window-geometry y origin",
+        format = "logical_px"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("window_width")],
+        Number,
+        "Window-geometry width, excluding CSD shadow when the client sets geometry (width/height are the buffer extent, shadow included); without explicit geometry, uses committed surface-tree bounds like window_x/window_y, or the root buffer if no geometry is cached",
+        format = "logical_px"
+    ),
+    descriptor!(
+        &[L("windows"), S, L("window_height")],
+        Number,
+        "Window-geometry height, excluding CSD shadow when the client sets geometry (width/height are the buffer extent, shadow included); without explicit geometry, uses committed surface-tree bounds like window_x/window_y, or the root buffer if no geometry is cached",
         format = "logical_px"
     ),
     descriptor!(
@@ -2966,6 +3015,8 @@ mod tests {
             window: WindowExtras {
                 window_x: 52.0,
                 window_y: 72.0,
+                window_width: 776.0,
+                window_height: 576.0,
                 pid: Some(4242),
                 workspace: 1,
             },
@@ -3033,6 +3084,8 @@ mod tests {
                 generation: toplevel.generation,
                 window_x: toplevel.window.window_x,
                 window_y: toplevel.window.window_y,
+                window_width: toplevel.window.window_width,
+                window_height: toplevel.window.window_height,
                 visible: toplevel.visible,
                 pid: toplevel.window.pid,
                 workspace: toplevel.window.workspace,

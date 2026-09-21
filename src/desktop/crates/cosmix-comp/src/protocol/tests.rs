@@ -17053,6 +17053,22 @@ fn unset_window_geometry_tracks_the_committed_subsurface_tree_bounds() {
             height: 32.0,
         }
     );
+    #[cfg(feature = "bus")]
+    {
+        let record = test_toplevel_record(&harness);
+        let surface = port_snapshot::project_surface_by_id(&harness.server.state, record.id, &[])
+            .expect("surface row");
+        let row = port_snapshot::project_window_row(&surface);
+        assert_eq!((row.window_width, row.window_height), (450.0, 32.0));
+        assert_eq!(
+            (row.window_x, row.window_y),
+            (row.x + geometry.x, row.y + geometry.y)
+        );
+        assert!(
+            row.window_width > row.width,
+            "implicit bounds include the subsurface"
+        );
+    }
 }
 
 #[test]
@@ -17397,7 +17413,113 @@ fn bufferless_window_geometry_commit_publishes_surface_and_window_x_changes() {
         BTreeSet::from([
             format!("surfaces.s{surface_id}.x"),
             format!("windows.s{surface_id}.x"),
+            format!("windows.s{surface_id}.window_width"),
+            format!("windows.s{surface_id}.window_height"),
         ])
+    );
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn window_geometry_props_exclude_csd_margins_in_reads_and_diffs() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let id = test_toplevel_record(&harness).id.0;
+    let key = format!("s{id}");
+    let context = harness.server.state.port_context.clone().unwrap();
+    let before = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let before_row = &before.windows[&key];
+    assert_eq!(
+        (before_row.window_x, before_row.window_y),
+        (before_row.x, before_row.y)
+    );
+    assert_eq!(
+        (before_row.window_width, before_row.window_height),
+        (before_row.width, before_row.height)
+    );
+
+    let watch = ingress.request_watch().unwrap();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    drop(watch);
+    drain_observations(&observations);
+    send_request(
+        &mut harness.client,
+        TEST_XDG_SURFACE_ID,
+        3,
+        &words(&[4, 6, 20, 18]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    port_observation::service_observations(&mut harness.server.state);
+    let changes = drain_observations(&observations);
+    for (leaf, old, new) in [
+        ("window_width", before_row.width, 20.0),
+        ("window_height", before_row.height, 18.0),
+    ] {
+        let (got_old, got_new, _) = changed_leaf(&changes, &format!("windows.{key}.{leaf}"))
+            .expect("geometry-only commit publishes extent change");
+        assert_eq!((got_old, got_new), (json!(old), json!(new)));
+    }
+    let diff = port_snapshot::snapshot(&harness.server.state, &context).unwrap();
+    let read = port_snapshot::read_snapshot(
+        &harness.server.state,
+        &context,
+        &port_snapshot::ReadScopes::All,
+    )
+    .unwrap();
+    for snapshot in [&diff, &read] {
+        let row = &snapshot.windows[&key];
+        assert_eq!(
+            (row.width, row.height),
+            (before_row.width, before_row.height)
+        );
+        assert_eq!((row.window_x, row.window_y), (row.x + 4.0, row.y + 6.0));
+        assert_eq!((row.window_width, row.window_height), (20.0, 18.0));
+        assert!(row.window_x > row.x && row.window_y > row.y);
+        assert!(row.window_x + row.window_width < row.x + row.width);
+        assert!(row.window_y + row.window_height < row.y + row.height);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let read = Arc::new(read);
+    let (rc, body) = runtime.block_on(port_snapshot::dispatch_read(
+        read.clone(),
+        "comp.windows.list".into(),
+        json!({}),
+    ));
+    assert_eq!(rc, 0);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let row = body["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap();
+    for leaf in ["window_x", "window_y", "window_width", "window_height"] {
+        let (rc, value) = runtime.block_on(port_snapshot::dispatch_read(
+            read.clone(),
+            "comp.props.get".into(),
+            json!({"path":format!("windows.{key}.{leaf}")}),
+        ));
+        assert_eq!(rc, 0);
+        assert_eq!(serde_json::from_str::<Value>(&value).unwrap(), row[leaf]);
+        let (rc, descriptor) = runtime.block_on(port_snapshot::dispatch_read(
+            read.clone(),
+            "comp.props.describe".into(),
+            json!({"path":format!("windows.{key}.{leaf}")}),
+        ));
+        assert_eq!(rc, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&descriptor).unwrap()["format"],
+            "logical_px"
+        );
+    }
+    port_observation::service_observations(&mut harness.server.state);
+    assert!(
+        drain_observations(&observations).is_empty(),
+        "stable geometry must not republish"
     );
 }
 

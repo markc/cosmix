@@ -877,7 +877,7 @@ surfaces.s&lt;id&gt;.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 generation}
 windows.s&lt;id&gt;.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid,workspace,
+               window_x,window_y,window_width,window_height,visible,pid,workspace,
                presentation.{presented,discarded,last_presented_us,
                  interval_p50_us,interval_p99_us,interval_max_us,
                  commit_to_present_p50_us,commit_to_present_p99_us,
@@ -911,9 +911,15 @@ sequence watermark across every topic, and <code>port.lost_count</code> is cumul
 <code>port.broker</code> is driven by connection-state edges and is <code>connected</code> or
 <code>retrying</code>. <code>port.reply_timeouts</code> and <code>port.publish_timeouts</code> count their
 separate bounded lanes; both abandon a sink wait after two seconds.</p>
-<p>Window rows add five read-only leaves. <code>generation</code> is the window's role
-generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin; <code>x</code>/<code>y</code>
-stay the buffer origin, which includes any client-side shadow. <code>visible</code> is
+<p>Window rows add seven read-only leaves. <code>generation</code> is the window's role
+generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin and
+<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. Use all four
+for window screenshots that exclude client-side shadow margins. <code>x</code>/<code>y</code> remain
+the buffer origin and <code>width</code>/<code>height</code> the buffer extent, including those margins.
+Without explicit client geometry, all four <code>window_*</code> fields use the effective
+committed surface-tree bounds, including mapped subsurfaces; shadow margins
+cannot then be distinguished. If no geometry is cached, the fallback is the
+root buffer with zero geometry offset and its full extent. <code>visible</code> is
 effective on-screen visibility: use it to ask "is this on screen", and
 <code>minimized</code> for the user's minimise state. <code>pid</code> is the process id of the
 client's socket peer, or null when the compositor cannot read it. A client
