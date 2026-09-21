@@ -72,15 +72,62 @@ fn rpc($target, $verb, $payload)
   return $result
 end
 
+-- The shell answers a bad document with real DIAGNOSTICS (code, line, message).
+-- The first cut discarded them and returned 0, so a document rejected for one
+-- malformed node looked exactly like a document that loaded: the scene simply
+-- never appeared, with nothing said anywhere. That cost a VT2 run to find.
+-- Never swallow this reply.
 fn load_scene($doc)
   send $HOST shell.scene.load body=$doc timeout=5
-  if $rc != 0 then return 0 end
+  if $rc != 0 then
+    note("scene.load REFUSED rc=" .. $rc .. ": " .. substr(to_string($result), 0, 400))
+    return 0
+  end
   return 1
 end
 
-fn panel_verb($verb)
-  send $HOST $verb body=json_encode({edge: $EDGE}) timeout=3
+-- The shell's panel verbs take KEY=VALUE args (edge=, id=), not a JSON body --
+-- the first cut sent a body and every call was silently ineffective, so the
+-- scene loaded and was never revealed (found on the VT2 run, 2026-09-21; the
+-- unit tests and the nested gate could not have caught it).
+fn panel_verb($verb, $edge, $id)
+  if $id == nil then
+    send $HOST $verb edge=$edge timeout=3
+  else
+    send $HOST $verb edge=$edge id=$id timeout=3
+  end
   return $rc
+end
+
+-- Loading a document does NOT put it on screen: the edge has to be pointed at
+-- the page and then pinned. page.set races the host's next frame mounting the
+-- new page ("unknown page id"), so it is retried -- a bounded wait on the
+-- effect of our own command, not a poll of anyone's state. Same shape as
+-- quoin-panel's show_page, which is where this contract was learned.
+fn show_page($edge, $page)
+  $tries = 0
+  while $tries < 20
+    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then break end
+    $tries = $tries + 1
+    sleep(0.05)
+  end
+  panel_verb("shell.panel.pin", $edge, nil)
+  return 0
+end
+
+-- hide is a no-op while the edge is still pinned, and the unpin lands on the
+-- host's next frame, so re-issue the hide until the host reports it hidden.
+fn hide_edge($edge)
+  panel_verb("shell.panel.unpin", $edge, nil)
+  $tries = 0
+  while $tries < 20
+    panel_verb("shell.panel.hide", $edge, nil)
+    $vis = rpc($HOST, "shell.props.get", {path: "panels." .. $edge .. ".visible"})
+    if $vis == false then break end
+    $tries = $tries + 1
+    sleep(0.05)
+  end
+  return 0
 end
 
 -- ── the scene ───────────────────────────────────────────────────────────
@@ -131,7 +178,17 @@ fn shot_doc()
   for each $r in $state.recent
     push($rows, {id: $r.path, cells: [$r.name, $r.when]})
   end
-  push($nodes, ["recent", {widget: "list", rows: $rows, on_click: "recent", hidden_if_empty: true}])
+  -- A `list` REQUIRES `row` (the id of a template node) and `row_height`; the
+  -- template binds each row's cells with {cells[N]}. Without them the shell
+  -- refuses the whole document -- "missing required port row on l" -- so one
+  -- malformed node kept the entire panel off screen.
+  push($nodes, ["recent", {widget: "list", row: "rec_row", row_height: 40, gap: 4,
+    fill: true, on_click: "recent", rows: $rows, hidden_if_empty: true}])
+  push($nodes, ["rec_row", {widget: "row", height: 40, radius: 8, padding: 8, gap: 8,
+    align: "center", hover: $C.hover, children: ["rec_name", "rec_when"]}])
+  push($nodes, ["rec_name", {widget: "text", text: "{cells[0]}", size: 12,
+    color: $C.fg, fill: true}])
+  push($nodes, ["rec_when", {widget: "text", text: "{cells[1]}", size: 11, color: $C.faint}])
 
   return $p.document({scene: "1", name: "shot", citizen: $ME,
     window: {kind: "edge", edge: $EDGE, title: "Screenshot", w: 380, chrome: false}}, $nodes)
@@ -198,10 +255,10 @@ end
 -- comes back only once the capture has LANDED. Region mode hides before the
 -- selection too: the rubber band belongs over the desktop, not over this panel.
 fn with_panel_hidden($verb, $payload, $target)
-  panel_verb("shell.panel.hide")
+  hide_edge($EDGE)
   $reply = rpc($target, $verb, $payload)
   $landed = await_capture(path_of($reply), 20)
-  panel_verb("shell.panel.pin")
+  show_page($EDGE, "scene-shot")
   if not $landed then
     set_status("Capture did not land within 20s", "err")
     return nil
@@ -223,16 +280,16 @@ fn shoot_full()
 end
 
 fn shoot_region()
-  panel_verb("shell.panel.hide")
+  hide_edge($EDGE)
   $sel = rpc($COMP, "comp.region.select", {timeout_ms: $SELECT_TIMEOUT_MS})
   if $sel == nil then
-    panel_verb("shell.panel.pin")
+    show_page($EDGE, "scene-shot")
     set_status("comp.region.select did not answer", "err")
     return nil
   end
   $status = to_string($sel.status ?? "")
   if $status != "selected" then
-    panel_verb("shell.panel.pin")
+    show_page($EDGE, "scene-shot")
     if $status == "timeout" then
       set_status("Selection timed out", "dim")
     else
@@ -243,7 +300,7 @@ fn shoot_region()
   $shot = rpc($CAPTURE, "capture.screenshot",
     {output: $sel.output, region: $sel.region})
   $landed = await_capture(path_of($shot), 20)
-  panel_verb("shell.panel.pin")
+  show_page($EDGE, "scene-shot")
   if not $landed then
     set_status("Capture did not land within 20s", "err")
     return nil
@@ -347,11 +404,15 @@ end
 on shot desc "toggle the screenshot panel"
   reply(0, "")
   if $state.open then
+    hide_edge($EDGE)
     send $HOST shell.scene.unload body=json_encode({scene: "shot"}) timeout=3
     $state.open = false
   else
     $state.open = true
     render()
+    -- render() only LOADS the document; the edge still has to be pointed at
+    -- the page and pinned or nothing appears on screen.
+    show_page($EDGE, "scene-shot")
   end
 end
 
