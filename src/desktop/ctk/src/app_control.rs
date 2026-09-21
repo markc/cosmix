@@ -92,12 +92,22 @@ pub enum LocalCallerError {
 /// `broker_origin` is broker-owned: noded strips every client spelling and
 /// overwrites it from connection state on delivery. Absence fails closed, so
 /// CTK mutation requires the matching broker release.
+/// Is the mesh lane open? Default yes; `COSMIX_MESH_OPEN=0` is the opt-in
+/// lock, per the agentic-first law (the guard rail is a flag a human turns
+/// ON, never the shipped default).
+///
+/// ONE reader for both entry points, deliberately. Not deduplication for its
+/// own sake: a review round observed that hardwiring this expression to
+/// `true` in one wrapper survives every test, because pinning it needs
+/// process-global env mutation and that is racy in a parallel test binary.
+/// That residual is accepted rather than fixed — but with one copy there is
+/// one place to audit, instead of two that can silently disagree.
+fn mesh_open_from_env() -> bool {
+    std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0")
+}
+
 pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCallerError> {
-    authorize_with_mesh_policy(
-        request,
-        std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0"),
-        true,
-    )
+    authorize_with_mesh_policy(request, mesh_open_from_env(), true)
 }
 
 /// Accept any caller whose PROVENANCE the broker vouches for — registered or
@@ -142,11 +152,7 @@ pub fn authorize_local_caller(request: &InboundRequest) -> Result<(), LocalCalle
 /// sovereign agentless control path, and the only thing an agent with no
 /// keyboard has — the single caller that could not drive the app.
 pub fn verify_caller_provenance(request: &InboundRequest) -> Result<(), LocalCallerError> {
-    authorize_with_mesh_policy(
-        request,
-        std::env::var("COSMIX_MESH_OPEN").as_deref() != Ok("0"),
-        false,
-    )
+    authorize_with_mesh_policy(request, mesh_open_from_env(), false)
 }
 
 fn authorize_with_mesh_policy(
@@ -1234,13 +1240,19 @@ mod tests {
 
         // The identity-header check is case-insensitive on the KEY. Making it
         // case-sensitive is a plausible refactor and would silently admit a
-        // self-asserted header.
-        let mut shouty = unregistered.clone();
-        shouty.headers.insert("SIGNED_IDENT".into(), "i-said-so".into());
-        assert_eq!(
-            authorize_with_mesh_policy(&shouty, true, false),
-            Err(LocalCallerError::RemoteIdentityUnavailable)
-        );
+        // self-asserted header. Each header is asserted SEPARATELY: covering
+        // only one of the three lets a regression that loses
+        // case-insensitivity on just `source_peer` or just `permissions` pass
+        // every test.
+        for header in ["SOURCE_PEER", "Permissions", "SIGNED_IDENT"] {
+            let mut shouty = unregistered.clone();
+            shouty.headers.insert(header.into(), "i-said-so".into());
+            assert_eq!(
+                authorize_with_mesh_policy(&shouty, true, false),
+                Err(LocalCallerError::RemoteIdentityUnavailable),
+                "{header} must be refused whatever its casing"
+            );
+        }
     }
 
     /// The public wrapper is the thing quoin actually calls, and its whole

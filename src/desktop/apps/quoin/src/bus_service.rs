@@ -596,10 +596,13 @@ fn dispatch_shell_request(
     // CROSS-COMPONENT TRUST DEPENDENCY, unchanged and still load-bearing:
     // what remains is only as strong as noded's guarantee to strip
     // client-supplied `broker_origin`/identity headers and restamp them from
-    // connection state. A self-asserted `source_peer`/`permissions`/
-    // `signed_ident`, a missing stamp, or a duplicated one is still refused,
-    // because each says the stamp cannot be trusted — not that the caller is
-    // the wrong one. Absence fails closed. The correctness checks below (edge
+    // connection state. On the LOCAL lane a self-asserted
+    // `source_peer`/`permissions`/`signed_ident` is refused, as is a missing
+    // stamp or a duplicated one, because each says the stamp cannot be
+    // trusted — not that the caller is the wrong one. Absence fails closed.
+    // The MESH lane returns before that identity check, deliberately, so a
+    // mesh-stamped frame carrying `signed_ident` is admitted; nothing here
+    // grants authority from the header. The correctness checks below (edge
     // valid, page id known on that edge) are what decide whether the
     // operation is well formed and aimed correctly, and they stay.
     if let Err(error) = verify_caller_provenance(request) {
