@@ -11,7 +11,13 @@ license = "MIT"
 # features, for the example.
 [features]
 default = []
-wgpu = ["iced_renderer/wgpu", "iced_renderer/geometry"]
+# `naga27-termcolor` rides every path that reaches iced's wgpu renderer, here
+# as well as in `apps/term`: a gallery-plus-Bevy build that never selects the
+# terminal would otherwise hit the same naga 27 compile failure. `gallery-wgpu`
+# is covered because it enables `wgpu`.
+wgpu = ["iced_renderer/wgpu", "iced_renderer/geometry", "naga27-termcolor"]
+# See the `naga27` dependency below; not meant to be selected on its own.
+naga27-termcolor = ["dep:naga27"]
 tiny-skia = ["iced_renderer/tiny-skia", "iced_renderer/geometry"]
 gallery = ["dep:iced"]
 gallery-wgpu = ["gallery", "wgpu", "iced/wgpu"]
@@ -24,6 +30,12 @@ iced_graphics = { version = "=0.14.0", default-features = false, features = ["ge
 iced_renderer = { version = "=0.14.0", default-features = false }
 cosmix-design = { path = "../cosmix-design", default-features = false }
 iced = { version = "=0.14.0", default-features = false, optional = true, features = ["advanced", "canvas", "wayland", "thread-pool", "fira-sans"] }
+# NOT called from this crate — a feature-unification fix for sharing a cargo
+# graph with Bevy. Full reasoning in `apps/term/Cargo.toml`; in one line, naga
+# 27 chooses its diagnostic buffer type from its own `termcolor` feature, while
+# Bevy's naga_oil switches `codespan-reporting 0.12` to termcolor underneath
+# it, and the two must agree or naga 27 does not compile.
+naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
 
 [dev-dependencies]
 iced_runtime = { version = "=0.14.0", default-features = false }

@@ -247,14 +247,33 @@ impl Raster {
     }
     /// Whole-grid render into a fresh buffer.
     ///
-    /// Kept for the Bevy frontend, which uploads a whole image per frame.
-    /// Every call allocates `cols * rows * cell * 4` bytes; prefer
-    /// [`Raster::render_into`], which reuses one [`Surface`] and repaints only
-    /// the rows the grid reports dirty.
+    /// **No frontend uses this.** Both paint in place — bterm through
+    /// [`Raster::paint`] into its Bevy `Image`, the iced one through
+    /// [`Raster::render_into`] and a [`Surface`] — because every call here
+    /// allocates `cols * rows * cell * 4` bytes, ~12 MB at 2.5x scale, and a
+    /// streaming pane damages at up to 60 fps. It survives as the one-shot
+    /// form for tests and for a caller that genuinely wants a whole frame
+    /// once; reach for it in a render loop and you have reintroduced the
+    /// churn the damage model exists to remove.
     pub fn render(&mut self, screen: &Screen) -> Vec<u8> {
         let mut surface = Surface::default();
         let _ = self.render_into(screen, &[], &mut surface);
         std::mem::take(&mut surface.rgba)
+    }
+
+    /// Physical pixels a [`Raster::paint`] target must be able to hold for
+    /// `screen`, at this raster's cell size.
+    ///
+    /// **A caller that owns its own buffer sizes it from here**, never from
+    /// its own `cols * cell` arithmetic: the row count is clamped to the
+    /// whole rows the screen actually has cells for, and a caller that
+    /// reimplemented that clamp slightly differently would have its buffer
+    /// refused — or, worse, would drift from the painter one edit later. The
+    /// minimum stride is `width * 4`; the minimum length is
+    /// `stride * height`.
+    pub fn target_size(&self, screen: &Screen) -> (u32, u32) {
+        let (width, height, _) = target(self, screen);
+        (width as u32, height as u32)
     }
 
     /// Rasterise `screen` into `surface` **in place**, repainting only the
@@ -279,21 +298,6 @@ impl Raster {
     /// belongs to this function, not to the VT, so nothing else can be relied
     /// on to erase it — in particular when the caller turns the cursor off
     /// (an unfocused pane) without the grid changing at all.
-    /// Physical pixels a [`Raster::paint`] target must be able to hold for
-    /// `screen`, at this raster's cell size.
-    ///
-    /// **A caller that owns its own buffer sizes it from here**, never from
-    /// its own `cols * cell` arithmetic: the row count is clamped to the
-    /// whole rows the screen actually has cells for, and a caller that
-    /// reimplemented that clamp slightly differently would have its buffer
-    /// refused — or, worse, would drift from the painter one edit later. The
-    /// minimum stride is `width * 4`; the minimum length is
-    /// `stride * height`.
-    pub fn target_size(&self, screen: &Screen) -> (u32, u32) {
-        let (width, height, _) = target(self, screen);
-        (width as u32, height as u32)
-    }
-
     pub fn render_into<'a>(
         &mut self,
         screen: &Screen,
@@ -523,7 +527,14 @@ mod tests {
     /// Fails loudly rather than skipping: a raster test that quietly passes on
     /// a machine with no monospace font is worse than no test at all.
     fn raster() -> Raster {
-        Raster::new(1.0, 13.0, Cursor::Underline)
+        raster_with(Cursor::Underline)
+    }
+
+    /// The cursor shape is not decoration in these tests: `Block` inverts the
+    /// whole cell and `Underline` only its last row, so a test about
+    /// inversion landing on the right row must say which one it means.
+    fn raster_with(cursor: Cursor) -> Raster {
+        Raster::new(1.0, 13.0, cursor)
             .expect("a monospace font; set TERM_SPIKE_FONT to point at one")
     }
 
@@ -912,7 +923,11 @@ mod tests {
     /// overwrite of the rows it touches, so repeating a paint is a no-op.
     #[test]
     fn a_repaint_is_idempotent_and_the_cursor_only_inverts_a_painted_row() {
-        let mut raster = raster();
+        // `Block` deliberately: it inverts the whole cell, so a stale cursor
+        // left on an unpainted row is visible in the row comparison below. The
+        // shared helper's `Underline` touches one pixel row of the cell and
+        // makes the same assertions far weaker.
+        let mut raster = raster_with(Cursor::Block);
         let mut state = PaintState::default();
         let mut grid = screen(4, 3, 'M');
         grid.cursor_visible = true;
@@ -942,6 +957,59 @@ mod tests {
         let _ = raster.paint(&grid, &mut once, stride, &mut state, &[false; 3]);
         assert_eq!(row(&once, 1), row(&once, 0), "the old cursor was not erased");
         assert_ne!(row(&once, 2), row(&once, 0));
+    }
+
+    /// The regression the Bevy frontend used to guard by hand, and the reason
+    /// `paint` compares cols and rows SEPARATELY rather than comparing the
+    /// buffer's length: 96x25 and 80x30 are both 2400 cells and therefore the
+    /// same number of bytes, so a target holding one is exactly the right size
+    /// to be mistaken for the other. Reusing the same buffer keeps its address
+    /// and length identical too, which is what makes every cheaper check —
+    /// length, identity — answer "unchanged" here.
+    ///
+    /// 4x3 -> 3x4 is the same trap at test scale: same bytes, different
+    /// stride. Anything less than a full repaint leaves rows laid out for the
+    /// old geometry on screen.
+    #[test]
+    fn a_shape_change_at_identical_byte_length_repaints_in_full() {
+        let mut raster = raster();
+        let mut state = PaintState::default();
+        let wide = screen(4, 3, 'W');
+        let tall = screen(3, 4, 'T');
+
+        let (cell_w, cell_h) = (raster.width, raster.height);
+        let bytes =
+            |cols: usize, rows: usize| cols * cell_w as usize * 4 * rows * cell_h as usize;
+        assert_eq!(
+            bytes(4, 3),
+            bytes(3, 4),
+            "the trap itself is gone if these differ"
+        );
+
+        let mut buffer = vec![0_u8; bytes(4, 3)];
+        let _ = raster.paint(&wide, &mut buffer, 4 * raster.width as usize * 4, &mut state, &[]);
+
+        // Same buffer, same length, nothing reported dirty. Only the recorded
+        // grid shape can tell this apart from an idle frame.
+        let tall_stride = 3 * raster.width as usize * 4;
+        let bands = raster
+            .paint(&tall, &mut buffer, tall_stride, &mut state, &[false; 4])
+            .to_vec();
+        assert_eq!(
+            bands,
+            vec![DamageBand {
+                y: 0,
+                height: 4 * raster.height
+            }],
+            "a shape change owes the whole frame, not the rows the VT called dirty"
+        );
+
+        // And the pixels must be the ones a cold paint of the new shape
+        // produces, not a reinterpretation of the old ones.
+        let mut fresh_state = PaintState::default();
+        let mut fresh = vec![0_u8; bytes(3, 4)];
+        let _ = raster.paint(&tall, &mut fresh, tall_stride, &mut fresh_state, &[]);
+        assert_eq!(buffer, fresh);
     }
 
     #[test]

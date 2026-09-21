@@ -1252,6 +1252,17 @@ fn refresh(
         let (width, height) = painter.target_size(&screen);
         let stride = width as usize * 4;
         let bytes = stride * height as usize;
+        // A zero extent is not paintable and not installable: `paint` would
+        // refuse the buffer, and a zero-sized `Extent3d` is rejected by wgpu's
+        // own validation, which is a panic in the render world rather than a
+        // blank pane. `grid_snapshot` does not produce one (cols and rows are
+        // clamped above), so this is a guard on an invariant held elsewhere —
+        // which is exactly the kind that earns its keep when the elsewhere
+        // moves.
+        if width == 0 || height == 0 {
+            pane.rendered = false;
+            continue;
+        }
         if let Some(mut image) = images.get_mut(&pane.image) {
             // Mutate the texture the pane already owns. Building a fresh
             // `Image` per damaged frame threw away a full-frame buffer (~12 MB
@@ -1267,12 +1278,21 @@ fn refresh(
             }
             let rgba = image.data.get_or_insert_with(Vec::new);
             // `paint` never resizes a buffer it does not own, so sizing it is
-            // this caller's job — and a buffer that moves or changes length
-            // loses the identity the state recorded, which is what makes the
-            // paint after a resize a full one without being told.
+            // this caller's job.
+            //
+            // The invalidation is not redundant with the identity check inside
+            // `paint`. That check compares the buffer's address and length to
+            // what it last painted — and repairing the buffer HERE can restore
+            // both: anything that empties the `Vec` while keeping its capacity
+            // leaves this `resize` handing back the same address and the same
+            // length, with zeroed contents that `paint` would then trust and
+            // only partly overwrite. Nothing in bterm does that today; the
+            // churn branch was nonetheless right to treat "I had to repair the
+            // buffer" as knowledge only the caller has.
             if rgba.len() != bytes {
                 rgba.clear();
                 rgba.resize(bytes, 0);
+                pane.paint.invalidate();
             }
             // `switched` is a first frame, a focus change, or a Raster rebuilt
             // at a new scale. The last of those the state catches by itself
@@ -1296,22 +1316,39 @@ fn refresh(
             // Either way the texture holds pixels nothing wrote, and leaving
             // `rendered` false is what makes the next frame repaint it whole
             // rather than trust it.
+            // Bands are whole cell rows by construction, so both divisions are
+            // exact. `full` is OBSERVED here — the count of rows actually
+            // painted — where the churn branch printed the decision it had made
+            // in advance; a zero-row target would make `rows == total` claim a
+            // full repaint of nothing, so it says so instead.
             let rows = painted_px / painter.height.max(1);
             let total = height / painter.height.max(1);
             let refused = pane.paint.grid() == (0, 0) && total > 0;
             if *raster_trace() {
+                let full = if total == 0 {
+                    "empty"
+                } else if rows == total {
+                    "true"
+                } else {
+                    "false"
+                };
                 eprintln!(
-                    "RASTER rows={rows}/{total} full={} refused={refused} paint={:?}",
-                    rows == total,
+                    "RASTER rows={rows}/{total} full={full} refused={refused} paint={:?}",
                     converted - started
                 );
             }
             pane.rendered = !refused;
             let mut stats = terminal.stats.lock().unwrap();
             stats.vt_rgba.add(converted - screen.updated);
-            // The raster now writes straight into the asset's own buffer, so
-            // there is no separate convert-then-upload step left to time; the
-            // rasterisation itself is what this frame cost the main thread.
+            // The raster writes straight into the asset's own buffer, so this
+            // is the rasterisation cost on the main thread and nothing else.
+            //
+            // It is NOT the upload cost, and `uploads` below is not bounded by
+            // the damage bands: mutating the asset trips Bevy's change
+            // detection and the render world re-uploads the WHOLE image
+            // (bevy_render texture/gpu_image.rs). Damage bounds what the CPU
+            // paints, not what the GPU is handed — cutting the second one is
+            // its own piece of work, and this counter is what would show it.
             stats.raster_paint.add(converted - started);
             stats.uploads += 1;
         } else {

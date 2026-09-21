@@ -3125,6 +3125,7 @@ dependencies = [
  "iced_renderer",
  "iced_runtime",
  "iced_widget",
+ "naga 27.0.3",
 ]
 
 [[package]]
@@ -3470,6 +3471,7 @@ dependencies = [
  "cosmix-term-core",
  "iced",
  "libc",
+ "naga 27.0.3",
  "serde_json",
 ]
 

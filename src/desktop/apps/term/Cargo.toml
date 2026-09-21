@@ -23,7 +23,12 @@ engine = "iced"
 [features]
 default = ["wgpu"]
 # The shader-widget path: one persistent wgpu texture, damage-band uploads.
-wgpu = ["iced/wgpu"]
+# `naga27-termcolor` rides along: see that dependency for why iced-on-wgpu
+# cannot share a build with Bevy without it.
+wgpu = ["iced/wgpu", "naga27-termcolor"]
+# Not meant to be selected on its own; `wgpu` pulls it in. It exists as a
+# feature so the compatibility dependency stays optional.
+naga27-termcolor = ["dep:naga27"]
 # D7's booked second arm: iced's CPU rasteriser into `wl_shm`, no DRM fd at
 # all. Build it ALONE (`--no-default-features --features tiny-skia`) — with
 # both compiled in, iced_renderer picks wgpu and the arm measures nothing.
@@ -52,3 +57,24 @@ cosmix-iced-widgets = { path = "../../crates/cosmix-iced-widgets" }
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 libc = "0.2.189"
 serde_json = "1"
+# NOT a dependency this crate calls — a feature-unification fix, and the whole
+# reason iced-on-wgpu and Bevy can share one workspace.
+#
+# Bevy reaches `naga_oil 0.22`, which depends on `codespan-reporting 0.12` with
+# DEFAULT features, so `termcolor` is on for that package. iced 0.14 reaches
+# `naga 27`, which depends on the same package with `default-features = false`.
+# naga 27 picks its diagnostic buffer by its OWN `termcolor` feature
+# (naga-27.0.3/src/error.rs:64): off it writes into a `String`, on it writes
+# into `NoColor<Vec<u8>>`. Cargo unions features across dependents but does not
+# propagate a dependency's features back into its dependants, so naga 27 was
+# compiled expecting `String` while codespan had been switched to termcolor's
+# `WriteColor` — and any build selecting both Bevy and iced-with-wgpu died with
+# "the trait bound `String: WriteColor` is not satisfied", inside naga, naming
+# nothing of ours.
+#
+# Enabling naga 27's own `termcolor` aligns the two halves. `NoColor` means no
+# escape codes are produced; this buys compilability, not coloured output.
+#
+# Retire this when iced moves to wgpu 29 (TODO-term D3's iced 0.15 question, at
+# T3): naga 27 leaves the graph and takes the conflict with it.
+naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"], optional = true }
