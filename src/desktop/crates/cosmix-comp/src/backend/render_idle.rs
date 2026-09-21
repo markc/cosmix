@@ -115,6 +115,23 @@ pub(super) fn observe_presentations(
     execution: LiveUpdateExecution,
     events: &[KmsRenderFrameEvent],
 ) -> Result<(), super::super::kms_live::KmsLiveError> {
+    #[cfg(feature = "bus")]
+    if let Some(bridge) = app
+        .world()
+        .get_resource::<crate::region_scene::RegionBridge>()
+    {
+        for event in events {
+            if let KmsRenderFrameEvent::FrameSubmitted {
+                generation,
+                key,
+                scene_revision,
+                ..
+            } = event
+            {
+                bridge.presented(&key.connector_name, *generation, *scene_revision);
+            }
+        }
+    }
     if !app.world().contains_resource::<IdleConfiguration>()
         || app.world().get_resource::<LiveSceneMode>() != Some(&LiveSceneMode::ClientContent)
     {

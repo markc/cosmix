@@ -8,7 +8,9 @@ use bevy::{
     },
     prelude::*,
 };
-use cosmix_quoin::embedded::{EmbeddedOutput, EmbeddedPanelRegions, EmbeddedQuoinPlugin, EmbeddedWorkArea};
+use cosmix_quoin::embedded::{
+    EmbeddedOutput, EmbeddedPanelRegions, EmbeddedQuoinPlugin, EmbeddedWorkArea,
+};
 use cosmix_shell::{host::PanelRect, runtime::ShellRuntimeSet};
 use std::{
     collections::BTreeSet,
@@ -17,6 +19,7 @@ use std::{
 
 #[derive(Default)]
 struct InputState {
+    suspended: bool,
     regions: Vec<PanelRect>,
     held: BTreeSet<u32>,
     buttons: Vec<(Vec2, u32, bool)>,
@@ -28,13 +31,25 @@ struct InputState {
 pub(crate) struct EmbeddedShellBridge(Arc<Mutex<InputState>>);
 
 impl EmbeddedShellBridge {
+    pub(crate) fn suspend(&self, suspended: bool) {
+        self.reset();
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).suspended = suspended;
+    }
+    pub(crate) fn held(&self) -> bool {
+        !self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .held
+            .is_empty()
+    }
     pub(crate) fn scroll(&self, delta: Vec2) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         state.scroll += delta;
     }
     pub(crate) fn covers(&self, x: f64, y: f64) -> bool {
         let state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        !state.held.is_empty() || covers(&state.regions, x, y)
+        !state.suspended && (!state.held.is_empty() || covers(&state.regions, x, y))
     }
 
     pub(crate) fn button(
@@ -47,6 +62,9 @@ impl EmbeddedShellBridge {
     ) -> bool {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
         let owned = state.held.contains(&button);
+        if state.suspended {
+            return false;
+        }
         if !owned && (client_grab || !covers(&state.regions, x, y)) {
             return false;
         }
@@ -155,7 +173,7 @@ fn pointer_input(
         let mut state = bridge.0.lock().unwrap_or_else(|p| p.into_inner());
         (
             std::mem::take(&mut state.buttons),
-            std::mem::take(&mut state.cancel),
+            std::mem::take(&mut state.cancel) || state.suspended,
             std::mem::take(&mut state.scroll),
         )
     };

@@ -3035,7 +3035,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-capture"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-client",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.62.1"
+version = "0.63.3"
 dependencies = [
  "bevy",
  "chrono",

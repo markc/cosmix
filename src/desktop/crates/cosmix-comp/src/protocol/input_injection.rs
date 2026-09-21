@@ -695,6 +695,9 @@ impl WaylandState {
                 self.advance_sequence(id);
             }
             LongOp::Wait(spec) => self.start_window_wait(spec, reply, admitted),
+            LongOp::RegionSelect { output, timeout } => {
+                self.start_region_selection(output, timeout, reply, admitted)
+            }
             LongOp::ForceClose {
                 id,
                 generation,

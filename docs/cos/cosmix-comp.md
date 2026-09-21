@@ -385,6 +385,8 @@ The control plane exposes these verbs:
   and returns `{version:1,topic:"<service>.pointer.changed",lease_ms:3000}`.
   Subscribe before calling; renew about once per second while observation is
   wanted. The acknowledgement contains no pointer coordinates.
+- `comp.region.select {output?,timeout_ms?}` selects a rectangle using native
+  compositor furniture. See Region selection below.
 - `comp.window.minimize {id,generation}` minimises one window, like its
   title-bar button. Both fields are required.
 - `comp.window.restore {id?,generation?}` with no arguments restores the most
@@ -408,6 +410,62 @@ The control plane exposes these verbs:
   `comp.input.pointer.scroll`, `comp.input.key`, `comp.input.release_all` and
   `comp.input.sequence` inject input through the real seat (see Input
   injection below).
+
+### Region selection
+
+`comp.region.select` holds one pending reply while the seat selects a region.
+Left-button drag selects; reverse drags are normalised and rounded outwards to
+integer logical units. A click or zero-area drag keeps selection armed. Esc or
+right-button press cancels. Unknown fields are rejected. `timeout_ms` defaults
+to 30000 and accepts 1–55000: three further seconds bound clean-frame removal,
+with a four-second responder margin, strictly below the 60-second long-verb cap.
+Set the caller's Bus timeout above that total budget.
+
+An explicit `output` restricts selection to that named output. Otherwise the
+first left press chooses its output. Dragging across its edge clips the rectangle;
+this does not stitch multiple outputs. Success (rc 0) is:
+
+```json
+{"version":1,"status":"selected","output":"Output-1","output_generation":42,"coordinate_space":"output-local-logical","region":{"x":100,"y":80,"width":640,"height":360}}
+```
+
+Coordinates are relative to the displayed output's top-left, before conversion
+to physical pixels. Cancellation returns
+`{"version":1,"status":"cancelled","reason":"escape"}` (or `right_button`);
+timeout returns `{"version":1,"status":"timeout"}`. These are rc 0 outcomes.
+Successful completion waits for a submitted frame without the overlay on the
+selected output; an unrelated sleeping monitor does not delay that reply.
+If the selected output disappears during cleanup, all surviving overlay outputs
+must submit clean frames; no surviving output means success cannot be proven.
+Cancellation, timeout and refusal restore focus and publish overlay removal, then
+reply without waiting for presentation: they do not authorise a capture.
+Failure to prove removal within the margin returns rc 10 `busy`, never success.
+
+A second selector, an existing pointer/popup grab, touch sequence, native panel
+drag, input sequence or window manipulation returns rc 10 `busy`. Output identity,
+generation, geometry, scale or transform changing before a result is decided
+returns `output_changed`. A decided result is preserved during cleanup.
+A requested output name that does not exist returns `unknown_output`.
+Session lock returns `locked`. These are lifecycle/correctness rules, not caller
+permissions. Temporary seat focus does not deactivate or restack fullscreen windows.
+Pointer constraints are released for selection and reconsidered on focus restoration.
+VT/focus/device loss and a closed local responder clean up input ownership.
+Touchscreen removal aborts even a pointer-driven selection with `busy`; KMS
+session pause reports `output_changed` before generic input-loss cleanup.
+Remote caller disappearance is bounded by the deadline; immediate remote request
+cancellation is not currently propagated to the local responder.
+
+The result contains geometry only. Pass `output` and `region` to
+`capture.screenshot`; an agent that already knows its rectangle can call capture
+directly. `output_generation` describes selection-time identity; capture's current
+Wayland request does not carry that generation, so this is not an atomic
+selection-to-capture topology fence.
+
+Compositor log colours follow the stderr log sink's terminal status. Redirecting
+stdout alone preserves colour; stderr pipes, files and journald receive plain text
+in both KMS and nested modes.
+
+### Minimise and restore
 
 Minimise and restore reply `{id,generation,title,app_id,minimized,changed}`;
 `changed:false` means the window was already in the requested state.
@@ -439,7 +497,7 @@ surfaces.s<id>.{id,role,mapped,visible,x,y,width,height,band,sequence,
                 generation}
 windows.s<id>.{id,foreign_id,title,app_id,x,y,width,height,focused,
                maximized,fullscreen,minimized,output,band,generation,
-               window_x,window_y,visible,pid,workspace,
+               window_x,window_y,window_width,window_height,visible,pid,workspace,
                presentation.{presented,discarded,last_presented_us,
                  interval_p50_us,interval_p99_us,interval_max_us,
                  commit_to_present_p50_us,commit_to_present_p99_us,
@@ -475,9 +533,15 @@ sequence watermark across every topic, and `port.lost_count` is cumulative.
 `retrying`. `port.reply_timeouts` and `port.publish_timeouts` count their
 separate bounded lanes; both abandon a sink wait after two seconds.
 
-Window rows add five read-only leaves. `generation` is the window's role
-generation (below). `window_x`/`window_y` are the window-geometry origin; `x`/`y`
-stay the buffer origin, which includes any client-side shadow. `visible` is
+Window rows add seven read-only leaves. `generation` is the window's role
+generation (below). `window_x`/`window_y` are the window-geometry origin and
+`window_width`/`window_height` its extent, all in logical pixels. Use all four
+for window screenshots that exclude client-side shadow margins. `x`/`y` remain
+the buffer origin and `width`/`height` the buffer extent, including those margins.
+Without explicit client geometry, all four `window_*` fields use the effective
+committed surface-tree bounds, including mapped subsurfaces; shadow margins
+cannot then be distinguished. If no geometry is cached, the fallback is the
+root buffer with zero geometry offset and its full extent. `visible` is
 effective on-screen visibility: use it to ask "is this on screen", and
 `minimized` for the user's minimise state. `pid` is the process id of the
 client's socket peer, or null when the compositor cannot read it. A client

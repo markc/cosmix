@@ -22,12 +22,15 @@ mod port;
 mod protocol;
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
 mod readiness;
+#[cfg(feature = "bus")]
+mod region_scene;
 mod render_asset_demand;
 mod render_asset_readiness;
 mod render_component_demand;
 mod render_pipeline_readiness;
 mod shadow_material;
 
+use std::io::IsTerminal;
 use std::{env, error::Error, ffi::OsString, io, mem, process::ExitCode, time::Duration};
 
 use backend::{BackendKind, render::KmsRenderTargetPlugin};
@@ -176,11 +179,29 @@ fn init_kms_live_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     };
     fmt()
+        .with_ansi(log_ansi_enabled())
         .with_env_filter(filter)
         .with_writer(io::stderr)
         .with_thread_names(true)
         .with_target(true)
         .try_init()
+}
+
+fn log_ansi_enabled() -> bool {
+    // Only the actual log sink controls colour; piping stdout is independent.
+    log_ansi_for(io::stdout().is_terminal(), io::stderr().is_terminal())
+}
+
+fn log_ansi_for(_stdout_terminal: bool, stderr_terminal: bool) -> bool {
+    stderr_terminal
+}
+
+fn comp_log_layer(_: &mut App) -> Option<bevy::log::BoxedFmtLayer> {
+    Some(Box::new(
+        bevy::log::tracing_subscriber::fmt::layer()
+            .with_writer(io::stderr)
+            .with_ansi(log_ansi_enabled()),
+    ))
 }
 
 fn main() -> ExitCode {
@@ -335,6 +356,10 @@ fn run(cli: Cli) -> Result<AppExit, Box<dyn Error>> {
     // present even in a narrow `cargo run -p cosmix-comp` build.
     let default_plugins = DefaultPlugins
         .build()
+        .set(bevy::log::LogPlugin {
+            fmt_layer: comp_log_layer,
+            ..default()
+        })
         .disable::<PipelinedRenderingPlugin>()
         .set(WindowPlugin {
             primary_window: Some(Window {
@@ -890,9 +915,9 @@ fn setup_scene(mut commands: Commands) {
         Camera2d,
         capture::CaptureOutputSource {
             source_id: backend::CaptureSourceId::Nested {
-                output_name: "cosmix-nested-0".into(),
+                output_name: backend::NESTED_OUTPUT_NAME.into(),
             },
-            output_name: "cosmix-nested-0".into(),
+            output_name: backend::NESTED_OUTPUT_NAME.into(),
         },
     ));
     commands.spawn((
@@ -1408,6 +1433,8 @@ struct NestedPostPresent;
 
 #[derive(Resource, Default)]
 struct NestedPresentCandidate {
+    #[cfg(feature = "bus")]
+    scene_revision: Option<u64>,
     acquisition: Option<capture::NestedCaptureAcquisition>,
     epochs: Vec<(u64, protocol::SecurityPresentationTarget)>,
     captures: Vec<capture::PendingCapturePresentation>,
@@ -1505,6 +1532,7 @@ fn install_nested_security_presentation_completion(
 }
 
 fn capture_nested_swapchain_acquisition(
+    #[cfg(feature = "bus")] revision: Option<Res<compositor_scene::SceneContentRevision>>,
     pending: Res<NestedSecurityPresentation>,
     capture_pending: Res<capture::CapturePresentationPending>,
     windows: Res<ExtractedWindows>,
@@ -1512,6 +1540,10 @@ fn capture_nested_swapchain_acquisition(
     mut candidate: ResMut<NestedPresentCandidate>,
 ) {
     candidate.acquisition = None;
+    #[cfg(feature = "bus")]
+    {
+        candidate.scene_revision = revision.and_then(|r| r.0);
+    }
     candidate.epochs.clear();
     candidate.captures.clear();
     candidate.content = None;
@@ -1551,7 +1583,24 @@ fn stage_nested_capture_presentations(
     }
 }
 
+#[cfg(feature = "bus")]
+fn complete_nested_region_presentation(
+    region: &region_scene::RegionBridge,
+    acquisition_consumed: bool,
+    revision: Option<u64>,
+) {
+    if acquisition_consumed {
+        region.presented(
+            backend::NESTED_OUTPUT_NAME,
+            backend::NESTED_OUTPUT_GENERATION,
+            revision,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Bevy system parameters.
 fn complete_nested_security_presentation(
+    #[cfg(feature = "bus")] region: Option<Res<region_scene::RegionBridge>>,
     pending: Res<NestedSecurityPresentation>,
     completion: Res<NestedPresentationCompletion>,
     render_device: Res<RenderDevice>,
@@ -1595,6 +1644,14 @@ fn complete_nested_security_presentation(
         if let Some(mut sources) = sources {
             sources.consume();
         }
+    }
+    #[cfg(feature = "bus")]
+    if let Some(region) = region {
+        complete_nested_region_presentation(
+            &region,
+            acquisition_consumed,
+            candidate.scene_revision,
+        );
     }
     if !acquisition_consumed {
         return;
@@ -1724,6 +1781,38 @@ fn pulse_nested_client_frames(clock: Res<protocol::ClientFrameClock>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn journald_fields_are_plain_and_interactive_logs_keep_colour() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (out, err) in [(false, false), (true, false), (false, true), (true, true)] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Capture(bytes.clone());
+            let subscriber = bevy::log::tracing_subscriber::fmt()
+                .with_ansi(log_ansi_for(out, err))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(
+                subscriber,
+                || tracing::info!(state=?"Paused","state changed"),
+            );
+            let bytes = bytes.lock().unwrap();
+            assert_eq!(bytes.contains(&0x1b), err);
+            if !err {
+                assert!(String::from_utf8_lossy(&bytes).contains("state=\"Paused\""));
+            }
+        }
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -2672,7 +2761,10 @@ mod tests {
         assert_eq!(lines.len(), 4);
         assert!(lines[0].starts_with("cosmix-comp "));
         let commit = lines[1].strip_prefix("commit: ").expect("commit key");
-        assert!(commit == "unknown" || (commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit())));
+        assert!(
+            commit == "unknown"
+                || (commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()))
+        );
         let features = lines[2].strip_prefix("features: ").expect("features key");
         assert!(!features.is_empty());
         assert!(lines[3].starts_with("profile: "));

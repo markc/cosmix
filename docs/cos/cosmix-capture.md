@@ -15,7 +15,7 @@ The service exposes four commands, with JSON object bodies:
 
 | Command | Body | Effect |
 | --- | --- | --- |
-| `capture.screenshot` | `{}` | Start an asynchronous PNG screenshot |
+| `capture.screenshot` | `{output?,region?}` | Start an asynchronous output or region PNG screenshot |
 | `capture.start` | `{"fps":30}` | Start MP4 recording, 1–60 fps (default 30) |
 | `capture.stop` | `{}` | Stop the active job and finalise its MP4 |
 | `capture.status` | `{}` | Read state and completed file path |
@@ -28,6 +28,19 @@ still have a finalised usable MP4; `error` explains why recording stopped.
 The initial screenshot/start response acknowledges the job; poll status for
 completion. Stop is idempotent when no job is active. Concurrent jobs fail
 explicitly. Names are generated, and existing files are never overwritten.
+
+Screenshots accept, for example,
+`{"output":"Output-1","region":{"x":100,"y":80,"width":640,"height":360}}`.
+`output` overrides the startup output for that request only; omitted fields keep
+the existing whole-output behaviour and reply shape. Region coordinates are
+output-local displayed logical integers, matching `comp.region.select`. Origins
+must be non-negative, sizes positive, and right/bottom edges fit signed 32-bit
+integers. Unknown or missing region fields are rejected. The compositor clips
+to output bounds, converts scale/orientation and crops through
+`zwlr_screencopy_manager_v1.capture_output_region`; this app does not crop a
+full-output image. Regions are screenshots only; recording remains whole-output.
+The selection's `output_generation` is not a capture argument: topology can change
+between separate selection and capture requests.
 
 Recording statistics also expose `fresh_frames`, `duplicate_frames`,
 `elapsed_ms`, `fresh_fps`, `capture_ms` and `encode_ms`. Use `fresh_fps` to

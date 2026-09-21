@@ -190,7 +190,54 @@ impl Drop for PendingFrame {
         self.frame.destroy();
     }
 }
+/// Same output-local logical integer geometry returned by comp.region.select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+impl Region {
+    pub fn parse(value: &serde_json::Value) -> Result<Self, String> {
+        let object = value.as_object().ok_or("region must be an object")?;
+        if object.len() != 4
+            || object
+                .keys()
+                .any(|k| !["x", "y", "width", "height"].contains(&k.as_str()))
+        {
+            return Err("region requires exactly x, y, width, height".into());
+        }
+        let integer = |name| {
+            object
+                .get(name)
+                .and_then(|v| v.as_i64())
+                .and_then(|n| i32::try_from(n).ok())
+                .ok_or_else(|| format!("region {name} must be an i32 integer"))
+        };
+        let r = Self {
+            x: integer("x")?,
+            y: integer("y")?,
+            width: integer("width")?,
+            height: integer("height")?,
+        };
+        if r.x < 0
+            || r.y < 0
+            || r.width <= 0
+            || r.height <= 0
+            || r.x.checked_add(r.width).is_none()
+            || r.y.checked_add(r.height).is_none()
+        {
+            return Err(
+                "region must have non-negative origin and positive, non-overflowing extent".into(),
+            );
+        }
+        Ok(r)
+    }
+}
+
 pub struct Capture {
+    pub region: Option<Region>,
     connection: Connection,
     queue: EventQueue<State>,
     state: State,
@@ -231,6 +278,7 @@ impl Capture {
             last_success: Instant::now(),
         };
         let mut this = Self {
+            region: None,
             connection,
             queue,
             state,
@@ -340,12 +388,25 @@ impl Capture {
             .checked_add(1)
             .ok_or("capture request ID exhausted")?;
         let id = self.next_id;
-        let frame = self
+        let manager = self
             .state
             .manager
             .as_ref()
-            .ok_or("screencopy unavailable")?
-            .capture_output(1, &output.0, &self.queue.handle(), id);
+            .ok_or("screencopy unavailable")?;
+        let frame = if let Some(r) = self.region {
+            manager.capture_output_region(
+                1,
+                &output.0,
+                r.x,
+                r.y,
+                r.width,
+                r.height,
+                &self.queue.handle(),
+                id,
+            )
+        } else {
+            manager.capture_output(1, &output.0, &self.queue.handle(), id)
+        };
         self.state.frames.insert(id, PendingFrame::new(frame));
         // A full socket retains queued requests. The dispatcher retries on
         // POLLOUT while preserving the request's original deadline.
@@ -786,6 +847,86 @@ wayland_client::delegate_noop!(State: ignore manager::ZwlrScreencopyManagerV1);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn region_requests_use_screencopy_region_opcode_and_full_output_is_unchanged() {
+        use std::{io::Read, os::unix::net::UnixStream};
+        use wayland_client::Proxy;
+        for region in [
+            None,
+            Some(Region {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40,
+            }),
+        ] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let connection = Connection::from_socket(client).unwrap();
+            let queue = connection.new_event_queue::<State>();
+            let registry = connection.display().get_registry(&queue.handle(), ());
+            let manager: manager::ZwlrScreencopyManagerV1 =
+                registry.bind(1, 3, &queue.handle(), ());
+            let manager_id = manager.id().protocol_id();
+            let output: wl_output::WlOutput = registry.bind(2, 4, &queue.handle(), 2);
+            let output_id = output.id().protocol_id();
+            let state = State {
+                outputs: BTreeMap::from([(2, (output, Some("Output-1".into())))]),
+                shm: None,
+                manager: Some(manager),
+                frames: BTreeMap::new(),
+                error: None,
+                selected: Some(2),
+                expected_extent: None,
+                free_slots: Vec::new(),
+                slot_limit: 1,
+                last_success: Instant::now(),
+            };
+            let mut capture = Capture {
+                region,
+                connection,
+                queue,
+                state,
+                cancel: Arc::new(AtomicBool::new(false)),
+                timing: FrameTiming::default(),
+                next_id: 0,
+                next_due: Instant::now(),
+                repeated_frames: 0,
+                last_timestamp: None,
+                streaming: false,
+                refused_frames: 0,
+            };
+            capture.request().unwrap();
+            let mut bytes = [0u8; 1024];
+            let count = server.read(&mut bytes).unwrap();
+            let mut offset = 0;
+            let mut found = false;
+            while offset < count {
+                let word =
+                    |i| u32::from_ne_bytes(bytes[offset + i..offset + i + 4].try_into().unwrap());
+                let size = (word(4) >> 16) as usize;
+                if word(0) == manager_id {
+                    assert_eq!(word(4) & 0xffff, u32::from(region.is_some()));
+                    assert_eq!(word(12), 1, "cursor overlay remains enabled");
+                    assert_eq!(word(16), output_id);
+                    if let Some(r) = region {
+                        assert_eq!(
+                            [word(20), word(24), word(28), word(32)],
+                            [r.x as u32, r.y as u32, r.width as u32, r.height as u32]
+                        );
+                        assert_eq!(size, 36);
+                    } else {
+                        assert_eq!(size, 20);
+                    }
+                    found = true;
+                }
+                offset += size;
+            }
+            assert!(found, "screencopy request reached the Wayland socket");
+        }
+    }
     use std::os::unix::fs::FileExt;
     #[test]
     fn persistent_mapping_observes_reused_slot_and_seals_its_extent() {

@@ -4838,6 +4838,7 @@ fn acquire_output_frames(
             worker_stop.wake();
         }
         if let Some(frame_events) = &frame_events {
+            // A disconnected observer has gone away; worker_stop retains failure.
             let _ = frame_events.send(KmsRenderFrameEvent::TerminalFailure(failure));
         }
         drain_render_resources(RenderDrainScope::All, &mut targets, &mut views);
@@ -6359,6 +6360,7 @@ fn present_selected_output_frames(
                         worker_stop.wake();
                     }
                     if let Some(frame_events) = &frame_events {
+                        // Observer teardown cannot turn this latched failure into success.
                         let _ = frame_events.send(KmsRenderFrameEvent::TerminalFailure(failure));
                     }
                     break;
@@ -6415,6 +6417,7 @@ fn present_selected_output_frames(
                 })
             }
             Ok(PresentOutcome::Cancelled) => {
+                // Cancellation retires this attempt, not scene dirtiness/content costs.
                 fail_capture_presentations(&presenter.capture_presentations, capture_reporter);
                 Some(KmsRenderFrameEvent::PresentationCancelled {
                     generation: presenter.generation,
@@ -6447,6 +6450,7 @@ fn present_selected_output_frames(
             worker_stop.wake();
         }
         if let (Some(frame_events), Some(event)) = (&frame_events, event) {
+            // This unbounded send fails only after the coordinator receiver is gone.
             let _ = frame_events.send(event);
         }
         if terminal {

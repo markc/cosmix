@@ -970,6 +970,8 @@ impl HostInput {
 }
 
 enum ProtocolCommand {
+    #[cfg(feature = "bus")]
+    RegionBridge(crate::region_scene::RegionBridge),
     #[cfg(feature = "embedded-quoin")]
     EmbeddedShell(crate::embedded_shell::EmbeddedShellBridge),
     #[cfg(feature = "embedded-quoin")]
@@ -1305,8 +1307,21 @@ pub(crate) struct ClientSceneFeed {
 static_assertions::assert_not_impl_any!(ClientSceneFeed: Clone, Copy);
 
 impl ClientSceneFeed {
+    #[cfg(feature = "bus")]
+    pub(crate) fn install_region_bridge(&self, bridge: crate::region_scene::RegionBridge) {
+        if self
+            .commands
+            .send(ProtocolCommand::RegionBridge(bridge))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before region renderer attachment");
+        }
+    }
     #[cfg(feature = "embedded-quoin")]
-    pub(crate) fn install_embedded_shell(&self, bridge: crate::embedded_shell::EmbeddedShellBridge) {
+    pub(crate) fn install_embedded_shell(
+        &self,
+        bridge: crate::embedded_shell::EmbeddedShellBridge,
+    ) {
         self.commands
             .send(ProtocolCommand::EmbeddedShell(bridge))
             .expect("live protocol thread for native shell");
@@ -1440,6 +1455,8 @@ impl ClientSceneFeed {
         loop {
             match commands.try_recv() {
                 Ok(ProtocolCommand::ReleaseDmabuf { token }) => tokens.push(token),
+                #[cfg(feature = "bus")]
+                Ok(ProtocolCommand::RegionBridge(_)) => {} // Startup renderer attachment owns no buffer.
                 Ok(_) => panic!("scene feed emitted an unrelated command"),
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return tokens,
             }
@@ -3134,7 +3151,7 @@ impl ProtocolServer {
         let backend = match backend_kind {
             BackendKind::Winit => {
                 let output = Output::new(
-                    "cosmix-nested-0".into(),
+                    crate::backend::NESTED_OUTPUT_NAME.into(),
                     PhysicalProperties {
                         size: (254, 169).into(),
                         subpixel: Subpixel::Unknown,
@@ -3326,6 +3343,8 @@ impl ProtocolServer {
             pending_port_controls: Vec::with_capacity(PORT_QUEUE_CAPACITY),
             #[cfg(feature = "bus")]
             injection: input_injection::InjectionState::default(),
+            #[cfg(feature = "bus")]
+            region: region_selection::RegionSelection::default(),
             #[cfg(feature = "bus")]
             window_waiters: window_control::WindowWaiters::default(),
             #[cfg(feature = "bus")]
@@ -3528,6 +3547,10 @@ impl ProtocolServer {
         event_loop
             .handle()
             .insert_source(command_source, |event, (), state| match event {
+                #[cfg(feature = "bus")]
+                ChannelEvent::Msg(ProtocolCommand::RegionBridge(bridge)) => {
+                    state.region.bridge = Some(bridge);
+                }
                 #[cfg(feature = "embedded-quoin")]
                 ChannelEvent::Msg(ProtocolCommand::EmbeddedShell(bridge)) => {
                     state.embedded_shell = Some(bridge);
@@ -3687,6 +3710,13 @@ impl ProtocolServer {
                     let resumed = matches!(&event, KmsTopologyLifecycleEvent::Resume(_));
                     let previous_kms_outputs = state.backend.kms_registered_outputs();
                     if pause {
+                        // Pause retires output generations. Latch that specific
+                        // cause before generic input-authority cleanup tries Busy.
+                        #[cfg(feature = "bus")]
+                        state.finish_region_selection(crate::port::ControlReply::Refused {
+                            error: "output_changed",
+                            detail: serde_json::json!({}),
+                        });
                         let kms_captures = state
                             .capture_frames
                             .iter()
@@ -6205,6 +6235,8 @@ struct WaylandState {
     /// Bus-injected input: held keys/buttons, sequences, host passthrough.
     #[cfg(feature = "bus")]
     injection: input_injection::InjectionState,
+    #[cfg(feature = "bus")]
+    region: region_selection::RegionSelection,
     /// `comp.window.wait` / `close {force}` waiters.
     #[cfg(feature = "bus")]
     window_waiters: window_control::WindowWaiters,
@@ -8005,6 +8037,10 @@ impl WaylandState {
     }
 
     fn teardown_input_for_session_lock(&mut self) {
+        #[cfg(feature = "bus")]
+        self.finish_region_selection(crate::port::ControlReply::Locked);
+        #[cfg(feature = "bus")]
+        self.abandon_region_input();
         #[cfg(feature = "embedded-quoin")]
         if let Some(bridge) = &self.embedded_shell {
             bridge.reset();
@@ -8759,6 +8795,13 @@ impl WaylandState {
     }
 
     fn handle_host_input_with_activity(&mut self, input: HostInput, user_activity: bool) {
+        #[cfg(feature = "bus")]
+        if self.region_input(&input) {
+            if user_activity {
+                self.notify_idle_activity();
+            }
+            return;
+        }
         let exposure_sensitive = matches!(
             &input,
             HostInput::PointerMotionAbsolute { .. }
@@ -12254,6 +12297,8 @@ impl WaylandState {
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     fn reconcile_all_input_authority_loss(&mut self) {
+        #[cfg(feature = "bus")]
+        self.abandon_region_input();
         self.cancel_chrome_pointer_grab(true);
         self.update_chrome_hover(None);
         self.set_chrome_cursor_override(None);
@@ -12517,6 +12562,10 @@ impl WaylandState {
     }
 
     fn reconcile_pointer_target(&mut self) {
+        #[cfg(feature = "bus")]
+        if self.region.suspended {
+            return;
+        }
         let (x, y) = self.cursor_position;
         let target = if self.pointer.is_grabbed() {
             self.client_pointer_target_at(x, y)
@@ -13348,6 +13397,9 @@ impl WaylandState {
     /// cursor still sits in a corner.
     #[cfg(feature = "bus")]
     pub(crate) fn service_deferred_constraint_activation(&mut self) {
+        if self.region.suspended {
+            return;
+        }
         if !self.constraint_activation_deferred() || self.corner_engaged() {
             return;
         }
@@ -13498,6 +13550,10 @@ impl WaylandState {
         clear_if_unrequested: bool,
     ) {
         #[cfg(feature = "bus")]
+        if self.region.suspended {
+            return;
+        }
+        #[cfg(feature = "bus")]
         self.mark_focus_before_change("wayland.focus");
         'focus_policy: {
             let previous_exclusive = self.exclusive_keyboard_focus.take();
@@ -13628,6 +13684,10 @@ impl WaylandState {
     }
 
     fn retarget_pointer_after_visibility_change(&mut self) {
+        #[cfg(feature = "bus")]
+        if self.region.suspended {
+            return;
+        }
         let (x, y) = self.cursor_position;
         let target = if self.pointer.is_grabbed() {
             self.client_pointer_target_at(x, y)
@@ -15977,6 +16037,8 @@ mod input_injection;
 mod occlusion;
 pub(crate) mod presentation;
 pub(crate) mod presentation_stats;
+#[cfg(feature = "bus")]
+pub(crate) mod region_selection;
 mod release_use;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;

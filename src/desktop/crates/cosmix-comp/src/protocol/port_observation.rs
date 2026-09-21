@@ -2176,6 +2176,16 @@ fn diff_window_row(
             PropValue::F32(new.window_y),
         ),
         (
+            "window_width",
+            PropValue::F32(old.window_width),
+            PropValue::F32(new.window_width),
+        ),
+        (
+            "window_height",
+            PropValue::F32(old.window_height),
+            PropValue::F32(new.window_height),
+        ),
+        (
             "visible",
             PropValue::Bool(old.visible),
             PropValue::Bool(new.visible),

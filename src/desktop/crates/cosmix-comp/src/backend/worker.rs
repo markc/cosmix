@@ -1382,6 +1382,7 @@ where
                 present: fallible_present_output_frame(move |deadline| {
                     let outcome = present_output_frame(present, deadline)?;
                     if outcome == PresentOutcome::Displayed {
+                        // A closed receiver means observer teardown, not a failed flip.
                         let _ = frame_events.send(KmsRenderWorkerEvent::Reply(
                             KmsRenderReply::FrameSubmitted {
                                 generation,

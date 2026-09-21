@@ -453,7 +453,7 @@ named advertised output is selected. This version records one entire output,
 not a combined multi-monitor canvas. Keep the media directory outside Git.</p>
 <p>The service exposes four commands, with JSON object bodies:</p>
 <table><thead><tr><th>Command</th><th>Body</th><th>Effect</th></tr></thead><tbody>
-<tr><td><code>capture.screenshot</code></td><td><code>{}</code></td><td>Start an asynchronous PNG screenshot</td></tr>
+<tr><td><code>capture.screenshot</code></td><td><code>{output?,region?}</code></td><td>Start an asynchronous output or region PNG screenshot</td></tr>
 <tr><td><code>capture.start</code></td><td><code>{"fps":30}</code></td><td>Start MP4 recording, 1–60 fps (default 30)</td></tr>
 <tr><td><code>capture.stop</code></td><td><code>{}</code></td><td>Stop the active job and finalise its MP4</td></tr>
 <tr><td><code>capture.status</code></td><td><code>{}</code></td><td>Read state and completed file path</td></tr>
@@ -466,6 +466,18 @@ still have a finalised usable MP4; <code>error</code> explains why recording sto
 The initial screenshot/start response acknowledges the job; poll status for
 completion. Stop is idempotent when no job is active. Concurrent jobs fail
 explicitly. Names are generated, and existing files are never overwritten.</p>
+<p>Screenshots accept, for example,
+<code>{"output":"Output-1","region":{"x":100,"y":80,"width":640,"height":360}}</code>.
+<code>output</code> overrides the startup output for that request only; omitted fields keep
+the existing whole-output behaviour and reply shape. Region coordinates are
+output-local displayed logical integers, matching <code>comp.region.select</code>. Origins
+must be non-negative, sizes positive, and right/bottom edges fit signed 32-bit
+integers. Unknown or missing region fields are rejected. The compositor clips
+to output bounds, converts scale/orientation and crops through
+<code>zwlr_screencopy_manager_v1.capture_output_region</code>; this app does not crop a
+full-output image. Regions are screenshots only; recording remains whole-output.
+The selection's <code>output_generation</code> is not a capture argument: topology can change
+between separate selection and capture requests.</p>
 <p>Recording statistics also expose <code>fresh_frames</code>, <code>duplicate_frames</code>,
 <code>elapsed_ms</code>, <code>fresh_fps</code>, <code>capture_ms</code> and <code>encode_ms</code>. Use <code>fresh_fps</code> to
 measure acquisition throughput: the MP4 frame rate alone includes repeated
