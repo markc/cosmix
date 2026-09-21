@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-comp"
-version = "0.62.1"
+version = "0.63.0"
 description = "Smithay protocol frontend with Bevy rendering for the CosMix desktop"
 edition = "2024"
 rust-version = "1.95"
@@ -9,6 +9,8 @@ license = "MIT"
 [features]
 default = ["bus", "frame-capture", "xwayland"]
 bus = [
+    "bevy/bevy_ui_render",
+    "bevy/bevy_picking",
     "dep:cosmix-bus",
     "dep:cosmix-client",
     "dep:cosmix-config",

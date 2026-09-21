@@ -379,6 +379,7 @@ impl AtomicCancellation {
         }
         let published = self.generation.load(Ordering::Acquire);
         if published != 0 && published < generation {
+            // A failed CAS preserves a newer cancellation published by another thread.
             let _ =
                 self.generation
                     .compare_exchange(published, 0, Ordering::AcqRel, Ordering::Acquire);
@@ -1040,6 +1041,7 @@ impl<I: AtomicIo> AtomicPresenter<I> {
                                 self.cancellation.drain_stale_publication(generation);
                             }
                             if drm {
+                                // This commit is still EBUSY: discard prior flips, not its completion.
                                 let _ = self.io.decode_pageflips(self.selection.crtc_id).map_err(
                                     |detail| {
                                         AtomicCommitError::synthetic(

@@ -352,6 +352,10 @@ pub(crate) struct SequenceStep {
 /// A verb whose reply waits on a timer or an edge.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LongOp {
+    RegionSelect {
+        output: Option<String>,
+        timeout: Duration,
+    },
     Sequence(Vec<SequenceStep>),
     Wait(WaitSpec),
     /// Polite close now; if the same `{id, generation}` is still alive at
@@ -367,6 +371,9 @@ impl LongOp {
     /// When the protocol thread must have answered by.
     fn budget(&self) -> Duration {
         match self {
+            // Reserve four seconds after interaction for an acknowledged clean
+            // frame (55s + 4s = 59s), strictly inside LONG_VERB_MAX's 60s.
+            Self::RegionSelect { timeout, .. } => *timeout + Duration::from_secs(4),
             Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
             Self::Wait(spec) => spec.timeout,
             Self::ForceClose { timeout, .. } => *timeout,
@@ -1654,6 +1661,34 @@ fn dispatch_incoming(
         );
         return;
     }
+    if command.command == "comp.region.select" {
+        let parsed = if malformed {
+            Err(invalid_argument(
+                "args",
+                "JSON object",
+                "{output?, timeout_ms?}",
+            ))
+        } else {
+            parse_region_select(&command.args)
+        };
+        match parsed {
+            Ok(op) => spawn_long_verb(
+                ingress,
+                responders,
+                long_permits,
+                reply_sender,
+                reply_timeouts,
+                command,
+                op,
+            ),
+            Err(reply) => queue_reply(
+                reply_sender,
+                reply_timeouts,
+                PendingReply::new(command, reply.into_wire()),
+            ),
+        }
+        return;
+    }
     if command.command == "comp.input.sequence" {
         let parsed = if malformed {
             Err(invalid_argument(
@@ -2667,6 +2702,58 @@ fn delay_arg(value: Option<&Value>, name: &'static str) -> Result<Option<Duratio
     }
 }
 
+#[cfg(test)]
+mod region_argument_tests {
+    use super::*;
+    #[test]
+    fn region_arguments_are_strict_and_leave_reply_margin() {
+        for args in [
+            json!({"timeout_ms":0}),
+            json!({"timeout_ms":55_001}),
+            json!({"timeout_ms":2.5}),
+            json!({"output":""}),
+            json!({"region":{}}),
+        ] {
+            assert!(parse_region_select(&args).is_err(), "{args}");
+        }
+        let op = parse_region_select(&json!({"output":"Output-1","timeout_ms":55_000})).unwrap();
+        assert_eq!(op.budget(), Duration::from_secs(59));
+        assert!(op.budget() < LONG_VERB_MAX);
+        assert!(
+            matches!(parse_region_select(&json!({})).unwrap(),LongOp::RegionSelect {output:None,timeout} if timeout==Duration::from_secs(30))
+        );
+    }
+}
+
+fn parse_region_select(args: &Value) -> Result<LongOp, ControlReply> {
+    let empty = serde_json::Map::new();
+    let object = args_object(args, &empty, &["output", "timeout_ms"])?;
+    let output = match object.get("output") {
+        None => None,
+        Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
+        _ => {
+            return Err(invalid_argument(
+                "output",
+                "non-empty string",
+                "output name",
+            ));
+        }
+    };
+    let timeout = match object.get("timeout_ms") {
+        None => 30_000,
+        Some(value) => value
+            .as_u64()
+            .filter(|ms| (1..=55_000).contains(ms))
+            .ok_or_else(|| {
+                invalid_argument("timeout_ms", "integer 1..55000", "selection deadline")
+            })?,
+    };
+    Ok(LongOp::RegionSelect {
+        output,
+        timeout: Duration::from_millis(timeout),
+    })
+}
+
 /// `comp.input.sequence {steps:[{verb, args?, delay_ms?}], interval_ms?}`.
 /// `delay_ms` (default `interval_ms`, default 0) runs before its step; the
 /// delays together are capped at 60 s.
@@ -3411,7 +3498,11 @@ mod tests {
         assert_eq!(list("windows"), Some("windows".to_string()));
         assert_eq!(list("windows.s3"), Some("windows.s3".to_string()));
         assert_eq!(list("windows.s"), Some("windows.s".to_string()));
-        assert_eq!(read_scope("comp.props.list", &json!({})), None, "no prefix: whole tree");
+        assert_eq!(
+            read_scope("comp.props.list", &json!({})),
+            None,
+            "no prefix: whole tree"
+        );
         assert_eq!(
             read_scope("comp.props.get", &json!({ "path": "windows.s3.visible" })),
             Some("windows.s3.visible".to_string())
@@ -3420,7 +3511,10 @@ mod tests {
             read_scope("comp.props.describe", &json!({ "path": "windows.s3" })),
             Some("windows.s3".to_string())
         );
-        assert_eq!(read_scope("comp.info", &json!({})), Some("info".to_string()));
+        assert_eq!(
+            read_scope("comp.info", &json!({})),
+            Some("info".to_string())
+        );
         assert_eq!(read_scope("comp.windows.list", &json!({})), None);
         // A scope reaches its own subtree and no sibling; a mid-segment
         // prefix scopes nothing, exactly as the list itself matches nothing.
@@ -4421,6 +4515,70 @@ mod tests {
             assert_eq!(body["error"], "invalid_args", "{verb}");
             assert_eq!(body["field"], field, "{verb}");
         }
+    }
+
+    #[tokio::test]
+    async fn region_mesh_dispatch_uses_long_pool_and_replies_once() {
+        let (ingress, source, depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(1));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        for index in 0..2 {
+            let mut incoming = command("comp.region.select", index);
+            incoming.from = "mesh-agent".into();
+            incoming.args = json!({"output":"Output-1","timeout_ms":55_000});
+            incoming.body = incoming.args.to_string();
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp",
+                incoming,
+            );
+        }
+        let busy = replies.try_recv().unwrap();
+        assert_eq!(busy.id.as_deref(), Some("1"));
+        assert_eq!(busy.rc, 10);
+        assert_eq!(
+            serde_json::from_str::<Value>(&busy.body).unwrap()["error"],
+            "busy"
+        );
+        assert_eq!(permits.available_permits(), PORT_QUEUE_CAPACITY);
+        assert_eq!(long_permits.available_permits(), 0);
+        let Ok(PortCommand::Long(mut request)) = source.try_recv() else {
+            panic!("region must use LongAdmission");
+        };
+        assert!(
+            matches!(request.op.take(),Some(LongOp::RegionSelect{output:Some(name),timeout})
+            if name=="Output-1" && timeout==Duration::from_secs(55))
+        );
+        request.slot.take();
+        assert_eq!(depth.load(Ordering::Acquire), 0);
+        assert!(replies.try_recv().is_err(), "selection is still pending");
+        request
+            .reply
+            .take()
+            .unwrap()
+            .send(ControlReply::Body(
+                json!({"version":1,"status":"cancelled","reason":"escape"}),
+            ))
+            .unwrap();
+        responders.join_next().await.unwrap().unwrap();
+        let reply = replies.try_recv().unwrap();
+        assert_eq!(reply.from, "mesh-agent");
+        assert_eq!(reply.id.as_deref(), Some("0"));
+        assert_eq!(reply.rc, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&reply.body).unwrap()["status"],
+            "cancelled"
+        );
+        assert!(replies.try_recv().is_err(), "exactly one terminal reply");
+        assert_eq!(long_permits.available_permits(), 1);
     }
 
     #[tokio::test]

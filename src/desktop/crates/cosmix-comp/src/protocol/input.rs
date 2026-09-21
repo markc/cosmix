@@ -732,6 +732,10 @@ fn input_event_code<B: InputBackend>(event: &InputEvent<B>) -> u64 {
 }
 
 pub(crate) fn route_input_event<B: InputBackend>(state: &mut WaylandState, event: InputEvent<B>) {
+    #[cfg(feature = "bus")]
+    if matches!(event, InputEvent::DeviceRemoved { .. }) {
+        state.abandon_region_input();
+    }
     // Wall + CPU cost of dispatching one host input event, on the dispatch
     // thread. A pointer-motion burst that blocks the render/service loop shows
     // up here as long/frequent `comp_input_dispatch` spans interleaved with the

@@ -17,6 +17,7 @@ use std::{
 #[derive(Clone)]
 struct Options {
     output: Option<String>,
+    region: Option<wayland::Region>,
     directory: PathBuf,
     vaapi_device: Option<PathBuf>,
 }
@@ -126,6 +127,7 @@ fn options() -> Result<Option<Options>, String> {
     }
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
     Ok(Some(Options {
+        region: None,
         output,
         directory,
         vaapi_device,
@@ -172,6 +174,7 @@ fn run_job(
 ) {
     let result = (|| -> Result<(), String> {
         let mut capture = wayland::Capture::connect(options.output.as_deref(), cancel.clone())?;
+        capture.region = options.region;
         let capture_started = Instant::now();
         let first = capture.frame()?;
         {
@@ -320,7 +323,15 @@ fn recording_shortfall(elapsed: Duration, fps: u32, frames: u64) -> u64 {
     ((elapsed.as_secs_f64() * f64::from(fps)).round() as u64).saturating_sub(frames)
 }
 
-fn request(command: &str, body: &str) -> Result<Option<(bool, u32)>, String> {
+#[derive(Debug, PartialEq)]
+struct JobRequest {
+    video: bool,
+    fps: u32,
+    output: Option<String>,
+    region: Option<wayland::Region>,
+}
+
+fn request(command: &str, body: &str) -> Result<Option<JobRequest>, String> {
     if body.len() > 1024 {
         return Err("capture request exceeds 1024 bytes".into());
     }
@@ -342,13 +353,38 @@ fn request(command: &str, body: &str) -> Result<Option<(bool, u32)>, String> {
                     .ok_or("fps must be an integer 1..60")? as u32,
                 None => 30,
             };
-            Ok(Some((true, fps)))
+            Ok(Some(JobRequest {
+                video: true,
+                fps,
+                output: None,
+                region: None,
+            }))
         }
-        "capture.screenshot" | "capture.stop" | "capture.status" => {
+        "capture.screenshot" => {
+            if object.keys().any(|k| k != "output" && k != "region") {
+                return Err("unknown screenshot option".into());
+            }
+            let output = match object.get("output") {
+                None => None,
+                Some(Value::String(name)) if !name.is_empty() => Some(name.clone()),
+                _ => return Err("output must be a non-empty string".into()),
+            };
+            let region = object
+                .get("region")
+                .map(wayland::Region::parse)
+                .transpose()?;
+            Ok(Some(JobRequest {
+                video: false,
+                fps: 30,
+                output,
+                region,
+            }))
+        }
+        "capture.stop" | "capture.status" => {
             if !object.is_empty() {
                 return Err("this command takes an empty object".into());
             }
-            Ok((command == "capture.screenshot").then_some((false, 30)))
+            Ok(None)
         }
         _ => Err("unknown capture command".into()),
     }
@@ -389,12 +425,14 @@ async fn main() -> Result<(), String> {
                 if job.as_ref().is_some_and(|j|j.thread.is_finished()) { let _ = job.take().unwrap().thread.join(); }
                 let result = (|| -> Result<Value,String> {
                     let start = request(&command.command,&command.body)?;
-                    if let Some((video,fps)) = start {
+                    if let Some(JobRequest {video,fps,output,region}) = start {
                         if job.is_some() { return Err("capture job already active".into()); }
                         let (path,partial) = reserve(&options,video)?;
                         *status.lock().unwrap() = Status {phase:if video {"starting"}else{"screenshot"},path:Some(path.clone()),vaapi_device:options.vaapi_device.clone(),..Default::default()};
                         let cancel = Arc::new(AtomicBool::new(false));
-                        let (opts,flag,state) = (options.clone(),cancel.clone(),status.clone());
+                        let (mut opts,flag,state) = (options.clone(),cancel.clone(),status.clone());
+                        if output.is_some() { opts.output=output; }
+                        opts.region=region;
                         let thread = std::thread::Builder::new().name("cosmix-capture".into()).spawn(move ||run_job(opts,video,fps,path,partial,flag,state)).map_err(|e|e.to_string())?;
                         job = Some(Job {cancel,thread});
                     } else if command.command=="capture.stop" && let Some(job)=&job {
@@ -467,7 +505,15 @@ mod tests {
     #[test]
     fn strict_commands_and_fps() {
         assert!(request("capture.status", &" ".repeat(1025)).is_err());
-        assert_eq!(request("capture.start", "{}").unwrap(), Some((true, 30)));
+        assert_eq!(
+            request("capture.start", "{}").unwrap(),
+            Some(JobRequest {
+                video: true,
+                fps: 30,
+                output: None,
+                region: None
+            })
+        );
         for body in [
             "{\"fps\":0}",
             "{\"fps\":61}",
@@ -479,6 +525,57 @@ mod tests {
         }
         assert!(request("capture.stop", "{\"fps\":30}").is_err());
         assert!(request("other", "{}").is_err());
+    }
+    #[test]
+    fn screenshot_region_arguments_and_no_arg_compatibility() {
+        let empty = JobRequest {
+            video: false,
+            fps: 30,
+            output: None,
+            region: None,
+        };
+        assert_eq!(request("capture.screenshot", "{}").unwrap(), Some(empty));
+        assert_eq!(
+            request("capture.screenshot", "").unwrap(),
+            request("capture.screenshot", "{}").unwrap()
+        );
+        let job = request(
+            "capture.screenshot",
+            r#"{"output":"Output-1","region":{"x":10,"y":20,"width":30,"height":40}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(job.output.as_deref(), Some("Output-1"));
+        assert_eq!(
+            job.region,
+            Some(wayland::Region {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40
+            })
+        );
+        for body in [
+            r#"{"output":""}"#,
+            r#"{"output":null}"#,
+            r#"{"region":null}"#,
+            r#"{"region":{"x":-1,"y":0,"width":1,"height":1}}"#,
+            r#"{"region":{"x":0,"y":0,"width":0,"height":1}}"#,
+            r#"{"region":{"x":0.5,"y":0,"width":1,"height":1}}"#,
+            r#"{"region":{"x":2147483647,"y":0,"width":1,"height":1}}"#,
+            r#"{"region":{"x":0,"y":0,"width":1,"height":1,"extra":0}}"#,
+            r#"{"region":{"x":0,"y":0,"width":1}}"#,
+            r#"{"fps":30}"#,
+        ] {
+            assert!(request("capture.screenshot", body).is_err(), "{body}");
+        }
+        assert!(
+            request(
+                "capture.start",
+                r#"{"region":{"x":0,"y":0,"width":1,"height":1}}"#
+            )
+            .is_err()
+        );
     }
     #[test]
     fn publication_never_clobbers_existing_media() {

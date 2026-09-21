@@ -1286,6 +1286,10 @@ const TEST_LAYER_SHELL_ID: u32 = 15;
 #[path = "window_switching_tests.rs"]
 mod window_switching;
 
+#[cfg(feature = "bus")]
+#[path = "region_selection_tests.rs"]
+mod region_selection_tests;
+
 struct KeybindingHarness {
     server: ProtocolServer,
     client: UnixStream,

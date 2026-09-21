@@ -38,6 +38,9 @@ It reads the node's mesh IP from `/etc/cosmix/node.toml` and binds
 portable across nodes that bring the WG interface up asynchronously. Binding
 `:53` needs `CAP_NET_BIND_SERVICE`. Standalone `--listen <ip:port>` flags are
 available for testing without a live WG interface.
+Standalone logging enables ANSI colours only when stdout is a terminal, keeping
+journald and redirected output plain. The standard daemon logging library already
+detects terminal colour support for its stderr sink.
 
 Example generated zone (illustrative — public placeholders only):
 

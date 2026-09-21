@@ -1,0 +1,325 @@
+-- quoin-shot -- the screenshot furniture, written as Mix Scenes. One citizen
+-- owns one scene:
+--
+--   shot   right edge: capture mode (full screen / region / window), a delay,
+--          Take, a preview of the last capture, and the recent shots
+--
+-- It owns no pixels and no selection UI of its own. The two things it cannot
+-- do in the scene vocabulary it asks the substrate for:
+--
+--   region   comp.region.select -- comp draws the rubber band inside its own
+--            Bevy world (furniture-in-comp) and replies with the rectangle
+--   pixels   capture.screenshot -- the capture citizen, which crops through
+--            zwlr_screencopy's CaptureOutputRegion
+--
+-- so every mode is the same two calls with a different rectangle, and an agent
+-- on the mesh can make either call itself without going through this panel.
+--
+-- Run: mix --serve quoin-shot.mix --name quoin-shot
+-- Env: SCENE_HOST (default shell), COMP_SERVICE (comp), CAPTURE_SERVICE
+--      (capture) -- a nested dev desktop points these elsewhere.
+$p = require("lib/panel.mix")
+
+$ME = "quoin-shot"
+$HOST = env("SCENE_HOST", "shell")
+$COMP = env("COMP_SERVICE", "comp")
+$CAPTURE = env("CAPTURE_SERVICE", "capture")
+$EDGE = "right"
+$LOG = env("XDG_RUNTIME_DIR", "/tmp") .. "/quoin-shot.log"
+
+-- Breeze Dark, the palette the panel already uses.
+$C = {
+  fg: "#fcfcfc", dim: "#a1a9b1", faint: "#6e7680", accent: "#3daee9",
+  accent_bg: "#3daee940", card: "#2a2e32", hover: "#ffffff1a",
+  ok: "#27ae60", err: "#e74c3c"
+}
+
+$MAX_RECENT = 8
+-- comp caps a selection well inside LONG_VERB_MAX; ask for less than that so
+-- the long-verb deadline is never the thing that ends our wait.
+$SELECT_TIMEOUT_MS = 30000
+
+$state = {
+  mode: "region",
+  delay: 0,
+  last: nil,
+  status: "Ready",
+  status_tone: "dim",
+  recent: [],
+  open: false,
+  busy: false
+}
+
+fn note($msg)
+  try
+    append_file($LOG, now_iso() .. "  " .. $msg .. "\n")
+  catch $e
+    return 0
+  end
+  return 0
+end
+
+fn rpc($target, $verb, $payload)
+  send $target $verb body=json_encode($payload) timeout=60
+  if $rc != 0 then return nil end
+  if type($result) == "string" then
+    try
+      return json_parse($result)
+    catch $e
+      return nil
+    end
+  end
+  return $result
+end
+
+fn load_scene($doc)
+  send $HOST shell.scene.load body=$doc timeout=5
+  if $rc != 0 then return 0 end
+  return 1
+end
+
+fn panel_verb($verb)
+  send $HOST $verb body=json_encode({edge: $EDGE}) timeout=3
+  return $rc
+end
+
+-- ── the scene ───────────────────────────────────────────────────────────
+fn mode_button($id, $label, $mode)
+  $node = {widget: "button", label: $label, on_click: "mode", tone: "flat"}
+  if $state.mode == $mode then
+    $node.tone = "primary"
+  end
+  return $node
+end
+
+fn shot_doc()
+  $nodes = []
+  push($nodes, ["root", {widget: "column", gap: 12, padding: 14, children:
+    ["hdr", "modes", "delay_row", "take", "status", "preview", "actions", "recent_h", "recent"]}])
+  push($nodes, ["hdr", {widget: "text", text: "Screenshot", size: 18, bold: true, color: $C.fg}])
+
+  push($nodes, ["modes", {widget: "row", gap: 6, children: ["m_full", "m_region", "m_window"]}])
+  push($nodes, ["m_full", mode_button("m_full", "Full screen", "full")])
+  push($nodes, ["m_region", mode_button("m_region", "Region", "region")])
+  push($nodes, ["m_window", mode_button("m_window", "Window", "window")])
+
+  push($nodes, ["delay_row", {widget: "row", gap: 8, align: "center", children: ["delay_l", "delay"]}])
+  push($nodes, ["delay_l", {widget: "text", text: "Delay (s)", size: 13, color: $C.dim, width: 80}])
+  push($nodes, ["delay", {widget: "field", value: to_string($state.delay), placeholder: "0", on_change: "delay"}])
+
+  $take_label = $state.mode == "region" ? "Select region…" : "Take screenshot"
+  if $state.busy then $take_label = "Working…" end
+  push($nodes, ["take", {widget: "button", label: $take_label, tone: "primary", on_click: "take"}])
+
+  $tone = $C.dim
+  if $state.status_tone == "ok" then $tone = $C.ok end
+  if $state.status_tone == "err" then $tone = $C.err end
+  push($nodes, ["status", {widget: "text", text: $state.status, size: 12, color: $tone}])
+
+  if $state.last != nil then
+    push($nodes, ["preview", {widget: "image", src: $state.last, w: 340}])
+    push($nodes, ["actions", {widget: "row", gap: 6, children: ["a_open", "a_folder"]}])
+    push($nodes, ["a_open", {widget: "button", label: "Open", on_click: "open", tone: "flat"}])
+    push($nodes, ["a_folder", {widget: "button", label: "Show folder", on_click: "folder", tone: "flat"}])
+  else
+    push($nodes, ["preview", {widget: "spacer"}])
+    push($nodes, ["actions", {widget: "spacer"}])
+  end
+
+  push($nodes, ["recent_h", {widget: "text", text: "Recent", size: 12, bold: true, color: $C.faint}])
+  $rows = []
+  for each $r in $state.recent
+    push($rows, {id: $r.path, cells: [$r.name, $r.when]})
+  end
+  push($nodes, ["recent", {widget: "list", rows: $rows, on_click: "recent", hidden_if_empty: true}])
+
+  return $p.document({scene: "1", name: "shot", citizen: $ME,
+    window: {kind: "edge", edge: $EDGE, title: "Screenshot", w: 380, chrome: false}}, $nodes)
+end
+
+fn render()
+  $doc = shot_doc()
+  load_scene($doc)
+  return 0
+end
+
+fn set_status($text, $tone)
+  $state.status = $text
+  $state.status_tone = $tone
+  return 0
+end
+
+fn remember($path)
+  $name = after_last($path, "/") ?? $path
+  $entry = {path: $path, name: $name, when: substr(now_iso(), 11, 8)}
+  $kept = [$entry]
+  for each $r in $state.recent
+    if length($kept) < $MAX_RECENT and $r.path != $path then
+      push($kept, $r)
+    end
+  end
+  $state.recent = $kept
+  $state.last = $path
+  return 0
+end
+
+-- ── capture ─────────────────────────────────────────────────────────────
+-- The panel must not appear in its own screenshot, so it hides for the shot
+-- and comes back afterwards. Region mode hides BEFORE the selection too: the
+-- rubber band should be drawn over the desktop, not over this panel.
+fn with_panel_hidden($verb, $payload, $target)
+  panel_verb("shell.panel.hide")
+  $reply = rpc($target, $verb, $payload)
+  panel_verb("shell.panel.pin")
+  return $reply
+end
+
+fn focused_window()
+  $list = rpc($COMP, "comp.windows.list", {})
+  if $list == nil then return nil end
+  for each $w in ($list.windows ?? [])
+    if $w.focused == true and $w.minimized != true then return $w end
+  end
+  return nil
+end
+
+fn shoot_full()
+  return with_panel_hidden("capture.screenshot", {}, $CAPTURE)
+end
+
+fn shoot_region()
+  panel_verb("shell.panel.hide")
+  $sel = rpc($COMP, "comp.region.select", {timeout_ms: $SELECT_TIMEOUT_MS})
+  if $sel == nil then
+    panel_verb("shell.panel.pin")
+    set_status("comp.region.select did not answer", "err")
+    return nil
+  end
+  $status = to_string($sel.status ?? "")
+  if $status != "selected" then
+    panel_verb("shell.panel.pin")
+    if $status == "timeout" then
+      set_status("Selection timed out", "dim")
+    else
+      set_status("Selection cancelled", "dim")
+    end
+    return nil
+  end
+  $shot = rpc($CAPTURE, "capture.screenshot",
+    {output: $sel.output, region: $sel.region})
+  panel_verb("shell.panel.pin")
+  return $shot
+end
+
+fn shoot_window()
+  $w = focused_window()
+  if $w == nil then
+    set_status("No focused window to capture", "err")
+    return nil
+  end
+  return with_panel_hidden("capture.screenshot",
+    {output: $w.output, region: {x: $w.x, y: $w.y, width: $w.width, height: $w.height}},
+    $CAPTURE)
+end
+
+-- ── handlers ────────────────────────────────────────────────────────────
+fn node_of()
+  $a = $event.args
+  if $a == nil or type($a) != "map" then return "" end
+  return to_string($a.node ?? "")
+end
+
+fn value_of()
+  $a = $event.args
+  if $a == nil or type($a) != "map" then return "" end
+  return to_string($a.value ?? "")
+end
+
+on shot desc "toggle the screenshot panel"
+  reply(0, "")
+  if $state.open then
+    send $HOST shell.scene.unload body=json_encode({scene: "shot"}) timeout=3
+    $state.open = false
+  else
+    $state.open = true
+    render()
+  end
+end
+
+on mode desc "choose full screen, region or window"
+  reply(0, "")
+  $node = node_of()
+  if $node == "m_full" then $state.mode = "full" end
+  if $node == "m_region" then $state.mode = "region" end
+  if $node == "m_window" then $state.mode = "window" end
+  set_status("Ready", "dim")
+  render()
+end
+
+on delay desc "capture delay in seconds"
+  reply(0, "")
+  $n = to_number(value_of())
+  if $n == nil or $n < 0 then $n = 0 end
+  if $n > 60 then $n = 60 end
+  $state.delay = $n
+end
+
+on take desc "take the screenshot in the selected mode" async
+  reply(0, "")
+  if $state.busy then return end
+  $state.busy = true
+  render()
+  try
+    if $state.delay > 0 then
+      set_status("Waiting " .. to_string($state.delay) .. "s…", "dim")
+      render()
+      sleep($state.delay)
+    end
+    $shot = nil
+    if $state.mode == "full" then
+      $shot = shoot_full()
+    elif $state.mode == "region" then
+      $shot = shoot_region()
+    else
+      $shot = shoot_window()
+    end
+    if $shot != nil then
+      $path = to_string($shot.path ?? "")
+      if $path == "" then
+        set_status("Capture returned no path", "err")
+      else
+        remember($path)
+        set_status("Saved " .. (after_last($path, "/") ?? $path), "ok")
+      end
+    end
+  catch $err
+    note("take failed: " .. to_string($err))
+    set_status("Failed: " .. to_string($err), "err")
+  end
+  $state.busy = false
+  render()
+end
+
+on open desc "open the last screenshot" async
+  reply(0, "")
+  if $state.last == nil then return end
+  spawn(["xdg-open", $state.last], {detach: true})
+end
+
+on folder desc "open the folder holding the screenshots" async
+  reply(0, "")
+  if $state.last == nil then return end
+  spawn(["xdg-open", dirname($state.last)], {detach: true})
+end
+
+on recent desc "select a recent screenshot as the preview"
+  reply(0, "")
+  $id = ""
+  $a = $event.args
+  if $a != nil and type($a) == "map" then $id = to_string($a.item ?? "") end
+  if $id != "" then
+    $state.last = $id
+    set_status("Showing " .. (after_last($id, "/") ?? $id), "dim")
+    render()
+  end
+end

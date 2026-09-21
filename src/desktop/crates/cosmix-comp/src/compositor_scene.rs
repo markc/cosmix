@@ -274,6 +274,8 @@ impl Plugin for CompositorScenePlugin {
         crate::render_asset_readiness::configure(app);
         crate::render_asset_demand::configure(app);
         crate::render_component_demand::configure(app);
+        #[cfg(feature = "bus")]
+        crate::region_scene::install(app);
     }
 
     fn finish(&self, app: &mut App) {

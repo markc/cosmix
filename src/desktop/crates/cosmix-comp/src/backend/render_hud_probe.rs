@@ -217,13 +217,20 @@ fn update(world: &mut World) {
                 .get::<crate::capture::CaptureOutputSource>(output.owner)
                 .map(|source| source.output_name.clone())
                 .unwrap_or_else(|| "primary".into());
-            if let Some(mut native) = world.get_resource_mut::<cosmix_quoin::embedded::EmbeddedOutput>()
+            #[cfg(feature = "bus")]
+            let selecting = world
+                .get_resource::<crate::region_scene::RegionBridge>()
+                .is_some_and(|b| b.active());
+            #[cfg(not(feature = "bus"))]
+            let selecting = false;
+            if let Some(mut native) =
+                world.get_resource_mut::<cosmix_quoin::embedded::EmbeddedOutput>()
             {
                 native.camera = Some(output.owner);
                 native.size = size;
                 native.name = name;
                 native.active = active && !fullscreen;
-                native.pointer = (active && !fullscreen && pointer.on_output)
+                native.pointer = (active && !fullscreen && pointer.on_output && !selecting)
                     .then_some(Vec2::new(pointer.x as f32, pointer.y as f32));
             }
         }
@@ -250,7 +257,8 @@ fn update(world: &mut World) {
         }
         let (phase, amount) = panel_cycle(probe.started.elapsed().as_secs_f32());
         #[cfg(feature = "embedded-quoin")]
-        let active_hud = active && !world.contains_resource::<cosmix_quoin::embedded::EmbeddedOutput>();
+        let active_hud =
+            active && !world.contains_resource::<cosmix_quoin::embedded::EmbeddedOutput>();
         #[cfg(not(feature = "embedded-quoin"))]
         let active_hud = active;
         if let Some(mut node) = world.get_mut::<Node>(output.panel) {

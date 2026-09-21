@@ -385,6 +385,8 @@ The control plane exposes these verbs:
   and returns `{version:1,topic:"<service>.pointer.changed",lease_ms:3000}`.
   Subscribe before calling; renew about once per second while observation is
   wanted. The acknowledgement contains no pointer coordinates.
+- `comp.region.select {output?,timeout_ms?}` selects a rectangle using native
+  compositor furniture. See Region selection below.
 - `comp.window.minimize {id,generation}` minimises one window, like its
   title-bar button. Both fields are required.
 - `comp.window.restore {id?,generation?}` with no arguments restores the most
@@ -408,6 +410,52 @@ The control plane exposes these verbs:
   `comp.input.pointer.scroll`, `comp.input.key`, `comp.input.release_all` and
   `comp.input.sequence` inject input through the real seat (see Input
   injection below).
+
+### Region selection
+
+`comp.region.select` holds one pending reply while the seat selects a region.
+Left-button drag selects; reverse drags are normalised and rounded outwards to
+integer logical units. A click or zero-area drag keeps selection armed. Esc or
+right-button press cancels. Unknown fields are rejected. `timeout_ms` defaults
+to 30000 and accepts 1–55000: three further seconds bound clean-frame removal,
+with a four-second responder margin, strictly below the 60-second long-verb cap.
+Set the caller's Bus timeout above that total budget.
+
+An explicit `output` restricts selection to that named output. Otherwise the
+first left press chooses its output. Dragging across its edge clips the rectangle;
+this does not stitch multiple outputs. Success (rc 0) is:
+
+```json
+{"version":1,"status":"selected","output":"Output-1","output_generation":42,"coordinate_space":"output-local-logical","region":{"x":100,"y":80,"width":640,"height":360}}
+```
+
+Coordinates are relative to the displayed output's top-left, before conversion
+to physical pixels. Cancellation returns
+`{"version":1,"status":"cancelled","reason":"escape"}` (or `right_button`);
+timeout returns `{"version":1,"status":"timeout"}`. These are rc 0 outcomes.
+Successful/normal completion waits for a submitted frame without the overlay.
+Failure to prove removal within the margin returns rc 10 `busy`, never success.
+
+A second selector, an existing pointer/popup grab, touch sequence, native panel
+drag, input sequence or window manipulation returns rc 10 `busy`. Output identity,
+generation, geometry, scale or transform changing returns `output_changed`.
+Session lock returns `locked`. These are lifecycle/correctness rules, not caller
+permissions. Temporary seat focus does not deactivate or restack fullscreen windows.
+Pointer constraints are released for selection and reconsidered on focus restoration.
+VT/focus/device loss and a closed local responder clean up input ownership.
+Remote caller disappearance is bounded by the deadline; immediate remote request
+cancellation is not currently propagated to the local responder.
+
+The result contains geometry only. Pass `output` and `region` to
+`capture.screenshot`; an agent that already knows its rectangle can call capture
+directly. `output_generation` describes selection-time identity; capture's current
+Wayland request does not carry that generation, so this is not an atomic
+selection-to-capture topology fence.
+
+Compositor log colours require both stdout and the stderr log sink to be terminals.
+Pipes, files and journald receive plain text in both KMS and nested modes.
+
+### Minimise and restore
 
 Minimise and restore reply `{id,generation,title,app_id,minimized,changed}`;
 `changed:false` means the window was already in the requested state.

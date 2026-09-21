@@ -1995,8 +1995,6 @@ impl SeatHandler for WaylandState {
         let focused_root = focused_surface
             .as_ref()
             .map(|surface| canonical_root_surface(&self.popup_manager, surface));
-        #[cfg(feature = "xwayland")]
-        self.publish_x11_active_window(focused_root.as_ref());
         // Data-device focus is still withheld from X11 targets, but the reason
         // CHANGED with X-2b and the old one ("comp refuses to bridge") is no
         // longer true. Xwayland is itself a Wayland client, so granting it
@@ -2021,6 +2019,14 @@ impl SeatHandler for WaylandState {
         // resolved-focus surface every other consumer here uses, so text input
         // cannot disagree with keyboard focus about where typing goes.
         seat.text_input().set_focus(focused_surface.clone());
+        // Temporary native modal focus is a seat transition, not window
+        // deactivation: do not configure clients or demote fullscreen stacking.
+        #[cfg(feature = "bus")]
+        if self.region.suspended {
+            return;
+        }
+        #[cfg(feature = "xwayland")]
+        self.publish_x11_active_window(focused_root.as_ref());
         let toplevels = self
             .surfaces
             .values()
@@ -2207,7 +2213,7 @@ impl PointerConstraintsHandler for WaylandState {
         // first physical motion outside every corner activates it
         // (`service_deferred_constraint_activation`, end of pointer_moved).
         #[cfg(feature = "bus")]
-        if self.corner_engaged() {
+        if self.corner_engaged() || self.region.suspended {
             self.defer_constraint_activation();
             return;
         }
