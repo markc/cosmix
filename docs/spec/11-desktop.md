@@ -1,9 +1,9 @@
 ---
 title: Desktop Protocol, Rendering and Control
 chapter: 11
-version: 0.1.1
+version: 0.2.0
 status: draft
-date: 2026-09-05
+date: 2026-09-21
 ---
 
 # Desktop protocol, rendering and control
@@ -61,7 +61,20 @@ XR, depth-composited application scenes and scene-switchboard clients are resear
 
 **DESKTOP-008 — Trusted presentation.** Session lock and consent require compositor-enforced ordering and input isolation. Ordinary client appearance cannot establish authority. A lock protocol implementation is distinct from the full intended compositor-drawn consent/palette experience. Capture while locked and client disconnect during lock require explicit fail-closed tests.
 
-**DESKTOP-009 — Furniture isolation.** Panels, docks, notifications and pagers must remain separate client processes; furniture must never move in-process into the compositor. Preserve crash isolation and independent release cadence. Shared design tokens provide coherent appearance without removing this boundary. This does not reclassify compositor-owned trusted lock/consent surfaces as furniture. Guest toolkits remain compatible through standard protocols without requiring native CTK styling.
+**DESKTOP-009 — Furniture isolation.** *(Revised 2026-09-21. The previous rule — "panels, docks, notifications and pagers must remain separate client processes; furniture must never move in-process into the compositor" — is SUPERSEDED. It prohibited the architecture that was subsequently accepted, and the measurement it rested on did not reproduce.)*
+
+Desktop furniture — panels, docks, notifications, pagers, launcher, wallpaper — **renders inside the compositor**. It is not required to be a separate client process, and a separate rendering process is not the mechanism by which isolation is obtained.
+
+**Isolation is preserved at the logic boundary, not the rendering boundary.** Furniture *content and behaviour* live in citizen processes outside the compositor, communicating declaratively; the compositor renders what they declare. The requirements that the old rule was protecting are restated here as obligations on that boundary:
+
+- The compositor must **refuse an invalid or malformed scene document** rather than fault on it. A citizen cannot crash the compositor by describing bad furniture.
+- A **slow or dead citizen must not block compositor input**, leave stale space reservations, or prevent the user hiding or re-moding a panel. Compositor-owned controls remain available when the citizen owning a panel's content is gone.
+- Furniture content must carry an **owner identity and generation**, so a late message from a retired owner cannot revive removed furniture.
+- **Independent release cadence** applies to citizens, which are scripts and may be changed without rebuilding the compositor.
+
+Crash isolation of the *rendering* itself is now the same class of risk as any other compositor defect, and is accepted deliberately: the compositor is already a single point of failure for the session, and a second rendering process was measured at 183 MB resident and 492 MB of GPU allocation for a panel.
+
+This does not reclassify compositor-owned trusted lock/consent surfaces as furniture. Guest toolkits remain compatible through standard protocols without requiring native CTK styling, and applications remain separate client processes free to use any toolkit — the furniture/application split is the boundary that matters, not furniture/compositor.
 
 The old shell-before-compositor sequence and remote `ui.*` drawing protocol are superseded. Wayland carries desktop protocol interactions; Bus carries semantic control and observation. Existing protocol handlers do not establish complete portal, workspace, multi-seat or guest support. Enumerate support by actual advertised version, implemented semantics and interoperability evidence.
 
