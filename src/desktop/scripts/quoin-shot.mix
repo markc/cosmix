@@ -164,13 +164,48 @@ fn remember($path)
 end
 
 -- ── capture ─────────────────────────────────────────────────────────────
--- The panel must not appear in its own screenshot, so it hides for the shot
--- and comes back afterwards. Region mode hides BEFORE the selection too: the
--- rubber band should be drawn over the desktop, not over this panel.
+-- capture.screenshot REPLIES EARLY. It reserves a path, spawns the job on a
+-- thread and answers immediately (capture/src/main.rs: the reply is the status
+-- snapshot taken right after `reserve`), so its reply proves only that the job
+-- started -- the screencopy round trip has not happened yet. Re-showing the
+-- panel on that reply put the panel INTO its own screenshot on every shot, in
+-- every mode (found in cold review 2026-09-21). Nothing may act on the reply
+-- until the file is actually on disk.
+fn await_capture($path, $deadline_s)
+  if $path == "" then return false end
+  $deadline = time() + $deadline_s
+  while time() < $deadline
+    $st = rpc($CAPTURE, "capture.status", {})
+    $phase = ""
+    if $st != nil then $phase = to_string($st.phase ?? "") end
+    -- idle again AND the bytes are there: either alone can be true mid-job
+    -- (the path is reserved before the frame, the phase clears before the
+    -- encoder's final flush on some paths).
+    if $phase != "screenshot" and is_file($path) then
+      return true
+    end
+    sleep(0.1)
+  end
+  return false
+end
+
+fn path_of($reply)
+  if $reply == nil then return "" end
+  return to_string($reply.path ?? "")
+end
+
+-- The panel must not appear in its own screenshot, so it hides for the shot and
+-- comes back only once the capture has LANDED. Region mode hides before the
+-- selection too: the rubber band belongs over the desktop, not over this panel.
 fn with_panel_hidden($verb, $payload, $target)
   panel_verb("shell.panel.hide")
   $reply = rpc($target, $verb, $payload)
+  $landed = await_capture(path_of($reply), 20)
   panel_verb("shell.panel.pin")
+  if not $landed then
+    set_status("Capture did not land within 20s", "err")
+    return nil
+  end
   return $reply
 end
 
@@ -207,8 +242,34 @@ fn shoot_region()
   end
   $shot = rpc($CAPTURE, "capture.screenshot",
     {output: $sel.output, region: $sel.region})
+  $landed = await_capture(path_of($shot), 20)
   panel_verb("shell.panel.pin")
+  if not $landed then
+    set_status("Capture did not land within 20s", "err")
+    return nil
+  end
   return $shot
+end
+
+-- comp.windows.list reports window geometry in GLOBAL compositor-logical
+-- coordinates, but capture.screenshot's region is OUTPUT-LOCAL: comp clamps x/y
+-- against that one output's extents and discards the origin. Feeding a global x
+-- straight in captured the wrong rectangle -- silently clamped to the edge, or
+-- an empty region and a failed frame -- on every layout whose output does not
+-- start at (0,0), i.e. every second monitor (cold review 2026-09-21, found by
+-- both arms). Subtract the output's own origin, and round: window geometry is
+-- f32, and under fractional scaling a `100.5` is rejected outright by the
+-- capture app's integer-only region parser.
+fn output_origin($name)
+  $outs = rpc($COMP, "comp.props.get", {path: "outputs"})
+  if $outs == nil or type($outs) != "map" then return nil end
+  for each $key in keys($outs)
+    $o = $outs[$key]
+    if type($o) == "map" and to_string($o.name ?? "") == $name then
+      return $o
+    end
+  end
+  return nil
 end
 
 fn shoot_window()
@@ -217,8 +278,40 @@ fn shoot_window()
     set_status("No focused window to capture", "err")
     return nil
   end
+  $name = to_string($w.output ?? "")
+  if $name == "" then
+    set_status("Focused window is on no output", "err")
+    return nil
+  end
+  $out = output_origin($name)
+  if $out == nil then
+    set_status("Output " .. $name .. " has no geometry", "err")
+    return nil
+  end
+  $x = round(to_number($w.x) - to_number($out.x))
+  $y = round(to_number($w.y) - to_number($out.y))
+  $rw = round(to_number($w.width))
+  $rh = round(to_number($w.height))
+  -- Clip to the output; a window straddling two monitors or hanging off the
+  -- left/top edge otherwise produces a region comp will refuse.
+  if $x < 0 then
+    $rw = $rw + $x
+    $x = 0
+  end
+  if $y < 0 then
+    $rh = $rh + $y
+    $y = 0
+  end
+  $ow = to_number($out.width)
+  $oh = to_number($out.height)
+  if $x + $rw > $ow then $rw = $ow - $x end
+  if $y + $rh > $oh then $rh = $oh - $y end
+  if $rw <= 0 or $rh <= 0 then
+    set_status("Window is not visible on " .. $name, "err")
+    return nil
+  end
   return with_panel_hidden("capture.screenshot",
-    {output: $w.output, region: {x: $w.x, y: $w.y, width: $w.width, height: $w.height}},
+    {output: $name, region: {x: $x, y: $y, width: $rw, height: $rh}},
     $CAPTURE)
 end
 

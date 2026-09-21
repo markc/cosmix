@@ -433,12 +433,16 @@ Coordinates are relative to the displayed output's top-left, before conversion
 to physical pixels. Cancellation returns
 `{"version":1,"status":"cancelled","reason":"escape"}` (or `right_button`);
 timeout returns `{"version":1,"status":"timeout"}`. These are rc 0 outcomes.
-Successful/normal completion waits for a submitted frame without the overlay.
+Successful completion waits for a submitted frame without the overlay on the
+selected output; an unrelated sleeping monitor does not delay that reply.
+Cancellation/timeout before an output is chosen still waits on all candidate outputs.
 Failure to prove removal within the margin returns rc 10 `busy`, never success.
 
 A second selector, an existing pointer/popup grab, touch sequence, native panel
 drag, input sequence or window manipulation returns rc 10 `busy`. Output identity,
-generation, geometry, scale or transform changing returns `output_changed`.
+generation, geometry, scale or transform changing before a result is decided
+returns `output_changed`. A decided result is preserved during cleanup.
+A requested output name that does not exist returns `unknown_output`.
 Session lock returns `locked`. These are lifecycle/correctness rules, not caller
 permissions. Temporary seat focus does not deactivate or restack fullscreen windows.
 Pointer constraints are released for selection and reconsidered on focus restoration.
@@ -452,8 +456,9 @@ directly. `output_generation` describes selection-time identity; capture's curre
 Wayland request does not carry that generation, so this is not an atomic
 selection-to-capture topology fence.
 
-Compositor log colours require both stdout and the stderr log sink to be terminals.
-Pipes, files and journald receive plain text in both KMS and nested modes.
+Compositor log colours follow the stderr log sink's terminal status. Redirecting
+stdout alone preserves colour; stderr pipes, files and journald receive plain text
+in both KMS and nested modes.
 
 ### Minimise and restore
 

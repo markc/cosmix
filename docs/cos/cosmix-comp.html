@@ -822,11 +822,15 @@ this does not stitch multiple outputs. Success (rc 0) is:</p>
 to physical pixels. Cancellation returns
 <code>{"version":1,"status":"cancelled","reason":"escape"}</code> (or <code>right_button</code>);
 timeout returns <code>{"version":1,"status":"timeout"}</code>. These are rc 0 outcomes.
-Successful/normal completion waits for a submitted frame without the overlay.
+Successful completion waits for a submitted frame without the overlay on the
+selected output; an unrelated sleeping monitor does not delay that reply.
+Cancellation/timeout before an output is chosen still waits on all candidate outputs.
 Failure to prove removal within the margin returns rc 10 <code>busy</code>, never success.</p>
 <p>A second selector, an existing pointer/popup grab, touch sequence, native panel
 drag, input sequence or window manipulation returns rc 10 <code>busy</code>. Output identity,
-generation, geometry, scale or transform changing returns <code>output_changed</code>.
+generation, geometry, scale or transform changing before a result is decided
+returns <code>output_changed</code>. A decided result is preserved during cleanup.
+A requested output name that does not exist returns <code>unknown_output</code>.
 Session lock returns <code>locked</code>. These are lifecycle/correctness rules, not caller
 permissions. Temporary seat focus does not deactivate or restack fullscreen windows.
 Pointer constraints are released for selection and reconsidered on focus restoration.
@@ -838,8 +842,9 @@ cancellation is not currently propagated to the local responder.</p>
 directly. <code>output_generation</code> describes selection-time identity; capture's current
 Wayland request does not carry that generation, so this is not an atomic
 selection-to-capture topology fence.</p>
-<p>Compositor log colours require both stdout and the stderr log sink to be terminals.
-Pipes, files and journald receive plain text in both KMS and nested modes.</p>
+<p>Compositor log colours follow the stderr log sink's terminal status. Redirecting
+stdout alone preserves colour; stderr pipes, files and journald receive plain text
+in both KMS and nested modes.</p>
 <h3 id="minimise-and-restore">Minimise and restore</h3>
 <p>Minimise and restore reply <code>{id,generation,title,app_id,minimized,changed}</code>;
 <code>changed:false</code> means the window was already in the requested state.

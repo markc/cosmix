@@ -373,7 +373,11 @@ impl LongOp {
         match self {
             // Reserve four seconds after interaction for an acknowledged clean
             // frame (55s + 4s = 59s), strictly inside LONG_VERB_MAX's 60s.
-            Self::RegionSelect { timeout, .. } => *timeout + Duration::from_secs(4),
+            Self::RegionSelect { timeout, .. } => {
+                *timeout
+                    + crate::protocol::region_selection::REGION_CLEANUP_BUDGET
+                    + Duration::from_secs(1)
+            }
             Self::Sequence(steps) => steps.iter().map(|step| step.delay).sum(),
             Self::Wait(spec) => spec.timeout,
             Self::ForceClose { timeout, .. } => *timeout,
@@ -2719,6 +2723,14 @@ mod region_argument_tests {
         let op = parse_region_select(&json!({"output":"Output-1","timeout_ms":55_000})).unwrap();
         assert_eq!(op.budget(), Duration::from_secs(59));
         assert!(op.budget() < LONG_VERB_MAX);
+        let reply_budget =
+            Duration::from_secs(55) + crate::protocol::region_selection::REGION_CLEANUP_BUDGET;
+        assert_eq!(reply_budget, Duration::from_secs(58));
+        assert_eq!(op.budget(), reply_budget + Duration::from_secs(1));
+        assert_eq!(
+            op.budget().min(LONG_VERB_MAX) + LONG_VERB_SLACK,
+            reply_budget + Duration::from_secs(2)
+        );
         assert!(
             matches!(parse_region_select(&json!({})).unwrap(),LongOp::RegionSelect {output:None,timeout} if timeout==Duration::from_secs(30))
         );
@@ -4522,7 +4534,12 @@ mod tests {
         let (ingress, source, depth) = test_ingress();
         let mut responders = JoinSet::new();
         let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
-        let long_permits = Arc::new(Semaphore::new(1));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        // Model seven other long operations occupying the production pool.
+        let other_operations = long_permits
+            .clone()
+            .try_acquire_many_owned((LONG_VERB_PERMITS - 1) as u32)
+            .unwrap();
         let (reply_sender, mut replies) = tokio_mpsc::channel(8);
         let reply_timeouts = Arc::new(AtomicU64::new(0));
         for index in 0..2 {
@@ -4579,6 +4596,8 @@ mod tests {
         );
         assert!(replies.try_recv().is_err(), "exactly one terminal reply");
         assert_eq!(long_permits.available_permits(), 1);
+        drop(other_operations);
+        assert_eq!(long_permits.available_permits(), LONG_VERB_PERMITS);
     }
 
     #[tokio::test]

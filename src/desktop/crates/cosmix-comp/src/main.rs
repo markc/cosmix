@@ -188,13 +188,12 @@ fn init_kms_live_tracing() -> Result<(), Box<dyn Error + Send + Sync>> {
 }
 
 fn log_ansi_enabled() -> bool {
-    // stdout identifies an interactive launch; stderr is the actual log sink.
-    // Either stream redirected to journald/a file must keep stored bytes plain.
+    // Only the actual log sink controls colour; piping stdout is independent.
     log_ansi_for(io::stdout().is_terminal(), io::stderr().is_terminal())
 }
 
-fn log_ansi_for(stdout_terminal: bool, stderr_terminal: bool) -> bool {
-    stdout_terminal && stderr_terminal
+fn log_ansi_for(_stdout_terminal: bool, stderr_terminal: bool) -> bool {
+    stderr_terminal
 }
 
 fn comp_log_layer(_: &mut App) -> Option<bevy::log::BoxedFmtLayer> {
@@ -916,9 +915,9 @@ fn setup_scene(mut commands: Commands) {
         Camera2d,
         capture::CaptureOutputSource {
             source_id: backend::CaptureSourceId::Nested {
-                output_name: "cosmix-nested-0".into(),
+                output_name: backend::NESTED_OUTPUT_NAME.into(),
             },
-            output_name: "cosmix-nested-0".into(),
+            output_name: backend::NESTED_OUTPUT_NAME.into(),
         },
     ));
     commands.spawn((
@@ -1584,6 +1583,21 @@ fn stage_nested_capture_presentations(
     }
 }
 
+#[cfg(feature = "bus")]
+fn complete_nested_region_presentation(
+    region: &region_scene::RegionBridge,
+    acquisition_consumed: bool,
+    revision: Option<u64>,
+) {
+    if acquisition_consumed {
+        region.presented(
+            backend::NESTED_OUTPUT_NAME,
+            backend::NESTED_OUTPUT_GENERATION,
+            revision,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Bevy system parameters.
 fn complete_nested_security_presentation(
     #[cfg(feature = "bus")] region: Option<Res<region_scene::RegionBridge>>,
@@ -1631,12 +1645,16 @@ fn complete_nested_security_presentation(
             sources.consume();
         }
     }
-    if !acquisition_consumed {
-        return;
-    }
     #[cfg(feature = "bus")]
     if let Some(region) = region {
-        region.presented("cosmix-nested-0", 1, candidate.scene_revision);
+        complete_nested_region_presentation(
+            &region,
+            acquisition_consumed,
+            candidate.scene_revision,
+        );
+    }
+    if !acquisition_consumed {
+        return;
     }
     if let Err(error) = poll_nested_security_gpu(epochs.len(), || {
         render_device.poll(PollType::wait_indefinitely())
@@ -1789,8 +1807,8 @@ mod tests {
                 || tracing::info!(state=?"Paused","state changed"),
             );
             let bytes = bytes.lock().unwrap();
-            assert_eq!(bytes.contains(&0x1b), out && err);
-            if !out || !err {
+            assert_eq!(bytes.contains(&0x1b), err);
+            if !err {
                 assert!(String::from_utf8_lossy(&bytes).contains("state=\"Paused\""));
             }
         }

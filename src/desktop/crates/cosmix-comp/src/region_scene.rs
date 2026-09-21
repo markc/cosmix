@@ -51,6 +51,9 @@ impl RegionBridge {
             && s.view
                 .outputs
                 .iter()
+                // A selected rectangle is captured from this output only. A
+                // sleeping unrelated monitor must not hold its reply hostage.
+                .filter(|o| s.view.selected.as_ref().is_none_or(|name| *name == o.name))
                 .all(|o| s.clean_outputs.contains(&o.name))
     }
     pub(crate) fn presented(&self, output: &str, generation: u64, revision: Option<u64>) {
@@ -210,6 +213,47 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn region_clean_frame_only_requires_selected_output() {
+        let bridge = RegionBridge::default();
+        let output = |name: &str| OutputGeometry {
+            name: name.into(),
+            source_id: crate::backend::CaptureSourceId::Nested {
+                output_name: name.into(),
+            },
+            bounds: crate::occlusion::Bounds::new(0., 0., 320., 240.),
+            scale: 1.,
+            scale_y: 1.,
+            generation: 1,
+            transform: smithay::utils::Transform::Normal,
+        };
+        bridge.set(View {
+            id: 9,
+            active: false,
+            outputs: vec![output("Selected"), output("Sleeping")],
+            selected: Some("Selected".into()),
+            ..Default::default()
+        });
+        let revision = Some(test_remove_frame(&bridge));
+        bridge.presented("Sleeping", 1, revision);
+        assert!(!bridge.clean(9), "unrelated output cannot satisfy removal");
+        bridge.presented("Selected", 2, revision);
+        assert!(!bridge.clean(9), "generation must still match");
+        bridge.presented("Selected", 1, revision);
+        assert!(bridge.clean(9));
+
+        bridge.set(View {
+            id: 10,
+            active: false,
+            outputs: vec![output("Selected"), output("Sleeping")],
+            selected: Some("Selected".into()),
+            ..Default::default()
+        });
+        let revision = Some(test_remove_frame(&bridge));
+        bridge.presented("Selected", 1, revision);
+        assert!(bridge.clean(10), "sleeping output need never submit");
+    }
+
     #[test]
     fn region_overlay_targets_output_above_quoin_and_removal_needs_matching_frame() {
         let bridge = RegionBridge::default();

@@ -9,6 +9,8 @@ use serde_json::json;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::wayland::input_method::InputMethodSeat as _;
 
+pub(crate) const REGION_CLEANUP_BUDGET: Duration = Duration::from_secs(3);
+
 #[derive(Default)]
 pub(super) struct RegionSelection {
     pub bridge: Option<RegionBridge>,
@@ -56,7 +58,7 @@ pub(super) fn normalise(output: &OutputGeometry, a: (f64, f64), b: (f64, f64)) -
         ax.max(bx).ceil().min(bounds.w),
         ay.max(by).ceil().min(bounds.h),
     );
-    if x < 0. || y < 0. || r > i32::MAX as f64 || b > i32::MAX as f64 {
+    if r > i32::MAX as f64 || b > i32::MAX as f64 {
         return None;
     }
     let rect = [x as i32, y as i32, (r - x) as i32, (b - y) as i32];
@@ -102,9 +104,15 @@ impl WaylandState {
             let _ = reply.send(ControlReply::Locked);
             return;
         }
-        let outputs = self
-            .backend
-            .occlusion_outputs()
+        let available = self.backend.occlusion_outputs();
+        if output
+            .as_ref()
+            .is_some_and(|name| !available.iter().any(|o| o.name == *name))
+        {
+            let _ = reply.send(refused("unknown_output"));
+            return;
+        }
+        let outputs = available
             .into_iter()
             .filter(|o| o.generation != 0 && output.as_ref().is_none_or(|name| *name == o.name))
             .collect::<Vec<_>>();
@@ -133,7 +141,7 @@ impl WaylandState {
             deadline: admitted + timeout,
             // Three seconds to remove and submit furniture; LongOp reserves four.
             // Thus even failure replies precede both the 60s cap and its waiter.
-            reply_deadline: admitted + timeout + Duration::from_secs(3),
+            reply_deadline: admitted + timeout + REGION_CLEANUP_BUDGET,
             reply,
             result: None,
         };
@@ -149,6 +157,9 @@ impl WaylandState {
         if let Some(bridge) = &self.embedded_shell {
             bridge.suspend(true);
         }
+        // Unlike session lock, leave focus before retiring presses: wl_keyboard.leave
+        // tells the client to release all keys. Smithay still updates its internal
+        // pressed set with no focus, without forwarding releases to that client.
         self.keyboard
             .clone()
             .set_focus(self, None, SERIAL_COUNTER.next_serial());
@@ -217,7 +228,6 @@ impl WaylandState {
             self.finish_region_selection(refused("output_changed"));
             let current = self.backend.occlusion_outputs();
             if let Some(run) = &mut self.region.run {
-                run.result = Some(refused("output_changed"));
                 // Removed/inactive outputs cannot submit another frame. Require
                 // clean frames from surviving ready outputs, including a new
                 // generation of the same connector, after entity removal.
@@ -278,6 +288,7 @@ impl WaylandState {
         if self.region.run.is_none()
             && self.region.keys.is_empty()
             && self.region.buttons.is_empty()
+            && self.region.touches.is_empty()
             && self.region.suppressed_touches.is_empty()
         {
             return;
@@ -345,6 +356,17 @@ impl WaylandState {
     }
 
     pub(super) fn region_input(&mut self, input: &HostInput) -> bool {
+        // Recovery also owns release tails after the modal operation has ended.
+        if matches!(
+            input,
+            HostInput::KeyboardFocusLost
+                | HostInput::KeyboardFocusLostKeepingKeys
+                | HostInput::PointerLeave
+                | HostInput::TouchDeviceRemoved
+        ) {
+            self.abandon_region_input();
+            return false;
+        }
         match input {
             HostInput::TouchDown { slot, .. } => {
                 self.region.touches.insert(*slot);
@@ -470,16 +492,9 @@ impl WaylandState {
                     ));
                 }
             }
-            HostInput::KeyboardFocusLost
-            | HostInput::KeyboardFocusLostKeepingKeys
-            | HostInput::PointerLeave => {
-                self.abandon_region_input();
-                return false;
-            }
             HostInput::OutputResized { .. }
             | HostInput::OutputScaleChanged { .. }
-            | HostInput::TouchDeviceAdded
-            | HostInput::TouchDeviceRemoved => return false,
+            | HostInput::TouchDeviceAdded => return false,
             _ => {} // Scroll/touch cannot reach clients or native furniture during selection.
         }
         true

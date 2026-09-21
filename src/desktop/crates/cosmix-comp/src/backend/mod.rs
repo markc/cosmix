@@ -178,6 +178,9 @@ impl KmsBackendData {
     }
 }
 
+pub(crate) const NESTED_OUTPUT_NAME: &str = "cosmix-nested-0";
+pub(crate) const NESTED_OUTPUT_GENERATION: u64 = 1;
+
 impl BackendData {
     pub(crate) fn occlusion_outputs(&self) -> Vec<crate::occlusion::OutputGeometry> {
         use crate::occlusion::{Bounds, OutputGeometry};
@@ -195,7 +198,7 @@ impl BackendData {
                 ),
                 scale: data.output_scale,
                 scale_y: data.output_scale,
-                generation: 1,
+                generation: NESTED_OUTPUT_GENERATION,
                 transform: data.output.current_transform(),
             }],
             Self::Kms(data) => {

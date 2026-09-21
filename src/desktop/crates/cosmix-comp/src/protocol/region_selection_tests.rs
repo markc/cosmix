@@ -51,6 +51,165 @@ fn body(rx: &mut tokio::sync::oneshot::Receiver<ControlReply>) -> serde_json::Va
 }
 
 #[test]
+fn region_touch_only_device_removal_admits_next_selection() {
+    for direct_recovery in [true, false] {
+        let mut h = KeybindingHarness::new(true);
+        h.server
+            .state
+            .handle_host_input(HostInput::TouchDeviceAdded);
+        h.server.state.handle_host_input(HostInput::TouchDown {
+            slot: Some(0).into(),
+            x: 20.,
+            y: 20.,
+            time: 1,
+        });
+        assert!(!h.server.state.region.touches.is_empty());
+        let mut busy = begin(&mut h);
+        assert_eq!(busy.try_recv().unwrap(), ControlReply::Busy);
+        // Same recovery hook used by device removal, VT loss and session lock;
+        // no run, keys, buttons or suppressed touches exist in this state.
+        if direct_recovery {
+            h.server.state.abandon_region_input();
+            assert!(h.server.state.region.touches.is_empty());
+        }
+        h.server
+            .state
+            .handle_host_input(HostInput::TouchDeviceRemoved);
+        assert!(h.server.state.region.touches.is_empty());
+        let mut next = begin(&mut h);
+        assert!(next.try_recv().is_err());
+        assert!(h.server.state.region.suspended);
+    }
+}
+
+#[test]
+fn region_normalise_rejects_coordinates_beyond_i32() {
+    let h = KeybindingHarness::new(true);
+    let mut output = h.server.state.backend.occlusion_outputs().remove(0);
+    output.bounds.w = f64::from(u32::MAX);
+    assert_eq!(
+        super::super::region_selection::normalise(
+            &output,
+            (0., 0.),
+            (f64::from(i32::MAX) + 1., 10.),
+        ),
+        None
+    );
+}
+
+#[test]
+fn region_focus_loss_after_cancel_drains_held_keys_and_buttons() {
+    for event in [
+        HostInput::KeyboardFocusLost,
+        HostInput::KeyboardFocusLostKeepingKeys,
+        HostInput::PointerLeave,
+    ] {
+        let mut h = KeybindingHarness::new(true);
+        let mut rx = begin(&mut h);
+        h.key(42, HostButtonState::Pressed);
+        button(&mut h, 0x111, HostButtonState::Pressed);
+        clean_frame(&mut h);
+        assert_eq!(body(&mut rx)["status"], "cancelled");
+        assert!(!h.server.state.region.suspended);
+        let mut busy = begin(&mut h);
+        assert_eq!(busy.try_recv().unwrap(), ControlReply::Busy);
+        h.server.state.handle_host_input(event);
+        assert!(h.server.state.keyboard.pressed_keys().is_empty());
+        let mut next = begin(&mut h);
+        assert!(next.try_recv().is_err());
+        assert!(h.server.state.region.suspended);
+    }
+}
+
+#[test]
+fn region_nested_production_presentation_completes_selection() {
+    let mut h = KeybindingHarness::new(true);
+    let mut rx = begin(&mut h);
+    motion(&mut h, 20., 20.);
+    button(&mut h, 0x110, HostButtonState::Pressed);
+    motion(&mut h, 80., 80.);
+    button(&mut h, 0x110, HostButtonState::Released);
+    let bridge = h.server.state.region.bridge.as_ref().unwrap().clone();
+    let revision = test_remove_frame(&bridge);
+    // Exercise the production handoff, without deriving identity from the view.
+    crate::complete_nested_region_presentation(&bridge, false, Some(revision));
+    h.server.state.poll_region_selection(Instant::now());
+    assert!(rx.try_recv().is_err());
+    crate::complete_nested_region_presentation(&bridge, true, Some(revision - 1));
+    h.server.state.poll_region_selection(Instant::now());
+    assert!(rx.try_recv().is_err());
+    crate::complete_nested_region_presentation(&bridge, true, Some(revision));
+    h.server.state.poll_region_selection(Instant::now());
+    assert_eq!(body(&mut rx)["status"], "selected");
+}
+
+#[test]
+fn region_decided_rectangle_survives_geometry_change() {
+    let mut h = KeybindingHarness::new(true);
+    let mut rx = begin(&mut h);
+    motion(&mut h, 20., 20.);
+    button(&mut h, 0x110, HostButtonState::Pressed);
+    motion(&mut h, 80., 80.);
+    button(&mut h, 0x110, HostButtonState::Released);
+    h.server.state.resize_output(800, 600);
+    h.server.state.poll_region_selection(Instant::now());
+    clean_frame(&mut h);
+    let result = body(&mut rx);
+    assert_eq!(result["status"], "selected");
+    assert_eq!(
+        result["region"],
+        serde_json::json!({"x":20,"y":20,"width":60,"height":60})
+    );
+}
+
+#[test]
+fn region_nonexistent_output_is_unknown_output() {
+    let mut h = KeybindingHarness::new(true);
+    h.server.state.region.bridge = Some(RegionBridge::default());
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    h.server.state.start_long_op(
+        LongOp::RegionSelect {
+            output: Some("does-not-exist".into()),
+            timeout: Duration::from_secs(30),
+        },
+        tx,
+        Instant::now(),
+    );
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        ControlReply::Refused {
+            error: "unknown_output",
+            ..
+        }
+    ));
+    assert!(!h.server.state.region.suspended);
+}
+
+#[test]
+fn region_reply_deadline_is_timeout_plus_three_seconds() {
+    let mut h = KeybindingHarness::new(true);
+    h.server.state.region.bridge = Some(RegionBridge::default());
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    let admitted = Instant::now();
+    h.server.state.start_long_op(
+        LongOp::RegionSelect {
+            output: None,
+            timeout: Duration::from_secs(55),
+        },
+        tx,
+        admitted,
+    );
+    h.server
+        .state
+        .poll_region_selection(admitted + Duration::from_millis(57_999));
+    assert!(rx.try_recv().is_err());
+    h.server
+        .state
+        .poll_region_selection(admitted + Duration::from_secs(58));
+    assert_eq!(rx.try_recv().unwrap(), ControlReply::Busy);
+}
+
+#[test]
 fn region_reverse_drag_waits_for_clean_frame_and_normalises() {
     let mut h = KeybindingHarness::new(true);
     let mut rx = begin(&mut h);

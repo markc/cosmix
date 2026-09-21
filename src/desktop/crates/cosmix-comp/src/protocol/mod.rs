@@ -3151,7 +3151,7 @@ impl ProtocolServer {
         let backend = match backend_kind {
             BackendKind::Winit => {
                 let output = Output::new(
-                    "cosmix-nested-0".into(),
+                    crate::backend::NESTED_OUTPUT_NAME.into(),
                     PhysicalProperties {
                         size: (254, 169).into(),
                         subpixel: Subpixel::Unknown,
@@ -16031,7 +16031,7 @@ mod occlusion;
 pub(crate) mod presentation;
 pub(crate) mod presentation_stats;
 #[cfg(feature = "bus")]
-mod region_selection;
+pub(crate) mod region_selection;
 mod release_use;
 #[cfg(feature = "bus")]
 pub(crate) mod window_control;
