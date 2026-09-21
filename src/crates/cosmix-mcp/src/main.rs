@@ -374,7 +374,19 @@ const TERM_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// likely cause of this error for the rest of 2026 is a caller expecting the
 /// pre-rename `term` to be there, and an error that named only one of them
 /// would leave that reader guessing.
-const TERM_NO_FRONTEND: &str = "no CosMix terminal is registered on the Bus (looked for `term`, then `bterm`) — start one with `mix --gui`";
+/// Derived from [`TERM_SERVICES`] rather than spelling the names again: this
+/// string said "`term`, then `bterm`" for as long as it took someone to grep
+/// for the other name after the order was flipped ten lines above it.
+fn term_no_frontend() -> String {
+    format!(
+        "no CosMix terminal is registered on the Bus (looked for {}) — start one with `mix --gui`",
+        TERM_SERVICES
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", then ")
+    )
+}
 
 /// The registered frontends, in preference order.
 ///
@@ -779,7 +791,7 @@ impl CosmixMcp {
         let registered = noded.list_services().await.map_err(|e| e.to_string())?;
         let candidates = registered_term_services(&registered);
         if candidates.is_empty() {
-            return Err(TERM_NO_FRONTEND.to_string());
+            return Err(term_no_frontend());
         }
         for name in &candidates {
             // `call` collapses an application error into `Err`, so strictly
@@ -835,7 +847,7 @@ impl CosmixMcp {
     // ---- Bus tools ----
 
     /// Read-only tab and active-tab pane listing (ids, active flags, dimensions, pids,
-    /// geometry) from the live CosMix terminal over ABP (`term`, else `bterm`).
+    /// geometry) from the live CosMix terminal over ABP (`bterm`, else `term`).
     /// Sequential reads are not atomic.
     /// The term service is a self-asserted diagnostic surface pending authenticated
     /// per-instance identity (P0-I).
@@ -2919,7 +2931,8 @@ mod tests {
     }
 
     /// D1 (TODO-term, 2026-09-21): the MCP addresses whichever frontend is
-    /// live, preferring the default `term` over the Bevy `bterm`.
+    /// live. D10 (same day) sets which it prefers when both are: `bterm`, the
+    /// verb-complete one, until the iced `term` reaches parity at T6.
     ///
     /// This is the SHORTLIST half — which names are candidates and in what
     /// order. Whether a candidate is actually answering is decided by the
@@ -3078,8 +3091,15 @@ mod tests {
     #[test]
     fn unresponsive_is_distinguishable_from_absent() {
         use super::*;
-        let absent = TERM_NO_FRONTEND;
+        let absent = term_no_frontend();
         assert!(absent.contains("`term`") && absent.contains("`bterm`"), "{absent}");
+        // The message must state the order it will actually try, not a
+        // hand-written guess at it. This is the assertion that was missing
+        // while the string claimed `term` first and the list said otherwise.
+        assert!(
+            absent.contains(&TERM_SERVICES.map(|n| format!("`{n}`")).join(", then ")),
+            "the error must name the frontends in TERM_SERVICES order: {absent}"
+        );
         assert!(absent.contains("not registered") || absent.contains("no CosMix terminal is registered"));
 
         let wedged_one = term_unresponsive(&["bterm"]);

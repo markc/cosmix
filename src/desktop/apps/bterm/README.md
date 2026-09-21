@@ -12,8 +12,11 @@ cannot both own it and T5's A/B weight comparison needs both running at once.
 **This is not a deprecation.** Per D6 bterm is kept indefinitely: it is the
 reference implementation, the A/B control for every weight claim, and the only
 frontend proven against the native-session lane. It stops being the default; it
-does not stop existing. `mix --gui` resolves `term` first and falls back to
-`bterm`, so on a machine that has only this one it is still what you get.
+does not stop existing — and per **D10 (2026-09-21) it has not stopped being
+the default yet**: `mix --gui` resolves `bterm` first and falls back to `term`,
+because the iced frontend is a skeleton until it reaches verb parity at T6.
+That order flips as part of T6, not before. `COSMIX_TERM_BIN` is how you reach
+the other one deliberately in the meantime.
 
 Children start in `$HOME` with the startup-selected `TERM` (see below).
 PTY damage wakes the reactive event loop (focused/unfocused: 16/33 ms).
@@ -80,7 +83,7 @@ count towards the 8192-byte request cap. Invalid JSON, non-object bodies,
 unexpected fields and missing or wrongly typed arguments are rejected before
 mutation. IDs are non-negative u64 integers. This breaks raw-body callers as
 of Term 0.3.0. See the [MCP Term contracts](../../../../docs/cos/mcp.md) —
-those tools resolve `term`, then `bterm`, and build the verb from whichever
+those tools resolve `bterm`, then `term`, and build the verb from whichever
 answers.
 
 Headless tab tests launch real Mix children where `/opt/cosmix/bin/mix` exists

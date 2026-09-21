@@ -25,13 +25,14 @@
 -- running instance by adding a tab rather than spawning a second window — the
 -- desktop-legible "don't proliferate windows" half of focus-existing.
 
--- The Bus name of a LIVE CosMix terminal: `term` (the default frontend) if it
--- answers, else `bterm` (the Bevy one), else "" when neither does.
+-- The Bus name of a LIVE CosMix terminal: `bterm` (the Bevy one, the frontend
+-- with the verbs) if it answers, else `term` (the iced one), else "" when
+-- neither does.
 --
 -- INFO is answered by any live frontend, so this proves the instance is
 -- responsive and not merely registered — this script is about to drive verbs,
 -- not just report. Preference order matches `mix --gui`'s binary resolution
--- (term, then bterm) so the launcher drives the same terminal it starts.
+-- (bterm, then term — D10) so the launcher drives the same terminal it starts.
 --
 -- The per-send `timeout=` is load-bearing, not tidiness. Without it a
 -- REGISTERED BUT WEDGED `term` costs the default 60s transport timeout, and
@@ -136,9 +137,13 @@ if $need_launch then
   end
   -- TERM_CWD is inherited by the detached child (space-safe, no shell quoting);
   -- `mix --gui` resolves the Term frontend and the child shell starts in $dir.
-  -- The BINARY resolution lives in `mix --gui` (COSMIX_TERM_BIN, then term then
-  -- bterm at each tier) and is deliberately not duplicated here: a second copy
-  -- of that search would be a second thing to keep in step with the first.
+  -- The BINARY resolution lives in `mix --gui` (COSMIX_TERM_BIN, then bterm
+  -- then term at each tier) and is deliberately not duplicated here: a second
+  -- copy of that search would be a second thing to keep in step with the
+  -- first. Note COSMIX_TERM_BIN governs only which BINARY is launched — the
+  -- service this script then drives is resolved separately above, so forcing
+  -- the iced binary still leaves the verbs going to whichever frontend
+  -- answers first.
   export TERM_CWD = $dir
   -- Resolve while this launcher is alive; another Term may answer INFO at once.
   $resolved = run_argv(["readlink", "-f", "/proc/" .. to_string(pid()) .. "/exe"])
@@ -170,7 +175,7 @@ if $need_launch then
     sleep(0.5)
     $service = resolve_term_service($deadline)
   end
-  if $service == "" then raise("TERM_NOREG", "no Term answered on the Bus within 20s (looked for `term`, then `bterm`)") end
+  if $service == "" then raise("TERM_NOREG", "no Term answered on the Bus within 20s (looked for `bterm`, then `term`)") end
   print("driving Bus service `" .. $service .. "`")
 end
 

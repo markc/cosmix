@@ -306,7 +306,15 @@ fn resolve_term(
     TERM_FRONTENDS
         .into_iter()
         .find_map(|name| lookup(Path::new(name)))
-        .ok_or_else(|| "mix --gui: no CosMix terminal frontend is installed (looked for bterm then term in $COSMIX/bin, /opt/cosmix/bin, and on PATH). Install the desktop package.".to_string())
+        // Derived from TERM_FRONTENDS, never spelled out again. Two sibling
+        // error strings in other crates drifted stale the moment this order
+        // changed, which is what a hand-written copy of a list does.
+        .ok_or_else(|| {
+            format!(
+                "mix --gui: no CosMix terminal frontend is installed (looked for {} in $COSMIX/bin, /opt/cosmix/bin, and on PATH). Install the desktop package.",
+                TERM_FRONTENDS.join(" then ")
+            )
+        })
 }
 
 /// The frontend binary names, in resolution order. Shared with [`term_lookup`]
@@ -2143,6 +2151,14 @@ mod gui_tests {
         );
         assert!(error.starts_with("mix --gui: no CosMix terminal frontend is installed"));
         assert!(error.ends_with("Install the desktop package."));
+        // The message must state the order actually tried. Pinning only the
+        // ends let two sibling error strings in other crates go stale the
+        // moment D10 flipped the order, each naming a sequence its own list
+        // no longer used.
+        assert!(
+            error.contains(&TERM_FRONTENDS.join(" then ")),
+            "the error must name the frontends in TERM_FRONTENDS order: {error}"
+        );
         for (winner, expected) in seen.iter().enumerate() {
             let mut index = 0;
             let found = resolve_term(None, Some("/test-root".into()), |path| {
