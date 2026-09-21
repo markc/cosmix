@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3784,7 +3784,7 @@ dependencies = [
 
 [[package]]
 name = "ctk"
-version = "0.56.0"
+version = "0.57.0"
 dependencies = [
  "accesskit",
  "ammonia",
