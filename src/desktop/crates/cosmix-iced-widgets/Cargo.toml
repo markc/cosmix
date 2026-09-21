@@ -48,20 +48,11 @@ iced_runtime = { version = "=0.14.0", default-features = false }
 # carried it; `cargo test -p cosmix-iced-widgets` gets no such help, so the
 # crate's tests have been unbuildable on their own.
 # Declared as a DEV-dependency on purpose: it feeds this crate's test target
-# without adding a backend to the production feature graph.
-# wgpu, not tiny-skia. tiny-skia looks like the lighter choice -- CPU only,
-# never reaches naga -- but `iced_tiny_skia` pulls `softbuffer`, and with the
-# component crates taken at default-features = false softbuffer gets no
-# platform backend, so its `make_dispatch` macro expands to a match over
-# uninhabited variants and fails to compile with 25 errors (E0004/E0282/E0283/
-# E0392). Fixing that means version-coupling softbuffer's x11/wayland features
-# here, which is worse than the problem. wgpu skips softbuffer entirely.
-# `naga27` mirrors what this crate's own `wgpu` feature does: naga 27 picks its
-# diagnostic buffer type from its `termcolor` feature, and must agree with what
-# Bevy's naga_oil does to codespan-reporting 0.12 -- see the dependency note
-# above and apps/term.
-iced_renderer = { version = "=0.14.0", default-features = false, features = ["wgpu", "geometry"] }
-naga27 = { package = "naga", version = "27", default-features = false, features = ["termcolor"] }
+# without adding a backend to the production feature graph, which is tuned
+# around the naga 27 / codespan-reporting conflict documented above and in
+# apps/term. tiny-skia rather than wgpu for the same reason -- it is CPU-only
+# and never reaches naga at all.
+iced_renderer = { version = "=0.14.0", default-features = false, features = ["tiny-skia", "geometry"] }
 
 [[example]]
 name = "gallery"
