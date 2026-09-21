@@ -12,8 +12,9 @@ cannot both own it and T5's A/B weight comparison needs both running at once.
 **This is not a deprecation.** Per D6 bterm is kept indefinitely: it is the
 reference implementation, the A/B control for every weight claim, and the only
 frontend proven against the native-session lane. It stops being the default; it
-does not stop existing — and per **D10 (2026-09-21) it has not stopped being
-the default yet**: `mix --gui` resolves `bterm` first and falls back to `term`,
+does not stop existing. The *name* `term` moved to the iced frontend at T1; the
+*job* has not, and per **D10 (2026-09-21) bterm is still what you get**:
+`mix --gui` resolves `bterm` first and falls back to `term`,
 because the iced frontend is a skeleton until it reaches verb parity at T6.
 That order flips as part of T6, not before. `COSMIX_TERM_BIN` is how you reach
 the other one deliberately in the meantime.

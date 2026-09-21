@@ -490,13 +490,20 @@ retrieved skill → <code>*_feedback</code> to score the chunks you used.</p>
 The self-asserted terminal service is diagnostic pending authenticated
 per-instance identity (P0-I). These tools reuse the Bus client and central
 per-call metrics. Replies are bounded to 1 MiB.</p>
-<p><strong>Which frontend they address is RESOLVED, not fixed (cosmix-mcp 0.5.1).</strong>
+<p><strong>Which frontend they address is RESOLVED, not fixed (cosmix-mcp 0.5.2).</strong>
 TODO-term D1 split the global Bus name in two: the iced+wgpu frontend is
 <code>term</code> / <code>term.*</code>, the Bevy one is <code>bterm</code> / <code>bterm.*</code>, and a frontend
 <em>refuses</em> a verb from the other namespace. Before every tool call the MCP asks
-the broker which of <code>term</code>, then <code>bterm</code>, is registered, and <strong>probes each in
+the broker which of <code>bterm</code>, then <code>term</code>, is registered, and <strong>probes each in
 turn with a bounded <code>INFO</code></strong> — taking the first that actually answers and
-building the verb from that same name. Resolution is per call, never cached
+building the verb from that same name.</p>
+<p><strong><code>bterm</code> is preferred when both answer (TODO-term D10, cosmix-mcp 0.5.2).</strong>
+It is the frontend with the tabs, the panes and the whole verb surface; the
+iced <code>term</code> is a skeleton until it reaches parity at T6. There is no
+environment override for this lane — <code>COSMIX_TERM_BIN</code> governs only which
+<em>binary</em> <code>mix --gui</code> launches, not which <em>service</em> these tools drive, so while
+both are running these tools address <code>bterm</code>.</p>
+<p>Resolution is per call, never cached
 for the process: the MCP outlives any one terminal, and both frontends may be
 up at once for an A/B.</p>
 <p><em>Live means answering, not merely registered.</em> A frontend whose event loop is
@@ -513,7 +520,7 @@ control surfaces agree.</p>
 <p>The failure modes are reported distinctly, because they call for different
 actions — start a terminal, find the stuck one, or go and look at the broker:</p>
 <ul>
-<li>nothing registered → <code>ERROR: no CosMix terminal is registered on the Bus (looked for </code>term<code>, then </code>bterm<code>) — start one with </code>mix --gui``</li>
+<li>nothing registered → <code>ERROR: no CosMix terminal is registered on the Bus (looked for </code>bterm<code>, then </code>term<code>) — start one with </code>mix --gui``</li>
 <li>registered but silent → <code>ERROR: CosMix terminal registered but unresponsive: </code>term<code> did not answer INFO within 3s (wedged, or shutting down). No other frontend is registered. Nothing was sent.</code></li>
 <li>the Bus itself went away mid-resolution → <code>ERROR: the broker stopped answering while probing for a CosMix terminal (…) — this is a Bus problem, not a wedged terminal. Check cosmix-noded. Nothing was sent.</code></li>
 </ul>

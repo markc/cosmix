@@ -402,7 +402,7 @@ fn registered_term_services(registered: &[String]) -> Vec<&'static str> {
 
 /// What to say when a frontend holds a name but will not answer on it.
 ///
-/// Kept distinct from [`TERM_NO_FRONTEND`] on purpose. "Nothing is running"
+/// Kept distinct from [`term_no_frontend`] on purpose. "Nothing is running"
 /// and "something is running and wedged" call for opposite actions — start a
 /// terminal, versus find and kill the one that is stuck — and an operator who
 /// is handed the first message while the second is true will go looking in
