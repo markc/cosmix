@@ -17,6 +17,13 @@ described by `describe()`. Enum ports (`window.kind`, `window.edge`,
 `row.align`, and `button.tone`) are validated during lint. Numeric ports are
 always JSON floating-point values: `13` resolves and travels as `13.0`.
 
+Version 0.4 adds the [curated layout vocabulary](scenes#curated-layout-ports-scene-crates-04)
+without changing the `scene: 1` header. Citizens discover support through
+`shell.scene.describe`, by family and port. `layout-conflict` rejects
+contradictory legacy/explicit sizing and inverted min/max bounds; an old
+host instead rejects the new ports as `unknown-port`. See the renderer manual
+for the text centring correction and the changed default text minimum width.
+
 Lists require rows of `{id: string, cells: [string]}`, a sibling `row`
 template and a positive `row_height`. Template subtrees may contain only row,
 column, text, spacer and image. `{cells[i]}` is allowed only in `text.text`,

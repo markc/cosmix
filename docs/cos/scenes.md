@@ -107,6 +107,96 @@ Text elision uses CTK's middle-elision policy.
 `text.align` sets justification to `left` (default), `center` or `right`
 within the text's `width` or the space allocated by `fill: true`.
 
+### Curated layout ports (scene crates 0.4)
+
+These ports retain the `scene: 1` envelope. Before emitting them, citizens
+must call `shell.scene.describe` for each affected family and check the
+returned port paths and enum values. Do not infer support from `scene: 1` or
+the shell's version. An older host rejects an unknown port and preserves its
+last-good document; a citizen can then submit a separately authored legacy
+document or report that the host is too old.
+
+| Families | Port | Values / meaning |
+|---|---|---|
+| row, column | `justify` | `start`, `center`, `end`, `between`, `around`, `evenly`; main-axis distribution |
+| Every family except window | `align_self` | `auto`, `start`, `center`, `end`, `stretch`; this child's cross-axis override |
+| Every family except window | `grow`, `shrink` | Non-negative flex weights |
+| Every family except window | `basis` | Non-negative initial main-axis size in logical px; omission retains the native/legacy basis |
+| Every family except window | `min_width`, `max_width`, `min_height`, `max_height` | Non-negative logical px constraints |
+| row, column | `row_gap`, `column_gap` | Non-negative logical px, overriding the respective axis of `gap` |
+| row, column | `padding_top`, `padding_right`, `padding_bottom`, `padding_left` | Non-negative logical px, overriding that side of `padding` |
+
+`row.align` and `column.align` keep their cross-axis meanings and their
+existing defaults (`start` and `stretch`, respectively). `text.align` keeps
+its text-alignment meaning. No reverse direction, flex wrapping, baseline
+alignment or absolute-position ports are exposed. `basis` is numeric only;
+clear it with null to restore the native basis. All new ports are optional
+without schema defaults, so old resolved documents retain their canonical
+ports. Clearing an axis/side override restores its shorthand's value.
+
+`fill` retains its existing behaviour when explicit flex sizing is absent,
+including the fixed-height row exception and fill-text stretch in a stretched
+column. Authored `fill` (including false) cannot coexist with `grow`, `shrink`
+or `basis`. Fixed row `height` and spacer `size` likewise cannot coexist with
+those explicit flex ports: remove the legacy declaration when migrating.
+`list.max_rows` and `max_height` are mutually exclusive. Inverted min/max
+bounds are errors. These produce `layout-conflict`, not silent precedence.
+Bounds are also checked after model binding evaluation and template
+instantiation; a rejected model patch retains the previous tree.
+Gap/padding shorthands with their documented overrides are intentionally
+allowed, as is `fill` with `align_self`.
+
+Text remains single-line unless the authored string contains explicit
+newlines. It does not acquire soft wrapping from this change. In Bevy 0.19.1,
+`NoWrap` uses an unbounded text layout even if the UI label has a wider
+percentage width. The adapter therefore leaves the label at its intrinsic
+width and positions it inside the wrapper using Taffy. Natural-width text
+stays natural. Width-constrained text without `elide` may overflow; `elide`
+uses CTK's existing middle-elision system and the wrapper's width budget.
+Hosts must install `CtkThemePlugin` for that production elision system.
+
+**Known scene: 1 behaviour change:** the text wrapper's default `min_width`
+changes from zero to automatic intrinsic sizing when `elide` is false.
+Crowded rows can therefore retain more text width and overflow rather than
+silently compressing its wrapper. Use `min_width: 0` to opt into compression,
+or `elide: true` for bounded middle-elision (which retains the zero minimum).
+This is not only an additive vocabulary change. The text centring correction
+also deliberately changes geometry for existing centred/right-aligned text
+with a wider allocation.
+
+### Layout regression fixtures
+
+`cosmix-scene-bevy/src/render/layout_tests.rs` runs the real document ingress,
+reconciliation and Bevy/Taffy layout against a synthetic 800×560 logical
+viewport at scale 1.25. It rejects an unsettled font measurement and compares
+logical geometry with a 0.5px tolerance. The deliberately displaced scene
+must trigger the centring assertion. The authored-width text regression is
+enabled in P1.
+
+The legacy freeze compares every document node's border/content boxes and
+shaped text-run boxes against a test-only copy of the P0 renderer mapping.
+It covers rows/columns with gaps and padding, plus static reconstructions of
+Quoin's launcher fallback, workspace buttons, task label, flexible spacer,
+status badges, nested clock and calendar/notification popup shapes. Internal
+label UI boxes intentionally become intrinsic; the freeze compares visible
+text geometry instead. Fixtures contain no new ports and no intentionally
+corrected centred-text allocation. Separate tests cover the corrected defect,
+new vocabulary, port clearing, no soft wrapping, explicit newlines and elision
+with the production CTK theme plugin.
+
+These are representative shapes, not captured executions of
+`scripts/quoin-panel.mix`. That citizen builds documents from live services,
+time and icon lookup and cannot be loaded as a static scene. For full
+record/replay coverage, add a pure document-export seam before `load_scene`:
+provide deterministic service snapshots and a fixed clock to each builder,
+replace icon paths and private content with public fixtures, and save the
+exact document returned by `lib/panel.mix`'s `document` function. Replay those
+bytes through the same harness against both mappings. Include empty and busy
+taskbars, tray variants, launcher lists, calendar months and notifications;
+record the font/scale inputs alongside any numeric geometry goldens. The
+current freeze does not claim to cover those dynamic states or Quoin's edge
+chrome/mount geometry.
+
 Absolute image `src` paths load PNG and SVG directly, rasterised or resized
 at `UiScale` multiplied by the primary window's scale factor, or `UiScale`
 alone in a compositor host without a primary window. Scale changes reapply

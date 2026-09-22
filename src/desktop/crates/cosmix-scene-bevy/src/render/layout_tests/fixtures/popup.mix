@@ -1,0 +1,19 @@
+root: {widget: "column", fill: true, gap: 8, padding: 12, children: ["heading", "week", "days", "notice"]}
+heading: {widget: "row", gap: 8, align: "center", children: ["previous", "month", "next"]}
+previous: {widget: "text", text: "<", width: 24}
+month: {widget: "text", text: "September 2026", fill: true}
+next: {widget: "text", text: ">", width: 24}
+week: {widget: "row", gap: 4, children: ["mon", "tue", "wed"]}
+mon: {widget: "text", text: "Mon", width: 40}
+tue: {widget: "text", text: "Tue", width: 40}
+wed: {widget: "text", text: "Wed", width: 40}
+days: {widget: "row", gap: 4, children: ["day1", "day2", "day3"]}
+day1: {widget: "row", height: 30, padding: 4, align: "center", children: ["one"]}
+one: {widget: "text", text: "21", width: 32}
+day2: {widget: "row", height: 30, padding: 4, align: "center", children: ["two"]}
+two: {widget: "text", text: "22", width: 32}
+day3: {widget: "row", height: 30, padding: 4, align: "center", children: ["three"]}
+three: {widget: "text", text: "23", width: 32}
+notice: {widget: "column", padding: 8, gap: 4, children: ["title", "body"]}
+title: {widget: "text", text: "Notification", bold: true}
+body: {widget: "text", text: "A short notification body"}

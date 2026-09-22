@@ -8,6 +8,8 @@ use bevy::text::TextLayoutInfo;
 use bevy::ui::{UiPlugin, widget::TextNodeFlags};
 use cosmix_shell::runtime::SceneVerb;
 
+mod legacy;
+
 const TOLERANCE: f32 = 0.5;
 const SETTLE_FRAMES: usize = 12;
 
@@ -47,6 +49,10 @@ fn close(context: &str, actual: f32, expected: f32) {
 
 impl Harness {
     fn load(body: &str) -> Self {
+        Self::load_options(body, false, false)
+    }
+
+    fn load_options(body: &str, frozen: bool, theme: bool) -> Self {
         let mut app = App::new();
         // Plugin list and camera setup copied verbatim from bterm, including
         // fractional scale: physical 1000x700 means logical 800x560.
@@ -90,6 +96,18 @@ impl Harness {
         app.add_message::<bevy::window::WindowFocused>()
             .add_message::<bevy::window::Ime>();
         app.add_plugins(crate::ScenePlugin);
+        if frozen {
+            app.add_systems(
+                Update,
+                frozen_layout_once
+                    .after(reconcile)
+                    .run_if(bevy::ecs::schedule::common_conditions::run_once),
+            );
+        }
+        if theme {
+            // Elision belongs to this production plugin, not ScenePlugin.
+            app.add_plugins(ctk::theme::CtkThemePlugin::default());
+        }
         app.finish();
         app.cleanup();
         assert!(app.world().contains_resource::<Assets<Image>>());
@@ -178,6 +196,19 @@ impl Harness {
             .unwrap()
             .nodes[id]
             .root
+    }
+
+    fn patch(&mut self, path: &str, value: Value) {
+        self.app
+            .world_mut()
+            .resource_mut::<SceneStore>()
+            .request(
+                SceneVerb::Patch,
+                "",
+                &json!({"scene":"layout", "path":path, "value":value}),
+            )
+            .unwrap();
+        self.settle();
     }
 
     fn geometry(&self) -> BTreeMap<String, Geometry> {
@@ -367,9 +398,7 @@ fn harness_rejects_a_three_pixel_displacement() {
 }
 
 #[test]
-// P1: fix authored-width text centring (NoWrap uses unbounded text bounds),
-// then remove this ignore. Do not accept the full-width UI node as proof.
-#[ignore = "P1: centre the measured label box within the authored text width"]
+// P1 regression: measure the shaped run, not just its UI wrapper.
 fn authored_width_centres_the_measured_label_box() {
     let geometry = Harness::load(
         r#"
@@ -391,5 +420,442 @@ label: {widget: "text", text: "Clock", width: 240, align: "center"}
         "measured label box centre",
         measured.center().x,
         label.content.center().x,
+    );
+}
+
+#[test]
+fn text_centring_follows_legacy_fill_and_explicit_flex_allocation() {
+    for sizing in ["fill: true", "grow: 1, basis: 0"] {
+        let body = format!(
+            r#"
+root: {{widget: "row", fill: true, align: "center", children: ["before", "label", "after"]}}
+before: {{widget: "spacer", size: 20}}
+label: {{widget: "text", text: "Clock", align: "center", {sizing}}}
+after: {{widget: "spacer", size: 20}}
+"#
+        );
+        let g = Harness::load(&body).geometry();
+        close("allocated text width", g["label"].border.width(), 760.0);
+        close(
+            "allocated text centre",
+            g["label"].label_box.unwrap().center().x,
+            g["label"].content.center().x,
+        );
+    }
+}
+
+fn frozen_layout_once(world: &mut World) {
+    world.resource_scope(|world, store: Mut<SceneStore>| {
+        let entry = &store.scenes["layout"];
+        let mounted = entry.mounted.as_ref().unwrap();
+        for (id, view) in &mounted.nodes {
+            // Start from the native spawn defaults, not P1's modified Node.
+            let base = world.get::<SceneLayoutBase>(view.root).unwrap().0.clone();
+            world.entity_mut(view.root).insert(base);
+            if let Some(label) = view.label {
+                world.entity_mut(label).insert(Node::default());
+            }
+            legacy::update(world, &entry.tree, id, &entry.tree.nodes[id], None, view);
+        }
+    });
+}
+
+fn same_rect(context: &str, actual: Rect, expected: Rect) {
+    for axis in 0..2 {
+        close(
+            &format!("{context} min[{axis}]"),
+            actual.min[axis],
+            expected.min[axis],
+        );
+        close(
+            &format!("{context} max[{axis}]"),
+            actual.max[axis],
+            expected.max[axis],
+        );
+    }
+}
+
+#[test]
+fn legacy_fixture_geometry_is_frozen() {
+    // Static reconstructions of programmatically generated Quoin shapes, not
+    // a claim to have run the citizen or captured an operator's live state.
+    for (name, body) in [
+        ("panel", include_str!("layout_tests/fixtures/panel.mix")),
+        ("popup", include_str!("layout_tests/fixtures/popup.mix")),
+        ("row", &gaps_document("row")),
+        ("column", &gaps_document("column")),
+    ] {
+        let before = Harness::load_options(body, true, false).geometry();
+        let after = Harness::load(body).geometry();
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>()
+        );
+        for (id, expected) in before {
+            let actual = &after[&id];
+            same_rect(
+                &format!("{name}/{id} border"),
+                actual.border,
+                expected.border,
+            );
+            same_rect(
+                &format!("{name}/{id} content"),
+                actual.content,
+                expected.content,
+            );
+            match (actual.label_box, expected.label_box) {
+                (Some(actual), Some(expected)) => {
+                    same_rect(&format!("{name}/{id} text"), actual, expected)
+                }
+                (None, None) => {}
+                _ => panic!("{name}/{id}: text box disappeared"),
+            }
+        }
+    }
+}
+
+#[test]
+fn justify_distributes_real_boxes_on_both_main_axes() {
+    for (family, axis) in [("row", 0), ("column", 1)] {
+        for justify in ["start", "center", "end", "between", "around", "evenly"] {
+            let body = format!(
+                r#"
+root: {{widget: "{family}", fill: true, padding: 16, gap: 12, justify: "{justify}", children: ["a", "b", "c"]}}
+a: {{widget: "text", text: "a", min_width: 40, max_width: 40, min_height: 40, max_height: 40}}
+b: {{widget: "spacer", size: 40}}
+c: {{widget: "spacer", size: 40}}
+"#
+            );
+            let g = Harness::load(&body).geometry();
+            let free = g["root"].content.size()[axis] - 3.0 * 40.0 - 2.0 * 12.0;
+            let (leading, extra_gap) = match justify {
+                "center" => (free / 2.0, 0.0),
+                "end" => (free, 0.0),
+                "between" => (0.0, free / 2.0),
+                "around" => (free / 6.0, free / 3.0),
+                "evenly" => (free / 4.0, free / 4.0),
+                _ => (0.0, 0.0),
+            };
+            for (index, id) in ["a", "b", "c"].iter().enumerate() {
+                close(
+                    &format!("{family}/{justify}/{id}"),
+                    g[*id].border.min[axis],
+                    g["root"].content.min[axis] + leading + index as f32 * (52.0 + extra_gap),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn align_self_overrides_only_the_child_cross_axis() {
+    for (alignment, expected_top, expected_height) in [
+        ("auto", 0.0, 24.0),
+        ("start", 0.0, 24.0),
+        ("center", 88.0, 24.0),
+        ("end", 176.0, 24.0),
+        ("stretch", 0.0, 200.0),
+    ] {
+        let body = format!(
+            r#"
+root: {{widget: "row", fill: true, max_height: 200, align: "start", children: ["label"]}}
+label: {{widget: "text", text: "x", min_height: 24, align_self: "{alignment}"}}
+"#
+        );
+        let g = Harness::load(&body).geometry();
+        close(
+            alignment,
+            g["label"].border.min.y - g["root"].content.min.y,
+            expected_top,
+        );
+        close(alignment, g["label"].border.height(), expected_height);
+        close(
+            "cross-axis override preserves main-axis start",
+            g["label"].border.min.x,
+            g["root"].content.min.x,
+        );
+    }
+}
+
+#[test]
+fn explicit_flex_sizes_and_bounds_are_measured() {
+    for (a, b, expected) in [
+        ("grow: 1, basis: 0", "grow: 3, basis: 0", [100.0, 300.0]),
+        (
+            "width: 300, shrink: 1",
+            "width: 300, shrink: 3",
+            [250.0, 150.0],
+        ),
+        ("grow: 0, basis: 80", "grow: 0, basis: 120", [80.0, 120.0]),
+    ] {
+        let body = format!(
+            r#"
+root: {{widget: "row", fill: true, max_width: 400, children: ["a", "b"]}}
+a: {{widget: "text", text: "a", min_width: 0, {a}}}
+b: {{widget: "text", text: "b", min_width: 0, {b}}}
+"#
+        );
+        let g = Harness::load(&body).geometry();
+        for (id, width) in ["a", "b"].into_iter().zip(expected) {
+            close(id, g[id].border.width(), width);
+        }
+    }
+    let g = Harness::load(
+        r#"
+root: {widget: "row", fill: true, children: ["a", "b", "sentinel"]}
+a: {widget: "spacer", size: 40, min_width: 80, min_height: 60}
+b: {widget: "spacer", size: 40, max_width: 20, max_height: 24}
+sentinel: {widget: "text", text: "Measured"}
+"#,
+    )
+    .geometry();
+    close("authored min width", g["a"].border.width(), 80.0);
+    close("authored min height", g["a"].border.height(), 60.0);
+    close("authored max width", g["b"].border.width(), 20.0);
+    close("authored max height", g["b"].border.height(), 24.0);
+}
+
+#[test]
+fn axis_gaps_and_each_padding_side_override_the_shorthand() {
+    for (family, axis, expected_gap) in [("row", 0, 20.0), ("column", 1, 8.0)] {
+        let body = gaps_document(family).replace("gap: 12", "gap: 12, row_gap: 8, column_gap: 20")
+            .replace("padding: 16", "padding: 16, padding_left: 4, padding_right: 8, padding_top: 12, padding_bottom: 20");
+        let mut harness = Harness::load(&body);
+        let g = harness.geometry();
+        close(
+            "left",
+            g["root"].content.min.x - g["root"].border.min.x,
+            4.0,
+        );
+        close(
+            "right",
+            g["root"].border.max.x - g["root"].content.max.x,
+            8.0,
+        );
+        close(
+            "top",
+            g["root"].content.min.y - g["root"].border.min.y,
+            12.0,
+        );
+        close(
+            "bottom",
+            g["root"].border.max.y - g["root"].content.max.y,
+            20.0,
+        );
+        close(
+            "axis gap",
+            g["b"].border.min[axis] - g["a"].border.max[axis],
+            expected_gap,
+        );
+        harness.patch(
+            if axis == 0 {
+                "root.column_gap"
+            } else {
+                "root.row_gap"
+            },
+            Value::Null,
+        );
+        harness.patch("root.padding_left", Value::Null);
+        let g = harness.geometry();
+        close(
+            "gap clear restores shorthand",
+            g["b"].border.min[axis] - g["a"].border.max[axis],
+            12.0,
+        );
+        close(
+            "padding clear restores shorthand",
+            g["root"].content.min.x - g["root"].border.min.x,
+            16.0,
+        );
+    }
+}
+
+#[test]
+fn natural_text_and_overflow_stay_single_line() {
+    let natural =
+        Harness::load(r#"root: {widget: "text", text: "one two three four five"}"#).geometry();
+    let intrinsic = natural["root"].label_box.unwrap();
+    for align in ["left", "center", "right"] {
+        let body = format!(
+            r#"root: {{widget: "text", text: "one two three four five", width: 40, min_width: 0, align: "{align}"}}"#
+        );
+        let mut harness = Harness::load(&body);
+        let g = harness.geometry();
+        close(
+            "no soft wrap height",
+            g["root"].label_box.unwrap().height(),
+            intrinsic.height(),
+        );
+        close(
+            "no soft wrap width",
+            g["root"].label_box.unwrap().width(),
+            intrinsic.width(),
+        );
+        close("allocated wrapper", g["root"].border.width(), 40.0);
+        assert!(intrinsic.width() > 40.0);
+        harness.patch("root.width", Value::Null);
+        harness.patch("root.min_width", Value::Null);
+        same_rect(
+            "natural width restored",
+            harness.geometry()["root"].border,
+            natural["root"].border,
+        );
+    }
+}
+
+#[test]
+fn elision_uses_the_wrapper_budget_and_recovers_after_resize() {
+    let source = "a-very-long-document-name-for-elision.txt";
+    for align in ["left", "center", "right"] {
+        let body = format!(
+            r#"root: {{widget: "text", text: "{source}", width: 120, elide: true, align: "{align}"}}"#
+        );
+        let mut harness = Harness::load_options(&body, false, true);
+        let label = harness.app.world().resource::<SceneStore>().scenes["layout"]
+            .mounted
+            .as_ref()
+            .unwrap()
+            .nodes["root"]
+            .label
+            .unwrap();
+        let displayed = &harness.app.world().get::<Text>(label).unwrap().0;
+        assert!(
+            displayed.contains('…') && displayed.ends_with(".txt"),
+            "{displayed}"
+        );
+        let g = harness.geometry();
+        let shaped = g["root"].label_box.unwrap();
+        assert!(shaped.width() <= 120.0 + TOLERANCE);
+        match align {
+            "center" => close(
+                "elided centre",
+                shaped.center().x,
+                g["root"].content.center().x,
+            ),
+            "right" => close("elided right", shaped.max.x, g["root"].content.max.x),
+            _ => close("elided left", shaped.min.x, g["root"].content.min.x),
+        }
+        let height = shaped.height();
+        harness.patch("root.width", json!(700));
+        assert_eq!(harness.app.world().get::<Text>(label).unwrap().0, source);
+        close(
+            "elision stays single line",
+            harness.geometry()["root"].label_box.unwrap().height(),
+            height,
+        );
+        harness.patch("root.elide", json!(false));
+        harness.patch("root.width", json!(120));
+        assert_eq!(harness.app.world().get::<Text>(label).unwrap().0, source);
+        assert!(harness.geometry()["root"].label_box.unwrap().width() > 120.0);
+    }
+}
+
+#[test]
+fn explicit_newlines_are_preserved_without_soft_wrapping() {
+    let one = Harness::load(r#"root: {widget: "text", text: "wide words on one line"}"#).geometry();
+    let two = Harness::load(r#"root: {widget: "text", text: "wide words on one line\nsecond line", width: 40, min_width: 0, align: "center"}"#).geometry();
+    let line_height = one["root"].label_box.unwrap().height();
+    close(
+        "exactly two explicit lines",
+        two["root"].label_box.unwrap().height(),
+        2.0 * line_height,
+    );
+    assert!(two["root"].label_box.unwrap().width() > 40.0);
+}
+
+#[test]
+fn clearing_new_ports_restores_fresh_document_geometry() {
+    let body = r#"
+root: {widget: "row", children: ["a", "b"], grow: 1, shrink: 0, basis: 200, min_width: 400, max_width: 600, min_height: 200, max_height: 400, align_self: "center", justify: "between", gap: 12, row_gap: 8, column_gap: 20, padding: 16, padding_left: 4, padding_right: 8, padding_top: 12, padding_bottom: 20}
+a: {widget: "text", text: "Label", width: 40, grow: 1, shrink: 0, basis: 60, min_width: 20, max_width: 100, min_height: 40, max_height: 80, align_self: "end"}
+b: {widget: "text", text: "Sentinel"}
+"#;
+    for id in ["root", "a"] {
+        for port in [
+            "grow",
+            "shrink",
+            "basis",
+            "min_width",
+            "max_width",
+            "min_height",
+            "max_height",
+            "align_self",
+            "justify",
+            "row_gap",
+            "column_gap",
+            "padding_left",
+            "padding_right",
+            "padding_top",
+            "padding_bottom",
+        ] {
+            if id == "a"
+                && [
+                    "justify",
+                    "row_gap",
+                    "column_gap",
+                    "padding_left",
+                    "padding_right",
+                    "padding_top",
+                    "padding_bottom",
+                ]
+                .contains(&port)
+            {
+                continue;
+            }
+            let mut harness = Harness::load(body);
+            harness.patch(&format!("{id}.{port}"), Value::Null);
+            let source = crate::serialised_document(
+                &harness.app.world().resource::<SceneStore>().scenes["layout"].document,
+            );
+            let fresh_body = source
+                .split_once("```mix\n")
+                .unwrap()
+                .1
+                .split_once("```")
+                .unwrap()
+                .0;
+            let fresh = Harness::load(fresh_body).geometry();
+            for (node, actual) in harness.geometry() {
+                same_rect(
+                    &format!("clear {id}.{port}: {node}"),
+                    actual.border,
+                    fresh[&node].border,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn conflicting_patch_preserves_the_mounted_last_good_scene() {
+    let mut harness = Harness::load(r#"root: {widget: "text", text: "x", fill: true}"#);
+    let before = harness.geometry()["root"].border;
+    let revision = harness.app.world().resource::<SceneStore>().scenes["layout"].revision;
+    let error = harness
+        .app
+        .world_mut()
+        .resource_mut::<SceneStore>()
+        .request(
+            SceneVerb::Patch,
+            "",
+            &json!({"scene":"layout", "path":"root.grow", "value":2}),
+        )
+        .unwrap_err();
+    assert!(
+        error["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "layout-conflict")
+    );
+    harness.settle();
+    assert_eq!(
+        harness.app.world().resource::<SceneStore>().scenes["layout"].revision,
+        revision
+    );
+    same_rect(
+        "rejected patch leaves geometry",
+        harness.geometry()["root"].border,
+        before,
     );
 }
