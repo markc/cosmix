@@ -361,6 +361,14 @@ output refreshes and loss markers retain them. This relies on the compositor's
 consecutive LMB pair and monotonically increasing observation stream, not a
 timing window. It is not an exactly-once guarantee across a connection reset or
 publisher sequence restart; a publisher restart requires a fresh host/connection.
+High-water rejections emit `quoin_corner_sequence_rejected` WARNs at counts
+1, 2, 4, 8, … with the received sequence, canonical sequence and high-water mark.
+These include legitimate duplicates (including the first legacy/v2 pair);
+persistent low sequences can indicate a compositor restart. Legacy clicks ignored
+after v2 discovery do not increment this separate counter. The counter resets
+with connection preference state. Automatic publisher-restart recovery is not
+implemented: `info.instance` identifies the compositor process, but is absent
+from the subscribed corner/output payloads and the host's `outputs` query.
 
 Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed `comp.props.get` request verb at `outputs`. It maps the topic's
@@ -382,7 +390,7 @@ refresh it before accepting mapped corner state again.
 A lost click is a missed toggle and is never replayed or synthetically recovered.
 If only a click is dropped at the host-to-runner queue, existing holds are retained.
 
-A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
+A compositor enter reveals and holds the counter-clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native
 pointer is also outside. Native SCTK pointer enter/leave supplies the second
 hold; Bevy pointer button events drive pin, both carousel chevrons and page

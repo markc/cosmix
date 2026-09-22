@@ -751,7 +751,15 @@ output-map queueing. Reconnect clears preference and sequence state; ordinary
 output refreshes and loss markers retain them. This relies on the compositor's
 consecutive LMB pair and monotonically increasing observation stream, not a
 timing window. It is not an exactly-once guarantee across a connection reset or
-publisher sequence restart; a publisher restart requires a fresh host/connection.</p>
+publisher sequence restart; a publisher restart requires a fresh host/connection.
+High-water rejections emit <code>quoin_corner_sequence_rejected</code> WARNs at counts
+1, 2, 4, 8, … with the received sequence, canonical sequence and high-water mark.
+These include legitimate duplicates (including the first legacy/v2 pair);
+persistent low sequences can indicate a compositor restart. Legacy clicks ignored
+after v2 discovery do not increment this separate counter. The counter resets
+with connection preference state. Automatic publisher-restart recovery is not
+implemented: <code>info.instance</code> identifies the compositor process, but is absent
+from the subscribed corner/output payloads and the host's <code>outputs</code> query.</p>
 <p>Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed <code>comp.props.get</code> request verb at <code>outputs</code>. It maps the topic's
 stable <code>o_&lt;slug&gt;</code> output key through the public
@@ -770,7 +778,7 @@ disconnect: synthesize left for all engagements, invalidate the slug map, and
 refresh it before accepting mapped corner state again.
 A lost click is a missed toggle and is never replayed or synthetically recovered.
 If only a click is dropped at the host-to-runner queue, existing holds are retained.</p>
-<p>A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
+<p>A compositor enter reveals and holds the counter-clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native
 pointer is also outside. Native SCTK pointer enter/leave supplies the second
 hold; Bevy pointer button events drive pin, both carousel chevrons and page

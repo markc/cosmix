@@ -75,6 +75,7 @@ pub(crate) enum CornerAction {
 struct ClickPreference {
     v2_seen: bool,
     last_sequence: Option<u64>,
+    sequence_rejections: u64,
 }
 
 impl ClickPreference {
@@ -95,7 +96,22 @@ impl ClickPreference {
             }
             _ => return true,
         };
-        if self.last_sequence.is_some_and(|last| canonical <= last) {
+        if let Some(last) = self.last_sequence
+            && canonical <= last
+        {
+            // A publisher restart can rewind sequences without disconnecting
+            // this subscriber. Do not infer a restart from a duplicate alone.
+            self.sequence_rejections = self.sequence_rejections.saturating_add(1);
+            if self.sequence_rejections.is_power_of_two() {
+                tracing::warn!(
+                    event = "quoin_corner_sequence_rejected",
+                    count = self.sequence_rejections,
+                    sequence,
+                    canonical_sequence = canonical,
+                    high_water_mark = last,
+                    "duplicate/stale corner click; persistent low sequences may indicate a compositor restart"
+                );
+            }
             return false;
         }
         self.last_sequence = Some(canonical);
@@ -1933,6 +1949,25 @@ mod tests {
         assert!(clicks.accept(&CornerKind::Clicked, 1));
         assert!(!clicks.accept(&CornerKind::Clicked, 1));
         assert!(clicks.accept(&CornerKind::Clicked, 2));
+    }
+
+    #[test]
+    fn publisher_sequence_restart_is_counted_without_resetting_high_water_mark() {
+        let mut clicks = ClickPreference::default();
+        let dock = CornerKind::Action(CornerAction::DockToggle);
+        assert!(clicks.accept(&dock, 500_000));
+        // Normal legacy suppression must not count as a sequence rejection.
+        assert!(!clicks.accept(&CornerKind::Clicked, 1));
+        assert_eq!(clicks.sequence_rejections, 0);
+        for sequence in [1, 2, 500_000] {
+            assert!(!clicks.accept(&dock, sequence));
+        }
+        assert_eq!(clicks.sequence_rejections, 3);
+        assert_eq!(clicks.last_sequence, Some(500_000));
+        assert!(clicks.accept(&dock, 500_001));
+        clicks = ClickPreference::default();
+        assert_eq!(clicks.sequence_rejections, 0);
+        assert!(clicks.accept(&dock, 1));
     }
 
     #[test]

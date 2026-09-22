@@ -61,7 +61,7 @@ impl Corner {
         Self::TopRight,
     ];
 
-    /// The edge at this corner's clockwise end, per the Quoin mapping rule.
+    /// The edge counter-clockwise from this corner, per the Quoin mapping rule.
     pub const fn summoned_edge(self) -> Edge {
         match self {
             Self::TopLeft => Edge::Left,
