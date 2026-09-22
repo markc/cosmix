@@ -383,6 +383,7 @@ pub(crate) struct CornersSnapshot {
     pub(crate) enabled: bool,
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
+    pub(crate) hold_ms: u64,
     pub(crate) velocity_max_px_s: f64,
 }
 
@@ -392,6 +393,7 @@ impl From<CornerConfig> for CornersSnapshot {
             enabled: config.enabled,
             deadzone_px: config.deadzone_px,
             dwell_ms: config.dwell_ms,
+            hold_ms: config.hold_ms,
             velocity_max_px_s: config.velocity_max_px_s,
         }
     }
@@ -694,6 +696,7 @@ flat_snapshot!(
     enabled,
     deadzone_px,
     dwell_ms,
+    hold_ms,
     velocity_max_px_s
 );
 flat_snapshot!(
@@ -2124,6 +2127,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         range = "0..=5000"
     ),
     descriptor!(
+        &[L("input"), L("corners"), L("hold_ms")],
+        Number,
+        "Right-button corner hold threshold in milliseconds",
+        mutable,
+        range = "1..=5000"
+    ),
+    descriptor!(
         &[L("input"), L("corners"), L("velocity_max_px_s")],
         Number,
         "Maximum corner-entry velocity in logical pixels per second",
@@ -3208,13 +3218,14 @@ mod tests {
         // the count, and the current workspace by default output and by
         // output key.
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 12);
+        assert_eq!(mutable.len(), 13);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 11);
+        assert_eq!(mutable.len(), 12);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
+            "input.corners.hold_ms",
             "input.corners.velocity_max_px_s",
             "input.host.passthrough",
             "windows.s2.band",

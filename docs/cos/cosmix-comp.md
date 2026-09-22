@@ -371,7 +371,7 @@ The control plane exposes these verbs:
   the name this compositor instance actually registered. The reply is truthful
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
-- `comp.props.set {path,value,generation?}` mutates the four corner
+- `comp.props.set {path,value,generation?}` mutates the five corner
   properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
   `windows.s<id>.workspace`, `workspaces.count`, `workspaces.current`,
   `workspaces.o_<slug>.current`, `input.host.passthrough`, or
@@ -513,7 +513,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+input.corners.{enabled,deadzone_px,dwell_ms,hold_ms,velocity_max_px_s}
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -920,6 +920,7 @@ below, so handlers do not depend on the instance name.
 | `<service>.corner.entered` | `corner.entered` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.left` | `corner.left` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.clicked` | `corner.clicked` | `{output,corner,dwell_ms,event_seq}` |
+| `<service>.corner.clicked.v2` | `corner.clicked.v2` | `{output,corner,button,kind,dwell_ms,event_seq}` |
 | `<service>.pointer.changed` | `pointer.changed` | `{version:1,instance,output,position,valid,timestamp_ms,event_seq}` |
 
 Map edges carry the surface's role `generation` and its `app_id` and `title`
@@ -937,9 +938,23 @@ condition, use `comp.window.wait` rather than subscribing and hoping: the
 topics are not retained, so an edge that happened before the subscription is
 never delivered.
 
-`corner.clicked` observes a left-button press while a corner is engaged, carrying
-the same engagement dwell as entered/left. It does not consume the button event;
-clients can map it to a panel pin toggle.
+Engaged corners consume pointer presses and their matching releases. The v2
+click topic reports `button: "left"|"right"` and `kind: "brief"|"hold"`.
+LMB emits brief on release, with no hold behaviour. RMB emits brief on release
+before `input.corners.hold_ms` (default 500ms), or hold once at that deadline;
+release after hold emits nothing. Other buttons are consumed without an action.
+Movement further than `input.corners.deadzone_px` from the press position cancels
+the pending action, even within the hotspot. Leaving the corner or resetting
+engagement (including output changes, lock, or config changes) also cancels it.
+Cancellation retains release ownership; returning to the corner cannot revive
+the action. A hold already emitted is not retracted by later movement.
+
+The original `corner.clicked` topic retains its exact JSON body and emits only
+successful LMB brief actions, now on release. V2 consumers should subscribe only
+to `corner.clicked.v2` to avoid handling LMB twice. This versioning preserves old
+shell-hosts with strict JSON decoding; they receive no RMB actions during rollout.
+Both versions carry engagement dwell, not press duration. Pin/dock/menu routing
+is a separate shell integration step; this compositor change does not implement it.
 
 For a reliable property bootstrap: subscribe to the instance topic (for
 example `comp.props.changed` on the seat or `comp-nested.props.changed` when
@@ -1110,9 +1125,10 @@ ranges are:
 | `input.corners.enabled` | `true` | boolean |
 | `input.corners.deadzone_px` | `12.0` | `1.0..=256.0` logical px |
 | `input.corners.dwell_ms` | `200` | `0..=5000` ms |
+| `input.corners.hold_ms` | `500` | `1..=5000` ms (RMB only) |
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
-The mutable leaves are the four corner leaves, `windows.s<id>.band`,
+The mutable leaves are the five corner leaves, `windows.s<id>.band`,
 `windows.s<id>.minimized`, `windows.s<id>.workspace`, `workspaces.count`,
 `workspaces.current`, `workspaces.o_<slug>.current`, `input.host.passthrough`
 (nested only) and `xwayland.enabled`. The corner, window and workspace

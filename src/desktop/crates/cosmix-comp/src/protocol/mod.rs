@@ -8796,6 +8796,19 @@ impl WaylandState {
 
     fn handle_host_input_with_activity(&mut self, input: HostInput, user_activity: bool) {
         #[cfg(feature = "bus")]
+        if let HostInput::PointerButton {
+            button,
+            state: HostButtonState::Released,
+            ..
+        } = &input
+            && self.consume_corner_release(*button)
+        {
+            if user_activity {
+                self.notify_idle_activity();
+            }
+            return;
+        }
+        #[cfg(feature = "bus")]
         if self.region_input(&input) {
             if user_activity {
                 self.notify_idle_activity();
@@ -11754,6 +11767,13 @@ impl WaylandState {
     }
 
     fn pointer_button(&mut self, button: u32, state: HostButtonState, time: u32) {
+        #[cfg(feature = "bus")]
+        if (state == HostButtonState::Pressed && self.consume_corner_press(button))
+            || (state == HostButtonState::Released && self.consume_corner_release(button))
+        {
+            self.titlebar_click_candidate = None;
+            return;
+        }
         #[cfg(feature = "embedded-quoin")]
         if let Some(bridge) = &self.embedded_shell
             && bridge.button(
@@ -11766,10 +11786,6 @@ impl WaylandState {
         {
             self.titlebar_click_candidate = None;
             return;
-        }
-        #[cfg(feature = "bus")]
-        if state == HostButtonState::Pressed && button == PRIMARY_POINTER_BUTTON {
-            self.observe_corner_click();
         }
         if self
             .titlebar_click_candidate

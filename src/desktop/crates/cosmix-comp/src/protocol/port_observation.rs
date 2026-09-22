@@ -46,6 +46,7 @@ pub(crate) const OUTPUT_TOPIC_SUFFIX: &str = "output.changed";
 pub(crate) const CORNER_ENTERED_TOPIC_SUFFIX: &str = "corner.entered";
 pub(crate) const CORNER_LEFT_TOPIC_SUFFIX: &str = "corner.left";
 pub(crate) const CORNER_CLICKED_TOPIC_SUFFIX: &str = "corner.clicked";
+pub(crate) const CORNER_CLICKED_V2_TOPIC_SUFFIX: &str = "corner.clicked.v2";
 pub(crate) const POINTER_TOPIC_SUFFIX: &str = "pointer.changed";
 
 pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
@@ -91,6 +92,7 @@ pub(crate) enum ValidatedCornerValue {
     Enabled(bool),
     DeadzonePx(f64),
     DwellMs(u64),
+    HoldMs(u64),
     VelocityMaxPxS(f64),
 }
 
@@ -161,6 +163,14 @@ pub(crate) enum ObservationRecord {
         dwell_ms: u64,
         event_seq: u64,
     },
+    CornerClickedV2 {
+        output: String,
+        corner: Corner,
+        dwell_ms: u64,
+        button: &'static str,
+        kind: &'static str,
+        event_seq: u64,
+    },
 }
 
 impl ObservationRecord {
@@ -174,6 +184,7 @@ impl ObservationRecord {
             | Self::OutputChanged { event_seq, .. }
             | Self::CornerEntered { event_seq, .. }
             | Self::CornerClicked { event_seq, .. }
+            | Self::CornerClickedV2 { event_seq, .. }
             | Self::CornerLeft { event_seq, .. } => *event_seq,
         }
     }
@@ -189,6 +200,7 @@ impl ObservationRecord {
             Self::CornerEntered { .. } => CORNER_ENTERED_TOPIC_SUFFIX,
             Self::CornerLeft { .. } => CORNER_LEFT_TOPIC_SUFFIX,
             Self::CornerClicked { .. } => CORNER_CLICKED_TOPIC_SUFFIX,
+            Self::CornerClickedV2 { .. } => CORNER_CLICKED_V2_TOPIC_SUFFIX,
         }
     }
 
@@ -197,6 +209,22 @@ impl ObservationRecord {
         message.set("command", self.topic_suffix());
         message.set("event_seq", &self.event_seq().to_string());
         message.body = match self {
+            Self::CornerClickedV2 {
+                output,
+                corner,
+                dwell_ms,
+                button,
+                kind,
+                event_seq,
+            } => json!({
+                "output": output,
+                "corner": corner.name(),
+                "dwell_ms": dwell_ms,
+                "button": button,
+                "kind": kind,
+                "event_seq": event_seq,
+            })
+            .to_string(),
             Self::PointerChanged { sample, event_seq } => {
                 let mut value = serde_json::to_value(sample).expect("finite pointer sample");
                 value["event_seq"] = json!(event_seq);
@@ -308,7 +336,7 @@ impl ObservationRecord {
     }
 }
 
-const TOPIC_SUFFIXES: [&str; 9] = [
+const TOPIC_SUFFIXES: [&str; 10] = [
     PROPS_TOPIC_SUFFIX,
     SURFACE_MAPPED_TOPIC_SUFFIX,
     SURFACE_UNMAPPED_TOPIC_SUFFIX,
@@ -318,6 +346,7 @@ const TOPIC_SUFFIXES: [&str; 9] = [
     CORNER_LEFT_TOPIC_SUFFIX,
     CORNER_CLICKED_TOPIC_SUFFIX,
     POINTER_TOPIC_SUFFIX,
+    CORNER_CLICKED_V2_TOPIC_SUFFIX,
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -589,6 +618,8 @@ pub(crate) struct ObservationState {
     pub(crate) corner_regions: Vec<CornerRegion>,
     pub(crate) corner_output_keys: Vec<String>,
     corner_detector: CornerDetector,
+    // None retains ownership of a cancelled/completed press until release.
+    corner_presses: BTreeMap<u32, Option<CornerPress>>,
     corner_output: Option<usize>,
     corner_clock: Instant,
     corner_timer: Option<RegistrationToken>,
@@ -600,6 +631,14 @@ pub(crate) struct ObservationState {
     event_seq: u64,
     event_seq_exhausted: bool,
     event_seq_watermark: Arc<AtomicU64>,
+}
+
+struct CornerPress {
+    output: String,
+    corner: Corner,
+    dwell_ms: u64,
+    position: (f64, f64),
+    hold_deadline_ms: Option<u64>,
 }
 
 impl ObservationState {
@@ -629,6 +668,7 @@ impl ObservationState {
             corner_regions: Vec::new(),
             corner_output_keys: Vec::new(),
             corner_detector: CornerDetector::new(corner_config, (0.0, 0.0)),
+            corner_presses: BTreeMap::new(),
             corner_output: None,
             corner_clock: Instant::now(),
             corner_timer: None,
@@ -754,6 +794,9 @@ impl WaylandState {
     }
 
     pub(crate) fn mark_output_before_change(&mut self, output: &Output, cause: &'static str) {
+        if cause == "output.geometry" {
+            self.cancel_corner_presses();
+        }
         let Some((key, row)) = project_output(self, output) else {
             if self.observations.watched_baseline.is_some() {
                 self.observations.full_dirty.get_or_insert(cause);
@@ -801,6 +844,7 @@ impl WaylandState {
 
     #[cfg(any(all(feature = "kms-live", not(test)), test))]
     pub(crate) fn mark_output_topology_before_change(&mut self) {
+        self.cancel_corner_presses();
         self.observations.pointer_lease.changed();
         self.mark_all_outputs_before_change("output.geometry");
         self.observations.output_topology_dirty = true;
@@ -849,17 +893,107 @@ impl WaylandState {
             });
     }
 
-    pub(crate) fn observe_corner_click(&mut self) {
-        if let Some(output) = self
+    pub(crate) fn consume_corner_press(&mut self, button: u32) -> bool {
+        if self.observations.corner_presses.contains_key(&button) {
+            return true;
+        }
+        if self.session_lock_active() || !self.corner_engaged() {
+            return false;
+        }
+        let action = if let Some(output) = self
             .observations
             .corner_output
             .and_then(|index| self.observations.corner_output_keys.get(index))
             .cloned()
             && let Some(corner) = self.observations.corner_detector.engaged_corner()
             && let Some(dwell_ms) = self.observations.corner_detector.engaged_dwell_ms()
+            && (button == super::PRIMARY_POINTER_BUTTON
+                || button == super::PRIMARY_POINTER_BUTTON + 1)
         {
-            self.emit_corner_clicked(output, corner, dwell_ms);
+            let now_ms = self.corner_now_ms();
+            Some(CornerPress {
+                output,
+                corner,
+                dwell_ms,
+                position: self.cursor_position,
+                hold_deadline_ms: (button == super::PRIMARY_POINTER_BUTTON + 1)
+                    .then_some(now_ms.saturating_add(self.observations.corner_config.hold_ms)),
+            })
+        } else {
+            None
+        };
+        self.observations.corner_presses.insert(button, action);
+        self.rearm_corner_timer();
+        true
+    }
+
+    /// Called before modal/lock delivery gates, so ownership survives all resets
+    /// and the eventual release cannot reach a client that never saw its press.
+    pub(crate) fn consume_corner_release(&mut self, button: u32) -> bool {
+        if !self.observations.corner_presses.contains_key(&button) {
+            return false;
         }
+        if self
+            .observations
+            .corner_presses
+            .get(&button)
+            .is_some_and(Option::is_some)
+        {
+            let position = self.cursor_position;
+            let region = self.observations.corner_output.unwrap_or_default();
+            self.sample_corner_motion(position, region, (0.0, 0.0));
+        }
+        if let Some(Some(press)) = self.observations.corner_presses.remove(&button) {
+            self.emit_corner_action(press, button, "brief");
+        }
+        self.rearm_corner_timer();
+        true
+    }
+
+    fn corner_now_ms(&self) -> u64 {
+        u64::try_from(self.observations.corner_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn cancel_corner_presses(&mut self) {
+        for action in self.observations.corner_presses.values_mut() {
+            *action = None;
+        }
+    }
+
+    fn service_corner_presses(&mut self, position: (f64, f64)) {
+        let now_ms = self.corner_now_ms();
+        let deadzone = self.observations.corner_config.deadzone_px;
+        let mut held = None;
+        for (&button, action) in &mut self.observations.corner_presses {
+            let Some(press) = action else { continue };
+            if (position.0 - press.position.0).hypot(position.1 - press.position.1) > deadzone {
+                *action = None;
+            } else if press
+                .hold_deadline_ms
+                .is_some_and(|deadline| now_ms >= deadline)
+            {
+                held = action.take().map(|press| (button, press));
+            }
+        }
+        if let Some((button, press)) = held {
+            self.emit_corner_action(press, button, "hold");
+        }
+    }
+
+    fn emit_corner_action(&mut self, press: CornerPress, button: u32, kind: &'static str) {
+        let left = button == super::PRIMARY_POINTER_BUTTON;
+        if left {
+            self.emit_corner_clicked(press.output.clone(), press.corner, press.dwell_ms);
+        }
+        self.observations
+            .offer(|event_seq| ObservationRecord::CornerClickedV2 {
+                output: press.output,
+                corner: press.corner,
+                dwell_ms: press.dwell_ms,
+                button: if left { "left" } else { "right" },
+                kind,
+                event_seq,
+            });
     }
 
     pub(crate) fn emit_corner_clicked(&mut self, output: String, corner: Corner, dwell_ms: u64) {
@@ -958,6 +1092,7 @@ impl WaylandState {
             .corner_detector
             .sample(at_ms, local, attempted_motion);
         self.emit_corner_events(events, region.key_index);
+        self.service_corner_presses(position);
         self.rearm_corner_timer();
     }
 
@@ -975,6 +1110,7 @@ impl WaylandState {
     }
 
     pub(crate) fn reset_corner_detector(&mut self) {
+        self.cancel_corner_presses();
         let output = self.observations.corner_output.take();
         let events = self.observations.corner_detector.reset();
         if let Some(output) = output {
@@ -988,6 +1124,9 @@ impl WaylandState {
 
     fn emit_corner_events(&mut self, events: [Option<CornerEvent>; 2], output_index: usize) {
         for event in events.into_iter().flatten() {
+            if matches!(event, CornerEvent::Left { .. }) {
+                self.cancel_corner_presses();
+            }
             let Some(output) = self
                 .observations
                 .corner_output_keys
@@ -1009,7 +1148,18 @@ impl WaylandState {
     }
 
     fn rearm_corner_timer(&mut self) {
-        let deadline = self.observations.corner_detector.next_deadline_ms();
+        let deadline = self
+            .observations
+            .corner_detector
+            .next_deadline_ms()
+            .into_iter()
+            .chain(
+                self.observations
+                    .corner_presses
+                    .values()
+                    .filter_map(|action| action.as_ref().and_then(|press| press.hold_deadline_ms)),
+            )
+            .min();
         if deadline == self.observations.corner_timer_deadline_ms
             && self.observations.corner_timer.is_some()
         {
@@ -3084,6 +3234,12 @@ pub(crate) fn validate_corner_value(
             };
             Ok(ValidatedCornerValue::DwellMs(value))
         }
+        "input.corners.hold_ms" => {
+            let Some(value) = value.as_u64().filter(|value| (1..=5_000).contains(value)) else {
+                return Err(invalid_value(path, "integer", "1..=5000"));
+            };
+            Ok(ValidatedCornerValue::HoldMs(value))
+        }
         "input.corners.velocity_max_px_s" => {
             let value = finite_number(path, value, "finite number", "1.0..=20000.0")?;
             if !(1.0..=20_000.0).contains(&value) {
@@ -3115,6 +3271,11 @@ fn apply_corner_value(
         ValidatedCornerValue::DwellMs(value) => {
             let old = config.dwell_ms;
             config.dwell_ms = value;
+            (PropValue::U64(old), PropValue::U64(value))
+        }
+        ValidatedCornerValue::HoldMs(value) => {
+            let old = config.hold_ms;
+            config.hold_ms = value;
             (PropValue::U64(old), PropValue::U64(value))
         }
         ValidatedCornerValue::VelocityMaxPxS(value) => {
@@ -3759,6 +3920,31 @@ mod tests {
     }
 
     #[test]
+    fn corner_clicked_v2_wire_has_button_and_kind_without_changing_legacy() {
+        for (button, kind) in [("left", "brief"), ("right", "brief"), ("right", "hold")] {
+            let record = ObservationRecord::CornerClickedV2 {
+                output: "o_nested".into(),
+                corner: Corner::BottomRight,
+                dwell_ms: 217,
+                button,
+                kind,
+                event_seq: 42,
+            };
+            let wire = record.wire();
+            assert_eq!(record.topic_suffix(), "corner.clicked.v2");
+            assert_eq!(wire.get("command"), Some("corner.clicked.v2"));
+            assert_eq!(wire.get("event_seq"), Some("42"));
+            assert_eq!(
+                serde_json::from_str::<Value>(&wire.body).unwrap(),
+                json!({
+                    "output": "o_nested", "corner": "br", "dwell_ms": 217,
+                    "button": button, "kind": kind, "event_seq": 42,
+                })
+            );
+        }
+    }
+
+    #[test]
     fn corner_clicked_wire_matches_entered_and_left() {
         let clicked = ObservationRecord::CornerClicked {
             output: "o_nested".into(),
@@ -3914,6 +4100,8 @@ mod tests {
             ("input.corners.deadzone_px", json!(256.0)),
             ("input.corners.dwell_ms", json!(0)),
             ("input.corners.dwell_ms", json!(5_000)),
+            ("input.corners.hold_ms", json!(1)),
+            ("input.corners.hold_ms", json!(5_000)),
             ("input.corners.velocity_max_px_s", json!(1.0)),
             ("input.corners.velocity_max_px_s", json!(20_000.0)),
         ] {
@@ -3927,6 +4115,9 @@ mod tests {
             ("input.corners.deadzone_px", json!("12")),
             ("input.corners.dwell_ms", json!(1.5)),
             ("input.corners.dwell_ms", json!(-1)),
+            ("input.corners.hold_ms", json!(0)),
+            ("input.corners.hold_ms", json!(5_001)),
+            ("input.corners.hold_ms", json!(1.5)),
             ("input.corners.velocity_max_px_s", json!(null)),
         ] {
             assert!(matches!(
