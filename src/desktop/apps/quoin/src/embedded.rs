@@ -343,7 +343,7 @@ mod tests {
             std::array::from_fn(|_| app.world_mut().spawn(Node::default()).id());
         let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
         model
-            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
             .unwrap();
         app.insert_resource(EmbeddedOutput {
             camera: Some(camera),

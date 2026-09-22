@@ -12,7 +12,7 @@ embedded application owns the same `shell` Bus service.
 Both hosts reuse the page registry, content, chrome, theme, persistence and
 semantic Bus commands. The compositor host supplies panel mounts, logical
 geometry and pointer input. Panel movement uses the existing chrome animation;
-there are no panel Wayland buffers or panel swapchains. Pinned panel geometry
+there are no panel Wayland buffers or panel swapchains. Docked panel geometry
 updates comp's usable area, publishes output/property changes and reconfigures
 maximised windows including their decoration extents. Repeated unchanged work
 areas do not trigger another resize or notification. Application
@@ -94,16 +94,30 @@ successful remap therefore emits `WindowCreated` again before another buffer
 can be presented. Teardown order is defined in one place and tested through a
 probe.
 
-Pinned panels use `Top`, reserve their complete logical thickness and keep
-protocol margin zero; chrome alone owns their transient slide. Revealed and
-mapped-concealing panels use `Overlay`, reserve zero and slide with their edge
-protocol margin. This also covers pin-from-hidden: the full zone exists at
+Docked panels use `Top`, reserve their complete logical thickness and keep
+protocol margin zero; chrome alone owns their transient slide. Pinned panels,
+transiently revealed hidden panels and mapped-concealing panels use `Overlay`,
+reserve zero and slide with their edge protocol margin. Pinning a transient
+reveal changes neither layer nor reservation. Docking from hidden claims the full zone at
 fraction zero while chrome supplies the only visual translation. Keyboard
 policy maps only to `None` or `OnDemand`; Quoin never requests `Exclusive`.
 Chrome selects its translation owner from the last successfully committed
 protocol mode, not the model's next desired mode. The host advances that latch
-only after a commit, or after completed role destruction for unmap, so pin and
-unpin cannot hand motion between protocol margin and chrome one frame early.
+only after a commit, or after completed role destruction for unmap, so docking
+and undocking cannot hand motion between protocol margin and chrome one frame
+early. If the planner proves there are no protocol changes to an already
+committed surface, the stored presentation can refresh its logical visibility
+intent without a new commit. This never bypasses an outstanding configure.
+
+The persistent modes are `Hidden`, `Pinned` and `Docked`. A separate
+`transient_revealed` flag lets a hidden panel respond to pointer/corner holds
+without changing its mode. Only transient visibility auto-hides. An idle hidden
+panel is unmapped; during concealment it stays mapped until its slide finishes.
+Hide, Escape and ordinary visibility toggle do not release either persistent
+mode. Core `PinToggle` and `DockToggle` select their respective mode, or release
+it to hidden with transient grace if already selected. `SetMode(Hidden)` instead
+conceals directly. The Rust model exposes `set_mode(edge, at, mode)`; new
+compositor corner-event discrimination is a separate integration.
 
 ## Event-driven wake contract
 
@@ -175,6 +189,14 @@ plane is `shell-sub`. `shell.ping` and `shell.info` provide presence and
 discovery. Live panel state is read through the uniform
 `shell.props.{get,list,describe}` surface under
 `panels.<edge>.{visible,pinned,width_px,page,pages,output}`.
+
+`pinned` is a read-compatibility shim: true for either persistent `Pinned` or
+`Docked`, false for `Hidden` even while transiently revealed. It is not a precise
+mode signal. Existing Bus `pin` retains its reserving behaviour (`Docked`),
+including the corner-addressed alias. Existing Bus `unpin` releases either
+persistent mode into transient grace; follow it with `hide` to conceal.
+No new mode property or Bus verb is introduced here. Taskbar, popup and capture
+callers retain their existing verb mapping pending the separate caller update.
 
 The semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin}`,
 `shell.panel.page.{next,prev,set}` and `shell.quit`. They require a broker-stamped local,
@@ -252,22 +274,40 @@ inherits Quoin's environment and service lifetime.
 
 Quoin loads strict-data `$COSMIX_VAR/quoin.state.mix` before constructing its
 initial model, using the shared path resolver (including its XDG fallback).
-The root map contains `scheme` and `left`, `bottom`, `right`, `top` maps with
-`thickness_px`, `pinned` and stable `page` IDs. Thickness must be finite and
-positive; missing or invalid files use defaults with one diagnostic line.
-Unknown page IDs use the edge's default page. Scheme is retained unchanged
-until theme controls are implemented.
+The v2 root contains exactly six fields: `version: 2`, `scheme`, and `left`,
+`bottom`, `right`, `top`. Each edge has exactly `thickness_px`, `mode` and `page`:
 
-Accepted pin and page changes save the current state after the Model stage,
+```text
+{
+  version: 2,
+  scheme: "builtin",
+  left:   {thickness_px: 240, mode: "hidden", page: "nav"},
+  bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
+  right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
+  top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+}
+```
+
+Modes are the strings `hidden`, `pinned` or `docked`. Thickness must be finite
+and positive; unknown page IDs use the edge's default page. The strict legacy
+five-field root (no version) with three-field edges containing `pinned` booleans
+is migrated in memory: true becomes `docked`, false becomes `hidden`, preserving
+thickness, page and scheme. Only successfully parsed legacy files migrate.
+The next normal persistent mutation writes v2; loading and transient visibility
+do not rewrite the file. Missing or invalid files use hidden defaults with one
+diagnostic line and no startup write. As before, a later normal mutation may
+overwrite a corrupt file; write inhibition is a separate outstanding issue.
+
+Accepted mode, page, scheme and completed resize changes save state after the Model stage,
 using a temporary file and atomic rename. Output migration carries live
-pin, page and thickness state; it never reloads disk state. Both smoke modes
+mode, page and thickness state; it never reloads disk state. Both smoke modes
 skip restore, saving and the intro pulse.
 
-A normal cold start reveals unpinned panels for two seconds, then releases
+A normal cold start transiently reveals hidden panels for two seconds, then releases
 a temporary startup hold into normal 800 ms grace. This discovery pulse is
 an explicit exception to compositor-only corner reveal. Real corner and
 pointer membership remain independent and can keep panels revealed after
-the pulse expires. Restored pins remain pinned.
+the pulse expires. Restored pins and docks keep their persistent modes.
 
 `setup.mix --desktop` installs `dev.cosmix.quoin.desktop` into the user's XDG
 applications directory, pointing at the installed checkout binary. Quit
@@ -293,12 +333,15 @@ registered compositor instance (default `comp`), giving topic headers
 `<service>.corner.entered`, `<service>.corner.left`, `<service>.corner.clicked` and
 `<service>.output.changed`. Their inner commands remain the unprefixed
 `corner.entered`, `corner.left`, `corner.clicked` and `output.changed`.
-The compositor emits legacy `corner.clicked` on a successful left-button release on an engaged
-corner; the client toggles the clockwise edge's panel pin (TL→left, BL→bottom,
+The compositor emits legacy `corner.clicked` on a successful left-button release on
+an engaged corner; the client toggles the clockwise edge's dock (TL→left, BL→bottom,
 BR→right, TR→top). Each click is an impulse, independent of corner membership;
-the model resolves the toggle from its current pin state and persists the
-change. Unpinning leaves the panel revealed and arms grace when no hold remains.
-The visible header pin control remains available as a fallback.
+the model resolves the toggle from its current mode and persists the
+change. Undocking leaves the hidden panel transiently revealed and arms grace
+when no hold remains. This preserves the old click behaviour; wiring the new
+compositor corner consumption/discrimination to pin/dock toggles is deferred.
+The header pin control toggles overlay pinning; its glyph is `◇` for hidden
+(including transient reveal), `◆` for pinned and `▣` for docked.
 
 The compositor also publishes `corner.clicked.v2` with `button` and `kind` for
 LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
@@ -358,13 +401,15 @@ Stable transition markers are:
 QUOIN_REVEAL edge=left trigger=corner
 QUOIN_CONCEAL edge=left reason=corner-left
 QUOIN_CONCEAL edge=left reason=grace
-QUOIN_PIN edge=left state=pinned
-QUOIN_PIN edge=left state=unpinned
+QUOIN_MODE edge=left mode=pinned
+QUOIN_MODE edge=left mode=docked
+QUOIN_MODE edge=left mode=hidden
 ```
 
 The edge is one of `left`, `bottom`, `right` or `top`. A marker is printed once
 per real semantic transition. `--smoke-all-panels` starts all four panels
-pinned and prints one pinned marker per edge before the existing four-surface
+docked and retains the compatibility `QUOIN_PIN edge=... state=pinned` smoke
+marker per edge before the existing four-surface
 ready marker. Mutually exclusive `--smoke-hidden` starts them hidden and prints
 `QUOIN_HIDDEN_READY panels=4` after the first complete hidden frame.
 

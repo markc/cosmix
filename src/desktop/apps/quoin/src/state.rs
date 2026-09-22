@@ -7,13 +7,13 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use cosmix_config::{CosmixDir, Value, cosmix_path, parse_mix_data};
-use cosmix_shell::core::{Edge, PanelConfig, PanelEffect, PanelInput, PanelMode, ShellModel};
+use cosmix_shell::core::{Edge, PanelConfig, PanelEffect, PanelMode, ShellModel};
 use cosmix_shell::runtime::{ShellEffects, ShellFrameState};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct EdgeState {
     thickness_px: Option<f32>,
-    pinned: bool,
+    mode: PanelMode,
     page: String,
 }
 
@@ -64,7 +64,12 @@ impl SavedState {
         let Some(Value::String(scheme)) = root.get("scheme") else {
             return Err(invalid());
         };
-        if root.len() != 5 {
+        let legacy = match root.get("version") {
+            None => true,
+            Some(Value::Number(version)) if *version == 2.0 => false,
+            _ => return Err(invalid()),
+        };
+        if root.len() != if legacy { 5 } else { 6 } {
             return Err(invalid());
         }
         let mut state = Self {
@@ -75,21 +80,31 @@ impl SavedState {
             let Some(Value::Map(fields)) = root.get(crate::edge_name(edge)) else {
                 return Err(invalid());
             };
-            let (
-                Some(Value::Number(thickness)),
-                Some(Value::Bool(pinned)),
-                Some(Value::String(page)),
-            ) = (
-                fields.get("thickness_px"),
-                fields.get("pinned"),
-                fields.get("page"),
-            )
+            let (Some(Value::Number(thickness)), Some(Value::String(page))) =
+                (fields.get("thickness_px"), fields.get("page"))
             else {
                 return Err(invalid());
             };
             if fields.len() != 3 {
                 return Err(invalid());
             }
+            let mode = if legacy {
+                match fields.get("pinned") {
+                    Some(Value::Bool(true)) => PanelMode::Docked,
+                    Some(Value::Bool(false)) => PanelMode::Hidden,
+                    _ => return Err(invalid()),
+                }
+            } else {
+                match fields.get("mode") {
+                    Some(Value::String(mode)) => match mode.as_str() {
+                        "hidden" => PanelMode::Hidden,
+                        "pinned" => PanelMode::Pinned,
+                        "docked" => PanelMode::Docked,
+                        _ => return Err(invalid()),
+                    },
+                    _ => return Err(invalid()),
+                }
+            };
             let thickness = *thickness as f32;
             PanelConfig::new(
                 thickness,
@@ -99,7 +114,7 @@ impl SavedState {
             .map_err(|error| StateError::Data(error.to_string()))?;
             state.edges[edge.index()] = EdgeState {
                 thickness_px: Some(thickness),
-                pinned: *pinned,
+                mode,
                 page: page.clone(),
             };
         }
@@ -116,16 +131,17 @@ impl SavedState {
                     .expect("saved thickness was validated");
             }
             model.carousel_mut(edge).select_id(&state.page);
-            if state.pinned {
-                model
-                    .panel_input(edge, model.last_update(), PanelInput::Pin)
-                    .expect("restore uses model time");
-            }
+            model
+                .set_mode(edge, model.last_update(), state.mode)
+                .expect("restore uses model time");
         }
     }
 
     fn encode(&self) -> Result<String, StateError> {
-        let mut fields = vec![("scheme".to_owned(), Value::String(self.scheme.clone()))];
+        let mut fields = vec![
+            ("version".to_owned(), Value::Number(2.0)),
+            ("scheme".to_owned(), Value::String(self.scheme.clone())),
+        ];
         for edge in Edge::ALL {
             let state = &self.edges[edge.index()];
             let thickness = state
@@ -136,7 +152,7 @@ impl SavedState {
                 Value::map(
                     [
                         ("thickness_px".into(), Value::Number(f64::from(thickness))),
-                        ("pinned".into(), Value::Bool(state.pinned)),
+                        ("mode".into(), Value::String(state.mode.as_str().into())),
                         ("page".into(), Value::String(state.page.clone())),
                     ]
                     .into_iter()
@@ -244,7 +260,7 @@ pub(crate) fn persist_transitions(
             && !effects.0.iter().any(|effect| {
                 matches!(
                     effect.effect,
-                    PanelEffect::Pin { .. } | PanelEffect::ResizeCompleted
+                    PanelEffect::ModeChanged { .. } | PanelEffect::ResizeCompleted
                 )
             })
             && effects.1.is_empty())
@@ -258,7 +274,7 @@ pub(crate) fn persist_transitions(
         let panel = frame.0.panel(edge);
         store.saved.edges[edge.index()] = EdgeState {
             thickness_px: Some(panel.settled_thickness_px),
-            pinned: panel.mode == PanelMode::Pinned,
+            mode: panel.mode,
             page: panel.active_page_id.clone().unwrap_or_default(),
         };
     }
@@ -278,7 +294,7 @@ pub(crate) fn persist_transitions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmix_shell::core::{LogicalSize, OutputKey};
+    use cosmix_shell::core::{LogicalSize, OutputKey, PanelInput};
     use cosmix_shell::runtime::{
         CarouselInput, ShellCommand, ShellCommandKind, ShellRuntimePlugin, ShellRuntimeSet,
     };
@@ -381,7 +397,7 @@ mod tests {
                 thickness_px: 333.0,
             },
         );
-        resize_input(&mut app, PanelInput::Pin);
+        resize_input(&mut app, PanelInput::Dock);
         assert_eq!(
             StateStore::load(Some(path.clone())).snapshot().edges[0].thickness_px,
             Some(starting)
@@ -419,11 +435,297 @@ mod tests {
         for edge in Edge::ALL {
             state.edges[edge.index()] = EdgeState {
                 thickness_px: Some(model.panel(edge).thickness_px + 13.0),
-                pinned: edge == Edge::Left,
+                mode: if edge == Edge::Left {
+                    PanelMode::Docked
+                } else {
+                    PanelMode::Hidden
+                },
                 page: model.carousel(edge).page_ids()[1].clone(),
             };
         }
         state
+    }
+
+    fn legacy_source(mask: u8) -> String {
+        let mut source = String::from("{scheme: \"legacy\"");
+        for edge in Edge::ALL {
+            source.push_str(&format!(
+                ", {}: {{thickness_px: {}, pinned: {}, page: \"{}\"}}",
+                crate::edge_name(edge),
+                140 + edge.index(),
+                mask & (1 << edge.index()) != 0,
+                "removed-page"
+            ));
+        }
+        source.push('}');
+        source
+    }
+
+    #[test]
+    fn every_legacy_pin_combination_migrates_preserving_sizes_pages_and_scheme() {
+        for mask in 0..16 {
+            let source = legacy_source(mask);
+            let saved = SavedState::parse(&source).unwrap();
+            assert_eq!(saved.scheme, "legacy");
+            let mut model = model();
+            saved.restore(&mut model);
+            for edge in Edge::ALL {
+                let expected = if mask & (1 << edge.index()) != 0 {
+                    PanelMode::Docked
+                } else {
+                    PanelMode::Hidden
+                };
+                assert_eq!(saved.edges[edge.index()].mode, expected);
+                assert_eq!(saved.edges[edge.index()].page, "removed-page");
+                assert_eq!(
+                    saved.edges[edge.index()].thickness_px,
+                    Some((140 + edge.index()) as f32)
+                );
+                assert_eq!(model.panel(edge).mode, expected);
+                assert!(!model.panel(edge).transient_revealed);
+            }
+            assert_eq!(SavedState::parse(&saved.encode().unwrap()).unwrap(), saved);
+        }
+    }
+
+    #[test]
+    fn v2_round_trips_all_modes_without_transient_visibility() {
+        let mut saved = populated();
+        for (edge, mode) in Edge::ALL.into_iter().zip([
+            PanelMode::Hidden,
+            PanelMode::Pinned,
+            PanelMode::Docked,
+            PanelMode::Hidden,
+        ]) {
+            saved.edges[edge.index()].mode = mode;
+        }
+        let encoded = saved.encode().unwrap();
+        let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
+            panic!("map")
+        };
+        assert_eq!(root.len(), 6);
+        assert_eq!(root.get("version"), Some(&Value::Number(2.0)));
+        assert!(!encoded.contains("transient"));
+        assert_eq!(SavedState::parse(&encoded).unwrap(), saved);
+        let mut model = model();
+        saved.restore(&mut model);
+        for edge in Edge::ALL {
+            assert_eq!(model.panel(edge).mode, saved.edges[edge.index()].mode);
+            assert!(!model.panel(edge).transient_revealed);
+        }
+    }
+
+    #[test]
+    fn legacy_load_and_hover_do_not_rewrite_but_normal_mutation_writes_v2() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let source = legacy_source(0);
+        std::fs::write(&path, &source).unwrap();
+        let mut app = resize_app(&path);
+        for input in [
+            PanelInput::CornerEntered,
+            PanelInput::PointerEntered,
+            PanelInput::CornerLeft,
+            PanelInput::PointerLeft,
+            PanelInput::Hide,
+        ] {
+            resize_input(&mut app, input);
+        }
+        assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        resize_input(&mut app, PanelInput::Pin);
+        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
+            panic!("map")
+        };
+        assert_eq!(root.get("version"), Some(&Value::Number(2.0)));
+        assert_eq!(
+            SavedState::parse(&encoded).unwrap().edges[0].mode,
+            PanelMode::Pinned
+        );
+    }
+
+    #[test]
+    fn transient_reveal_is_not_saved_even_when_another_edge_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app(&path);
+        for input in [
+            PanelInput::CornerEntered,
+            PanelInput::PointerEntered,
+            PanelInput::CornerLeft,
+            PanelInput::PointerLeft,
+            PanelInput::Reveal,
+        ] {
+            resize_input(&mut app, input);
+            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert!(!path.exists());
+        }
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .transient_revealed
+        );
+        resize_command(
+            &mut app,
+            ShellCommandKind::Panel {
+                edge: Edge::Right,
+                input: PanelInput::Dock,
+            },
+        );
+        let saved = StateStore::load(Some(path)).snapshot();
+        assert_eq!(saved.edges[Edge::Left.index()].mode, PanelMode::Hidden);
+        assert_eq!(saved.edges[Edge::Right.index()].mode, PanelMode::Docked);
+        let mut model = model();
+        saved.restore(&mut model);
+        assert!(!model.panel(Edge::Left).mapped);
+        assert!(!model.panel(Edge::Left).transient_revealed);
+    }
+
+    #[test]
+    fn hover_grace_and_animation_ticks_write_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app(&path);
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::ZERO,
+        ));
+        resize_input(&mut app, PanelInput::CornerEntered);
+        resize_input(&mut app, PanelInput::PointerEntered);
+        resize_input(&mut app, PanelInput::CornerLeft);
+        resize_input(&mut app, PanelInput::PointerLeft);
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            Duration::from_millis(100),
+        ));
+        for _ in 0..15 {
+            app.update();
+            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert!(!path.exists());
+        }
+        let frame = app.world().resource::<ShellFrameState>();
+        assert_eq!(frame.0.panel(Edge::Left).mode, PanelMode::Hidden);
+        assert!(!frame.0.panel(Edge::Left).mapped);
+        assert!(!frame.0.panel(Edge::Left).transient_revealed);
+    }
+
+    #[test]
+    fn only_actual_persistent_mode_changes_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app(&path);
+        for (input, count) in [
+            (PanelInput::Pin, 1),
+            (PanelInput::Pin, 1),
+            (PanelInput::Dock, 2),
+            (PanelInput::Dock, 2),
+            (PanelInput::Release, 3),
+            (PanelInput::Release, 3),
+            (PanelInput::Reveal, 3),
+            (PanelInput::Hide, 3),
+        ] {
+            resize_input(&mut app, input);
+            assert_eq!(app.world().resource::<StateStore>().write_count, count);
+        }
+    }
+
+    #[test]
+    fn invalid_versions_and_mixed_shapes_load_defaults_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let legacy = legacy_source(15);
+        let v2 = populated().encode().unwrap();
+        let mut sources = vec![
+            "{version: 2, broken".into(),
+            legacy.replacen('{', "{version: 2,", 1),
+            legacy.replacen('{', "{version: 3,", 1),
+            legacy.replacen('{', "{version: \"2\",", 1),
+            legacy.replace("pinned: true", "mode: \"docked\""),
+            legacy.replacen("pinned: true", "pinned: 1", 1),
+            legacy.replacen("thickness_px: 140", "thickness_px: -1", 1),
+        ];
+        // Modify parsed v2 maps rather than depending on the pretty printer's
+        // whitespace/key quoting, including unknown and missing fields.
+        for case in 0..6 {
+            let Value::Map(ref root) = parse_mix_data(&v2).unwrap() else {
+                panic!("map")
+            };
+            let mut root = (**root).clone();
+            match case {
+                0 => {
+                    root.insert("version".into(), Value::Number(3.0));
+                }
+                1 => {
+                    root.shift_remove("version");
+                }
+                2 => {
+                    root.insert("extra".into(), Value::Bool(true));
+                }
+                _ => {
+                    let Some(Value::Map(fields)) = root.get_mut("left") else {
+                        panic!("edge")
+                    };
+                    let fields = std::rc::Rc::make_mut(fields);
+                    match case {
+                        3 => {
+                            fields.insert("mode".into(), Value::String("revealed".into()));
+                        }
+                        4 => {
+                            fields.insert("pinned".into(), Value::Bool(true));
+                        }
+                        _ => {
+                            fields.shift_remove("page");
+                        }
+                    }
+                }
+            }
+            sources.push(Value::map(root).to_mix_data_string_pretty().unwrap());
+        }
+        for source in sources {
+            std::fs::write(&path, &source).unwrap();
+            assert!(SavedState::parse(&source).is_err(), "{source}");
+            let mut app = resize_app(&path);
+            app.update();
+            resize_input(&mut app, PanelInput::CornerEntered);
+            assert_eq!(
+                app.world().resource::<StateStore>().snapshot(),
+                SavedState::default()
+            );
+            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn legacy_popup_release_clears_migrated_reservation_before_conceal() {
+        use cosmix_shell::runtime::{ShellSemanticVerb, semantic_shell_command};
+        let saved = SavedState::parse(&legacy_source(1)).unwrap();
+        let mut model = model();
+        saved.restore(&mut model);
+        model.tick(Duration::from_millis(200)).unwrap();
+        assert!(model.panel(Edge::Left).exclusive_zone_px > 0.0);
+        let command = semantic_shell_command(
+            model.output().clone(),
+            model.last_update(),
+            Edge::Left,
+            ShellSemanticVerb::PanelUnpin,
+        );
+        let ShellCommandKind::Panel { edge, input } = command.kind else {
+            panic!("panel")
+        };
+        model.panel_input(edge, command.at, input).unwrap();
+        assert_eq!(model.panel(edge).mode, PanelMode::Hidden);
+        assert_eq!(model.panel(edge).exclusive_zone_px, 0.0);
+        // Enqueue acceptance alone is not concealment: the record must remain
+        // until the existing props subtree reads pinned=false AND visible=false.
+        assert!(model.panel(edge).mapped);
+        model
+            .panel_input(edge, command.at, PanelInput::Hide)
+            .unwrap();
+        model.tick(Duration::from_millis(400)).unwrap();
+        assert!(!model.panel(edge).mapped);
     }
 
     #[test]
@@ -434,7 +736,7 @@ mod tests {
         let path = directory.path().join("quoin.state.mix");
         let mut model = model();
         model
-            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
             .unwrap();
         let mut app = App::new();
         app.add_plugins((
@@ -508,7 +810,7 @@ mod tests {
                 saved.edges[edge.index()].thickness_px.unwrap()
             );
             assert_eq!(
-                model.panel(edge).mode == PanelMode::Pinned,
+                model.panel(edge).mode == PanelMode::Docked,
                 edge == Edge::Left
             );
             assert_eq!(
@@ -563,7 +865,7 @@ mod tests {
             at: Duration::ZERO,
             kind: ShellCommandKind::Panel {
                 edge: Edge::Left,
-                input: PanelInput::Pin,
+                input: PanelInput::Dock,
             },
         });
         app.world_mut()
@@ -602,7 +904,7 @@ mod tests {
         app.world_mut()
             .write_message(command(ShellCommandKind::Panel {
                 edge: Edge::Left,
-                input: PanelInput::Pin,
+                input: PanelInput::Dock,
             }));
         app.world_mut()
             .write_message(command(ShellCommandKind::Carousel {
@@ -611,7 +913,7 @@ mod tests {
             }));
         app.update();
         let saved = StateStore::load(Some(path)).snapshot();
-        assert!(saved.edges[0].pinned);
+        assert_eq!(saved.edges[0].mode, PanelMode::Docked);
         assert_eq!(saved.edges[0].page, "places");
     }
 }

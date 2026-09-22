@@ -240,8 +240,8 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
             thickness,
         ),
     };
-    let pinned = panel.mode == PanelMode::Pinned;
-    let hidden = if pinned {
+    let docked = panel.mode == PanelMode::Docked;
+    let hidden = if docked {
         0
     } else {
         -((1.0 - panel.visible_fraction) * panel.thickness_px).round() as i32
@@ -265,7 +265,7 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
         },
     };
     Ok(DesiredSurface {
-        layer: if pinned {
+        layer: if docked {
             ProtocolLayer::Top
         } else {
             ProtocolLayer::Overlay
@@ -273,7 +273,7 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
         anchor,
         width,
         height,
-        zone: if pinned { thickness as i32 } else { 0 },
+        zone: if docked { thickness as i32 } else { 0 },
         margin,
         keyboard: match panel.keyboard_interactivity {
             KeyboardInteractivity::None => ProtocolKeyboardInteractivity::None,
@@ -283,7 +283,7 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
 }
 
 pub(crate) fn committed_edge_margin(panel: &PanelPresentation) -> i32 {
-    if panel.mode == PanelMode::Pinned {
+    if panel.mode == PanelMode::Docked {
         0
     } else {
         -((1.0 - panel.visible_fraction) * panel.thickness_px).round() as i32
@@ -321,6 +321,7 @@ mod tests {
 
     fn panel(edge: Edge, mode: PanelMode, mapped: bool, fraction: f32) -> PanelPresentation {
         PanelPresentation {
+            transient_revealed: mode == PanelMode::Hidden && mapped && fraction > 0.0,
             max_thickness_px: 500.0,
             edge,
             mode,
@@ -329,7 +330,7 @@ mod tests {
             thickness_px: 101.0,
             resize_active: false,
             settled_thickness_px: 101.0,
-            exclusive_zone_px: if mode == PanelMode::Pinned {
+            exclusive_zone_px: if mode == PanelMode::Docked {
                 101.0
             } else {
                 0.0
@@ -345,7 +346,46 @@ mod tests {
     }
 
     fn replay(edge: Edge) -> Vec<ProtocolOp> {
-        plan_surface(None, &panel(edge, PanelMode::Revealed, true, 1.0), GEOMETRY).unwrap()
+        plan_surface(None, &panel(edge, PanelMode::Hidden, true, 1.0), GEOMETRY).unwrap()
+    }
+
+    #[test]
+    fn three_modes_map_layers_reservations_and_motion_for_every_edge() {
+        for edge in Edge::ALL {
+            let hidden = panel(edge, PanelMode::Hidden, false, 0.0);
+            assert!(plan_surface(None, &hidden, GEOMETRY).unwrap().is_empty());
+            for fraction in [0.0, 0.5, 1.0] {
+                let mut transient = panel(edge, PanelMode::Hidden, true, fraction);
+                transient.transient_revealed = true;
+                let pinned = panel(edge, PanelMode::Pinned, true, fraction);
+                let docked = panel(edge, PanelMode::Docked, true, fraction);
+                assert_eq!(desired(&transient).unwrap(), desired(&pinned).unwrap());
+                assert!(
+                    plan_surface(Some(&transient), &pinned, GEOMETRY)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    plan_surface(Some(&pinned), &transient, GEOMETRY)
+                        .unwrap()
+                        .is_empty()
+                );
+                for overlay in [&transient, &pinned] {
+                    let desired = desired(overlay).unwrap();
+                    assert_eq!(desired.layer, ProtocolLayer::Overlay);
+                    assert_eq!(desired.zone, 0);
+                    assert_eq!(
+                        committed_edge_margin(overlay),
+                        -((1.0 - fraction) * 101.0).round() as i32
+                    );
+                }
+                let desired = desired(&docked).unwrap();
+                assert_eq!(desired.layer, ProtocolLayer::Top);
+                assert_eq!(desired.zone, 101);
+                assert_eq!(desired.margin, ProtocolMargin::default());
+                assert_eq!(committed_edge_margin(&docked), 0);
+            }
+        }
     }
 
     #[test]
@@ -406,11 +446,11 @@ mod tests {
     }
 
     #[test]
-    fn non_pinned_fraction_table_uses_edge_margin_and_half_away_rounding() {
+    fn overlay_fraction_table_uses_edge_margin_and_half_away_rounding() {
         for (fraction, expected) in [(0.0, -101), (0.5, -51), (1.0, 0)] {
             let operations = plan_surface(
                 None,
-                &panel(Edge::Right, PanelMode::Revealed, true, fraction),
+                &panel(Edge::Right, PanelMode::Hidden, true, fraction),
                 GEOMETRY,
             )
             .unwrap();
@@ -425,9 +465,9 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_pinning_flips_overlay_to_top_and_claims_full_zone() {
-        let revealed = panel(Edge::Top, PanelMode::Revealed, true, 0.5);
-        let pinned = panel(Edge::Top, PanelMode::Pinned, true, 0.5);
+    fn dynamic_docking_flips_overlay_to_top_and_claims_full_zone() {
+        let revealed = panel(Edge::Top, PanelMode::Hidden, true, 0.5);
+        let pinned = panel(Edge::Top, PanelMode::Docked, true, 0.5);
         assert_eq!(
             plan_surface(Some(&revealed), &pinned, GEOMETRY).unwrap(),
             vec![
@@ -452,9 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn pin_from_hidden_maps_top_with_full_zone_and_zero_protocol_margin() {
+    fn dock_from_hidden_maps_top_with_full_zone_and_zero_protocol_margin() {
         let hidden = panel(Edge::Left, PanelMode::Hidden, false, 0.0);
-        let pinned = panel(Edge::Left, PanelMode::Pinned, true, 0.0);
+        let pinned = panel(Edge::Left, PanelMode::Docked, true, 0.0);
         let operations = plan_surface(Some(&hidden), &pinned, GEOMETRY).unwrap();
         assert_eq!(operations[0], ProtocolOp::CreateSurface);
         assert_eq!(operations[1], ProtocolOp::SetLayer(ProtocolLayer::Top));
@@ -468,8 +508,9 @@ mod tests {
 
     #[test]
     fn mapped_hidden_is_conceal_motion_and_final_hidden_unmaps() {
-        let revealed = panel(Edge::Bottom, PanelMode::Revealed, true, 1.0);
-        let concealing = panel(Edge::Bottom, PanelMode::Hidden, true, 0.5);
+        let revealed = panel(Edge::Bottom, PanelMode::Hidden, true, 1.0);
+        let mut concealing = panel(Edge::Bottom, PanelMode::Hidden, true, 0.5);
+        concealing.transient_revealed = false;
         let hidden = panel(Edge::Bottom, PanelMode::Hidden, false, 0.0);
         assert_eq!(
             plan_surface(Some(&revealed), &concealing, GEOMETRY).unwrap(),
@@ -489,7 +530,7 @@ mod tests {
 
     #[test]
     fn no_protocol_change_is_a_no_op_even_if_content_changes() {
-        let previous = panel(Edge::Left, PanelMode::Revealed, true, 1.0);
+        let previous = panel(Edge::Left, PanelMode::Hidden, true, 1.0);
         let mut next = previous.clone();
         next.active_page_id = Some("other".to_owned());
         assert!(
@@ -502,7 +543,7 @@ mod tests {
     #[test]
     fn remap_replays_every_property_and_configure_gate() {
         let hidden = panel(Edge::Right, PanelMode::Hidden, false, 0.0);
-        let remapped = panel(Edge::Right, PanelMode::Revealed, true, 0.5);
+        let remapped = panel(Edge::Right, PanelMode::Hidden, true, 0.5);
         let operations = plan_surface(Some(&hidden), &remapped, GEOMETRY).unwrap();
         assert_eq!(operations, plan_surface(None, &remapped, GEOMETRY).unwrap());
         assert_eq!(operations.first(), Some(&ProtocolOp::CreateSurface));
@@ -512,14 +553,14 @@ mod tests {
     #[test]
     fn rejects_non_finite_values_and_invalid_zone_range() {
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let mut invalid = panel(Edge::Left, PanelMode::Revealed, true, 1.0);
+            let mut invalid = panel(Edge::Left, PanelMode::Hidden, true, 1.0);
             invalid.visible_fraction = value;
             assert!(matches!(
                 plan_surface(None, &invalid, GEOMETRY),
                 Err(PlanError::InvalidVisibleFraction(_))
             ));
         }
-        let mut invalid = panel(Edge::Left, PanelMode::Pinned, true, 1.0);
+        let mut invalid = panel(Edge::Left, PanelMode::Docked, true, 1.0);
         invalid.exclusive_zone_px = -1.0;
         assert_eq!(
             plan_surface(None, &invalid, GEOMETRY),
@@ -544,7 +585,7 @@ mod tests {
         assert!(matches!(
             plan_surface(
                 None,
-                &panel(Edge::Left, PanelMode::Revealed, true, 1.0),
+                &panel(Edge::Left, PanelMode::Hidden, true, 1.0),
                 OutputGeometry {
                     width: f32::NAN,
                     height: 1.0,
@@ -557,7 +598,7 @@ mod tests {
     #[test]
     fn keyboard_mapping_is_strictly_none_or_on_demand() {
         let hidden = panel(Edge::Top, PanelMode::Hidden, false, 0.0);
-        let mapped = panel(Edge::Top, PanelMode::Revealed, true, 1.0);
+        let mapped = panel(Edge::Top, PanelMode::Hidden, true, 1.0);
         assert_eq!(
             plan_surface(None, &mapped, GEOMETRY).unwrap()[6],
             ProtocolOp::SetKeyboardInteractivity(ProtocolKeyboardInteractivity::OnDemand)

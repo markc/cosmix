@@ -7,7 +7,7 @@ scene documents and loads them into the running Quoin (`shell`):
 
 | scene | edge | what it is |
 |---|---|---|
-| `panel` | bottom, pinned | launcher button · workspace pager · task buttons · tray icons · status applets · clock · peek-at-desktop |
+| `panel` | bottom, docked (legacy Bus `pin`) | launcher button · workspace pager · task buttons · tray icons · status applets · clock · peek-at-desktop |
 | `launcher` | left | search field + every visible `.desktop` application, click launches |
 | `calendar` | right | month grid (Monday first, today marked, neighbouring days greyed), month navigation, "Open calendar app" |
 | `notes` | right | live notifications from the `notify` adapter, click dismisses, "Clear all" |
@@ -61,7 +61,16 @@ already in flight does not leave a closed popup open. Every popup pin the
 panel makes is recorded in `$XDG_STATE_HOME/cosmix/quoin-panel-pins.json`; at
 start the citizen releases exactly those edges (a popup open when Quoin or
 the citizen went down would otherwise return as a pinned native page). A
-record is only dropped once Quoin has taken the unpin. Pin state is per edge,
+record is only dropped after a single applied `shell.props.get` subtree snapshot
+confirms both `pinned == false` and `visible == false`. An enqueue acknowledgement
+is insufficient. The existing bounded hide loop is retained; failure or an
+unconfirmed release leaves the record for the existing startup/recovery pass.
+The file remains a bare JSON array of edge strings. Its explicit compatibility
+rule is that legacy Bus `unpin` releases both persistent modes, including dock
+reservations migrated from legacy `pinned: true`. No version conversion is
+needed for this record. Existing Bus `pin` still reserves space; switching
+popup/capture callers to overlay pin intent is a separate API/caller chunk.
+Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.
 

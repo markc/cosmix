@@ -447,7 +447,7 @@ popup, written as <a href="/cos/scenes">Mix Scenes</a>. One Mix citizen
 (<code>src/desktop/scripts/quoin-panel.mix</code>, Bus name <code>quoin-panel</code>) owns four
 scene documents and loads them into the running Quoin (<code>shell</code>):</p>
 <table><thead><tr><th>scene</th><th>edge</th><th>what it is</th></tr></thead><tbody>
-<tr><td><code>panel</code></td><td>bottom, pinned</td><td>launcher button · workspace pager · task buttons · tray icons · status applets · clock · peek-at-desktop</td></tr>
+<tr><td><code>panel</code></td><td>bottom, docked (legacy Bus <code>pin</code>)</td><td>launcher button · workspace pager · task buttons · tray icons · status applets · clock · peek-at-desktop</td></tr>
 <tr><td><code>launcher</code></td><td>left</td><td>search field + every visible <code>.desktop</code> application, click launches</td></tr>
 <tr><td><code>calendar</code></td><td>right</td><td>month grid (Monday first, today marked, neighbouring days greyed), month navigation, "Open calendar app"</td></tr>
 <tr><td><code>notes</code></td><td>right</td><td>live notifications from the <code>notify</code> adapter, click dismisses, "Clear all"</td></tr>
@@ -495,7 +495,16 @@ already in flight does not leave a closed popup open. Every popup pin the
 panel makes is recorded in <code>$XDG_STATE_HOME/cosmix/quoin-panel-pins.json</code>; at
 start the citizen releases exactly those edges (a popup open when Quoin or
 the citizen went down would otherwise return as a pinned native page). A
-record is only dropped once Quoin has taken the unpin. Pin state is per edge,
+record is only dropped after a single applied <code>shell.props.get</code> subtree snapshot
+confirms both <code>pinned == false</code> and <code>visible == false</code>. An enqueue acknowledgement
+is insufficient. The existing bounded hide loop is retained; failure or an
+unconfirmed release leaves the record for the existing startup/recovery pass.
+The file remains a bare JSON array of edge strings. Its explicit compatibility
+rule is that legacy Bus <code>unpin</code> releases both persistent modes, including dock
+reservations migrated from legacy <code>pinned: true</code>. No version conversion is
+needed for this record. Existing Bus <code>pin</code> still reserves space; switching
+popup/capture callers to overlay pin intent is a separate API/caller chunk.
+Pin state is per edge,
 so a pin you set on a recorded edge after the citizen stopped is released
 too; edges the panel never pinned are never touched.</p>
 <p>Once every five minutes the clock tick also re-seeds the compositor watch

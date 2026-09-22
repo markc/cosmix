@@ -99,7 +99,7 @@ pub fn run_layer_host() -> AppExit {
             model.set_carousel(edge, model_registry.carousel(edge));
             if smoke_all_panels {
                 model
-                    .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                    .panel_input(edge, Duration::ZERO, PanelInput::Dock)
                     .expect("static smoke input is monotonic");
             }
         }
@@ -262,10 +262,9 @@ fn log_transitions(
             PanelEffect::Conceal {
                 reason: ConcealReason::Grace,
             } => println!("QUOIN_CONCEAL edge={edge} reason=grace"),
-            PanelEffect::Pin { pinned } => println!(
-                "QUOIN_PIN edge={edge} state={}",
-                if pinned { "pinned" } else { "unpinned" }
-            ),
+            PanelEffect::ModeChanged { mode } => {
+                println!("QUOIN_MODE edge={edge} mode={}", mode.as_str())
+            }
         }
     }
     if smoke.emitted {

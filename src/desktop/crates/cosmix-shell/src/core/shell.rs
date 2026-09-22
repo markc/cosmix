@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use super::{
     Carousel, CornerEvent, Edge, LogicalSize, OutputKey, PanelConfig, PanelConfigError, PanelInput,
-    PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake, seed_panel_thickness,
+    PanelMode, PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake,
+    seed_panel_thickness,
 };
 
 /// Complete pure shell state for one output.
@@ -173,12 +174,32 @@ impl ShellModel {
         input: PanelInput,
     ) -> Result<PanelUpdate, PanelTimeError> {
         self.ensure_monotonic(at)?;
-        if matches!(input, PanelInput::Pin | PanelInput::PinToggle) {
+        // Only Dock clamps into the opposing-edge thickness budget here: Docked
+        // is the only mode that claims an exclusive zone, so it is the only one
+        // that competes for it. Pin/PinToggle deliberately do NOT clamp -- a
+        // Pinned overlay claims no zone and may legitimately overhang an
+        // opposing Docked panel (the same way a transient reveal already does).
+        // fit_output_budget() still clamps on every geometry change regardless
+        // of mode, so this only affects the initial thickness on entry.
+        if matches!(
+            input,
+            PanelInput::Dock | PanelInput::DockToggle | PanelInput::SetMode(PanelMode::Docked)
+        ) {
             let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
         }
         let update = self.panels[edge.index()].apply(at, input)?;
         self.last_update = at;
         Ok(update)
+    }
+
+    /// Persistent mode ingress for future input adapters; no corner wiring implied.
+    pub fn set_mode(
+        &mut self,
+        edge: Edge,
+        at: Duration,
+        mode: PanelMode,
+    ) -> Result<PanelUpdate, PanelTimeError> {
+        self.panel_input(edge, at, PanelInput::SetMode(mode))
     }
 
     /// Apply compositor corner containment or clicks to the mapped clockwise edge.
@@ -195,7 +216,7 @@ impl ShellModel {
                 .panel_input(corner.summoned_edge(), at, PanelInput::CornerLeft)
                 .map(Some),
             CornerEvent::Clicked { corner } => self
-                .panel_input(corner.summoned_edge(), at, PanelInput::PinToggle)
+                .panel_input(corner.summoned_edge(), at, PanelInput::DockToggle)
                 .map(Some),
         }
     }

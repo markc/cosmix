@@ -923,9 +923,10 @@ impl PanelSurface {
     pub fn wants_animation_callback(&self) -> bool {
         self.last_committed.as_ref().is_some_and(|panel| {
             panel.mapped
-                && match panel.mode {
-                    PanelMode::Pinned | PanelMode::Revealed => panel.visible_fraction < 1.0,
-                    PanelMode::Hidden => panel.visible_fraction > 0.0,
+                && if panel.mode != PanelMode::Hidden || panel.transient_revealed {
+                    panel.visible_fraction < 1.0
+                } else {
+                    panel.visible_fraction > 0.0
                 }
         })
     }

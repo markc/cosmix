@@ -841,6 +841,9 @@ enum CommitAdvance {
     Pending,
     Advance,
     Repair,
+    /// The planner proved that an already committed surface needs no protocol
+    /// changes. Refresh logical intent (not a new Wayland commit receipt).
+    Equivalent,
 }
 
 fn commit_advance<E>(execution: Result<ApplyResult, E>, unmap: bool) -> Result<CommitAdvance, E> {
@@ -872,7 +875,7 @@ fn record_commit_advance(
     unmap: bool,
 ) -> Option<cosmix_shell::core::PanelMode> {
     match advance {
-        CommitAdvance::Advance => {
+        CommitAdvance::Advance | CommitAdvance::Equivalent => {
             *last_committed = Some(next.clone());
             *pending_committed = None;
             Some(next.mode)
@@ -1442,6 +1445,19 @@ impl RunnerState {
                 operations.contains(&ProtocolOp::Unmap),
                 awaiting_initial_configure,
             )?;
+            // Hidden+transient <-> Pinned and animation reversals can change
+            // intent without changing a rounded margin or any protocol field.
+            // Keep callback gating current, but never promote a pending first
+            // configure or an executor Noop that ignored nonempty operations.
+            let advance = if advance == CommitAdvance::Repair
+                && operations.is_empty()
+                && panel.pending_committed.is_none()
+                && panel.last_committed.is_some()
+            {
+                CommitAdvance::Equivalent
+            } else {
+                advance
+            };
             if let Some(mode) = record_commit_advance(
                 &mut panel.last_committed,
                 &mut panel.pending_committed,
@@ -3521,7 +3537,7 @@ mod tests {
             at: time.elapsed(),
             kind: ShellCommandKind::Panel {
                 edge: Edge::Left,
-                input: cosmix_shell::core::PanelInput::Pin,
+                input: cosmix_shell::core::PanelInput::Dock,
             },
         });
         redraw.write(RequestRedraw);
@@ -3541,7 +3557,7 @@ mod tests {
             output,
             ShellCommandKind::Panel {
                 edge: Edge::Left,
-                input: cosmix_shell::core::PanelInput::Pin,
+                input: cosmix_shell::core::PanelInput::Dock,
             },
         );
     }
@@ -3660,6 +3676,102 @@ mod tests {
     }
 
     #[test]
+    fn callback_gating_distinguishes_transient_intent_from_persistent_mode() {
+        let mut app = App::new();
+        let (mut panels, _) = reconciliation_panels(&mut app, SurfacePhase::Configured);
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
+        for (mode, transient, expected) in [
+            (PanelMode::Hidden, false, [false, true, true]),
+            (PanelMode::Hidden, true, [true, true, false]),
+            (PanelMode::Pinned, false, [true, true, false]),
+            (PanelMode::Docked, false, [true, true, false]),
+        ] {
+            for (fraction, expected) in [0.0, 0.5, 1.0].into_iter().zip(expected) {
+                let mut presentation = frame.panel(Edge::Left).clone();
+                presentation.mode = mode;
+                presentation.transient_revealed = transient;
+                presentation.visible_fraction = fraction;
+                presentation.mapped = mode != PanelMode::Hidden || transient || fraction > 0.0;
+                panels[0].last_committed = Some(presentation);
+                assert_eq!(
+                    panels[0].wants_animation_callback(),
+                    expected,
+                    "{mode:?}, transient={transient}, fraction={fraction}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_equivalent_pin_and_visibility_reversal_refresh_committed_intent() {
+        use cosmix_shell::core::PanelInput;
+        let mut model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        let at = Duration::from_millis(200);
+        model.tick(at).unwrap();
+        let initial = cosmix_shell::runtime::ShellFrame::from_model(&model);
+        let mut app = App::new();
+        app.insert_resource(QuoinCommittedMotionModes::hidden());
+        let (mut panels, _) = reconciliation_panels(&mut app, SurfacePhase::Configured);
+        for edge in Edge::ALL {
+            panels[edge.index()].last_committed = Some(initial.panel(edge).clone());
+        }
+        let mut pointer = PointerBridge::default();
+        let mut executor = ScriptedExecutor {
+            results: VecDeque::new(),
+            operations: Vec::new(),
+        };
+        for (input, callback, latch_changed) in [
+            (PanelInput::Pin, false, true),
+            (PanelInput::SetMode(PanelMode::Hidden), true, true),
+            (PanelInput::Reveal, false, false),
+        ] {
+            model.panel_input(Edge::Left, at, input).unwrap();
+            let frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
+            assert_eq!(
+                RunnerState::reconcile(
+                    &mut app,
+                    &mut pointer,
+                    model.output(),
+                    &mut panels,
+                    model.geometry(),
+                    &frame,
+                    at,
+                    &mut executor
+                )
+                .unwrap(),
+                latch_changed
+            );
+            assert!(
+                executor.operations.is_empty(),
+                "same layer, zone and margin"
+            );
+            assert_eq!(
+                panels[0].last_committed.as_ref(),
+                Some(frame.panel(Edge::Left))
+            );
+            assert_eq!(panels[0].wants_animation_callback(), callback);
+        }
+    }
+
+    #[test]
     fn late_pointer_activation_gets_exactly_one_host_owned_follow_up_update() {
         let output = OutputKey::new("DP-1").unwrap();
         let model = ShellModel::new(
@@ -3706,7 +3818,7 @@ mod tests {
                 .0
                 .panel(Edge::Left)
                 .mode,
-            PanelMode::Pinned,
+            PanelMode::Docked,
             "the single follow-up consumes the activation command"
         );
     }
@@ -3752,7 +3864,7 @@ mod tests {
                 .0
                 .panel(Edge::Left)
                 .mode,
-            PanelMode::Pinned
+            PanelMode::Docked
         );
     }
 
@@ -3770,7 +3882,7 @@ mod tests {
             .panel(Edge::Left)
             .clone();
         let mut revealed = hidden.clone();
-        revealed.mode = PanelMode::Revealed;
+        revealed.mode = PanelMode::Pinned;
         revealed.mapped = true;
 
         let mut last = None;
@@ -3788,7 +3900,7 @@ mod tests {
             &mut modes,
             [(Edge::Left, committed)]
         ));
-        assert_eq!(modes.get(Edge::Left), PanelMode::Revealed);
+        assert_eq!(modes.get(Edge::Left), PanelMode::Pinned);
 
         last = None;
         pending = None;
@@ -3845,7 +3957,7 @@ mod tests {
             .panel_input(
                 Edge::Left,
                 Duration::ZERO,
-                cosmix_shell::core::PanelInput::Reveal,
+                cosmix_shell::core::PanelInput::Pin,
             )
             .unwrap();
         let revealed_frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
@@ -3910,7 +4022,7 @@ mod tests {
             app.world()
                 .resource::<QuoinCommittedMotionModes>()
                 .get(Edge::Left),
-            PanelMode::Revealed,
+            PanelMode::Pinned,
             "deleting the configured-latch resource write leaves this Hidden"
         );
 
@@ -3918,7 +4030,7 @@ mod tests {
             .panel_input(
                 Edge::Left,
                 Duration::from_millis(1),
-                cosmix_shell::core::PanelInput::Pin,
+                cosmix_shell::core::PanelInput::Dock,
             )
             .unwrap();
         let pinned_frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
@@ -3947,7 +4059,7 @@ mod tests {
             app.world()
                 .resource::<QuoinCommittedMotionModes>()
                 .get(Edge::Left),
-            PanelMode::Revealed
+            PanelMode::Pinned
         );
 
         let mut unmapping = ScriptedExecutor {
@@ -4066,7 +4178,7 @@ mod tests {
             app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
             app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
             let mut engaged = BTreeSet::new();
-            for expected in [PanelMode::Pinned, PanelMode::Revealed] {
+            for expected in [PanelMode::Docked, PanelMode::Hidden] {
                 assert!(apply_corner_ingress_to_app(
                     &mut app,
                     Some(&output),
@@ -4106,7 +4218,7 @@ mod tests {
             assert_eq!(engaged, BTreeSet::from([corner]));
             assert_eq!(
                 app.world().resource::<ShellFrameState>().0.panel(edge).mode,
-                PanelMode::Revealed
+                PanelMode::Hidden
             );
         }
     }
@@ -4337,8 +4449,17 @@ mod tests {
                     .0
                     .panel(Edge::Left)
                     .mode,
-                PanelMode::Revealed,
+                PanelMode::Hidden,
                 "iteration {iteration}: early timer must not conceal"
+            );
+            assert!(
+                state
+                    .app
+                    .world()
+                    .resource::<ShellFrameState>()
+                    .0
+                    .panel(Edge::Left)
+                    .transient_revealed
             );
             assert_eq!(state.wake_timer.deadline, Some(deadline));
             assert!(state.wake_timer.token.is_some(), "early timer must re-arm");
@@ -4362,6 +4483,7 @@ mod tests {
             let frame = &state.app.world().resource::<ShellFrameState>().0;
             let concealed = frame.panel(Edge::Left);
             assert_eq!(concealed.mode, PanelMode::Hidden);
+            assert!(!concealed.transient_revealed);
             assert!(!concealed.mapped, "iteration {iteration}: panel must unmap");
             assert_eq!(
                 conceal_effects,
