@@ -1,0 +1,24 @@
+root: {widget: "row", fill: true, align: "center", gap: 4, padding: 4, children: ["launcher", "gap1", "pager", "gap2", "tasks", "fill", "status", "clock", "peek"]}
+launcher: {widget: "row", height: 40, radius: 8, padding: 6, align: "center", children: ["launcher_icon"]}
+launcher_icon: {widget: "text", text: "Apps", size: 14, bold: true}
+gap1: {widget: "spacer", size: 6}
+pager: {widget: "row", gap: 3, align: "center", children: ["ws1", "ws2"]}
+ws1: {widget: "row", height: 30, radius: 6, padding: 8, align: "center", children: ["ws1_t"]}
+ws1_t: {widget: "text", text: "1", size: 12, bold: true}
+ws2: {widget: "row", height: 30, radius: 6, padding: 8, align: "center", children: ["ws2_t"]}
+ws2_t: {widget: "text", text: "2", size: 12}
+gap2: {widget: "spacer", size: 8}
+tasks: {widget: "row", gap: 4, align: "center", children: ["task"]}
+task: {widget: "row", height: 40, radius: 6, padding: 8, gap: 8, align: "center", children: ["task_icon", "task_label"]}
+task_icon: {widget: "spacer", size: 0}
+task_label: {widget: "text", text: "Terminal", size: 13, elide: true, width: 170}
+fill: {widget: "spacer"}
+status: {widget: "row", height: 36, radius: 6, padding: 7, gap: 4, align: "center", children: ["status_icon", "status_count"]}
+status_icon: {widget: "text", text: "•", size: 14}
+status_count: {widget: "text", text: "2", size: 11, bold: true}
+clock: {widget: "row", height: 44, radius: 8, padding: 10, align: "center", children: ["clock_col"]}
+clock_col: {widget: "column", gap: 0, align: "center", children: ["clock_time", "clock_date"]}
+clock_time: {widget: "text", text: "12:34", size: 19, bold: true}
+clock_date: {widget: "text", text: "Tue 22 Sep", size: 11}
+peek: {widget: "row", height: 44, radius: 6, padding: 6, align: "center", children: ["peek_icon"]}
+peek_icon: {widget: "text", text: "•", size: 14}

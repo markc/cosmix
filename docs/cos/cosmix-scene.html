@@ -456,6 +456,12 @@ shape <code>id: { widget: family, ...ports }</code>. The ten families are <code>
 described by <code>describe()</code>. Enum ports (<code>window.kind</code>, <code>window.edge</code>,
 <code>row.align</code>, and <code>button.tone</code>) are validated during lint. Numeric ports are
 always JSON floating-point values: <code>13</code> resolves and travels as <code>13.0</code>.</p>
+<p>Version 0.4 adds the <a href="scenes#curated-layout-ports-scene-crates-04">curated layout vocabulary</a>
+without changing the <code>scene: 1</code> header. Citizens discover support through
+<code>shell.scene.describe</code>, by family and port. <code>layout-conflict</code> rejects
+contradictory legacy/explicit sizing and inverted min/max bounds; an old
+host instead rejects the new ports as <code>unknown-port</code>. See the renderer manual
+for the text centring correction and the preserved zero text-wrapper minimum width.</p>
 <p>Lists require rows of <code>{id: string, cells: [string]}</code>, a sibling <code>row</code>
 template and a positive <code>row_height</code>. Template subtrees may contain only row,
 column, text, spacer and image. <code>{cells[i]}</code> is allowed only in <code>text.text</code>,

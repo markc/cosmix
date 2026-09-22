@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 use super::SceneStore;
 
 mod icons;
+#[cfg(test)]
+mod layout_tests;
 use icons::IconCache;
 
 #[derive(Resource)]
@@ -237,6 +239,11 @@ struct View {
     label: Option<Entity>,
     list: Option<Arc<RwLock<ListData>>>,
 }
+
+// Restore CTK-owned defaults when an explicit constraint is cleared. Reading
+// the previous Node would otherwise retain the last authored min/max/shrink.
+#[derive(Component)]
+struct SceneLayoutBase(Node);
 
 pub(crate) fn reconcile(world: &mut World) {
     let scale = icons::effective_scale(world);
@@ -582,6 +589,8 @@ fn spawn(world: &mut World, tree: &ResolvedScene, id: &str, node: &SceneNode) ->
         _ => commands.spawn(Node::default()).id(),
     };
     queue.apply(world);
+    let base = world.get::<Node>(root).cloned().unwrap_or_default();
+    world.entity_mut(root).insert(SceneLayoutBase(base));
     View {
         root,
         input,
@@ -603,6 +612,27 @@ fn update(
         .entity_mut(view.input.unwrap_or(view.root))
         .insert(binding);
     let mut layout = world.get::<Node>(view.root).cloned().unwrap_or_default();
+    let base = &world.get::<SceneLayoutBase>(view.root).unwrap().0;
+    // Leave native controls untouched unless the scene previously owned the
+    // property. In particular, a legacy reload must not reset CTK's metrics.
+    if old.is_some_and(|old| old.ports.contains_key("shrink")) {
+        layout.flex_shrink = base.flex_shrink;
+    }
+    if old.is_some_and(|old| old.ports.contains_key("basis")) {
+        layout.flex_basis = base.flex_basis;
+    }
+    if old.is_some_and(|old| old.ports.contains_key("align_self")) {
+        layout.align_self = base.align_self;
+    }
+    for (port, target, baseline) in [
+        ("min_height", &mut layout.min_height, base.min_height),
+        ("max_width", &mut layout.max_width, base.max_width),
+        ("max_height", &mut layout.max_height, base.max_height),
+    ] {
+        if old.is_some_and(|old| old.ports.contains_key(port)) {
+            *target = baseline;
+        }
+    }
     layout.width = node
         .ports
         .get("width")
@@ -627,9 +657,23 @@ fn update(
             } else {
                 FlexDirection::Column
             };
-            layout.row_gap = px(number(node, "gap", 0.0));
-            layout.column_gap = layout.row_gap;
-            layout.padding = UiRect::all(px(number(node, "padding", 0.0)));
+            layout.row_gap = px(number(node, "row_gap", number(node, "gap", 0.0)));
+            layout.column_gap = px(number(node, "column_gap", number(node, "gap", 0.0)));
+            layout.padding = UiRect {
+                top: px(number(node, "padding_top", number(node, "padding", 0.0))),
+                right: px(number(node, "padding_right", number(node, "padding", 0.0))),
+                bottom: px(number(node, "padding_bottom", number(node, "padding", 0.0))),
+                left: px(number(node, "padding_left", number(node, "padding", 0.0))),
+            };
+            layout.justify_content = match text(node, "justify") {
+                "start" => JustifyContent::Start,
+                "center" => JustifyContent::Center,
+                "end" => JustifyContent::End,
+                "between" => JustifyContent::SpaceBetween,
+                "around" => JustifyContent::SpaceAround,
+                "evenly" => JustifyContent::SpaceEvenly,
+                _ => JustifyContent::Default,
+            };
             layout.height = node
                 .ports
                 .get("height")
@@ -710,13 +754,24 @@ fn update(
                 "right" => Justify::Right,
                 _ => Justify::Left,
             };
-            // Justification uses the wrapper's authored or flex-allocated width.
-            world.get_mut::<Node>(label).unwrap().width =
-                if node.ports.contains_key("width") || flag(node, "fill") {
-                    percent(100)
-                } else {
-                    Val::Auto
-                };
+            // Bevy 0.19's NoWrap path discards the node width and shapes with
+            // TextBounds::UNBOUNDED. Keep the single-line label intrinsic and
+            // position its box with Taffy inside the allocated wrapper instead.
+            // TextLayout::justify still aligns explicit newline-separated lines.
+            layout.justify_content = match text(node, "align") {
+                "center" => JustifyContent::Center,
+                "right" => JustifyContent::End,
+                _ => JustifyContent::Start,
+            };
+            // Keep the legacy zero wrapper minimum set above. P1's auto
+            // minimum changed panel allocation independently of centring;
+            // authors can still override it with the explicit min_width port.
+            {
+                let mut label_node = world.get_mut::<Node>(label).unwrap();
+                label_node.width = Val::Auto;
+                label_node.min_width = Val::Auto;
+                label_node.flex_shrink = 0.0;
+            }
             if flag(node, "fill")
                 && tree.nodes.values().any(|parent| {
                     parent.family == "column"
@@ -768,12 +823,7 @@ fn update(
         "image" => {
             let src = text(node, "src");
             let image = if src.starts_with('/') {
-                icons::load(
-                    world,
-                    src,
-                    number(node, "w", 16.0),
-                    number(node, "h", 16.0),
-                )
+                icons::load(world, src, number(node, "w", 16.0), number(node, "h", 16.0))
             } else {
                 world
                     .get_resource::<AssetServer>()
@@ -802,6 +852,36 @@ fn update(
             layout.height = px(0);
         }
         _ => {}
+    }
+    // Explicit values override only their own legacy/default values. The
+    // schema rejects ambiguous fill + explicit flex declarations at ingress.
+    if let Some(value) = node.ports.get("grow").and_then(Value::as_f64) {
+        layout.flex_grow = value as f32;
+    }
+    if let Some(value) = node.ports.get("shrink").and_then(Value::as_f64) {
+        layout.flex_shrink = value as f32;
+    }
+    if let Some(value) = node.ports.get("basis").and_then(Value::as_f64) {
+        layout.flex_basis = px(value as f32);
+    }
+    if node.ports.contains_key("align_self") {
+        layout.align_self = match text(node, "align_self") {
+            "start" => AlignSelf::Start,
+            "center" => AlignSelf::Center,
+            "end" => AlignSelf::End,
+            "stretch" => AlignSelf::Stretch,
+            _ => AlignSelf::Auto,
+        };
+    }
+    for (port, target) in [
+        ("min_width", &mut layout.min_width),
+        ("max_width", &mut layout.max_width),
+        ("min_height", &mut layout.min_height),
+        ("max_height", &mut layout.max_height),
+    ] {
+        if let Some(value) = node.ports.get(port).and_then(Value::as_f64) {
+            *target = px(value as f32);
+        }
     }
     world.entity_mut(view.root).insert(layout);
 }
@@ -1031,7 +1111,11 @@ mod tests {
         );
         let mut store = SceneStore::default();
         store
-            .request(cosmix_shell::runtime::SceneVerb::Load, &source, &Value::Null)
+            .request(
+                cosmix_shell::runtime::SceneVerb::Load,
+                &source,
+                &Value::Null,
+            )
             .unwrap();
         let mut world = World::new();
         world.insert_resource(store);
@@ -1222,26 +1306,43 @@ mod tests {
             )
         };
         let first = cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:05 pm")).unwrap()).unwrap();
-        let second = cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:06 pm")).unwrap()).unwrap();
+        let second =
+            cosmix_scene::resolve(&cosmix_scene::parse(&doc("09:06 pm")).unwrap()).unwrap();
         let mut world = World::new();
         let mut mounted = mounted(&mut world, &first);
         apply(&mut world, &mut mounted, &first);
         let label = mounted.nodes["label"].label.unwrap();
         let clock = mounted.nodes["clock"].label.unwrap();
         let label_root = mounted.nodes["label"].root;
-        let label_tick = world.entity(label).get_ref::<Text>().unwrap().last_changed();
-        let parent_tick = world.entity(label_root).get_ref::<ChildOf>().unwrap().last_changed();
+        let label_tick = world
+            .entity(label)
+            .get_ref::<Text>()
+            .unwrap()
+            .last_changed();
+        let parent_tick = world
+            .entity(label_root)
+            .get_ref::<ChildOf>()
+            .unwrap()
+            .last_changed();
         world.increment_change_tick();
         apply(&mut world, &mut mounted, &second);
         assert_eq!(
-            world.entity(label).get_ref::<Text>().unwrap().last_changed(),
+            world
+                .entity(label)
+                .get_ref::<Text>()
+                .unwrap()
+                .last_changed(),
             label_tick,
             "the unchanged label must not be re-inserted"
         );
         // No node added, removed or re-childed: the hierarchy is left alone
         // (detach + re-parent re-lays out every text for a few frames).
         assert_eq!(
-            world.entity(label_root).get_ref::<ChildOf>().unwrap().last_changed(),
+            world
+                .entity(label_root)
+                .get_ref::<ChildOf>()
+                .unwrap()
+                .last_changed(),
             parent_tick,
             "a non-structural revision must not re-parent scene roots"
         );
@@ -1249,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn text_align_center_sets_justify() {
+    fn text_alignment_positions_an_intrinsic_label_without_wrapping() {
         for (family, align, expected) in [
             ("row", "center", AlignSelf::Auto),
             ("column", "center", AlignSelf::Auto),
@@ -1266,7 +1367,7 @@ mod tests {
             assert_eq!(world.get::<Node>(view.root).unwrap().align_self, expected);
             assert_eq!(
                 world.get::<Node>(view.label.unwrap()).unwrap().width,
-                percent(100)
+                Val::Auto
             );
             assert_eq!(
                 world
@@ -1300,7 +1401,15 @@ mod tests {
                 world.get::<TextLayout>(label).unwrap().justify,
                 Justify::Center
             );
-            assert_eq!(world.get::<Node>(label).unwrap().width, percent(100));
+            assert_eq!(world.get::<Node>(label).unwrap().width, Val::Auto);
+            assert_eq!(world.get::<Node>(label).unwrap().flex_shrink, 0.0);
+            assert_eq!(
+                world
+                    .get::<Node>(mounted.nodes["root"].root)
+                    .unwrap()
+                    .justify_content,
+                JustifyContent::Center
+            );
             let root = world.get::<Node>(mounted.nodes["root"].root).unwrap();
             if sizing.starts_with("width") {
                 assert_eq!(root.width, px(120));

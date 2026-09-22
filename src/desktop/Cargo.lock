@@ -3373,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cosmix-lib-bus",
  "cosmix-lib-mix",
@@ -3384,7 +3384,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.3.2"
+version = "0.4.1"
 dependencies = [
  "bevy",
  "cosmix-scene",

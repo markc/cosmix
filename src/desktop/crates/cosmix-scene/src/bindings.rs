@@ -221,6 +221,13 @@ pub fn reevaluate(
             }
         }
     }
+    let mut conflicts = Vec::new();
+    for (id, node) in &next.nodes {
+        crate::check_layout_bounds(id, node, &mut conflicts);
+    }
+    if !conflicts.is_empty() {
+        return Err(conflicts);
+    }
     let changed = crate::port_changes(&old, &next);
     Ok(ReEval {
         tree: next,
@@ -255,6 +262,11 @@ pub fn template_instantiate(
                 )
             })?;
         set_port(&mut out.ports, port, value);
+    }
+    let mut conflicts = Vec::new();
+    crate::check_layout_bounds(id, &out, &mut conflicts);
+    if let Some(conflict) = conflicts.into_iter().next() {
+        return Err(conflict);
     }
     Ok(out)
 }

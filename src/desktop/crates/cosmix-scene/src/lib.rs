@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub mod bindings;
 #[cfg(test)]
 mod binding_tests;
+#[cfg(test)]
+mod layout_tests;
 
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_NODES: usize = 2_000;
@@ -42,6 +44,7 @@ pub const ALL_CODES: &[&str] = &[
     "port-type",
     "enum-value",
     "port-min",
+    "layout-conflict",
     "missing-port",
     "dangling-child",
     "child-type",
@@ -253,7 +256,7 @@ const fn pn(n: &'static str, r: bool, m: Option<f64>) -> Port {
         }),
     }
 }
-fn schema(f: &str) -> Option<&'static [Port]> {
+fn schema(f: &str) -> Option<Vec<Port>> {
     static EDGE: &[&str] = &["right", "left", "top", "bottom"];
     static ALIGN: &[&str] = &["start", "center", "end", "stretch"];
     static TONE: &[&str] = &["normal", "danger", "primary"];
@@ -355,7 +358,7 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         pn("h", false, Some(0.0)),
     ];
     static SPACER: [Port; 1] = [pn("size", false, None)];
-    Some(match f {
+    let family: &[Port] = match f {
         "window" => &WINDOW,
         "column" => &BOX,
         "row" => &ROW,
@@ -367,7 +370,61 @@ fn schema(f: &str) -> Option<&'static [Port]> {
         "image" => &IMAGE,
         "spacer" => &SPACER,
         _ => return None,
-    })
+    };
+    let mut ports = family.to_vec();
+    // No defaults here: absence preserves the legacy mapping and canonical
+    // resolved documents. Window is edge metadata, not a flex child.
+    if f != "window" {
+        ports.extend([
+            p("align_self", "string", false, None),
+            pn("grow", false, None), pn("shrink", false, None), pn("basis", false, None),
+            pn("min_width", false, None), pn("max_width", false, None),
+            pn("min_height", false, None), pn("max_height", false, None),
+        ]);
+        ports.iter_mut().find(|p| p.name == "align_self").unwrap().enum_values =
+            &["auto", "start", "center", "end", "stretch"];
+    }
+    if matches!(f, "row" | "column") {
+        let mut justify = p("justify", "string", false, None);
+        justify.enum_values = &["start", "center", "end", "between", "around", "evenly"];
+        ports.extend([
+            justify, pn("row_gap", false, None), pn("column_gap", false, None),
+            pn("padding_top", false, None), pn("padding_right", false, None),
+            pn("padding_bottom", false, None), pn("padding_left", false, None),
+        ]);
+    }
+    Some(ports)
+}
+
+// Check presence before defaults are inserted. Even fill:false + grow is
+// ambiguous author intent; require removing the legacy shorthand first.
+fn check_layout_declarations(id: &str, node: &RawNode, out: &mut Vec<Diagnostic>) {
+    let ports = &node.ports;
+    let explicit = ["grow", "shrink", "basis"].iter().any(|p| ports.contains_key(*p));
+    let conflict = (ports.contains_key("fill") && explicit)
+        || (node.widget == "spacer" && ports.contains_key("size") && explicit)
+        || (node.widget == "row" && ports.contains_key("height") && explicit);
+    if conflict {
+        out.push(Diagnostic::error("layout-conflict", node.line,
+            format!("{id}: remove legacy fill / fixed row height / spacer size before conflicting explicit flex sizing")));
+    }
+}
+
+pub(crate) fn check_layout_bounds(id: &str, node: &Node, out: &mut Vec<Diagnostic>) {
+    for (min, max) in [("min_width", "max_width"), ("min_height", "max_height")] {
+        if let (Some(low), Some(high)) = (
+            node.ports.get(min).and_then(JsonValue::as_f64),
+            node.ports.get(max).and_then(JsonValue::as_f64),
+        ) && low > high {
+            out.push(Diagnostic::error("layout-conflict", node.line,
+                format!("{id}: {min} exceeds {max}")));
+        }
+    }
+    if node.family == "list" && node.ports.contains_key("max_rows")
+        && node.ports.contains_key("max_height") {
+        out.push(Diagnostic::error("layout-conflict", node.line,
+            format!("{id}: max_rows and max_height both constrain the list viewport")));
+    }
 }
 pub fn describe(f: &str) -> Option<Vec<PortDescribe>> {
     schema(f).map(|ps| {
@@ -667,6 +724,10 @@ fn lint_structure(doc: &SceneDocument) -> Vec<Diagnostic> {
             ));
             continue;
         };
+        check_layout_declarations(id, n, &mut out);
+        check_layout_bounds(id, &Node {
+            family: n.widget.clone(), ports: n.ports.clone(), line: n.line, is_template: false,
+        }, &mut out);
         for (k, v) in &n.ports {
             let Some(p) = ps.iter().find(|p| p.name == k) else {
                 out.push(Diagnostic::error(
@@ -864,6 +925,11 @@ pub fn resolve(doc: &SceneDocument) -> Result<ResolvedScene, Vec<Diagnostic>> {
         );
     }
     let mut templates: Vec<_> = ts.into_iter().collect();
+    let mut conflicts = Vec::new();
+    for (id, node) in &nodes {
+        check_layout_bounds(id, node, &mut conflicts);
+    }
+    if !conflicts.is_empty() { return Err(sorted(conflicts)); }
     templates.sort();
     Ok(ResolvedScene {
         name: doc.name.clone(),
@@ -1659,6 +1725,7 @@ b: {widget: "window", kind: "edge", edge: "right", title: "ok", w: 1, h: 2}
             ("node-limit", valid(&(0..=MAX_NODES).map(|i| format!("n{i}: {{widget: \"text\", text: \"x\"}}\n")).collect::<String>())),
             ("unknown-family", valid("root: {widget: \"unknown\"}").into()),
             ("unknown-port", valid("root: {widget: \"text\", text: \"x\", nope: 1}").into()),
+            ("layout-conflict", valid("root: {widget: \"text\", text: \"x\", fill: true, grow: 1}").into()),
             ("port-type", valid("root: {widget: \"text\", text: 1}").into()),
             ("enum-value", valid("root: {widget: \"button\", label: \"x\", tone: \"bad\"}").into()),
             ("port-min", valid("root: {widget: \"list\", rows: [], row: \"t\", row_height: 0}\nt: {widget: \"row\", children: []}").into()),
