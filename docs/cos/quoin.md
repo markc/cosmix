@@ -19,6 +19,13 @@ areas do not trigger another resize or notification. Application
 processes remain ordinary Wayland clients, with their existing comp-owned
 window decorations and move/resize policy.
 
+Shared scene geometry gives horizontal docks precedence: top and bottom span
+the full output width; left and right start below the docked top panel and end
+above the docked bottom panel. Hidden and pinned panels reserve no space.
+In the embedded host, pinned and transiently revealed hidden panels draw and
+receive pointer hits above docked panels. Edge ordering stays stable within
+each class, including while hidden panels animate closed.
+
 The native host forwards panel mouse buttons, scrolling and grip gestures to
 Bevy picking. A press beginning on a panel retains its release outside the
 panel; an existing application/window drag retains ownership. Session locking
