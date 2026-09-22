@@ -500,7 +500,7 @@ mod tests {
             saved.edges[edge.index()].mode = mode;
         }
         let encoded = saved.encode().unwrap();
-        let Value::Map(root) = parse_mix_data(&encoded).unwrap() else {
+        let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
             panic!("map")
         };
         assert_eq!(root.len(), 6);
@@ -536,7 +536,7 @@ mod tests {
         resize_input(&mut app, PanelInput::Pin);
         assert_eq!(app.world().resource::<StateStore>().write_count, 1);
         let encoded = std::fs::read_to_string(&path).unwrap();
-        let Value::Map(root) = parse_mix_data(&encoded).unwrap() else {
+        let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
             panic!("map")
         };
         assert_eq!(root.get("version"), Some(&Value::Number(2.0)));
@@ -649,7 +649,7 @@ mod tests {
         // Modify parsed v2 maps rather than depending on the pretty printer's
         // whitespace/key quoting, including unknown and missing fields.
         for case in 0..6 {
-            let Value::Map(root) = parse_mix_data(&v2).unwrap() else {
+            let Value::Map(ref root) = parse_mix_data(&v2).unwrap() else {
                 panic!("map")
             };
             let mut root = (*root).clone();
