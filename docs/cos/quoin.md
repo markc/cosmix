@@ -19,6 +19,15 @@ areas do not trigger another resize or notification. Application
 processes remain ordinary Wayland clients, with their existing comp-owned
 window decorations and move/resize policy.
 
+Shared scene geometry gives horizontal docks precedence: top and bottom span
+the full output width; left and right start below the docked top panel and end
+above the docked bottom panel. Hidden and pinned panels reserve no space.
+In the embedded host, pinned and transiently revealed hidden panels draw and
+receive pointer hits above docked panels. Edge ordering stays stable within
+each class, including while hidden panels animate closed. The `dev-host`
+normal-window tuning harness uses the same geometry and stacking bands:
+docked panels at 110–140 and pinned/hidden overlays at 150–180.
+
 The native host forwards panel mouse buttons, scrolling and grip gestures to
 Bevy picking. A press beginning on a panel retains its release outside the
 panel; an existing application/window drag retains ownership. Session locking
@@ -330,25 +339,45 @@ never rendered as zero.
 Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. `--comp-service NAME` selects the
 registered compositor instance (default `comp`), giving topic headers
-`<service>.corner.entered`, `<service>.corner.left`, `<service>.corner.clicked` and
-`<service>.output.changed`. Their inner commands remain the unprefixed
-`corner.entered`, `corner.left`, `corner.clicked` and `output.changed`.
-The compositor emits legacy `corner.clicked` on a successful left-button release on
-an engaged corner; the client toggles the clockwise edge's dock (TL→left, BL→bottom,
-BR→right, TR→top). Each click is an impulse, independent of corner membership;
-the model resolves the toggle from its current mode and persists the
-change. Undocking leaves the hidden panel transiently revealed and arms grace
-when no hold remains. This preserves the old click behaviour; wiring the new
-compositor corner consumption/discrimination to pin/dock toggles is deferred.
+`<service>.corner.entered`, `<service>.corner.left`, `<service>.corner.clicked.v2`,
+`<service>.corner.clicked` and `<service>.output.changed`. Their inner commands
+are the same suffixes without the service prefix.
+Brief LMB toggles **Pinned** (persistent overlay); brief RMB toggles **Docked**
+(reserves space). Both use the existing counter-clockwise mapping: TL→left,
+BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
+membership; the model resolves the toggle from its current mode and persists
+the change. Unpinning or undocking leaves transient reveal/grace to the panel model.
 The header pin control toggles overlay pinning; its glyph is `◇` for hidden
 (including transient reveal), `◆` for pinned and `▣` for docked.
 
 The compositor also publishes `corner.clicked.v2` with `button` and `kind` for
 LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
 their releases, cancelling pending actions on excess movement or disengagement.
-The current shell-host subscribes to the legacy LMB topic only; richer action
-routing is a subsequent integration step. During this transition RMB corner
-presses are swallowed without opening a menu on an old shell-host.
+RMB hold never toggles a mode. It calls the optional host App resource
+`CornerMenuHook(fn(&mut World, &OutputKey, Corner))`. The callback must look up
+that output/corner's configured menu and do nothing if none exists. Without
+the resource, hold is a traced no-op. No callback or menu UI is installed yet.
+
+Both click topics are subscribed for old-compositor compatibility. Successful
+subscription is not capability discovery: the broker accepts unpublished topics.
+Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The current
+compositor emits each LMB's legacy record at sequence N and its v2 record at N+1;
+the host maps both to N and admits that logical click once, in either delivery
+order. On observing v2 it ignores all subsequent legacy clicks for that connection.
+A sequence high-water mark also rejects duplicate/stale click records, before
+output-map queueing. Reconnect clears preference and sequence state; ordinary
+output refreshes and loss markers retain them. This relies on the compositor's
+consecutive LMB pair and monotonically increasing observation stream, not a
+timing window. It is not an exactly-once guarantee across a connection reset or
+publisher sequence restart; a publisher restart requires a fresh host/connection.
+High-water rejections emit `quoin_corner_sequence_rejected` WARNs at counts
+1, 2, 4, 8, … with the received sequence, canonical sequence and high-water mark.
+These include legitimate duplicates (including the first legacy/v2 pair);
+persistent low sequences can indicate a compositor restart. Legacy clicks ignored
+after v2 discovery do not increment this separate counter. The counter resets
+with connection preference state. Automatic publisher-restart recovery is not
+implemented: `info.instance` identifies the compositor process, but is absent
+from the subscribed corner/output payloads and the host's `outputs` query.
 
 Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed `comp.props.get` request verb at `outputs`. It maps the topic's
@@ -370,7 +399,7 @@ refresh it before accepting mapped corner state again.
 A lost click is a missed toggle and is never replayed or synthetically recovered.
 If only a click is dropped at the host-to-runner queue, existing holds are retained.
 
-A compositor enter reveals and holds the clockwise edge (TL→left, BL→bottom,
+A compositor enter reveals and holds the counter-clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native
 pointer is also outside. Native SCTK pointer enter/leave supplies the second
 hold; Bevy pointer button events drive pin, both carousel chevrons and page

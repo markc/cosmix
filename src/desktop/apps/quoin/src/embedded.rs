@@ -11,7 +11,7 @@ use cosmix_shell::{
     chrome::{QuoinPanelMounts, QuoinResizeGrip},
     core::{
         CornerDetector, CornerDetectorConfig, Edge, LogicalPoint, LogicalSize, OutputKey,
-        PanelInput, PointerSample, ShellModel,
+        PanelInput, PanelMode, PointerSample, ShellModel,
     },
     host::{PanelRect, panel_layout},
     runtime::{
@@ -70,7 +70,7 @@ impl Plugin for EmbeddedQuoinPlugin {
                         display: Display::None,
                         ..default()
                     },
-                    GlobalZIndex(110 + i as i32 * 10),
+                    panel_z_index(Edge::ALL[i], PanelMode::Hidden),
                 ))
                 .id()
         });
@@ -278,13 +278,21 @@ fn prepare(world: &mut World) {
     }
 }
 
+/// Bevy uses the UI stack for both drawing and picking. Keep the existing
+/// edge order within each band, with every overlay above every dock. Hidden
+/// panels retain the overlay band throughout reveal and conceal animations.
+fn panel_z_index(edge: Edge, mode: PanelMode) -> GlobalZIndex {
+    let base = if mode == PanelMode::Docked { 110 } else { 150 };
+    GlobalZIndex(base + edge.index() as i32 * 10)
+}
+
 fn present(
     mut commands: Commands,
     output: Res<EmbeddedOutput>,
     mounts: Res<EmbeddedPanelMounts>,
     frame: Res<ShellFrameState>,
     mut regions: ResMut<EmbeddedPanelRegions>,
-    mut nodes: Query<(&mut Node, Option<&UiTargetCamera>)>,
+    mut nodes: Query<(&mut Node, &mut GlobalZIndex, Option<&UiTargetCamera>)>,
     mut work_area: ResMut<EmbeddedWorkArea>,
 ) {
     regions.0.clear();
@@ -292,9 +300,13 @@ fn present(
     work_area.0 = output.active.then_some(layout.canvas);
     for edge in Edge::ALL {
         let mount = mounts.0.get(edge);
-        let Ok((mut node, target)) = nodes.get_mut(mount) else {
+        let Ok((mut node, mut z_index, target)) = nodes.get_mut(mount) else {
             continue;
         };
+        let desired_z = panel_z_index(edge, frame.0.panel(edge).mode);
+        if *z_index != desired_z {
+            *z_index = desired_z;
+        }
         let display = if output.active && output.camera.is_some() {
             Display::Flex
         } else {
@@ -334,13 +346,101 @@ fn present(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_overlay_edge_stacks_above_every_dock_edge() {
+        for overlay in Edge::ALL {
+            for dock in Edge::ALL {
+                for mode in [PanelMode::Pinned, PanelMode::Hidden] {
+                    assert!(
+                        panel_z_index(overlay, mode).0 > panel_z_index(dock, PanelMode::Docked).0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_overlay_mount_updates_stacking_on_mode_changes() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        let camera = app.world_mut().spawn_empty().id();
+        let mounts: [Entity; 4] = std::array::from_fn(|_| {
+            app.world_mut()
+                .spawn((Node::default(), GlobalZIndex(0)))
+                .id()
+        });
+        let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
+            .unwrap();
+        app.insert_resource(EmbeddedOutput {
+            camera: Some(camera),
+            size: Vec2::new(1000., 800.),
+            name: "test".into(),
+            active: true,
+            pointer: None,
+        })
+        .insert_resource(EmbeddedPanelMounts(QuoinPanelMounts::new(
+            mounts[0], mounts[1], mounts[2], mounts[3],
+        )))
+        .init_resource::<EmbeddedPanelRegions>()
+        .init_resource::<EmbeddedWorkArea>()
+        .add_systems(Update, present);
+
+        for input in [PanelInput::Pin, PanelInput::Dock, PanelInput::Undock] {
+            model
+                .panel_input(Edge::Bottom, Duration::ZERO, input)
+                .unwrap();
+            let frame = cosmix_shell::runtime::ShellFrame::from_model(&model);
+            let overlay = frame.panel(Edge::Bottom).mode != PanelMode::Docked;
+            if overlay {
+                assert!(
+                    frame.panel(Edge::Bottom).mode == PanelMode::Pinned
+                        || frame.panel(Edge::Bottom).transient_revealed
+                );
+                let layout = panel_layout(&frame);
+                let left = layout.panels[Edge::Left.index()];
+                let bottom = layout.panels[Edge::Bottom.index()];
+                assert!(left.x < bottom.x + bottom.width && bottom.x < left.x + left.width);
+                assert!(left.y < bottom.y + bottom.height && bottom.y < left.y + left.height);
+            }
+            app.insert_resource(ShellFrameState(frame));
+            app.update();
+            for edge in Edge::ALL {
+                assert_eq!(
+                    *app.world()
+                        .get::<GlobalZIndex>(mounts[edge.index()])
+                        .unwrap(),
+                    panel_z_index(edge, model.panel(edge).mode),
+                );
+            }
+            if overlay {
+                assert!(
+                    app.world()
+                        .get::<GlobalZIndex>(mounts[Edge::Bottom.index()])
+                        .unwrap()
+                        .0
+                        > app
+                            .world()
+                            .get::<GlobalZIndex>(mounts[Edge::Left.index()])
+                            .unwrap()
+                            .0
+                );
+            }
+        }
+    }
+
     #[test]
     fn stable_mounts_do_not_relayout_and_deactivation_clears_hit_regions() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         let camera = app.world_mut().spawn_empty().id();
-        let mounts: [Entity; 4] =
-            std::array::from_fn(|_| app.world_mut().spawn(Node::default()).id());
+        let mounts: [Entity; 4] = std::array::from_fn(|_| {
+            app.world_mut()
+                .spawn((Node::default(), GlobalZIndex(0)))
+                .id()
+        });
         let mut model = model("test", Vec2::new(1000., 800.), &crate::page_registry());
         model
             .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)

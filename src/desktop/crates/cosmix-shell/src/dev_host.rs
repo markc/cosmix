@@ -23,7 +23,7 @@ use ctk::theme::tokens;
 use crate::chrome::QuoinPanelMounts;
 use crate::core::{
     Corner, CornerDetector, CornerDetectorConfig, CornerDetectorError, CornerDiagnostics,
-    CornerEvent, Edge, LogicalPoint, LogicalSize, OutputKey, PointerSample,
+    CornerEvent, Edge, LogicalPoint, LogicalSize, OutputKey, PanelMode, PointerSample,
 };
 use crate::host::ShellHost;
 use crate::runtime::{
@@ -145,7 +145,7 @@ pub fn spawn_dev_host(
         ))
         .id();
 
-    let mount = |commands: &mut Commands, z| {
+    let mount = |commands: &mut Commands, edge| {
         commands
             .spawn((
                 Node {
@@ -153,16 +153,16 @@ pub fn spawn_dev_host(
                     overflow: Overflow::visible(),
                     ..default()
                 },
-                GlobalZIndex(z),
+                panel_z_index(edge, PanelMode::Hidden),
             ))
             .id()
     };
-    // Top > right > bottom > left. The matching geometry calculation assigns
-    // each shared corner to the same winner and shortens pinned neighbours.
-    let left = mount(commands, 110);
-    let bottom = mount(commands, 120);
-    let right = mount(commands, 130);
-    let top = mount(commands, 140);
+    // Top/bottom always span the full output width; left/right take the
+    // remaining height between docked top/bottom panels.
+    let left = mount(commands, Edge::Left);
+    let bottom = mount(commands, Edge::Bottom);
+    let right = mount(commands, Edge::Right);
+    let top = mount(commands, Edge::Top);
     let mounts = QuoinPanelMounts::new(left, bottom, right, top);
 
     let deadzone = config.corner.deadzone_px() * 2.0;
@@ -401,13 +401,28 @@ fn reconcile_host(frame: Res<ShellFrameState>, mut host: ResMut<DevShellHost>) {
     let _ = host.set_wake_policy(frame.0.wake);
 }
 
-fn apply_host_layout(host: Res<DevShellHost>, mut nodes: Query<&mut Node>) {
-    if let Ok(mut canvas) = nodes.get_mut(host.canvas) {
+// Match the production embedded host: docks use 110–140, overlays 150–180.
+// Hidden panels keep the overlay band throughout reveal/conceal animations.
+fn panel_z_index(edge: Edge, mode: PanelMode) -> GlobalZIndex {
+    let base = if mode == PanelMode::Docked { 110 } else { 150 };
+    GlobalZIndex(base + edge.index() as i32 * 10)
+}
+
+fn apply_host_layout(
+    host: Res<DevShellHost>,
+    frame: Res<ShellFrameState>,
+    mut nodes: Query<(&mut Node, &mut GlobalZIndex)>,
+) {
+    if let Ok((mut canvas, _)) = nodes.get_mut(host.canvas) {
         apply_rect(&mut canvas, host.layout.canvas);
     }
     for edge in Edge::ALL {
-        if let Ok(mut node) = nodes.get_mut(host.panel_mount(edge)) {
+        if let Ok((mut node, mut z_index)) = nodes.get_mut(host.panel_mount(edge)) {
             apply_rect(&mut node, host.layout.panels[edge.index()]);
+            let desired_z = panel_z_index(edge, frame.0.panel(edge).mode);
+            if *z_index != desired_z {
+                *z_index = desired_z;
+            }
         }
     }
 }
@@ -657,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_neighbours_reduce_lower_priority_edge_lengths() {
+    fn docked_neighbours_do_not_shorten_full_width_edges() {
         let size = LogicalSize::new(1000.0, 800.0).unwrap();
         let mut model = ShellModel::new(
             OutputKey::new("dev").unwrap(),
@@ -683,10 +698,7 @@ mod tests {
             layout.panels[Edge::Right.index()].y,
             frame.panel(Edge::Top).thickness_px
         );
-        assert_eq!(
-            layout.panels[Edge::Bottom.index()].width,
-            1000.0 - frame.panel(Edge::Right).thickness_px
-        );
+        assert_eq!(layout.panels[Edge::Bottom.index()].width, 1000.0);
         assert_eq!(layout.canvas.x, 0.0);
         assert_eq!(layout.canvas.y, frame.panel(Edge::Top).thickness_px);
     }
