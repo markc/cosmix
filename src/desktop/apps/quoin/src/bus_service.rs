@@ -765,7 +765,9 @@ impl PropTree for ShellProps<'_> {
                 leaf(format!("panels.{name}.visible"), panel.mapped.into()),
                 leaf(
                     format!("panels.{name}.pinned"),
-                    (panel.mode == PanelMode::Pinned).into(),
+                    // Compatibility shim, not a precise mode signal. Transient
+                    // visibility of a Hidden panel must never read as pinned.
+                    (panel.mode != PanelMode::Hidden).into(),
                 ),
                 leaf(
                     format!("panels.{name}.width_px"),
@@ -813,7 +815,11 @@ impl PropTree for ShellProps<'_> {
         Some(PropDescribe::leaf(
             path.clone(),
             ty,
-            "live Quoin panel state",
+            if field == "pinned" {
+                "compatibility shim: true for persistent Pinned or Docked; false for Hidden, including transient reveal"
+            } else {
+                "live Quoin panel state"
+            },
         ))
     }
 }
@@ -1237,14 +1243,14 @@ mod tests {
                 "shell.panel.pin",
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
-                    input: PanelInput::Pin,
+                    input: PanelInput::Dock,
                 },
             ),
             (
                 "shell.panel.unpin",
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
-                    input: PanelInput::Unpin,
+                    input: PanelInput::Release,
                 },
             ),
             (
@@ -1715,6 +1721,71 @@ mod tests {
 
     fn test_frame() -> ShellFrame {
         ShellFrame::from_model(&test_model())
+    }
+
+    #[test]
+    fn compatibility_props_and_legacy_unpin_confirm_release_of_both_modes() {
+        use std::time::Duration;
+        for (mode, transient) in [
+            (PanelMode::Hidden, false),
+            (PanelMode::Hidden, true),
+            (PanelMode::Pinned, false),
+            (PanelMode::Docked, false),
+        ] {
+            let mut model = test_model();
+            model.set_mode(Edge::Left, Duration::ZERO, mode).unwrap();
+            if transient {
+                model
+                    .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+                    .unwrap();
+            }
+            let at = Duration::from_millis(200);
+            model.tick(at).unwrap();
+            let props = |model: &cosmix_shell::core::ShellModel| {
+                let mut request = request("shell.props.get");
+                request.body = json!({"path":"panels.left"}).to_string();
+                let (rc, body, command) = dispatch_shell_request(
+                    &request,
+                    &ShellFrame::from_model(model),
+                    model.last_update(),
+                );
+                assert_eq!(rc, 0);
+                assert!(command.is_none());
+                serde_json::from_str::<Value>(&body).unwrap()
+            };
+            let before = props(&model);
+            assert_eq!(before["pinned"], json!(mode != PanelMode::Hidden));
+            assert_eq!(
+                before["visible"],
+                json!(mode != PanelMode::Hidden || transient)
+            );
+            let (rc, body, command) = dispatch_shell_request(
+                &local("shell.panel.unpin"),
+                &ShellFrame::from_model(&model),
+                at,
+            );
+            assert_eq!(rc, 0);
+            assert_eq!(
+                serde_json::from_str::<Value>(&body).unwrap(),
+                json!({"accepted":true})
+            );
+            assert_eq!(
+                props(&model),
+                before,
+                "enqueue acceptance has not applied anything"
+            );
+            let ShellCommandKind::Panel { edge, input } = command.unwrap().kind else {
+                panic!("panel")
+            };
+            model.panel_input(edge, at, input).unwrap();
+            assert_eq!(model.panel(edge).exclusive_zone_px, 0.0);
+            assert_eq!(props(&model)["pinned"], json!(false));
+            model.panel_input(edge, at, PanelInput::Hide).unwrap();
+            model.tick(Duration::from_millis(400)).unwrap();
+            let confirmed = props(&model);
+            assert_eq!(confirmed["pinned"], json!(false));
+            assert_eq!(confirmed["visible"], json!(false));
+        }
     }
 
     /// A frame whose carousels carry Quoin's real page schema.

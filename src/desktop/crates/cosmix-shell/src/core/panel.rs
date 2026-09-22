@@ -2,7 +2,7 @@
 //! `_plan/2026-08-06-cosmix-shell-corner-panels.md` §E1 and logical-pixel
 //! thickness storage from §E2.
 //!
-//! Ordinary hide and Escape are intentional no-ops while pinned. Corner and
+//! Ordinary hide and Escape are intentional no-ops while pinned or docked. Corner and
 //! pointer containment are independent holds; concealment after either hold is
 //! attributed to the event which armed the grace deadline.
 
@@ -16,22 +16,33 @@ use super::{MotionError, PanelMotion};
 pub const RESIZE_THICKNESS_RANGE: std::ops::RangeInclusive<f32> = 120.0..=500.0;
 
 /// Stable semantic mode of one panel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PanelMode {
+    #[default]
     Hidden,
-    Revealed,
     Pinned,
+    Docked,
+}
+
+impl PanelMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Pinned => "pinned",
+            Self::Docked => "docked",
+        }
+    }
 }
 
 /// Inputs accepted by the pure panel state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelInput {
     Reveal,
-    /// Reveal when `Hidden`, hide otherwise; a pinned panel ignores it (the
+    /// Toggle transient visibility when `Hidden`; persistent panels ignore it (the
     /// same law as [`PanelInput::Hide`]). The direction binds at Model time
-    /// against the authoritative [`PanelMode`] — never against a caller's
-    /// frame snapshot — so a mid-conceal panel (`mapped == true`, mode
-    /// already `Hidden`) toggles back open, and two toggles applied in one
+    /// against authoritative transient visibility — never against a caller's
+    /// frame snapshot — so a mid-conceal panel (`mapped == true`, transient
+    /// reveal already false) toggles back open, and two toggles applied in one
     /// drained batch net to identity rather than to a single toggle.
     Toggle,
     CornerEntered,
@@ -43,6 +54,16 @@ pub enum PanelInput {
     /// Toggle pinning against the model's current mode, emitting the same
     /// effects as Pin/Unpin so persistence observes both directions.
     PinToggle,
+    Dock,
+    Undock,
+    DockToggle,
+    /// Set a persistent mode. Hidden conceals immediately; unlike Unpin/Undock
+    /// it does not leave a transient grace hold. Repeating Hidden also dismisses
+    /// a transient reveal, without emitting a persistence effect.
+    SetMode(PanelMode),
+    /// Compatibility release for legacy Bus unpin: releases either persistent
+    /// mode into transient visibility with normal grace.
+    Release,
     PointerEntered,
     PointerLeft,
     ResizeStarted,
@@ -69,7 +90,7 @@ pub enum PanelEffect {
     ResizeCompleted,
     Reveal { trigger: RevealTrigger },
     Conceal { reason: ConcealReason },
-    Pin { pinned: bool },
+    ModeChanged { mode: PanelMode },
 }
 
 /// Per-panel timing and stored thickness.
@@ -116,6 +137,8 @@ impl PanelConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PanelSnapshot {
     pub mode: PanelMode,
+    /// Runtime visibility intent only; never persisted. Only true in Hidden.
+    pub transient_revealed: bool,
     pub visible_fraction: f32,
     pub target_fraction: f32,
     pub velocity_per_second: f32,
@@ -152,6 +175,7 @@ pub enum PanelWake {
 pub struct PanelStateMachine {
     config: PanelConfig,
     mode: PanelMode,
+    transient_revealed: bool,
     motion: PanelMotion,
     pointer_inside: bool,
     resize_start: Option<f32>,
@@ -167,6 +191,7 @@ impl PanelStateMachine {
         Ok(Self {
             config,
             mode: PanelMode::Hidden,
+            transient_revealed: false,
             motion: PanelMotion::new(config.motion_time).map_err(PanelConfigError::Motion)?,
             pointer_inside: false,
             resize_start: None,
@@ -197,7 +222,7 @@ impl PanelStateMachine {
                     } else {
                         self.config.thickness_px = start;
                     }
-                    if self.mode == PanelMode::Revealed
+                    if self.transient_revealed
                         && !self.pointer_inside
                         && !self.corner_inside
                         && self.intro_until.is_none()
@@ -207,20 +232,20 @@ impl PanelStateMachine {
                 }
             }
             PanelInput::Reveal => {
-                if self.mode != PanelMode::Pinned {
-                    self.mode = PanelMode::Revealed;
+                if self.mode == PanelMode::Hidden {
+                    self.transient_revealed = true;
                     self.clear_deadline();
                 }
                 self.motion.reveal();
             }
             PanelInput::Toggle => {
-                if self.mode == PanelMode::Hidden {
-                    self.mode = PanelMode::Revealed;
+                if self.mode == PanelMode::Hidden && !self.transient_revealed {
+                    self.transient_revealed = true;
                     self.clear_deadline();
                     self.motion.reveal();
-                } else if self.mode != PanelMode::Pinned && self.resize_start.is_none() {
-                    // Mirrors Hide: a pinned panel ignores both directions.
-                    self.mode = PanelMode::Hidden;
+                } else if self.mode == PanelMode::Hidden && self.resize_start.is_none() {
+                    // Mirrors Hide: persistent panels ignore both directions.
+                    self.transient_revealed = false;
                     self.clear_deadline();
                     self.motion.conceal();
                 }
@@ -231,13 +256,13 @@ impl PanelStateMachine {
                 }
                 self.corner_inside = true;
                 self.clear_deadline();
-                if self.mode != PanelMode::Pinned {
-                    if self.mode == PanelMode::Hidden {
+                if self.mode == PanelMode::Hidden {
+                    if !self.transient_revealed {
                         effect = Some(PanelEffect::Reveal {
                             trigger: RevealTrigger::Corner,
                         });
                     }
-                    self.mode = PanelMode::Revealed;
+                    self.transient_revealed = true;
                     self.motion.reveal();
                 }
             }
@@ -246,37 +271,32 @@ impl PanelStateMachine {
                     return Ok(self.update_since(before, effect));
                 }
                 self.corner_inside = false;
-                if self.mode == PanelMode::Revealed
-                    && !self.pointer_inside
-                    && self.intro_until.is_none()
-                {
+                if self.transient_revealed && !self.pointer_inside && self.intro_until.is_none() {
                     self.arm_deadline(at, ConcealReason::CornerLeft);
                 }
             }
             PanelInput::Hide | PanelInput::Escape => {
-                if self.mode != PanelMode::Pinned && self.resize_start.is_none() {
-                    self.mode = PanelMode::Hidden;
+                if self.mode == PanelMode::Hidden && self.resize_start.is_none() {
+                    self.transient_revealed = false;
                     self.clear_deadline();
                     self.motion.conceal();
                 }
             }
             PanelInput::Unpin | PanelInput::PinToggle if self.mode == PanelMode::Pinned => {
-                self.mode = PanelMode::Revealed;
-                effect = effect.or(Some(PanelEffect::Pin { pinned: false }));
-                if !self.pointer_inside && !self.corner_inside && self.intro_until.is_none() {
-                    self.arm_deadline(at, ConcealReason::Grace);
-                }
+                effect = self.release(at).or(effect);
             }
+            PanelInput::Undock | PanelInput::DockToggle if self.mode == PanelMode::Docked => {
+                effect = self.release(at).or(effect);
+            }
+            PanelInput::Release => effect = self.release(at).or(effect),
             PanelInput::Pin | PanelInput::PinToggle => {
-                self.intro_until = None;
-                if self.mode != PanelMode::Pinned {
-                    effect = Some(PanelEffect::Pin { pinned: true });
-                }
-                self.mode = PanelMode::Pinned;
-                self.clear_deadline();
-                self.motion.reveal();
+                effect = self.change_mode(PanelMode::Pinned).or(effect);
             }
-            PanelInput::Unpin => {}
+            PanelInput::Dock | PanelInput::DockToggle => {
+                effect = self.change_mode(PanelMode::Docked).or(effect);
+            }
+            PanelInput::SetMode(mode) => effect = self.change_mode(mode).or(effect),
+            PanelInput::Unpin | PanelInput::Undock => {}
             PanelInput::PointerEntered => {
                 if self.pointer_inside {
                     return Ok(self.update_since(before, effect));
@@ -284,7 +304,7 @@ impl PanelStateMachine {
                 self.pointer_inside = true;
                 self.clear_deadline();
                 if self.mode == PanelMode::Hidden && self.motion.visible_fraction() > 0.0 {
-                    self.mode = PanelMode::Revealed;
+                    self.transient_revealed = true;
                     self.motion.reveal();
                 }
             }
@@ -293,10 +313,7 @@ impl PanelStateMachine {
                     return Ok(self.update_since(before, effect));
                 }
                 self.pointer_inside = false;
-                if self.mode == PanelMode::Revealed
-                    && !self.corner_inside
-                    && self.intro_until.is_none()
-                {
+                if self.transient_revealed && !self.corner_inside && self.intro_until.is_none() {
                     self.arm_deadline(at, ConcealReason::Grace);
                 }
             }
@@ -312,9 +329,9 @@ impl PanelStateMachine {
 
     /// A startup hold never claims real corner or pointer membership.
     pub fn start_intro(&mut self, duration: Duration) {
-        if self.mode != PanelMode::Pinned {
+        if self.mode == PanelMode::Hidden {
             self.intro_until = Some(self.last_update + duration);
-            self.mode = PanelMode::Revealed;
+            self.transient_revealed = true;
             self.clear_deadline();
             self.motion.reveal();
         }
@@ -344,7 +361,7 @@ impl PanelStateMachine {
         }
         self.corner_inside = false;
         self.pointer_inside = false;
-        if held && self.mode == PanelMode::Revealed && self.intro_until.is_none() {
+        if held && self.transient_revealed && self.intro_until.is_none() {
             self.arm_deadline(self.last_update, ConcealReason::Grace);
         }
     }
@@ -353,12 +370,16 @@ impl PanelStateMachine {
         let visible_fraction = self.motion.visible_fraction();
         PanelSnapshot {
             mode: self.mode,
+            transient_revealed: self.transient_revealed,
             visible_fraction,
             target_fraction: self.motion.target(),
             velocity_per_second: self.motion.velocity_per_second(),
             thickness_px: self.config.thickness_px,
-            mapped: self.mode != PanelMode::Hidden || visible_fraction > 0.0,
-            exclusive_zone_px: if self.mode == PanelMode::Pinned {
+            // Keep the surface mapped until the outgoing animation finishes.
+            mapped: self.mode != PanelMode::Hidden
+                || self.transient_revealed
+                || visible_fraction > 0.0,
+            exclusive_zone_px: if self.mode == PanelMode::Docked {
                 self.config.thickness_px
             } else {
                 0.0
@@ -398,20 +419,20 @@ impl PanelStateMachine {
             && deadline <= at
         {
             self.intro_until = None;
-            if self.mode == PanelMode::Revealed && !self.pointer_inside && !self.corner_inside {
+            if self.transient_revealed && !self.pointer_inside && !self.corner_inside {
                 self.arm_deadline(deadline, ConcealReason::Grace);
             }
         }
         let mut effect = None;
         if let Some(deadline) = self.hide_at
             && deadline <= at
-            && self.mode == PanelMode::Revealed
+            && self.transient_revealed
             && !self.pointer_inside
             && !self.corner_inside
         {
             let before_deadline = deadline.saturating_sub(self.last_update);
             self.motion.advance(before_deadline);
-            self.mode = PanelMode::Hidden;
+            self.transient_revealed = false;
             effect = self
                 .conceal_reason
                 .map(|reason| PanelEffect::Conceal { reason });
@@ -424,6 +445,36 @@ impl PanelStateMachine {
         }
         self.last_update = at;
         Ok(effect)
+    }
+
+    fn change_mode(&mut self, mode: PanelMode) -> Option<PanelEffect> {
+        let changed = self.mode != mode;
+        self.mode = mode;
+        self.transient_revealed = false;
+        self.intro_until = None;
+        self.clear_deadline();
+        if mode == PanelMode::Hidden {
+            self.motion.conceal();
+        } else {
+            self.motion.reveal();
+        }
+        changed.then_some(PanelEffect::ModeChanged { mode })
+    }
+
+    fn release(&mut self, at: Duration) -> Option<PanelEffect> {
+        if self.mode == PanelMode::Hidden {
+            return None;
+        }
+        self.mode = PanelMode::Hidden;
+        self.transient_revealed = true;
+        self.motion.reveal();
+        self.clear_deadline();
+        if !self.pointer_inside && !self.corner_inside && self.intro_until.is_none() {
+            self.arm_deadline(at, ConcealReason::Grace);
+        }
+        Some(PanelEffect::ModeChanged {
+            mode: PanelMode::Hidden,
+        })
     }
 
     fn update_since(&self, before: PanelSnapshot, effect: Option<PanelEffect>) -> PanelUpdate {
@@ -524,7 +575,7 @@ mod intro_tests {
     }
 
     #[test]
-    fn pin_toggle_flips_both_ways_with_pin_effects_and_unpin_grace() {
+    fn dock_toggle_flips_both_ways_with_mode_effects_and_undock_grace() {
         let mut panel = panel();
         for held in [false, true] {
             if held {
@@ -532,13 +583,24 @@ mod intro_tests {
                     .apply(Duration::ZERO, PanelInput::CornerEntered)
                     .unwrap();
             }
-            let pinned = panel.apply(Duration::ZERO, PanelInput::PinToggle).unwrap();
-            assert_eq!(panel.snapshot().mode, PanelMode::Pinned);
+            let pinned = panel.apply(Duration::ZERO, PanelInput::DockToggle).unwrap();
+            assert_eq!(panel.snapshot().mode, PanelMode::Docked);
             assert_eq!(panel.snapshot().hide_at, None);
-            assert_eq!(pinned.effect, Some(PanelEffect::Pin { pinned: true }));
-            let unpinned = panel.apply(Duration::ZERO, PanelInput::PinToggle).unwrap();
-            assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
-            assert_eq!(unpinned.effect, Some(PanelEffect::Pin { pinned: false }));
+            assert_eq!(
+                pinned.effect,
+                Some(PanelEffect::ModeChanged {
+                    mode: PanelMode::Docked
+                })
+            );
+            let unpinned = panel.apply(Duration::ZERO, PanelInput::DockToggle).unwrap();
+            assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
+            assert!(panel.snapshot().transient_revealed);
+            assert_eq!(
+                unpinned.effect,
+                Some(PanelEffect::ModeChanged {
+                    mode: PanelMode::Hidden
+                })
+            );
             assert_eq!(
                 panel.snapshot().hide_at,
                 (!held).then_some(Duration::from_millis(800))
@@ -547,9 +609,9 @@ mod intro_tests {
     }
 
     #[test]
-    fn runtime_resize_validates_range_and_keeps_pinned_zone_live() {
+    fn runtime_resize_validates_range_and_keeps_docked_zone_live() {
         let mut panel = panel();
-        panel.apply(Duration::ZERO, PanelInput::Pin).unwrap();
+        panel.apply(Duration::ZERO, PanelInput::Dock).unwrap();
         for thickness in [120.0, 250.0, 500.0] {
             panel.resize_thickness(thickness).unwrap();
             assert_eq!(panel.snapshot().thickness_px, thickness);
@@ -586,7 +648,8 @@ mod intro_tests {
             panel.apply(Duration::ZERO, input).unwrap();
         }
         panel.tick(Duration::from_secs(10)).unwrap();
-        assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+        assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
+        assert!(panel.snapshot().transient_revealed);
         assert_eq!(panel.next_deadline(), None);
         assert_eq!(panel.wake(), PanelWake::Idle);
         assert_eq!(
@@ -668,7 +731,8 @@ mod intro_tests {
             .unwrap();
         panel.tick(Duration::from_secs(3)).unwrap();
         assert!(panel.snapshot().corner_inside);
-        assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+        assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
+        assert!(panel.snapshot().transient_revealed);
         assert_eq!(panel.next_deadline(), None);
         panel
             .apply(Duration::from_secs(3), PanelInput::CornerLeft)
@@ -689,17 +753,18 @@ mod intro_tests {
             panel.apply(Duration::from_millis(100), input).unwrap();
         }
         panel.tick(Duration::from_millis(1900)).unwrap();
-        assert_eq!(panel.snapshot().mode, PanelMode::Revealed);
+        assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
+        assert!(panel.snapshot().transient_revealed);
         assert_eq!(panel.snapshot().hide_at, None);
     }
 
     #[test]
-    fn intro_does_not_change_restored_pins() {
+    fn intro_does_not_change_restored_docks() {
         let mut panel = panel();
-        panel.apply(Duration::ZERO, PanelInput::Pin).unwrap();
+        panel.apply(Duration::ZERO, PanelInput::Dock).unwrap();
         panel.start_intro(Duration::from_secs(2));
         panel.tick(Duration::from_secs(3)).unwrap();
-        assert_eq!(panel.snapshot().mode, PanelMode::Pinned);
+        assert_eq!(panel.snapshot().mode, PanelMode::Docked);
         assert_eq!(panel.next_deadline(), None);
     }
 }

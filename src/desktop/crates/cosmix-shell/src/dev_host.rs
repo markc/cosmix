@@ -671,10 +671,10 @@ mod tests {
             model.set_carousel(edge, Carousel::new(["page"]).unwrap());
         }
         model
-            .panel_input(Edge::Top, Duration::ZERO, PanelInput::Pin)
+            .panel_input(Edge::Top, Duration::ZERO, PanelInput::Dock)
             .unwrap();
         model
-            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
             .unwrap();
         let frame = ShellFrame::from_model(&model);
         let layout = layout_for(&frame);

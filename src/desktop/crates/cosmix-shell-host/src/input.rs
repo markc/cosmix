@@ -1364,7 +1364,7 @@ mod tests {
         .unwrap();
         model.restore_thickness(Edge::Right, 350.0).unwrap();
         model
-            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+            .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
             .unwrap();
         app.insert_resource(ShellFrameState(
             cosmix_shell::runtime::ShellFrame::from_model(&model),
@@ -1582,7 +1582,8 @@ mod tests {
             .resource::<ShellFrameState>()
             .0
             .panel(Edge::Left);
-        assert_eq!(entered.mode, PanelMode::Revealed);
+        assert_eq!(entered.mode, PanelMode::Hidden);
+        assert!(entered.transient_revealed);
         assert_eq!(
             entered.visible_fraction, 0.0,
             "late enter starts its animation now"
@@ -1595,7 +1596,7 @@ mod tests {
                 .0
                 .panel(Edge::Left)
                 .mode,
-            PanelMode::Revealed,
+            PanelMode::Hidden,
             "an active corner hold survives more than one grace interval"
         );
         *app.world_mut().resource_mut::<TimeUpdateStrategy>() =
@@ -1611,7 +1612,8 @@ mod tests {
         let now = app.world().resource::<Time<Real>>().elapsed();
         let frame = &app.world().resource::<ShellFrameState>().0;
         let left = frame.panel(Edge::Left);
-        assert_eq!(left.mode, PanelMode::Revealed);
+        assert_eq!(left.mode, PanelMode::Hidden);
+        assert!(left.transient_revealed);
         assert_eq!(
             frame.wake,
             WakePolicy::WakeAt(now + Duration::from_millis(800))

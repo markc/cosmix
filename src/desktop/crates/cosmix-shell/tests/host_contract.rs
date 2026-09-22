@@ -100,7 +100,7 @@ fn corner_reveal_reconciles_an_animating_on_demand_panel() {
         .unwrap();
     let frame = ShellFrame::from_model(&model);
     let right = frame.panel(Edge::Right);
-    assert_eq!(right.mode, PanelMode::Revealed);
+    assert_eq!(right.mode, PanelMode::Hidden);
     assert!(right.mapped);
     assert_eq!(right.visible_fraction, 0.0);
     assert_eq!(right.exclusive_zone_px, 0.0);
@@ -142,7 +142,7 @@ fn pinned_frame_claims_zone_and_ordinary_hide_cannot_release_it() {
     let mut model = model();
     model.set_carousel(Edge::Left, Carousel::new(["nav", "places"]).unwrap());
     model
-        .panel_input(Edge::Left, Duration::ZERO, PanelInput::Pin)
+        .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
         .unwrap();
     model.tick(ms(200)).unwrap();
     model
@@ -150,7 +150,7 @@ fn pinned_frame_claims_zone_and_ordinary_hide_cannot_release_it() {
         .unwrap();
     let frame = ShellFrame::from_model(&model);
     let left = frame.panel(Edge::Left);
-    assert_eq!(left.mode, PanelMode::Pinned);
+    assert_eq!(left.mode, PanelMode::Docked);
     assert_eq!(left.exclusive_zone_px, left.thickness_px);
     assert_eq!(left.active_page_id.as_deref(), Some("nav"));
     assert_eq!(frame.wake, WakePolicy::Idle);
@@ -207,7 +207,7 @@ fn corner_left_arms_attributed_grace_and_conceals_at_deadline() {
         "animation must not mask the grace timer"
     );
     model.tick(ms(809)).unwrap();
-    assert_eq!(model.panel(Edge::Top).mode, PanelMode::Revealed);
+    assert_eq!(model.panel(Edge::Top).mode, PanelMode::Hidden);
     let concealed = model.tick(ms(810)).unwrap();
     assert_eq!(
         concealed[Edge::Top.index()].effect,
@@ -273,12 +273,8 @@ fn clockwise_corner_mapping_reaches_each_edge_once() {
             )
             .unwrap();
         for edge in Edge::ALL {
-            let expected = if edge == expected_edge {
-                PanelMode::Revealed
-            } else {
-                PanelMode::Hidden
-            };
-            assert_eq!(model.panel(edge).mode, expected);
+            assert_eq!(model.panel(edge).mode, PanelMode::Hidden);
+            assert_eq!(model.panel(edge).transient_revealed, edge == expected_edge);
         }
     }
 }

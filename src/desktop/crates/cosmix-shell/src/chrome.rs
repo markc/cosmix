@@ -5,8 +5,8 @@
 //! supplies four mount entities; every visual update is driven only by the
 //! renderer-neutral [`ShellFrameState`]. Panels keep their final layout size.
 //! The development host lets chrome own the complete off-edge slide, while a
-//! layer-shell host selects protocol margins for non-pinned motion and leaves
-//! only pinned motion with [`UiTransform::translation`].
+//! layer-shell host selects protocol margins for overlay motion and leaves
+//! only docked motion with [`UiTransform::translation`].
 
 use accesskit::Role;
 use std::error::Error;
@@ -46,8 +46,8 @@ pub enum QuoinMotionOwnership {
     /// Chrome translates every mapped panel (the normal-window development host).
     #[default]
     Chrome,
-    /// Protocol margins translate non-pinned panels; chrome translates pinned panels.
-    ProtocolWhenUnpinned,
+    /// Protocol margins translate overlays; chrome translates docked panels.
+    ProtocolWhenUndocked,
 }
 
 /// Selects the source of semantic pointer enter/leave commands.
@@ -61,6 +61,9 @@ pub enum QuoinPointerOwnership {
 }
 
 /// Motion modes retained by the host after successful protocol commits.
+/// Only Docked owns chrome translation. Hidden (including transient reveal)
+/// and Pinned share protocol motion, so this latch deliberately needs no
+/// transient flag; the complete committed presentation retains that intent.
 #[derive(Resource, Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QuoinCommittedMotionModes([PanelMode; 4]);
 
@@ -92,7 +95,7 @@ impl QuoinPanelMounts {
     }
 
     /// Construct mounts for layer-shell surfaces, where protocol margins own
-    /// revealed and concealing motion and chrome owns pinned motion.
+    /// transient and pinned overlay motion; chrome owns docked motion.
     pub const fn for_layer_surfaces(
         left: Entity,
         bottom: Entity,
@@ -105,7 +108,7 @@ impl QuoinPanelMounts {
         mounts[Edge::Top.index()] = top;
         Self {
             mounts,
-            motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+            motion_ownership: QuoinMotionOwnership::ProtocolWhenUndocked,
             pointer_ownership: QuoinPointerOwnership::NativeSurface,
         }
     }
@@ -1103,11 +1106,7 @@ fn on_activate(
         QuoinAction::Quit => ShellCommandKind::Quit,
         QuoinAction::TogglePin => ShellCommandKind::Panel {
             edge: control.edge,
-            input: if frame.0.panel(control.edge).mode == PanelMode::Pinned {
-                PanelInput::Unpin
-            } else {
-                PanelInput::Pin
-            },
+            input: PanelInput::PinToggle,
         },
         QuoinAction::Previous => ShellCommandKind::Carousel {
             edge: control.edge,
@@ -1221,12 +1220,12 @@ fn present_panels(
         }
         let chrome_owns_motion = match chrome.motion_ownership {
             QuoinMotionOwnership::Chrome => true,
-            QuoinMotionOwnership::ProtocolWhenUnpinned => {
+            QuoinMotionOwnership::ProtocolWhenUndocked => {
                 committed_modes
                     .as_ref()
                     .expect("layer mounts require QuoinCommittedMotionModes")
                     .get(chrome.edge)
-                    == PanelMode::Pinned
+                    == PanelMode::Docked
             }
         };
         let hidden = if chrome_owns_motion {
@@ -1244,10 +1243,10 @@ fn present_panels(
             transform.translation = translation;
         }
         if let Ok(mut label) = queries.labels.get_mut(parts.pin_label) {
-            let text = if panel.mode == PanelMode::Pinned {
-                "◆"
-            } else {
-                "◇"
+            let text = match panel.mode {
+                PanelMode::Hidden => "◇",
+                PanelMode::Pinned => "◆",
+                PanelMode::Docked => "▣",
             };
             if label.0 != text {
                 label.0 = text.to_owned();
@@ -1653,7 +1652,7 @@ mod tests {
             pointer_click_command(QuoinAction::TogglePin),
             ShellCommandKind::Panel {
                 edge: Edge::Left,
-                input: PanelInput::Pin,
+                input: PanelInput::PinToggle,
             }
         );
         assert_eq!(
@@ -1756,7 +1755,8 @@ mod tests {
         .unwrap();
         let mut frame = frame_for(&registry);
         frame.panels[Edge::Left.index()].mapped = true;
-        frame.panels[Edge::Left.index()].mode = PanelMode::Revealed;
+        frame.panels[Edge::Left.index()].mode = PanelMode::Hidden;
+        frame.panels[Edge::Left.index()].transient_revealed = true;
         let mut world = World::new();
         let pin = world.spawn(Text::new("")).id();
         let title = world.spawn(Text::new("")).id();
@@ -1769,7 +1769,7 @@ mod tests {
             .spawn((
                 QuoinPanelChrome {
                     edge: Edge::Left,
-                    motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+                    motion_ownership: QuoinMotionOwnership::ProtocolWhenUndocked,
                     pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
@@ -1820,14 +1820,15 @@ mod tests {
         {
             let mut frame = world.resource_mut::<ShellFrameState>();
             let left = &mut frame.0.panels[Edge::Left.index()];
-            left.mode = PanelMode::Pinned;
+            left.mode = PanelMode::Docked;
+            left.transient_revealed = false;
             left.active_page_id = Some("places".into());
         }
         world.run_system_once(present_panels).unwrap();
         for entity in [pin, title, nav_dot, places_dot] {
             assert!(world.entity(entity).get_ref::<Text>().unwrap().is_changed());
         }
-        assert_eq!(world.get::<Text>(pin).unwrap().0, "◆");
+        assert_eq!(world.get::<Text>(pin).unwrap().0, "▣");
         assert_eq!(world.get::<Text>(title).unwrap().0, "Places");
         assert_eq!(world.get::<Node>(nav_page).unwrap().display, Display::None);
         assert_eq!(
@@ -1871,7 +1872,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_mounts_leave_unpinned_motion_to_protocol_but_own_pinned_motion() {
+    fn layer_mounts_leave_overlay_motion_to_protocol_but_own_docked_motion() {
         let mut model = ShellModel::new(
             OutputKey::new("test").unwrap(),
             LogicalSize::new(1_000.0, 800.0).unwrap(),
@@ -1891,7 +1892,7 @@ mod tests {
             .spawn((
                 QuoinPanelChrome {
                     edge: Edge::Left,
-                    motion_ownership: QuoinMotionOwnership::ProtocolWhenUnpinned,
+                    motion_ownership: QuoinMotionOwnership::ProtocolWhenUndocked,
                     pointer_ownership: QuoinPointerOwnership::NativeSurface,
                 },
                 QuoinPanelParts {
@@ -1917,12 +1918,13 @@ mod tests {
             Val2::new(px(0), px(0))
         );
 
+        // Persistent pin stays on the same Overlay layer and protocol motion
+        // path as transient reveal, before AND after its latch update.
         model
             .panel_input(Edge::Left, Duration::ZERO, PanelInput::Pin)
             .unwrap();
         world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
         world.run_system_once(present_panels).unwrap();
-        // Current pinned with committed unpinned remains protocol-owned.
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(0), px(0))
@@ -1933,21 +1935,42 @@ mod tests {
         world.run_system_once(present_panels).unwrap();
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
-            Val2::new(px(-240.0), px(0))
+            Val2::new(px(0), px(0))
         );
+        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "◆");
+
         model
-            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Unpin)
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
             .unwrap();
         world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
         world.run_system_once(present_panels).unwrap();
-        // Current unpinned with committed pinned remains chrome-owned.
+        // Current docked with committed overlay remains protocol-owned.
+        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "▣");
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(0), px(0))
+        );
+        world
+            .resource_mut::<QuoinCommittedMotionModes>()
+            .set(Edge::Left, PanelMode::Docked);
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<UiTransform>(chrome).unwrap().translation,
+            Val2::new(px(-240.0), px(0))
+        );
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Undock)
+            .unwrap();
+        world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
+        world.run_system_once(present_panels).unwrap();
+        // Current overlay with committed docked remains chrome-owned.
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(-240.0), px(0))
         );
         world
             .resource_mut::<QuoinCommittedMotionModes>()
-            .set(Edge::Left, PanelMode::Revealed);
+            .set(Edge::Left, PanelMode::Hidden);
         world.run_system_once(present_panels).unwrap();
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
@@ -1955,6 +1978,7 @@ mod tests {
         );
         assert_eq!(model.panel(Edge::Left).visible_fraction, 0.0);
         assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 0.0);
+        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "◇");
     }
 
     #[test]

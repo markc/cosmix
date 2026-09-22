@@ -120,20 +120,24 @@ fn show_page($edge, $page)
   panel_verb("shell.panel.pin", $edge, nil)
 end
 
--- Unpin an edge and hide it. hide is a no-op while the edge is still
--- pinned, and the unpin lands on the host's next frame, so re-issue the hide
--- until the host reports the edge hidden (bounded, ~1 s). A pointer resting
--- on the panel legitimately keeps it revealed; that is Quoin's rule, not ours.
+-- Legacy Bus unpin releases BOTH Pinned and Docked. This is also the
+-- compatibility rule for bare-array popup records: a legacy saved true
+-- migrates to Docked, and still needs its reservation released here.
+-- Reuse the existing bounded hide loop. A reply is only enqueue acceptance;
+-- return a single applied snapshot only after BOTH persistence and visibility
+-- are clear. Failure leaves the record for the existing recovery pass.
 fn hide_edge($edge)
-  panel_verb("shell.panel.unpin", $edge, nil)
+  if panel_verb("shell.panel.unpin", $edge, nil) != 0 then return nil end
   $tries = 0
   while $tries < 20
+    if edge_in_use($edge) then return nil end
     panel_verb("shell.panel.hide", $edge, nil)
-    $state_r = rpc($HOST, "shell.props.get", {path: "panels." .. $edge .. ".visible"})
-    if $state_r == false then break end
+    $state_r = rpc($HOST, "shell.props.get", {path: "panels." .. $edge})
+    if $p.popup_release_confirmed($state_r) then return $state_r end
     $tries = $tries + 1
     sleep(0.05)
   end
+  return nil
 end
 
 -- ── icons (the apps citizen resolves themes; cached here) ───────────────
@@ -688,16 +692,13 @@ fn edge_in_use($edge)
   return $state.calendar_open or $state.notes_open
 end
 
--- Release a popup edge; drop it from the pin record only once the host has
--- actually taken the unpin (a host that is down keeps the record, so the
--- next start still knows to release it).
+-- Bare arrays remain supported and written: unpin releases either persistent
+-- mode, so old and new records have identical cleanup semantics. Drop an edge
+-- only after props confirms application, never after just an enqueue ack.
 fn hide_popup($edge)
-  if panel_verb("shell.panel.unpin", $edge, nil) != 0 then return end
-  hide_edge($edge)
-  $kept = []
-  for each $e in read_pins()
-    if $e != $edge then push($kept, $e) end
-  end
+  $confirmed = hide_edge($edge)
+  if edge_in_use($edge) or not $p.popup_release_confirmed($confirmed) then return end
+  $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
   write_pins($kept)
 end
 

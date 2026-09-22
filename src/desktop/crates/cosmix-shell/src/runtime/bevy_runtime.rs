@@ -327,7 +327,7 @@ mod tests {
             model.set_geometry(LogicalSize::new(600.0, 600.0).unwrap());
             model.restore_thickness(Edge::Right, 350.0).unwrap();
             model
-                .panel_input(Edge::Right, Duration::ZERO, PanelInput::Pin)
+                .panel_input(Edge::Right, Duration::ZERO, PanelInput::Dock)
                 .unwrap();
             assert_eq!(model.max_thickness(Edge::Left), 249.0);
             model.output().clone()
@@ -376,7 +376,7 @@ mod tests {
         for (edge, thickness) in [(Edge::Left, 798.0), (Edge::Right, 1.0)] {
             model.restore_thickness(edge, thickness).unwrap();
             model
-                .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                .panel_input(edge, Duration::ZERO, PanelInput::Dock)
                 .unwrap();
         }
         assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 798.0);
@@ -411,7 +411,7 @@ mod tests {
             let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
             runtime
                 .model
-                .panel_input(edge, Duration::ZERO, PanelInput::Pin)
+                .panel_input(edge, Duration::ZERO, PanelInput::Dock)
                 .unwrap();
             assert!(
                 runtime.model.panel(Edge::Left).exclusive_zone_px
@@ -618,7 +618,7 @@ mod tests {
     fn output_model_replacement_reseeds_the_committed_motion_latch() {
         let mut app = app();
         let mut modes = QuoinCommittedMotionModes::hidden();
-        modes.set(Edge::Left, PanelMode::Pinned);
+        modes.set(Edge::Left, PanelMode::Docked);
         app.insert_resource(modes);
         let replacement = ShellModel::new(
             OutputKey::new("HDMI-A-1").unwrap(),
@@ -650,7 +650,7 @@ mod tests {
             runtime.model.carousel_mut(Edge::Left).select_id("places");
             runtime
                 .model
-                .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Pin)
+                .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Dock)
                 .unwrap();
         }
         let mut replacement = ShellModel::new(
@@ -665,7 +665,7 @@ mod tests {
         replace_shell_model(app.world_mut(), replacement);
         let frame = &app.world().resource::<ShellFrameState>().0;
         assert_eq!(frame.geometry.output.as_str(), "HDMI-A-1");
-        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Pinned);
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
         assert_eq!(frame.panel(Edge::Left).thickness_px, 137.0);
         assert_eq!(
             frame.panel(Edge::Left).active_page_id.as_deref(),
@@ -752,14 +752,14 @@ mod tests {
                 ShellSemanticVerb::PanelPin,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Pin,
+                    input: crate::core::PanelInput::Dock,
                 },
             ),
             (
                 ShellSemanticVerb::PanelUnpin,
                 ShellCommandKind::Panel {
                     edge: Edge::Left,
-                    input: crate::core::PanelInput::Unpin,
+                    input: crate::core::PanelInput::Release,
                 },
             ),
             (
@@ -903,6 +903,7 @@ mod tests {
                 .0
                 .panel(Edge::Left);
             assert!(panel.mapped, "precondition: mid-conceal panel is mapped");
+            assert!(!panel.transient_revealed);
             assert_eq!(
                 panel.mode,
                 PanelMode::Hidden,
@@ -924,9 +925,10 @@ mod tests {
             .clone();
         assert_eq!(
             panel.mode,
-            PanelMode::Revealed,
+            PanelMode::Hidden,
             "toggle must reopen a mid-conceal panel"
         );
+        assert!(panel.transient_revealed);
         assert!(panel.mapped);
     }
 
@@ -965,8 +967,15 @@ mod tests {
                 .0
                 .panel(Edge::Left)
                 .mode,
-            PanelMode::Revealed,
+            PanelMode::Hidden,
             "toggle+toggle in one batch must be identity, not one toggle"
+        );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .transient_revealed
         );
     }
 }

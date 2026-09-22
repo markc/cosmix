@@ -71,11 +71,13 @@ pub fn semantic_shell_command(
         },
         ShellSemanticVerb::PanelPin => ShellCommandKind::Panel {
             edge,
-            input: PanelInput::Pin,
+            // Legacy Bus pin reserves space; precise mode verbs are deferred.
+            input: PanelInput::Dock,
         },
         ShellSemanticVerb::PanelUnpin => ShellCommandKind::Panel {
             edge,
-            input: PanelInput::Unpin,
+            // Includes legacy popup records restored as Docked, and new pins.
+            input: PanelInput::Release,
         },
         ShellSemanticVerb::PageNext => ShellCommandKind::Carousel {
             edge,

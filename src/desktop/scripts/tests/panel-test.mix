@@ -6,6 +6,20 @@ fn check($condition, $message)
   if not $condition then raise("PANEL_TEST", $message) end
 end
 
+-- Legacy bare-array popup records: acceptance, failure and incomplete
+-- application retain the retry record; only applied release removes our edge.
+$pins = json_parse("[\"left\",\"right\"]")
+for each $snapshot in [nil, {}, {accepted: true}, {pinned: false}, {visible: false},
+  {pinned: true, visible: true}, {pinned: true, visible: false},
+  {pinned: false, visible: true}, {pinned: "false", visible: false}]
+  check(not $p.popup_release_confirmed($snapshot), "not applied release")
+  check($p.released_popup_pins($pins, "left", $snapshot) == $pins, "retain recovery record")
+end
+$confirmed = {pinned: false, visible: false}
+check($p.popup_release_confirmed($confirmed), "applied release")
+check($p.released_popup_pins($pins, "left", $confirmed) == ["right"], "release only our edge")
+check($p.released_popup_pins(["right"], "left", $confirmed) == ["right"], "idempotent recovery")
+
 -- ── calendar arithmetic ────────────────────────────────────────────────
 -- Known weekdays (ISO 1 = Monday): 2026-09-01 Tue, 2026-09-20 Sun,
 -- 2000-01-01 Sat, 2024-02-29 Thu, 1970-01-01 Thu.
@@ -57,7 +71,7 @@ check($p.month_title(2026, 9) == "September 2026", "month title")
 -- date_parse reads UTC and date_format prints local time, so shift by the
 -- local offset at that instant: the test holds in any timezone.
 fn local_ts($text)
-  $u = date_parse($text, "%Y-%m-%d %H:%M:%S")
+  $u = date_parse($text)
   $z = date_format($u, "%z")
   $sign = starts_with($z, "-") ? -1 : 1
   $off = $sign * (to_number(slice($z, 1, 3)) * 3600 + to_number(slice($z, 3, 5)) * 60)

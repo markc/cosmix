@@ -4,6 +4,25 @@
 -- (tests/panel-test.mix) and returns a value rather than mutating a caller's
 -- map (Mix map arguments are copies).
 
+-- Existing Bus compatibility props describe both persistent modes as pinned.
+-- One applied subtree read must confirm release AND completed concealment.
+-- Nil, acceptance replies and incomplete snapshots are never confirmation.
+fn popup_release_confirmed($snapshot)
+  if type($snapshot) != "map" then return false end
+  return $snapshot.pinned == false and $snapshot.visible == false
+end
+
+-- Bare-array records need no version conversion: Bus unpin releases either
+-- persistent mode, including Docked restored from legacy pinned=true.
+fn released_popup_pins($pins, $edge, $snapshot)
+  if not popup_release_confirmed($snapshot) then return $pins end
+  $kept = []
+  for each $e in $pins
+    if $e != $edge then push($kept, $e) end
+  end
+  return $kept
+end
+
 -- Month abbreviations the way they are written here: "Sept", "June", "July"
 -- (not strftime's "Sep"/"Jun"/"Jul").
 $MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "June", "July", "Aug", "Sept", "Oct", "Nov", "Dec"]
