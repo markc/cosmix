@@ -34,6 +34,10 @@ onto the same store. It is built from a small family of crates:
 
 ## Running it
 
+`--version` or `-V` anywhere in the arguments (including after `serve`) prints
+the compiled version and exits before TLS setup, configuration loading, database
+access or listener binding.
+
 ```sh
 /opt/cosmix/bin/cosmix-maild --config /etc/cosmix/maild/config.toml serve
 ```
@@ -47,6 +51,9 @@ the broker exists first. Listen addresses default from `/etc/cosmix/node.toml`
 listen field accepts a single address or a list, for multi-homed binds.
 
 ## Interfaces
+
+SMTP, SMTPS and IMAPS normalise IPv4-mapped IPv6 peers to plain IPv4 at accept time,
+so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.
 
 - **Protocol ports:** SMTP `25`, SMTPS submission `465`, IMAPS `993`, and JMAP over HTTP (dev default `127.0.0.1:8088`); CalDAV/CardDAV share the HTTP surface.
 - **Bus management surface** — the operational verbs, grouped:

@@ -471,6 +471,9 @@ onto the same store. It is built from a small family of crates:</p>
 <li><strong>DKIM key lifecycle</strong> — generate, rotate, and retire signing keys per domain.</li>
 </ul>
 <h2 id="running-it">Running it</h2>
+<p><code>--version</code> or <code>-V</code> anywhere in the arguments (including after <code>serve</code>) prints
+the compiled version and exits before TLS setup, configuration loading, database
+access or listener binding.</p>
 <pre><code class="language-sh">/opt/cosmix/bin/cosmix-maild --config /etc/cosmix/maild/config.toml serve
 </code></pre>
 <p>Subcommands cover setup and operations: <code>migrate</code> (run DB migrations), <code>account</code>
@@ -481,6 +484,8 @@ the broker exists first. Listen addresses default from <code>/etc/cosmix/node.to
 <code>config.toml</code>, which also carries the <code>[[dkim.domain]]</code> signing config. Each
 listen field accepts a single address or a list, for multi-homed binds.</p>
 <h2 id="interfaces">Interfaces</h2>
+<p>SMTP, SMTPS and IMAPS normalise IPv4-mapped IPv6 peers to plain IPv4 at accept time,
+so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.</p>
 <ul>
 <li><strong>Protocol ports:</strong> SMTP <code>25</code>, SMTPS submission <code>465</code>, IMAPS <code>993</code>, and JMAP over HTTP (dev default <code>127.0.0.1:8088</code>); CalDAV/CardDAV share the HTTP surface.</li>
 <li><strong>Bus management surface</strong> — the operational verbs, grouped:</li>

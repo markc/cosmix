@@ -79,6 +79,7 @@ pub async fn start(
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
                         let cfg = cfg_task.clone();
                         let slots = slots_task.clone();
                         let db = db_task.clone();

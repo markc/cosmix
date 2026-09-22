@@ -2153,6 +2153,15 @@ async fn run_inspection_verb_cli(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Allow appending the version flag to the daemon's exact argv.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("cosmix-maild {}", VERSION);
+        std::process::exit(0);
+    }
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls CryptoProvider");
