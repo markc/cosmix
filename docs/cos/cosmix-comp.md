@@ -951,10 +951,15 @@ the action. A hold already emitted is not retracted by later movement.
 
 The original `corner.clicked` topic retains its exact JSON body and emits only
 successful LMB brief actions, now on release. V2 consumers should subscribe only
-to `corner.clicked.v2` to avoid handling LMB twice. This versioning preserves old
+to `corner.clicked.v2` to avoid handling LMB twice. Consumers retaining an old-comp
+fallback must deduplicate: each LMB emits legacy at sequence N immediately followed
+by v2 at N+1, with the same output, corner and engagement dwell. Quoin uses this
+pair to admit the first click once, then ignores legacy after observing v2.
+This versioning preserves old
 shell-hosts with strict JSON decoding; they receive no RMB actions during rollout.
-Both versions carry engagement dwell, not press duration. Pin/dock/menu routing
-is a separate shell integration step; this compositor change does not implement it.
+Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
+to overlay pinning, RMB brief to docking, and RMB hold to an optional corner menu
+hook; an unconfigured menu does nothing.
 
 For a reliable property bootstrap: subscribe to the instance topic (for
 example `comp.props.changed` on the seat or `comp-nested.props.changed` when
