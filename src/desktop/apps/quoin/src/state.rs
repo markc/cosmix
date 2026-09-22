@@ -652,7 +652,7 @@ mod tests {
             let Value::Map(ref root) = parse_mix_data(&v2).unwrap() else {
                 panic!("map")
             };
-            let mut root = (*root).clone();
+            let mut root = (**root).clone();
             match case {
                 0 => {
                     root.insert("version".into(), Value::Number(3.0));
