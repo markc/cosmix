@@ -116,6 +116,36 @@ mod tests {
     }
 
     #[test]
+    fn oversized_horizontal_dock_reservations_clamp_remaining_height_to_zero() {
+        let mut model = model();
+        for edge in [Edge::Top, Edge::Bottom] {
+            model
+                .panel_input(edge, Duration::ZERO, PanelInput::Dock)
+                .unwrap();
+        }
+        let mut frame = ShellFrame::from_model(&model);
+        // Each reservation fits alone, but together they exceed the output.
+        for edge in [Edge::Top, Edge::Bottom] {
+            frame.panels[edge.index()].thickness_px = 500.0;
+            frame.panels[edge.index()].exclusive_zone_px = 500.0;
+        }
+        assert!(
+            frame.panel(Edge::Top).exclusive_zone_px
+                + frame.panel(Edge::Bottom).exclusive_zone_px
+                > frame.geometry.logical_size.height()
+        );
+        let layout = panel_layout(&frame);
+        for edge in [Edge::Left, Edge::Right] {
+            assert_eq!(layout.panels[edge.index()].y, 500.0);
+            assert_eq!(layout.panels[edge.index()].height, 0.0);
+        }
+        assert_eq!(layout.canvas.height, 0.0);
+        for edge in [Edge::Top, Edge::Bottom] {
+            assert_eq!(layout.panels[edge.index()].width, 1000.0);
+        }
+    }
+
+    #[test]
     fn side_docks_have_full_height_without_horizontal_docks() {
         let mut model = model();
         for edge in [Edge::Left, Edge::Right] {
