@@ -30,6 +30,12 @@ fn next_backoff(current: Duration) -> Duration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CornerIngress {
+    Action {
+        output: OutputKey,
+        epoch: u64,
+        corner: Corner,
+        action: CornerAction,
+    },
     Event {
         output: OutputKey,
         epoch: u64,
@@ -46,8 +52,54 @@ pub(crate) enum CornerIngress {
 impl CornerIngress {
     pub const fn epoch(&self) -> u64 {
         match self {
-            Self::Event { epoch, .. } | Self::Reset { epoch } | Self::Disabled { epoch } => *epoch,
+            Self::Action { epoch, .. }
+            | Self::Event { epoch, .. }
+            | Self::Reset { epoch }
+            | Self::Disabled { epoch } => *epoch,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CornerAction {
+    PinToggle,
+    DockToggle,
+    Menu,
+}
+
+/// Click sequence numbers belong to one compositor observation stream.
+/// The compositor emits an LMB legacy record immediately before its v2 record,
+/// allocating consecutive sequence numbers. Canonicalise both to the legacy
+/// number, so even the first click (before v2 discovery) acts exactly once.
+#[derive(Default)]
+struct ClickPreference {
+    v2_seen: bool,
+    last_sequence: Option<u64>,
+}
+
+impl ClickPreference {
+    fn accept(&mut self, kind: &CornerKind, sequence: u64) -> bool {
+        let canonical = match kind {
+            CornerKind::Clicked if self.v2_seen => return false,
+            CornerKind::Clicked => sequence,
+            CornerKind::Action(action) => {
+                self.v2_seen = true;
+                if *action == CornerAction::PinToggle {
+                    let Some(previous) = sequence.checked_sub(1) else {
+                        return false;
+                    };
+                    previous
+                } else {
+                    sequence
+                }
+            }
+            _ => return true,
+        };
+        if self.last_sequence.is_some_and(|last| canonical <= last) {
+            return false;
+        }
+        self.last_sequence = Some(canonical);
+        true
     }
 }
 
@@ -165,6 +217,7 @@ struct Topics {
     entered: String,
     left: String,
     clicked: String,
+    clicked_v2: String,
     output: String,
 }
 
@@ -174,6 +227,7 @@ impl Topics {
             entered: format!("{service}.corner.entered"),
             left: format!("{service}.corner.left"),
             clicked: format!("{service}.corner.clicked"),
+            clicked_v2: format!("{service}.corner.clicked.v2"),
             output: format!("{service}.output.changed"),
         }
     }
@@ -185,6 +239,8 @@ impl Topics {
             Some("corner.left")
         } else if topic == self.clicked {
             Some("corner.clicked")
+        } else if topic == self.clicked_v2 {
+            Some("corner.clicked.v2")
         } else if topic == self.output {
             Some("output.changed")
         } else {
@@ -192,8 +248,14 @@ impl Topics {
         }
     }
 
-    fn subscriptions(&self) -> [&str; 4] {
-        [&self.entered, &self.left, &self.clicked, &self.output]
+    fn subscriptions(&self) -> [&str; 5] {
+        [
+            &self.entered,
+            &self.left,
+            &self.clicked_v2,
+            &self.clicked,
+            &self.output,
+        ]
     }
 }
 
@@ -305,6 +367,7 @@ async fn bootstrap<S: CornerBusSession>(
 }
 
 struct WorkerState {
+    clicks: ClickPreference,
     topics: Topics,
     selected: OutputKey,
     outputs: Option<BTreeMap<String, OutputKey>>,
@@ -319,6 +382,7 @@ struct WorkerState {
 impl WorkerState {
     fn new(service: &str, selected: OutputKey) -> Self {
         Self {
+            clicks: ClickPreference::default(),
             topics: Topics::new(service),
             selected,
             outputs: None,
@@ -404,6 +468,12 @@ impl WorkerState {
     ) -> DecodeAction {
         match decode(&self.topics, &command) {
             Ok(Decoded::Corner(corner)) => {
+                // Broker subscriptions accept unpublished topics: subscribing
+                // successfully cannot tell us whether comp supports v2.
+                // Filter before queueing so refreshes cannot double a click.
+                if !self.clicks.accept(&corner.kind, corner.event_seq) {
+                    return DecodeAction::None;
+                }
                 if !self.map_valid {
                     // A loss marker invalidates the retained lane. The reset
                     // already synthesized Left for every engagement; only
@@ -463,15 +533,18 @@ impl WorkerState {
         if output != self.selected {
             return;
         }
-        if event.kind == CornerKind::Clicked {
+        if let Some(action) = match event.kind {
+            CornerKind::Clicked => Some(CornerAction::PinToggle),
+            CornerKind::Action(action) => Some(action),
+            _ => None,
+        } {
             // An impulse neither changes membership nor needs recovery when
             // dropped. Only lost membership events invalidate the host epoch.
-            let _ = sender.try_send(CornerIngress::Event {
+            let _ = sender.try_send(CornerIngress::Action {
                 output,
                 epoch: self.epoch,
-                event: CornerEvent::Clicked {
-                    corner: event.corner,
-                },
+                corner: event.corner,
+                action,
             });
             return;
         }
@@ -1058,6 +1131,7 @@ async fn run_connected_session<S: LiveCornerBusSession>(
                 }
                 match *connection_state.borrow_and_update() {
                     ConnState::Disconnected => {
+                        state.clicks = ClickPreference::default();
                         refresh_gate.cancel();
                         refresh_retry.clear();
                         state.map_valid = false;
@@ -1066,6 +1140,7 @@ async fn run_connected_session<S: LiveCornerBusSession>(
                     ConnState::Connected
                         if take_new_generation(&mut generation, client.connection_generation()) =>
                     {
+                        state.clicks = ClickPreference::default();
                         refresh_retry.clear();
                         state.map_valid = false;
                         state.reset(sender, overflowed, shared_epoch);
@@ -1221,11 +1296,12 @@ fn send(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CornerKind {
     Entered,
     Left,
     Clicked,
+    Action(CornerAction),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1234,6 +1310,7 @@ struct DecodedCorner {
     corner: Corner,
     dwell_ms: u64,
     kind: CornerKind,
+    event_seq: u64,
 }
 
 enum Decoded {
@@ -1249,6 +1326,17 @@ struct CornerBody {
     corner: String,
     dwell_ms: u64,
     event_seq: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CornerActionBody {
+    output: String,
+    corner: String,
+    dwell_ms: u64,
+    event_seq: u64,
+    button: String,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -1326,8 +1414,30 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
         );
         return Ok(Decoded::Refresh);
     }
-    let body: CornerBody =
-        serde_json::from_str(&command.body).map_err(|error| error.to_string())?;
+    let (body, action) = if expected == "corner.clicked.v2" {
+        let body: CornerActionBody =
+            serde_json::from_str(&command.body).map_err(|error| error.to_string())?;
+        let action = match (body.button.as_str(), body.kind.as_str()) {
+            ("left", "brief") if body.event_seq > 0 => CornerAction::PinToggle,
+            ("right", "brief") => CornerAction::DockToggle,
+            ("right", "hold") => CornerAction::Menu,
+            _ => return Err("invalid corner action".to_owned()),
+        };
+        (
+            CornerBody {
+                output: body.output,
+                corner: body.corner,
+                dwell_ms: body.dwell_ms,
+                event_seq: body.event_seq,
+            },
+            Some(action),
+        )
+    } else {
+        (
+            serde_json::from_str::<CornerBody>(&command.body).map_err(|error| error.to_string())?,
+            None,
+        )
+    };
     if !valid_slug(&body.output) || body.dwell_ms > MAX_DWELL_MS {
         return Err("invalid corner body".to_owned());
     }
@@ -1338,17 +1448,22 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
         "tr" => Corner::TopRight,
         _ => return Err("invalid corner".to_owned()),
     };
-    let _ = body.event_seq;
-    Ok(Decoded::Corner(DecodedCorner {
-        output: body.output,
-        corner,
-        dwell_ms: body.dwell_ms,
-        kind: match expected {
+    let kind = if let Some(action) = action {
+        CornerKind::Action(action)
+    } else {
+        match expected {
             "corner.entered" => CornerKind::Entered,
             "corner.left" => CornerKind::Left,
             "corner.clicked" => CornerKind::Clicked,
             _ => return Err("unexpected corner command".to_owned()),
-        },
+        }
+    };
+    Ok(Decoded::Corner(DecodedCorner {
+        output: body.output,
+        corner,
+        dwell_ms: body.dwell_ms,
+        kind,
+        event_seq: body.event_seq,
     }))
 }
 
@@ -1642,6 +1757,7 @@ mod tests {
             [
                 "subscribe:comp-nested.corner.entered",
                 "subscribe:comp-nested.corner.left",
+                "subscribe:comp-nested.corner.clicked.v2",
                 "subscribe:comp-nested.corner.clicked",
                 "subscribe:comp-nested.output.changed",
                 "read:comp-nested",
@@ -1684,7 +1800,143 @@ mod tests {
     }
 
     #[test]
-    fn clicked_decodes_and_emits_each_impulse_without_changing_engagement() {
+    fn v2_actions_decode_strictly_and_keep_all_corner_mappings() {
+        let topics = Topics::new("comp");
+        for (wire, corner, edge) in [
+            ("tl", Corner::TopLeft, cosmix_shell::core::Edge::Left),
+            ("bl", Corner::BottomLeft, cosmix_shell::core::Edge::Bottom),
+            ("br", Corner::BottomRight, cosmix_shell::core::Edge::Right),
+            ("tr", Corner::TopRight, cosmix_shell::core::Edge::Top),
+        ] {
+            for (button, kind, action) in [
+                ("left", "brief", CornerAction::PinToggle),
+                ("right", "brief", CornerAction::DockToggle),
+                ("right", "hold", CornerAction::Menu),
+            ] {
+                let body = json!({
+                    "output": "o_dp_1", "corner": wire, "button": button,
+                    "kind": kind, "dwell_ms": 200, "event_seq": 10,
+                });
+                let command = incoming(
+                    "comp.corner.clicked.v2",
+                    "corner.clicked.v2",
+                    &body.to_string(),
+                );
+                let Ok(Decoded::Corner(decoded)) = decode(&topics, &command) else {
+                    panic!("valid v2 action rejected");
+                };
+                assert_eq!(decoded.corner, corner);
+                assert_eq!(decoded.corner.summoned_edge(), edge);
+                assert_eq!(decoded.kind, CornerKind::Action(action));
+                assert_eq!(decoded.event_seq, 10);
+            }
+        }
+        for (button, kind) in [("left", "hold"), ("middle", "brief"), ("right", "drag")] {
+            let body = json!({
+                "output": "o_dp_1", "corner": "tl", "button": button,
+                "kind": kind, "dwell_ms": 200, "event_seq": 10,
+            });
+            assert!(
+                decode(
+                    &topics,
+                    &incoming(
+                        "comp.corner.clicked.v2",
+                        "corner.clicked.v2",
+                        &body.to_string(),
+                    )
+                )
+                .is_err()
+            );
+        }
+        let legacy = r#"{"output":"o_dp_1","corner":"tl","dwell_ms":200,"event_seq":9}"#;
+        assert!(
+            decode(
+                &topics,
+                &incoming("comp.corner.clicked.v2", "corner.clicked.v2", legacy,)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_and_v2_pair_toggle_once_in_either_order_even_while_map_is_pending() {
+        for v2_first in [false, true] {
+            for map_pending in [false, true] {
+                let (sender, channel) = sync_channel(8);
+                let overflow = AtomicBool::new(false);
+                let epoch = AtomicU64::new(0);
+                let output = OutputKey::new("DP-1").unwrap();
+                let mut state = WorkerState::new("comp", output.clone());
+                let outputs = BTreeMap::from([("o_dp_1".to_owned(), output.clone())]);
+                if !map_pending {
+                    state.install_outputs(outputs.clone(), &sender, &overflow, &epoch);
+                }
+                let legacy = json!({
+                    "output": "o_dp_1", "corner": "tl", "dwell_ms": 200, "event_seq": 9,
+                })
+                .to_string();
+                let v2 = json!({
+                    "output": "o_dp_1", "corner": "tl", "dwell_ms": 200, "event_seq": 10,
+                    "button": "left", "kind": "brief",
+                })
+                .to_string();
+                let mut pair = [("corner.clicked", legacy), ("corner.clicked.v2", v2)];
+                if v2_first {
+                    pair.reverse();
+                }
+                // Replay both records too: neither duplicate may undo the pin.
+                for _ in 0..2 {
+                    for (command, body) in &pair {
+                        state.decode_and_apply(
+                            incoming(&format!("comp.{command}"), command, body),
+                            &sender,
+                            &overflow,
+                            &epoch,
+                        );
+                    }
+                }
+                if map_pending {
+                    assert!(channel.try_recv().is_err());
+                    state.install_outputs(outputs, &sender, &overflow, &epoch);
+                }
+                assert_eq!(
+                    channel.try_recv().unwrap(),
+                    CornerIngress::Action {
+                        output,
+                        epoch: 0,
+                        corner: Corner::TopLeft,
+                        action: CornerAction::PinToggle,
+                    }
+                );
+                assert!(channel.try_recv().is_err());
+                assert!(state.engaged.is_empty());
+                assert!(state.clicks.v2_seen);
+            }
+        }
+    }
+
+    #[test]
+    fn v2_preference_ignores_legacy_and_duplicate_actions_until_new_connection() {
+        let mut clicks = ClickPreference::default();
+        let pin = CornerKind::Action(CornerAction::PinToggle);
+        let dock = CornerKind::Action(CornerAction::DockToggle);
+        let menu = CornerKind::Action(CornerAction::Menu);
+        assert!(clicks.accept(&pin, 10));
+        assert!(!clicks.accept(&CornerKind::Clicked, 11));
+        assert!(clicks.accept(&dock, 12));
+        assert!(!clicks.accept(&dock, 12));
+        assert!(clicks.accept(&menu, 13));
+        assert!(!clicks.accept(&menu, 13));
+        assert!(!clicks.accept(&pin, 10));
+        assert!(clicks.accept(&pin, 15));
+        clicks = ClickPreference::default();
+        assert!(clicks.accept(&CornerKind::Clicked, 1));
+        assert!(!clicks.accept(&CornerKind::Clicked, 1));
+        assert!(clicks.accept(&CornerKind::Clicked, 2));
+    }
+
+    #[test]
+    fn legacy_clicked_emits_distinct_impulses_without_changing_engagement() {
         let (sender, channel) = sync_channel(8);
         let overflow = AtomicBool::new(false);
         let epoch = AtomicU64::new(0);
@@ -1705,6 +1957,7 @@ mod tests {
                 ..
             }))
         ));
+        let mut sequence = 9;
         for engaged in [false, true] {
             if engaged {
                 state.decode_and_apply(
@@ -1723,16 +1976,22 @@ mod tests {
             }
             let before = state.engaged.clone();
             for _ in 0..2 {
+                sequence += 1;
+                let click_body = json!({
+                    "output": "o_dp_1", "corner": "tl", "dwell_ms": 200,
+                    "event_seq": sequence,
+                })
+                .to_string();
                 state.decode_and_apply(
-                    incoming("comp.corner.clicked", "corner.clicked", body),
+                    incoming("comp.corner.clicked", "corner.clicked", &click_body),
                     &sender,
                     &overflow,
                     &epoch,
                 );
                 assert_eq!(state.engaged, before);
-                assert!(matches!(channel.try_recv(), Ok(CornerIngress::Event {
+                assert!(matches!(channel.try_recv(), Ok(CornerIngress::Action {
                     output: received, epoch: received_epoch,
-                    event: CornerEvent::Clicked { corner: Corner::TopLeft },
+                    corner: Corner::TopLeft, action: CornerAction::PinToggle,
                 }) if received == output && received_epoch == state.epoch));
             }
         }
@@ -1841,6 +2100,7 @@ mod tests {
             corner: Corner::TopLeft,
             dwell_ms: 10,
             kind: CornerKind::Entered,
+            event_seq: 1,
         };
         state.apply_corner(foreign, &sender, &overflow, &epoch);
         assert!(channel.try_recv().is_err());
@@ -1849,6 +2109,7 @@ mod tests {
             corner: Corner::TopLeft,
             dwell_ms: 10,
             kind: CornerKind::Entered,
+            event_seq: 2,
         };
         state.apply_corner(selected.clone(), &sender, &overflow, &epoch);
         state.apply_corner(selected, &sender, &overflow, &epoch);
@@ -1873,6 +2134,7 @@ mod tests {
             corner: Corner::TopLeft,
             dwell_ms: 20,
             kind: CornerKind::Entered,
+            event_seq: 1,
         });
         assert!(channel.try_recv().is_err());
         state.install_outputs(
@@ -1922,6 +2184,7 @@ mod tests {
                 corner: Corner::TopLeft,
                 dwell_ms: 20,
                 kind: CornerKind::Entered,
+                event_seq: 1,
             },
             &sender,
             &overflow,

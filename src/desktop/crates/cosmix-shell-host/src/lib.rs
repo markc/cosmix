@@ -18,6 +18,6 @@ pub mod scene;
 pub mod surface;
 
 pub use runner::{
-    LayerHostConfig, LayerHostDeadline, LayerHostError, LayerHostWake, LayerPanelMounts,
-    configure_layer_host,
+    CornerMenuHook, LayerHostConfig, LayerHostDeadline, LayerHostError, LayerHostWake,
+    LayerPanelMounts, configure_layer_host,
 };

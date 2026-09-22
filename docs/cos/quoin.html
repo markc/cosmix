@@ -723,24 +723,35 @@ never rendered as zero.</p>
 <p>Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. <code>--comp-service NAME</code> selects the
 registered compositor instance (default <code>comp</code>), giving topic headers
-<code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code>, <code>&lt;service&gt;.corner.clicked</code> and
-<code>&lt;service&gt;.output.changed</code>. Their inner commands remain the unprefixed
-<code>corner.entered</code>, <code>corner.left</code>, <code>corner.clicked</code> and <code>output.changed</code>.
-The compositor emits legacy <code>corner.clicked</code> on a successful left-button release on
-an engaged corner; the client toggles the clockwise edge's dock (TL→left, BL→bottom,
-BR→right, TR→top). Each click is an impulse, independent of corner membership;
-the model resolves the toggle from its current mode and persists the
-change. Undocking leaves the hidden panel transiently revealed and arms grace
-when no hold remains. This preserves the old click behaviour; wiring the new
-compositor corner consumption/discrimination to pin/dock toggles is deferred.
+<code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code>, <code>&lt;service&gt;.corner.clicked.v2</code>,
+<code>&lt;service&gt;.corner.clicked</code> and <code>&lt;service&gt;.output.changed</code>. Their inner commands
+are the same suffixes without the service prefix.
+Brief LMB toggles <strong>Pinned</strong> (persistent overlay); brief RMB toggles <strong>Docked</strong>
+(reserves space). Both use the existing counter-clockwise mapping: TL→left,
+BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
+membership; the model resolves the toggle from its current mode and persists
+the change. Unpinning or undocking leaves transient reveal/grace to the panel model.
 The header pin control toggles overlay pinning; its glyph is <code>◇</code> for hidden
 (including transient reveal), <code>◆</code> for pinned and <code>▣</code> for docked.</p>
 <p>The compositor also publishes <code>corner.clicked.v2</code> with <code>button</code> and <code>kind</code> for
 LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
 their releases, cancelling pending actions on excess movement or disengagement.
-The current shell-host subscribes to the legacy LMB topic only; richer action
-routing is a subsequent integration step. During this transition RMB corner
-presses are swallowed without opening a menu on an old shell-host.</p>
+RMB hold never toggles a mode. It calls the optional host App resource
+<code>CornerMenuHook(fn(&amp;mut World, &amp;OutputKey, Corner))</code>. The callback must look up
+that output/corner's configured menu and do nothing if none exists. Without
+the resource, hold is a traced no-op. No callback or menu UI is installed yet.</p>
+<p>Both click topics are subscribed for old-compositor compatibility. Successful
+subscription is not capability discovery: the broker accepts unpublished topics.
+Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The current
+compositor emits each LMB's legacy record at sequence N and its v2 record at N+1;
+the host maps both to N and admits that logical click once, in either delivery
+order. On observing v2 it ignores all subsequent legacy clicks for that connection.
+A sequence high-water mark also rejects duplicate/stale click records, before
+output-map queueing. Reconnect clears preference and sequence state; ordinary
+output refreshes and loss markers retain them. This relies on the compositor's
+consecutive LMB pair and monotonically increasing observation stream, not a
+timing window. It is not an exactly-once guarantee across a connection reset or
+publisher sequence restart; a publisher restart requires a fresh host/connection.</p>
 <p>Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed <code>comp.props.get</code> request verb at <code>outputs</code>. It maps the topic's
 stable <code>o_&lt;slug&gt;</code> output key through the public

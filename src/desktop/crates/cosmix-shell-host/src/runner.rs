@@ -62,7 +62,9 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
-use crate::corner_bus::{CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus};
+use crate::corner_bus::{
+    CornerAction, CornerBusHandle, CornerIngress, gate_ingress, start as start_corner_bus,
+};
 use crate::input::{
     KeyboardBridge, PointerBridge, SurfaceTarget, TouchBridge, configure_ingress,
     stage_shell_command, staged_shell_commands_pending,
@@ -2994,6 +2996,17 @@ impl RunnerState {
 
     fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
         match &ingress {
+            CornerIngress::Action {
+                output,
+                epoch,
+                action,
+                ..
+            } => tracing::debug!(
+                event = "quoin_corner_action",
+                ?action,
+                output = output.as_str(),
+                epoch
+            ),
             CornerIngress::Event {
                 output,
                 epoch,
@@ -3121,6 +3134,13 @@ impl RunnerState {
     }
 }
 
+/// Optional main-world corner menu entry point. Register this resource on the
+/// host App; the callback must check configuration for the supplied output and
+/// corner and do nothing if that corner has no menu. No fallback action exists.
+/// TODO: wire configurable corner menus when the menu UI is implemented.
+#[derive(Resource, Clone, Copy)]
+pub struct CornerMenuHook(pub fn(&mut World, &OutputKey, cosmix_shell::core::Corner));
+
 pub(crate) fn apply_corner_ingress_to_app(
     app: &mut App,
     selected_key: Option<&OutputKey>,
@@ -3132,6 +3152,35 @@ pub(crate) fn apply_corner_ingress_to_app(
         CornerIngress::Reset { .. } | CornerIngress::Disabled { .. }
     );
     let events = match ingress {
+        CornerIngress::Action {
+            output,
+            corner,
+            action,
+            ..
+        } if selected_key == Some(&output) => {
+            let input = match action {
+                CornerAction::PinToggle => cosmix_shell::core::PanelInput::PinToggle,
+                CornerAction::DockToggle => cosmix_shell::core::PanelInput::DockToggle,
+                CornerAction::Menu => {
+                    if let Some(hook) = app.world().get_resource::<CornerMenuHook>().copied() {
+                        (hook.0)(app.world_mut(), &output, corner);
+                        return true;
+                    }
+                    tracing::trace!(event = "quoin_corner_menu_unconfigured", ?corner);
+                    return false;
+                }
+            };
+            stage_shell_command(
+                app,
+                output,
+                ShellCommandKind::Panel {
+                    edge: corner.summoned_edge(),
+                    input,
+                },
+            );
+            return true;
+        }
+        CornerIngress::Action { .. } => return false,
         CornerIngress::Event { output, event, .. } if selected_key == Some(&output) => {
             let corner = event.corner();
             let changed = match event {
@@ -4154,6 +4203,152 @@ mod tests {
         );
         assert_eq!(sequences[Edge::Left.index()].lock().unwrap().len(), 5);
         assert!(executor.operations[0].1.contains(&ProtocolOp::Unmap));
+    }
+
+    #[test]
+    fn corner_actions_toggle_pin_and_dock_on_all_four_edges() {
+        for (corner, edge) in [
+            (Corner::TopLeft, Edge::Left),
+            (Corner::BottomLeft, Edge::Bottom),
+            (Corner::BottomRight, Edge::Right),
+            (Corner::TopRight, Edge::Top),
+        ] {
+            for (action, mode) in [
+                (CornerAction::PinToggle, PanelMode::Pinned),
+                (CornerAction::DockToggle, PanelMode::Docked),
+            ] {
+                let output = OutputKey::new("DP-1").unwrap();
+                let model = ShellModel::new(
+                    output.clone(),
+                    LogicalSize::new(1_000.0, 800.0).unwrap(),
+                    Duration::ZERO,
+                    Duration::from_millis(800),
+                    Duration::from_millis(200),
+                )
+                .unwrap();
+                let mut app = App::new();
+                configure_ingress(&mut app);
+                app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+                app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+                let mut engaged = BTreeSet::from([corner]);
+                for expected in [mode, PanelMode::Hidden] {
+                    assert!(apply_corner_ingress_to_app(
+                        &mut app,
+                        Some(&output),
+                        &mut engaged,
+                        CornerIngress::Action {
+                            output: output.clone(),
+                            epoch: 0,
+                            corner,
+                            action
+                        },
+                    ));
+                    app.update();
+                    let frame = &app.world().resource::<ShellFrameState>().0;
+                    assert_eq!(frame.panel(edge).mode, expected);
+                    for other in [Edge::Left, Edge::Bottom, Edge::Right, Edge::Top] {
+                        if other != edge {
+                            assert_eq!(frame.panel(other).mode, PanelMode::Hidden);
+                        }
+                    }
+                    assert_eq!(engaged, BTreeSet::from([corner]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn corner_hold_never_changes_panel_mode_with_or_without_menu_hook() {
+        #[derive(Resource, Default)]
+        struct Requests(Vec<(OutputKey, Corner)>);
+        fn hook(world: &mut World, output: &OutputKey, corner: Corner) {
+            // A future menu owner looks up configuration here. This recorder
+            // deliberately has no configured menu and must not toggle a panel.
+            world
+                .resource_mut::<Requests>()
+                .0
+                .push((output.clone(), corner));
+        }
+        for registered in [false, true] {
+            for mode in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {
+                let output = OutputKey::new("DP-1").unwrap();
+                let mut model = ShellModel::new(
+                    output.clone(),
+                    LogicalSize::new(1_000.0, 800.0).unwrap(),
+                    Duration::ZERO,
+                    Duration::from_millis(800),
+                    Duration::from_millis(200),
+                )
+                .unwrap();
+                model
+                    .panel_input(
+                        Edge::Left,
+                        Duration::ZERO,
+                        cosmix_shell::core::PanelInput::SetMode(mode),
+                    )
+                    .unwrap();
+                let mut app = App::new();
+                configure_ingress(&mut app);
+                app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+                app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+                app.init_resource::<Requests>();
+                if registered {
+                    app.insert_resource(CornerMenuHook(hook));
+                }
+                let mut engaged = BTreeSet::from([Corner::TopLeft]);
+                assert_eq!(
+                    apply_corner_ingress_to_app(
+                        &mut app,
+                        Some(&output),
+                        &mut engaged,
+                        CornerIngress::Action {
+                            output: output.clone(),
+                            epoch: 0,
+                            corner: Corner::TopLeft,
+                            action: CornerAction::Menu,
+                        },
+                    ),
+                    registered
+                );
+                assert!(!staged_shell_commands_pending(&app));
+                app.update();
+                assert_eq!(
+                    app.world()
+                        .resource::<ShellFrameState>()
+                        .0
+                        .panel(Edge::Left)
+                        .mode,
+                    mode
+                );
+                assert_eq!(engaged, BTreeSet::from([Corner::TopLeft]));
+                let expected = if registered {
+                    vec![(output.clone(), Corner::TopLeft)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(app.world().resource::<Requests>().0, expected);
+                // Neither a callback nor a panel action may target another output.
+                for action in [
+                    CornerAction::Menu,
+                    CornerAction::PinToggle,
+                    CornerAction::DockToggle,
+                ] {
+                    assert!(!apply_corner_ingress_to_app(
+                        &mut app,
+                        Some(&output),
+                        &mut engaged,
+                        CornerIngress::Action {
+                            output: OutputKey::new("DP-2").unwrap(),
+                            epoch: 0,
+                            corner: Corner::TopLeft,
+                            action,
+                        },
+                    ));
+                }
+                assert_eq!(app.world().resource::<Requests>().0, expected);
+                assert!(!staged_shell_commands_pending(&app));
+            }
+        }
     }
 
     #[test]
