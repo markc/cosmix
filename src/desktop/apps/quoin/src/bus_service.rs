@@ -205,7 +205,7 @@ fn service_bus(
                 generation,
             } => {
                 if !state.ready_logged {
-                    println!("QUOIN_BUS_READY service=shell");
+                    println!("QUOIN_BUS_READY service={}", bridge.service_name());
                     state.ready_logged = true;
                 }
                 state.live_generation = Some(generation);

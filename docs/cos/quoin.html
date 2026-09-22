@@ -488,6 +488,9 @@ installable application id and layer namespace are <code>dev.cosmix.quoin</code>
 current source versions. <code>cosmix-quoin-demo</code> remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.</p>
+<p><code>QUOIN_BUS_READY service=NAME</code> reports the configured Bus identity (including
+<code>--bus-service</code> overrides). It records the first connected event consumed by
+the shell service, not successful presentation or continued event-loop progress.</p>
 <h2 id="output-and-scale">Output and scale</h2>
 <p>Version 1 owns exactly one output runtime. <code>--output NAME</code> selects the exact
 complete SCTK <code>wl_output</code> advertising that name. A missing name is an error

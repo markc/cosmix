@@ -55,6 +55,10 @@ current source versions. `cosmix-quoin-demo` remains a
 feature-gated, non-installable normal-window tuning arm; it is not a
 layer-shell client.
 
+`QUOIN_BUS_READY service=NAME` reports the configured Bus identity (including
+`--bus-service` overrides). It records the first connected event consumed by
+the shell service, not successful presentation or continued event-loop progress.
+
 ## Output and scale
 
 Version 1 owns exactly one output runtime. `--output NAME` selects the exact
