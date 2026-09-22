@@ -292,6 +292,7 @@ pub async fn start(
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
                         let s = inbound_state.clone();
                         // Snapshot the resolver + cached ServerConfig
                         // at TCP-accept time. A reload that swaps the
@@ -332,6 +333,7 @@ pub async fn start(
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        let peer = SocketAddr::new(peer.ip().to_canonical(), peer.port());
                         let s = sub_state.clone();
                         // Capture the resolver + ServerConfig snapshot
                         // at TCP-accept time. A reload after this point
