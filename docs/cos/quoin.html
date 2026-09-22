@@ -691,12 +691,18 @@ registered compositor instance (default <code>comp</code>), giving topic headers
 <code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code>, <code>&lt;service&gt;.corner.clicked</code> and
 <code>&lt;service&gt;.output.changed</code>. Their inner commands remain the unprefixed
 <code>corner.entered</code>, <code>corner.left</code>, <code>corner.clicked</code> and <code>output.changed</code>.
-The compositor emits <code>corner.clicked</code> on a left-button press on an engaged
+The compositor emits legacy <code>corner.clicked</code> on a successful left-button release on an engaged
 corner; the client toggles the clockwise edge's panel pin (TL→left, BL→bottom,
 BR→right, TR→top). Each click is an impulse, independent of corner membership;
 the model resolves the toggle from its current pin state and persists the
 change. Unpinning leaves the panel revealed and arms grace when no hold remains.
 The visible header pin control remains available as a fallback.</p>
+<p>The compositor also publishes <code>corner.clicked.v2</code> with <code>button</code> and <code>kind</code> for
+LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
+their releases, cancelling pending actions on excess movement or disengagement.
+The current shell-host subscribes to the legacy LMB topic only; richer action
+routing is a subsequent integration step. During this transition RMB corner
+presses are swallowed without opening a menu on an old shell-host.</p>
 <p>Quoin subscribes to the corner and output topics before addressing the selected service
 with the fixed <code>comp.props.get</code> request verb at <code>outputs</code>. It maps the topic's
 stable <code>o_&lt;slug&gt;</code> output key through the public
