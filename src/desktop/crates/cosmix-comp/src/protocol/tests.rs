@@ -29572,7 +29572,7 @@ fn port_observation_reports_nested_resize_once_with_final_geometry() {
 
 #[cfg(feature = "bus")]
 #[test]
-fn port_corner_clicked_requires_engaged_left_press() {
+fn port_corner_clicked_requires_engaged_left_release() {
     use port_observation::ObservationRecord;
 
     let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
@@ -29601,21 +29601,30 @@ fn port_corner_clicked_requires_engaged_left_press() {
         .expect("corner engaged");
     assert_eq!(corner, corner::Corner::TopLeft);
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(drain_observations(&observations).is_empty());
+    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let records = drain_observations(&observations);
-    assert_eq!(records.len(), 1, "exactly one click observation");
+    assert_eq!(records.len(), 2, "legacy and v2 click observations");
     assert_eq!(
         records[0],
         ObservationRecord::CornerClicked {
-            output,
+            output: output.clone(),
             corner,
             dwell_ms,
             event_seq: entered_seq + 1,
         }
     );
-    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
-    assert!(
-        drain_observations(&observations).is_empty(),
-        "release emits nothing"
+    assert_eq!(
+        records[1],
+        ObservationRecord::CornerClickedV2 {
+            output,
+            corner,
+            dwell_ms,
+            button: "left",
+            kind: "brief",
+            event_seq: entered_seq + 2,
+        }
     );
     route_pointer_button(
         &mut harness,
@@ -29631,6 +29640,205 @@ fn port_corner_clicked_requires_engaged_left_press() {
         PRIMARY_POINTER_BUTTON + 1,
         ButtonState::Released,
     );
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 1, "RMB has no legacy pin-toggle event");
+    assert!(matches!(
+        records[0],
+        ObservationRecord::CornerClickedV2 {
+            button: "right",
+            kind: "brief",
+            ..
+        }
+    ));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
+    use port_observation::ObservationRecord;
+
+    for cancellation in [
+        "none", "drag", "outside", "resize", "lock", "leave", "disable",
+    ] {
+        for button in [
+            PRIMARY_POINTER_BUTTON,
+            PRIMARY_POINTER_BUTTON + 1,
+            PRIMARY_POINTER_BUTTON + 2,
+        ] {
+            let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+            let pointer = harness.bind_pointer();
+            let (layer, _) = map_test_layer_surface(
+                &mut harness,
+                0,
+                TestLayerSpec {
+                    size: (0, 0),
+                    anchor: 1 | 2 | 4 | 8,
+                    ..TestLayerSpec::default()
+                },
+            );
+            let mut config = corner::CornerConfig {
+                hold_ms: 5_000,
+                ..corner::CornerConfig::default()
+            };
+            harness.server.state.apply_corner_config(config);
+            route_pointer_to(&mut harness, 1.0, 1.0);
+            harness.sync();
+            assert_eq!(
+                harness.server.state.surface_at(1.0, 1.0)
+                    .map(|record| record.role.wl_surface().id().protocol_id()),
+                Some(layer.surface)
+            );
+            assert!(harness.server.state.pointer.current_focus().is_some());
+            harness
+                .server
+                .event_loop
+                .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+                .unwrap();
+            assert!(harness.server.state.corner_engaged());
+            drain_observations(&observations);
+            route_pointer_button(&mut harness, button, ButtonState::Pressed);
+            assert!(pointer_bodies(&harness.sync(), pointer, 3).is_empty());
+            assert!(harness.server.state.pointer.current_pressed().is_empty());
+            match cancellation {
+                "drag" => {
+                    // Still within the square hotspot, but >12px from press.
+                    route_pointer_to(&mut harness, 11.0, 11.0);
+                    assert!(harness.server.state.corner_engaged());
+                    route_pointer_to(&mut harness, 1.0, 1.0);
+                }
+                "outside" => route_pointer_to(&mut harness, 100.0, 100.0),
+                "resize" => {
+                    harness.server.state.resize_output(640, 480);
+                }
+                "lock" => harness.server.state.teardown_input_for_session_lock(),
+                "leave" => harness
+                    .server
+                    .state
+                    .handle_host_input(HostInput::PointerLeave),
+                "disable" => {
+                    config.enabled = false;
+                    harness.server.state.apply_corner_config(config);
+                }
+                "none" => route_pointer_to(&mut harness, 3.0, 3.0),
+                _ => unreachable!(),
+            }
+            route_pointer_button(&mut harness, button, ButtonState::Released);
+            assert!(
+                pointer_bodies(&harness.sync(), pointer, 3).is_empty(),
+                "{cancellation}"
+            );
+            let records = drain_observations(&observations);
+            let actions = records
+                .iter()
+                .filter(|record| matches!(record, ObservationRecord::CornerClickedV2 { .. }))
+                .count();
+            assert_eq!(
+                actions,
+                usize::from(cancellation == "none" && button != PRIMARY_POINTER_BUTTON + 2),
+                "{cancellation}: {records:?}"
+            );
+            // Ownership ends at release: ordinary client clicks still work.
+            route_pointer_to(&mut harness, 100.0, 100.0);
+            harness.sync();
+            route_pointer_button(&mut harness, button, ButtonState::Pressed);
+            route_pointer_button(&mut harness, button, ButtonState::Released);
+            assert_eq!(pointer_bodies(&harness.sync(), pointer, 3).len(), 2);
+        }
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_corner_does_not_steal_release_of_a_client_press() {
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    let pointer = harness.bind_pointer();
+    route_pointer_to(&mut harness, 100.0, 100.0);
+    harness.sync();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(pointer_bodies(&harness.sync(), pointer, 3).len(), 1);
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .unwrap();
+    assert!(harness.server.state.corner_engaged());
+    drain_observations(&observations);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(pointer_bodies(&harness.sync(), pointer, 3).len(), 1);
+    assert!(!drain_observations(&observations).iter().any(|record| matches!(
+        record,
+        port_observation::ObservationRecord::CornerClicked { .. }
+            | port_observation::ObservationRecord::CornerClickedV2 { .. }
+    )));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_corner_rmb_hold_timer_fires_once_and_lmb_never_holds() {
+    use port_observation::ObservationRecord;
+
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    let config = corner::CornerConfig {
+        hold_ms: 20,
+        ..corner::CornerConfig::default()
+    };
+    harness.server.state.apply_corner_config(config);
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .unwrap();
+    assert!(harness.server.state.corner_engaged());
+    drain_observations(&observations);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert!(
+        harness.server.state.corner_timer_probe().0.is_none(),
+        "LMB has no hold timer"
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Pressed,
+    );
+    assert!(harness.server.state.corner_timer_probe().0.is_some());
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(100)), &mut harness.server.state)
+        .unwrap();
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        records[0],
+        ObservationRecord::CornerClickedV2 {
+            button: "right",
+            kind: "hold",
+            ..
+        }
+    ));
+    assert!(harness.server.state.corner_timer_probe().0.is_none());
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Released,
+    );
+    assert!(
+        drain_observations(&observations).is_empty(),
+        "no brief after hold"
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 2);
+    assert!(matches!(
+        records[1],
+        ObservationRecord::CornerClickedV2 {
+            button: "left",
+            kind: "brief",
+            ..
+        }
+    ));
 }
 
 #[cfg(feature = "bus")]
@@ -30160,6 +30368,7 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
         ("input.corners.enabled", json!(false), json!(true)),
         ("input.corners.deadzone_px", json!(24.5), json!(12.0)),
         ("input.corners.dwell_ms", json!(250), json!(200)),
+        ("input.corners.hold_ms", json!(750), json!(500)),
         (
             "input.corners.velocity_max_px_s",
             json!(900.0),
