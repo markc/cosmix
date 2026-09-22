@@ -593,7 +593,25 @@ must trigger the centring assertion. The authored-width text regression is
 enabled in P1.</p>
 <p>The legacy freeze compares every document node's border/content boxes and
 shaped text-run boxes against a test-only copy of the P0 renderer mapping.
-It covers rows/columns with gaps and padding, plus static reconstructions of
+It collects every mismatch across all four fixtures before failing once.
+The report orders differing nodes by their largest absolute edge-coordinate
+delta, and prints old/new/delta values for all three rectangles, including
+left/top/right/bottom and width/height in logical px. The existing 0.5px edge
+tolerance is unchanged; width/height deltas are additional diagnostics.
+Missing or non-finite geometry ranks first. Camera, font and readback validity
+guards remain prerequisites: invalid measurements are not geometry results.</p>
+<p>Independent node-ID manifests pin coverage to 53 nodes: panel 24, popup 19,
+row 5 and column 5. Global and per-fixture summaries report compared and
+differing counts, along with expected/old/new counts and coverage errors.
+Deleting a node from both mappings cannot silently shrink the freeze.
+The panel's <code>root</code>, <code>fill</code>, <code>clock</code>, <code>clock_col</code>, <code>clock_time</code>, <code>clock_date</code>
+and <code>peek</code> are all compared; their rectangles are also printed when unchanged
+within tolerance, so the clock's right-edge arithmetic can be checked.</p>
+<p>The former fail-fast implementation stopped on the first coordinate of
+<code>panel/clock</code>. That failure gave no comparison result for the remaining 52
+nodes or even the clock's other edges. All fixture IDs were mapped; this was
+premature termination, not an intentional exclusion from the geometry map.</p>
+<p>It covers rows/columns with gaps and padding, plus static reconstructions of
 Quoin's launcher fallback, workspace buttons, task label, flexible spacer,
 status badges, nested clock and calendar/notification popup shapes. Internal
 label UI boxes intentionally become intrinsic; the freeze compares visible
@@ -601,6 +619,15 @@ text geometry instead. Fixtures contain no new ports and no intentionally
 corrected centred-text allocation. Separate tests cover the corrected defect,
 new vocabulary, port clearing, no soft wrapping, explicit newlines and elision
 with the production CTK theme plugin.</p>
+<p>Of the real Quoin shapes exposed to non-elided text sizing, the current panel
+fixture represents the Apps fallback, two workspace labels, a simplified
+status bullet/count, the nested clock and the peek fallback. The popup has a
+rough month/arrows analogue, three weekday/day cells and a generic notice;
+it does not reproduce the actual calendar navigation or notification header.
+Tray fallback initials, launcher heading/count/category chips, calendar
+Today/day/full-date headings, and notification heading/Clear-all controls
+are absent. Exact builder output and dynamic states require the extraction
+below (additional hand-authored fixtures could cover individual shapes).</p>
 <p>These are representative shapes, not captured executions of
 <code>scripts/quoin-panel.mix</code>. That citizen builds documents from live services,
 time and icon lookup and cannot be loaded as a static scene. For full

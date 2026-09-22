@@ -479,39 +479,187 @@ fn same_rect(context: &str, actual: Rect, expected: Rect) {
 fn legacy_fixture_geometry_is_frozen() {
     // Static reconstructions of programmatically generated Quoin shapes, not
     // a claim to have run the citizen or captured an operator's live state.
-    for (name, body) in [
-        ("panel", include_str!("layout_tests/fixtures/panel.mix")),
-        ("popup", include_str!("layout_tests/fixtures/popup.mix")),
-        ("row", &gaps_document("row")),
-        ("column", &gaps_document("column")),
+    // Independent ID manifests make deletion from BOTH mappings visible.
+    // These freeze coverage, not geometry; update deliberately with fixtures.
+    let mut differences = Vec::new();
+    let mut coverage_errors = Vec::new();
+    let mut summaries = Vec::new();
+    let mut unchanged_focus = Vec::new();
+    let mut total_compared = 0;
+    let mut total_expected = 0;
+    const FOCUS: &[&str] = &[
+        "root",
+        "fill",
+        "clock",
+        "clock_col",
+        "clock_time",
+        "clock_date",
+        "peek",
+    ];
+    for (name, body, expected_ids) in [
+        (
+            "panel",
+            include_str!("layout_tests/fixtures/panel.mix"),
+            "root launcher launcher_icon gap1 pager ws1 ws1_t ws2 ws2_t gap2 tasks task task_icon task_label fill status status_icon status_count clock clock_col clock_time clock_date peek peek_icon",
+        ),
+        (
+            "popup",
+            include_str!("layout_tests/fixtures/popup.mix"),
+            "root heading previous month next week mon tue wed days day1 one day2 two day3 three notice title body",
+        ),
+        ("row", &gaps_document("row"), "root a b c sentinel"),
+        ("column", &gaps_document("column"), "root a b c sentinel"),
     ] {
         let before = Harness::load_options(body, true, false).geometry();
         let after = Harness::load(body).geometry();
-        assert_eq!(
-            before.keys().collect::<Vec<_>>(),
-            after.keys().collect::<Vec<_>>()
-        );
-        for (id, expected) in before {
-            let actual = &after[&id];
-            same_rect(
-                &format!("{name}/{id} border"),
-                actual.border,
-                expected.border,
-            );
-            same_rect(
-                &format!("{name}/{id} content"),
-                actual.content,
-                expected.content,
-            );
-            match (actual.label_box, expected.label_box) {
-                (Some(actual), Some(expected)) => {
-                    same_rect(&format!("{name}/{id} text"), actual, expected)
-                }
-                (None, None) => {}
-                _ => panic!("{name}/{id}: text box disappeared"),
+        let expected: BTreeSet<_> = expected_ids.split_whitespace().map(str::to_owned).collect();
+        total_expected += expected.len();
+        for (side, geometry) in [("old", &before), ("new", &after)] {
+            let ids: BTreeSet<_> = geometry.keys().cloned().collect();
+            for id in expected.difference(&ids) {
+                coverage_errors.push(format!("{name}/{id}: missing from {side} mapping"));
+            }
+            for id in ids.difference(&expected) {
+                coverage_errors.push(format!(
+                    "{name}/{id}: unexpected {side} node; update the coverage manifest deliberately"
+                ));
             }
         }
+        // Include unmanifested nodes too: a coverage error must not hide their
+        // geometry or stop any later fixture from being compared.
+        let ids: BTreeSet<_> = before.keys().chain(after.keys()).cloned().collect();
+        let mut compared = 0;
+        let first_difference = differences.len();
+        for id in ids {
+            let old = before.get(&id);
+            let new = after.get(&id);
+            if old.is_some() && new.is_some() {
+                compared += 1;
+            }
+            let magnitude = match (old, new) {
+                (Some(old), Some(new)) => [
+                    freeze_rect_delta(Some(old.border), Some(new.border)),
+                    freeze_rect_delta(Some(old.content), Some(new.content)),
+                    freeze_rect_delta(old.label_box, new.label_box),
+                ]
+                .into_iter()
+                .fold(0.0_f32, f32::max),
+                _ => f32::INFINITY,
+            };
+            if magnitude > TOLERANCE {
+                differences.push((
+                    magnitude,
+                    format!("{name}/{id}"),
+                    freeze_node_table(old, new),
+                ));
+            } else if name == "panel" && FOCUS.contains(&id.as_str()) {
+                // Include exact endpoints for the diagnostic chain even when
+                // unchanged, so a fixed right edge need not be guessed.
+                unchanged_focus.push(format!("{name}/{id}\n{}", freeze_node_table(old, new)));
+            }
+        }
+        let differing = differences.len() - first_difference;
+        total_compared += compared;
+        summaries.push(format!(
+            "{name}: {compared} nodes compared, {differing} differ; expected {}, old {}, new {}",
+            expected.len(),
+            before.len(),
+            after.len()
+        ));
     }
+    differences.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut report = format!(
+        "{total_compared} nodes compared, {} differ; {total_expected} expected; {} coverage errors\n{}\n\
+         Logical px; tolerance {TOLERANCE}; delta = new - old.\n\
+         Sorted by maximum absolute edge-coordinate delta across border/content/text-run boxes.\n\
+         Missing/non-finite geometry ranks first. Width/height deltas are diagnostic; edge tolerance is unchanged.\n",
+        differences.len(),
+        coverage_errors.len(),
+        summaries.join("\n"),
+    );
+    for error in &coverage_errors {
+        report.push_str(&format!("COVERAGE ERROR: {error}\n"));
+    }
+    for (magnitude, id, table) in &differences {
+        report.push_str(&format!("\n{id} | max edge delta {magnitude:.3}\n{table}"));
+    }
+    if !unchanged_focus.is_empty() {
+        report.push_str("\nPanel diagnostic nodes unchanged within tolerance:\n");
+        report.push_str(&unchanged_focus.join("\n"));
+    }
+    // Also emit the coverage summary on success (visible with --nocapture).
+    // Font/camera/readback validity guards still fail immediately: invalid
+    // measurements cannot be presented as a geometry comparison.
+    if differences.is_empty() && coverage_errors.is_empty() {
+        eprintln!("{report}");
+    }
+    assert!(
+        differences.is_empty() && coverage_errors.is_empty(),
+        "{report}"
+    );
+}
+
+fn freeze_rect_delta(old: Option<Rect>, new: Option<Rect>) -> f32 {
+    match (old, new) {
+        (None, None) => 0.0,
+        (Some(old), Some(new)) => [old.min.x, old.min.y, old.max.x, old.max.y]
+            .into_iter()
+            .zip([new.min.x, new.min.y, new.max.x, new.max.y])
+            .map(|(old, new)| {
+                if old.is_finite() && new.is_finite() {
+                    (new - old).abs()
+                } else {
+                    f32::INFINITY
+                }
+            })
+            .fold(0.0, f32::max),
+        _ => f32::INFINITY,
+    }
+}
+
+fn freeze_node_table(old: Option<&Geometry>, new: Option<&Geometry>) -> String {
+    let mut table = String::from(
+        "box       | value |       left        top      right     bottom      width     height\n",
+    );
+    for (name, old, new) in [
+        ("border", old.map(|g| g.border), new.map(|g| g.border)),
+        ("content", old.map(|g| g.content), new.map(|g| g.content)),
+        (
+            "text-run",
+            old.and_then(|g| g.label_box),
+            new.and_then(|g| g.label_box),
+        ),
+    ] {
+        let values = |rect: Rect| {
+            [
+                rect.min.x,
+                rect.min.y,
+                rect.max.x,
+                rect.max.y,
+                rect.width(),
+                rect.height(),
+            ]
+        };
+        let old = old.map(values);
+        let new = new.map(values);
+        let delta = old
+            .zip(new)
+            .map(|(old, new)| std::array::from_fn::<_, 6, _>(|i| new[i] - old[i]));
+        for (kind, values) in [("old", old), ("new", new), ("delta", delta)] {
+            let cells = values.map_or_else(
+                || "— (absent / not applicable)".to_owned(),
+                |values| {
+                    values
+                        .into_iter()
+                        .map(|value| format!("{value:>10.3}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                },
+            );
+            table.push_str(&format!("{name:<9} | {kind:<5} | {cells}\n"));
+        }
+    }
+    table
 }
 
 #[test]
