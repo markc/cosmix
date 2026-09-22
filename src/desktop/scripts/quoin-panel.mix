@@ -330,7 +330,7 @@ fn panel_doc()
   for $i = 1 to $state.ws_count
     $id = "ws_" .. to_string($i)
     $current = $i == $state.ws_current
-    $b = {widget: "row", height: 30, radius: 6, padding: 8, align: "center", hover: $C.hover, on_click: "ws", children: [$id .. "_t"]}
+    $b = {widget: "row", height: 30, radius: 6, padding: 8, align: "center", justify: "center", hover: $C.hover, on_click: "ws", children: [$id .. "_t"]}
     $b.background = $current ? $C.accent : $C.task_bg
     push($nodes, [$id, $b])
     push($nodes, [$id .. "_t", {widget: "text", text: to_string($i), size: 12, bold: $current, color: $current ? "#0b1f2b" : $C.dim}])
