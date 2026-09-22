@@ -38,8 +38,8 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.89.1 |
-| `cosmix-mix` | 0.89.3 |
+| `cosmix-lib-mix` | 0.90.0 |
+| `cosmix-mix` | 0.90.1 |
 | `mix-bench` | 0.1.0 |
 
 ## cos
@@ -53,7 +53,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-app-identity` | 0.2.0 |
 | `cosmix-claud` | 0.2.0 |
 | `cosmix-dbusd` | 0.3.0 |
-| `cosmix-dnsd` | 0.3.1 |
+| `cosmix-dnsd` | 0.3.2 |
 | `cosmix-filesd` | 0.8.1 |
 | `cosmix-indexd` | 0.9.1 |
 | `cosmix-input-core` | 0.1.2 |
@@ -76,11 +76,11 @@ CoS — substrate libraries and daemon family
 | `cosmix-lib-props-store` | 0.4.0 |
 | `cosmix-lib-skills` | 0.1.0 |
 | `cosmix-lib-wg` | 0.2.0 |
-| `cosmix-maild` | 0.8.2 |
+| `cosmix-maild` | 0.8.3 |
 | `cosmix-maild-auth` | 0.2.0 |
 | `cosmix-maild-bayesian` | 0.6.1 |
 | `cosmix-maild-rules` | 0.2.2 |
-| `cosmix-mcp` | 0.5.1 |
+| `cosmix-mcp` | 0.5.2 |
 | `cosmix-mds` | 0.2.2 |
 | `cosmix-mesh-sign` | 0.8.0 |
 | `cosmix-midicomp` | 0.3.0 |
@@ -102,36 +102,37 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 |---|---|
 | `cosmix-bg-boing` | 0.1.0 |
 | `cosmix-bg-showcase` | 0.2.5 |
-| `cosmix-bterm` | 0.9.0 |
+| `cosmix-bterm` | 0.9.1 |
 | `cosmix-busviewer` | 0.1.1 |
-| `cosmix-capture` | 0.1.2 |
-| `cosmix-comp` | 0.62.0 |
+| `cosmix-capture` | 0.2.0 |
+| `cosmix-comp` | 0.63.4 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
 | `cosmix-flock` | 0.1.0 |
-| `cosmix-iced-widgets` | 0.1.0 |
+| `cosmix-iced-widgets` | 0.1.1 |
 | `cosmix-imeprobe` | 0.2.0 |
 | `cosmix-interactgui` | 0.1.2 |
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
 | `cosmix-quoin` | 0.13.0 |
-| `cosmix-scene` | 0.3.0 |
-| `cosmix-scene-bevy` | 0.3.2 |
+| `cosmix-scene` | 0.4.0 |
+| `cosmix-scene-bevy` | 0.4.1 |
 | `cosmix-shell` | 0.13.0 |
 | `cosmix-shell-host` | 0.7.0 |
 | `cosmix-studio` | 0.4.7 |
-| `cosmix-term-core` | 0.2.0 |
+| `cosmix-term` | 0.1.0 |
+| `cosmix-term-core` | 0.3.0 |
 | `cosmix-tower` | 0.5.4 |
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
 | `cosmix-wallpaper` | 0.2.0 |
 | `cosmix-wgpu-dmabuf` | 0.16.2 |
 | `cosmix-wl-dnd` | 0.4.2 |
-| `ctk` | 0.56.0 |
+| `ctk` | 0.57.0 |
 | `spike-wl-dnd` | 0.1.0 |
 | `term-native-test-broker` | 0.0.0 |
 
 ---
 
-53 crates in `$COSMIX/src` and 31 in the separate `$COSMIX/src/desktop` workspace.
+53 crates in `$COSMIX/src` and 32 in the separate `$COSMIX/src/desktop` workspace.
