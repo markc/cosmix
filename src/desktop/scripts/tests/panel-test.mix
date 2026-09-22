@@ -13,12 +13,12 @@ for each $snapshot in [nil, {}, {accepted: true}, {pinned: false}, {visible: fal
   {pinned: true, visible: true}, {pinned: true, visible: false},
   {pinned: false, visible: true}, {pinned: "false", visible: false}]
   check(not $p.popup_release_confirmed($snapshot), "not applied release")
-  check($p.released_popup_pins($pins, "left", $snapshot) == $pins, "retain recovery record")
+  check(deep_eq($p.released_popup_pins($pins, "left", $snapshot), $pins), "retain recovery record")
 end
 $confirmed = {pinned: false, visible: false}
 check($p.popup_release_confirmed($confirmed), "applied release")
-check($p.released_popup_pins($pins, "left", $confirmed) == ["right"], "release only our edge")
-check($p.released_popup_pins(["right"], "left", $confirmed) == ["right"], "idempotent recovery")
+check(deep_eq($p.released_popup_pins($pins, "left", $confirmed), ["right"]), "release only our edge")
+check(deep_eq($p.released_popup_pins(["right"], "left", $confirmed), ["right"]), "idempotent recovery")
 
 -- ── calendar arithmetic ────────────────────────────────────────────────
 -- Known weekdays (ISO 1 = Monday): 2026-09-01 Tue, 2026-09-20 Sun,
