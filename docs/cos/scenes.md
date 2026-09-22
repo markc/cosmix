@@ -155,14 +155,11 @@ stays natural. Width-constrained text without `elide` may overflow; `elide`
 uses CTK's existing middle-elision system and the wrapper's width budget.
 Hosts must install `CtkThemePlugin` for that production elision system.
 
-**Known scene: 1 behaviour change:** the text wrapper's default `min_width`
-changes from zero to automatic intrinsic sizing when `elide` is false.
-Crowded rows can therefore retain more text width and overflow rather than
-silently compressing its wrapper. Use `min_width: 0` to opt into compression,
-or `elide: true` for bounded middle-elision (which retains the zero minimum).
-This is not only an additive vocabulary change. The text centring correction
-also deliberately changes geometry for existing centred/right-aligned text
-with a wider allocation.
+Text wrappers retain the legacy zero minimum width, whether or not `elide`
+is enabled. Authors can set an explicit numeric `min_width` to constrain
+compression. The intrinsic label used for centring does not change that
+wrapper default. The text centring correction deliberately changes text
+placement for existing centred/right-aligned text with a wider allocation.
 
 ### Layout regression fixtures
 
@@ -178,8 +175,10 @@ shaped text-run boxes against a test-only copy of the P0 renderer mapping.
 It collects every mismatch across all four fixtures before failing once.
 The report orders differing nodes by their largest absolute edge-coordinate
 delta, and prints old/new/delta values for all three rectangles, including
-left/top/right/bottom and width/height in logical px. The existing 0.5px edge
-tolerance is unchanged; width/height deltas are additional diagnostics.
+left/top/right/bottom and width/height in logical px. The freeze requires
+exact equality after restoring the legacy zero text-wrapper minimum;
+width/height deltas are additional diagnostics. Other layout tests retain
+their 0.5px tolerance.
 Missing or non-finite geometry ranks first. Camera, font and readback validity
 guards remain prerequisites: invalid measurements are not geometry results.
 
@@ -188,8 +187,8 @@ row 5 and column 5. Global and per-fixture summaries report compared and
 differing counts, along with expected/old/new counts and coverage errors.
 Deleting a node from both mappings cannot silently shrink the freeze.
 The panel's `root`, `fill`, `clock`, `clock_col`, `clock_time`, `clock_date`
-and `peek` are all compared; their rectangles are also printed when unchanged
-within tolerance, so the clock's right-edge arithmetic can be checked.
+and `peek` are all compared; their rectangles are also printed when exactly
+unchanged, so the clock's right-edge arithmetic can be checked.
 
 The former fail-fast implementation stopped on the first coordinate of
 `panel/clock`. That failure gave no comparison result for the remaining 52

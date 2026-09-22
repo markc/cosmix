@@ -546,7 +546,10 @@ fn legacy_fixture_geometry_is_frozen() {
                 .fold(0.0_f32, f32::max),
                 _ => f32::INFINITY,
             };
-            if magnitude > TOLERANCE {
+            // Restoring the zero text-wrapper minimum after 7456b56e /
+            // 1a1c2598 restores these legacy rectangles exactly. Do not accept
+            // a sub-tolerance movement or re-freeze the containment faults.
+            if magnitude > 0.0 {
                 differences.push((
                     magnitude,
                     format!("{name}/{id}"),
@@ -554,7 +557,7 @@ fn legacy_fixture_geometry_is_frozen() {
                 ));
             } else if name == "panel" && FOCUS.contains(&id.as_str()) {
                 // Include exact endpoints for the diagnostic chain even when
-                // unchanged, so a fixed right edge need not be guessed.
+                // identical, so a fixed right edge need not be guessed.
                 unchanged_focus.push(format!("{name}/{id}\n{}", freeze_node_table(old, new)));
             }
         }
@@ -570,9 +573,9 @@ fn legacy_fixture_geometry_is_frozen() {
     differences.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut report = format!(
         "{total_compared} nodes compared, {} differ; {total_expected} expected; {} coverage errors\n{}\n\
-         Logical px; tolerance {TOLERANCE}; delta = new - old.\n\
+         Logical px; exact equality required; delta = new - old.\n\
          Sorted by maximum absolute edge-coordinate delta across border/content/text-run boxes.\n\
-         Missing/non-finite geometry ranks first. Width/height deltas are diagnostic; edge tolerance is unchanged.\n",
+         Missing/non-finite geometry ranks first. Width/height deltas are diagnostic.\n",
         differences.len(),
         coverage_errors.len(),
         summaries.join("\n"),
@@ -584,7 +587,7 @@ fn legacy_fixture_geometry_is_frozen() {
         report.push_str(&format!("\n{id} | max edge delta {magnitude:.3}\n{table}"));
     }
     if !unchanged_focus.is_empty() {
-        report.push_str("\nPanel diagnostic nodes unchanged within tolerance:\n");
+        report.push_str("\nPanel diagnostic nodes exactly unchanged:\n");
         report.push_str(&unchanged_focus.join("\n"));
     }
     // Also emit the coverage summary on success (visible with --nocapture).

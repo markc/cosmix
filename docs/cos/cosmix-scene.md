@@ -22,7 +22,7 @@ without changing the `scene: 1` header. Citizens discover support through
 `shell.scene.describe`, by family and port. `layout-conflict` rejects
 contradictory legacy/explicit sizing and inverted min/max bounds; an old
 host instead rejects the new ports as `unknown-port`. See the renderer manual
-for the text centring correction and the changed default text minimum width.
+for the text centring correction and the preserved zero text-wrapper minimum width.
 
 Lists require rows of `{id: string, cells: [string]}`, a sibling `row`
 template and a positive `row_height`. Template subtrees may contain only row,

@@ -763,11 +763,9 @@ fn update(
                 "right" => JustifyContent::End,
                 _ => JustifyContent::Start,
             };
-            layout.min_width = if flag(node, "elide") {
-                px(0)
-            } else {
-                Val::Auto
-            };
+            // Keep the legacy zero wrapper minimum set above. P1's auto
+            // minimum changed panel allocation independently of centring;
+            // authors can still override it with the explicit min_width port.
             {
                 let mut label_node = world.get_mut::<Node>(label).unwrap();
                 label_node.width = Val::Auto;
