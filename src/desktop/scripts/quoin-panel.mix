@@ -479,7 +479,7 @@ fn launcher_doc()
     for each $cat in $cats
       $id = "cat_" .. ($cat == "" ? "all" : lower($cat))
       $on = $cat == $state.category
-      push($nodes, [$id, {widget: "row", height: 28, radius: 14, padding: 10, align: "center", hover: $C.hover, background: $on ? $C.accent : $C.task_bg, on_click: "cat", children: [$id .. "_t"]}])
+      push($nodes, [$id, {widget: "row", height: 28, radius: 14, padding: 10, align: "center", justify: "center", hover: $C.hover, background: $on ? $C.accent : $C.task_bg, on_click: "cat", children: [$id .. "_t"]}])
       push($nodes, [$id .. "_t", {widget: "text", text: $p.category_label($cat), size: 12, bold: $on, color: $on ? "#0b1f2b" : $C.fg}])
     end
   end
@@ -507,11 +507,11 @@ fn calendar_doc()
   push($nodes, ["cal_nav", {widget: "row", gap: 6, align: "center", children: ["cal_title", "cal_prev", "cal_today", "cal_next"]}])
   -- Flat tool-buttons (hover rows), the way Plasma draws calendar nav.
   push($nodes, ["cal_title", {widget: "text", text: $p.month_title($shown.year, $shown.month), size: 16, bold: true, color: $C.fg, fill: true}])
-  push($nodes, ["cal_prev", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, on_click: "cal_prev", children: ["cal_prev_t"]}])
+  push($nodes, ["cal_prev", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, on_click: "cal_prev", children: ["cal_prev_t"]}])
   push($nodes, ["cal_prev_t", {widget: "text", text: "‹", size: 16, bold: true, color: $C.fg}])
-  push($nodes, ["cal_today", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, background: $C.task_bg, on_click: "cal_today", children: ["cal_today_t"]}])
+  push($nodes, ["cal_today", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, background: $C.task_bg, on_click: "cal_today", children: ["cal_today_t"]}])
   push($nodes, ["cal_today_t", {widget: "text", text: "Today", size: 12, color: $C.fg}])
-  push($nodes, ["cal_next", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, on_click: "cal_next", children: ["cal_next_t"]}])
+  push($nodes, ["cal_next", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, on_click: "cal_next", children: ["cal_next_t"]}])
   push($nodes, ["cal_next_t", {widget: "text", text: "›", size: 16, bold: true, color: $C.fg}])
   -- weekday header
   $hdr = []
@@ -564,7 +564,7 @@ fn notes_doc()
     ["nh", {widget: "row", gap: 8, align: "center", children: ["nh_t", "nh_fill", "nh_clear"]}],
     ["nh_t", {widget: "text", text: "Notifications", size: 18, bold: true, color: $C.fg}],
     ["nh_fill", {widget: "spacer"}],
-    ["nh_clear", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", hover: $C.hover, background: $C.task_bg, on_click: "notes_clear", children: ["nh_clear_t"]}],
+    ["nh_clear", {widget: "row", height: 30, radius: 6, padding: 10, align: "center", justify: "center", hover: $C.hover, background: $C.task_bg, on_click: "notes_clear", children: ["nh_clear_t"]}],
     ["nh_clear_t", {widget: "text", text: "Clear all", size: 12, color: $C.fg}]
   ]
   if length($rows) == 0 then
