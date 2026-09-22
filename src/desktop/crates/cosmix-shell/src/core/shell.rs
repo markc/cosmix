@@ -174,6 +174,13 @@ impl ShellModel {
         input: PanelInput,
     ) -> Result<PanelUpdate, PanelTimeError> {
         self.ensure_monotonic(at)?;
+        // Only Dock clamps into the opposing-edge thickness budget here: Docked
+        // is the only mode that claims an exclusive zone, so it is the only one
+        // that competes for it. Pin/PinToggle deliberately do NOT clamp -- a
+        // Pinned overlay claims no zone and may legitimately overhang an
+        // opposing Docked panel (the same way a transient reveal already does).
+        // fit_output_budget() still clamps on every geometry change regardless
+        // of mode, so this only affects the initial thickness on entry.
         if matches!(
             input,
             PanelInput::Dock | PanelInput::DockToggle | PanelInput::SetMode(PanelMode::Docked)
