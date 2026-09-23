@@ -33,7 +33,11 @@ fn as_string_literal(expr: &Expr) -> &str {
 
 fn as_binary_sub(expr: &Expr) -> (&Expr, &Expr) {
     match expr {
-        Expr::BinaryOp { left, op, right } if matches!(op, BinOp::Sub) => (left, right),
+        Expr::BinaryOp {
+            left,
+            op: BinOp::Sub,
+            right,
+        } => (left, right),
         other => panic!("expected subtraction, got {other:?}"),
     }
 }
