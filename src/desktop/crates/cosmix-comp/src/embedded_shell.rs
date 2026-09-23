@@ -103,13 +103,16 @@ fn covers(regions: &[PanelRect], x: f64, y: f64) -> bool {
     })
 }
 
-pub(crate) fn install(app: &mut App) {
+/// `comp_service` is this compositor's registered Bus service name, so the
+/// embedded Quoin's hotspot observer mirrors its own instance even when it
+/// runs as e.g. `comp-nested`.
+pub(crate) fn install(app: &mut App, comp_service: &str) {
     if std::env::var("COSMIX_COMP_EMBEDDED_QUOIN").as_deref() != Ok("1") {
         return;
     }
     let bridge = EmbeddedShellBridge::default();
     app.insert_resource(bridge)
-        .add_plugins(EmbeddedQuoinPlugin)
+        .add_plugins(EmbeddedQuoinPlugin::new().with_comp_service(comp_service))
         .add_systems(Startup, attach_protocol)
         .add_systems(
             PreUpdate,

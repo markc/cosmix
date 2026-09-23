@@ -1951,7 +1951,7 @@ mod tests {
             request_id: request.request_id,
             result: Ok(ctk::bus::BusReply {
                 rc: 0,
-                body: json!({"input":{"corners":{"deadzone_px":24.0}}}).to_string(),
+                body: json!(24.0).to_string(),
                 result: None,
             }),
         });
@@ -1974,7 +1974,7 @@ mod tests {
             request_id: calls[0].request_id,
             result: Ok(ctk::bus::BusReply {
                 rc: 0,
-                body: json!({"input":{"corners":{"deadzone_px":32.0}}}).to_string(),
+                body: json!(32.0).to_string(),
                 result: None,
             }),
         });

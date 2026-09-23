@@ -1,13 +1,15 @@
 //! Event-driven mirror of comp's authoritative corner deadzone. Subscribe
 //! before the initial read; subsequent reads are triggered only by property
 //! events, registry changes, reconnects or delivery gaps, never by a timer.
+//! Reads use the comp port's scoped form (`props.get` with a `{"path": ...}`
+//! body), so the reply body is the bare value at `input.corners.deadzone_px`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::prelude::*;
 use cosmix_shell::chrome::QuoinHotspotSize;
-use ctk::bus::{BusBridge, BusBridgeConfig, BusBridgeEvent, BusConnectionState, BusMessage};
-use serde_json::Value;
+use ctk::bus::{BusBridge, BusBridgeConfig, BusBridgeEvent, BusConnectionState, BusMessage, BusReply};
+use serde_json::{Value, json};
 
 const DEADZONE_PATH: &str = "input.corners.deadzone_px";
 
@@ -19,6 +21,9 @@ pub(crate) struct HotspotObserver {
     present: Option<bool>,
     pending: Option<u64>,
     dirty: bool,
+    /// One `QUOIN_HOTSPOT_READ_FAILED` notice per run of failed reads; a
+    /// successful read re-arms it so a later failure is noticed again.
+    read_failure_logged: bool,
     next_id: u64,
 }
 
@@ -38,6 +43,7 @@ impl HotspotObserver {
             present: None,
             pending: None,
             dirty: false,
+            read_failure_logged: false,
             next_id: 0x48_0000_0000,
         }
     }
@@ -45,6 +51,15 @@ impl HotspotObserver {
     pub(crate) fn presence(&mut self, services: &BTreeSet<String>, size: &mut QuoinHotspotSize) {
         let present = services.contains(&self.service);
         if self.present == Some(present) {
+            if !present {
+                return;
+            }
+            // No transition, yet a fresh registry observation reports comp
+            // registered: a re-registration receipt. A comp that left and
+            // re-registered between observations (or inside a leave/register
+            // burst noded suppressed) publishes no initial `props.changed` —
+            // comp emits changes only — so this lifetime's value is re-read.
+            self.dirty = true;
             return;
         }
         self.present = Some(present);
@@ -79,20 +94,25 @@ impl HotspotObserver {
                 // A change received during this read requires a fresh read.
                 // Do not transiently publish a snapshot already known stale.
                 if !self.dirty {
-                    *size = result
-                        .as_ref()
-                        .ok()
-                        .filter(|reply| reply.rc == 0)
-                        .and_then(|reply| serde_json::from_str::<Value>(&reply.body).ok())
-                        .and_then(|body| {
-                            body.pointer("/input/corners/deadzone_px")
-                                .and_then(Value::as_f64)
-                        })
-                        .filter(|value| {
-                            value.is_finite() && *value > 0.0 && *value <= f32::MAX as f64
-                        })
-                        .map(|value| QuoinHotspotSize(value as f32))
-                        .unwrap_or_default();
+                    match scoped_deadzone(result) {
+                        Ok(value) => {
+                            *size = QuoinHotspotSize(value as f32);
+                            self.read_failure_logged = false;
+                        }
+                        Err(detail) => {
+                            *size = QuoinHotspotSize::default();
+                            if !self.read_failure_logged {
+                                self.read_failure_logged = true;
+                                eprintln!(
+                                    "QUOIN_HOTSPOT_READ_FAILED service={} path={} detail={} using_default_px={}",
+                                    self.service,
+                                    DEADZONE_PATH,
+                                    detail,
+                                    QuoinHotspotSize::default().0
+                                );
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -128,19 +148,45 @@ impl HotspotObserver {
             return;
         }
         self.next_id += 1;
+        // The comp port's scoped read: `props.get` with a `path` body answers
+        // with only that leaf, instead of the whole comp snapshot.
+        let body = json!({ "path": DEADZONE_PATH }).to_string();
         if bridge
             .try_call(
                 self.next_id,
                 &self.service,
                 format!("{}.props.get", self.service),
                 BTreeMap::new(),
-                "{}",
+                body,
             )
             .is_ok()
         {
             self.pending = Some(self.next_id);
             self.dirty = false;
         }
+    }
+}
+
+/// Parse the scoped reply. The body is the bare value at [`DEADZONE_PATH`]
+/// (comp's `props.get` answers a `path`-scoped request with that leaf alone),
+/// so there is no JSON pointer to walk — anything that is not a usable
+/// finite positive number is a failed read.
+fn scoped_deadzone(result: &Result<BusReply, String>) -> Result<f64, String> {
+    let reply = result
+        .as_ref()
+        .map_err(|error| format!("transport error: {error}"))?;
+    if reply.rc != 0 {
+        return Err(format!("rc={}", reply.rc));
+    }
+    let body: Value = serde_json::from_str(&reply.body)
+        .map_err(|error| format!("unparseable body: {error}"))?;
+    let value = body
+        .as_f64()
+        .ok_or_else(|| "body is not the scoped numeric value".to_owned())?;
+    if value.is_finite() && value > 0.0 && value <= f32::MAX as f64 {
+        Ok(value)
+    } else {
+        Err(format!("invalid value: {value}"))
     }
 }
 
@@ -160,13 +206,15 @@ mod tests {
         );
     }
 
+    /// A scoped-read reply: the body is the bare value at the requested
+    /// path, the shape comp's `props.get` answers a `{"path": ...}` body with.
     fn reply(observer: &mut HotspotObserver, size: &mut QuoinHotspotSize, id: u64, value: Value) {
         observer.event(
             &BusBridgeEvent::Reply {
                 request_id: id,
                 result: Ok(BusReply {
                     rc: 0,
-                    body: json!({"input":{"corners":{"deadzone_px": value}}}).to_string(),
+                    body: value.to_string(),
                     result: None,
                 }),
             },
@@ -202,6 +250,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].to, "comp-nested");
         assert_eq!(calls[0].command, "comp-nested.props.get");
+        assert_eq!(calls[0].body, r#"{"path":"input.corners.deadzone_px"}"#);
         reply(&mut observer, &mut size, calls[0].request_id, json!(24.0));
         assert_eq!(size.0, 24.0);
         for _ in 0..10 {
@@ -260,6 +309,68 @@ mod tests {
             json!(18.0),
         );
         assert_eq!(size.0, 18.0);
+    }
+
+    /// A registered→registered observation is a re-registration receipt: no
+    /// presence transition, but comp may be a new lifetime that publishes no
+    /// initial `props.changed`, so exactly one re-read fires. Observations
+    /// that do not report comp registered trigger none.
+    #[test]
+    fn hotspot_registry_receipt_without_transition_rereads_once() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut observer = HotspotObserver::new("comp-nested".into());
+        let mut size = QuoinHotspotSize::default();
+        connect(&mut observer, &mut size, 1);
+        let registered = BTreeSet::from(["comp-nested".to_owned()]);
+        // First observation: the None→registered transition.
+        observer.presence(&registered, &mut size);
+        observer.flush(&bridge);
+        reply(&mut observer, &mut size, peer.drain_calls()[0].request_id, json!(24.0));
+        assert_eq!(size.0, 24.0);
+        observer.presence(&registered, &mut size);
+        // The last good value stands until the receipt's read lands.
+        assert_eq!(size.0, 24.0);
+        observer.flush(&bridge);
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1);
+        reply(&mut observer, &mut size, calls[0].request_id, json!(30.0));
+        assert_eq!(size.0, 30.0);
+        // No further observation: nothing fires.
+        observer.flush(&bridge);
+        assert!(peer.drain_calls().is_empty());
+        // Unrelated observations (comp not reported) trigger none: the
+        // transition to absent invalidates, and absent→absent is silent.
+        let unrelated = BTreeSet::from(["other-service".to_owned()]);
+        observer.presence(&unrelated, &mut size);
+        assert_eq!(size.0, QuoinHotspotSize::default().0);
+        observer.flush(&bridge);
+        assert!(peer.drain_calls().is_empty());
+        observer.presence(&unrelated, &mut size);
+        observer.flush(&bridge);
+        assert!(peer.drain_calls().is_empty());
+    }
+
+    /// The scoped reply contract: the bare leaf value parses, and transport
+    /// errors, non-zero rc, non-numeric bodies and out-of-range values are
+    /// failed reads.
+    #[test]
+    fn hotspot_scoped_reply_parses_bare_value_only() {
+        let ok = |rc: u8, body: &str| {
+            Ok(BusReply {
+                rc,
+                body: body.to_owned(),
+                result: None,
+            })
+        };
+        assert_eq!(scoped_deadzone(&ok(0, "18")), Ok(18.0));
+        assert_eq!(scoped_deadzone(&ok(0, "18.5")), Ok(18.5));
+        assert!(scoped_deadzone(&ok(10, r#"{"error":"unknown_path"}"#)).is_err());
+        assert!(scoped_deadzone(&ok(0, r#""24""#)).is_err());
+        assert!(scoped_deadzone(&ok(0, r#"{"input":{}}"#)).is_err());
+        assert!(scoped_deadzone(&ok(0, "-1")).is_err());
+        assert!(scoped_deadzone(&ok(0, "0")).is_err());
+        assert!(scoped_deadzone(&ok(0, "1e100")).is_err());
+        assert!(scoped_deadzone(&Err("comp unavailable".into())).is_err());
     }
 
     #[test]

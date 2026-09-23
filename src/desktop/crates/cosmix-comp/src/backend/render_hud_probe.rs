@@ -26,14 +26,16 @@ struct ProbeOutput {
 }
 
 #[cfg(not(test))]
-pub(super) fn install_from_environment(app: &mut App) {
+pub(super) fn install_from_environment(app: &mut App, comp_service: &str) {
     if std::env::var("COSMIX_COMP_HUD_PROBE").as_deref() != Ok("1") {
         return;
     }
-    install(app);
+    install(app, comp_service);
 }
 
-fn install(app: &mut App) {
+fn install(app: &mut App, comp_service: &str) {
+    #[cfg(not(feature = "embedded-quoin"))]
+    let _ = comp_service;
     app.insert_resource(idle::ContinuousRendering)
         .insert_resource(GlobalAmbientLight {
             brightness: 180.0,
@@ -52,7 +54,7 @@ fn install(app: &mut App) {
             Update,
             cosmix_shell::runtime::ShellRuntimeSet::Input.after(update),
         );
-        crate::embedded_shell::install(app);
+        crate::embedded_shell::install(app, comp_service);
     }
     tracing::warn!("Native Boing/HUD comparison enabled; first output only, automatic panel cycle");
 }
