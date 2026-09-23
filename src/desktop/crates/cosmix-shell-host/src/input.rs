@@ -664,6 +664,8 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Corner(CornerEvent::Clicked { .. }) => "corner-clicked",
         ShellCommandKind::Panel { .. } => "panel",
         ShellCommandKind::Carousel { .. } => "carousel",
+        ShellCommandKind::SubPanelRegister { .. } => "sub-register",
+        ShellCommandKind::SubPanelRemove { .. } => "sub-remove",
     }
 }
 

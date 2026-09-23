@@ -54,6 +54,29 @@ pub enum ShellCommandKind {
         edge: Edge,
         input: CarouselInput,
     },
+    /// Register a sub-panel name on `edge` (panel doc §3). The dispatch
+    /// reserved the registry seat transactionally before acking; the Model
+    /// stage only fills the carousel slot, without revealing or selecting.
+    /// `owner` is the broker-attested caller at dispatch, never a
+    /// caller-supplied field.
+    SubPanelRegister {
+        edge: Edge,
+        name: String,
+        owner: String,
+    },
+    /// Remove a sub-panel by name (panel doc §3). The name is the address
+    /// (§5), so `edge`, `owner` and `accepted_at` are the seat's own values
+    /// resolved at dispatch — the registry applies the carousel's removal
+    /// landing rule at the Model stage, atomically with the seat, and only
+    /// while that exact registration (same owner AND same acceptance
+    /// receipt) still stands: a name re-reserved by a later load after this
+    /// seat was dropped is a replacement, not this removal's target.
+    SubPanelRemove {
+        edge: Edge,
+        name: String,
+        owner: String,
+        accepted_at: u64,
+    },
 }
 
 #[cfg_attr(feature = "chrome-core", derive(bevy::prelude::Message))]

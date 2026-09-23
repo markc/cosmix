@@ -49,6 +49,25 @@ pub enum ShellSemanticVerb {
     PageNext,
     PagePrevious,
     PageSet(String),
+    /// Register a sub-panel name on the verb's edge (panel doc §3). Unlike
+    /// the panel verbs, identity binds at dispatch: `owner` is the
+    /// broker-attested caller, never a caller-supplied field, and the
+    /// dispatch reserves the registry seat before acking. Hosts route these
+    /// through their registry-aware ingress, not the frame-only verb parser.
+    SubRegister {
+        name: String,
+        owner: String,
+    },
+    /// Remove a sub-panel (panel doc §3). The name is the address (§5): the
+    /// verb's edge, owner and acceptance receipt are the sub-panel's own
+    /// seat values, resolved at dispatch — a caller never picks the edge a
+    /// removal lands on, and the Model stage applies only against that
+    /// exact registration. Routed like [`Self::SubRegister`].
+    SubRemove {
+        name: String,
+        owner: String,
+        accepted_at: u64,
+    },
 }
 
 /// Produce the same [`ShellCommand`] used by pointer and keyboard input.
@@ -56,6 +75,9 @@ pub enum ShellSemanticVerb {
 /// Deliberately takes no frame snapshot: every verb (toggle included) binds
 /// its direction inside the core at Model time, so a stale snapshot cannot
 /// mis-route a verb and two toggles drained in one batch net to identity.
+/// The sub-panel verbs are the exception that proves the rule: they carry
+/// identity (name, owner), and their dispatch binds that identity against
+/// the sub-panel registry before this adapter ever runs.
 pub fn semantic_shell_command(
     output: OutputKey,
     at: Duration,
@@ -106,6 +128,19 @@ pub fn semantic_shell_command(
         ShellSemanticVerb::PageSet(id) => ShellCommandKind::Carousel {
             edge,
             input: CarouselInput::SelectId(id),
+        },
+        ShellSemanticVerb::SubRegister { name, owner } => {
+            ShellCommandKind::SubPanelRegister { edge, name, owner }
+        }
+        ShellSemanticVerb::SubRemove {
+            name,
+            owner,
+            accepted_at,
+        } => ShellCommandKind::SubPanelRemove {
+            edge,
+            name,
+            owner,
+            accepted_at,
         },
     };
     ShellCommand { output, at, kind }
