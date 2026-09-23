@@ -371,7 +371,7 @@ The control plane exposes these verbs:
   the name this compositor instance actually registered. The reply is truthful
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
-- `comp.props.set {path,value,generation?}` mutates the four corner
+- `comp.props.set {path,value,generation?}` mutates the six corner
   properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
   `windows.s<id>.workspace`, `workspaces.count`, `workspaces.current`,
   `workspaces.o_<slug>.current`, `input.host.passthrough`, or
@@ -513,7 +513,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery}
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -1139,11 +1139,31 @@ ranges are:
 | Property | Default | Range |
 | --- | ---: | ---: |
 | `input.corners.enabled` | `true` | boolean |
-| `input.corners.deadzone_px` | `12.0` | `1.0..=256.0` logical px |
+| `input.corners.deadzone_px` | `10.0` | `1.0..=256.0` logical px |
 | `input.corners.dwell_ms` | `200` | `0..=5000` ms |
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
+| `input.corners.affordance` | `true` | boolean |
+| `input.corners.discovery` | `false` | boolean |
 
-The mutable leaves are the four corner leaves, `windows.s<id>.band`,
+`deadzone_px` is the hotspot: a square of that many logical units at each
+output corner, so it is the same size on a 2x output as on a 1x one.
+
+The compositor draws the hotspot affordance itself, above every client and
+panel and below the cursor, in the scheme accent. With `affordance` true it
+shows the engaged hotspot while the pointer rests there, flashes it for
+180 ms on every recognised release (the brief LMB or RMB that emits
+`corner.clicked.v2`), and, while `discovery` is true, blinks every hotspot
+slowly until the first engagement. That engagement sets `discovery` back to
+`false` with cause `corner.entered`; a shell that reveals a panel another way
+(keyboard) writes `false` itself. The compositor keeps no record of a first
+run, so it never turns `discovery` on: a shell does, when its own state says
+the user has not yet found the corners. `affordance: false` makes the corners
+silent without changing detection. Nothing is drawn under a session lock.
+The affordance renders only when what it draws changes — once on engage, once
+on leave, a few quantised steps for a flash, two frames per 2 s blink — so a
+settled corner leaves the renderer idle.
+
+The mutable leaves are the six corner leaves, `windows.s<id>.band`,
 `windows.s<id>.minimized`, `windows.s<id>.workspace`, `workspaces.count`,
 `workspaces.current`, `workspaces.o_<slug>.current`, `input.host.passthrough`
 (nested only) and `xwayland.enabled`. The corner, window and workspace

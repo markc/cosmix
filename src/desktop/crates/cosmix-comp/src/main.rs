@@ -16,6 +16,8 @@ mod embedded_shell;
 mod frame_capture;
 mod frame_content;
 mod frame_trace;
+#[cfg(feature = "bus")]
+mod hotspot_scene;
 mod occlusion;
 #[cfg(feature = "bus")]
 mod port;

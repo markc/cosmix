@@ -275,6 +275,8 @@ impl Plugin for CompositorScenePlugin {
         crate::render_asset_demand::configure(app);
         crate::render_component_demand::configure(app);
         #[cfg(feature = "bus")]
+        crate::hotspot_scene::install(app);
+        #[cfg(feature = "bus")]
         crate::region_scene::install(app);
     }
 
@@ -467,8 +469,16 @@ impl NestedSecurityPresentation {
 }
 
 #[derive(Resource, Default)]
-struct LockBlankScene {
+pub(crate) struct LockBlankScene {
     entity: Option<Entity>,
+}
+
+impl LockBlankScene {
+    /// Whether the session-lock blank currently covers the normal scene.
+    #[cfg_attr(not(feature = "bus"), allow(dead_code))]
+    pub(crate) fn active(&self) -> bool {
+        self.entity.is_some()
+    }
 }
 
 #[derive(Component)]

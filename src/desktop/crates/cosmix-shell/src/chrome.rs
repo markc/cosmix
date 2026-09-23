@@ -376,9 +376,11 @@ pub const fn carousel_slide_duration(reduced_motion: bool) -> Duration {
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct QuoinHotspotSize(pub f32);
 
-/// Mirrors comp's default in `cosmix-comp/src/protocol/corner.rs` (12 logical
-/// pixels), until the first Bus observation or while no cosmix comp is present.
-pub const DEFAULT_COMP_HOTSPOT_PX: f32 = 12.0;
+/// Mirrors comp's default in `cosmix-comp/src/protocol/corner.rs` (10 logical
+/// pixels, shell design §2), until the first Bus observation or while no
+/// cosmix comp is present. Comp's `quoin_hotspot_mirror_matches_default_deadzone`
+/// test reads this literal and fails if the two drift.
+pub const DEFAULT_COMP_HOTSPOT_PX: f32 = 10.0;
 
 impl Default for QuoinHotspotSize {
     fn default() -> Self {

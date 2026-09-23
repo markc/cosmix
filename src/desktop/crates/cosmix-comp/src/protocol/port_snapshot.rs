@@ -384,6 +384,8 @@ pub(crate) struct CornersSnapshot {
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
     pub(crate) velocity_max_px_s: f64,
+    pub(crate) affordance: bool,
+    pub(crate) discovery: bool,
 }
 
 impl From<CornerConfig> for CornersSnapshot {
@@ -393,6 +395,8 @@ impl From<CornerConfig> for CornersSnapshot {
             deadzone_px: config.deadzone_px,
             dwell_ms: config.dwell_ms,
             velocity_max_px_s: config.velocity_max_px_s,
+            affordance: config.affordance,
+            discovery: config.discovery,
         }
     }
 }
@@ -694,7 +698,9 @@ flat_snapshot!(
     enabled,
     deadzone_px,
     dwell_ms,
-    velocity_max_px_s
+    velocity_max_px_s,
+    affordance,
+    discovery
 );
 flat_snapshot!(
     PortSnapshot,
@@ -2131,6 +2137,18 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         range = "1.0..=20000.0"
     ),
     descriptor!(
+        &[L("input"), L("corners"), L("affordance")],
+        Bool,
+        "Whether comp draws the hotspot hover reveal, release flash and discovery flash",
+        mutable
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("discovery")],
+        Bool,
+        "Whether every hotspot flashes slowly until the first corner reveal",
+        mutable
+    ),
+    descriptor!(
         &[L("input"), L("host"), L("passthrough")],
         Bool,
         "Nested backend only: false drops host pointer and key input (resize, \
@@ -3217,15 +3235,19 @@ mod tests {
         // 0.59.0 adds the four workspace leaves: the window's workspace,
         // the count, and the current workspace by default output and by
         // output key.
+        // Chunk 19 adds the two affordance leaves, `input.corners.affordance`
+        // and `input.corners.discovery`.
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 12);
+        assert_eq!(mutable.len(), 14);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 11);
+        assert_eq!(mutable.len(), 13);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
             "input.corners.velocity_max_px_s",
+            "input.corners.affordance",
+            "input.corners.discovery",
             "input.host.passthrough",
             "windows.s2.band",
             "windows.s2.minimized",

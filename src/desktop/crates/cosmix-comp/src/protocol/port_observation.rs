@@ -22,6 +22,7 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_server::Resource;
 use tokio::sync::Notify;
 
+use crate::hotspot_scene::{HotspotBridge, Square, View as HotspotView};
 use crate::port::{ControlReply, PortControl, PortSetRequest};
 
 use super::{
@@ -47,6 +48,7 @@ pub(crate) const CORNER_ENTERED_TOPIC_SUFFIX: &str = "corner.entered";
 pub(crate) const CORNER_LEFT_TOPIC_SUFFIX: &str = "corner.left";
 pub(crate) const CORNER_CLICKED_TOPIC_SUFFIX: &str = "corner.clicked";
 pub(crate) const CORNER_CLICKED_V2_TOPIC_SUFFIX: &str = "corner.clicked.v2";
+const DISCOVERY_PATH: &str = "input.corners.discovery";
 pub(crate) const POINTER_TOPIC_SUFFIX: &str = "pointer.changed";
 
 pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
@@ -93,6 +95,8 @@ pub(crate) enum ValidatedCornerValue {
     DeadzonePx(f64),
     DwellMs(u64),
     VelocityMaxPxS(f64),
+    Affordance(bool),
+    Discovery(bool),
 }
 
 impl PropValue {
@@ -628,6 +632,12 @@ pub(crate) struct ObservationState {
     corner_timer_deadline_ms: Option<u64>,
     #[cfg(test)]
     corner_timer_arms: usize,
+    /// The renderer's affordance view (shell design §8.1, §8.5, §8.7).
+    hotspots: Option<HotspotBridge>,
+    /// The last recognised corner release: square index and time.
+    hotspot_flash: Option<(usize, Instant)>,
+    /// Phase origin of the discovery blink while `corner_config.discovery`.
+    discovery_since: Option<Instant>,
     loop_handle: LoopHandle<'static, WaylandState>,
     producer: ObservationProducer,
     event_seq: u64,
@@ -677,6 +687,9 @@ impl ObservationState {
             corner_timer_deadline_ms: None,
             #[cfg(test)]
             corner_timer_arms: 0,
+            hotspots: None,
+            hotspot_flash: None,
+            discovery_since: None,
             loop_handle,
             producer,
             event_seq: 0,
@@ -978,6 +991,17 @@ impl WaylandState {
     }
 
     fn emit_corner_action(&mut self, press: CornerPress, button: u32) {
+        // Every recognised release is acknowledged with a flash (§8.1).
+        if let Some(region) = self
+            .observations
+            .corner_output_keys
+            .iter()
+            .position(|key| *key == press.output)
+        {
+            self.observations.hotspot_flash =
+                Some((region * Corner::ALL.len() + press.corner.index(), Instant::now()));
+            self.publish_hotspots();
+        }
         let left = button == super::PRIMARY_POINTER_BUTTON;
         // The decoder canonicalises unmodified LMB v2 to the legacy sequence.
         // Every such click needs its sibling; every modified click is standalone.
@@ -1021,6 +1045,7 @@ impl WaylandState {
             self.observations.corner_regions.clear();
             self.reset_corner_detector();
             self.observations.corner_output_keys.clear();
+            self.publish_hotspots();
             return;
         };
         let mut keys = Vec::with_capacity(projection.keys.len());
@@ -1039,6 +1064,79 @@ impl WaylandState {
         }
         self.observations.corner_output_keys = keys;
         self.observations.corner_regions = regions;
+        self.publish_hotspots();
+    }
+
+    /// Attach the renderer's affordance bridge and give it the current view.
+    pub(crate) fn install_hotspot_bridge(&mut self, bridge: HotspotBridge) {
+        self.observations.hotspots = Some(bridge);
+        self.publish_hotspots();
+    }
+
+    /// Project the corner state into the renderer's affordance view: one
+    /// square of `deadzone_px` LOGICAL units at each corner of each output,
+    /// indexed `region * 4 + Corner::index`. Called only on state changes,
+    /// never per motion sample.
+    fn publish_hotspots(&self) {
+        let Some(bridge) = &self.observations.hotspots else {
+            return;
+        };
+        let config = self.observations.corner_config;
+        let squares = self
+            .observations
+            .corner_regions
+            .iter()
+            .flat_map(|region| {
+                let (x, y) = region.origin;
+                let (width, height) = region.size;
+                let side = config.deadzone_px.min(width).min(height).max(0.0);
+                Corner::ALL.map(|corner| {
+                    let right = matches!(corner, Corner::TopRight | Corner::BottomRight);
+                    let bottom = matches!(corner, Corner::BottomLeft | Corner::BottomRight);
+                    Square {
+                        x: if right { x + width - side } else { x },
+                        y: if bottom { y + height - side } else { y },
+                        side,
+                    }
+                })
+            })
+            .collect();
+        let hover = self
+            .observations
+            .corner_output
+            .zip(self.observations.corner_detector.engaged_corner())
+            .map(|(region, corner)| region * Corner::ALL.len() + corner.index());
+        bridge.set(HotspotView {
+            enabled: config.affordance && config.enabled && config.valid(),
+            squares,
+            hover,
+            flash: self.observations.hotspot_flash,
+            discovery: self
+                .observations
+                .discovery_since
+                .filter(|_| config.discovery),
+        });
+    }
+
+    /// The first reveal of any kind ends the discovery flash (§8.5). A
+    /// hover or click reaches here; a keyboard reveal is the shell's, and it
+    /// ends discovery by writing `input.corners.discovery = false`.
+    fn end_corner_discovery(&mut self, cause: &'static str) {
+        if !self.observations.corner_config.discovery {
+            return;
+        }
+        self.observations.corner_config.discovery = false;
+        self.observations.discovery_since = None;
+        emit_prop_change(
+            self,
+            DISCOVERY_PATH.into(),
+            PropValue::Bool(true),
+            PropValue::Bool(false),
+            cause,
+        );
+        if let Some(baseline) = self.observations.watched_baseline.as_mut() {
+            baseline.input.corners.discovery = false;
+        }
     }
 
     pub(crate) fn sample_corner_motion(
@@ -1101,12 +1199,20 @@ impl WaylandState {
         let size = output
             .and_then(|index| self.observations.corner_regions.get(index))
             .map_or((0.0, 0.0), |region| region.size);
+        if !config.discovery {
+            self.observations.discovery_since = None;
+        } else if !self.observations.corner_config.discovery
+            || self.observations.discovery_since.is_none()
+        {
+            self.observations.discovery_since = Some(Instant::now());
+        }
         self.observations.corner_config = config;
         let events = self.observations.corner_detector.reconfigure(config, size);
         if let Some(output) = output {
             self.emit_corner_events(events, output);
         }
         self.rearm_corner_timer();
+        self.publish_hotspots();
     }
 
     pub(crate) fn reset_corner_detector(&mut self) {
@@ -1123,6 +1229,19 @@ impl WaylandState {
     }
 
     fn emit_corner_events(&mut self, events: [Option<CornerEvent>; 2], output_index: usize) {
+        if events.iter().all(Option::is_none) {
+            return;
+        }
+        self.emit_corner_event_records(events, output_index);
+        // Engagement moved: the hover reveal follows it (§8.7).
+        self.publish_hotspots();
+    }
+
+    fn emit_corner_event_records(
+        &mut self,
+        events: [Option<CornerEvent>; 2],
+        output_index: usize,
+    ) {
         for event in events.into_iter().flatten() {
             if matches!(event, CornerEvent::Left { .. }) {
                 self.cancel_corner_presses();
@@ -1139,6 +1258,7 @@ impl WaylandState {
                 CornerEvent::Entered { corner, dwell_ms } => {
                     self.break_pointer_constraint_for_corner();
                     self.emit_corner_entered(output, corner, dwell_ms);
+                    self.end_corner_discovery("corner.entered");
                 }
                 CornerEvent::Left { corner, dwell_ms } => {
                     self.emit_corner_left(output, corner, dwell_ms);
@@ -1875,6 +1995,16 @@ fn diff_corners(
             "velocity_max_px_s",
             PropValue::F64(old.velocity_max_px_s),
             PropValue::F64(new.velocity_max_px_s),
+        ),
+        (
+            "affordance",
+            PropValue::Bool(old.affordance),
+            PropValue::Bool(new.affordance),
+        ),
+        (
+            "discovery",
+            PropValue::Bool(old.discovery),
+            PropValue::Bool(new.discovery),
         ),
     ] {
         queue_prop_change(pending, format!("input.corners.{leaf}"), old, new, cause);
@@ -3230,6 +3360,18 @@ pub(crate) fn validate_corner_value(
             }
             Ok(ValidatedCornerValue::VelocityMaxPxS(value))
         }
+        "input.corners.affordance" => {
+            let Some(value) = value.as_bool() else {
+                return Err(invalid_value(path, "bool", "true|false"));
+            };
+            Ok(ValidatedCornerValue::Affordance(value))
+        }
+        DISCOVERY_PATH => {
+            let Some(value) = value.as_bool() else {
+                return Err(invalid_value(path, "bool", "true|false"));
+            };
+            Ok(ValidatedCornerValue::Discovery(value))
+        }
         _ if path.starts_with("input.corners.") => Err(SetValidationError::UnknownPath),
         _ if known_read_only_path(path) => Err(SetValidationError::ReadOnly),
         _ => Err(SetValidationError::UnknownPath),
@@ -3260,6 +3402,16 @@ fn apply_corner_value(
             let old = config.velocity_max_px_s;
             config.velocity_max_px_s = value;
             (PropValue::F64(old), PropValue::F64(value))
+        }
+        ValidatedCornerValue::Affordance(value) => {
+            let old = config.affordance;
+            config.affordance = value;
+            (PropValue::Bool(old), PropValue::Bool(value))
+        }
+        ValidatedCornerValue::Discovery(value) => {
+            let old = config.discovery;
+            config.discovery = value;
+            (PropValue::Bool(old), PropValue::Bool(value))
         }
     }
 }
@@ -4086,6 +4238,8 @@ mod tests {
             ("input.corners.dwell_ms", json!(5_000)),
             ("input.corners.velocity_max_px_s", json!(1.0)),
             ("input.corners.velocity_max_px_s", json!(20_000.0)),
+            ("input.corners.affordance", json!(false)),
+            ("input.corners.discovery", json!(true)),
         ] {
             assert!(
                 validate_corner_value(path, &value).is_ok(),
@@ -4098,6 +4252,8 @@ mod tests {
             ("input.corners.dwell_ms", json!(1.5)),
             ("input.corners.dwell_ms", json!(-1)),
             ("input.corners.velocity_max_px_s", json!(null)),
+            ("input.corners.affordance", json!(0)),
+            ("input.corners.discovery", json!("true")),
         ] {
             assert!(matches!(
                 validate_corner_value(path, &value),
