@@ -56,9 +56,6 @@ impl RunnerState {
         if self.selected_key.as_ref() != Some(&request.output) {
             return Ok(());
         }
-        let Some(output) = self.outputs.get(&request.output) else {
-            return Ok(());
-        };
         // A request arriving while a menu is open replaces it. The incumbent
         // must leave through the normal dismiss path — staging its hold
         // release — or its exclusive-keyboard layer and row entities leak.
@@ -66,6 +63,9 @@ impl RunnerState {
         if replacing {
             self.dismiss_corner_menu(None);
         }
+        let Some(output) = self.outputs.get(&request.output) else {
+            return Ok(());
+        };
         let size = Vec2::new(output.logical_size.width(), output.logical_size.height());
         let mode = self
             .app
