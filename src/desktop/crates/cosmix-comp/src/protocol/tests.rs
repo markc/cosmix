@@ -29623,6 +29623,7 @@ fn port_corner_clicked_requires_engaged_left_release() {
             dwell_ms,
             button: "left",
             kind: "brief",
+            modifiers: vec![],
             event_seq: entered_seq + 2,
         }
     );
@@ -29654,6 +29655,145 @@ fn port_corner_clicked_requires_engaged_left_release() {
 
 #[cfg(feature = "bus")]
 #[test]
+fn port_corner_captures_modifiers_at_press_and_suppresses_every_modified_legacy() {
+    use port_observation::ObservationRecord;
+
+    for keys in [
+        vec![(50, "shift")],
+        vec![(37, "ctrl")],
+        vec![(64, "alt")],
+        vec![(133, "super")],
+        vec![(50, "shift"), (37, "ctrl"), (64, "alt"), (133, "super")],
+    ] {
+        for modified_at_press in [true, false] {
+            for button in [PRIMARY_POINTER_BUTTON, PRIMARY_POINTER_BUTTON + 1] {
+                let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+                route_pointer_to(&mut harness, 5.0, 5.0);
+                harness
+                    .server
+                    .event_loop
+                    .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+                    .unwrap();
+                assert!(harness.server.state.corner_engaged());
+                if modified_at_press {
+                    for &(code, _) in &keys {
+                        harness.server.state.handle_host_input(HostInput::Key {
+                            keycode: Keycode::new(code),
+                            state: HostButtonState::Pressed,
+                            time: 1,
+                        });
+                    }
+                }
+                drain_observations(&observations);
+                route_pointer_button(&mut harness, button, ButtonState::Pressed);
+                assert!(drain_observations(&observations).is_empty());
+                for &(code, _) in &keys {
+                    harness.server.state.handle_host_input(HostInput::Key {
+                        keycode: Keycode::new(code),
+                        state: if modified_at_press {
+                            HostButtonState::Released
+                        } else {
+                            HostButtonState::Pressed
+                        },
+                        time: 2,
+                    });
+                }
+                drain_observations(&observations);
+                route_pointer_button(&mut harness, button, ButtonState::Released);
+                let records = drain_observations(&observations);
+                let paired = button == PRIMARY_POINTER_BUTTON && !modified_at_press;
+                assert_eq!(records.len(), if paired { 2 } else { 1 });
+                assert_eq!(
+                    records
+                        .iter()
+                        .any(|r| matches!(r, ObservationRecord::CornerClicked { .. })),
+                    paired
+                );
+                let expected: Vec<_> = if modified_at_press {
+                    keys.iter().map(|&(_, name)| name).collect()
+                } else {
+                    vec![]
+                };
+                let body: Value =
+                    serde_json::from_str(&records.last().unwrap().wire().body).unwrap();
+                assert_eq!(body["modifiers"], json!(expected));
+                assert_eq!(body["kind"], "brief");
+            }
+        }
+    }
+}
+
+/// Producer-side pin only. The comp crate cannot reach cosmix-shell-host's real
+/// decoder (`corner_bus::decode` and `ClickPreference` are private, and a
+/// shell-host dev-dependency would pull bevy_winit into comp's test graph), so
+/// the canonicalisation below MODELS chunk 4's rule rather than running it. What
+/// this proves is comp's half: every unmodified LMB emits legacy at N and v2 at
+/// N+1, adjacent, with no gap after a preceding standalone click. The decoder's
+/// half is pinned by the corner_bus pair tests.
+#[cfg(feature = "bus")]
+#[test]
+fn port_corner_unmodified_left_emits_adjacent_siblings_for_pairing_model() {
+    use port_observation::ObservationRecord;
+
+    for v2_first in [false, true] {
+        let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+        route_pointer_to(&mut harness, 5.0, 5.0);
+        harness
+            .server
+            .event_loop
+            .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+            .unwrap();
+        assert!(harness.server.state.corner_engaged());
+        drain_observations(&observations);
+        // Seed a preceding standalone click: suppressing the next legacy sibling
+        // would make the decoder's v2 seq-1 collide with this record.
+        route_pointer_button(
+            &mut harness,
+            PRIMARY_POINTER_BUTTON + 1,
+            ButtonState::Pressed,
+        );
+        route_pointer_button(
+            &mut harness,
+            PRIMARY_POINTER_BUTTON + 1,
+            ButtonState::Released,
+        );
+        let previous = drain_observations(&observations);
+        assert_eq!(previous.len(), 1);
+        let mut last = previous[0].event_seq();
+        let mut producer_sequence = last;
+        for _ in 0..2 {
+            route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+            route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+            let records = drain_observations(&observations);
+            assert_eq!(
+                records.len(), 2,
+                "every unmodified LMB needs its legacy sibling"
+            );
+            assert!(matches!(records[0], ObservationRecord::CornerClicked { .. }));
+            assert!(matches!(&records[1], ObservationRecord::CornerClickedV2 {
+                button: "left", kind: "brief", modifiers, ..
+            } if modifiers.is_empty()));
+            assert_eq!(records[0].event_seq(), producer_sequence + 1);
+            assert_eq!(records[1].event_seq(), producer_sequence + 2);
+            let order = if v2_first { [1, 0] } else { [0, 1] };
+            let mut accepted = 0;
+            for index in order {
+                // Model of chunk 4's canonicalisation (v2 seq - 1), not the decoder.
+                let canonical = records[index].event_seq() - u64::from(index == 1);
+                if canonical > last {
+                    accepted += 1;
+                    last = canonical;
+                }
+            }
+            assert_eq!(accepted, 1);
+            // The next producer allocation follows the v2 record, not its canonical ID.
+            producer_sequence = records[1].event_seq();
+        }
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
 fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
     use port_observation::ObservationRecord;
 
@@ -29676,10 +29816,7 @@ fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
                     ..TestLayerSpec::default()
                 },
             );
-            let mut config = corner::CornerConfig {
-                hold_ms: 5_000,
-                ..corner::CornerConfig::default()
-            };
+            let mut config = corner::CornerConfig::default();
             harness.server.state.apply_corner_config(config);
             route_pointer_to(&mut harness, 1.0, 1.0);
             harness.sync();
@@ -29701,8 +29838,8 @@ fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
             assert!(harness.server.state.pointer.current_pressed().is_empty());
             match cancellation {
                 "drag" => {
-                    // Still within the square hotspot, but >12px from press.
-                    route_pointer_to(&mut harness, 11.0, 11.0);
+                    // Still within the square 10px hotspot, but >10px from press.
+                    route_pointer_to(&mut harness, 10.0, 10.0);
                     assert!(harness.server.state.corner_engaged());
                     route_pointer_to(&mut harness, 1.0, 1.0);
                 }
@@ -29775,15 +29912,10 @@ fn port_corner_does_not_steal_release_of_a_client_press() {
 
 #[cfg(feature = "bus")]
 #[test]
-fn port_corner_rmb_hold_timer_fires_once_and_lmb_never_holds() {
+fn port_corner_neither_button_holds_and_both_act_on_release() {
     use port_observation::ObservationRecord;
 
     let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
-    let config = corner::CornerConfig {
-        hold_ms: 20,
-        ..corner::CornerConfig::default()
-    };
-    harness.server.state.apply_corner_config(config);
     route_pointer_to(&mut harness, 5.0, 5.0);
     harness
         .server
@@ -29802,32 +29934,29 @@ fn port_corner_rmb_hold_timer_fires_once_and_lmb_never_holds() {
         PRIMARY_POINTER_BUTTON + 1,
         ButtonState::Pressed,
     );
-    assert!(harness.server.state.corner_timer_probe().0.is_some());
+    assert!(harness.server.state.corner_timer_probe().0.is_none());
     harness
         .server
         .event_loop
-        .dispatch(Some(Duration::from_millis(100)), &mut harness.server.state)
+        .dispatch(Some(Duration::from_millis(600)), &mut harness.server.state)
         .unwrap();
-    let records = drain_observations(&observations);
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        records[0],
-        ObservationRecord::CornerClickedV2 {
-            button: "right",
-            kind: "hold",
-            ..
-        }
-    ));
+    assert!(drain_observations(&observations).is_empty());
     assert!(harness.server.state.corner_timer_probe().0.is_none());
     route_pointer_button(
         &mut harness,
         PRIMARY_POINTER_BUTTON + 1,
         ButtonState::Released,
     );
-    assert!(
-        drain_observations(&observations).is_empty(),
-        "no brief after hold"
-    );
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        records[0],
+        ObservationRecord::CornerClickedV2 {
+            button: "right",
+            kind: "brief",
+            ..
+        }
+    ));
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let records = drain_observations(&observations);
     assert_eq!(records.len(), 2);
@@ -29839,6 +29968,200 @@ fn port_corner_rmb_hold_timer_fires_once_and_lmb_never_holds() {
             ..
         }
     ));
+}
+
+/// Engage the top-left hotspot the way a resting pointer does.
+#[cfg(feature = "bus")]
+fn engage_top_left_corner(harness: &mut KeybindingHarness) {
+    route_pointer_to(harness, 5.0, 5.0);
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .unwrap();
+    assert!(harness.server.state.corner_engaged());
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn affordance_follows_engaged_corner() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    let view = bridge.view();
+    assert!(view.enabled);
+    assert!(!view.squares.is_empty());
+    assert_eq!(view.squares.len() % 4, 0, "four hotspots per output");
+    assert!(
+        view.squares.iter().all(|square| square.side == 10.0),
+        "the default hotspot is 10 logical units: {:?}",
+        view.squares
+    );
+    assert_eq!(view.hover, None);
+    assert!(
+        view.frame(Instant::now()).is_empty(),
+        "nothing is drawn until a corner engages"
+    );
+
+    engage_top_left_corner(&mut harness);
+    let view = bridge.view();
+    assert_eq!(view.hover, Some(0), "output 0, top-left");
+    let frame = view.frame(Instant::now());
+    assert_eq!(frame.len(), 1);
+    assert_eq!(frame[0].square, view.squares[0]);
+
+    route_pointer_to(&mut harness, 100.0, 100.0);
+    assert!(!harness.server.state.corner_engaged());
+    assert_eq!(bridge.view().hover, None, "leaving hides the reveal");
+
+    // §8.7: disabling the affordance silences an engaged corner without
+    // ending the engagement itself.
+    engage_top_left_corner(&mut harness);
+    let config = corner::CornerConfig {
+        affordance: false,
+        ..corner::CornerConfig::default()
+    };
+    harness.server.state.apply_corner_config(config);
+    assert!(harness.server.state.corner_engaged());
+    let view = bridge.view();
+    assert!(!view.enabled);
+    assert!(view.frame(Instant::now()).is_empty());
+}
+
+/// Publishing is per state change, never per motion sample: a burst of
+/// motion inside a hotspot (while a candidate, and while engaged) with no
+/// Entered/Left/action publishes nothing.
+#[cfg(feature = "bus")]
+#[test]
+fn hotspot_motion_inside_a_corner_publishes_nothing() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    let candidate = bridge.sets();
+    for (x, y) in [(6.0, 5.0), (6.0, 6.0), (5.0, 7.0), (4.0, 4.0), (5.0, 5.0)] {
+        route_pointer_to(&mut harness, x, y);
+    }
+    assert!(!harness.server.state.corner_engaged());
+    assert_eq!(bridge.sets(), candidate, "candidate motion publishes nothing");
+    engage_top_left_corner(&mut harness);
+    let engaged = bridge.sets();
+    for (x, y) in [(6.0, 5.0), (2.0, 8.0), (9.0, 9.0), (1.0, 1.0), (5.0, 5.0)] {
+        route_pointer_to(&mut harness, x, y);
+    }
+    assert!(harness.server.state.corner_engaged());
+    assert_eq!(bridge.sets(), engaged, "engaged motion publishes nothing");
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn flash_fires_on_recognised_release() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    engage_top_left_corner(&mut harness);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(
+        bridge.view().flash,
+        None,
+        "the flash acknowledges the release"
+    );
+    let before = Instant::now();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let view = bridge.view();
+    let (index, at) = view.flash.expect("a recognised release flashes");
+    assert_eq!(index, 0);
+    assert!(at >= before);
+    let flashing = view.frame(at);
+    let settled = view.frame(at + crate::hotspot_scene::FLASH_DURATION);
+    assert_eq!((flashing.len(), settled.len()), (1, 1), "hover stays");
+    assert!(
+        flashing[0].level > settled[0].level,
+        "the flash is brighter than the hover it returns to"
+    );
+
+    // RMB is recognised too.
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Pressed,
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Released,
+    );
+    let (_, right_at) = bridge.view().flash.expect("RMB flashes");
+    assert!(right_at >= at);
+
+    // A press dragged past the deadzone is cancelled: its release is not
+    // recognised and must not flash.
+    route_pointer_to(&mut harness, 1.0, 1.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_to(&mut harness, 10.0, 10.0);
+    assert!(harness.server.state.corner_engaged());
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(bridge.view().flash, Some((0, right_at)));
+
+    // Unconsumed buttons are not corner clicks either.
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 2,
+        ButtonState::Pressed,
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 2,
+        ButtonState::Released,
+    );
+    assert_eq!(bridge.view().flash, Some((0, right_at)));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn discovery_flash_ends_at_the_first_reveal() {
+    use port_observation::ObservationRecord;
+
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    assert_eq!(bridge.view().discovery, None, "off unless the shell asks");
+    let config = corner::CornerConfig {
+        discovery: true,
+        ..corner::CornerConfig::default()
+    };
+    harness.server.state.apply_corner_config(config);
+    let view = bridge.view();
+    let since = view.discovery.expect("discovery blink running");
+    assert_eq!(
+        view.frame(since).len(),
+        view.squares.len(),
+        "every hotspot blinks"
+    );
+    drain_observations(&observations);
+
+    engage_top_left_corner(&mut harness);
+    let view = bridge.view();
+    assert_eq!(view.discovery, None, "the first reveal ends discovery");
+    assert_eq!(view.frame(since).len(), 1, "only the hover remains");
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                ObservationRecord::PropsChanged {
+                    path,
+                    cause: "corner.entered",
+                    ..
+                } if path == "input.corners.discovery"
+            )),
+        "the leaf reports its own change"
+    );
+    // Re-arming restarts the blink; a later engagement ends it again.
+    route_pointer_to(&mut harness, 100.0, 100.0);
+    harness.server.state.apply_corner_config(config);
+    assert!(bridge.view().discovery.is_some());
 }
 
 #[cfg(feature = "bus")]
@@ -30366,14 +30689,15 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
 
     for (path, value, old) in [
         ("input.corners.enabled", json!(false), json!(true)),
-        ("input.corners.deadzone_px", json!(24.5), json!(12.0)),
+        ("input.corners.deadzone_px", json!(24.5), json!(10.0)),
         ("input.corners.dwell_ms", json!(250), json!(200)),
-        ("input.corners.hold_ms", json!(750), json!(500)),
         (
             "input.corners.velocity_max_px_s",
             json!(900.0),
             json!(1500.0),
         ),
+        ("input.corners.affordance", json!(false), json!(true)),
+        ("input.corners.discovery", json!(true), json!(false)),
     ] {
         let set = ingress
             .request_set(path.to_string(), value.clone())

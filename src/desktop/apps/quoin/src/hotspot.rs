@@ -23,6 +23,18 @@ pub(crate) fn is_comp_gap(body: &Value) -> bool {
     body.get("gap").and_then(Value::as_bool) == Some(true)
 }
 
+const DISCOVERY_PATH: &str = "input.corners.discovery";
+
+/// One pending write of comp's `input.corners.discovery` (shell design
+/// §8.5). Sends are triggered by a Bus connection or by comp being seen
+/// registered, never by a timer; a failed write waits for the next trigger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoveryWrite {
+    Idle,
+    Queued { value: bool, send: bool },
+    InFlight { value: bool, id: u64 },
+}
+
 #[derive(Resource)]
 pub(crate) struct HotspotObserver {
     service: String,
@@ -41,6 +53,12 @@ pub(crate) struct HotspotObserver {
     /// successful read re-arms it so a later failure is noticed again.
     read_failure_logged: bool,
     next_id: u64,
+    discovery: DiscoveryWrite,
+    /// This is the shell's first run: the first discovery write comp
+    /// accepts consumes it (see [`Self::take_first_run_written`]).
+    first_run: bool,
+    first_run_written: bool,
+    discovery_failure_logged: bool,
 }
 
 pub(crate) fn install(app: &mut App, bus: &mut BusBridgeConfig, service: String) {
@@ -48,6 +66,14 @@ pub(crate) fn install(app: &mut App, bus: &mut BusBridgeConfig, service: String)
     bus.subscriptions.push(observer.topic.clone());
     app.insert_resource(observer)
         .init_resource::<QuoinHotspotSize>();
+}
+
+/// Arm the first-run discovery write when the state store says this is the
+/// shell's first run (§8.5). A no-op without an installed observer.
+pub(crate) fn arm_first_run(app: &mut App, first_run: bool) {
+    if first_run && let Some(mut observer) = app.world_mut().get_resource_mut::<HotspotObserver>() {
+        observer.arm_first_run_discovery();
+    }
 }
 
 impl HotspotObserver {
@@ -62,7 +88,83 @@ impl HotspotObserver {
             stale: false,
             read_failure_logged: false,
             next_id: 0x48_0000_0000,
+            discovery: DiscoveryWrite::Idle,
+            first_run: false,
+            first_run_written: false,
+            discovery_failure_logged: false,
         }
+    }
+
+    /// First run (no saved shell state yet): ask comp to blink every hotspot
+    /// until the first reveal (§8.5). Comp clears the leaf itself at the
+    /// first corner engagement. Called once at startup, and only when the
+    /// state store reports a first run.
+    pub(crate) fn arm_first_run_discovery(&mut self) {
+        self.first_run = true;
+        self.queue_discovery(true);
+    }
+
+    /// HOOK FOR CHUNK 20 (keyboard reveal): a panel revealed from the
+    /// keyboard is a reveal comp never sees, so the shell ends the discovery
+    /// blink itself by writing `input.corners.discovery = false`. Harmless
+    /// when comp already cleared it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn end_discovery_on_keyboard_reveal(&mut self) {
+        self.queue_discovery(false);
+    }
+
+    fn queue_discovery(&mut self, value: bool) {
+        self.discovery = DiscoveryWrite::Queued { value, send: true };
+    }
+
+    /// Consume the reply to the in-flight discovery write; false when the
+    /// reply belongs to something else.
+    fn discovery_reply(&mut self, request_id: u64, result: &Result<BusReply, String>) -> bool {
+        let DiscoveryWrite::InFlight { value, id } = self.discovery else {
+            return false;
+        };
+        if id != request_id {
+            return false;
+        }
+        match result {
+            Ok(reply) if reply.rc == 0 => {
+                self.discovery = DiscoveryWrite::Idle;
+                self.discovery_failure_logged = false;
+                if self.first_run {
+                    self.first_run = false;
+                    self.first_run_written = true;
+                }
+            }
+            failed => {
+                // Wait for the next trigger; never retry on a clock.
+                self.discovery = DiscoveryWrite::Queued { value, send: false };
+                if !self.discovery_failure_logged {
+                    self.discovery_failure_logged = true;
+                    let detail = match failed {
+                        Ok(reply) => format!("rc={}", reply.rc),
+                        Err(error) => format!("transport error: {error}"),
+                    };
+                    eprintln!(
+                        "QUOIN_DISCOVERY_WRITE_FAILED service={} path={} value={} detail={}",
+                        self.service, DISCOVERY_PATH, value, detail
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    /// A trigger (connection, comp registered) releases a queued write.
+    fn release_discovery(&mut self) {
+        if let DiscoveryWrite::Queued { value, .. } = self.discovery {
+            self.discovery = DiscoveryWrite::Queued { value, send: true };
+        }
+    }
+
+    /// True once, when comp has accepted the first-run write: the caller
+    /// records the first run as consumed so it never re-arms.
+    pub(crate) fn take_first_run_written(&mut self) -> bool {
+        std::mem::take(&mut self.first_run_written)
     }
 
     pub(crate) fn presence(&mut self, services: &BTreeSet<String>, size: &mut QuoinHotspotSize) {
@@ -77,16 +179,25 @@ impl HotspotObserver {
             // burst noded suppressed) publishes no initial `props.changed` —
             // comp emits changes only — so this lifetime's value is re-read.
             self.dirty = true;
+            self.release_discovery();
             return;
         }
         self.present = Some(present);
         // Invalidate any read from the previous service lifetime.
         self.pending = None;
         self.dirty = present;
+        if present {
+            self.release_discovery();
+        }
         *size = QuoinHotspotSize::default();
     }
 
     pub(crate) fn event(&mut self, event: &BusBridgeEvent, size: &mut QuoinHotspotSize) {
+        if let BusBridgeEvent::Reply { request_id, result } = event
+            && self.discovery_reply(*request_id, result)
+        {
+            return;
+        }
         match event {
             BusBridgeEvent::Connection {
                 state: BusConnectionState::Connected,
@@ -97,6 +208,11 @@ impl HotspotObserver {
                 self.pending = None;
                 self.dirty = true;
                 *size = QuoinHotspotSize::default();
+                // A write in flight on the old connection never answers.
+                if let DiscoveryWrite::InFlight { value, .. } = self.discovery {
+                    self.discovery = DiscoveryWrite::Queued { value, send: true };
+                }
+                self.release_discovery();
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
                 self.generation = None;
@@ -104,6 +220,9 @@ impl HotspotObserver {
                 self.pending = None;
                 self.dirty = false;
                 *size = QuoinHotspotSize::default();
+                if let DiscoveryWrite::InFlight { value, .. } = self.discovery {
+                    self.discovery = DiscoveryWrite::Queued { value, send: false };
+                }
             }
             BusBridgeEvent::DroppedMessages(_) => {
                 self.dirty = self.generation.is_some();
@@ -163,6 +282,7 @@ impl HotspotObserver {
     /// A full queue retries the outstanding event-triggered read. Once sent,
     /// no more requests are issued until another observation requires one.
     pub(crate) fn flush(&mut self, bridge: &BusBridge) {
+        self.flush_discovery(bridge);
         if !self.dirty || self.pending.is_some() || self.generation.is_none() {
             return;
         }
@@ -183,6 +303,34 @@ impl HotspotObserver {
             self.pending = Some(self.next_id);
             self.dirty = false;
             self.stale = false;
+        }
+    }
+
+    fn flush_discovery(&mut self, bridge: &BusBridge) {
+        let DiscoveryWrite::Queued { value, send: true } = self.discovery else {
+            return;
+        };
+        if self.generation.is_none() {
+            return;
+        }
+        self.next_id += 1;
+        let body = json!({ "path": DISCOVERY_PATH, "value": value }).to_string();
+        if bridge
+            .try_call(
+                self.next_id,
+                &self.service,
+                // Addressed to the selected service, but comp dispatches the
+                // literal `comp.*` command whatever its registered name.
+                "comp.props.set".to_owned(),
+                BTreeMap::new(),
+                body,
+            )
+            .is_ok()
+        {
+            self.discovery = DiscoveryWrite::InFlight {
+                value,
+                id: self.next_id,
+            };
         }
     }
 }
@@ -420,6 +568,150 @@ mod tests {
         assert!(scoped_deadzone(&ok(0, "0")).is_err());
         assert!(scoped_deadzone(&ok(0, "1e100")).is_err());
         assert!(scoped_deadzone(&Err("comp unavailable".into())).is_err());
+    }
+
+    fn discovery_sets(peer: &ctk::bus::TestBusPeer) -> Vec<(u64, Value)> {
+        peer.drain_calls()
+            .into_iter()
+            .filter(|call| call.command == "comp.props.set")
+            .map(|call| {
+                assert_eq!(call.to, "comp-nested");
+                let body: Value = serde_json::from_str(&call.body).unwrap();
+                assert_eq!(body["path"], DISCOVERY_PATH);
+                (call.request_id, body["value"].clone())
+            })
+            .collect()
+    }
+
+    fn set_reply(observer: &mut HotspotObserver, size: &mut QuoinHotspotSize, id: u64, rc: u8) {
+        observer.event(
+            &BusBridgeEvent::Reply {
+                request_id: id,
+                result: Ok(BusReply {
+                    rc,
+                    body: "{}".into(),
+                    result: None,
+                }),
+            },
+            size,
+        );
+    }
+
+    /// §8.5: on the shell's first run Quoin asks comp to blink the hotspots,
+    /// exactly once; the accepted write consumes the first run.
+    #[test]
+    fn first_run_discovery_is_written_once_and_consumed() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut observer = HotspotObserver::new("comp-nested".into());
+        let mut size = QuoinHotspotSize::default();
+        observer.arm_first_run_discovery();
+        observer.flush(&bridge);
+        assert!(discovery_sets(&peer).is_empty(), "no connection, no write");
+        connect(&mut observer, &mut size, 1);
+        observer.flush(&bridge);
+        let sets = discovery_sets(&peer);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].1, json!(true));
+        observer.flush(&bridge);
+        assert!(discovery_sets(&peer).is_empty(), "one write in flight");
+        assert!(!observer.take_first_run_written());
+        set_reply(&mut observer, &mut size, sets[0].0, 0);
+        assert!(observer.take_first_run_written());
+        assert!(!observer.take_first_run_written(), "reported once");
+        // Reconnects and registry receipts never re-request it.
+        connect(&mut observer, &mut size, 2);
+        observer.presence(&BTreeSet::from(["comp-nested".to_owned()]), &mut size);
+        observer.flush(&bridge);
+        assert!(discovery_sets(&peer).is_empty());
+    }
+
+    /// Comp matches the literal `comp.props.set`; a service-prefixed verb is
+    /// `unknown_verb` on any comp not registered as `comp`.
+    #[test]
+    fn discovery_write_is_literal_comp_props_set_to_the_selected_service() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut observer = HotspotObserver::new("comp-nested".into());
+        let mut size = QuoinHotspotSize::default();
+        observer.arm_first_run_discovery();
+        connect(&mut observer, &mut size, 1);
+        observer.flush(&bridge);
+        let sets = peer
+            .drain_calls()
+            .into_iter()
+            .filter(|call| call.command.ends_with("props.set"))
+            .collect::<Vec<_>>();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].command, "comp.props.set");
+        assert_eq!(sets[0].to, "comp-nested");
+    }
+
+    #[test]
+    fn first_run_discovery_failure_waits_for_a_trigger_not_a_clock() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut observer = HotspotObserver::new("comp-nested".into());
+        let mut size = QuoinHotspotSize::default();
+        observer.arm_first_run_discovery();
+        connect(&mut observer, &mut size, 1);
+        observer.flush(&bridge);
+        let first = discovery_sets(&peer);
+        set_reply(&mut observer, &mut size, first[0].0, 10);
+        for _ in 0..5 {
+            observer.flush(&bridge);
+        }
+        assert!(
+            discovery_sets(&peer).is_empty(),
+            "a refusal is not retried on a clock"
+        );
+        assert!(!observer.take_first_run_written());
+        // Comp seen registered is the trigger.
+        observer.presence(&BTreeSet::from(["comp-nested".to_owned()]), &mut size);
+        observer.flush(&bridge);
+        let retry = discovery_sets(&peer);
+        assert_eq!(retry.len(), 1);
+        // A disconnect loses the in-flight write; the reconnect resends it.
+        observer.event(
+            &BusBridgeEvent::Connection {
+                state: BusConnectionState::Disconnected,
+                generation: 1,
+            },
+            &mut size,
+        );
+        set_reply(&mut observer, &mut size, retry[0].0, 0);
+        assert!(
+            !observer.take_first_run_written(),
+            "a stale reply is ignored"
+        );
+        connect(&mut observer, &mut size, 2);
+        observer.flush(&bridge);
+        let resent = discovery_sets(&peer);
+        assert_eq!(resent.len(), 1);
+        set_reply(&mut observer, &mut size, resent[0].0, 0);
+        assert!(observer.take_first_run_written());
+    }
+
+    #[test]
+    fn not_first_run_writes_nothing_and_keyboard_hook_clears_discovery() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut app = App::new();
+        let mut config = BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        install(&mut app, &mut config, "comp-nested".into());
+        arm_first_run(&mut app, false);
+        let mut observer = app
+            .world_mut()
+            .remove_resource::<HotspotObserver>()
+            .unwrap();
+        let mut size = QuoinHotspotSize::default();
+        connect(&mut observer, &mut size, 1);
+        observer.flush(&bridge);
+        assert!(discovery_sets(&peer).is_empty(), "restored state: no blink");
+        // Chunk 20's keyboard-reveal hook ends the blink comp cannot see.
+        observer.end_discovery_on_keyboard_reveal();
+        observer.flush(&bridge);
+        let sets = discovery_sets(&peer);
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].1, json!(false));
+        set_reply(&mut observer, &mut size, sets[0].0, 0);
+        assert!(!observer.take_first_run_written(), "not a first run");
     }
 
     #[test]

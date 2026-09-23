@@ -971,6 +971,8 @@ impl HostInput {
 
 enum ProtocolCommand {
     #[cfg(feature = "bus")]
+    HotspotBridge(crate::hotspot_scene::HotspotBridge),
+    #[cfg(feature = "bus")]
     RegionBridge(crate::region_scene::RegionBridge),
     #[cfg(feature = "embedded-quoin")]
     EmbeddedShell(crate::embedded_shell::EmbeddedShellBridge),
@@ -1308,6 +1310,16 @@ static_assertions::assert_not_impl_any!(ClientSceneFeed: Clone, Copy);
 
 impl ClientSceneFeed {
     #[cfg(feature = "bus")]
+    pub(crate) fn install_hotspot_bridge(&self, bridge: crate::hotspot_scene::HotspotBridge) {
+        if self
+            .commands
+            .send(ProtocolCommand::HotspotBridge(bridge))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before hotspot renderer attachment");
+        }
+    }
+    #[cfg(feature = "bus")]
     pub(crate) fn install_region_bridge(&self, bridge: crate::region_scene::RegionBridge) {
         if self
             .commands
@@ -1457,6 +1469,8 @@ impl ClientSceneFeed {
                 Ok(ProtocolCommand::ReleaseDmabuf { token }) => tokens.push(token),
                 #[cfg(feature = "bus")]
                 Ok(ProtocolCommand::RegionBridge(_)) => {} // Startup renderer attachment owns no buffer.
+                #[cfg(feature = "bus")]
+                Ok(ProtocolCommand::HotspotBridge(_)) => {} // Likewise.
                 Ok(_) => panic!("scene feed emitted an unrelated command"),
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return tokens,
             }
@@ -1493,6 +1507,9 @@ impl ClientSceneFeed {
                 Ok(ProtocolCommand::CaptureFailed { id, .. }) => {
                     outcomes.push(CaptureTestOutcome::Failed(id));
                 }
+                // Startup renderer attachment, not a capture outcome.
+                #[cfg(feature = "bus")]
+                Ok(ProtocolCommand::HotspotBridge(_)) => {}
                 Ok(_) => panic!("scene feed emitted an unrelated command"),
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
                     return outcomes;
@@ -3552,6 +3569,10 @@ impl ProtocolServer {
         event_loop
             .handle()
             .insert_source(command_source, |event, (), state| match event {
+                #[cfg(feature = "bus")]
+                ChannelEvent::Msg(ProtocolCommand::HotspotBridge(bridge)) => {
+                    state.install_hotspot_bridge(bridge);
+                }
                 #[cfg(feature = "bus")]
                 ChannelEvent::Msg(ProtocolCommand::RegionBridge(bridge)) => {
                     state.region.bridge = Some(bridge);

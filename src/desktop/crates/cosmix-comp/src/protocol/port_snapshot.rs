@@ -384,8 +384,9 @@ pub(crate) struct CornersSnapshot {
     pub(crate) enabled: bool,
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
-    pub(crate) hold_ms: u64,
     pub(crate) velocity_max_px_s: f64,
+    pub(crate) affordance: bool,
+    pub(crate) discovery: bool,
 }
 
 impl From<CornerConfig> for CornersSnapshot {
@@ -395,8 +396,9 @@ impl From<CornerConfig> for CornersSnapshot {
             enabled: config.enabled,
             deadzone_px: config.deadzone_px,
             dwell_ms: config.dwell_ms,
-            hold_ms: config.hold_ms,
             velocity_max_px_s: config.velocity_max_px_s,
+            affordance: config.affordance,
+            discovery: config.discovery,
         }
     }
 }
@@ -699,8 +701,9 @@ flat_snapshot!(
     enabled,
     deadzone_px,
     dwell_ms,
-    hold_ms,
-    velocity_max_px_s
+    velocity_max_px_s,
+    affordance,
+    discovery
 );
 flat_snapshot!(
     PortSnapshot,
@@ -2135,18 +2138,23 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         range = "0..=5000"
     ),
     descriptor!(
-        &[L("input"), L("corners"), L("hold_ms")],
-        Number,
-        "Right-button corner hold threshold in milliseconds",
-        mutable,
-        range = "1..=5000"
-    ),
-    descriptor!(
         &[L("input"), L("corners"), L("velocity_max_px_s")],
         Number,
         "Maximum corner-entry velocity in logical pixels per second",
         mutable,
         range = "1.0..=20000.0"
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("affordance")],
+        Bool,
+        "Whether comp draws the hotspot hover reveal, release flash and discovery flash",
+        mutable
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("discovery")],
+        Bool,
+        "Whether every hotspot flashes slowly until the first corner reveal",
+        mutable
     ),
     descriptor!(
         &[L("input"), L("host"), L("passthrough")],
@@ -3211,6 +3219,16 @@ mod tests {
     }
 
     #[test]
+    fn corner_hold_property_is_absent_from_snapshot_and_schema() {
+        let snapshot = fixture();
+        assert_eq!(snapshot.select(&["input", "corners", "hold_ms"]), None);
+        assert_eq!(snapshot.node_kind(&["input", "corners", "hold_ms"]), None);
+        let corners = snapshot.select(&["input", "corners"]).unwrap();
+        assert!(corners.get("hold_ms").is_none());
+        assert!(describe(&snapshot, &PropPath::new("input.corners.hold_ms").unwrap()).is_none());
+    }
+
+    #[test]
     fn mutable_descriptors_match_the_writable_leaves() {
         let snapshot = fixture();
         let mutable = DESCRIPTORS
@@ -3225,16 +3243,19 @@ mod tests {
         // 0.59.0 adds the four workspace leaves: the window's workspace,
         // the count, and the current workspace by default output and by
         // output key.
+        // Chunk 19 adds the two affordance leaves, `input.corners.affordance`
+        // and `input.corners.discovery`.
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 13);
+        assert_eq!(mutable.len(), 14);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 12);
+        assert_eq!(mutable.len(), 13);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
-            "input.corners.hold_ms",
             "input.corners.velocity_max_px_s",
+            "input.corners.affordance",
+            "input.corners.discovery",
             "input.host.passthrough",
             "windows.s2.band",
             "windows.s2.minimized",

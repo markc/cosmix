@@ -498,30 +498,36 @@ reads `input.corners.deadzone_px` through a path-scoped `<service>.props.get`
 (whose reply body is the bare value at that path), re-reading on a relevant
 change, reconnect, delivery gap, or any registry observation that reports the
 service registered — a restarted comp republishes no initial value. Until a
-read lands, or while no cosmix comp is present, the inset falls back to 12 px,
+read lands, or while no cosmix comp is present, the inset falls back to 10 px,
 mirroring comp's own default; a failed read keeps that fallback and logs one
 `QUOIN_HOTSPOT_READ_FAILED` notice per run of failures. The compositor's
 embedded Quoin host passes its own registered service name the same way.
-With legacy corner payloads, brief LMB toggles **Pinned** (persistent overlay);
-brief RMB toggles **Docked**
-(reserves space). Both use the existing counter-clockwise mapping: TL→left,
+LMB toggles **Pinned** (persistent overlay); from Docked it becomes Pinned.
+Shift+LMB toggles **Docked** (reserves space) and Hidden. RMB opens the corner
+menu. Ctrl/Alt/Super+LMB without Shift retain pinning. All use the
+counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
-the change. Unpinning leaves transient reveal/grace to the panel model; undocking
-does so only while held, otherwise it starts concealment immediately.
+the change. Unpinning leaves transient reveal/grace to the panel model;
+undocking with Shift+LMB does so only while the panel is held, otherwise it
+starts concealment immediately. The menu's Hide conceals at once from any mode.
 Horizontal panels (bottom, top) carry a paging chevron at each end, inset from
 the panel ends by comp's corner-hotspot size, with the title and page dots as a
 centred overlay across the content strip; vertical panels (left, right) keep a
-`< [title] >` header with the chevrons inside it. Chevron paging slides the
+`< [title] >` header with the chevrons inside it, the header's top grown by the
+same inset. Only the chevrons are inset — page content fills the panel below the
+header on a side edge, and the full width on a top/bottom edge with a single
+page — and an edge with a single page shows no chevrons and no inset. Chevron paging slides the
 carousel 300 ms, collapsing to zero under reduced motion; named jumps — the
 dots, `panel.page.set`, activation, restore and a removal's landing — go
 directly to the page without the slide. Headers carry no pin glyph or mode
 button; change mode at the corner, in its menu, or through the precise mode
 verbs.
 
-The compositor also publishes `corner.clicked.v2` with `button` and `kind` for
-LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
-their releases, cancelling pending actions on excess movement or disengagement.
+The compositor publishes `corner.clicked.v2` with `button`, `kind: "brief"` and
+`modifiers` captured at press time (always present, even when empty). It consumes
+engaged corner presses and their releases, cancelling pending actions on excess
+movement or disengagement. Both buttons act on release; neither has a hold action.
 The menu action calls `CornerMenuHook(fn(&mut World, &OutputKey, Corner))`.
 The host always provides **Pin / Dock / Hide**, with the current mode checked
 and disabled; Quoin appends `conf.mix`'s `menu_items` for that edge. Each mode
@@ -535,20 +541,18 @@ restoration belongs to the forthcoming compositor popup holder. Pin and Dock
 apply before the local hold is released, so concealment cannot race the choice.
 Opening a menu at a hidden corner does not itself reveal the panel.
 
-With the newer modifier-aware corner protocol, brief RMB opens this menu.
-Until the compositor remapping lands, legacy brief RMB still toggles Docked
-and RMB hold opens the menu.
-
 Both click topics are subscribed for old-compositor compatibility. Successful
 subscription is not capability discovery: the broker accepts unpublished topics.
 Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The current
-compositor emits each LMB's legacy record at sequence N and its v2 record at N+1;
+compositor emits each unmodified LMB's legacy record at sequence N and its v2
+record at N+1, including when the v2 payload has `modifiers: []`;
 the host maps both to N and admits that logical click once, in either delivery
-order. On observing v2 it ignores all subsequent legacy clicks for that connection.
+order. Every modified click emits only v2 and keeps its own sequence, including
+Ctrl/Alt+LMB. On observing v2 it ignores all subsequent legacy clicks for that connection.
 A sequence high-water mark also rejects duplicate/stale click records, before
 output-map queueing. Reconnect clears preference and sequence state; ordinary
 output refreshes and loss markers retain them. This relies on the compositor's
-consecutive LMB pair and monotonically increasing observation stream, not a
+consecutive unmodified LMB pair and monotonically increasing observation stream, not a
 timing window. It is not an exactly-once guarantee across a connection reset or
 publisher sequence restart; a publisher restart requires a fresh host/connection.
 High-water rejections emit `quoin_corner_sequence_rejected` WARNs at counts
