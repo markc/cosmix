@@ -441,11 +441,12 @@ fn update_model(
                 runtime.page_changes[edge.index()] = PageChange::Named;
                 // Hidden: a transient reveal, never a mode change (panel doc
                 // §6); the host holds it with a compositor focus hold.
-                // Pinned or docked: the page switch is the whole activation.
-                // Moving keyboard focus in (a `FocusDirective::Panel`) is not
-                // wired here yet; this arm is where it joins.
+                // Pinned or docked: a page switch, no mode change. Either way
+                // the panel then asks for the keyboard, as a focus-cycle stop
+                // does (the layer turns exclusive until focus lands and leaves,
+                // Escape, or the grant times out).
+                let at = command.at.clamp(runtime.model.last_update(), now);
                 if runtime.model.panel(*edge).mode == PanelMode::Hidden {
-                    let at = command.at.clamp(runtime.model.last_update(), now);
                     if let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
                         && let Some(effect) = update.effect
                     {
@@ -455,6 +456,7 @@ fn update_model(
                         });
                     }
                 }
+                runtime.model.request_keyboard_focus(*edge, at);
                 continue;
             }
             ShellCommandKind::HolderPlane(available) => {

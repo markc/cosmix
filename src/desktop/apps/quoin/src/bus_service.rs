@@ -4058,6 +4058,8 @@ mod tests {
         assert!(panel.transient_revealed);
         assert_eq!(panel.active_page_id.as_deref(), Some("beta"));
         assert_eq!(panel.page_change, cosmix_shell::runtime::PageChange::Named);
+        assert_eq!(panel.keyboard_interactivity,
+            cosmix_shell::runtime::KeyboardInteractivity::Exclusive, "the panel asks for the keyboard");
         // A focus change before comp has acknowledged the hold is not the
         // user leaving it: the reveal it made may not even have a layer yet.
         peer.deliver_message(focus_changed(Some(4), Some(3)));
@@ -4135,6 +4137,9 @@ mod tests {
                 assert_eq!(after.active_page_id.as_deref(), Some(name), "{mode:?}");
                 assert_eq!(after.page_change, cosmix_shell::runtime::PageChange::Named,
                     "{mode:?}: a direct jump, never a slide");
+                assert_eq!(after.keyboard_interactivity,
+                    cosmix_shell::runtime::KeyboardInteractivity::Exclusive,
+                    "{mode:?}: the panel asks for the keyboard");
                 assert!(holds(&pump(&mut app, &peer, &comp)).is_empty(),
                     "{mode:?}: persistent panels take no hold");
             }

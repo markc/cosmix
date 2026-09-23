@@ -378,6 +378,19 @@ impl ShellModel {
         stop
     }
 
+    /// Named activation (panel doc §6) gives the panel focus: the same
+    /// request, deadline and endings as a cycle stop, for a panel that is
+    /// mapped (a hidden edge's activation reveals it first). Never changes a
+    /// mode.
+    pub fn request_keyboard_focus(&mut self, edge: Edge, at: Duration) {
+        if !self.panel(edge).mapped {
+            return;
+        }
+        self.focus_directive = FocusDirective::Panel(edge);
+        self.focus_grant_deadline =
+            (self.keyboard_focus != Some(edge)).then_some(at + FOCUS_GRANT_TIMEOUT);
+    }
+
     /// Escape from a focused panel (shell doc §4.3). A transient reveal hides
     /// (latching while the pointer is still inside); a pinned or docked panel
     /// changes nothing. Either way keyboard focus is given back. Only a host

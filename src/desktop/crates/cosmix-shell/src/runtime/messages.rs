@@ -91,7 +91,8 @@ pub enum ShellCommandKind {
     /// The carousel jumps to the page (a named change, never animated); a
     /// `Hidden` edge also gets a transient reveal, which the host holds with
     /// a compositor focus hold. A pinned or docked edge only switches pages:
-    /// activation never changes a mode.
+    /// activation never changes a mode. Either way the panel then asks for
+    /// the keyboard, exactly as a focus-cycle stop does.
     SubPanelActivate {
         edge: Edge,
         name: String,
@@ -168,9 +169,10 @@ pub enum PageChange {
 pub enum KeyboardInteractivity {
     None,
     OnDemand,
-    /// Only while the focus cycle has moved the keyboard into this panel:
-    /// a client cannot focus its own layer on demand, so the cycle asks for
-    /// the grab and gives it back on Escape or the next cycle stop.
+    /// Only while the focus cycle or a named activation has moved the
+    /// keyboard into this panel: a client cannot focus its own layer on
+    /// demand, so they ask for the grab and give it back on Escape or the
+    /// next cycle stop.
     Exclusive,
 }
 

@@ -707,9 +707,10 @@ panel's layer, which keeps it shown until keyboard focus first moves after comp
 acknowledges the hold (a move into the panel is then held by comp's own focus
 holder), or until Escape, a hide or a corner action ends the reveal. It never
 changes the persisted mode. On a pinned or docked edge it only switches the
-carousel to the page. Activation does not itself move keyboard focus into the
-panel yet: a layer client cannot focus its own surface on demand, and the
-keyboard slice's focus request is what will do it. The reply is
+carousel to the page. Either way the panel then asks for the keyboard exactly
+as a focus-cycle stop does: its layer requests exclusive keyboard
+interactivity until focus has landed and left, Escape, or the grant times out,
+so typing goes to the activated sub-panel. The reply is
 <code>{"accepted":true,"name":…,"edge":…,"output":…,"target":…}</code>: <code>output</code> is where
 the sub-panel lives, and <code>target</code> the output the user is at (the focused
 surface's, else the pointer's, as comp last reported them; <code>null</code> when
