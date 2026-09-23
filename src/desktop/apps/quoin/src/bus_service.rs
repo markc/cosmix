@@ -196,8 +196,10 @@ fn service_bus(
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut content: SceneBus,
-    mut hotspot: Option<ResMut<crate::hotspot::HotspotObserver>>,
-    mut hotspot_size: ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
+    (mut hotspot, mut hotspot_size): (
+        Option<ResMut<crate::hotspot::HotspotObserver>>,
+        ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
+    ),
     mut wallpaper: (
         ResMut<crate::wallpaper::WallpaperState>,
         ResMut<cosmix_shell_host::LayerHostDeadline>,

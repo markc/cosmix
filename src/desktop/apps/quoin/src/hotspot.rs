@@ -132,7 +132,7 @@ impl HotspotObserver {
             .try_call(
                 self.next_id,
                 &self.service,
-                &format!("{}.props.get", self.service),
+                format!("{}.props.get", self.service),
                 BTreeMap::new(),
                 "{}",
             )
