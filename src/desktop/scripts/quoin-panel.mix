@@ -32,7 +32,14 @@
 -- poll of anyone's state.
 $p = require("lib/panel.mix")
 
-$ME = "quoin-panel"
+-- Our own Bus name goes into every scene document's `citizen:` field, which
+-- is where Quoin routes the document's clicks. It must be the name THIS
+-- instance registered under (`mix --serve … --name`): a second instance (the
+-- nested dev stack's `quoin-panel-n`) that still said "quoin-panel" had its
+-- clicks delivered to the LIVE panel (found 2026-09-24 by the chunk-21 gate).
+-- Mix has no "my serve name" builtin yet (TODO-mix), so the launcher must
+-- pass PANEL_NAME whenever --name is not the default.
+$ME = env("PANEL_NAME", "quoin-panel")
 $HOST = env("SCENE_HOST", "shell")
 $COMP = env("COMP_SERVICE", "comp")
 $APPS = env("APPS_SERVICE", "apps")
