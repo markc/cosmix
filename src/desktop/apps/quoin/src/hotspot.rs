@@ -21,6 +21,12 @@ pub(crate) struct HotspotObserver {
     present: Option<bool>,
     pending: Option<u64>,
     dirty: bool,
+    /// A deadzone change (or an unknown one: gap, dropped messages) landed
+    /// while a read was in flight, so its reply is known stale and is not
+    /// published. Registry receipts set only `dirty`: they queue one follow-up
+    /// read without discarding the reply, so unrelated registry churn cannot
+    /// starve the inset.
+    stale: bool,
     /// One `QUOIN_HOTSPOT_READ_FAILED` notice per run of failed reads; a
     /// successful read re-arms it so a later failure is noticed again.
     read_failure_logged: bool,
@@ -43,6 +49,7 @@ impl HotspotObserver {
             present: None,
             pending: None,
             dirty: false,
+            stale: false,
             read_failure_logged: false,
             next_id: 0x48_0000_0000,
         }
@@ -88,12 +95,15 @@ impl HotspotObserver {
                 self.dirty = false;
                 *size = QuoinHotspotSize::default();
             }
-            BusBridgeEvent::DroppedMessages(_) => self.dirty = self.generation.is_some(),
+            BusBridgeEvent::DroppedMessages(_) => {
+                self.dirty = self.generation.is_some();
+                self.stale = self.dirty;
+            }
             BusBridgeEvent::Reply { request_id, result } if self.pending == Some(*request_id) => {
                 self.pending = None;
-                // A change received during this read requires a fresh read.
-                // Do not transiently publish a snapshot already known stale.
-                if !self.dirty {
+                // A deadzone change received during this read requires a fresh
+                // read; do not transiently publish a snapshot known stale.
+                if !self.stale {
                     match scoped_deadzone(result) {
                         Ok(value) => {
                             *size = QuoinHotspotSize(value as f32);
@@ -138,6 +148,7 @@ impl HotspotObserver {
         if gap || relevant || self.present != Some(true) {
             self.present = Some(true);
             self.dirty = true;
+            self.stale = true;
         }
     }
 
@@ -163,6 +174,7 @@ impl HotspotObserver {
         {
             self.pending = Some(self.next_id);
             self.dirty = false;
+            self.stale = false;
         }
     }
 }
