@@ -2161,13 +2161,10 @@ mod tests {
         let mut stale = scene_load("stale", "owner", "left");
         stale.connection_generation = 0;
         peer.send(stale);
-        let mut unattested = scene_load("unattested", "owner", "left");
-        unattested.headers.clear();
-        peer.send(unattested);
         app.update();
-        let replies = peer.drain_responses();
-        assert_eq!(replies.len(), 2);
-        assert!(replies.iter().all(|reply| reply.rc == 10));
+        // The bridge drops stale epochs before Quoin dispatch. Their reply
+        // correlation belongs to a dead connection, so no reply is expected.
+        assert!(peer.drain_responses().is_empty());
         assert!(
             app.world()
                 .resource::<SubPanelRegistryState>()
@@ -2175,6 +2172,43 @@ mod tests {
                 .names_owned_by("owner")
                 .is_empty()
         );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner")
+                .is_empty()
+        );
+        let mut unattested = scene_load("unattested", "owner", "left");
+        unattested.headers.clear();
+        peer.send(unattested);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(replies[0].body.contains("scene caller provenance"));
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .is_empty()
+        );
+        // Positive control: the same live, attested sender can still load.
+        load_scene(&mut app, &peer, "accepted", "owner", "left");
     }
 
     /// A reply that failed because the worker is GONE must be dropped, not
