@@ -80,8 +80,11 @@ impl SubPanelRegistry {
         self.seats.get(name)
     }
 
-    /// Repopulate a replacement output in receipt order, retaining its config
-    /// order and selection. Mounted and verb-only registrations both survive.
+    /// Repopulate a replacement output in receipt order. The caller must reapply
+    /// accepted declarations first so declared names fill their configured slots;
+    /// undeclared names append in receipt order. Registration fulfils pending
+    /// saved selection without overriding explicit selection. Mounted and
+    /// verb-only registrations both survive.
     pub fn populate_model(&self, model: &mut ShellModel) {
         let mut seats: Vec<_> = self
             .seats

@@ -404,6 +404,64 @@ mod tests {
     }
 
     #[test]
+    fn output_change_repopulates_carousel_from_migrated_seats() {
+        use cosmix_shell::runtime::{SubPanelRegistryState, register_shell_page};
+        let registry = crate::page_registry();
+        let size = Vec2::new(1920.0, 1080.0);
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            ShellRuntimePlugin::new(model("DP-1", size, &registry)),
+        ))
+        .insert_resource(registry)
+        .insert_resource(crate::state::StateStore::load(None))
+        .insert_resource(EmbeddedHost {
+            detector: CornerDetector::new(
+                CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0).unwrap(),
+            ),
+            name: "DP-1".into(),
+            size,
+        })
+        .init_resource::<EmbeddedOutput>();
+        let world = app.world_mut();
+        crate::config::ingest_test_config(
+            world,
+            r#"{panels: {left: ["scene-mounted", "verb-only", "nav"]}}"#,
+        );
+        // Receipt order deliberately differs from declaration order.
+        for (name, receipt) in [("verb-only", 1), ("scene-mounted", 2), ("tail", 3)] {
+            world
+                .resource_mut::<SubPanelRegistryState>()
+                .0
+                .mount(name, OutputKey::new("DP-1").unwrap(), Edge::Left, "owner", receipt)
+                .unwrap();
+            register_shell_page(world, Edge::Left, name);
+        }
+        {
+            let mut output = world.resource_mut::<EmbeddedOutput>();
+            output.name = "HDMI-1".into();
+            output.size = size;
+            output.active = true;
+        }
+        // The production host constructs a static model, restores state and
+        // calls replace_shell_model. No declarations are seeded into it here.
+        prepare(world);
+        let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert_eq!(
+            panel.page_ids.as_ref(),
+            ["scene-mounted", "verb-only", "nav", "places", "info", "tail"]
+        );
+        assert!(!panel.mapped);
+        for name in ["verb-only", "scene-mounted", "tail"] {
+            assert_eq!(
+                world.resource::<SubPanelRegistryState>().0.seat(name)
+                    .unwrap().output.as_str(),
+                "HDMI-1"
+            );
+        }
+    }
+
+    #[test]
     fn startup_placeholder_restores_nothing_until_the_first_real_observation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quoin.state.mix");

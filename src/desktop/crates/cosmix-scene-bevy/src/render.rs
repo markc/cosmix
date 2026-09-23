@@ -381,6 +381,15 @@ pub(crate) fn remove_unseated_scenes(world: &mut World) {
             .collect();
         for name in removed {
             if let Some(mounted) = store.scenes.remove(&name).and_then(|entry| entry.mounted) {
+                let id = page_id(&mounted.tree);
+                let still_registered = world
+                    .get_resource::<cosmix_shell::runtime::ShellFrameState>()
+                    .is_some_and(|frame| frame.0.panel(mounted.edge).page_ids.contains(&id));
+                if still_registered {
+                    eprintln!("QUOIN_INVARIANT unseated_scene_still_in_carousel page={id}");
+                    #[cfg(test)]
+                    debug_assert!(!still_registered, "unseated scene still in carousel: {id}");
+                }
                 cosmix_shell::chrome::unmount_page_content(
                     world,
                     mounted.edge,
@@ -1366,6 +1375,20 @@ mod tests {
                 .seat("verb-only")
                 .is_some()
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "unseated scene still in carousel")]
+    fn unseated_scene_with_live_carousel_page_trips_invariant() {
+        use cosmix_shell::runtime::SubPanelRegistryState;
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        load_mount_test_scene(world, "orphan", Edge::Left, 200);
+        reconcile(world);
+        // Deliberately violate the registry-removal contract: drop only the
+        // seat, leaving the frame's page live when content teardown runs.
+        world.resource_mut::<SubPanelRegistryState>().0.forget("scene-orphan");
+        remove_unseated_scenes(world);
     }
 
     #[test]

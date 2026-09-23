@@ -33,6 +33,8 @@ pub struct Carousel {
     pages: Arc<[String]>,
     /// Page a default reveal shows; `None` until one is selected.
     last_selected: Option<String>,
+    /// Saved selection waiting for content; a successful explicit selection cancels it.
+    pending_restore: Option<String>,
 }
 
 /// One ordered carousel position.
@@ -60,6 +62,7 @@ impl Carousel {
             declared_len: 0,
             pages: Arc::from([]),
             last_selected: None,
+            pending_restore: None,
         };
         carousel.rebuild_pages();
         Ok(carousel)
@@ -82,6 +85,7 @@ impl Carousel {
             active: None,
             pages: Arc::from([]),
             last_selected: None,
+            pending_restore: None,
         })
     }
 
@@ -147,6 +151,16 @@ impl Carousel {
     /// shows the primary, skipping empty slots if it has no content.
     pub fn last_selected(&self) -> Option<&str> {
         self.last_selected.as_deref()
+    }
+
+    /// Restore a saved name now, or when its content first registers.
+    /// Until then the carousel rests on live content. Explicit selection wins
+    /// over this deferred restore, including selection of the current page.
+    pub fn restore_saved_selection(&mut self, name: &str) {
+        self.pending_restore = None;
+        if !self.select_id(name) && !name.trim().is_empty() {
+            self.pending_restore = Some(name.to_owned());
+        }
     }
 
     /// Restore default-reveal selection without rewriting selection memory.
@@ -217,8 +231,9 @@ impl Carousel {
     /// Register content for `name`.
     ///
     /// A declared name fills its slot in declared order; any other name
-    /// appends to the tail in registration order. Registering never moves
-    /// the selection. The name must be non-empty and not already live.
+    /// appends to the tail in registration order. Selection stays put except
+    /// when this name fulfils a pending saved-state restore. The name must be
+    /// non-empty and not already live.
     pub fn register(&mut self, name: &str) -> Result<(), CarouselError> {
         if name.trim().is_empty() {
             return Err(CarouselError::EmptyId);
@@ -237,6 +252,9 @@ impl Carousel {
         // Filling a preceding empty slot must not move the default-shown page.
         // Registration only appends or fills slots, so this index stays valid.
         self.active = showing.or_else(|| self.registered_slot(name));
+        if self.pending_restore.as_deref() == Some(name) {
+            self.select_id(name);
+        }
         self.rebuild_pages();
         Ok(())
     }
@@ -327,6 +345,7 @@ impl Carousel {
     }
 
     fn select_slot(&mut self, slot: usize) {
+        self.pending_restore = None;
         self.active = Some(slot);
         self.last_selected = Some(self.slots[slot].name.clone());
     }
@@ -593,6 +612,41 @@ mod tests {
         carousel.remove("alpha").unwrap();
         assert_eq!(carousel.last_selected(), None);
         assert_eq!(carousel.active_id(), Some("beta"));
+    }
+
+    #[test]
+    fn pending_restore_survives_redeclare_and_reveal_then_uses_removal_memory() {
+        let mut carousel = Carousel::new(["primary", "other"]).unwrap();
+        carousel.restore_saved_selection("scene-panel");
+        carousel.redeclare(["primary", "scene-panel", "other"]).unwrap();
+        carousel.restore_selection();
+        assert_eq!(carousel.active_id(), Some("primary"));
+        carousel.register("scene-panel").unwrap();
+        assert_eq!(carousel.active_id(), Some("scene-panel"));
+        assert_eq!(carousel.last_selected(), Some("scene-panel"));
+        carousel.remove("scene-panel").unwrap();
+        assert_eq!(carousel.last_selected(), Some("primary"));
+        carousel.register("scene-panel").unwrap();
+        carousel.restore_selection();
+        assert_eq!(carousel.active_id(), Some("primary"));
+    }
+
+    #[test]
+    fn activation_and_index_selection_cancel_pending_restore() {
+        for by_index in [false, true] {
+            let mut carousel = Carousel::new(["primary", "other"]).unwrap();
+            carousel.restore_saved_selection("scene-panel");
+            if by_index {
+                assert!(carousel.select_index(0));
+            } else {
+                carousel.activate("other").unwrap();
+            }
+            let selected = carousel.active_id().unwrap().to_owned();
+            carousel.register("scene-panel").unwrap();
+            carousel.restore_selection();
+            assert_eq!(carousel.active_id(), Some(selected.as_str()));
+            assert_eq!(carousel.last_selected(), Some(selected.as_str()));
+        }
     }
 
     #[test]

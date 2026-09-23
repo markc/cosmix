@@ -188,7 +188,7 @@ impl SavedState {
                     .restore_thickness(edge, thickness)
                     .expect("saved thickness was validated");
             }
-            model.carousel_mut(edge).select_id(&saved.page);
+            model.carousel_mut(edge).restore_saved_selection(&saved.page);
             model
                 .set_mode(edge, model.last_update(), saved.mode)
                 .expect("restore uses model time");
@@ -1059,6 +1059,113 @@ mod tests {
                 Some(scheme.name().to_owned())
             );
             app.world_mut().entity_mut(dot).despawn();
+        }
+    }
+
+    fn scene_selection_state(output: &str) -> SavedState {
+        let mut saved = SavedState::default();
+        let mut state = output_state(output, 177.0, PanelMode::Hidden, 0);
+        state.edges[Edge::Left.index()].page = "scene-panel".into();
+        saved.outputs.insert(
+            output_identity(&OutputKey::new(output).unwrap()).unwrap(),
+            state,
+        );
+        saved
+    }
+
+    #[test]
+    fn cold_restart_restores_scene_backed_selection_on_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        atomic_save(&path, &scene_selection_state("DP-1")).unwrap();
+        let mut model = model_for("DP-1");
+        StateStore::load(Some(path)).restore(&mut model);
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("nav"));
+        model
+            .carousel_mut(Edge::Left)
+            .register("unrelated")
+            .unwrap();
+        model
+            .carousel_mut(Edge::Left)
+            .register("scene-panel")
+            .unwrap();
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("scene-panel"));
+        assert_eq!(model.panel(Edge::Left).mode, PanelMode::Hidden);
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("scene-panel"));
+        assert_eq!(
+            model.carousel(Edge::Left).last_selected(),
+            Some("scene-panel")
+        );
+        assert_eq!(model.panel(Edge::Left).thickness_px, 177.0);
+    }
+
+    #[test]
+    fn output_switch_restores_scene_backed_selection_on_registration() {
+        use cosmix_shell::runtime::{SubPanelRegistryState, register_shell_page};
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model_for("DP-1"))));
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "scene-panel",
+                OutputKey::new("DP-1").unwrap(),
+                Edge::Left,
+                "owner",
+                1,
+            )
+            .unwrap();
+        register_shell_page(app.world_mut(), Edge::Left, "scene-panel");
+        let mut replacement = model_for("HDMI-1");
+        scene_selection_state("HDMI-1").restore(&mut replacement);
+        replace_shell_model(app.world_mut(), replacement);
+        let panel = app.world().resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert_eq!(panel.active_page_id.as_deref(), Some("scene-panel"));
+        assert!(!panel.mapped);
+        resize_command_for(
+            &mut app,
+            "HDMI-1",
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Reveal,
+            },
+        );
+        assert_eq!(
+            app.world().resource::<ShellFrameState>().0.panel(Edge::Left)
+                .active_page_id.as_deref(),
+            Some("scene-panel")
+        );
+    }
+
+    #[test]
+    fn explicit_selection_cancels_pending_restore() {
+        use cosmix_shell::runtime::register_shell_page;
+        // Both an explicit no-op selection and moving to another page cancel.
+        for input in [
+            CarouselInput::SelectId("nav".into()),
+            CarouselInput::SelectId("places".into()),
+            CarouselInput::Next,
+            CarouselInput::Previous,
+        ] {
+            let mut model = model_for("DP-1");
+            scene_selection_state("DP-1").restore(&mut model);
+            let mut app = App::new();
+            app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+            resize_command(
+                &mut app,
+                ShellCommandKind::Carousel { edge: Edge::Left, input },
+            );
+            let selected = app.world().resource::<ShellFrameState>().0.panel(Edge::Left)
+                .active_page_id.clone();
+            register_shell_page(app.world_mut(), Edge::Left, "scene-panel");
+            resize_input(&mut app, PanelInput::Reveal);
+            assert_eq!(
+                app.world().resource::<ShellFrameState>().0.panel(Edge::Left).active_page_id,
+                selected
+            );
         }
     }
 

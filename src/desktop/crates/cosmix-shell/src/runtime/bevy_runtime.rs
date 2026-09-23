@@ -28,6 +28,10 @@ struct ShellRuntime {
 #[derive(Resource, Clone, Debug)]
 pub struct ShellFrameState(pub ShellFrame);
 
+/// Last accepted declarations, retained across model factories in both hosts.
+#[derive(Resource, Clone)]
+struct ShellPageDeclarations([Vec<String>; 4]);
+
 /// The process-wide sub-panel registry: every live sub-panel name with its
 /// `(output, edge, owner)` seat, held above the one live [`ShellModel`]
 /// because names are globally unique across outputs while a model is not.
@@ -103,7 +107,8 @@ impl Plugin for ShellRuntimePlugin {
 /// keeps whatever its factory restored or defaulted to, so the outgoing
 /// output's live state never leaks into another output's remembered
 /// configuration (per-(output, edge) persistence). Registry seats migrate and
-/// refill the replacement's declared slots without carrying selection. The layer
+/// refill slots after reapplying the last accepted declarations. A pending saved
+/// selection is fulfilled as its seat registers. The layer
 /// host drains and destroys the old surfaces first, then calls this before
 /// mapping fresh surfaces on the replacement output.
 pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
@@ -113,6 +118,14 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     }
     if model.output() == &old_output {
         model.carry_live_state(&world.resource::<ShellRuntime>().model);
+    }
+    if let Some(declarations) = world.get_resource::<ShellPageDeclarations>() {
+        for edge in Edge::ALL {
+            model
+                .carousel_mut(edge)
+                .redeclare(declarations.0[edge.index()].iter().cloned())
+                .expect("accepted shell declarations remain valid");
+        }
     }
     if let Some(registry) = world.get_resource::<SubPanelRegistryState>() {
         registry.0.populate_model(&mut model);
@@ -130,7 +143,8 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
 }
 
 /// Set an edge preference without emitting a pointer-resize persistence effect.
-/// Scene mounting uses `seed_page_thickness` to avoid replacing this value.
+/// Production calls this only through `seed_page_thickness`; direct calls are
+/// used by tests to establish remembered preferences.
 pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
     let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
         return;
@@ -152,7 +166,8 @@ pub fn seed_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
     }
 }
 
-/// Add mounted content without rebuilding declarations or moving selection.
+/// Add mounted content without rebuilding declarations; only a pending saved
+/// selection may move the resting page during registration.
 /// A scene may already have been registered by its ingress transaction.
 pub fn register_shell_page(world: &mut World, edge: Edge, name: &str) {
     let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
@@ -184,7 +199,8 @@ pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: 
 
 /// Reapply configuration declarations without rebuilding live carousels.
 /// Validate every edge before mutation; registrations, active names and selection
-/// memory survive. Returns false if the host has not installed its model yet.
+/// memory survive. Retain accepted declarations for replacement models in either
+/// host. Returns false if the host has not installed its model yet.
 pub fn redeclare_shell_pages(
     world: &mut World,
     declarations: &[Vec<String>; 4],
@@ -203,6 +219,7 @@ pub fn redeclare_shell_pages(
     }
     let frame = ShellFrame::from_model(&runtime.model);
     world.resource_mut::<ShellFrameState>().0 = frame;
+    world.insert_resource(ShellPageDeclarations(declarations.clone()));
     Ok(true)
 }
 
@@ -1033,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn output_change_repopulates_carousel_from_migrated_seats() {
+    fn replacement_reapplies_accepted_declarations_before_migrated_seats() {
         let mut app = app();
         let world = app.world_mut();
         for (name, receipt) in [("verb-only", 1), ("scene-mounted", 2)] {
@@ -1064,9 +1081,9 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        replacement
-            .declare_carousel(Edge::Left, ["scene-mounted", "verb-only"])
-            .unwrap();
+        let mut declarations = std::array::from_fn(|_| Vec::new());
+        declarations[Edge::Left.index()] = vec!["scene-mounted".into(), "verb-only".into()];
+        redeclare_shell_pages(world, &declarations).unwrap();
         replacement.restore_thickness(Edge::Left, 88.0).unwrap();
         replace_shell_model(world, replacement);
         let runtime = world.resource::<ShellRuntime>();
