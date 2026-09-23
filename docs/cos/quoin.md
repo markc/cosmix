@@ -421,22 +421,35 @@ registered compositor instance (default `comp`), giving topic headers
 `<service>.corner.entered`, `<service>.corner.left`, `<service>.corner.clicked.v2`,
 `<service>.corner.clicked` and `<service>.output.changed`. Their inner commands
 are the same suffixes without the service prefix.
-Brief LMB toggles **Pinned** (persistent overlay); brief RMB toggles **Docked**
+With legacy corner payloads, brief LMB toggles **Pinned** (persistent overlay);
+brief RMB toggles **Docked**
 (reserves space). Both use the existing counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
 the change. Unpinning leaves transient reveal/grace to the panel model; undocking
 does so only while held, otherwise it starts concealment immediately.
-The header pin control toggles overlay pinning; its glyph is `◇` for hidden
-(including transient reveal), `◆` for pinned and `▣` for docked.
+Panel headers have carousel controls, with no pin glyph or mode button. Change
+mode at the corner, in its menu, or through the precise mode verbs.
 
 The compositor also publishes `corner.clicked.v2` with `button` and `kind` for
 LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
 their releases, cancelling pending actions on excess movement or disengagement.
-RMB hold never toggles a mode. It calls the optional host App resource
-`CornerMenuHook(fn(&mut World, &OutputKey, Corner))`. The callback must look up
-that output/corner's configured menu and do nothing if none exists. Without
-the resource, hold is a traced no-op. No callback or menu UI is installed yet.
+The menu action calls `CornerMenuHook(fn(&mut World, &OutputKey, Corner))`.
+The host always provides **Pin / Dock / Hide**, with the current mode checked
+and disabled; Quoin appends `conf.mix`'s `menu_items` for that edge. Each mode
+choice uses the same `SetMode` command as the precise mode verbs. Extra items
+invoke their declared Bus target and verb, with the string list in `args`.
+The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
+Return or Space chooses it. Escape, click-away and item choice close the menu,
+end its local reveal hold and release its exclusive keyboard layer. Comp's
+existing policy then focuses the top toplevel; exact previous-surface focus
+restoration belongs to the forthcoming compositor popup holder. Pin and Dock
+apply before the local hold is released, so concealment cannot race the choice.
+Opening a menu at a hidden corner does not itself reveal the panel.
+
+With the newer modifier-aware corner protocol, brief RMB opens this menu.
+Until the compositor remapping lands, legacy brief RMB still toggles Docked
+and RMB hold opens the menu.
 
 Both click topics are subscribed for old-compositor compatibility. Successful
 subscription is not capability discovery: the broker accepts unpublished topics.
@@ -482,7 +495,7 @@ If only a click is dropped at the host-to-runner queue, existing holds are retai
 A compositor enter reveals and holds the counter-clockwise edge (TL→left, BL→bottom,
 BR→right, TR→top). Matching left starts the 800 ms grace only when the native
 pointer is also outside. Native SCTK pointer enter/leave supplies the second
-hold; Bevy pointer button events drive pin, both carousel chevrons and page
+hold; Bevy pointer button events drive both carousel chevrons and page
 dots. Pin survives both leaves, and unpin outside both holds starts normal
 grace. Wheel events are delivered to Bevy although current chrome does not
 consume them.

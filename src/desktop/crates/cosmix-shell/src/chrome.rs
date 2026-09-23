@@ -9,6 +9,7 @@
 //! only docked motion with [`UiTransform::translation`].
 
 use accesskit::Role;
+pub mod corner_menu;
 use std::error::Error;
 use std::fmt::{Display as FmtDisplay, Formatter};
 
@@ -350,7 +351,6 @@ struct QuoinPanelChrome {
 #[derive(Component)]
 struct QuoinPanelParts {
     header: Entity,
-    pin_label: Entity,
     title_label: Entity,
     page_titles: Vec<(String, String)>,
     page_chromeless: Vec<(String, bool)>,
@@ -391,7 +391,6 @@ enum QuoinAction {
     Scheme(Scheme),
     Intent,
     Quit,
-    TogglePin,
     Previous,
     Next,
     Select(String),
@@ -517,7 +516,7 @@ pub fn mount_page_with(
         .id();
     world.entity_mut(host).add_child(wrapper);
     let header = world.get::<QuoinPanelParts>(panel).unwrap().header;
-    let dots = world.get::<Children>(header).unwrap()[3];
+    let dots = world.get::<Children>(header).unwrap()[2];
     let mut queue = bevy::ecs::world::CommandQueue::default();
     let mut commands = Commands::new(&mut queue, world);
     let label = text(&mut commands, "○", 11.0, true);
@@ -598,14 +597,6 @@ fn spawn_panel(
         .iter()
         .map(|page| (page.id.clone(), page.title.clone()))
         .collect::<Vec<_>>();
-    let pin_label = text(commands, "◇", 15.0, false);
-    let pin = button(
-        commands,
-        edge,
-        QuoinAction::TogglePin,
-        pin_label,
-        "Pin panel",
-    );
     let previous_label = text(commands, "‹", 17.0, false);
     let previous = button(
         commands,
@@ -634,7 +625,7 @@ fn spawn_panel(
             ..default()
         })
         .id();
-    let mut controls = vec![pin, previous, next];
+    let mut controls = vec![previous, next];
     let mut dot_labels = Vec::with_capacity(pages.len());
     for page in &pages {
         let label = text(commands, "○", 11.0, true);
@@ -665,7 +656,7 @@ fn spawn_panel(
             },
             bevy::feathers::theme::ThemeBackgroundColor(tokens::MASTER_PANEL),
         ))
-        .add_children(&[pin, title_label, previous, dots, next])
+        .add_children(&[title_label, previous, dots, next])
         .id();
 
     let page_host = commands
@@ -726,7 +717,6 @@ fn spawn_panel(
             },
             QuoinPanelParts {
                 header,
-                pin_label,
                 title_label,
                 page_titles,
                 page_chromeless: Vec::new(),
@@ -1099,10 +1089,6 @@ fn on_activate(
             return;
         }
         QuoinAction::Quit => ShellCommandKind::Quit,
-        QuoinAction::TogglePin => ShellCommandKind::Panel {
-            edge: control.edge,
-            input: PanelInput::PinToggle,
-        },
         QuoinAction::Previous => ShellCommandKind::Carousel {
             edge: control.edge,
             input: CarouselInput::Previous,
@@ -1236,16 +1222,6 @@ fn present_panels(
         };
         if transform.translation != translation {
             transform.translation = translation;
-        }
-        if let Ok(mut label) = queries.labels.get_mut(parts.pin_label) {
-            let text = match panel.mode {
-                PanelMode::Hidden => "◇",
-                PanelMode::Pinned => "◆",
-                PanelMode::Docked => "▣",
-            };
-            if label.0 != text {
-                label.0 = text.to_owned();
-            }
         }
         if let Some(title) = panel.active_page_id.as_deref().and_then(|active| {
             parts
@@ -1642,14 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_cursor_press_release_activates_pin_both_chevrons_and_dot() {
-        assert_eq!(
-            pointer_click_command(QuoinAction::TogglePin),
-            ShellCommandKind::Panel {
-                edge: Edge::Left,
-                input: PanelInput::PinToggle,
-            }
-        );
+    fn pointer_cursor_press_release_activates_both_chevrons_and_dot() {
         assert_eq!(
             pointer_click_command(QuoinAction::Previous),
             ShellCommandKind::Carousel {
@@ -1753,7 +1722,6 @@ mod tests {
         frame.panels[Edge::Left.index()].mode = PanelMode::Hidden;
         frame.panels[Edge::Left.index()].transient_revealed = true;
         let mut world = World::new();
-        let pin = world.spawn(Text::new("")).id();
         let title = world.spawn(Text::new("")).id();
         let nav_dot = world.spawn(Text::new("")).id();
         let places_dot = world.spawn(Text::new("")).id();
@@ -1770,7 +1738,6 @@ mod tests {
                 QuoinPanelParts {
                     header: Entity::PLACEHOLDER,
                     page_chromeless: Vec::new(),
-                    pin_label: pin,
                     title_label: title,
                     page_titles: vec![
                         ("nav".into(), "Navigation".into()),
@@ -1790,7 +1757,7 @@ mod tests {
         world.run_system_once(present_panels).unwrap();
         world.clear_trackers();
         world.run_system_once(present_panels).unwrap();
-        for entity in [pin, title, nav_dot, places_dot] {
+        for entity in [title, nav_dot, places_dot] {
             assert!(!world.entity(entity).get_ref::<Text>().unwrap().is_changed());
         }
         for entity in [panel, nav_page, places_page] {
@@ -1811,7 +1778,7 @@ mod tests {
                 .is_changed()
         );
 
-        // Pin and carousel changes must still reach the existing entities.
+        // Carousel changes must still reach the existing entities.
         {
             let mut frame = world.resource_mut::<ShellFrameState>();
             let left = &mut frame.0.panels[Edge::Left.index()];
@@ -1820,10 +1787,9 @@ mod tests {
             left.active_page_id = Some("places".into());
         }
         world.run_system_once(present_panels).unwrap();
-        for entity in [pin, title, nav_dot, places_dot] {
+        for entity in [title, nav_dot, places_dot] {
             assert!(world.entity(entity).get_ref::<Text>().unwrap().is_changed());
         }
-        assert_eq!(world.get::<Text>(pin).unwrap().0, "▣");
         assert_eq!(world.get::<Text>(title).unwrap().0, "Places");
         assert_eq!(world.get::<Node>(nav_page).unwrap().display, Display::None);
         assert_eq!(
@@ -1881,7 +1847,6 @@ mod tests {
             .unwrap();
 
         let mut world = World::new();
-        let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         let chrome = world
             .spawn((
@@ -1893,7 +1858,6 @@ mod tests {
                 QuoinPanelParts {
                     header: Entity::PLACEHOLDER,
                     page_chromeless: Vec::new(),
-                    pin_label,
                     title_label,
                     page_titles: Vec::new(),
                     page_wrappers: Vec::new(),
@@ -1932,7 +1896,6 @@ mod tests {
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(0), px(0))
         );
-        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "◆");
 
         model
             .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
@@ -1940,7 +1903,6 @@ mod tests {
         world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
         world.run_system_once(present_panels).unwrap();
         // Current docked with committed overlay remains protocol-owned.
-        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "▣");
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(0), px(0))
@@ -1973,7 +1935,6 @@ mod tests {
         );
         assert_eq!(model.panel(Edge::Left).visible_fraction, 0.0);
         assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 0.0);
-        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "◇");
     }
 
     #[test]
@@ -1994,7 +1955,6 @@ mod tests {
         let control = world.spawn(TabIndex(0)).id();
         let content_control = world.spawn(TabIndex(0)).id();
         let header = world.spawn(Node::default()).add_child(control).id();
-        let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         world
             .spawn((
@@ -2005,7 +1965,6 @@ mod tests {
                 },
                 QuoinPanelParts {
                     header,
-                    pin_label,
                     title_label,
                     page_chromeless: vec![("plain".into(), true)],
                     page_titles: Vec::new(),
@@ -2062,7 +2021,6 @@ mod tests {
 
         let mut world = World::new();
         let control = world.spawn((TabIndex(-1), InteractionDisabled)).id();
-        let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         world.spawn((
             QuoinPanelChrome {
@@ -2073,7 +2031,6 @@ mod tests {
             QuoinPanelParts {
                 header: Entity::PLACEHOLDER,
                 page_chromeless: Vec::new(),
-                pin_label,
                 title_label,
                 page_titles: Vec::new(),
                 page_wrappers: Vec::new(),
@@ -2137,7 +2094,7 @@ mod tests {
     }
 
     /// Full-spawn sweep: every control the production `spawn_quoin_chrome`
-    /// path produces — pins, chevrons, dots, page controls on all four
+    /// path produces — chevrons, dots, page controls on all four
     /// edges — must carry the ui_widgets Button. Guards the assumption that
     /// `button()` stays the single spawn choke point; a control spawned some
     /// other way would pass the choke-point test above and still be
@@ -2172,6 +2129,11 @@ mod tests {
         assert!(
             !controls.is_empty(),
             "spawn_quoin_chrome produced no controls — the sweep would be vacuous"
+        );
+        assert_eq!(
+            controls.len(),
+            12,
+            "only two chevrons and one page dot per header; no mode control"
         );
         for control in controls {
             assert!(
