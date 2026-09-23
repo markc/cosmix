@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bevy::prelude::*;
-use cosmix_shell::core::{OutputKey, SubPanelRegistry, SubPanelRegistryError, target_output};
+use cosmix_shell::core::{OutputKey, SubPanelRegistry, SubPanelRegistryError, keyboard_target_output};
 use cosmix_shell::runtime::{ShellCommand, ShellFrame, ShellSemanticVerb, semantic_shell_command};
 use ctk::app_control::verify_caller_provenance;
 use ctk::bus::{BusBridge, BusBridgeConfig, BusBridgeEvent, BusConnectionState, BusMessage, InboundRequest};
@@ -78,7 +78,8 @@ impl ActivationTargets {
     /// The output an activation aims at: the focused window's, else the
     /// pointer's. `None` until comp has answered.
     pub(crate) fn target(&self) -> Option<&OutputKey> {
-        target_output(self.focused.as_ref(), self.pointer.as_ref())
+        // The same shell doc §5 rule keyboard actions follow.
+        keyboard_target_output(self.focused.as_ref(), self.pointer.as_ref())
     }
 
     /// Forget what comp said and start a fresh round on the next flush.

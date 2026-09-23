@@ -11,7 +11,9 @@ use super::{Edge, OutputKey};
 /// keyboard, so for a key it received the focused window is that panel and
 /// its output always wins. The pointer fallback serves a future global route
 /// (a compositor-grabbed chord fired while an application or nothing is
-/// focused), whose inputs are comp's focus and pointer observations.
+/// focused), whose inputs are comp's focus and pointer observations. Named
+/// activation (panel doc §6) aims through this same seam, fed by those
+/// observations (`apps/quoin` `activation.rs`).
 pub fn keyboard_target_output<'a>(
     focused_window: Option<&'a OutputKey>,
     pointer: Option<&'a OutputKey>,
