@@ -133,11 +133,16 @@ fn select_page($edge, $page)
   return false
 end
 
--- Select a scene page and pin its edge open; false (nothing pinned) when the
--- page could not be selected, so the wrong page is never pinned.
+-- Select a scene page and pin its edge open; false when the page could not
+-- be selected (so the wrong page is never pinned) OR the pin was refused, so a
+-- caller that records success (panel_shown) keeps retrying until the edge is
+-- actually pinned.
 fn show_page($edge, $page)
   if not select_page($edge, $page) then return false end
-  panel_verb("shell.panel.pin", $edge, nil)
+  if panel_verb("shell.panel.pin", $edge, nil) != 0 then
+    note("pin " .. $edge .. " refused after selecting " .. $page)
+    return false
+  end
   return true
 end
 
