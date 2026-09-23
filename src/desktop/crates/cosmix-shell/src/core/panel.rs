@@ -239,16 +239,22 @@ pub struct PanelStateMachine {
     /// A deliberate conceal the compositor's holders have not yet released:
     /// its reveals are ignored until it reports the holders released.
     ///
-    /// This is THE command-driven (holder-plane) latch: set by a hide from a
-    /// persistent mode, and by Hide/Escape/toggle-off while the compositor
-    /// (or the local membership shows the pointer) holds; cleared by
-    /// `HolderConceal`, by a mode change to pinned or docked (a change to
-    /// hidden sets it), and, with no compositor hold, once the local
-    /// membership is gone — so it can never wedge. Chunk 20's
-    /// `hover_latched` stays local-only (set and cleared only in the unguarded
-    /// corner/pointer arms); at that merge the Hide/Escape arm becomes
-    /// `if plane { latch_deliberate_conceal } else { hover latch }` before
-    /// `conceal_now()`, and the snapshot's latch reads `hover_latched || latched`.
+    /// This is THE command-driven (holder-plane) latch.
+    /// - Set by a mode change to hidden (plane only), and by Hide, Escape and
+    ///   toggle-off while the compositor holds or the local membership shows
+    ///   the pointer inside.
+    /// - Cleared by `HolderConceal`; by a mode change to pinned or docked; by
+    ///   an explicit `Reveal` or toggle-on; by `release()` (unpin/undock); by
+    ///   `set_holder_plane` in either direction; and, for a latch armed on
+    ///   local membership alone, once that membership is gone — so it can
+    ///   never wedge.
+    ///
+    /// Chunk 20's `hover_latched` stays local-only (set and cleared only in the
+    /// unguarded corner/pointer arms). At that merge BOTH arms that call
+    /// [`Self::latch_deliberate_conceal`] — Hide/Escape and Toggle-off — become
+    /// `if plane { self.latch_deliberate_conceal() } else { hover latch }`
+    /// before `conceal_now()`, and the snapshot's latch reads
+    /// `hover_latched || latched`.
     latched: bool,
     /// The latch was armed on local membership with no compositor hold, so
     /// no release is certain to clear it: leaving clears it instead.
