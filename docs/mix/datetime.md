@@ -8,18 +8,19 @@ $tomorrow = $now + 86400   -- one day later — just arithmetic
 print(date_format($tomorrow, "%Y-%m-%d"))
 ```
 
-The six builtins:
+The seven builtins:
 
 | Builtin | Returns | Purpose |
 |---|---|---|
 | `time()` | number (float seconds) | current Unix timestamp |
+| `monotonic()` | number (float seconds) | monotonic-clock reading for measuring intervals |
 | `now_iso()` | string | current local time as ISO 8601 / RFC 3339 |
 | `date_format(ts [, fmt])` | string | render a timestamp via strftime (**local** time) |
 | `date_parse(s)` | number | parse a date string → Unix timestamp |
 | `duration_format(secs)` | string | render a span of seconds as `1d 2h 3m 4s` |
 | `relative_time(ts)` | string | render a timestamp as `3h ago` / `in 5m` |
 
-`time()` is always available. The five conversion builtins are **`datetime`-feature-gated** in the library, but the shipping `mix` binary turns the feature on, so they are always present in the `mix` CLI and as a login shell. All six are `Pure`-class (no I/O beyond reading the wall clock) and register under the `system` builtin category — `mix builtins system` lists them. For *pausing* rather than measuring, `sleep(n)` lives on the [system](system.md) page.
+`time()` and `monotonic()` are always available. The five conversion builtins are **`datetime`-feature-gated** in the library, but the shipping `mix` binary turns the feature on, so they are always present in the `mix` CLI and as a login shell. All seven are `Pure`-class (no I/O beyond reading a clock) and register under the `system` builtin category — `mix builtins system` lists them. For *pausing* rather than measuring, `sleep(n)` lives on the [system](system.md) page.
 
 ## time() — the current timestamp
 
@@ -56,6 +57,18 @@ print("took " .. duration_format($elapsed))
 The numeric inputs accept numbers and numeric strings. A supplied value that
 `to_number` cannot parse raises `TYPE_MISMATCH`; it never silently becomes the
 epoch or a zero-duration result.
+
+## monotonic() — the clock that never goes backwards
+
+`monotonic()` returns seconds on the kernel's `CLOCK_MONOTONIC` clock as a **float**. Use it **instead of `time()` whenever you are measuring an interval rather than stamping a calendar moment**: `time()` is wall-clock time, and NTP can step or slew it, so a `time() - $start` difference can come out wrong — even negative — across a clock adjustment. `monotonic()` never goes backwards (two successive reads always satisfy `later >= $earlier`), which is exactly the property an elapsed-time, timeout, or "did this happen before that" computation needs. It is also the clock the compositor's frame traces stamp (`mono_us` in `FRAME_TRACE`), so a Mix measurement can be correlated with a compositor trace from the same machine.
+
+```mix
+$start = monotonic()
+-- ... do work ...
+print("took " .. (monotonic() - $start) .. "s")
+```
+
+The trade-offs: the epoch is unspecified (on Linux it usually counts from machine boot), so the absolute value means nothing across reboots or other machines — only differences and ordering — and `date_format`/`duration_format` have nothing useful to say about it. It also does not include time the machine spends suspended.
 
 ## now_iso() — current local time as a string
 
@@ -323,4 +336,4 @@ due 15:20 (in 1h)
 - [builtins index](builtins.md) — the full builtin catalogue
 - [shell](shell-mode.md) — `mix -c` one-liner rules (newlines, classifier)
 - chrono strftime reference — <https://docs.rs/chrono/latest/chrono/format/strftime/index.html>
-- Run `mix help` for the category listing, or `mix what date_format` (also `time`, `date_parse`, `now_iso`, `duration_format`, `relative_time`) for a one-line description of any builtin.
+- Run `mix help` for the category listing, or `mix what date_format` (also `time`, `monotonic`, `date_parse`, `now_iso`, `duration_format`, `relative_time`) for a one-line description of any builtin.

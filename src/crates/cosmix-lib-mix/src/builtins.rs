@@ -291,6 +291,7 @@ builtin_table! {
 
     ("env", CapabilityClass::Env,             "system",  "Get environment variable value (\"\" if unset); env(name, default) returns default when unset or empty", contract!((name: string, default?: any) -> any)),
     ("time", CapabilityClass::Pure,            "system",  "Return current Unix timestamp as float", contract!(() -> number)),
+    ("monotonic", CapabilityClass::Pure,        "system",  "Return CLOCK_MONOTONIC seconds as a float — the kernel monotonic clock (the one compositor FRAME_TRACE mono_us stamps), never stepped by NTP or wall-clock adjustment, so it never goes backwards and differences are true elapsed intervals. The epoch is unspecified (on Linux it counts from boot); use time() for calendar timestamps, this for measuring and for correlating with compositor traces", contract!(() -> number)),
     ("pid", CapabilityClass::Env,             "system",  "Return current process ID", contract!(() -> number)),
     ("uid", CapabilityClass::Env,             "system",  "Effective user id of this process (geteuid) — normally the id a file access is checked against (Linux checks fsuid, which tracks euid unless setfsuid(2) is called; no Mix script can call it, though an embedder can), so it is the one to compare a stat() map's `uid` against when deciding whether a path is yours (v0.41.0)", contract!(() -> number)),
     ("gid", CapabilityClass::Env,             "system",  "Effective group id of this process (getegid) — the companion to uid(), for comparing against a stat() map's `gid`; same fsgid caveat, and it answers only whether a file's group is the EFFECTIVE one, so use groups() to decide which permission class applies (v0.41.0)", contract!(() -> number)),
@@ -510,6 +511,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "delete" => builtin_delete(args),
         "env" => builtin_env(args),
         "time" => builtin_time(args),
+        "monotonic" => builtin_monotonic(args),
         "pid" => builtin_pid(args),
         "uid" => builtin_uid(args),
         "gid" => builtin_gid(args),
@@ -957,6 +959,7 @@ pub fn man_topic_for_builtin(name: &str) -> Option<&'static str> {
     // Name overrides — most specific, and they beat the coarse category.
     const DATETIME: &[&str] = &[
         "time",
+        "monotonic",
         "now_iso",
         "date_format",
         "date_parse",
@@ -3271,6 +3274,33 @@ fn builtin_time(_args: Vec<Value>) -> MixResult<Option<Value>> {
         .unwrap_or_default()
         .as_secs_f64();
     Ok(Some(Value::Number(secs)))
+}
+
+/// `CLOCK_MONOTONIC` seconds as a float — the measurement clock, not the
+/// calendar. `time()` is wall time: NTP can step or slew it, so a
+/// `time() - time()` difference can come out wrong (even negative) across
+/// a clock adjustment. This clock never goes backwards, which is what an
+/// elapsed-time or ordering comparison needs, and it is the same kernel
+/// clock the compositor's frame traces stamp (`mono_us` in FRAME_TRACE),
+/// so a Mix measurement correlates with a compositor trace from the same
+/// machine. Its epoch is unspecified (on Linux it commonly counts from
+/// boot) and it does not include suspended time — only differences and
+/// ordering are meaningful, never the absolute value.
+fn builtin_monotonic(args: Vec<Value>) -> MixResult<Option<Value>> {
+    expect_args("monotonic", &args, 0)?;
+    // SAFETY: `ts` is a fully-initialised `timespec` passed by exclusive
+    // reference; `clock_gettime` only writes it and returns 0 on success.
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        // Effectively impossible on Linux for this clock id, but a clock
+        // builtin must not fabricate a value — a silent 0 would corrupt
+        // every interval computed from it.
+        return Err(MixError::RuntimeError {
+            msg: "monotonic(): clock_gettime(CLOCK_MONOTONIC) failed".to_string(),
+            span: None,
+        });
+    }
+    Ok(Some(Value::Number(ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9)))
 }
 
 fn builtin_pid(_args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -26655,6 +26685,7 @@ mod char_aware_tests {
             "markdown_escape",
             "merge",
             "mix_version",
+            "monotonic",
             "now_iso",
             // Codepoint <-> character (0.90.0) — pure string arithmetic.
             "ord",
@@ -27834,6 +27865,45 @@ mod loud_numeric_argument_tests {
     }
 }
 
+#[cfg(test)]
+mod monotonic_tests {
+    use super::call_builtin;
+    use crate::value::Value;
+
+    // monotonic() is the interval clock. Positive and finite, and never
+    // decreasing between successive calls in one process — the property
+    // that separates it from time(), which an NTP step can move backwards.
+    #[test]
+    fn monotonic_is_positive_and_never_decreases() {
+        let a = call_builtin("monotonic", vec![]).unwrap().unwrap();
+        let b = call_builtin("monotonic", vec![]).unwrap().unwrap();
+        let (Value::Number(a), Value::Number(b)) = (&a, &b) else {
+            panic!("monotonic() must return numbers, got {a:?} then {b:?}");
+        };
+        assert!(
+            a.is_finite() && *a > 0.0,
+            "monotonic() must be a positive finite number, got {a}"
+        );
+        assert!(b >= a, "monotonic() went backwards: {a} then {b}");
+    }
+
+    // Differencing two reads is the documented use — pin that the delta of
+    // back-to-back calls is a sane (tiny, non-negative) interval.
+    #[test]
+    fn monotonic_differences_are_small_non_negative_intervals() {
+        let a = call_builtin("monotonic", vec![]).unwrap().unwrap();
+        let b = call_builtin("monotonic", vec![]).unwrap().unwrap();
+        let (Value::Number(a), Value::Number(b)) = (&a, &b) else {
+            panic!("monotonic() must return numbers");
+        };
+        let delta = b - a;
+        assert!(
+            (0.0..=1.0).contains(&delta),
+            "back-to-back monotonic() reads should be ~0s apart, got {delta}"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "toml"))]
 mod strict_toml_encode_tests {
     use super::call_builtin;
@@ -27929,6 +27999,9 @@ mod man_topic_tests {
         assert_eq!(man_topic_for_builtin("re_match"), Some("regex"));
         assert_eq!(man_topic_for_builtin("ssh_exec"), Some("remote"));
         assert_eq!(man_topic_for_builtin("date_format"), Some("datetime"));
+        // monotonic sits in the "system" catch-all category but is
+        // documented on the datetime page beside time().
+        assert_eq!(man_topic_for_builtin("monotonic"), Some("datetime"));
     }
 
     #[test]

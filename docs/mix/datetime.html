@@ -447,16 +447,17 @@
 $tomorrow = $now + 86400   -- one day later — just arithmetic
 print(date_format($tomorrow, "%Y-%m-%d"))
 </code></pre>
-<p>The six builtins:</p>
+<p>The seven builtins:</p>
 <table><thead><tr><th>Builtin</th><th>Returns</th><th>Purpose</th></tr></thead><tbody>
 <tr><td><code>time()</code></td><td>number (float seconds)</td><td>current Unix timestamp</td></tr>
+<tr><td><code>monotonic()</code></td><td>number (float seconds)</td><td>monotonic-clock reading for measuring intervals</td></tr>
 <tr><td><code>now_iso()</code></td><td>string</td><td>current local time as ISO 8601 / RFC 3339</td></tr>
 <tr><td><code>date_format(ts [, fmt])</code></td><td>string</td><td>render a timestamp via strftime (<strong>local</strong> time)</td></tr>
 <tr><td><code>date_parse(s)</code></td><td>number</td><td>parse a date string → Unix timestamp</td></tr>
 <tr><td><code>duration_format(secs)</code></td><td>string</td><td>render a span of seconds as <code>1d 2h 3m 4s</code></td></tr>
 <tr><td><code>relative_time(ts)</code></td><td>string</td><td>render a timestamp as <code>3h ago</code> / <code>in 5m</code></td></tr>
 </tbody></table>
-<p><code>time()</code> is always available. The five conversion builtins are <strong><code>datetime</code>-feature-gated</strong> in the library, but the shipping <code>mix</code> binary turns the feature on, so they are always present in the <code>mix</code> CLI and as a login shell. All six are <code>Pure</code>-class (no I/O beyond reading the wall clock) and register under the <code>system</code> builtin category — <code>mix builtins system</code> lists them. For <em>pausing</em> rather than measuring, <code>sleep(n)</code> lives on the <a href="/mix/system">system</a> page.</p>
+<p><code>time()</code> and <code>monotonic()</code> are always available. The five conversion builtins are <strong><code>datetime</code>-feature-gated</strong> in the library, but the shipping <code>mix</code> binary turns the feature on, so they are always present in the <code>mix</code> CLI and as a login shell. All seven are <code>Pure</code>-class (no I/O beyond reading a clock) and register under the <code>system</code> builtin category — <code>mix builtins system</code> lists them. For <em>pausing</em> rather than measuring, <code>sleep(n)</code> lives on the <a href="/mix/system">system</a> page.</p>
 <h2 id="time--the-current-timestamp">time() — the current timestamp</h2>
 <p><code>time()</code> returns the current Unix time as a <strong>float</strong> with sub-second precision (it is <code>SystemTime::now()</code> as <code>as_secs_f64</code>).</p>
 <pre><code class="language-mix">print(time())
@@ -481,6 +482,13 @@ print("took " .. duration_format($elapsed))
 <p>The numeric inputs accept numbers and numeric strings. A supplied value that
 <code>to_number</code> cannot parse raises <code>TYPE_MISMATCH</code>; it never silently becomes the
 epoch or a zero-duration result.</p>
+<h2 id="monotonic--the-clock-that-never-goes-backwards">monotonic() — the clock that never goes backwards</h2>
+<p><code>monotonic()</code> returns seconds on the kernel's <code>CLOCK_MONOTONIC</code> clock as a <strong>float</strong>. Use it <strong>instead of <code>time()</code> whenever you are measuring an interval rather than stamping a calendar moment</strong>: <code>time()</code> is wall-clock time, and NTP can step or slew it, so a <code>time() - $start</code> difference can come out wrong — even negative — across a clock adjustment. <code>monotonic()</code> never goes backwards (two successive reads always satisfy <code>later &gt;= $earlier</code>), which is exactly the property an elapsed-time, timeout, or "did this happen before that" computation needs. It is also the clock the compositor's frame traces stamp (<code>mono_us</code> in <code>FRAME_TRACE</code>), so a Mix measurement can be correlated with a compositor trace from the same machine.</p>
+<pre><code class="language-mix">$start = monotonic()
+-- ... do work ...
+print("took " .. (monotonic() - $start) .. "s")
+</code></pre>
+<p>The trade-offs: the epoch is unspecified (on Linux it usually counts from machine boot), so the absolute value means nothing across reboots or other machines — only differences and ordering — and <code>date_format</code>/<code>duration_format</code> have nothing useful to say about it. It also does not include time the machine spends suspended.</p>
 <h2 id="now_iso--current-local-time-as-a-string">now_iso() — current local time as a string</h2>
 <p><code>now_iso()</code> takes no arguments and returns the current <strong>local</strong> time as an RFC 3339 string (chrono's <code>Local::now().to_rfc3339()</code>), including the fractional seconds and the offset from UTC.</p>
 <pre><code class="language-mix">print(now_iso())
@@ -671,7 +679,7 @@ print("due " .. date_format($deadline, "%H:%M") .. " (" .. relative_time($deadli
 <li><a href="/mix/builtins">builtins index</a> — the full builtin catalogue</li>
 <li><a href="/mix/shell-mode">shell</a> — <code>mix -c</code> one-liner rules (newlines, classifier)</li>
 <li>chrono strftime reference — <a href="https://docs.rs/chrono/latest/chrono/format/strftime/index.html">https://docs.rs/chrono/latest/chrono/format/strftime/index.html</a></li>
-<li>Run <code>mix help</code> for the category listing, or <code>mix what date_format</code> (also <code>time</code>, <code>date_parse</code>, <code>now_iso</code>, <code>duration_format</code>, <code>relative_time</code>) for a one-line description of any builtin.</li>
+<li>Run <code>mix help</code> for the category listing, or <code>mix what date_format</code> (also <code>time</code>, <code>monotonic</code>, <code>date_parse</code>, <code>now_iso</code>, <code>duration_format</code>, <code>relative_time</code>) for a one-line description of any builtin.</li>
 </ul></div></div>
     </div>
 
