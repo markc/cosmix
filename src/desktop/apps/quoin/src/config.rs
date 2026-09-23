@@ -30,6 +30,13 @@ use cosmix_shell_host::file_watch::{LayerHostFileWatch, LayerHostFileWatches};
 
 pub const SETTINGS_APPEARANCE: &str = "settings.appearance";
 
+/// The one resolver for the config file every in-process reader and writer
+/// uses: the standalone watcher (`install`) and the settings verbs' motion
+/// writes (`settings::dispatch_verb`). Never restate the path inline.
+pub(crate) fn conf_mix_path() -> PathBuf {
+    cosmix_path(CosmixDir::Etc).join("quoin/conf.mix")
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CarouselMotion {
     #[default]
@@ -347,6 +354,52 @@ fn read(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
+/// Settings writes the same data-only field ingestion reads. Preserve all
+/// other authored VALUES, refuse invalid input, and atomically replace the
+/// file so the existing watcher observes a complete configuration. The
+/// rewrite re-encodes the whole file: comments and formatting do not survive
+/// a motion write — only the parsed values do.
+pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Result<(), String> {
+    use std::io::Write;
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
+        Err(error) => return Err(error.to_string()),
+    };
+    ShellConfig::parse(&source)?;
+    let mut value = parse_mix_data(&source).map_err(|error| error.to_string())?;
+    let Value::Map(root) = &mut value else {
+        unreachable!("validated config map")
+    };
+    std::rc::Rc::make_mut(root).insert(
+        "carousel_motion".into(),
+        Value::String(
+            match motion {
+                CarouselMotion::Slide => "slide",
+                CarouselMotion::Fade => "fade",
+            }
+            .into(),
+        ),
+    );
+    let encoded = value
+        .to_mix_data_string_pretty()
+        .map_err(|error| error.to_string())?;
+    ShellConfig::parse(&encoded)?;
+    let parent = path.parent().ok_or("config path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temp.write_all(encoded.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ConfigIngest;
+
 impl ConfigReader {
     fn start(path: PathBuf, report: ReportRefusal) -> std::io::Result<(Self, LayerHostFileWatch)> {
         let pending = Arc::new(Mutex::new(ConfigInbox::default()));
@@ -400,7 +453,7 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
         return;
     }
     let (reader, watch) = ConfigReader::start(
-        cosmix_path(CosmixDir::Etc).join("quoin/conf.mix"),
+        conf_mix_path(),
         Arc::new(|path, error| {
             eprintln!(
                 "QUOIN_CONFIG refused path={} reason={error}",
@@ -415,7 +468,13 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
         .push(watch);
     app.init_resource::<ShellConfig>()
         .insert_resource(reader)
-        .add_systems(Update, ingest.in_set(ShellRuntimeSet::Input));
+        .add_systems(
+            Update,
+            ingest
+                .in_set(ShellRuntimeSet::Input)
+                .in_set(ConfigIngest)
+                .before(crate::bus_service::ShellBusDispatch),
+        );
 }
 
 fn ingest(world: &mut World) {
@@ -436,6 +495,14 @@ fn ingest(world: &mut World) {
     let config = candidate.unwrap_or_else(|| world.resource::<ShellConfig>().clone());
     match redeclare_shell_pages(world, &config.panels) {
         Ok(true) => {
+            // A fade configured by hand in conf.mix ingests (the schema is
+            // renderer-neutral) but cannot render yet; say so once per
+            // ingestion rather than letting the panel's marks imply it runs.
+            if config.carousel_motion == CarouselMotion::Fade {
+                eprintln!(
+                    "QUOIN_CONFIG carousel_motion=fade note=renders as slide until the renderer gains sibling stacking"
+                );
+            }
             world.insert_resource(config);
             world.resource_mut::<ConfigReader>().applied = true;
         }

@@ -120,6 +120,8 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<cosmix_scene_bevy::SceneEvents>()
             .init_resource::<crate::wallpaper::WallpaperState>()
             .init_resource::<crate::demos::DemoState>()
+            .init_resource::<crate::config::ShellConfig>()
+            .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
             .add_systems(
@@ -144,6 +146,8 @@ struct SceneBus<'w, 's> {
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
     registry: ResMut<'w, SubPanelRegistryState>,
+    config: ResMut<'w, crate::config::ShellConfig>,
+    schemes: MessageWriter<'w, cosmix_shell::chrome::QuoinSchemeSelected>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -397,76 +401,105 @@ fn service_bus(
 
     for request in bridge.drain_inbound() {
         let started = std::time::Instant::now();
-        let (rc, body, command) =
-            if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
-                let args = parse_args(&request).unwrap_or(Value::Null);
-                let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
-                    (
-                        10,
-                        json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
-                    )
-                } else if state
-                    .live_generation
-                    .is_some_and(|generation| generation != request.connection_generation)
-                {
-                    (
-                        10,
-                        json!({"error":"scene request belongs to a stale Quoin connection"})
-                            .to_string(),
-                    )
-                } else {
-                    state.citizen_receipt = state
-                        .citizen_receipt
-                        .checked_add(1)
-                        .expect("receipt sequence exhausted");
-                    let owner = attested_owner(&request, state.citizen_receipt);
-                    let SceneBus {
-                        scenes, registry, ..
-                    } = &mut content;
-                    scenes.dispatch(
-                        verb,
-                        &request.body,
-                        &args,
-                        &bridge,
-                        &mut cosmix_scene_bevy::SceneMount {
-                            registry: &mut registry.0,
-                            output: &frame.0.geometry.output,
-                            owner: &owner,
-                            accepted_at: state.citizen_receipt,
-                        },
-                    )
-                };
-                (rc, body, None)
-            } else if matches!(
-                request.command.as_str(),
-                "shell.sub.register" | "shell.sub.remove"
-            ) {
-                let (rc, body, command) = dispatch_sub_panel_verb(
-                    &request,
-                    &frame.0,
-                    &mut content.registry.0,
-                    &mut state,
-                    time.elapsed(),
-                );
-                (rc, body, command)
-            } else if request.command == "shell.debug.status" {
+        let (rc, body, command) = if let Some(verb) =
+            cosmix_shell::runtime::SceneVerb::parse(&request.command)
+        {
+            let args = parse_args(&request).unwrap_or(Value::Null);
+            let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
                 (
-                    0,
-                    json!({
-                        "requests":state.diagnostics.requests,
-                        "rejected":state.diagnostics.rejected,
-                        "accepted_mutations":state.diagnostics.accepted_mutations,
-                        "max_dispatch_us":state.diagnostics.max_dispatch_us,
-                        "pending_replies":state.pending_replies.len(),
-                        "connected":state.live_generation.is_some(),
-                        "scope":"this process; dispatch excludes model application and transport"
-                    })
-                    .to_string(),
+                    10,
+                    json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
+                )
+            } else if state
+                .live_generation
+                .is_some_and(|generation| generation != request.connection_generation)
+            {
+                (
+                    10,
+                    json!({"error":"scene request belongs to a stale Quoin connection"})
+                        .to_string(),
+                )
+            } else {
+                state.citizen_receipt = state
+                    .citizen_receipt
+                    .checked_add(1)
+                    .expect("receipt sequence exhausted");
+                let owner = attested_owner(&request, state.citizen_receipt);
+                let SceneBus {
+                    scenes, registry, ..
+                } = &mut content;
+                scenes.dispatch(
+                    verb,
+                    &request.body,
+                    &args,
+                    &bridge,
+                    &mut cosmix_scene_bevy::SceneMount {
+                        registry: &mut registry.0,
+                        output: &frame.0.geometry.output,
+                        owner: &owner,
+                        accepted_at: state.citizen_receipt,
+                    },
+                )
+            };
+            (rc, body, None)
+        } else if matches!(
+            request.command.as_str(),
+            "shell.sub.register" | "shell.sub.remove"
+        ) {
+            let (rc, body, command) = dispatch_sub_panel_verb(
+                &request,
+                &frame.0,
+                &mut content.registry.0,
+                &mut state,
+                time.elapsed(),
+            );
+            (rc, body, command)
+        } else if request.command.starts_with("shell.settings.") {
+            // The bridge drops stale epochs before dispatch; the same fence
+            // the scene and sub-panel verbs keep — a stale request must not
+            // spend a settings write (a live theme application, a conf.mix
+            // rewrite or a resize command).
+            if state
+                .live_generation
+                .is_some_and(|generation| generation != request.connection_generation)
+            {
+                (
+                    10,
+                    json!({"error":"settings request belongs to a stale Quoin connection"})
+                        .to_string(),
                     None,
                 )
             } else {
-                dispatch_shell_request(&request, &frame.0, time.elapsed())
-            };
+                let SceneBus {
+                    config, schemes, ..
+                } = &mut content;
+                crate::settings::dispatch_verb(
+                    &request,
+                    &frame.0,
+                    config,
+                    &crate::config::conf_mix_path(),
+                    schemes,
+                    time.elapsed(),
+                )
+            }
+        } else if request.command == "shell.debug.status" {
+            (
+                0,
+                json!({
+                    "requests":state.diagnostics.requests,
+                    "rejected":state.diagnostics.rejected,
+                    "accepted_mutations":state.diagnostics.accepted_mutations,
+                    "max_dispatch_us":state.diagnostics.max_dispatch_us,
+                    "pending_replies":state.pending_replies.len(),
+                    "connected":state.live_generation.is_some(),
+                    "scope":"this process; dispatch excludes model application and transport"
+                })
+                .to_string(),
+                None,
+            )
+        } else {
+            dispatch_shell_request(&request, &frame.0, time.elapsed())
+        };
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         state.diagnostics.record(rc, command.is_some(), elapsed_us);
         if command.is_some() || rc != 0 {
@@ -769,49 +802,13 @@ fn dispatch_sub_panel_verb(
                 None,
             );
         };
-        // Global duplicate first (the registry is the address space), then
-        // the frame: a live page without a seat (host chrome content) is as
-        // taken as a seated one, on ANY edge of this output — names are
-        // globally unique, so a seat-less page on another edge refuses a
-        // registration the requested edge alone would have accepted.
-        if registry.seat(&name).is_some() {
-            let error = cosmix_shell::core::SubPanelRegistryError::Duplicate(name);
-            return (10, json!({"error":error.to_string()}).to_string(), None);
-        }
-        if Edge::ALL.into_iter().any(|live_edge| {
-            frame
-                .panel(live_edge)
-                .page_ids
-                .iter()
-                .any(|page| page == &name)
-        }) {
-            return (
-                10,
-                json!({"error":format!("name '{name}' is already a page on this output")})
-                    .to_string(),
-                None,
-            );
-        }
         state.citizen_receipt = state
             .citizen_receipt
             .checked_add(1)
             .expect("receipt sequence exhausted");
         let receipt = state.citizen_receipt;
-        // Ownership is the attested caller, never a caller-supplied field:
-        // an `owner=` argument off the wire is simply not read.
         let owner = attested_owner(request, receipt);
-        if let Err(error) =
-            registry.mount(&name, frame.geometry.output.clone(), edge, &owner, receipt)
-        {
-            return (10, json!({"error":error.to_string()}).to_string(), None);
-        }
-        let command = semantic_shell_command(
-            frame.geometry.output.clone(),
-            at,
-            edge,
-            ShellSemanticVerb::SubRegister { name, owner },
-        );
-        return (0, json!({"accepted":true}).to_string(), Some(command));
+        return register_sub_panel(frame, registry, name, edge, owner, receipt, at);
     }
     // Removal: the name is the address; the seat supplies the edge, owner
     // and acceptance receipt the command carries. An unknown name is
@@ -839,6 +836,52 @@ fn dispatch_sub_panel_verb(
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
 
+/// Shared sub.register acceptance path for Bus callers and host-owned content.
+/// The caller supplies its attested owner; registration never reveals a panel.
+pub(crate) fn register_sub_panel(
+    frame: &ShellFrame,
+    registry: &mut cosmix_shell::core::SubPanelRegistry,
+    name: String,
+    edge: Edge,
+    owner: String,
+    receipt: u64,
+    at: std::time::Duration,
+) -> (u8, String, Option<ShellCommand>) {
+    // Global duplicate first (the registry is the address space), then
+    // the frame: a live page without a seat (host chrome content) is as
+    // taken as a seated one, on ANY edge of this output — names are
+    // globally unique, so a seat-less page on another edge refuses a
+    // registration the requested edge alone would have accepted.
+    if registry.seat(&name).is_some() {
+        let error = cosmix_shell::core::SubPanelRegistryError::Duplicate(name);
+        return (10, json!({"error":error.to_string()}).to_string(), None);
+    }
+    if Edge::ALL.into_iter().any(|live_edge| {
+        frame
+            .panel(live_edge)
+            .page_ids
+            .iter()
+            .any(|page| page == &name)
+    }) {
+        return (
+            10,
+            json!({"error":format!("name '{name}' is already a page on this output")}).to_string(),
+            None,
+        );
+    }
+    if let Err(error) = registry.mount(&name, frame.geometry.output.clone(), edge, &owner, receipt)
+    {
+        return (10, json!({"error":error.to_string()}).to_string(), None);
+    }
+    let command = semantic_shell_command(
+        frame.geometry.output.clone(),
+        at,
+        edge,
+        ShellSemanticVerb::SubRegister { name, owner },
+    );
+    (0, json!({"accepted":true}).to_string(), Some(command))
+}
+
 fn dispatch_shell_request(
     request: &InboundRequest,
     frame: &ShellFrame,
@@ -856,7 +899,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1132,7 +1175,7 @@ const WIRE_OWNED_HEADERS: &[&str] = &[
 /// simply absent — the honest answer, and the one that makes `page.set`
 /// report "requires an id argument" instead of rejecting the broker's
 /// correlation id as an unknown page.
-fn argument(request: &InboundRequest, name: &str) -> Option<String> {
+pub(crate) fn argument(request: &InboundRequest, name: &str) -> Option<String> {
     if !WIRE_OWNED_HEADERS
         .iter()
         .any(|owned| owned.eq_ignore_ascii_case(name))
@@ -1146,7 +1189,7 @@ fn argument(request: &InboundRequest, name: &str) -> Option<String> {
 /// Read a finite numeric argument, accepting both a JSON number
 /// (`thickness_px=240`) and a numeric string (`thickness_px="240"`) — Mix's
 /// `send … k=v` may deliver either shape.
-fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
+pub(crate) fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
     let value = parse_args(request)?;
     let field = value.get(name)?;
     let number = field
@@ -1155,7 +1198,7 @@ fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
     number.is_finite().then_some(number)
 }
 
-fn parse_edge(value: String) -> Option<Edge> {
+pub(crate) fn parse_edge(value: String) -> Option<Edge> {
     match value.as_str() {
         "left" => Some(Edge::Left),
         "bottom" => Some(Edge::Bottom),
@@ -1309,6 +1352,24 @@ mod tests {
             dispatch_shell_request(&request, &frame, std::time::Duration::ZERO).0,
             0
         );
+    }
+
+    /// `shell.info` is the discovery surface: a verb missing from its list is
+    /// a verb no script can find, so the settings verbs must be advertised.
+    #[test]
+    fn shell_info_lists_the_settings_verbs() {
+        let frame = test_frame();
+        let (rc, body, _) =
+            dispatch_shell_request(&request("shell.info"), &frame, Default::default());
+        assert_eq!(rc, 0);
+        let info: Value = serde_json::from_str(&body).unwrap();
+        let verbs = info["verbs"].as_array().expect("verbs is a list");
+        for verb in ["settings.scheme", "settings.motion", "settings.size"] {
+            assert!(
+                verbs.contains(&json!(verb)),
+                "shell.info must advertise {verb}; got {verbs:?}"
+            );
+        }
     }
 
     /// The filed defect (TODO-cos, 2026-09-20): `send "shell"
@@ -2578,6 +2639,57 @@ mod tests {
         );
         // Positive control: the same live, attested sender can still load.
         load_scene(&mut app, &peer, "accepted", "owner", "left");
+    }
+
+    /// The settings branch keeps the same stale-connection fence as the scene
+    /// and sub-panel verbs. The test bridge's committed generation stays 1,
+    /// so a request stamped 1 still drains after a `Connected` event for
+    /// generation 2 — exactly the leaked-epoch shape the fence exists for:
+    /// the request must be refused before `dispatch_verb`, spending no
+    /// settings write (here, no live theme application).
+    #[test]
+    fn settings_verbs_refuse_a_stale_quoin_connection() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        // Before any connection, the fence is open (no live generation to
+        // mismatch) and the write spends normally.
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<cosmix_shell::chrome::QuoinSchemeSelected>>()
+                .drain()
+                .count(),
+            1,
+            "the live request applied the theme"
+        );
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        peer.drain_calls();
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(
+            replies[0].body.contains("stale Quoin connection"),
+            "{}",
+            replies[0].body
+        );
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<cosmix_shell::chrome::QuoinSchemeSelected>>()
+                .drain()
+                .count(),
+            0,
+            "a stale settings request must not apply a theme"
+        );
     }
 
     /// Chunk-8 fixture: the sub-panel verbs address the process-wide

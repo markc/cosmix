@@ -676,6 +676,24 @@ back <code>shell.props.get path="panels.&lt;edge&gt;.mode"</code> to verify the 
 These are semantic commands; they do not move the pointer or fabricate
 compositor corner-observation notifications. Read back
 <code>shell.props.get path="panels.left.visible"</code> to verify the applied state.</p>
+<p>The Settings/Appearance panel's own controls come back as
+<code>shell.settings.{scheme,motion,size}</code> (also listed by <code>shell.info</code>).
+<code>shell.settings.scheme</code> takes <code>name</code> (a known scheme such as <code>forest</code>) and
+applies the theme live through the same path as the chrome scheme dots,
+persisting it for the next launch. <code>shell.settings.motion</code> takes
+<code>motion slide|fade</code>: <code>slide</code> is accepted and written to the <code>carousel_motion</code>
+field of the data-only <code>conf.mix</code>; <code>fade</code> is refused with
+<code>MOTION_FADE_UNAVAILABLE</code> until the scene renderer can stack sibling
+documents in one rectangle, and a <code>fade</code> authored directly in <code>conf.mix</code>
+ingests but renders as slide (a <code>QUOIN_CONFIG</code> line says so at ingest, and
+the panel's marks follow the ingested value). A motion write re-encodes the
+whole <code>conf.mix</code>: other authored values are preserved, but comments and
+formatting are not. <code>shell.settings.size</code> takes <code>edge</code> and <code>delta_px</code> and
+enqueues the same resize commit an edge-drag completion produces, clamped to
+the supported thickness range and the output budget. Like the scene and
+sub-panel verbs, settings verbs from a stale Quoin connection are refused.
+Read back <code>shell.props.get path="panels.&lt;edge&gt;.width_px"</code> to verify a size
+change.</p>
 <p><code>shell.debug.status</code> exposes process-lifetime request/rejection counts,
 accepted mutation counts, maximum dispatch time in microseconds, pending reply
 count and connection state. It excludes model application, transport delay and

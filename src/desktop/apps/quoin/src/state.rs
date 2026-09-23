@@ -33,8 +33,10 @@ const DEFAULT_OUTPUT: &str = "default";
 /// protocol id (`wl-output-{id}`, see `cosmix-shell-host`'s `output_key`),
 /// and the embedded host keys its pre-observation placeholder the same way.
 /// Protocol ids are reassigned across sessions, so an output in this
-/// namespace is neither restored from nor persisted to a key.
-const EPHEMERAL_OUTPUT_PREFIX: &str = "wl-output-";
+/// namespace is neither restored from nor persisted to a key. The prefix is
+/// the one definition other modules test output names against (settings'
+/// placeholder guard); do not restate the literal.
+pub(crate) const EPHEMERAL_OUTPUT_PREFIX: &str = "wl-output-";
 
 /// Persistent identity of one output for state keying (shell design §7):
 /// EDID make/model/serial when the compositor reports it, else the connector

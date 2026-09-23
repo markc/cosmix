@@ -414,8 +414,21 @@ fn destroy(world: &mut World, mounted: Mounted) {
         world.despawn(mounted.page);
     }
 }
+/// The sub-panel address a scene mounts under.
+///
+/// The default is the anonymous `scene-<name>` id. A document authored for a
+/// *declared* sub-panel (panel doc §2/§5) names it in the window envelope's
+/// `panel` field — mounting metadata beside `edge`/`title` — because a
+/// declared name is the carousel's address and can carry characters the
+/// scene-name grammar forbids (`settings.appearance`). Without the override a
+/// declared slot could never be filled by scene content.
 pub(crate) fn page_id(tree: &ResolvedScene) -> String {
-    format!("scene-{}", tree.name)
+    mount_config(tree)
+        .as_ref()
+        .and_then(|window| window["panel"].as_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("scene-{}", tree.name))
 }
 pub(crate) fn scene_edge(tree: &ResolvedScene) -> Edge {
     match mount_config(tree)
@@ -2093,6 +2106,99 @@ mod tests {
             )
             .unwrap();
         assert_eq!(scene_edge(&store.scenes["node-mount"].tree), Edge::Right);
+    }
+
+    #[test]
+    fn declared_panel_name_is_the_page_id() {
+        use cosmix_shell::chrome::{
+            QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts, spawn_quoin_chrome,
+        };
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{SceneVerb, ShellFrameState, ShellRuntimePlugin};
+        let mut app = App::new();
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ShellRuntimePlugin::new(model));
+        let world = app.world_mut();
+        let registry = QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap();
+        let props = registry
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
+        queue.apply(world);
+        let mut store = SceneStore::default();
+        // A declared sub-panel name in the window envelope is the mount
+        // address; the scene's own name stays inside its grammar.
+        store.request(
+            SceneVerb::Load,
+            "---\nscene: 1\nname: settings\ncitizen: test\nwindow: {\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"settings.appearance\"}\n---\n```mix\nroot: {widget: \"column\", children: []}\n```\n",
+            &Value::Null,
+        )
+        .unwrap();
+        store.request(
+            SceneVerb::Load,
+            "---\nscene: 1\nname: plain\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"right\"}\n```\n",
+            &Value::Null,
+        )
+        .unwrap();
+        world.insert_resource(store);
+        reconcile(world);
+        let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
+        // Reconciliation visits scenes in name order (BTreeMap), not load
+        // order. The envelope overrides the page id, not that traversal.
+        assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
+        // The mount survives a revision under the same declared name.
+        world
+            .resource_mut::<SceneStore>()
+            .request(
+                SceneVerb::Load,
+                "---\nscene: 1\nname: settings\ncitizen: test\nwindow: {\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"settings.appearance\"}\n---\n```mix\nroot: {widget: \"column\", children: [\"extra\"]}\nextra: {widget: \"text\", text: \"x\"}\n```\n",
+                &Value::Null,
+            )
+            .unwrap();
+        reconcile(world);
+        let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
+        assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
+        // A live panel address cannot be aliased or renamed.
+        for (name, panel) in [("impostor", "settings.appearance"), ("settings", "renamed")] {
+            let result = world.resource_mut::<SceneStore>().request(
+                SceneVerb::Load,
+                &format!("---\nscene: 1\nname: {name}\ncitizen: test\nwindow: {{\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"{panel}\"}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"),
+                &Value::Null,
+            );
+            assert!(result.is_err(), "a live address cannot be aliased or renamed");
+        }
+        // An empty or non-string panel field falls back to the anonymous id.
+        for window in ["{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":\"\"}", "{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":7}"] {
+            let mut fallback = SceneStore::default();
+            fallback
+                .request(
+                    SceneVerb::Load,
+                    &format!(
+                        "---\nscene: 1\nname: fb\ncitizen: test\nwindow: {window}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"
+                    ),
+                    &Value::Null,
+                )
+                .unwrap();
+            assert_eq!(page_id(&fallback.scenes["fb"].tree), "scene-fb");
+        }
     }
 
     #[test]

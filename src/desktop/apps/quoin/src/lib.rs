@@ -9,6 +9,7 @@ mod hotspot;
 mod launcher;
 pub mod embedded;
 mod power;
+mod settings;
 mod state;
 mod wallpaper;
 
@@ -177,6 +178,7 @@ fn configure_content(
             Update,
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
+    settings::install(app, all_panels || hidden);
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
