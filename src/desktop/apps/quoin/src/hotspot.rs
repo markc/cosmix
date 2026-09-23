@@ -106,6 +106,43 @@ impl HotspotObserver {
         self.discovery = DiscoveryWrite::Queued { value, send: true };
     }
 
+    /// Consume the reply to the in-flight discovery write; false when the
+    /// reply belongs to something else.
+    fn discovery_reply(&mut self, request_id: u64, result: &Result<BusReply, String>) -> bool {
+        let DiscoveryWrite::InFlight { value, id } = self.discovery else {
+            return false;
+        };
+        if id != request_id {
+            return false;
+        }
+        match result {
+            Ok(reply) if reply.rc == 0 => {
+                self.discovery = DiscoveryWrite::Idle;
+                self.discovery_failure_logged = false;
+                if self.first_run {
+                    self.first_run = false;
+                    self.first_run_written = true;
+                }
+            }
+            failed => {
+                // Wait for the next trigger; never retry on a clock.
+                self.discovery = DiscoveryWrite::Queued { value, send: false };
+                if !self.discovery_failure_logged {
+                    self.discovery_failure_logged = true;
+                    let detail = match failed {
+                        Ok(reply) => format!("rc={}", reply.rc),
+                        Err(error) => format!("transport error: {error}"),
+                    };
+                    eprintln!(
+                        "QUOIN_DISCOVERY_WRITE_FAILED service={} path={} value={} detail={}",
+                        self.service, DISCOVERY_PATH, value, detail
+                    );
+                }
+            }
+        }
+        true
+    }
+
     /// A trigger (connection, comp registered) releases a queued write.
     fn release_discovery(&mut self) {
         if let DiscoveryWrite::Queued { value, .. } = self.discovery {
@@ -145,6 +182,11 @@ impl HotspotObserver {
     }
 
     pub(crate) fn event(&mut self, event: &BusBridgeEvent, size: &mut QuoinHotspotSize) {
+        if let BusBridgeEvent::Reply { request_id, result } = event
+            && self.discovery_reply(*request_id, result)
+        {
+            return;
+        }
         match event {
             BusBridgeEvent::Connection {
                 state: BusConnectionState::Connected,
@@ -169,38 +211,6 @@ impl HotspotObserver {
                 *size = QuoinHotspotSize::default();
                 if let DiscoveryWrite::InFlight { value, .. } = self.discovery {
                     self.discovery = DiscoveryWrite::Queued { value, send: false };
-                }
-            }
-            BusBridgeEvent::Reply { request_id, result }
-                if matches!(self.discovery, DiscoveryWrite::InFlight { id, .. } if id == *request_id) =>
-            {
-                let DiscoveryWrite::InFlight { value, .. } = self.discovery else {
-                    unreachable!("guarded above");
-                };
-                match result {
-                    Ok(reply) if reply.rc == 0 => {
-                        self.discovery = DiscoveryWrite::Idle;
-                        self.discovery_failure_logged = false;
-                        if self.first_run {
-                            self.first_run = false;
-                            self.first_run_written = true;
-                        }
-                    }
-                    failed => {
-                        // Wait for the next trigger; never retry on a clock.
-                        self.discovery = DiscoveryWrite::Queued { value, send: false };
-                        if !self.discovery_failure_logged {
-                            self.discovery_failure_logged = true;
-                            let detail = match failed {
-                                Ok(reply) => format!("rc={}", reply.rc),
-                                Err(error) => format!("transport error: {error}"),
-                            };
-                            eprintln!(
-                                "QUOIN_DISCOVERY_WRITE_FAILED service={} path={} value={} detail={}",
-                                self.service, DISCOVERY_PATH, value, detail
-                            );
-                        }
-                    }
                 }
             }
             BusBridgeEvent::DroppedMessages(_) => {
@@ -588,7 +598,10 @@ mod tests {
         for _ in 0..5 {
             observer.flush(&bridge);
         }
-        assert!(discovery_sets(&peer).is_empty(), "a refusal is not retried on a clock");
+        assert!(
+            discovery_sets(&peer).is_empty(),
+            "a refusal is not retried on a clock"
+        );
         assert!(!observer.take_first_run_written());
         // Comp seen registered is the trigger.
         observer.presence(&BTreeSet::from(["comp-nested".to_owned()]), &mut size);
@@ -604,7 +617,10 @@ mod tests {
             &mut size,
         );
         set_reply(&mut observer, &mut size, retry[0].0, 0);
-        assert!(!observer.take_first_run_written(), "a stale reply is ignored");
+        assert!(
+            !observer.take_first_run_written(),
+            "a stale reply is ignored"
+        );
         connect(&mut observer, &mut size, 2);
         observer.flush(&bridge);
         let resent = discovery_sets(&peer);

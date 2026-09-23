@@ -83,8 +83,8 @@ impl View {
             return Vec::new();
         }
         let discovery_on = self.discovery.is_some_and(|since| {
-            let phase = now.saturating_duration_since(since).as_millis()
-                % DISCOVERY_PERIOD.as_millis();
+            let phase =
+                now.saturating_duration_since(since).as_millis() % DISCOVERY_PERIOD.as_millis();
             phase < DISCOVERY_ON.as_millis()
         });
         let flash = self.flash.and_then(|(index, at)| {
