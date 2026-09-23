@@ -625,10 +625,11 @@ default:
 
 Chords are canonicalised at ingestion, so modifier order does not matter.
 Every chord needs Ctrl, Alt or Super. A bare or Shift-only key would take
-typing from the panel's own controls, and a bare Escape would turn the
-panel's Escape into a mode change. Duplicates, unknown keys, modifier-less
-chords and the reserved `Super+Escape` are refused. The refusal is loud and
-the previous configuration is kept.
+typing from the panel's own controls. Escape cannot be bound with any
+modifiers, because any Escape reaching a panel is the panel's own Escape.
+Duplicates, unknown keys, modifier-less chords and Escape chords are refused.
+`Super+Escape` is also comp's reserved chord. The refusal is loud and the
+previous configuration is kept.
 
 Letters and digits match the key labelled with them in the current layout,
 and named keys match by meaning, so a keypad arrow is `Left`. Any other key

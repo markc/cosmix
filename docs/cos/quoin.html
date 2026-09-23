@@ -991,10 +991,11 @@ default:</p>
 </code></pre>
 <p>Chords are canonicalised at ingestion, so modifier order does not matter.
 Every chord needs Ctrl, Alt or Super. A bare or Shift-only key would take
-typing from the panel's own controls, and a bare Escape would turn the
-panel's Escape into a mode change. Duplicates, unknown keys, modifier-less
-chords and the reserved <code>Super+Escape</code> are refused. The refusal is loud and
-the previous configuration is kept.</p>
+typing from the panel's own controls. Escape cannot be bound with any
+modifiers, because any Escape reaching a panel is the panel's own Escape.
+Duplicates, unknown keys, modifier-less chords and Escape chords are refused.
+<code>Super+Escape</code> is also comp's reserved chord. The refusal is loud and the
+previous configuration is kept.</p>
 <p>Letters and digits match the key labelled with them in the current layout,
 and named keys match by meaning, so a keypad arrow is <code>Left</code>. Any other key
 falls back to its physical position, so <code>Ctrl+Shift+1</code> is the 1 key even
