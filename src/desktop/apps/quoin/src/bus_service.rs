@@ -2108,7 +2108,8 @@ mod tests {
         });
         app.update();
         let request = peer.drain_calls().into_iter()
-            .find(|call| call.command == "comp-nested.props.get").unwrap();
+            .find(|call| call.command == "comp.props.get").unwrap();
+        assert_eq!(request.to, "comp-nested");
         peer.deliver_event(BusBridgeEvent::Reply {
             request_id: request.request_id,
             result: Ok(ctk::bus::BusReply {
@@ -2131,7 +2132,8 @@ mod tests {
         app.update();
         let calls = peer.drain_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].command, "comp-nested.props.get");
+        assert_eq!(calls[0].command, "comp.props.get");
+        assert_eq!(calls[0].to, "comp-nested");
         peer.deliver_event(BusBridgeEvent::Reply {
             request_id: calls[0].request_id,
             result: Ok(ctk::bus::BusReply {
