@@ -740,10 +740,14 @@ clicked. Escape or the cycle key releases it. Click-away release waits for
 the compositor focus holder.
 
 The latch described above is the local one, used while comp does not report
-the holder plane. A `hide` or a toggle-off with the pointer inside latches in
-the same way. When comp does report the holder plane, all three take the command-driven
-latch described earlier: the panel stays concealed against comp's reveals
-until comp reports that the holders have been released.
+the holder plane. A hide latches in the same way when the pointer is inside:
+`hide`, a toggle-off, or a mode set to hidden, whether from a binding, the
+menu or `shell.panel.mode`. When comp does report the holder plane, all of
+them take the command-driven latch described earlier. The panel stays
+concealed against comp's reveals until comp reports that the holders have been
+released. If comp had not yet reported a hold, the latch ends when the pointer
+leaves instead. A local latch that is still standing when comp starts
+reporting the holder plane carries over as that pointer-only latch.
 
 Stable transition markers are:
 

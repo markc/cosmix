@@ -8,7 +8,7 @@
 //! docked hides immediately unless a hold keeps the panel revealed: the grace delay
 //! exists to forgive pointer overshoot and never applies to a deliberate action.
 //! An interim local menu input suppresses concealment until the popup closes.
-//! Hide, Escape or toggle-off on a transient reveal hides it and, while the
+//! Hide, Escape, toggle-off or a hidden mode set conceals and, while the
 //! pointer is still in the panel or hotspot, latches: hover re-entry cannot re-reveal until the
 //! conceal has finished and the pointer is out of the hotspot (§4.3).
 //!
@@ -205,7 +205,8 @@ pub struct PanelSnapshot {
     /// finished and the pointer is out of the hotspot. Command-driven (holder
     /// plane): a deliberate conceal the compositor's holders have not yet
     /// released, whose reveals are ignored until it reports them released.
-    /// Reports either latch.
+    /// Reports either latch: despite the name (kept because only tests read
+    /// it), this is the local `hover_latched` OR the holder-plane `latched`.
     pub hover_latched: bool,
 }
 
@@ -267,10 +268,12 @@ pub struct PanelStateMachine {
     /// `hover_latched || latched`.
     latched: bool,
     /// The local driver's deliberate-conceal latch (see
-    /// `PanelSnapshot::hover_latched`): set by Hide, Escape or toggle-off with
-    /// the pointer in the panel or hotspot; read by the unguarded corner and
-    /// pointer arms; cleared by `release_latch_once_left`, by an input that
-    /// shows the panel, and by `set_holder_plane` and `leave_output`.
+    /// `PanelSnapshot::hover_latched`): set by Hide, Escape, toggle-off or
+    /// SetMode(Hidden) with the pointer in the panel or hotspot; read by the
+    /// unguarded corner and pointer arms; cleared by `release_latch_once_left`,
+    /// by an input that shows the panel, by `leave_output`, and by
+    /// `set_holder_plane` (which carries one standing on membership over as
+    /// the plane's membership-only latch).
     hover_latched: bool,
     /// The latch was armed on local membership with no compositor hold, so
     /// no release is certain to clear it: leaving clears it instead.
@@ -516,7 +519,18 @@ impl PanelStateMachine {
             PanelInput::Dock | PanelInput::DockToggle => {
                 effect = self.change_mode(PanelMode::Docked).or(effect);
             }
-            PanelInput::SetMode(mode) => effect = self.change_mode(mode).or(effect),
+            PanelInput::SetMode(mode) => {
+                effect = self.change_mode(mode).or(effect);
+                // A hide (the `hide` binding, the menu, `shell.panel.mode`) is
+                // a deliberate conceal like Hide and Escape; the plane path
+                // latches inside change_mode.
+                if mode == PanelMode::Hidden
+                    && !plane
+                    && (self.pointer_inside || self.corner_inside)
+                {
+                    self.hover_latched = true;
+                }
+            }
             PanelInput::Unpin | PanelInput::Undock => {}
             PanelInput::PointerEntered => {
                 if self.pointer_inside {
@@ -623,11 +637,18 @@ impl PanelStateMachine {
         }
         self.holder_plane = available;
         self.comp_held = false;
-        // Neither latch carries across drivers: each is released only by
-        // its own driver's events.
+        // Each latch is released only by its own driver's events, so neither
+        // carries across as itself. But a local latch still standing on the
+        // pointer's membership hands over as the plane's membership-only latch
+        // (which ends when that membership does, so it cannot wedge);
+        // otherwise comp's pointer holder would re-reveal the panel the user
+        // just concealed.
+        let carried = available
+            && self.hover_latched
+            && (self.pointer_inside || self.corner_inside);
         self.hover_latched = false;
-        self.latched = false;
-        self.latch_local = false;
+        self.latched = carried;
+        self.latch_local = carried;
         self.verdict_due = None;
         self.clear_deadline();
         if self.mode == PanelMode::Hidden && self.transient_revealed {
@@ -1658,6 +1679,127 @@ mod intro_tests {
         let shown = panel.apply(ms(20), PanelInput::Reveal).unwrap().snapshot;
         assert!(shown.transient_revealed);
         assert!(!shown.hover_latched);
+    }
+
+    #[test]
+    fn every_local_deliberate_conceal_latches_through_the_slide() {
+        let ms = Duration::from_millis;
+        // A transient reveal with the pointer in the panel, and a pinned one.
+        let revealed = || {
+            let mut panel = self::panel();
+            for input in [
+                PanelInput::CornerEntered,
+                PanelInput::PointerEntered,
+                PanelInput::CornerLeft,
+            ] {
+                panel.apply(Duration::ZERO, input).unwrap();
+            }
+            panel.tick(ms(300)).unwrap();
+            panel
+        };
+        let pinned = || {
+            let mut panel = self::panel();
+            panel.apply(Duration::ZERO, PanelInput::Pin).unwrap();
+            panel
+                .apply(Duration::ZERO, PanelInput::PointerEntered)
+                .unwrap();
+            panel.tick(ms(300)).unwrap();
+            panel
+        };
+        for (mut panel, conceal) in [
+            (revealed(), PanelInput::Hide),
+            (revealed(), PanelInput::Toggle),
+            (revealed(), PanelInput::SetMode(PanelMode::Hidden)),
+            (pinned(), PanelInput::SetMode(PanelMode::Hidden)),
+        ] {
+            let hidden = panel.apply(ms(300), conceal).unwrap().snapshot;
+            assert_eq!(hidden.mode, PanelMode::Hidden, "{conceal:?}");
+            assert!(!hidden.transient_revealed, "{conceal:?}");
+            assert!(hidden.hover_latched, "{conceal:?} did not latch");
+            // The slide's own leave, then a wiggle back over the still-mapped
+            // surface: no re-reveal.
+            for input in [PanelInput::PointerLeft, PanelInput::PointerEntered] {
+                let snapshot = panel.apply(ms(350), input).unwrap().snapshot;
+                assert!(snapshot.visible_fraction > 0.0, "slide still running");
+                assert!(!snapshot.transient_revealed, "{conceal:?}: {input:?} re-revealed");
+            }
+            // Same release rule: slide finished and out of the hotspot.
+            assert!(!panel.tick(ms(600)).unwrap().snapshot.hover_latched, "{conceal:?}");
+        }
+    }
+
+    #[test]
+    fn latches_hand_over_across_a_holder_plane_switch() {
+        let ms = Duration::from_millis;
+
+        // (a) OFF -> ON with the local latch armed on the pointer's
+        // membership: it carries as the plane's membership-only latch, so
+        // comp's pointer holder cannot re-reveal the panel just concealed.
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
+        panel.tick(ms(300)).unwrap();
+        panel.apply(ms(300), PanelInput::Escape).unwrap();
+        assert!(panel.hover_latched);
+        let switched = panel.set_holder_plane(true, ms(310)).unwrap().snapshot;
+        assert!(switched.hover_latched, "the latch was dropped at the switch");
+        assert!(!panel.hover_latched && panel.latched && panel.latch_local);
+        let mut unheld = panel.clone();
+        let held = panel.apply(ms(320), PanelInput::HolderReveal).unwrap();
+        assert!(!held.snapshot.transient_revealed, "comp re-revealed an Escaped panel");
+        // Comp now holds it, so comp's release ends the latch; a fresh
+        // dwell's hold then reveals.
+        panel.apply(ms(330), PanelInput::CornerLeft).unwrap();
+        let released = panel.apply(ms(340), PanelInput::HolderConceal).unwrap().snapshot;
+        assert!(!released.hover_latched);
+        panel.apply(ms(350), PanelInput::CornerEntered).unwrap();
+        assert!(
+            panel
+                .apply(ms(360), PanelInput::HolderReveal)
+                .unwrap()
+                .snapshot
+                .transient_revealed
+        );
+        // Before comp reports any hold it is membership-only, so leaving
+        // ends it: it cannot wedge.
+        let left = unheld.apply(ms(330), PanelInput::CornerLeft).unwrap().snapshot;
+        assert!(!left.hover_latched);
+
+        // With nothing inside at the switch there is nothing to carry.
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::Reveal).unwrap();
+        panel.apply(ms(10), PanelInput::Escape).unwrap();
+        panel.set_holder_plane(true, ms(20)).unwrap();
+        assert!(!panel.latched && !panel.hover_latched);
+
+        // (a) ON -> OFF: the plane latch does not survive as a local one
+        // (only comp's release could have ended it).
+        let mut panel = self::panel();
+        panel.set_holder_plane(true, Duration::ZERO).unwrap();
+        panel.apply(ms(10), PanelInput::CornerEntered).unwrap();
+        panel.apply(ms(20), PanelInput::HolderReveal).unwrap();
+        panel.apply(ms(300), PanelInput::Escape).unwrap();
+        assert!(panel.latched);
+        let off = panel.set_holder_plane(false, ms(310)).unwrap().snapshot;
+        assert!(!off.hover_latched);
+        assert!(!panel.latched && !panel.hover_latched);
+
+        // (b) Each driver arms only its own latch.
+        let mut panel = self::panel();
+        panel.set_holder_plane(true, Duration::ZERO).unwrap();
+        panel.apply(ms(10), PanelInput::CornerEntered).unwrap();
+        panel.apply(ms(20), PanelInput::HolderReveal).unwrap();
+        panel.apply(ms(300), PanelInput::Escape).unwrap();
+        assert!(panel.latched);
+        assert!(!panel.hover_latched, "plane Escape armed the local latch");
+
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
+        panel.tick(ms(300)).unwrap();
+        panel.apply(ms(300), PanelInput::Escape).unwrap();
+        let ignored = panel.apply(ms(310), PanelInput::HolderReveal).unwrap().snapshot;
+        assert!(!panel.latched, "local Escape armed the plane latch");
+        assert!(panel.hover_latched);
+        assert!(!ignored.transient_revealed);
     }
 
     #[test]
