@@ -248,8 +248,12 @@ pub struct ChangeBus {
     me: Weak<ChangeBus>,
     broker: Arc<SubscriptionBroker>,
     sink_tx: mpsc::Sender<String>,
+    /// Lock order: `last` → `last_emit` → `trailing`, everywhere (a
+    /// caller may skip a lock but never take them out of order).
+    /// `observe` holds `last` across swap, diff and emit so concurrent
+    /// observations apply in cache order; otherwise a stale diff could
+    /// overwrite a newer pending trailer.
     last: Mutex<Option<PropValue>>,
-    /// Lock order: `last_emit` before `trailing`, everywhere.
     last_emit: Mutex<HashMap<String, Instant>>,
     /// Per-path trailing emit armed by a cap-suppressed change. At most
     /// one per path; later suppressed changes overwrite `new`.
@@ -368,12 +372,9 @@ impl ChangeBus {
     /// stays fresh.
     pub async fn observe(&self, snapshot: &NodedPropsSnapshot, cause: &str) {
         let new_val = snapshot.snapshot_value();
-        let old_val = {
-            let mut g = self.last.lock().await;
-            let prev = g.clone();
-            *g = Some(new_val.clone());
-            prev
-        };
+        // Held to the end of the emit loop: see the lock order on the struct.
+        let mut last = self.last.lock().await;
+        let old_val = last.replace(new_val.clone());
         let Some(old_val) = old_val else { return };
         let diffs = cosmix_props::diff(&old_val, &new_val);
         if diffs.is_empty() {
@@ -430,6 +431,7 @@ impl ChangeBus {
         }
         drop(trailing);
         drop(last_emit);
+        drop(last);
 
         self.publish_world(snapshot).await;
     }
@@ -598,5 +600,87 @@ mod tests {
         bus.observe(&snap("debug"), "t").await;
         assert_eq!(next_event(&mut rx).await, None);
         assert!(bus.trailing.lock().await.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_observes_apply_in_cache_order() {
+        let (bus, mut rx) = setup().await;
+        bus.observe(&snap("debug"), "t").await;
+        assert_eq!(next_event(&mut rx).await, ev("info", "debug"));
+        tokio::time::advance(Duration::from_millis(30)).await;
+
+        // Stall both observers at the emit locks. The swap of `last` must
+        // not run ahead of them: if A could cache `warn` and then apply
+        // its diff after B, it would overwrite B's trailer with a stale
+        // value and the burst would end at `warn` while the cache says
+        // `error`.
+        let gate = bus.last_emit.lock().await;
+        let a = tokio::spawn({
+            let bus = bus.clone();
+            async move { bus.observe(&snap("warn"), "a").await }
+        });
+        let b = tokio::spawn({
+            let bus = bus.clone();
+            async move { bus.observe(&snap("error"), "b").await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            bus.last.try_lock().is_err(),
+            "the cache swap must stay inside the emit critical section"
+        );
+        drop(gate);
+        a.await.unwrap();
+        b.await.unwrap();
+
+        assert_eq!(next_event(&mut rx).await, ev("debug", "error"));
+        assert_eq!(next_event(&mut rx).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_timer_does_not_consume_rearmed_trailer() {
+        let (bus, mut rx) = setup().await;
+        bus.observe(&snap("debug"), "t").await;
+        assert_eq!(next_event(&mut rx).await, ev("info", "debug"));
+
+        // Trailer #1, timer due at t=100.
+        tokio::time::advance(Duration::from_millis(30)).await;
+        bus.observe(&snap("warn"), "t").await;
+        // A normal emit supersedes it at t=30 (see the race test)...
+        bus.last_emit.lock().await.insert(
+            "config.log_level".to_string(),
+            Instant::now() - Duration::from_millis(200),
+        );
+        bus.observe(&snap("error"), "t").await;
+        assert_eq!(next_event(&mut rx).await, ev("debug", "error"));
+        // ...and trailer #2 is armed at once, its timer due at t=130.
+        bus.observe(&snap("trace"), "t").await;
+
+        // Run past the stale timer only.
+        tokio::time::advance(Duration::from_millis(75)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "stale timer must not fire trailer #2");
+        assert!(bus.trailing.lock().await.contains_key("config.log_level"));
+
+        assert_eq!(next_event(&mut rx).await, ev("error", "trace"));
+        assert_eq!(next_event(&mut rx).await, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn change_after_trailer_continues_from_its_value() {
+        let (bus, mut rx) = setup().await;
+        bus.observe(&snap("debug"), "t").await;
+        assert_eq!(next_event(&mut rx).await, ev("info", "debug"));
+        tokio::time::advance(Duration::from_millis(30)).await;
+        bus.observe(&snap("warn"), "t").await;
+        assert_eq!(next_event(&mut rx).await, ev("debug", "warn"));
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        bus.observe(&snap("error"), "t").await;
+        assert_eq!(next_event(&mut rx).await, ev("warn", "error"));
+        assert_eq!(next_event(&mut rx).await, None);
     }
 }
