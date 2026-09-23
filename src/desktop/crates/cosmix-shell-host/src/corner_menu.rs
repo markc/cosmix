@@ -59,6 +59,13 @@ impl RunnerState {
         let Some(output) = self.outputs.get(&request.output) else {
             return Ok(());
         };
+        // A request arriving while a menu is open replaces it. The incumbent
+        // must leave through the normal dismiss path — staging its hold
+        // release — or its exclusive-keyboard layer and row entities leak.
+        let replacing = self.menu.is_some();
+        if replacing {
+            self.dismiss_corner_menu(None);
+        }
         let size = Vec2::new(output.logical_size.width(), output.logical_size.height());
         let mode = self
             .app
@@ -110,6 +117,16 @@ impl RunnerState {
         self.touch_bridge.cancel(&mut self.app);
         let elapsed = self.app.world().resource::<Time<Real>>().elapsed();
         surface.apply_protocol_ops(&[ProtocolOp::CommitBufferless], elapsed);
+        // The incumbent's dismissal released the hold; the successor
+        // re-acquires after it so the FIFO drain ends held.
+        if replacing {
+            stage_menu_hold(
+                &mut self.app,
+                &request.output,
+                request.corner.summoned_edge(),
+                true,
+            );
+        }
         self.menu = Some(NativeCornerMenu {
             surface,
             origin: ui::menu_origin(request.corner, size, request.items.len()),
@@ -126,13 +143,11 @@ impl RunnerState {
     /// the exclusive layer happens only after the renderer drains its handle.
     pub(super) fn dismiss_corner_menu(&mut self, choice: Option<usize>) {
         if let Some(request) = self.app.world_mut().remove_resource::<CornerMenuRequest>() {
-            stage_shell_command(
+            stage_menu_hold(
                 &mut self.app,
-                request.output,
-                ShellCommandKind::Panel {
-                    edge: request.corner.summoned_edge(),
-                    input: PanelInput::MenuHold(false),
-                },
+                &request.output,
+                request.corner.summoned_edge(),
+                false,
             );
             self.needs_update = true;
         }
@@ -178,6 +193,11 @@ impl RunnerState {
                 PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. } => {
                     menu.selected = enabled;
                     ui::highlight(self.app.world_mut(), &menu.rows, enabled);
+                    self.needs_update = true;
+                }
+                PointerEventKind::Leave { .. } => {
+                    menu.selected = None;
+                    ui::highlight(self.app.world_mut(), &menu.rows, None);
                     self.needs_update = true;
                 }
                 _ => {}
@@ -307,6 +327,21 @@ impl RunnerState {
     }
 }
 
+/// Stage the local popup hold for a menu's summoned edge. FIFO drain order
+/// is load-bearing: a choice stages its mode command before this release,
+/// and a replacement stages the incumbent's release before the successor's
+/// acquire, so no conceal can race the transfer.
+fn stage_menu_hold(app: &mut App, output: &OutputKey, edge: Edge, open: bool) {
+    stage_shell_command(
+        app,
+        output.clone(),
+        ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::MenuHold(open),
+        },
+    );
+}
+
 fn dismiss(app: &mut App, menu: &mut NativeCornerMenu, choice: Option<usize>) {
     let edge = menu.request.corner.summoned_edge();
     let item = choice
@@ -316,14 +351,7 @@ fn dismiss(app: &mut App, menu: &mut NativeCornerMenu, choice: Option<usize>) {
     if let Some(command) = item.as_ref().and_then(|i| i.command(edge)) {
         stage_shell_command(app, menu.request.output.clone(), command);
     }
-    stage_shell_command(
-        app,
-        menu.request.output.clone(),
-        ShellCommandKind::Panel {
-            edge,
-            input: PanelInput::MenuHold(false),
-        },
-    );
+    stage_menu_hold(app, &menu.request.output, edge, false);
     if let Some(ui::MenuItem {
         action: MenuAction::Extra(extra),
         ..
@@ -414,6 +442,107 @@ mod tests {
                 sequence.lock().unwrap().contains(&"layer"),
                 "dropping the exclusive layer releases keyboard focus"
             );
+        }
+    }
+
+    #[test]
+    fn second_request_while_open_retires_incumbent_and_reacquires_hold() {
+        let output = OutputKey::new("test-output").unwrap();
+        let mut model = ShellModel::new(
+            output.clone(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        // The pointer rests in the corner that RMB'd the incumbent open, as
+        // on the live path when the replacement request arrives.
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::CornerEntered)
+            .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::MenuHold(true))
+            .unwrap();
+        let mut app = App::new();
+        configure_ingress(&mut app);
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        let sequence = Arc::new(Mutex::new(Vec::new()));
+        let surface =
+            PanelSurface::test_double(&mut app, SurfacePhase::Configured, sequence.clone());
+        app.world_mut()
+            .entity_mut(surface.camera)
+            .insert(Camera::default());
+        let mut incumbent = NativeCornerMenu {
+            surface,
+            request: CornerMenuRequest {
+                output: output.clone(),
+                corner: cosmix_shell::core::Corner::TopLeft,
+                items: ui::menu_items(PanelMode::Hidden, &[]),
+            },
+            origin: Vec2::ZERO,
+            rows: vec![],
+            selected: None,
+            pressed: None,
+        };
+        // Replacement FIFO, as reconcile drives it: the ingress acquired
+        // for the successor, the incumbent's dismissal releases (drained by
+        // the update inside dismiss), then the successor re-acquires.
+        stage_menu_hold(&mut app, &output, Edge::Left, true);
+        dismiss(&mut app, &mut incumbent, None);
+        let (mount, camera, window) = (
+            incumbent.surface.mount,
+            incumbent.surface.camera,
+            incumbent.surface.window,
+        );
+        assert_eq!(incumbent.surface.phase, SurfacePhase::Closed);
+        incumbent.surface.retire(&mut app);
+        stage_menu_hold(&mut app, &output, Edge::Left, true);
+        app.update();
+        let revealed = |app: &App| {
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .transient_revealed
+        };
+        // The release inside the transfer concealed nothing, and no staging
+        // leaked past the drain.
+        assert!(revealed(&app));
+        assert!(!staged_shell_commands_pending(&app));
+        // The reacquired hold still blocks conceal once the pointer leaves.
+        stage_shell_command(
+            &mut app,
+            output.clone(),
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::CornerLeft,
+            },
+        );
+        stage_shell_command(
+            &mut app,
+            output,
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Hide,
+            },
+        );
+        app.update();
+        assert!(revealed(&app), "reacquired MenuHold(true) blocks Hide");
+        // Exactly one menu remains: the incumbent closed, dropped its
+        // exclusive layer exactly once, and left no entities behind.
+        assert_eq!(
+            sequence
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|step| **step == "layer")
+                .count(),
+            1
+        );
+        for entity in [mount, camera, window] {
+            assert!(app.world().get_entity(entity).is_err());
         }
     }
 }

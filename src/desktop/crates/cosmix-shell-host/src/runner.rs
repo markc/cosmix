@@ -3159,6 +3159,9 @@ impl RunnerState {
         if self.keyboard_bridge.cleanup(&mut self.app, None) {
             self.needs_update = true;
         }
+        // Escape needs a keyboard: with the active seat gone, nothing could
+        // close an open corner menu, so take it down with its hold released.
+        self.dismiss_corner_menu(None);
         if let Some(keyboard) = self.active_keyboard.take() {
             release_keyboard(keyboard);
         }
