@@ -59,7 +59,7 @@ impl Plugin for EmbeddedQuoinPlugin {
         let registry = crate::page_registry();
         let store = crate::state::StateStore::startup(false);
         let mut model = model("primary", Vec2::new(1920.0, 1080.0), &registry);
-        store.snapshot().restore(&mut model);
+        store.restore(&mut model);
         model.start_intro(Duration::from_secs(2));
         app.add_plugins(ShellRuntimePlugin::new(model));
         let mounts: [Entity; 4] = std::array::from_fn(|i| {
@@ -250,7 +250,13 @@ fn prepare(world: &mut World) {
     }
     let host = world.resource::<EmbeddedHost>();
     if host.name != name || host.size != size {
-        let replacement = model(&name, size, world.resource());
+        let mut replacement = model(&name, size, world.resource());
+        if host.name != name {
+            // A different output restores its own remembered state (per-
+            // (output, edge) persistence); a same-output resize keeps the
+            // fresh-model rebuild.
+            world.resource::<crate::state::StateStore>().restore(&mut replacement);
+        }
         replace_shell_model(world, replacement);
         let mut host = world.resource_mut::<EmbeddedHost>();
         host.name = name.clone();

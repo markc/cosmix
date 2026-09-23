@@ -709,26 +709,55 @@ Process feedback wakes the UI without periodic polling. The default child
 inherits Quoin's environment and service lifetime.</p>
 <p>Quoin loads strict-data <code>$COSMIX_VAR/quoin.state.mix</code> before constructing its
 initial model, using the shared path resolver (including its XDG fallback).
-The v2 root contains exactly six fields: <code>version: 2</code>, <code>scheme</code>, and <code>left</code>,
-<code>bottom</code>, <code>right</code>, <code>top</code>. Each edge has exactly <code>thickness_px</code>, <code>mode</code> and <code>page</code>:</p>
+The v3 root contains exactly three fields: <code>version: 3</code>, <code>scheme</code>, and
+<code>outputs</code> — a map from an output identity to that output's four edges. Each
+output entry has exactly <code>left</code>, <code>bottom</code>, <code>right</code> and <code>top</code>; each edge has
+exactly <code>thickness_px</code>, <code>mode</code> and <code>page</code>:</p>
 <pre><code class="language-text">{
-  version: 2,
+  version: 3,
   scheme: "builtin",
-  left:   {thickness_px: 240, mode: "hidden", page: "nav"},
-  bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
-  right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
-  top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+  outputs: {
+    "connector:DP-1": {
+      left:   {thickness_px: 240, mode: "hidden", page: "nav"},
+      bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
+      right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+    },
+    "connector:HDMI-1": {
+      left:   {thickness_px: 200, mode: "docked", page: "places"},
+      bottom: {thickness_px: 60,  mode: "hidden", page: "tasks"},
+      right:  {thickness_px: 240, mode: "hidden", page: "monitor"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+    }
+  }
 }
 </code></pre>
+<p>An output's key in the <code>outputs</code> map is its persistent identity, not its
+geometry: today <code>connector:&lt;name&gt;</code>, where <code>&lt;name&gt;</code> is the connector name comp
+reports for the output — the <code>outputs</code> props row name the layer host's
+<code>OutputKey</code> mirrors. comp cannot yet supply EDID make/model/serial, so no
+EDID-based identity tier exists; keys are opaque non-empty strings, so an
+<code>edid:</code> tier can be added when comp grows EDID fields without another format
+version. Real identities always carry a prefix, which keeps them clear of the
+reserved <code>default</code> entry that legacy files migrate to.</p>
 <p>Modes are the strings <code>hidden</code>, <code>pinned</code> or <code>docked</code>. Thickness must be finite
-and positive; unknown page IDs use the edge's default page. The strict legacy
-five-field root (no version) with three-field edges containing <code>pinned</code> booleans
-is migrated in memory: true becomes <code>docked</code>, false becomes <code>hidden</code>, preserving
-thickness, page and scheme. Only successfully parsed legacy files migrate.
-The next normal persistent mutation writes v2; loading and transient visibility
-do not rewrite the file. Missing or invalid files use hidden defaults with one
-diagnostic line and no startup write. As before, a later normal mutation may
-overwrite a corrupt file; write inhibition is a separate outstanding issue.</p>
+and positive; unknown page IDs use the edge's default page. On restore, an
+output with an entry under its own identity reuses it as-is. The strict
+legacy five-field root (no version) with three-field edges containing
+<code>pinned</code> booleans is migrated in memory — true becomes <code>docked</code>, false
+becomes <code>hidden</code>, preserving thickness, page and scheme — as is a v2 root
+(<code>version: 2</code> with the four edges at the top level). Both park their single
+edge set under the reserved <code>default</code> output entry, and the first output to
+restore claims it, re-filing the entry under its own identity; a different,
+later output gets the default config instead. Only successfully parsed
+legacy files migrate, and an output with no matching entry (and no unclaimed
+<code>default</code>) restores nothing: it keeps the default config and gains no entry
+until its first save. The next normal persistent mutation writes v3,
+rewriting only the current output's entry — other outputs' remembered state
+stays for reconnection. Loading and transient visibility do not rewrite the
+file. Missing or invalid files use hidden defaults with one diagnostic line
+and no startup write. As before, a later normal mutation may overwrite a
+corrupt file; write inhibition is a separate outstanding issue.</p>
 <p>Accepted mode, page, scheme and completed resize changes save state after the Model stage,
 using a temporary file and atomic rename. Output migration carries live
 mode, page and thickness state; it never reloads disk state. Both smoke modes

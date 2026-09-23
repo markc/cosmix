@@ -1,14 +1,40 @@
 //! Only accepted user state survives a launch; transient holds never reach disk.
+//!
+//! The v3 format scopes every edge set to its output's persistent identity
+//! (shell design §7): the root holds `version: 3`, `scheme`, and an `outputs`
+//! map from identity string to the four edge fields. v1 and v2 files keyed
+//! edges by the implicit single output; they migrate to the reserved
+//! [`DEFAULT_OUTPUT`] entry, which the first output to restore claims.
 
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bevy::prelude::*;
 use cosmix_config::{CosmixDir, Value, cosmix_path, parse_mix_data};
-use cosmix_shell::core::{Edge, PanelConfig, PanelEffect, PanelMode, ShellModel};
+use cosmix_shell::core::{Edge, OutputKey, PanelConfig, PanelEffect, PanelMode, ShellModel};
 use cosmix_shell::runtime::{ShellEffects, ShellFrameState};
+
+/// Reserved identity under which a v1/v2 file's single edge set migrates:
+/// it belonged to the output Quoin ran on, so the first output to restore
+/// claims it (a later unknown output gets the default config instead).
+const DEFAULT_OUTPUT: &str = "default";
+
+/// Persistent identity of one output for state keying (shell design §7):
+/// EDID make/model/serial when the compositor reports it, else the connector
+/// name, else a new output with the default config. comp's output
+/// observations currently carry only the connector name — the `outputs`
+/// props row name the layer host's `OutputKey` mirrors — so identities are
+/// `connector:<name>` today. File keys are opaque non-empty strings, so an
+/// `edid:` tier can be introduced when comp grows EDID fields without
+/// another format version. Real identities are always prefixed, which keeps
+/// them clear of [`DEFAULT_OUTPUT`].
+fn output_identity(output: &OutputKey) -> String {
+    format!("connector:{}", output.as_str())
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct EdgeState {
@@ -17,16 +43,22 @@ struct EdgeState {
     page: String,
 }
 
+/// One output's remembered per-edge state.
+#[derive(Clone, Debug, PartialEq)]
+struct OutputState {
+    edges: [EdgeState; 4],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SavedState {
-    edges: [EdgeState; 4],
+    outputs: BTreeMap<String, OutputState>,
     scheme: String,
 }
 
 impl Default for SavedState {
     fn default() -> Self {
         Self {
-            edges: std::array::from_fn(|_| EdgeState::default()),
+            outputs: BTreeMap::new(),
             scheme: "builtin".into(),
         }
     }
@@ -64,112 +96,183 @@ impl SavedState {
         let Some(Value::String(scheme)) = root.get("scheme") else {
             return Err(invalid());
         };
-        let legacy = match root.get("version") {
-            None => true,
-            Some(Value::Number(version)) if *version == 2.0 => false,
-            _ => return Err(invalid()),
-        };
-        if root.len() != if legacy { 5 } else { 6 } {
-            return Err(invalid());
-        }
         let mut state = Self {
             scheme: scheme.clone(),
             ..Self::default()
         };
-        for edge in Edge::ALL {
-            let Some(Value::Map(fields)) = root.get(crate::edge_name(edge)) else {
-                return Err(invalid());
-            };
-            let (Some(Value::Number(thickness)), Some(Value::String(page))) =
-                (fields.get("thickness_px"), fields.get("page"))
-            else {
-                return Err(invalid());
-            };
-            if fields.len() != 3 {
-                return Err(invalid());
+        match root.get("version") {
+            // v1 (no version) and v2 predate per-output keying: their single
+            // edge set belongs to the output Quoin ran on and migrates to the
+            // reserved default-output entry, claimed at restore time.
+            None => {
+                if root.len() != 5 {
+                    return Err(invalid());
+                }
+                let edges = parse_edge_set(&value, true)?;
+                state.outputs.insert(DEFAULT_OUTPUT.to_owned(), OutputState { edges });
             }
-            let mode = if legacy {
-                match fields.get("pinned") {
-                    Some(Value::Bool(true)) => PanelMode::Docked,
-                    Some(Value::Bool(false)) => PanelMode::Hidden,
-                    _ => return Err(invalid()),
+            Some(Value::Number(version)) if *version == 2.0 => {
+                if root.len() != 6 {
+                    return Err(invalid());
                 }
-            } else {
-                match fields.get("mode") {
-                    Some(Value::String(mode)) => match mode.as_str() {
-                        "hidden" => PanelMode::Hidden,
-                        "pinned" => PanelMode::Pinned,
-                        "docked" => PanelMode::Docked,
-                        _ => return Err(invalid()),
-                    },
-                    _ => return Err(invalid()),
+                let edges = parse_edge_set(&value, false)?;
+                state.outputs.insert(DEFAULT_OUTPUT.to_owned(), OutputState { edges });
+            }
+            Some(Value::Number(version)) if *version == 3.0 => {
+                if root.len() != 3 {
+                    return Err(invalid());
                 }
-            };
-            let thickness = *thickness as f32;
-            PanelConfig::new(
-                thickness,
-                Duration::from_millis(800),
-                Duration::from_millis(200),
-            )
-            .map_err(|error| StateError::Data(error.to_string()))?;
-            state.edges[edge.index()] = EdgeState {
-                thickness_px: Some(thickness),
-                mode,
-                page: page.clone(),
-            };
+                let Some(Value::Map(outputs)) = root.get("outputs") else {
+                    return Err(invalid());
+                };
+                for (identity, output) in outputs.iter() {
+                    if identity.trim().is_empty() {
+                        return Err(invalid());
+                    }
+                    let Value::Map(fields) = output else {
+                        return Err(invalid());
+                    };
+                    if fields.len() != Edge::ALL.len() {
+                        return Err(invalid());
+                    }
+                    let edges = parse_edge_set(output, false)?;
+                    state.outputs.insert(identity.clone(), OutputState { edges });
+                }
+            }
+            _ => return Err(invalid()),
         }
         Ok(state)
     }
 
     /// Unknown page IDs retain the registry's default selection.
-    pub(crate) fn restore(&self, model: &mut ShellModel) {
+    ///
+    /// Restoring claims the entry for the model's output: a match by
+    /// identity is reused as-is, while the migrated default-output entry
+    /// moves to the first output that restores it. An unknown output
+    /// restores nothing — it keeps the default config and gains no entry
+    /// until its first save.
+    pub(crate) fn restore(&mut self, model: &mut ShellModel) {
+        let identity = output_identity(model.output());
+        let Some(state) = self
+            .outputs
+            .remove(&identity)
+            .or_else(|| self.outputs.remove(DEFAULT_OUTPUT))
+        else {
+            return;
+        };
         for edge in Edge::ALL {
-            let state = &self.edges[edge.index()];
-            if let Some(thickness) = state.thickness_px {
+            let saved = &state.edges[edge.index()];
+            if let Some(thickness) = saved.thickness_px {
                 model
                     .restore_thickness(edge, thickness)
                     .expect("saved thickness was validated");
             }
-            model.carousel_mut(edge).select_id(&state.page);
+            model.carousel_mut(edge).select_id(&saved.page);
             model
-                .set_mode(edge, model.last_update(), state.mode)
+                .set_mode(edge, model.last_update(), saved.mode)
                 .expect("restore uses model time");
         }
+        self.outputs.insert(identity, state);
     }
 
     fn encode(&self) -> Result<String, StateError> {
-        let mut fields = vec![
-            ("version".to_owned(), Value::Number(2.0)),
-            ("scheme".to_owned(), Value::String(self.scheme.clone())),
-        ];
-        for edge in Edge::ALL {
-            let state = &self.edges[edge.index()];
-            let thickness = state
-                .thickness_px
-                .ok_or_else(|| StateError::Data("state has no model dimensions".into()))?;
-            fields.push((
-                crate::edge_name(edge).into(),
-                Value::map(
-                    [
-                        ("thickness_px".into(), Value::Number(f64::from(thickness))),
-                        ("mode".into(), Value::String(state.mode.as_str().into())),
-                        ("page".into(), Value::String(state.page.clone())),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
-            ));
+        let mut output_fields = Vec::with_capacity(self.outputs.len());
+        for (identity, output) in &self.outputs {
+            let mut edge_fields = Vec::with_capacity(Edge::ALL.len());
+            for edge in Edge::ALL {
+                let state = &output.edges[edge.index()];
+                let thickness = state.thickness_px.ok_or_else(|| {
+                    StateError::Data("state has no model dimensions".into())
+                })?;
+                edge_fields.push((
+                    crate::edge_name(edge).into(),
+                    Value::map(
+                        [
+                            ("thickness_px".into(), Value::Number(f64::from(thickness))),
+                            ("mode".into(), Value::String(state.mode.as_str().into())),
+                            ("page".into(), Value::String(state.page.clone())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                ));
+            }
+            output_fields.push((identity.clone(), Value::map(edge_fields.into_iter().collect())));
         }
-        Value::map(fields.into_iter().collect())
-            .to_mix_data_string_pretty()
-            .map_err(|error| StateError::Data(error.to_string()))
+        Value::map(
+            [
+                ("version".to_owned(), Value::Number(3.0)),
+                ("scheme".to_owned(), Value::String(self.scheme.clone())),
+                ("outputs".to_owned(), Value::map(output_fields.into_iter().collect())),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .to_mix_data_string_pretty()
+        .map_err(|error| StateError::Data(error.to_string()))
     }
+}
+
+/// Parse the four per-edge entries from a map-shaped value. For v1/v2 the
+/// value is the file root (whose extra keys were count-checked by the
+/// caller); for v3 it is one output's entry, already length-checked.
+fn parse_edge_set(edges: &Value, legacy: bool) -> Result<[EdgeState; 4], StateError> {
+    let invalid = || StateError::Data("invalid Quoin state fields".into());
+    let Value::Map(fields) = edges else {
+        return Err(invalid());
+    };
+    let mut set = std::array::from_fn(|_| EdgeState::default());
+    for edge in Edge::ALL {
+        let Some(Value::Map(entry)) = fields.get(crate::edge_name(edge)) else {
+            return Err(invalid());
+        };
+        let (Some(Value::Number(thickness)), Some(Value::String(page))) =
+            (entry.get("thickness_px"), entry.get("page"))
+        else {
+            return Err(invalid());
+        };
+        if entry.len() != 3 {
+            return Err(invalid());
+        }
+        let mode = if legacy {
+            match entry.get("pinned") {
+                Some(Value::Bool(true)) => PanelMode::Docked,
+                Some(Value::Bool(false)) => PanelMode::Hidden,
+                _ => return Err(invalid()),
+            }
+        } else {
+            match entry.get("mode") {
+                Some(Value::String(mode)) => match mode.as_str() {
+                    "hidden" => PanelMode::Hidden,
+                    "pinned" => PanelMode::Pinned,
+                    "docked" => PanelMode::Docked,
+                    _ => return Err(invalid()),
+                },
+                _ => return Err(invalid()),
+            }
+        };
+        let thickness = *thickness as f32;
+        PanelConfig::new(
+            thickness,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .map_err(|error| StateError::Data(error.to_string()))?;
+        set[edge.index()] = EdgeState {
+            thickness_px: Some(thickness),
+            mode,
+            page: page.clone(),
+        };
+    }
+    Ok(set)
 }
 
 #[derive(Resource)]
 pub(crate) struct StateStore {
     path: Option<PathBuf>,
-    saved: SavedState,
+    /// Shared with the host's model factory: restoring claims the migrated
+    /// default-output entry, and the claim must reach the next save.
+    saved: Arc<Mutex<SavedState>>,
     #[cfg(test)]
     write_count: usize,
 }
@@ -198,24 +301,49 @@ impl StateStore {
         };
         Self {
             path,
-            saved,
+            saved: Arc::new(Mutex::new(saved)),
             #[cfg(test)]
             write_count: 0,
         }
     }
 
+    /// The saved state as it stands; used by tests to inspect the store.
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> SavedState {
-        self.saved.clone()
+        self.lock_saved().clone()
+    }
+
+    /// A handle sharing the saved state with a host's model factory, which
+    /// builds models outside the Bevy world the store lives in.
+    pub(crate) fn shared_saved(&self) -> Arc<Mutex<SavedState>> {
+        Arc::clone(&self.saved)
+    }
+
+    /// Restore remembered state into `model`, claiming the model output's
+    /// identity (see [`SavedState::restore`]).
+    pub(crate) fn restore(&self, model: &mut ShellModel) {
+        self.lock_saved().restore(model);
+    }
+
+    /// Restore through a factory-held shared handle (see
+    /// [`Self::shared_saved`]), so the factory's claim is visible to the
+    /// next save.
+    pub(crate) fn restore_shared(shared: &Arc<Mutex<SavedState>>, model: &mut ShellModel) {
+        shared.lock().expect("Quoin state lock").restore(model);
     }
 
     /// The restored appearance scheme name, or `None` when the state uses the
     /// sentinel default (`"builtin"`) — meaning no scheme was ever persisted
     /// and the caller should keep CTK's built-in selection.
-    pub(crate) fn scheme(&self) -> Option<&str> {
-        match self.saved.scheme.as_str() {
+    pub(crate) fn scheme(&self) -> Option<String> {
+        match self.lock_saved().scheme.as_str() {
             "builtin" => None,
-            scheme => Some(scheme),
+            scheme => Some(scheme.to_owned()),
         }
+    }
+
+    fn lock_saved(&self) -> MutexGuard<'_, SavedState> {
+        self.saved.lock().expect("Quoin state lock")
     }
 }
 
@@ -267,27 +395,39 @@ pub(crate) fn persist_transitions(
     {
         return;
     }
+    let mut saved = store.lock_saved();
     if let Some(scheme) = selection {
-        store.saved.scheme = scheme.name().to_owned();
+        saved.scheme = scheme.name().to_owned();
     }
-    for edge in Edge::ALL {
-        let panel = frame.0.panel(edge);
-        store.saved.edges[edge.index()] = EdgeState {
-            thickness_px: Some(panel.settled_thickness_px),
-            mode: panel.mode,
-            page: panel.active_page_id.clone().unwrap_or_default(),
-        };
-    }
-    if let Some(path) = &store.path {
-        match atomic_save(path, &store.saved) {
-            Ok(()) => {
-                #[cfg(test)]
-                {
-                    store.write_count += 1;
+    // Only the current output's entry is rewritten; other outputs' remembered
+    // state stays for reconnection (shell design §7's output-removal row).
+    let output = output_identity(&frame.0.geometry.output);
+    saved.outputs.insert(
+        output,
+        OutputState {
+            edges: std::array::from_fn(|index| {
+                let panel = frame.0.panel(Edge::ALL[index]);
+                EdgeState {
+                    thickness_px: Some(panel.settled_thickness_px),
+                    mode: panel.mode,
+                    page: panel.active_page_id.clone().unwrap_or_default(),
                 }
+            }),
+        },
+    );
+    let saved_result = match store.path.as_deref() {
+        Some(path) => atomic_save(path, &saved),
+        None => Ok(()),
+    };
+    drop(saved);
+    match saved_result {
+        Ok(()) => {
+            #[cfg(test)]
+            {
+                store.write_count += 1;
             }
-            Err(error) => bevy::log::warn!("Quoin state save failed: {error}"),
         }
+        Err(error) => bevy::log::warn!("Quoin state save failed: {error}"),
     }
 }
 
@@ -300,8 +440,12 @@ mod tests {
     };
 
     fn resize_app(path: &Path) -> App {
+        resize_app_for(path, "DP-1")
+    }
+
+    fn resize_app_for(path: &Path, output: &str) -> App {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model())))
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model_for(output))))
             .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
             .add_message::<ctk::theme::ApplyTheme>()
             .add_message::<bevy::window::RequestRedraw>()
@@ -311,8 +455,12 @@ mod tests {
     }
 
     fn resize_command(app: &mut App, kind: ShellCommandKind) {
+        resize_command_for(app, "DP-1", kind);
+    }
+
+    fn resize_command_for(app: &mut App, output: &str, kind: ShellCommandKind) {
         app.world_mut().write_message(ShellCommand {
-            output: OutputKey::new("DP-1").unwrap(),
+            output: OutputKey::new(output).unwrap(),
             at: Duration::ZERO,
             kind,
         });
@@ -348,10 +496,8 @@ mod tests {
         }
         resize_input(&mut app, PanelInput::ResizeCompleted);
         assert_eq!(app.world().resource::<StateStore>().write_count, 1);
-        assert_eq!(
-            StateStore::load(Some(path)).snapshot().edges[0].thickness_px,
-            Some(300.0)
-        );
+        let saved = StateStore::load(Some(path)).snapshot();
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(300.0));
         resize_input(&mut app, PanelInput::ResizeCompleted);
         app.update();
         assert_eq!(app.world().resource::<StateStore>().write_count, 1);
@@ -398,21 +544,21 @@ mod tests {
             },
         );
         resize_input(&mut app, PanelInput::Dock);
-        assert_eq!(
-            StateStore::load(Some(path.clone())).snapshot().edges[0].thickness_px,
-            Some(starting)
-        );
+        let saved = StateStore::load(Some(path.clone())).snapshot();
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(starting));
         resize_input(&mut app, PanelInput::ResizeCancelled);
         assert_eq!(app.world().resource::<StateStore>().write_count, 1);
-        assert_eq!(
-            StateStore::load(Some(path)).snapshot().edges[0].thickness_px,
-            Some(starting)
-        );
+        let saved = StateStore::load(Some(path)).snapshot();
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(starting));
     }
 
     fn model() -> ShellModel {
+        model_for("DP-1")
+    }
+
+    fn model_for(output: &str) -> ShellModel {
         let mut model = ShellModel::new(
-            OutputKey::new("DP-1").unwrap(),
+            OutputKey::new(output).unwrap(),
             LogicalSize::new(1000.0, 800.0).unwrap(),
             Duration::ZERO,
             Duration::from_millis(800),
@@ -426,14 +572,31 @@ mod tests {
         model
     }
 
+    /// Distinct remembered state for one output, addressable by name.
+    fn output_state(output: &str, thickness_px: f32, mode: PanelMode, page: usize) -> OutputState {
+        let model = model_for(output);
+        OutputState {
+            edges: std::array::from_fn(|index| {
+                let edge = Edge::ALL[index];
+                let pages = model.carousel(edge).page_ids();
+                EdgeState {
+                    thickness_px: Some(thickness_px + index as f32),
+                    mode: if edge == Edge::Left { mode } else { PanelMode::Hidden },
+                    page: pages[page.min(pages.len() - 1)].clone(),
+                }
+            }),
+        }
+    }
+
     fn populated() -> SavedState {
         let model = model();
         let mut state = SavedState {
             scheme: "custom \"blue\" ${literal}\n".into(),
             ..SavedState::default()
         };
+        let mut edges = std::array::from_fn(|_| EdgeState::default());
         for edge in Edge::ALL {
-            state.edges[edge.index()] = EdgeState {
+            edges[edge.index()] = EdgeState {
                 thickness_px: Some(model.panel(edge).thickness_px + 13.0),
                 mode: if edge == Edge::Left {
                     PanelMode::Docked
@@ -443,6 +606,8 @@ mod tests {
                 page: model.carousel(edge).page_ids()[1].clone(),
             };
         }
+        let identity = output_identity(&OutputKey::new("DP-1").unwrap());
+        state.outputs.insert(identity, OutputState { edges });
         state
     }
 
@@ -461,11 +626,27 @@ mod tests {
         source
     }
 
+    /// A v2 file as today's Quoin writes it: string modes, no output nesting.
+    fn v2_source() -> String {
+        let mut source = String::from("{version: 2, scheme: \"v2\"");
+        for edge in Edge::ALL {
+            source.push_str(&format!(
+                ", {}: {{thickness_px: {}, mode: \"{}\", page: \"{}\"}}",
+                crate::edge_name(edge),
+                150 + edge.index(),
+                if edge == Edge::Left { "docked" } else { "hidden" },
+                "places"
+            ));
+        }
+        source.push('}');
+        source
+    }
+
     #[test]
     fn every_legacy_pin_combination_migrates_preserving_sizes_pages_and_scheme() {
         for mask in 0..16 {
             let source = legacy_source(mask);
-            let saved = SavedState::parse(&source).unwrap();
+            let mut saved = SavedState::parse(&source).unwrap();
             assert_eq!(saved.scheme, "legacy");
             let mut model = model();
             saved.restore(&mut model);
@@ -475,12 +656,10 @@ mod tests {
                 } else {
                     PanelMode::Hidden
                 };
-                assert_eq!(saved.edges[edge.index()].mode, expected);
-                assert_eq!(saved.edges[edge.index()].page, "removed-page");
-                assert_eq!(
-                    saved.edges[edge.index()].thickness_px,
-                    Some((140 + edge.index()) as f32)
-                );
+                let claimed = &saved.outputs["connector:DP-1"].edges[edge.index()];
+                assert_eq!(claimed.mode, expected);
+                assert_eq!(claimed.page, "removed-page");
+                assert_eq!(claimed.thickness_px, Some((140 + edge.index()) as f32));
                 assert_eq!(model.panel(edge).mode, expected);
                 assert!(!model.panel(edge).transient_revealed);
             }
@@ -491,32 +670,37 @@ mod tests {
     #[test]
     fn v2_round_trips_all_modes_without_transient_visibility() {
         let mut saved = populated();
-        for (edge, mode) in Edge::ALL.into_iter().zip([
+        let modes = [
             PanelMode::Hidden,
             PanelMode::Pinned,
             PanelMode::Docked,
             PanelMode::Hidden,
-        ]) {
-            saved.edges[edge.index()].mode = mode;
+        ];
+        let output = saved.outputs.get_mut("connector:DP-1").expect("populated");
+        for (edge, mode) in output.edges.iter_mut().zip(modes) {
+            edge.mode = mode;
         }
         let encoded = saved.encode().unwrap();
         let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
             panic!("map")
         };
-        assert_eq!(root.len(), 6);
-        assert_eq!(root.get("version"), Some(&Value::Number(2.0)));
+        assert_eq!(root.len(), 3);
+        assert_eq!(root.get("version"), Some(&Value::Number(3.0)));
         assert!(!encoded.contains("transient"));
         assert_eq!(SavedState::parse(&encoded).unwrap(), saved);
         let mut model = model();
         saved.restore(&mut model);
         for edge in Edge::ALL {
-            assert_eq!(model.panel(edge).mode, saved.edges[edge.index()].mode);
+            assert_eq!(
+                model.panel(edge).mode,
+                saved.outputs["connector:DP-1"].edges[edge.index()].mode
+            );
             assert!(!model.panel(edge).transient_revealed);
         }
     }
 
     #[test]
-    fn legacy_load_and_hover_do_not_rewrite_but_normal_mutation_writes_v2() {
+    fn legacy_load_and_hover_do_not_rewrite_but_normal_mutation_writes_v3() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quoin.state.mix");
         let source = legacy_source(0);
@@ -539,11 +723,9 @@ mod tests {
         let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
             panic!("map")
         };
-        assert_eq!(root.get("version"), Some(&Value::Number(2.0)));
-        assert_eq!(
-            SavedState::parse(&encoded).unwrap().edges[0].mode,
-            PanelMode::Pinned
-        );
+        assert_eq!(root.get("version"), Some(&Value::Number(3.0)));
+        let saved = SavedState::parse(&encoded).unwrap();
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].mode, PanelMode::Pinned);
     }
 
     #[test]
@@ -576,9 +758,15 @@ mod tests {
                 input: PanelInput::Dock,
             },
         );
-        let saved = StateStore::load(Some(path)).snapshot();
-        assert_eq!(saved.edges[Edge::Left.index()].mode, PanelMode::Hidden);
-        assert_eq!(saved.edges[Edge::Right.index()].mode, PanelMode::Docked);
+        let mut saved = StateStore::load(Some(path)).snapshot();
+        assert_eq!(
+            saved.outputs["connector:DP-1"].edges[Edge::Left.index()].mode,
+            PanelMode::Hidden
+        );
+        assert_eq!(
+            saved.outputs["connector:DP-1"].edges[Edge::Right.index()].mode,
+            PanelMode::Docked
+        );
         let mut model = model();
         saved.restore(&mut model);
         assert!(!model.panel(Edge::Left).mapped);
@@ -636,26 +824,27 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quoin.state.mix");
         let legacy = legacy_source(15);
-        let v2 = populated().encode().unwrap();
+        let v3 = populated().encode().unwrap();
         let mut sources = vec![
-            "{version: 2, broken".into(),
+            "{version: 3, broken".into(),
             legacy.replacen('{', "{version: 2,", 1),
             legacy.replacen('{', "{version: 3,", 1),
-            legacy.replacen('{', "{version: \"2\",", 1),
+            legacy.replacen('{', "{version: 4,", 1),
+            legacy.replacen('{', "{version: \"3\",", 1),
             legacy.replace("pinned: true", "mode: \"docked\""),
             legacy.replacen("pinned: true", "pinned: 1", 1),
             legacy.replacen("thickness_px: 140", "thickness_px: -1", 1),
         ];
-        // Modify parsed v2 maps rather than depending on the pretty printer's
+        // Modify parsed v3 maps rather than depending on the pretty printer's
         // whitespace/key quoting, including unknown and missing fields.
         for case in 0..6 {
-            let Value::Map(ref root) = parse_mix_data(&v2).unwrap() else {
+            let Value::Map(ref root) = parse_mix_data(&v3).unwrap() else {
                 panic!("map")
             };
             let mut root = (**root).clone();
             match case {
                 0 => {
-                    root.insert("version".into(), Value::Number(3.0));
+                    root.insert("version".into(), Value::Number(2.0));
                 }
                 1 => {
                     root.shift_remove("version");
@@ -664,8 +853,12 @@ mod tests {
                     root.insert("extra".into(), Value::Bool(true));
                 }
                 _ => {
-                    let Some(Value::Map(fields)) = root.get_mut("left") else {
-                        panic!("edge")
+                    let Some(Value::Map(outputs)) = root.get_mut("outputs") else {
+                        panic!("outputs")
+                    };
+                    let outputs = std::rc::Rc::make_mut(outputs);
+                    let Some(Value::Map(fields)) = outputs.get_mut("connector:DP-1") else {
+                        panic!("output")
                     };
                     let fields = std::rc::Rc::make_mut(fields);
                     match case {
@@ -701,7 +894,7 @@ mod tests {
     #[test]
     fn legacy_popup_release_clears_migrated_reservation_before_conceal() {
         use cosmix_shell::runtime::{ShellSemanticVerb, semantic_shell_command};
-        let saved = SavedState::parse(&legacy_source(1)).unwrap();
+        let mut saved = SavedState::parse(&legacy_source(1)).unwrap();
         let mut model = model();
         saved.restore(&mut model);
         model.tick(Duration::from_millis(200)).unwrap();
@@ -788,7 +981,7 @@ mod tests {
             assert_eq!(applied.0.mode, Mode::Dark);
             assert_eq!(
                 StateStore::load(Some(path.clone())).scheme(),
-                Some(scheme.name())
+                Some(scheme.name().to_owned())
             );
             app.world_mut().entity_mut(dot).despawn();
         }
@@ -800,14 +993,14 @@ mod tests {
         let path = directory.path().join("quoin.state.mix");
         let saved = populated();
         atomic_save(&path, &saved).unwrap();
-        let loaded = StateStore::load(Some(path)).snapshot();
+        let mut loaded = StateStore::load(Some(path)).snapshot();
         assert_eq!(loaded, saved);
         let mut model = model();
         loaded.restore(&mut model);
         for edge in Edge::ALL {
             assert_eq!(
                 model.panel(edge).thickness_px,
-                saved.edges[edge.index()].thickness_px.unwrap()
+                saved.outputs["connector:DP-1"].edges[edge.index()].thickness_px.unwrap()
             );
             assert_eq!(
                 model.panel(edge).mode == PanelMode::Docked,
@@ -815,7 +1008,7 @@ mod tests {
             );
             assert_eq!(
                 model.carousel(edge).active_id(),
-                Some(saved.edges[edge.index()].page.as_str())
+                Some(saved.outputs["connector:DP-1"].edges[edge.index()].page.as_str())
             );
         }
     }
@@ -838,14 +1031,24 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         }
         let mut invalid = populated();
-        invalid.edges[0].thickness_px = Some(-1.0);
+        invalid
+            .outputs
+            .get_mut("connector:DP-1")
+            .expect("populated output")
+            .edges[0]
+            .thickness_px = Some(-1.0);
         assert!(SavedState::parse(&invalid.encode().unwrap()).is_err());
     }
 
     #[test]
     fn unknown_saved_page_uses_registry_default() {
         let mut state = populated();
-        state.edges[0].page = "removed-page".into();
+        state
+            .outputs
+            .get_mut("connector:DP-1")
+            .expect("populated output")
+            .edges[0]
+            .page = "removed-page".into();
         let mut model = model();
         state.restore(&mut model);
         assert_eq!(model.carousel(Edge::Left).active_id(), Some("nav"));
@@ -875,7 +1078,7 @@ mod tests {
         app.update();
         let store = app.world().resource::<StateStore>();
         assert!(store.path.is_none());
-        assert_eq!(store.saved, SavedState::default());
+        assert_eq!(store.snapshot(), SavedState::default());
     }
 
     #[test]
@@ -913,7 +1116,137 @@ mod tests {
             }));
         app.update();
         let saved = StateStore::load(Some(path)).snapshot();
-        assert_eq!(saved.edges[0].mode, PanelMode::Docked);
-        assert_eq!(saved.edges[0].page, "places");
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].mode, PanelMode::Docked);
+        assert_eq!(saved.outputs["connector:DP-1"].edges[0].page, "places");
+    }
+
+    #[test]
+    fn two_outputs_keep_distinct_selection_and_thickness() {
+        let mut state = SavedState::default();
+        state.outputs.insert(
+            output_identity(&OutputKey::new("DP-1").unwrap()),
+            output_state("DP-1", 260.0, PanelMode::Docked, 1),
+        );
+        state.outputs.insert(
+            output_identity(&OutputKey::new("HDMI-1").unwrap()),
+            output_state("HDMI-1", 333.0, PanelMode::Pinned, 2),
+        );
+        assert_eq!(SavedState::parse(&state.encode().unwrap()).unwrap(), state);
+        let mut first = model_for("DP-1");
+        let mut second = model_for("HDMI-1");
+        state.restore(&mut first);
+        state.restore(&mut second);
+        // Restoring one output never feeds it another output's entry.
+        assert_eq!(first.panel(Edge::Left).thickness_px, 260.0);
+        assert_eq!(second.panel(Edge::Left).thickness_px, 333.0);
+        assert_eq!(first.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(second.panel(Edge::Left).mode, PanelMode::Pinned);
+        assert_eq!(first.carousel(Edge::Left).active_id(), Some("places"));
+        assert_eq!(second.carousel(Edge::Left).active_id(), Some("info"));
+        // Other edges keep their own per-output sizes too.
+        assert_eq!(first.panel(Edge::Top).thickness_px, 263.0);
+        assert_eq!(second.panel(Edge::Top).thickness_px, 336.0);
+    }
+
+    #[test]
+    fn legacy_v2_state_migrates_to_default_output() {
+        for (source, thickness, page) in [
+            (legacy_source(9), 140.0, "removed-page"),
+            (v2_source(), 150.0, "places"),
+        ] {
+            let mut saved = SavedState::parse(&source).unwrap();
+            // The single pre-v3 edge set parks under the reserved identity.
+            assert_eq!(saved.outputs.len(), 1);
+            let pool = &saved.outputs[DEFAULT_OUTPUT];
+            assert_eq!(pool.edges[0].thickness_px, Some(thickness));
+            assert_eq!(pool.edges[0].mode, PanelMode::Docked);
+            assert_eq!(pool.edges[0].page, page);
+
+            // The output Quoin runs on claims it; the claim survives encode.
+            let mut first = model_for("DP-1");
+            saved.restore(&mut first);
+            assert_eq!(first.panel(Edge::Left).thickness_px, thickness);
+            assert_eq!(first.panel(Edge::Left).mode, PanelMode::Docked);
+            assert!(saved.outputs.contains_key("connector:DP-1"));
+            assert!(!saved.outputs.contains_key(DEFAULT_OUTPUT));
+            assert_eq!(SavedState::parse(&saved.encode().unwrap()).unwrap(), saved);
+
+            // A later unknown output gets the default config, not the
+            // migrated edges (shell design §7's new-output rule).
+            let fresh = model_for("HDMI-1");
+            let mut second = model_for("HDMI-1");
+            saved.restore(&mut second);
+            for edge in Edge::ALL {
+                assert_eq!(second.panel(edge).mode, PanelMode::Hidden);
+                assert_eq!(second.panel(edge).thickness_px, fresh.panel(edge).thickness_px);
+                assert_eq!(second.carousel(edge).active_id(), fresh.carousel(edge).active_id());
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_output_gets_default_config() {
+        let mut state = populated();
+        let fresh = model_for("HDMI-1");
+        let mut model = model_for("HDMI-1");
+        state.restore(&mut model);
+        for edge in Edge::ALL {
+            assert_eq!(model.panel(edge).mode, PanelMode::Hidden);
+            assert_eq!(model.panel(edge).thickness_px, fresh.panel(edge).thickness_px);
+            assert_eq!(model.carousel(edge).active_id(), fresh.carousel(edge).active_id());
+        }
+        // Restoring an unknown output claims nothing and creates nothing;
+        // its entry first appears on its own next save.
+        assert_eq!(state.outputs.len(), 1);
+        assert!(state.outputs.contains_key("connector:DP-1"));
+    }
+
+    #[test]
+    fn reconnect_restores_removed_outputs_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut state = SavedState {
+            scheme: "dual".into(),
+            ..SavedState::default()
+        };
+        state.outputs.insert(
+            output_identity(&OutputKey::new("DP-1").unwrap()),
+            output_state("DP-1", 210.0, PanelMode::Docked, 2),
+        );
+        state.outputs.insert(
+            output_identity(&OutputKey::new("HDMI-1").unwrap()),
+            output_state("HDMI-1", 321.0, PanelMode::Pinned, 1),
+        );
+        atomic_save(&path, &state).unwrap();
+
+        // Running on HDMI-1 alone rewrites only that output's entry (with
+        // its live model state — Pin on the fresh model, not the saved
+        // Pinned mode); the removed DP-1's remembered configuration waits
+        // for reconnection untouched.
+        let mut app = resize_app_for(&path, "HDMI-1");
+        resize_command_for(
+            &mut app,
+            "HDMI-1",
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Pin,
+            },
+        );
+        let mut saved = StateStore::load(Some(path)).snapshot();
+        let removed = &saved.outputs["connector:DP-1"].edges;
+        assert_eq!(removed[0].thickness_px, Some(210.0));
+        assert_eq!(removed[0].mode, PanelMode::Docked);
+        assert_eq!(removed[0].page, "info");
+        assert_eq!(
+            saved.outputs["connector:HDMI-1"].edges[0].mode,
+            PanelMode::Pinned
+        );
+
+        // Reconnected, DP-1 restores exactly what it remembered.
+        let mut model = model_for("DP-1");
+        saved.restore(&mut model);
+        assert_eq!(model.panel(Edge::Left).thickness_px, 210.0);
+        assert_eq!(model.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("info"));
     }
 }
