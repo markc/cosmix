@@ -26735,6 +26735,8 @@ mod char_aware_tests {
             "rpad",
             "rpad_w",
             "sanitize",
+            // The evaluator's own serve-runtime name (0.91.0) — no host read.
+            "serve_name",
             "shell_quote",
             "shift",
             "sleep",
