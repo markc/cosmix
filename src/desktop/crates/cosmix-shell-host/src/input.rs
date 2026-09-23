@@ -20,7 +20,10 @@ use bevy::time::Real;
 use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent, WindowFocused};
 use bevy_winit::converters::{convert_logical_key, convert_physical_key_code};
 use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
-use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellRuntimeSet};
+use cosmix_shell::runtime::{
+    KeyboardCommand, ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimeSet,
+    ShellStagedIngress,
+};
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent as SctkKeyEvent, Keymap as SctkKeymap, Keysym, Modifiers, RepeatInfo,
 };
@@ -136,18 +139,37 @@ impl KeyboardBridge {
         raw: &[u32],
         keysyms: &[Keysym],
     ) -> bool {
+        self.enter_focus(
+            app,
+            KeyboardFocus {
+                surface: Some(target.surface.clone()),
+                window: target.window,
+            },
+            target.edge,
+            raw,
+            keysyms,
+        )
+    }
+
+    fn enter_focus(
+        &mut self,
+        app: &mut App,
+        focus: KeyboardFocus,
+        edge: Edge,
+        raw: &[u32],
+        keysyms: &[Keysym],
+    ) -> bool {
         if self.focus.is_some() {
             self.focus_lost(app);
         }
-        self.focus = Some(KeyboardFocus {
-            surface: Some(target.surface.clone()),
-            window: target.window,
-        });
-        set_window_focused(app, target.window, true);
+        let window = focus.window;
+        self.focus = Some(focus);
+        stage_keyboard_focus(app, Some(edge));
+        set_window_focused(app, window, true);
         emit_window(
             app,
             WindowFocused {
-                window: target.window,
+                window,
                 focused: true,
             },
         );
@@ -158,7 +180,13 @@ impl KeyboardBridge {
         debug_assert_eq!(raw.len(), keysyms.len());
         for (&raw_code, &keysym) in raw.iter().zip(keysyms) {
             let mapped = map_key(raw_code, keysym, None);
-            emit_keyboard(app, target.window, &mapped, ButtonState::Pressed, false);
+            // A key already held when focus arrives is not a fresh press:
+            // marking it `repeat` keeps it in Bevy's pressed state (modifiers
+            // still count) while shell bindings and Escape, which act only on
+            // non-repeat presses, cannot fire from it. Otherwise a focus move
+            // the binding itself caused would re-deliver the chord and fire
+            // it again. The key must be released and pressed to act.
+            emit_keyboard(app, window, &mapped, ButtonState::Pressed, true);
             self.pressed.insert(raw_code, mapped);
         }
         true
@@ -318,6 +346,7 @@ impl KeyboardBridge {
             emit_keyboard(app, focus.window, &mapped, ButtonState::Released, false);
         }
         self.cancel_repeat();
+        stage_keyboard_focus(app, None);
         set_window_focused(app, focus.window, false);
         emit_window(
             app,
@@ -547,7 +576,9 @@ pub(crate) fn configure_ingress(app: &mut App) {
         .init_resource::<StagedShellCommands>()
         .add_systems(
             Update,
-            flush_staged_shell_commands.in_set(ShellRuntimeSet::Input),
+            flush_staged_shell_commands
+                .in_set(ShellRuntimeSet::Input)
+                .in_set(ShellStagedIngress),
         )
         .add_systems(Update, trace_press_hover)
         .add_systems(PreUpdate, coalesce_keyboard_focus_lost.before(InputSystems));
@@ -653,6 +684,25 @@ pub(crate) fn stage_shell_command_world(
         .push((output, kind));
 }
 
+/// Tell the model which panel surface holds the keyboard, so Escape and the
+/// focus cycle act on that panel and a focus directive can end. Fixtures
+/// without a shell runtime or command staging have no model to tell.
+fn stage_keyboard_focus(app: &mut App, edge: Option<Edge>) {
+    let world = app.world_mut();
+    let Some(output) = world
+        .get_resource::<ShellFrameState>()
+        .map(|frame| frame.0.geometry.output.clone())
+    else {
+        return;
+    };
+    if let Some(mut staged) = world.get_resource_mut::<StagedShellCommands>() {
+        staged.0.push((
+            output,
+            ShellCommandKind::Keyboard(KeyboardCommand::FocusObserved(edge)),
+        ));
+    }
+}
+
 pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
     !app.world().resource::<StagedShellCommands>().0.is_empty()
 }
@@ -671,6 +721,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::HolderPlane(_) => "holder-plane",
         ShellCommandKind::Panel { .. } => "panel",
         ShellCommandKind::Carousel { .. } => "carousel",
+        ShellCommandKind::Keyboard(_) => "keyboard",
         ShellCommandKind::SubPanelRegister { .. } => "sub-register",
         ShellCommandKind::SubPanelRemove { .. } => "sub-remove",
         ShellCommandKind::SubPanelActivate { .. } => "sub-activate",
@@ -2088,6 +2139,59 @@ mod tests {
         assert_eq!(logical_key(Keysym::F35), Key::F35);
         assert_eq!(logical_key(Keysym::space), Key::Space);
         assert_eq!(logical_key(Keysym::XF86_AudioPlay), Key::MediaPlay);
+    }
+
+    #[test]
+    fn keys_held_at_enter_never_arrive_as_fresh_presses() {
+        // A binding that moves focus (the cycle's Exclusive commit makes comp
+        // re-enter with the chord still held) must not see its own chord again.
+        let (mut app, window) = keyboard_app();
+        let mut bridge = KeyboardBridge {
+            keymap: Some(us_keymap()),
+            ..Default::default()
+        };
+        // evdev 125 Super_L, 15 Tab, 1 Escape.
+        assert!(bridge.enter_focus(
+            &mut app,
+            KeyboardFocus {
+                surface: None,
+                window,
+            },
+            Edge::Left,
+            &[125, 15, 1],
+            &[Keysym::Super_L, Keysym::Tab, Keysym::Escape],
+        ));
+        let held = app
+            .world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            held.iter().map(|e| e.key_code).collect::<Vec<_>>(),
+            [KeyCode::SuperLeft, KeyCode::Tab, KeyCode::Escape]
+        );
+        assert!(
+            held.iter()
+                .all(|e| e.state == ButtonState::Pressed && e.repeat),
+            "enter-held keys must be marked as not-fresh: {held:?}"
+        );
+        // Release and press again: that one is a real press.
+        let tab = SctkKeyEvent {
+            time: 20,
+            raw_code: 15,
+            keysym: Keysym::Tab,
+            utf8: None,
+        };
+        assert!(bridge.release(&mut app, tab.clone()));
+        assert!(bridge.press(&mut app, tab, Duration::ZERO));
+        let fresh = app
+            .world_mut()
+            .resource_mut::<Messages<KeyboardInput>>()
+            .drain()
+            .collect::<Vec<_>>();
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh[1].state, ButtonState::Pressed);
+        assert!(!fresh[1].repeat);
     }
 
     #[test]

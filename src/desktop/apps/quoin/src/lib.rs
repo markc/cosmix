@@ -8,6 +8,7 @@ mod demos;
 mod desktop_font;
 mod holders;
 mod hotspot;
+mod keyboard;
 mod launcher;
 pub mod embedded;
 mod power;
@@ -147,6 +148,7 @@ pub fn run_layer_host() -> AppExit {
         smoke_hidden,
     );
     config::install(&mut app, smoke_all_panels || smoke_hidden);
+    keyboard::install(&mut app);
     corner_menu::install(&mut app);
     app.run()
 }
