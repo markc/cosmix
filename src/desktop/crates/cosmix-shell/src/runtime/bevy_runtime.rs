@@ -133,6 +133,30 @@ pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: 
     world.resource_mut::<ShellFrameState>().0 = frame;
 }
 
+/// Reapply configuration declarations without rebuilding live carousels.
+/// Validate every edge before mutation; registrations, active names and selection
+/// memory survive. Returns false if the host has not installed its model yet.
+pub fn redeclare_shell_pages(
+    world: &mut World,
+    declarations: &[Vec<String>; 4],
+) -> Result<bool, crate::core::CarouselError> {
+    for names in declarations {
+        crate::core::Carousel::declared(names.iter().cloned())?;
+    }
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return Ok(false);
+    };
+    for edge in Edge::ALL {
+        runtime
+            .model
+            .carousel_mut(edge)
+            .redeclare(declarations[edge.index()].iter().cloned())?;
+    }
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
+    Ok(true)
+}
+
 fn update_model(
     time: Res<Time<Real>>,
     mut commands: MessageReader<ShellCommand>,
