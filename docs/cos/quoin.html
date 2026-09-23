@@ -491,6 +491,23 @@ layer-shell client.</p>
 <p><code>QUOIN_BUS_READY service=NAME</code> reports the configured Bus identity (including
 <code>--bus-service</code> overrides). It records the first connected event consumed by
 the shell service, not successful presentation or continued event-loop progress.</p>
+<h2 id="core-carousel-registry">Core carousel registry</h2>
+<p>The host-neutral <code>cosmix-shell</code> carousel keeps config-declared names in order
+and appends undeclared registrations to the tail. Empty declared slots are
+skipped when paging or choosing a default page. Registration preserves the
+page currently shown; activation selects and remembers a registered name.</p>
+<p>Removing the shown page immediately selects its previous live neighbour,
+otherwise its next. Removing the remembered selection resets that memory to
+the primary. On the next reveal from hidden, <code>ShellModel</code> restores the remembered
+name or defaults to the primary, skipping empty slots. Repeated reveals while
+already visible retain the shown page, including a removal's neighbour landing.</p>
+<p><code>ShellModel::declare_carousel</code> reconciles declarations by name. Registered
+content, current selection and remembered selection survive reordering. A tail
+name promoted into config keeps its content in its new declared position.
+Live names omitted from config follow the new declarations in their previous
+relative order, preserving the order of remaining tail entries; omitted empty
+slots disappear. Invalid declarations leave the registry unchanged. These are
+core API contracts; scene mount and Bus lifecycle integration are separate.</p>
 <h2 id="output-and-scale">Output and scale</h2>
 <p>Version 1 owns exactly one output runtime. <code>--output NAME</code> selects the exact
 complete SCTK <code>wl_output</code> advertising that name. A missing name is an error
