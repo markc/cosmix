@@ -411,6 +411,7 @@ mod tests {
             )),
         ))
         .insert_resource(crate::state::StateStore::load(Some(path)))
+        .insert_resource(crate::page_registry())
         .insert_resource(EmbeddedHost {
             detector: CornerDetector::new(
                 CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)

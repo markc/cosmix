@@ -661,7 +661,7 @@ mod tests {
                 .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Dock)
                 .unwrap();
         }
-        let mut replacement = ShellModel::new(
+        let replacement = ShellModel::new(
             OutputKey::new("DP-1").unwrap(),
             LogicalSize::new(1920.0, 1080.0).unwrap(),
             Duration::ZERO,
