@@ -347,6 +347,50 @@ fn read(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
+/// Settings writes the same data-only field ingestion reads. Preserve all
+/// other authored values, refuse invalid input, and atomically replace the
+/// file so the existing watcher observes a complete configuration.
+pub(crate) fn write_carousel_motion(path: &Path, motion: CarouselMotion) -> Result<(), String> {
+    use std::io::Write;
+    let source = match std::fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "{}".to_owned(),
+        Err(error) => return Err(error.to_string()),
+    };
+    ShellConfig::parse(&source)?;
+    let mut value = parse_mix_data(&source).map_err(|error| error.to_string())?;
+    let Value::Map(root) = &mut value else {
+        unreachable!("validated config map")
+    };
+    std::rc::Rc::make_mut(root).insert(
+        "carousel_motion".into(),
+        Value::String(
+            match motion {
+                CarouselMotion::Slide => "slide",
+                CarouselMotion::Fade => "fade",
+            }
+            .into(),
+        ),
+    );
+    let encoded = value
+        .to_mix_data_string_pretty()
+        .map_err(|error| error.to_string())?;
+    ShellConfig::parse(&encoded)?;
+    let parent = path.parent().ok_or("config path has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    temp.write_all(encoded.as_bytes())
+        .map_err(|error| error.to_string())?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|error| error.to_string())?;
+    temp.persist(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ConfigIngest;
+
 impl ConfigReader {
     fn start(path: PathBuf, report: ReportRefusal) -> std::io::Result<(Self, LayerHostFileWatch)> {
         let pending = Arc::new(Mutex::new(ConfigInbox::default()));
@@ -415,7 +459,13 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
         .push(watch);
     app.init_resource::<ShellConfig>()
         .insert_resource(reader)
-        .add_systems(Update, ingest.in_set(ShellRuntimeSet::Input));
+        .add_systems(
+            Update,
+            ingest
+                .in_set(ShellRuntimeSet::Input)
+                .in_set(ConfigIngest)
+                .before(crate::bus_service::ShellBusDispatch),
+        );
 }
 
 fn ingest(world: &mut World) {

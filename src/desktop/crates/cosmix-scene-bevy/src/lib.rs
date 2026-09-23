@@ -291,6 +291,17 @@ impl SceneStore {
             return Err(json!({"scene":document.name,"diagnostics":diagnostics}));
         }
         let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
+        // A declared mount address is unique across scenes, including scenes
+        // from the same citizen. Content revisions cannot rename a live seat;
+        // unload first so the old carousel entry is removed transactionally.
+        let page = render::page_id(&tree);
+        if self.scenes.iter().any(|(name, entry)| {
+            (name != &tree.name && render::page_id(&entry.tree) == page)
+                || (name == &tree.name && render::page_id(&entry.tree) != page)
+        }) {
+            return Err(json!({"scene": tree.name, "error_code": "SUBPANEL_COLLISION",
+                "error": "scene mount address is occupied or changed; unload before renaming"}));
+        }
         let old_owner = self
             .scenes
             .get(&tree.name)
