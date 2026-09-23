@@ -114,6 +114,7 @@ pub(crate) struct ShellBusDispatch;
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
+            .init_resource::<cosmix_shell::chrome::QuoinHotspotSize>()
             .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
             .init_resource::<cosmix_scene_bevy::SceneEvents>()
@@ -195,6 +196,8 @@ fn service_bus(
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut content: SceneBus,
+    mut hotspot: Option<ResMut<crate::hotspot::HotspotObserver>>,
+    mut hotspot_size: ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
     mut wallpaper: (
         ResMut<crate::wallpaper::WallpaperState>,
         ResMut<cosmix_shell_host::LayerHostDeadline>,
@@ -235,6 +238,9 @@ fn service_bus(
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
+        if let Some(observer) = hotspot.as_deref_mut() {
+            observer.event(&event, &mut hotspot_size);
+        }
         content.events.reply(&event);
         wallpaper.0.event(&event, time.elapsed());
         wallpaper.2.event(&event, time.elapsed());
@@ -288,6 +294,9 @@ fn service_bus(
                             // A reply may have been captured before a new load.
                             // Use the request's fence, never the later reply time.
                             reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                            if let Some(observer) = hotspot.as_deref_mut() {
+                                observer.presence(&live, &mut hotspot_size);
+                            }
                         } else {
                             warn!("citizen registry snapshot failed; awaiting next Bus trigger");
                         }
@@ -315,6 +324,9 @@ fn service_bus(
         }
     }
     for message in bridge.drain_messages() {
+        if let Some(observer) = hotspot.as_deref_mut() {
+            observer.message(&message);
+        }
         wallpaper.0.message(&message, time.elapsed());
         if state.live_generation == Some(message.connection_generation) {
             if let Some(live) = registered_services(&message) {
@@ -327,6 +339,9 @@ fn service_bus(
                 state.citizen_snapshot = None;
                 state.citizen_snapshot_retry = false;
                 reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                if let Some(observer) = hotspot.as_deref_mut() {
+                    observer.presence(&live, &mut hotspot_size);
+                }
             } else if message
                 .headers
                 .get("gap")
@@ -348,6 +363,9 @@ fn service_bus(
                 }
             }
         }
+    }
+    if let Some(observer) = hotspot.as_deref_mut() {
+        observer.flush(&bridge);
     }
     wallpaper.0.tick(&bridge, time.elapsed(), &mut wallpaper.1);
     wallpaper.2.tick(&bridge, time.elapsed(), &mut wallpaper.1);
@@ -1912,6 +1930,55 @@ mod tests {
                 .pending_resizes
                 .is_empty()
         );
+    }
+
+    /// The shared Bus drain updates the exact resource read by chrome.
+    #[test]
+    fn hotspot_bus_observations_update_chrome_resource_without_polling() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut config = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::hotspot::install(&mut app, &mut config, "comp-nested".into());
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        let request = peer.drain_calls().into_iter()
+            .find(|call| call.command == "comp-nested.props.get").unwrap();
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id: request.request_id,
+            result: Ok(ctk::bus::BusReply {
+                rc: 0,
+                body: json!({"input":{"corners":{"deadzone_px":24.0}}}).to_string(),
+                result: None,
+            }),
+        });
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_shell::chrome::QuoinHotspotSize>().0, 24.0);
+        app.update();
+        assert!(peer.drain_calls().is_empty());
+        peer.deliver_message(BusMessage {
+            connection_generation: 1,
+            from: "comp-nested".into(),
+            command: "props.changed".into(),
+            body: json!({"path":"input.corners.deadzone_px", "new":32.0}).to_string(),
+            headers: BTreeMap::from([("topic".into(), "comp-nested.props.changed".into())]),
+        });
+        app.update();
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].command, "comp-nested.props.get");
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id: calls[0].request_id,
+            result: Ok(ctk::bus::BusReply {
+                rc: 0,
+                body: json!({"input":{"corners":{"deadzone_px":32.0}}}).to_string(),
+                result: None,
+            }),
+        });
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_shell::chrome::QuoinHotspotSize>().0, 32.0);
     }
 
     /// A `power.props.changed` delivery-gap notice on `generation`.

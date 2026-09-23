@@ -8,9 +8,9 @@ mod semantic;
 mod bevy_runtime;
 
 pub use messages::{
-    CarouselInput, HostGeometry, KeyboardInteractivity, PanelPresentation, ShellCommand,
-    ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame, ShellResizeError,
-    ShellResizeResult, WakePolicy,
+    CarouselInput, HostGeometry, KeyboardInteractivity, PageChange, PanelPresentation,
+    ShellCommand, ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame,
+    ShellResizeError, ShellResizeResult, WakePolicy,
 };
 pub use semantic::{SceneVerb, ShellSemanticVerb, semantic_shell_command};
 

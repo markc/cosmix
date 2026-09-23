@@ -110,6 +110,25 @@ pub enum CarouselInput {
     SelectId(String),
 }
 
+/// How one edge's active carousel page changed in the current model update
+/// (panel doc §5, §8). Only sequential chevron paging carries
+/// [`PageChange::Sequential`], so chrome can slide it; every other switch —
+/// dots, `page.set`/activate verbs, selection restores, removal landings —
+/// is a direct jump and never animates. The marker lives for the single
+/// update that applied the change; [`ShellFrame::from_model`] leaves it
+/// `None`, so a frame that did not run a carousel command never looks
+/// sequential.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PageChange {
+    #[default]
+    None,
+    Sequential {
+        /// `Next` pages forward, `Previous` back; sets the slide direction.
+        forward: bool,
+    },
+    Named,
+}
+
 /// Layer-shell keyboard policy requested for a panel surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyboardInteractivity {
@@ -133,6 +152,9 @@ pub struct PanelPresentation {
     pub keyboard_interactivity: KeyboardInteractivity,
     pub page_ids: Arc<[String]>,
     pub active_page_id: Option<String>,
+    /// Marker for the change that produced `active_page_id` this update, if
+    /// any; drives carousel motion (see [`PageChange`]).
+    pub page_change: PageChange,
 }
 
 /// Renderer-neutral dynamic content carried by the replayable frame.
@@ -176,6 +198,7 @@ impl ShellFrame {
                 },
                 page_ids: model.carousel(edge).shared_page_ids(),
                 active_page_id: model.carousel(edge).active_id().map(str::to_owned),
+                page_change: PageChange::None,
             }
         });
         Self {

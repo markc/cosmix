@@ -100,6 +100,7 @@ impl Plugin for EmbeddedQuoinPlugin {
             size: Vec2::new(1920.0, 1080.0),
         });
         let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
+        crate::hotspot::install(app, &mut bus, "comp".to_owned());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
         bus.inbound_prefixes.push("shell.".into());
         bus.subscriptions.extend(
