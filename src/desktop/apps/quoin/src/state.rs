@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -273,8 +275,11 @@ pub(crate) struct StateStore {
     /// Shared with the host's model factory: restoring claims the migrated
     /// default-output entry, and the claim must reach the next save.
     saved: Arc<Mutex<SavedState>>,
+    /// Completed file writes, observed by tests only. Atomic because the
+    /// store is interior-mutable: the persist system needs only shared
+    /// access, so the counter must not demand `ResMut`.
     #[cfg(test)]
-    write_count: usize,
+    write_count: AtomicUsize,
 }
 
 impl StateStore {
@@ -303,7 +308,7 @@ impl StateStore {
             path,
             saved: Arc::new(Mutex::new(saved)),
             #[cfg(test)]
-            write_count: 0,
+            write_count: AtomicUsize::new(0),
         }
     }
 
@@ -311,6 +316,12 @@ impl StateStore {
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> SavedState {
         self.lock_saved().clone()
+    }
+
+    /// Completed file writes; test-only observation of the store.
+    #[cfg(test)]
+    fn writes(&self) -> usize {
+        self.write_count.load(Ordering::Relaxed)
     }
 
     /// A handle sharing the saved state with a host's model factory, which
@@ -365,7 +376,7 @@ fn atomic_save(path: &Path, state: &SavedState) -> Result<(), StateError> {
 pub(crate) fn persist_transitions(
     effects: Res<ShellEffects>,
     frame: Res<ShellFrameState>,
-    mut store: ResMut<StateStore>,
+    store: Res<StateStore>,
     mut schemes: MessageReader<cosmix_shell::chrome::QuoinSchemeSelected>,
     mut themes: MessageWriter<ctk::theme::ApplyTheme>,
     mut redraw: MessageWriter<bevy::window::RequestRedraw>,
@@ -424,7 +435,7 @@ pub(crate) fn persist_transitions(
         Ok(()) => {
             #[cfg(test)]
             {
-                store.write_count += 1;
+                store.write_count.fetch_add(1, Ordering::Relaxed);
             }
         }
         Err(error) => bevy::log::warn!("Quoin state save failed: {error}"),
@@ -491,16 +502,16 @@ mod tests {
                     thickness_px,
                 },
             );
-            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert_eq!(app.world().resource::<StateStore>().writes(), 0);
             assert!(!path.exists());
         }
         resize_input(&mut app, PanelInput::ResizeCompleted);
-        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
         let saved = StateStore::load(Some(path)).snapshot();
         assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(300.0));
         resize_input(&mut app, PanelInput::ResizeCompleted);
         app.update();
-        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
     }
 
     #[test]
@@ -525,7 +536,7 @@ mod tests {
         resize_input(&mut app, PanelInput::ResizeCancelled);
         resize_input(&mut app, PanelInput::ResizeCompleted);
         assert!(!path.exists());
-        assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 0);
         assert_eq!(
             app.world()
                 .resource::<ShellFrameState>()
@@ -547,7 +558,7 @@ mod tests {
         let saved = StateStore::load(Some(path.clone())).snapshot();
         assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(starting));
         resize_input(&mut app, PanelInput::ResizeCancelled);
-        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
         let saved = StateStore::load(Some(path)).snapshot();
         assert_eq!(saved.outputs["connector:DP-1"].edges[0].thickness_px, Some(starting));
     }
@@ -715,10 +726,10 @@ mod tests {
         ] {
             resize_input(&mut app, input);
         }
-        assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         resize_input(&mut app, PanelInput::Pin);
-        assert_eq!(app.world().resource::<StateStore>().write_count, 1);
+        assert_eq!(app.world().resource::<StateStore>().writes(), 1);
         let encoded = std::fs::read_to_string(&path).unwrap();
         let Value::Map(ref root) = parse_mix_data(&encoded).unwrap() else {
             panic!("map")
@@ -741,7 +752,7 @@ mod tests {
             PanelInput::Reveal,
         ] {
             resize_input(&mut app, input);
-            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert_eq!(app.world().resource::<StateStore>().writes(), 0);
             assert!(!path.exists());
         }
         assert!(
@@ -790,7 +801,7 @@ mod tests {
         ));
         for _ in 0..15 {
             app.update();
-            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert_eq!(app.world().resource::<StateStore>().writes(), 0);
             assert!(!path.exists());
         }
         let frame = app.world().resource::<ShellFrameState>();
@@ -815,7 +826,7 @@ mod tests {
             (PanelInput::Hide, 3),
         ] {
             resize_input(&mut app, input);
-            assert_eq!(app.world().resource::<StateStore>().write_count, count);
+            assert_eq!(app.world().resource::<StateStore>().writes(), count);
         }
     }
 
@@ -836,7 +847,9 @@ mod tests {
             legacy.replacen("thickness_px: 140", "thickness_px: -1", 1),
         ];
         // Modify parsed v3 maps rather than depending on the pretty printer's
-        // whitespace/key quoting, including unknown and missing fields.
+        // whitespace/key quoting, including unknown and missing fields. The
+        // edge-entry mutations go through the output's map to the edge inside
+        // it — one level deeper than the root-shaped v1/v2 cases.
         for case in 0..6 {
             let Value::Map(ref root) = parse_mix_data(&v3).unwrap() else {
                 panic!("map")
@@ -861,15 +874,20 @@ mod tests {
                         panic!("output")
                     };
                     let fields = std::rc::Rc::make_mut(fields);
+                    let Some(Value::Map(entry)) = fields.get_mut(crate::edge_name(Edge::Left))
+                    else {
+                        panic!("edge")
+                    };
+                    let entry = std::rc::Rc::make_mut(entry);
                     match case {
                         3 => {
-                            fields.insert("mode".into(), Value::String("revealed".into()));
+                            entry.insert("mode".into(), Value::String("revealed".into()));
                         }
                         4 => {
-                            fields.insert("pinned".into(), Value::Bool(true));
+                            entry.insert("pinned".into(), Value::Bool(true));
                         }
                         _ => {
-                            fields.shift_remove("page");
+                            entry.shift_remove("page");
                         }
                     }
                 }
@@ -886,7 +904,7 @@ mod tests {
                 app.world().resource::<StateStore>().snapshot(),
                 SavedState::default()
             );
-            assert_eq!(app.world().resource::<StateStore>().write_count, 0);
+            assert_eq!(app.world().resource::<StateStore>().writes(), 0);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         }
     }
