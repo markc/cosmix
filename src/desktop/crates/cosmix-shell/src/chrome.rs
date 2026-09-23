@@ -495,6 +495,8 @@ impl Plugin for QuoinChromePlugin {
             .init_resource::<QuoinHotspotSize>()
             .init_resource::<QuoinReducedMotion>()
             .add_message::<QuoinSchemeSelected>()
+            // Chrome requests redraws even in hosts without WindowPlugin.
+            .add_message::<RequestRedraw>()
             .add_observer(on_activate)
             .add_systems(
                 Update,
@@ -1324,12 +1326,16 @@ fn escape_panels(
 fn present_panels(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    time: Res<Time<Real>>,
-    hotspot: Option<Res<QuoinHotspotSize>>,
-    reduced_motion: Option<Res<QuoinReducedMotion>>,
-    committed_modes: Option<Res<QuoinCommittedMotionModes>>,
-    mut slides: ResMut<QuoinCarouselSlides>,
-    mut redraw: MessageWriter<RequestRedraw>,
+    (hotspot, reduced_motion, committed_modes): (
+        Option<Res<QuoinHotspotSize>>,
+        Option<Res<QuoinReducedMotion>>,
+        Option<Res<QuoinCommittedMotionModes>>,
+    ),
+    (time, mut slides, mut redraw): (
+        Res<Time<Real>>,
+        ResMut<QuoinCarouselSlides>,
+        MessageWriter<RequestRedraw>,
+    ),
     mut focus: ResMut<InputFocus>,
     mut queries: PresentPanelQueries,
 ) {
@@ -2349,6 +2355,13 @@ mod tests {
         assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(-1)));
         assert!(world.entity(control).contains::<InteractionDisabled>());
         assert_eq!(world.resource::<InputFocus>().get(), None);
+    }
+
+    #[test]
+    fn chrome_registers_redraw_messages_without_window_plugin() {
+        let mut app = App::new();
+        app.add_plugins(QuoinChromePlugin);
+        assert!(app.world().contains_resource::<Messages<RequestRedraw>>());
     }
 
     /// Type-identity regression for the 2026-09-06 click-dead bug: the
