@@ -4360,20 +4360,17 @@ mod tests {
                     app.insert_resource(CornerMenuHook(hook));
                 }
                 let mut engaged = BTreeSet::from([Corner::TopLeft]);
-                assert_eq!(
-                    apply_corner_ingress_to_app(
-                        &mut app,
-                        Some(&output),
-                        &mut engaged,
-                        CornerIngress::Action {
-                            output: output.clone(),
-                            epoch: 0,
-                            corner: Corner::TopLeft,
-                            action: CornerAction::Menu,
-                        },
-                    ),
-                    true
-                );
+                assert!(apply_corner_ingress_to_app(
+                    &mut app,
+                    Some(&output),
+                    &mut engaged,
+                    CornerIngress::Action {
+                        output: output.clone(),
+                        epoch: 0,
+                        corner: Corner::TopLeft,
+                        action: CornerAction::Menu,
+                    },
+                ));
                 assert_eq!(staged_shell_commands_pending(&app), !registered);
                 app.update();
                 assert_eq!(

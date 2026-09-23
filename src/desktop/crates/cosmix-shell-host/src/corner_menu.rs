@@ -171,11 +171,9 @@ impl RunnerState {
                 }
                 PointerEventKind::Release {
                     button: BTN_LEFT, ..
-                } => {
-                    if enabled.is_some() && menu.pressed.take() == enabled {
-                        self.dismiss_corner_menu(enabled);
-                        return true;
-                    }
+                } if enabled.is_some() && menu.pressed.take() == enabled => {
+                    self.dismiss_corner_menu(enabled);
+                    return true;
                 }
                 PointerEventKind::Motion { .. } | PointerEventKind::Enter { .. } => {
                     menu.selected = enabled;
