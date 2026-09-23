@@ -59,6 +59,27 @@ layer-shell client.
 `--bus-service` overrides). It records the first connected event consumed by
 the shell service, not successful presentation or continued event-loop progress.
 
+## Core carousel registry
+
+The host-neutral `cosmix-shell` carousel keeps config-declared names in order
+and appends undeclared registrations to the tail. Empty declared slots are
+skipped when paging or choosing a default page. Registration preserves the
+page currently shown; activation selects and remembers a registered name.
+
+Removing the shown page immediately selects its previous live neighbour,
+otherwise its next. Removing the remembered selection resets that memory to
+the primary. On the next reveal from hidden, `ShellModel` restores the remembered
+name or defaults to the primary, skipping empty slots. Repeated reveals while
+already visible retain the shown page, including a removal's neighbour landing.
+
+`ShellModel::declare_carousel` reconciles declarations by name. Registered
+content, current selection and remembered selection survive reordering. A tail
+name promoted into config keeps its content in its new declared position.
+Live names omitted from config follow the new declarations in their previous
+relative order, preserving the order of remaining tail entries; omitted empty
+slots disappear. Invalid declarations leave the registry unchanged. These are
+core API contracts; scene mount and Bus lifecycle integration are separate.
+
 ## Output and scale
 
 Version 1 owns exactly one output runtime. `--output NAME` selects the exact

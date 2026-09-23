@@ -86,20 +86,19 @@ impl ShellModel {
         self.carousels[edge.index()] = carousel;
     }
 
-    /// Declare an edge's ordered page list, every slot starting empty.
+    /// Reconcile an edge's declared order, with new names starting empty.
     ///
     /// This is the config-driven construction path: registering attaches
     /// content to the declared names afterwards — a declared name fills its
     /// slot in order, an undeclared name appends to the tail. Re-declaring
-    /// replaces the edge's registry wholesale, dropping its registrations,
-    /// selection and last-selected memory with it.
+    /// preserves registrations, selection and memory by name. Live names no
+    /// longer declared become tail entries in their previous relative order.
     pub fn declare_carousel(
         &mut self,
         edge: Edge,
         page_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<(), CarouselError> {
-        self.carousels[edge.index()] = Carousel::declared(page_ids)?;
-        Ok(())
+        self.carousels[edge.index()].redeclare(page_ids)
     }
 
     /// Restored thickness has the same validation as a newly constructed panel.
@@ -167,8 +166,12 @@ impl ShellModel {
 
     /// Cold-start discovery is independent of compositor corner membership.
     pub fn start_intro(&mut self, duration: Duration) {
-        for panel in &mut self.panels {
+        for (panel, carousel) in self.panels.iter_mut().zip(&mut self.carousels) {
+            let before = panel.snapshot();
             panel.start_intro(duration);
+            if before.mode == PanelMode::Hidden && !before.transient_revealed {
+                carousel.restore_selection();
+            }
         }
     }
 
@@ -203,7 +206,21 @@ impl ShellModel {
         ) {
             let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
         }
-        let update = self.panels[edge.index()].apply(at, input)?;
+        let panel = &mut self.panels[edge.index()];
+        let before = panel.snapshot();
+        // Resolve expired grace/intro timers before deciding whether this input
+        // reveals a hidden edge, including when no frame tick ran in between.
+        let advanced = panel.tick(at)?;
+        let hidden =
+            advanced.snapshot.mode == PanelMode::Hidden && !advanced.snapshot.transient_revealed;
+        let mut update = panel.apply(at, input)?;
+        update.changed = update.snapshot != before;
+        update.effect = update.effect.or(advanced.effect);
+        if hidden
+            && (update.snapshot.mode != PanelMode::Hidden || update.snapshot.transient_revealed)
+        {
+            self.carousels[edge.index()].restore_selection();
+        }
         self.last_update = at;
         Ok(update)
     }
