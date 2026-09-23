@@ -169,6 +169,8 @@ impl HolderClient {
                 self.read_needed |= self.generation.is_some() && self.capability_read.is_none();
                 self.acknowledged.clear();
                 self.failed.clear();
+                // A restarted comp counts event_seq from zero again.
+                self.last_sequence = 0;
             }
             // Comp left or arrived. `maybe_held` stays: a living comp can lose
             // its registration and keep its holds, and a release to a comp
@@ -316,7 +318,9 @@ impl HolderClient {
     /// Fires the one-shot retry, then arms the next one if a transient failure
     /// asked for it, and publishes it as the host's wake deadline. The cap
     /// bounds the delay, not the attempts: a comp that stays busy is retried
-    /// every [`RETRY_CAP`] until it answers or the connection changes.
+    /// every [`RETRY_CAP`] until it answers or the connection changes. Capping
+    /// attempts instead would give up on a release and strand comp's hold;
+    /// comp leaving or a success are the only exits.
     fn tick(&mut self, now: Duration, deadline: &mut LayerHostDeadline) {
         if self.retry_at.is_some_and(|at| at <= now) {
             // One firing covers every transient failure so far.
@@ -604,6 +608,10 @@ mod tests {
         client.flush(&bridge);
         let commands: Vec<_> = peer.drain_calls().into_iter().map(|call| call.command).collect();
         assert_eq!(commands, ["comp.props.get", "comp.panel.mode"], "background re-read + replay");
+        assert!(client.message(&command("panel-1", 1)).is_none(), "an old sequence");
+        // A comp restarted between observations counts event_seq from zero.
+        client.presence(&comp());
+        assert!(client.message(&command("panel-1", 1)).is_some(), "a lower sequence after a receipt");
         client.presence(&BTreeSet::new());
         assert!(!client.capable);
         client.flush(&bridge);
