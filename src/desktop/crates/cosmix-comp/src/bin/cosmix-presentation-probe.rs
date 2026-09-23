@@ -620,6 +620,18 @@ fn run() -> Result<bool, String> {
     let mut callbacks = Vec::with_capacity(options.frames);
     for _ in 0..options.frames {
         for step in 0..options.burst {
+            // Idle-callback probe: after the first frame, request a callback
+            // without reattaching or damaging, so the scene can settle.
+            if options.callbacks_only
+                && options.burst == 1
+                && commit > 0
+                && std::env::var("COSMIX_PROBE_IDLE_CALLBACKS").as_deref() == Ok("1")
+            {
+                surface.frame(&qh, ());
+                surface.commit();
+                commit += 1;
+                continue;
+            }
             // Consecutive commits never share a buffer (there is one more
             // buffer than commits per burst).
             let slot = commit % slots;
