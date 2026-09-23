@@ -1,6 +1,7 @@
 //! Cosmix Quoin's real SCTK layer-shell host.
 
 mod bus_service;
+pub mod config;
 mod demos;
 mod desktop_font;
 mod launcher;
@@ -131,6 +132,7 @@ pub fn run_layer_host() -> AppExit {
         smoke_all_panels,
         smoke_hidden,
     );
+    config::install(&mut app, smoke_all_panels || smoke_hidden);
     app.run()
 }
 

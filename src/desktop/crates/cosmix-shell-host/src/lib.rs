@@ -3,6 +3,7 @@
 #![deny(unsafe_code)]
 
 pub mod background;
+pub mod file_watch;
 mod corner_bus;
 #[cfg(test)]
 mod feature_graph;
