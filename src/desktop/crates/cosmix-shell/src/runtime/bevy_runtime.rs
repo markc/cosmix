@@ -96,17 +96,23 @@ impl Plugin for ShellRuntimePlugin {
     }
 }
 
-/// Replace the singleton v1 model after its selected output disappears.
+/// Replace the singleton v1 model after a rebuild or an output switch.
 ///
-/// Live pins, pages and dimensions win over the replacement factory's seeds.
-/// The layer host drains and destroys the old surfaces first, then calls this
-/// before mapping fresh surfaces on the replacement output.
+/// A same-output rebuild (a resize) carries live pins, pages and dimensions
+/// over the replacement's seeds. An output change does not: the replacement
+/// keeps whatever its factory restored or defaulted to, so the outgoing
+/// output's live state never leaks into another output's remembered
+/// configuration (per-(output, edge) persistence). The layer host drains and
+/// destroys the old surfaces first, then calls this before mapping fresh
+/// surfaces on the replacement output.
 pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     let old_output = world.resource::<ShellRuntime>().model.output().clone();
     if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
         registry.0.migrate_output(&old_output, model.output());
     }
-    model.carry_live_state(&world.resource::<ShellRuntime>().model);
+    if model.output() == &old_output {
+        model.carry_live_state(&world.resource::<ShellRuntime>().model);
+    }
     let frame = ShellFrame::from_model(&model);
     *world.resource_mut::<ShellRuntime>() = ShellRuntime {
         model,
@@ -782,8 +788,10 @@ mod tests {
         );
     }
 
+    /// The live state a same-output rebuild must preserve: pins, pages and
+    /// dimensions carry over the replacement factory's seeds.
     #[test]
-    fn output_migration_carries_live_pin_page_and_thickness() {
+    fn same_output_replacement_carries_live_pin_page_and_thickness() {
         let mut app = app();
         app.world_mut()
             .resource_mut::<SubPanelRegistryState>()
@@ -809,6 +817,58 @@ mod tests {
                 .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Dock)
                 .unwrap();
         }
+        let replacement = ShellModel::new(
+            OutputKey::new("DP-1").unwrap(),
+            LogicalSize::new(1920.0, 1080.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        replace_shell_model(app.world_mut(), replacement);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "DP-1");
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 137.0);
+        assert_eq!(
+            frame.panel(Edge::Left).active_page_id.as_deref(),
+            Some("places")
+        );
+        assert_eq!(frame.panel(Edge::Right).mode, PanelMode::Hidden);
+    }
+
+    /// An output change keeps the replacement's own restored/default state:
+    /// the outgoing output's live pins, pages and dimensions are per-output
+    /// remembered state and must not follow the switch.
+    #[test]
+    fn output_change_keeps_replacement_state_not_live_state() {
+        let mut app = app();
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "places",
+                OutputKey::new("DP-1").unwrap(),
+                Edge::Left,
+                "owner",
+                7,
+            )
+            .unwrap();
+        {
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            runtime.model.restore_thickness(Edge::Left, 137.0).unwrap();
+            runtime.model.set_carousel(
+                Edge::Left,
+                crate::core::Carousel::new(["nav", "places"]).unwrap(),
+            );
+            runtime.model.carousel_mut(Edge::Left).select_id("places");
+            runtime
+                .model
+                .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Dock)
+                .unwrap();
+        }
+        // The replacement carries HDMI-A-1's own remembered seeds, as both
+        // hosts' model factories produce for a restored output.
         let mut replacement = ShellModel::new(
             OutputKey::new("HDMI-A-1").unwrap(),
             LogicalSize::new(1920.0, 1080.0).unwrap(),
@@ -817,17 +877,31 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        replacement.start_intro(Duration::from_secs(2));
+        replacement.set_carousel(
+            Edge::Left,
+            crate::core::Carousel::new(["nav", "places"]).unwrap(),
+        );
+        replacement.restore_thickness(Edge::Left, 88.0).unwrap();
         replace_shell_model(app.world_mut(), replacement);
         let frame = &app.world().resource::<ShellFrameState>().0;
         assert_eq!(frame.geometry.output.as_str(), "HDMI-A-1");
-        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
-        assert_eq!(frame.panel(Edge::Left).thickness_px, 137.0);
         assert_eq!(
+            frame.panel(Edge::Left).mode,
+            PanelMode::Hidden,
+            "DP-1's live dock must not follow the output change"
+        );
+        assert_eq!(
+            frame.panel(Edge::Left).thickness_px, 88.0,
+            "DP-1's live thickness must not follow the output change"
+        );
+        assert_ne!(
             frame.panel(Edge::Left).active_page_id.as_deref(),
-            Some("places")
+            Some("places"),
+            "DP-1's live page must not follow the output change"
         );
         assert_eq!(frame.panel(Edge::Right).mode, PanelMode::Hidden);
+        // Registry seats follow the output (chunk 5) even though live panel
+        // state does not (chunk 7).
         let registry = &app.world().resource::<SubPanelRegistryState>().0;
         let seat = registry.seat("places").unwrap();
         assert_eq!(seat.output.as_str(), "HDMI-A-1");

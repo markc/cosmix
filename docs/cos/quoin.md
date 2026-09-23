@@ -323,34 +323,73 @@ inherits Quoin's environment and service lifetime.
 
 Quoin loads strict-data `$COSMIX_VAR/quoin.state.mix` before constructing its
 initial model, using the shared path resolver (including its XDG fallback).
-The v2 root contains exactly six fields: `version: 2`, `scheme`, and `left`,
-`bottom`, `right`, `top`. Each edge has exactly `thickness_px`, `mode` and `page`:
+The v3 root contains exactly three fields: `version: 3`, `scheme`, and
+`outputs` — a map from an output identity to that output's four edges. Each
+output entry has exactly `left`, `bottom`, `right` and `top`; each edge has
+exactly `thickness_px`, `mode` and `page`:
 
 ```text
 {
-  version: 2,
+  version: 3,
   scheme: "builtin",
-  left:   {thickness_px: 240, mode: "hidden", page: "nav"},
-  bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
-  right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
-  top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+  outputs: {
+    "connector:DP-1": {
+      left:   {thickness_px: 240, mode: "hidden", page: "nav"},
+      bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
+      right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+    },
+    "connector:HDMI-1": {
+      left:   {thickness_px: 200, mode: "docked", page: "places"},
+      bottom: {thickness_px: 60,  mode: "hidden", page: "tasks"},
+      right:  {thickness_px: 240, mode: "hidden", page: "monitor"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+    }
+  }
 }
 ```
 
+An output's key in the `outputs` map is its persistent identity, not its
+geometry: today `connector:<name>`, where `<name>` is the connector name comp
+reports for the output — the `outputs` props row name the layer host's
+`OutputKey` mirrors. comp cannot yet supply EDID make/model/serial, so no
+EDID-based identity tier exists; keys are opaque non-empty strings, so an
+`edid:` tier can be added when comp grows EDID fields without another format
+version. Real identities always carry a prefix, which keeps them clear of the
+reserved `default` entry that legacy files migrate to. Only connector names
+are persistent identities: an output the compositor has not named (the layer
+host's `wl-output-<id>` fallback, the embedded host's pre-observation
+placeholder) restores nothing, claims nothing and is never persisted —
+protocol ids are reassigned across sessions and must not anchor state.
+
 Modes are the strings `hidden`, `pinned` or `docked`. Thickness must be finite
-and positive; unknown page IDs use the edge's default page. The strict legacy
-five-field root (no version) with three-field edges containing `pinned` booleans
-is migrated in memory: true becomes `docked`, false becomes `hidden`, preserving
-thickness, page and scheme. Only successfully parsed legacy files migrate.
-The next normal persistent mutation writes v2; loading and transient visibility
-do not rewrite the file. Missing or invalid files use hidden defaults with one
-diagnostic line and no startup write. As before, a later normal mutation may
-overwrite a corrupt file; write inhibition is a separate outstanding issue.
+and positive; unknown page IDs use the edge's default page. On restore, an
+output with an entry under its own identity reuses it as-is. The strict
+legacy five-field root (no version) with three-field edges containing
+`pinned` booleans is migrated in memory — true becomes `docked`, false
+becomes `hidden`, preserving thickness, page and scheme — as is a v2 root
+(`version: 2` with the four edges at the top level). Both park their single
+edge set under the reserved `default` output entry, and the first output to
+restore claims it, re-filing the entry under its own identity; a different,
+later output gets the default config instead. Only successfully parsed
+legacy files migrate, and an output with no matching entry (and no unclaimed
+`default`) restores nothing: it keeps the default config and gains no entry
+until its first save. The next normal persistent mutation writes v3,
+rewriting only the current output's entry — other outputs' remembered state
+stays for reconnection. Loading and transient visibility do not rewrite the
+file. A missing file is a first run: hidden defaults, one diagnostic line,
+and persistence stays enabled so the first accepted mutation creates the
+file. A file that exists but cannot be parsed (or read) also uses hidden
+defaults with one diagnostic line, and disables persistence for the whole
+session: a later mutation must not overwrite a file this Quoin never
+successfully read. Fixing or removing the file restores persistence on the
+next launch.
 
 Accepted mode, page, scheme and completed resize changes save state after the Model stage,
-using a temporary file and atomic rename. Output migration carries live
-mode, page and thickness state; it never reloads disk state. Both smoke modes
-skip restore, saving and the intro pulse.
+using a temporary file and atomic rename. A same-output rebuild carries live
+mode, page and thickness state; an output change keeps the replacement's
+restored or default state, so live state never crosses outputs. Both smoke
+modes skip restore, saving and the intro pulse.
 
 A normal cold start transiently reveals hidden panels for two seconds, then releases
 a temporary startup hold into normal 800 ms grace. This discovery pulse is

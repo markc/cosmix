@@ -83,7 +83,7 @@ pub fn run_layer_host() -> AppExit {
     };
     let registry = page_registry();
     let state_store = state::StateStore::startup(cli.smoke_all_panels || cli.smoke_hidden);
-    let restored = state_store.snapshot();
+    let restore_saved = state_store.shared_saved();
     let model_registry = registry.clone();
     let smoke_all_panels = cli.smoke_all_panels;
     let smoke_hidden = cli.smoke_hidden;
@@ -105,7 +105,9 @@ pub fn run_layer_host() -> AppExit {
             }
         }
         if !smoke_all_panels && !smoke_hidden {
-            restored.restore(&mut model);
+            // Restore through the store's shared handle so claiming the
+            // migrated default-output entry reaches the next save.
+            state::StateStore::restore_shared(&restore_saved, &mut model);
             model.start_intro(Duration::from_secs(2));
         }
         model
@@ -306,7 +308,7 @@ fn setup(
     // default is Ocean/Dark, overridden by a persisted scheme when present.
     let scheme = state_store
         .scheme()
-        .and_then(Scheme::from_name)
+        .and_then(|scheme| Scheme::from_name(&scheme))
         .unwrap_or(Scheme::Ocean);
     let mut spec = ThemeSpec::from_scheme(scheme, Mode::Dark);
     // Match the host desktop's UI font where it can be read; otherwise CTK's
