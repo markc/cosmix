@@ -420,7 +420,8 @@ struct QuoinPanelParts {
     header: Entity,
     /// `[previous, next]` chevron buttons. Side panels keep them in the
     /// header; horizontal panels pin them at the two panel ends. Hidden with
-    /// the header while the active page is chromeless.
+    /// the header while the active page is chromeless, and on an edge with a
+    /// single page. They alone carry the hotspot inset.
     chevrons: [Entity; 2],
     title_label: Entity,
     dots_host: Entity,
@@ -769,7 +770,7 @@ fn spawn_panel(
                     align_items: AlignItems::Center,
                     justify_content: JustifyContent::Center,
                     column_gap: px(4),
-                    padding: UiRect::axes(px(5), px(3)),
+                    padding: side_header_padding(0.0),
                     ..default()
                 },
                 bevy::feathers::theme::ThemeBackgroundColor(tokens::MASTER_PANEL),
@@ -834,7 +835,6 @@ fn spawn_panel(
                     FlexDirection::Column
                 },
                 border: panel_border(edge),
-                padding: hotspot_padding(edge, QuoinHotspotSize::default()),
                 ..default()
             },
             UiTransform::default(),
@@ -929,14 +929,30 @@ fn panel_border(edge: Edge) -> UiRect {
     }
 }
 
-/// Inset of the carousel furniture from the panel ends (panel doc §7): the
-/// extreme ends of a horizontal panel and the top end of a side panel sit
-/// under a corner hotspot, where a control is unclickable. Spawn uses the
-/// fallback size; presentation re-reads the observed one every frame.
-fn hotspot_padding(edge: Edge, size: QuoinHotspotSize) -> UiRect {
-    match edge.orientation() {
-        Orientation::Horizontal => UiRect::horizontal(px(size.0)),
-        Orientation::Vertical => UiRect::top(px(size.0)),
+/// Inset of the chevrons from the panel ends (panel doc §7): the extreme ends
+/// of a horizontal panel and the top end of a side panel sit under a corner
+/// hotspot, where a control is unclickable. Only the chevrons move — page
+/// content always fills the panel — and an edge with a single page has no
+/// chevrons, so no inset. Presentation re-reads the observed size every frame.
+fn chevron_inset(size: QuoinHotspotSize, paging: bool) -> f32 {
+    if paging { size.0 } else { 0.0 }
+}
+
+/// Horizontal panels: `[previous, next]` margins holding the chevrons off
+/// the two panel ends by `inset`.
+fn chevron_margins(inset: f32) -> [UiRect; 2] {
+    [UiRect::left(px(inset)), UiRect::right(px(inset))]
+}
+
+/// Side panels: the `< [title] >` header's padding, its top grown by `inset`
+/// so the chevrons inside it clear the corner hotspot while the header's own
+/// background still reaches the panel end.
+fn side_header_padding(inset: f32) -> UiRect {
+    UiRect {
+        left: px(5),
+        right: px(5),
+        top: px(3.0 + inset),
+        bottom: px(3),
     }
 }
 
@@ -1360,16 +1376,18 @@ fn present_panels(
         if node.display != display {
             node.display = display;
         }
-        // Chevron inset (panel doc §7), re-read every frame so an observed
-        // comp deadzone moves the furniture live.
-        let padding = hotspot_padding(
-            chrome.edge,
-            hotspot.as_deref().copied().unwrap_or_default(),
-        );
-        if node.padding != padding {
-            node.padding = padding;
-        }
+        // Chevrons page between pages: an edge with one page has none, and
+        // so no inset (panel doc §7). The inset is re-read every frame so an
+        // observed comp deadzone moves the chevrons live; page content is
+        // never inset.
+        // The model's carousel, not the chrome's wrapper list: chevrons walk
+        // the carousel, and a mounted page the carousel refused (an empty id)
+        // has a wrapper but nothing to page to.
+        let paging = panel.page_ids.len() > 1;
+        let inset = chevron_inset(hotspot.as_deref().copied().unwrap_or_default(), paging);
         for control in &parts.controls {
+            let controls_enabled =
+                controls_enabled && (paging || !parts.chevrons.contains(control));
             if let Ok(mut tab_index) = queries.tab_indices.get_mut(*control) {
                 let index = if controls_enabled { 0 } else { -1 };
                 if tab_index.0 != index {
@@ -1429,18 +1447,31 @@ fn present_panels(
             if header.display != display {
                 header.display = display;
             }
+            if chrome.edge.orientation() == Orientation::Vertical {
+                let padding = side_header_padding(inset);
+                if header.padding != padding {
+                    header.padding = padding;
+                }
+            }
         }
-        // Chromeless pages hide the whole carousel furniture: on horizontal
-        // panels the chevrons sit outside the header and hide with it.
-        for chevron in parts.chevrons {
+        // Chromeless pages hide the whole carousel furniture, and a single
+        // page has nothing to page to: on horizontal panels the chevrons sit
+        // outside the header and hide with it.
+        let margins = chevron_margins(inset);
+        for (chevron, margin) in parts.chevrons.into_iter().zip(margins) {
             if let Ok(mut chevron_node) = queries.nodes.get_mut(chevron) {
-                let display = if chromeless {
+                let display = if chromeless || !paging {
                     Display::None
                 } else {
                     Display::Flex
                 };
                 if chevron_node.display != display {
                     chevron_node.display = display;
+                }
+                if chrome.edge.orientation() == Orientation::Horizontal
+                    && chevron_node.margin != margin
+                {
+                    chevron_node.margin = margin;
                 }
             }
         }
@@ -2618,33 +2649,302 @@ mod tests {
         }
     }
 
-    /// The chevrons are inset from the panel ends by the configured hotspot
-    /// size, never flush (panel doc §7): the ends of a horizontal panel and
-    /// the top of a side panel sit under a corner hotspot. The inset tracks
-    /// comp's observed `input.corners.deadzone_px` live, falling back to the
-    /// comp default only while unobserved.
-    #[test]
-    fn chevron_inset_reads_hotspot_size() {
-        let expected = |edge: Edge, size: f32| hotspot_padding(edge, QuoinHotspotSize(size));
-        for edge in Edge::ALL {
-            let mut world = panel_world(edge, &["alpha"]);
-            let panel = panel_entity(&world, edge);
-            world.run_system_once(present_panels).unwrap();
-            assert_eq!(
-                world.get::<Node>(panel).unwrap().padding,
-                expected(edge, DEFAULT_COMP_HOTSPOT_PX),
-                "{edge:?}: unobserved fallback must mirror comp's default deadzone"
-            );
-            for observed in [24.0, 40.0] {
-                world.insert_resource(QuoinHotspotSize(observed));
-                world.run_system_once(present_panels).unwrap();
+    /// Where the chevron inset lands for `edge`: the two chevrons' margins on
+    /// a horizontal panel, the side header's padding on a vertical one.
+    fn chevron_placement(world: &World, edge: Edge) -> (Option<[UiRect; 2]>, UiRect) {
+        let parts = world
+            .get::<QuoinPanelParts>(panel_entity(world, edge))
+            .unwrap();
+        let margins = parts
+            .chevrons
+            .map(|chevron| world.get::<Node>(chevron).unwrap().margin);
+        let header = world.get::<Node>(parts.header).unwrap().padding;
+        match edge.orientation() {
+            Orientation::Horizontal => (Some(margins), header),
+            Orientation::Vertical => {
                 assert_eq!(
-                    world.get::<Node>(panel).unwrap().padding,
-                    expected(edge, observed),
-                    "{edge:?}: the inset must follow the observed deadzone, not a constant"
+                    margins,
+                    [UiRect::DEFAULT; 2],
+                    "{edge:?}: side chevrons sit inside the header, which carries the inset"
                 );
+                (None, header)
             }
         }
+    }
+
+    /// Page content fills the panel on every edge: the root carries no
+    /// padding, the page host none either, and each page wrapper spans the
+    /// whole host (panel doc §7 — "the panel ends belong to the chevrons and
+    /// everything else is content").
+    fn assert_content_not_inset(world: &World, edge: Edge, page_ids: &[&str]) {
+        let panel = panel_entity(world, edge);
+        let root = world.get::<Node>(panel).unwrap();
+        assert_eq!(root.padding, UiRect::DEFAULT, "{edge:?}: the panel root must not inset its content");
+        let parts = world.get::<QuoinPanelParts>(panel).unwrap();
+        let host = world.get::<Node>(parts.page_host).unwrap();
+        assert_eq!(host.padding, UiRect::DEFAULT, "{edge:?}: page host padding");
+        assert_eq!(host.margin, UiRect::DEFAULT, "{edge:?}: page host margin");
+        assert_eq!(host.flex_grow, 1.0, "{edge:?}: page host must take the free length");
+        for id in page_ids {
+            let wrapper = world.get::<Node>(wrapper_of(world, edge, id)).unwrap();
+            assert_eq!(wrapper.position_type, PositionType::Absolute);
+            assert_eq!((wrapper.left, wrapper.top), (px(0), px(0)), "{edge:?}/{id}");
+            assert_eq!(
+                (wrapper.width, wrapper.height),
+                (percent(100), percent(100)),
+                "{edge:?}/{id}: the page must span its host"
+            );
+            assert_eq!(wrapper.padding, UiRect::DEFAULT, "{edge:?}/{id}");
+            assert_eq!(wrapper.margin, UiRect::DEFAULT, "{edge:?}/{id}");
+        }
+    }
+
+    /// The chevrons — not the page content — are inset from the panel ends
+    /// by the configured hotspot size, never flush (panel doc §7): the ends
+    /// of a horizontal panel and the top of a side panel sit under a corner
+    /// hotspot. The inset tracks comp's observed `input.corners.deadzone_px`
+    /// live, falling back to the comp default only while unobserved.
+    #[test]
+    fn chevron_inset_reads_hotspot_size() {
+        let pages = ["alpha", "beta"];
+        for edge in Edge::ALL {
+            let mut world = panel_world(edge, &pages);
+            for (observed, why) in [
+                (None, "unobserved fallback must mirror comp's default deadzone"),
+                (Some(24.0), "the inset must follow the observed deadzone, not a constant"),
+                (Some(40.0), "the inset must follow the observed deadzone, not a constant"),
+            ] {
+                if let Some(observed) = observed {
+                    world.insert_resource(QuoinHotspotSize(observed));
+                }
+                world.run_system_once(present_panels).unwrap();
+                let size = observed.unwrap_or(DEFAULT_COMP_HOTSPOT_PX);
+                let (margins, header) = chevron_placement(&world, edge);
+                match edge.orientation() {
+                    Orientation::Horizontal => {
+                        assert_eq!(margins, Some(chevron_margins(size)), "{edge:?}: {why}");
+                        assert_eq!(
+                            margins.unwrap(),
+                            [UiRect::left(px(size)), UiRect::right(px(size))],
+                            "{edge:?}: previous holds off the left end, next the right"
+                        );
+                    }
+                    Orientation::Vertical => {
+                        assert_eq!(header, side_header_padding(size), "{edge:?}: {why}");
+                        assert_eq!(header.top, px(3.0 + size), "{edge:?}: {why}");
+                    }
+                }
+                let parts = world
+                    .get::<QuoinPanelParts>(panel_entity(&world, edge))
+                    .unwrap();
+                for chevron in parts.chevrons {
+                    assert_eq!(
+                        world.get::<Node>(chevron).unwrap().display,
+                        Display::Flex,
+                        "{edge:?}: a multi-page edge shows its chevrons"
+                    );
+                }
+                assert_content_not_inset(&world, edge, &pages);
+            }
+        }
+    }
+
+    /// An edge with a single page has nothing to page to: no chevrons, and
+    /// no hotspot inset anywhere — the page fills the panel exactly as it
+    /// did before the carousel chrome (the bottom panel's launcher and peek
+    /// buttons sit flush at the panel ends).
+    #[test]
+    fn single_page_edge_has_no_chevrons_and_no_inset() {
+        for edge in Edge::ALL {
+            let mut world = panel_world(edge, &["alpha"]);
+            world.insert_resource(QuoinHotspotSize(40.0));
+            // Mapped, so a -1 tab index below is the single-page rule's doing,
+            // not an unmapped panel's.
+            world.resource_mut::<ShellFrameState>().0.panels[edge.index()].mapped = true;
+            world.run_system_once(present_panels).unwrap();
+            let parts = world
+                .get::<QuoinPanelParts>(panel_entity(&world, edge))
+                .unwrap();
+            for chevron in parts.chevrons {
+                assert_eq!(
+                    world.get::<Node>(chevron).unwrap().display,
+                    Display::None,
+                    "{edge:?}: a single-page edge shows no chevrons"
+                );
+                assert_eq!(
+                    world.get::<TabIndex>(chevron),
+                    Some(&TabIndex(-1)),
+                    "{edge:?}: hidden chevrons must leave the tab order"
+                );
+            }
+            let (margins, header) = chevron_placement(&world, edge);
+            if let Some(margins) = margins {
+                assert_eq!(margins, [UiRect::DEFAULT; 2], "{edge:?}: no chevron inset");
+            }
+            if edge.orientation() == Orientation::Vertical {
+                assert_eq!(header, side_header_padding(0.0), "{edge:?}: no header inset");
+            }
+            assert_content_not_inset(&world, edge, &["alpha"]);
+        }
+    }
+
+    /// A multi-page edge still never insets its content: the hotspot inset
+    /// lives only on the chevrons (horizontal: their own end slots beside
+    /// the page host; vertical: the header above it), so the page host and
+    /// its pages carry no padding or margin whatever the deadzone.
+    #[test]
+    fn multi_page_edge_content_is_not_inset() {
+        for edge in Edge::ALL {
+            let mut world = panel_world(edge, &["alpha", "beta", "gamma"]);
+            world.insert_resource(QuoinHotspotSize(40.0));
+            world.run_system_once(present_panels).unwrap();
+            assert_content_not_inset(&world, edge, &["alpha", "beta", "gamma"]);
+            let panel = panel_entity(&world, edge);
+            let parts = world.get::<QuoinPanelParts>(panel).unwrap();
+            let children = world.get::<Children>(panel).unwrap();
+            let expected: Vec<Entity> = match edge.orientation() {
+                Orientation::Horizontal => {
+                    vec![parts.chevrons[0], parts.page_host, parts.chevrons[1], parts.header]
+                }
+                Orientation::Vertical => vec![parts.header, parts.page_host],
+            };
+            assert_eq!(
+                &children[..expected.len()],
+                expected.as_slice(),
+                "{edge:?}: chunk 10's furniture structure is kept"
+            );
+        }
+    }
+
+    /// The live dynamic-page path: a real shell runtime, production chrome
+    /// with no authored pages, and pages arriving through `mount_page` —
+    /// which registers them with the model's carousel — as chunk 21's
+    /// sub-panels do.
+    fn runtime_chrome_app() -> App {
+        use crate::runtime::ShellRuntimePlugin;
+
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .add_message::<RequestRedraw>();
+        let world = app.world_mut();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        app
+    }
+
+    /// Present `edge` as mapped (so a -1 tab index is the paging rule's
+    /// doing) and return its chevrons' `(display, tab index, margin)`.
+    fn present_chevrons(world: &mut World, edge: Edge) -> Vec<(Display, TabIndex, UiRect)> {
+        world.resource_mut::<ShellFrameState>().0.panels[edge.index()].mapped = true;
+        world.run_system_once(present_panels).unwrap();
+        let mut query = world.query::<(&QuoinPanelChrome, &QuoinPanelParts)>();
+        let chevrons = query
+            .iter(world)
+            .find(|(chrome, _)| chrome.edge == edge)
+            .map(|(_, parts)| parts.chevrons)
+            .unwrap();
+        chevrons
+            .iter()
+            .map(|chevron| {
+                let node = world.get::<Node>(*chevron).unwrap();
+                (node.display, *world.get::<TabIndex>(*chevron).unwrap(), node.margin)
+            })
+            .collect()
+    }
+
+    /// Chevrons follow the model's page count through `present_panels` as
+    /// pages come and go: one page, none; a second mounted, both appear,
+    /// reachable and inset; back to one, gone again with no inset.
+    #[test]
+    fn chevrons_follow_mounted_page_count() {
+        let mut app = runtime_chrome_app();
+        let world = app.world_mut();
+        world.insert_resource(QuoinHotspotSize(30.0));
+        let edge = Edge::Bottom;
+        let hidden = vec![(Display::None, TabIndex(-1), UiRect::DEFAULT); 2];
+        let content = world.spawn_empty().id();
+        assert!(mount_page(world, edge, "first", "First", content));
+        assert_eq!(present_chevrons(world, edge), hidden, "one page: no chevrons");
+        let content = world.spawn_empty().id();
+        assert!(mount_page(world, edge, "second", "Second", content));
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.len(),
+            2
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            vec![
+                (Display::Flex, TabIndex(0), UiRect::left(px(30.0))),
+                (Display::Flex, TabIndex(0), UiRect::right(px(30.0))),
+            ],
+            "two pages: chevrons shown, tabbable and inset by the hotspot size"
+        );
+        unmount_page(world, edge, "second");
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.len(),
+            1
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            hidden,
+            "back to one page: chevrons hidden, untabbable, not inset"
+        );
+    }
+
+    /// Paging follows the model's carousel, not the chrome's wrapper list:
+    /// a mounted page the carousel refuses (a whitespace-only id) still gets
+    /// a wrapper, but Next/Previous have nothing to walk, so the chevrons
+    /// stay hidden rather than showing inert.
+    #[test]
+    fn chevrons_ignore_a_mounted_page_the_carousel_refused() {
+        let mut app = runtime_chrome_app();
+        let world = app.world_mut();
+        let edge = Edge::Bottom;
+        for id in ["only", "  "] {
+            let content = world.spawn_empty().id();
+            assert!(mount_page(world, edge, id, id, content));
+        }
+        let mut query = world.query::<(&QuoinPanelChrome, &QuoinPanelParts)>();
+        let wrappers = query
+            .iter(world)
+            .find(|(chrome, _)| chrome.edge == edge)
+            .map(|(_, parts)| parts.page_wrappers.len())
+            .unwrap();
+        assert_eq!(wrappers, 2, "precondition: the refused page still has a wrapper");
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.as_ref(),
+            ["only".to_owned()],
+            "precondition: the model's carousel refused the empty id"
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            vec![(Display::None, TabIndex(-1), UiRect::DEFAULT); 2]
+        );
     }
 
     /// Panel doc §8: the slide is 300 ms and collapses to zero under reduced
