@@ -310,7 +310,9 @@ impl HotspotObserver {
             .try_call(
                 self.next_id,
                 &self.service,
-                format!("{}.props.set", self.service),
+                // Addressed to the selected service, but comp dispatches the
+                // literal `comp.*` command whatever its registered name.
+                "comp.props.set".to_owned(),
                 BTreeMap::new(),
                 body,
             )
@@ -533,7 +535,7 @@ mod tests {
     fn discovery_sets(peer: &ctk::bus::TestBusPeer) -> Vec<(u64, Value)> {
         peer.drain_calls()
             .into_iter()
-            .filter(|call| call.command == "comp-nested.props.set")
+            .filter(|call| call.command == "comp.props.set")
             .map(|call| {
                 assert_eq!(call.to, "comp-nested");
                 let body: Value = serde_json::from_str(&call.body).unwrap();
@@ -583,6 +585,26 @@ mod tests {
         observer.presence(&BTreeSet::from(["comp-nested".to_owned()]), &mut size);
         observer.flush(&bridge);
         assert!(discovery_sets(&peer).is_empty());
+    }
+
+    /// Comp matches the literal `comp.props.set`; a service-prefixed verb is
+    /// `unknown_verb` on any comp not registered as `comp`.
+    #[test]
+    fn discovery_write_is_literal_comp_props_set_to_the_selected_service() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut observer = HotspotObserver::new("comp-nested".into());
+        let mut size = QuoinHotspotSize::default();
+        observer.arm_first_run_discovery();
+        connect(&mut observer, &mut size, 1);
+        observer.flush(&bridge);
+        let sets = peer
+            .drain_calls()
+            .into_iter()
+            .filter(|call| call.command.ends_with("props.set"))
+            .collect::<Vec<_>>();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].command, "comp.props.set");
+        assert_eq!(sets[0].to, "comp-nested");
     }
 
     #[test]
