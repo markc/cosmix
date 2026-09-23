@@ -295,8 +295,8 @@ Sub-panels are addressed by their stable name, unique across every edge and
 output. `shell.sub.register` takes `edge` and `name` (the owner is the
 broker-attested caller) and fills a carousel slot without revealing or
 selecting it; `shell.sub.remove` takes `name` and lands per the removal rule.
-`shell.sub.activate` takes `name` and reveals and shows that sub-panel (panel
-design §6). On a hidden edge it is a transient reveal held by focus: the
+`shell.sub.activate` takes `name` and reveals, shows and focuses that
+sub-panel (panel design §6). On a hidden edge it is a transient reveal held by focus: the
 carousel jumps to the page (no slide) and Quoin acquires a `focus` hold on the
 panel's layer, which keeps it shown until keyboard focus first moves after comp
 acknowledges the hold (a move into the panel is then held by comp's own focus

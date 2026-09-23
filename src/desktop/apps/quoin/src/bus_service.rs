@@ -3936,6 +3936,13 @@ mod tests {
     /// the left edge. Left has no layer token yet: a hidden panel has no
     /// layer until a reveal maps one (the test inserts it then); the other
     /// edges report their modes during setup.
+    ///
+    /// Harness limit: `TestBusPeer::drain_calls` and `drain_responses` share
+    /// one queue and each discards what the other would return, so a verb
+    /// sent with [`sub_send`] must not also send a comp call in the same
+    /// update. The tests arrange that the way the live host does — the left
+    /// layer token appears only after the reveal — and drive mode changes
+    /// with `write_message` rather than over the Bus.
     fn activation_app(comp: &FakeComp) -> (App, ctk::bus::TestBusPeer) {
         let (bridge, peer) = test_bridge("quoin");
         let mut app = bus_app(bridge);
@@ -3965,6 +3972,15 @@ mod tests {
             assert_eq!(rc, 0, "{body}");
         }
         (app, peer)
+    }
+
+    /// The host's report of which panel surface holds the keyboard.
+    fn observe_focus(app: &mut App, edge: Option<Edge>) {
+        app.world_mut().write_message(ShellCommand {
+            output: test_model().output().clone(),
+            at: Default::default(),
+            kind: ShellCommandKind::Keyboard(cosmix_shell::runtime::KeyboardCommand::FocusObserved(edge)),
+        });
     }
 
     fn left(app: &App) -> cosmix_shell::runtime::PanelPresentation {
@@ -4059,9 +4075,12 @@ mod tests {
         assert_eq!(panel.active_page_id.as_deref(), Some("beta"));
         assert_eq!(panel.page_change, cosmix_shell::runtime::PageChange::Named);
         assert_eq!(panel.keyboard_interactivity,
-            cosmix_shell::runtime::KeyboardInteractivity::Exclusive, "the panel asks for the keyboard");
-        // A focus change before comp has acknowledged the hold is not the
-        // user leaving it: the reveal it made may not even have a layer yet.
+            cosmix_shell::runtime::KeyboardInteractivity::Exclusive,
+            "the panel asks for the keyboard: FocusDirective::Panel(Left)");
+        // The exclusive layer maps and takes the keyboard: the host reports
+        // it, and comp publishes the same move. A focus change before comp
+        // has acknowledged the hold is not the user leaving it.
+        observe_focus(&mut app, Some(Edge::Left));
         peer.deliver_message(focus_changed(Some(4), Some(3)));
         pump(&mut app, &peer, &comp);
         // The reveal maps the layer: its mode report, then the focus hold —
@@ -4079,9 +4098,15 @@ mod tests {
         // Only the exclusive latch moved: keyboard focus did not.
         peer.deliver_message(focus_changed(Some(4), Some(4)));
         assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
-        // Focus moves: the hold has done its job and is released ...
+        assert_eq!(left(&app).keyboard_interactivity,
+            cosmix_shell::runtime::KeyboardInteractivity::Exclusive, "focus landed: still held");
+        // Focus moves: the focus request ends (focus landed, then left) and
+        // the hold has done its job and is released ...
+        observe_focus(&mut app, None);
         peer.deliver_message(focus_changed(Some(5), Some(4)));
         let released = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(left(&app).keyboard_interactivity,
+            cosmix_shell::runtime::KeyboardInteractivity::OnDemand, "the grab is given back");
         assert_eq!(released.len(), 1);
         assert_eq!((&released[0]["holder"], &released[0]["acquire"]), (&json!("focus"), &json!(false)));
         // ... and comp's conceal (nothing else holds) ends the reveal.

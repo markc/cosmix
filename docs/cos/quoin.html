@@ -700,8 +700,8 @@ back <code>shell.props.get path="panels.&lt;edge&gt;.mode"</code> to verify the 
 output. <code>shell.sub.register</code> takes <code>edge</code> and <code>name</code> (the owner is the
 broker-attested caller) and fills a carousel slot without revealing or
 selecting it; <code>shell.sub.remove</code> takes <code>name</code> and lands per the removal rule.
-<code>shell.sub.activate</code> takes <code>name</code> and reveals and shows that sub-panel (panel
-design §6). On a hidden edge it is a transient reveal held by focus: the
+<code>shell.sub.activate</code> takes <code>name</code> and reveals, shows and focuses that
+sub-panel (panel design §6). On a hidden edge it is a transient reveal held by focus: the
 carousel jumps to the page (no slide) and Quoin acquires a <code>focus</code> hold on the
 panel's layer, which keeps it shown until keyboard focus first moves after comp
 acknowledges the hold (a move into the panel is then held by comp's own focus

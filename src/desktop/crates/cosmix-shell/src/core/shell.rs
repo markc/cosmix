@@ -365,23 +365,22 @@ impl ShellModel {
             })
             .collect();
         let stop = next_focus_stop(&stops, current);
-        self.focus_directive = match stop {
-            FocusStop::Panel(edge) => FocusDirective::Panel(edge),
-            FocusStop::Application => self.release_directive(),
-        };
-        self.focus_grant_deadline = match stop {
-            FocusStop::Panel(edge) if self.keyboard_focus != Some(edge) => {
-                Some(at + FOCUS_GRANT_TIMEOUT)
+        match stop {
+            FocusStop::Panel(edge) => self.request_keyboard_focus(edge, at),
+            FocusStop::Application => {
+                self.focus_directive = self.release_directive();
+                self.focus_grant_deadline = None;
             }
-            _ => None,
-        };
+        }
         stop
     }
 
-    /// Named activation (panel doc §6) gives the panel focus: the same
-    /// request, deadline and endings as a cycle stop, for a panel that is
-    /// mapped (a hidden edge's activation reveals it first). Never changes a
-    /// mode.
+    /// Ask for the keyboard in `edge`'s panel: the focus cycle's stops and
+    /// named activation (panel doc §6, whose hidden edge is revealed first)
+    /// both come here. The request lapses unless comp grants it by `at` +
+    /// [`FOCUS_GRANT_TIMEOUT`], and ends once focus has landed there and
+    /// then left, on Escape, or at the next cycle stop. An unmapped panel has
+    /// no surface to focus and is not asked for. Never changes a mode.
     pub fn request_keyboard_focus(&mut self, edge: Edge, at: Duration) {
         if !self.panel(edge).mapped {
             return;
