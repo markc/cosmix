@@ -13,6 +13,16 @@
 //! A settled hover is one frame in and one out; the release flash is a
 //! bounded one-shot of [`FLASH_STEPS`] quantised levels; the discovery flash
 //! is a two-state blink, two frames per period, and ends at the first reveal.
+//! The flash and blink advance on the pump's existing update cadence (the KMS
+//! pump services idle updates at refresh rate); a purely reactive pump would
+//! need a one-shot wake at each step, which this module does not arm.
+//!
+//! Multi-output limit: squares carry each output's global logical origin, but
+//! the renderer places every output camera over one shared canvas centre at
+//! one `RendererOutputScale120` — the same limit client placement has today.
+//! Mixed-scale, multi-output correctness is gated by the renderer's
+//! multi-output camera model (a comp TODO, not this module); the tests prove
+//! per-scale correctness on a single canvas.
 use crate::compositor_scene::{
     CompositorSceneSet, LockBlankScene, LogicalCanvasSize, RendererOutputScale120,
     SceneContentRevision, renderer_rect,
@@ -25,7 +35,8 @@ use std::{
 
 /// Above every client band (content tops out at 900, the lock blank's
 /// fallback is 925) and below the software cursor (950): no client and no
-/// panel can stack above a hotspot (§2).
+/// layer-shell panel can stack above a hotspot (§2). The embedded-quoin
+/// feature's Bevy UI panels composite above world sprites and can cover it.
 const HOTSPOT_Z: f32 = 940.0;
 pub(crate) const FLASH_DURATION: Duration = Duration::from_millis(180);
 pub(crate) const FLASH_STEPS: u8 = 6;
@@ -110,20 +121,33 @@ impl View {
 }
 
 #[derive(Resource, Clone, Default)]
-pub(crate) struct HotspotBridge(Arc<Mutex<View>>);
+pub(crate) struct HotspotBridge {
+    view: Arc<Mutex<View>>,
+    /// Publishes observed, so tests can prove motion alone publishes nothing.
+    #[cfg(test)]
+    sets: Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl HotspotBridge {
     pub(crate) fn set(&self, view: View) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = view;
+        *self.view.lock().unwrap_or_else(|p| p.into_inner()) = view;
+        #[cfg(test)]
+        self.sets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
     pub(crate) fn view(&self) -> View {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.view.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sets(&self) -> usize {
+        self.sets.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn frame(&self, now: Instant) -> Vec<Quad> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).frame(now)
+        self.view.lock().unwrap_or_else(|p| p.into_inner()).frame(now)
     }
 }
 
@@ -142,6 +166,18 @@ fn attach(feed: Option<Res<crate::protocol::ClientSceneFeed>>, bridge: Res<Hotsp
 #[derive(Component)]
 struct HotspotQuad;
 
+/// What the sprites currently on screen were drawn from. A redraw is due when
+/// any of it differs: the view's frame, or the canvas, scale or accent it was
+/// placed and coloured with (a hotplug, resize or theme switch during a held
+/// hover must not leave a stale square).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Drawn {
+    frame: Vec<Quad>,
+    canvas: Vec2,
+    scale120: u32,
+    accent: Option<Color>,
+}
+
 #[allow(clippy::too_many_arguments)] // Bevy system parameters.
 fn draw(
     mut commands: Commands,
@@ -151,7 +187,7 @@ fn draw(
     lock: Option<Res<LockBlankScene>>,
     theme: Option<Res<crate::decoration_scene::DecorationSceneTheme>>,
     quads: Query<Entity, With<HotspotQuad>>,
-    mut drawn: Local<Vec<Quad>>,
+    (mut drawn, mut accent): (Local<Drawn>, Local<Option<Color>>),
     mut revision: ResMut<SceneContentRevision>,
     damage: Option<Res<crate::capture::OutputDamageJournal>>,
 ) {
@@ -162,47 +198,60 @@ fn draw(
     } else {
         bridge.frame(Instant::now())
     };
-    if frame == *drawn {
+    // Resolving the accent builds a preset, so only on a theme change.
+    match &theme {
+        Some(theme) if theme.is_changed() || accent.is_none() => {
+            *accent = Some(theme.accent());
+        }
+        Some(_) => {}
+        None => *accent = None,
+    }
+    let next = Drawn {
+        scale120: scale.map_or(crate::backend::kms::OutputScale120::ONE.get(), |s| s.0),
+        canvas: canvas.0,
+        accent: *accent,
+        frame,
+    };
+    // Nothing drawn and nothing to draw: placement inputs are irrelevant.
+    if next == *drawn || (next.frame.is_empty() && drawn.frame.is_empty()) {
         return;
     }
     for entity in &quads {
         commands.entity(entity).despawn();
     }
-    let scale120 = scale.map_or(crate::backend::kms::OutputScale120::ONE.get(), |s| s.0);
-    let accent = theme.map_or(Color::WHITE, |theme| theme.accent());
-    let mut damaged = Vec::with_capacity(drawn.len() + frame.len());
-    for quad in drawn.iter().chain(&frame) {
-        let rect = renderer_rect(
+    let rect_of = |quad: &Quad, scale120| {
+        renderer_rect(
             quad.square.x as f32,
             quad.square.y as f32,
             quad.square.side as f32,
             quad.square.side as f32,
             scale120,
-        );
-        damaged.push(crate::capture::DisplayedLogicalRegion {
+        )
+    };
+    let damaged = drawn
+        .frame
+        .iter()
+        .map(|quad| rect_of(quad, drawn.scale120))
+        .chain(next.frame.iter().map(|quad| rect_of(quad, next.scale120)))
+        .map(|rect| crate::capture::DisplayedLogicalRegion {
             x: rect.x,
             y: rect.y,
             width: rect.width,
             height: rect.height,
-        });
-    }
-    for quad in &frame {
-        let rect = renderer_rect(
-            quad.square.x as f32,
-            quad.square.y as f32,
-            quad.square.side as f32,
-            quad.square.side as f32,
-            scale120,
-        );
+        })
+        .collect::<Vec<_>>();
+    let colour = next.accent.unwrap_or(Color::WHITE);
+    for quad in &next.frame {
+        let rect = rect_of(quad, next.scale120);
         commands.spawn((
             HotspotQuad,
             Sprite::from_color(
-                accent.with_alpha(f32::from(quad.level) / 255.0),
+                colour.with_alpha(f32::from(quad.level) / 255.0),
                 Vec2::new(rect.width, rect.height),
             ),
             Transform::from_xyz(
-                rect.x + rect.width / 2.0 - canvas.0.x / 2.0,
-                canvas.0.y / 2.0 - rect.y - rect.height / 2.0,
+                rect.x + rect.width / 2.0 - next.canvas.x / 2.0,
+                next.canvas.y / 2.0 - rect.y - rect.height / 2.0,
                 HOTSPOT_Z,
             ),
         ));
@@ -211,7 +260,7 @@ fn draw(
     if let Some(damage) = damage {
         damage.mark_base_logical_regions(&damaged);
     }
-    *drawn = frame;
+    *drawn = next;
 }
 
 #[cfg(test)]
@@ -365,6 +414,113 @@ mod tests {
         app.update();
         assert_eq!(app.world().resource::<SceneContentRevision>().0, hidden);
         assert!(sprites(&mut app).is_empty());
+    }
+
+    fn revision(app: &App) -> Option<u64> {
+        app.world().resource::<SceneContentRevision>().0
+    }
+
+    fn sprite_colours(app: &mut App) -> Vec<Color> {
+        app.world_mut()
+            .query_filtered::<&Sprite, With<HotspotQuad>>()
+            .iter(app.world())
+            .map(|sprite| sprite.color)
+            .collect()
+    }
+
+    /// The frame alone is not the cache key: a theme switch or a canvas
+    /// change under a held hover must repaint (once), not keep a stale
+    /// colour or a square placed from the old canvas centre.
+    #[test]
+    fn held_hover_redraws_once_when_accent_or_canvas_changes() {
+        use crate::decoration_scene::DecorationSceneTheme;
+        use cosmix_deco::{Mode, Scheme, presets};
+        let bridge = HotspotBridge::default();
+        let mut app = app(&bridge, 120);
+        app.insert_resource(DecorationSceneTheme::for_test(presets::cosmix(
+            Scheme::Ocean,
+            Mode::Dark,
+        )));
+        bridge.set(View {
+            hover: Some(0),
+            ..view()
+        });
+        app.update();
+        let shown = revision(&app);
+        let ocean = sprite_colours(&mut app);
+        app.update();
+        assert_eq!(revision(&app), shown);
+
+        app.insert_resource(DecorationSceneTheme::for_test(presets::cosmix(
+            Scheme::Crimson,
+            Mode::Dark,
+        )));
+        app.update();
+        let recoloured = revision(&app);
+        assert_ne!(recoloured, shown, "a theme switch repaints a held hover");
+        assert_ne!(sprite_colours(&mut app), ocean);
+        assert_eq!(sprite_colours(&mut app).len(), 1);
+        app.update();
+        assert_eq!(revision(&app), recoloured, "exactly once");
+
+        app.world_mut().resource_mut::<LogicalCanvasSize>().0 = Vec2::new(640.0, 480.0);
+        app.update();
+        let moved = revision(&app);
+        assert_ne!(moved, recoloured, "a canvas change repaints a held hover");
+        let drawn = sprites(&mut app);
+        assert_eq!(drawn.len(), 1);
+        assert!(
+            drawn[0]
+                .1
+                .abs_diff_eq(Vec3::new(5.0 - 320.0, 240.0 - 5.0, HOTSPOT_Z), 1e-3),
+            "placed from the new canvas centre: {:?}",
+            drawn[0].1
+        );
+        app.update();
+        assert_eq!(revision(&app), moved, "exactly once");
+
+        // With nothing drawn, placement inputs changing is not a render.
+        bridge.set(view());
+        app.update();
+        let hidden = revision(&app);
+        app.world_mut().resource_mut::<LogicalCanvasSize>().0 = Vec2::new(320.0, 240.0);
+        app.update();
+        assert_eq!(revision(&app), hidden);
+    }
+
+    /// Fractional placement: an origin that is not on a physical pixel at
+    /// 1.5x must still land on whole physical pixels, 15 of them for 10
+    /// logical units. The expected edges are worked by hand from the
+    /// projection's round-half-away rule, not read back from the input.
+    #[test]
+    fn fractional_hotspot_snaps_to_whole_physical_pixels() {
+        let bridge = HotspotBridge::default();
+        let mut app = app(&bridge, 180);
+        bridge.set(View {
+            enabled: true,
+            squares: vec![Square {
+                x: 100.4,
+                y: 50.3,
+                side: SIDE,
+            }],
+            hover: Some(0),
+            ..View::default()
+        });
+        app.update();
+        let drawn = sprites(&mut app);
+        assert_eq!(drawn.len(), 1);
+        let (size, centre) = drawn[0];
+        // Back from canvas-centred world space to output-local logical,
+        // then to physical at 1.5x.
+        let left = (centre.x - size.x / 2.0 + 160.0) * 1.5;
+        let right = (centre.x + size.x / 2.0 + 160.0) * 1.5;
+        let top = (120.0 - centre.y - size.y / 2.0) * 1.5;
+        let bottom = (120.0 - centre.y + size.y / 2.0) * 1.5;
+        // 100.4*1.5 = 150.6 -> 151; 110.4*1.5 = 165.6 -> 166;
+        // 50.3*1.5 = 75.45 -> 75; 60.3*1.5 = 90.45 -> 90.
+        for (edge, expected) in [(left, 151.0), (right, 166.0), (top, 75.0), (bottom, 90.0)] {
+            assert!((edge - expected).abs() < 1e-3, "{edge} vs {expected}");
+        }
     }
 
     /// Logical units: the square is the configured side in logical units at

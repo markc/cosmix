@@ -1148,8 +1148,8 @@ ranges are:
 `deadzone_px` is the hotspot: a square of that many logical units at each
 output corner, so it is the same size on a 2x output as on a 1x one.
 
-The compositor draws the hotspot affordance itself, above every client and
-panel and below the cursor, in the scheme accent. With `affordance` true it
+The compositor draws the hotspot affordance itself, above every client —
+layer-shell panels included — and below the cursor, in the scheme accent. With `affordance` true it
 shows the engaged hotspot while the pointer rests there, flashes it for
 180 ms on every recognised release (the brief LMB or RMB that emits
 `corner.clicked.v2`), and, while `discovery` is true, blinks every hotspot
@@ -1157,11 +1157,26 @@ slowly until the first engagement. That engagement sets `discovery` back to
 `false` with cause `corner.entered`; a shell that reveals a panel another way
 (keyboard) writes `false` itself. The compositor keeps no record of a first
 run, so it never turns `discovery` on: a shell does, when its own state says
-the user has not yet found the corners. `affordance: false` makes the corners
+the user has not yet found the corners — Quoin writes `true` once, on the
+launch that finds no `quoin.state.mix`, and creates that file when the
+compositor accepts the write, so it is never requested again. `affordance: false` makes the corners
 silent without changing detection. Nothing is drawn under a session lock.
 The affordance renders only when what it draws changes — once on engage, once
 on leave, a few quantised steps for a flash, two frames per 2 s blink — so a
 settled corner leaves the renderer idle.
+
+The affordance is ordinary on-screen furniture in the base layer, not a
+cursor-plane overlay, so screenshots and screencasts include a hover square
+or flash that is showing when they are taken. With the `embedded-quoin`
+build feature, the embedded Quoin draws its panels as UI that composites
+above the compositor's scene, so an embedded panel covering a corner hides
+that corner's affordance; the production Quoin is a separate layer-shell
+client and is unaffected, and the ordering belongs to the embedding work.
+Squares are sized and placed in each output's own logical coordinates, but
+the renderer currently places every output camera over one shared logical
+canvas at one output scale — the same limit client placement has — so
+mixed-scale, multi-output correctness depends on the renderer's multi-output
+camera model, not on the affordance.
 
 The mutable leaves are the six corner leaves, `windows.s<id>.band`,
 `windows.s<id>.minimized`, `windows.s<id>.workspace`, `workspaces.count`,

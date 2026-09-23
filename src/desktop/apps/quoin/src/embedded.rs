@@ -126,6 +126,7 @@ impl Plugin for EmbeddedQuoinPlugin {
         });
         let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
         crate::hotspot::install(app, &mut bus, self.comp_service.clone());
+        crate::hotspot::arm_first_run(app, store.first_run());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
         bus.inbound_prefixes.push("shell.".into());
         bus.subscriptions.extend(

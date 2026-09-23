@@ -30028,6 +30028,31 @@ fn affordance_follows_engaged_corner() {
     assert!(view.frame(Instant::now()).is_empty());
 }
 
+/// Publishing is per state change, never per motion sample: a burst of
+/// motion inside a hotspot (while a candidate, and while engaged) with no
+/// Entered/Left/action publishes nothing.
+#[cfg(feature = "bus")]
+#[test]
+fn hotspot_motion_inside_a_corner_publishes_nothing() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    let candidate = bridge.sets();
+    for (x, y) in [(6.0, 5.0), (6.0, 6.0), (5.0, 7.0), (4.0, 4.0), (5.0, 5.0)] {
+        route_pointer_to(&mut harness, x, y);
+    }
+    assert!(!harness.server.state.corner_engaged());
+    assert_eq!(bridge.sets(), candidate, "candidate motion publishes nothing");
+    engage_top_left_corner(&mut harness);
+    let engaged = bridge.sets();
+    for (x, y) in [(6.0, 5.0), (2.0, 8.0), (9.0, 9.0), (1.0, 1.0), (5.0, 5.0)] {
+        route_pointer_to(&mut harness, x, y);
+    }
+    assert!(harness.server.state.corner_engaged());
+    assert_eq!(bridge.sets(), engaged, "engaged motion publishes nothing");
+}
+
 #[cfg(feature = "bus")]
 #[test]
 fn flash_fires_on_recognised_release() {

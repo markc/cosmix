@@ -57,6 +57,11 @@ struct ChromeFontCxInitMeasurement {
 pub(crate) struct DecorationSceneTheme(DecoTheme);
 
 impl DecorationSceneTheme {
+    #[cfg(test)]
+    pub(crate) fn for_test(theme: DecoTheme) -> Self {
+        Self(theme)
+    }
+
     /// The live scheme's accent, whatever chrome style draws the frames
     /// (mac and win11 frames carry no accent of their own).
     #[cfg_attr(not(feature = "bus"), allow(dead_code))]

@@ -122,6 +122,7 @@ pub fn run_layer_host() -> AppExit {
     let wake = app.world().resource::<LayerHostWake>().callback();
     let mut bus = BusBridgeConfig::new(cli.bus_service, resolve_noded_url());
     hotspot::install(&mut app, &mut bus, cli.comp_service);
+    hotspot::arm_first_run(&mut app, state_store.first_run());
     bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
     bus.subscriptions.push("power.props.changed".to_owned());
     bus.subscriptions.push("wallpaper.props.changed".to_owned());

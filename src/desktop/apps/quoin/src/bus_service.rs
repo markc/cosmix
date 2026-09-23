@@ -199,9 +199,10 @@ fn service_bus(
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut content: SceneBus,
-    (mut hotspot, mut hotspot_size): (
+    (mut hotspot, mut hotspot_size, state_store): (
         Option<ResMut<crate::hotspot::HotspotObserver>>,
         ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
+        Option<Res<crate::state::StateStore>>,
     ),
     mut wallpaper: (
         ResMut<crate::wallpaper::WallpaperState>,
@@ -371,6 +372,12 @@ fn service_bus(
     }
     if let Some(observer) = hotspot.as_deref_mut() {
         observer.flush(&bridge);
+        // Comp accepted the first-run discovery write: never request it again.
+        if observer.take_first_run_written()
+            && let Some(store) = state_store.as_deref()
+        {
+            store.consume_first_run();
+        }
     }
     wallpaper.0.tick(&bridge, time.elapsed(), &mut wallpaper.1);
     wallpaper.2.tick(&bridge, time.elapsed(), &mut wallpaper.1);
