@@ -11,15 +11,14 @@
 //!
 //! [`SubPanelRegistry::register`] is the strict citizen-facing ingress and
 //! refuses a name that is live anywhere. Hosts that mount content themselves
-//! reconcile their seats with `reseat`/`forget`. Removal never re-implements
+//! reserve their seats with `mount`/`forget`. Removal never re-implements
 //! carousel policy: it delegates to the edge carousel's own removal landing
 //! rule (previous neighbour, else next, else primary; the remembered
 //! selection falls back to the primary).
 //!
-//! A seat's output records where the name was registered. Output migration
-//! carries live carousels into the replacement model
-//! ([`ShellModel::carry_live_state`]), so removal applies to whatever model
-//! the caller holds rather than matching the seat's output against it.
+//! The current host has one selected model. Output replacement carries its
+//! live carousels and explicitly migrates their seats; citizen ingress cannot
+//! move a name by updating it onto another output.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -30,14 +29,15 @@ use super::{Edge, OutputKey, ShellModel};
 /// Where one registered sub-panel name lives, and which citizen owns it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubPanelSeat {
-    /// Output the name was registered on. Registration-time identity, not a
-    /// live-model address (see the module doc on output migration).
+    /// Output carrying the name, updated only by explicit host migration.
     pub output: OutputKey,
     /// Edge whose carousel carries the sub-panel.
     pub edge: Edge,
-    /// The citizen that registered the sub-panel. A Bus-level disconnect of
-    /// this citizen removes everything it owns.
+    /// Broker-attested sender (qualified for remote callers), independent of
+    /// authored scene metadata. Untracked anonymous mounts use a host handle.
     pub owner: String,
+    /// Quoin receipt sequence at acceptance, not a broker incarnation token.
+    pub accepted_at: u64,
 }
 
 /// Live sub-panel names with their seats, one instance per process.
@@ -115,39 +115,50 @@ impl SubPanelRegistry {
                 output,
                 edge,
                 owner: owner.into(),
+                accepted_at: 0,
             },
         );
         Ok(())
     }
 
-    /// Reconcile the seat for content a host has mounted under `name`,
-    /// creating or replacing it.
-    ///
-    /// A host mount is not a citizen registration: the page id is already
-    /// live in the edge carousel, and the citizen or edge can change across
-    /// scene revisions, so this feed keeps the owner map fresh instead of
-    /// refusing. Empty names are skipped — a host never mounts one, and the
-    /// strict path is where that error belongs.
-    pub fn reseat(
+    /// Reserve a mount before accepting its content. Only the same owner on
+    /// the same output and edge may update a live name. Conflicts are atomic.
+    pub fn mount(
         &mut self,
         name: &str,
         output: OutputKey,
         edge: Edge,
         owner: impl Into<String>,
-    ) {
+        accepted_at: u64,
+    ) -> Result<(), SubPanelRegistryError> {
+        let owner = owner.into();
         if let Some(seat) = self.seats.get_mut(name) {
-            seat.output = output;
-            seat.edge = edge;
-            seat.owner = owner.into();
-        } else if !name.trim().is_empty() {
-            self.seats.insert(
-                name.to_owned(),
-                SubPanelSeat {
-                    output,
-                    edge,
-                    owner: owner.into(),
-                },
-            );
+            if seat.output != output || seat.edge != edge || seat.owner != owner {
+                return Err(SubPanelRegistryError::Duplicate(name.to_owned()));
+            }
+            seat.accepted_at = accepted_at;
+            return Ok(());
+        }
+        self.register(name, output, edge, owner)?;
+        self.seats.get_mut(name).unwrap().accepted_at = accepted_at;
+        Ok(())
+    }
+
+    /// Distinct locally registered owners to reconcile against broker discovery.
+    /// Empty/qualified identities have no entry in the local registration set.
+    pub fn live_owners(&self) -> std::collections::BTreeSet<String> {
+        self.seats
+            .values()
+            .filter(|seat| !seat.owner.is_empty() && !seat.owner.contains('@'))
+            .map(|seat| seat.owner.clone())
+            .collect()
+    }
+
+    /// The singleton host migrates its live content when an output disappears.
+    /// This is a host lifecycle operation, never an ingress collision bypass.
+    pub fn migrate_output(&mut self, old: &OutputKey, new: &OutputKey) {
+        for seat in self.seats.values_mut().filter(|seat| &seat.output == old) {
+            seat.output = new.clone();
         }
     }
 
@@ -182,10 +193,21 @@ impl SubPanelRegistry {
     /// Owner disconnect (or crash): remove every sub-panel the citizen owns,
     /// returning the removed seats in name order (panel doc §3).
     pub fn remove_all_owned(&mut self, owner: &str, model: &mut ShellModel) -> Vec<SubPanelSeat> {
+        self.remove_owned_before(owner, u64::MAX, model)
+    }
+
+    /// Remove only seats accepted before the observed absence. A replacement
+    /// accepted at that receipt sequence or later survives the deferred sweep.
+    pub fn remove_owned_before(
+        &mut self,
+        owner: &str,
+        before: u64,
+        model: &mut ShellModel,
+    ) -> Vec<SubPanelSeat> {
         let names: Vec<String> = self
             .seats
             .iter()
-            .filter(|(_, seat)| seat.owner == owner)
+            .filter(|(_, seat)| seat.owner == owner && seat.accepted_at < before)
             .map(|(name, _)| name.clone())
             .collect();
         names
@@ -197,8 +219,8 @@ impl SubPanelRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::LogicalSize;
+    use super::*;
 
     fn key(output: &str) -> OutputKey {
         OutputKey::new(output).unwrap()
@@ -254,7 +276,9 @@ mod tests {
     #[test]
     fn owner_disconnect_removes_all_owned_subpanels() {
         let mut model = model("DP-1");
-        model.declare_carousel(Edge::Right, ["notes", "calendar"]).unwrap();
+        model
+            .declare_carousel(Edge::Right, ["notes", "calendar"])
+            .unwrap();
         model.declare_carousel(Edge::Left, ["monitor"]).unwrap();
         let mut registry = SubPanelRegistry::new();
         for (name, edge) in [("notes", Edge::Right), ("calendar", Edge::Right)] {
@@ -360,23 +384,79 @@ mod tests {
             Some("owner-b")
         );
 
-        // The host feed path round-trips the same way: reseat recreates a
+        // The host mount path round-trips the same way: mount recreates a
         // forgotten seat, and forget alone also frees the name for register.
         registry.forget("status");
         registry
             .register("status", key("DP-1"), Edge::Top, "owner-c")
             .unwrap();
         registry.forget("status");
-        registry.reseat("status", key("HDMI-A-1"), Edge::Bottom, "owner-d");
+        registry
+            .mount("status", key("HDMI-A-1"), Edge::Bottom, "owner-d", 1)
+            .unwrap();
         let seat = registry.seat("status").unwrap();
         assert_eq!(
             (seat.output.as_str(), seat.edge, seat.owner.as_str()),
             ("HDMI-A-1", Edge::Bottom, "owner-d")
         );
-        // reseat refreshes an existing seat in place and skips empty names.
-        registry.reseat("status", key("DP-2"), Edge::Left, "owner-e");
-        assert_eq!(registry.seat("status").unwrap().owner, "owner-e");
-        registry.reseat("", key("DP-2"), Edge::Left, "owner-e");
+        // A mount cannot silently steal or move an existing seat.
+        assert!(
+            registry
+                .mount("status", key("DP-2"), Edge::Left, "owner-e", 2)
+                .is_err()
+        );
+        assert_eq!(registry.seat("status").unwrap().owner, "owner-d");
+        assert!(
+            registry
+                .mount("", key("DP-2"), Edge::Left, "owner-e", 2)
+                .is_err()
+        );
         assert!(registry.seat("").is_none());
+    }
+
+    #[test]
+    fn mount_rejects_cross_output_edge_and_owner_collisions() {
+        let mut registry = SubPanelRegistry::new();
+        registry
+            .mount("page", key("DP-1"), Edge::Left, "owner", 1)
+            .unwrap();
+        for (output, edge, owner) in [
+            ("DP-2", Edge::Left, "owner"),
+            ("DP-1", Edge::Right, "owner"),
+            ("DP-1", Edge::Left, "other"),
+        ] {
+            assert_eq!(
+                registry.mount("page", key(output), edge, owner, 2),
+                Err(SubPanelRegistryError::Duplicate("page".into()))
+            );
+            assert_eq!(registry.seat("page").unwrap().accepted_at, 1);
+        }
+        registry
+            .mount("page", key("DP-1"), Edge::Left, "owner", 2)
+            .unwrap();
+        assert_eq!(registry.seat("page").unwrap().accepted_at, 2);
+    }
+
+    #[test]
+    fn disconnect_sweep_preserves_replacements_on_every_edge() {
+        let mut registry = SubPanelRegistry::new();
+        let mut model = model("DP-1");
+        for edge in Edge::ALL {
+            let old = format!("old-{edge:?}");
+            let new = format!("new-{edge:?}");
+            for (name, receipt) in [(&old, 1), (&new, 2)] {
+                model.carousel_mut(edge).register(name).unwrap();
+                registry
+                    .mount(name, key("DP-1"), edge, "owner", receipt)
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            registry.remove_owned_before("owner", 2, &mut model).len(),
+            4
+        );
+        for edge in Edge::ALL {
+            assert_eq!(model.carousel(edge).page_ids(), [format!("new-{edge:?}")]);
+        }
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::ecs::message::MessageWriter;
 use bevy::prelude::*;
@@ -8,10 +8,11 @@ use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 use cosmix_shell::core::{Corner, Edge, PanelMode};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
-    ShellSemanticVerb, remove_all_owned_subpanels, semantic_shell_command,
+    ShellSemanticVerb, SubPanelRegistryState, remove_owned_subpanels_before,
+    semantic_shell_command,
 };
 use ctk::app_control::verify_caller_provenance;
-use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, InboundRequest};
+use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, BusMessage, InboundRequest};
 use serde_json::{Value, json};
 
 use crate::power::{PowerAction, PowerSync};
@@ -50,11 +51,15 @@ struct ShellBusState {
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
     pending_resizes: BTreeMap<u64, (InboundRequest, u64)>,
-    /// Citizens the broker just reported disconnected, pending sub-panel
-    /// removal. Collected by [`service_bus`] (which has no world access),
-    /// applied by [`apply_citizen_disconnects`] before the scene reconcile
-    /// runs in the same frame.
-    disconnected_citizens: Vec<String>,
+    /// Local receipt ordering, not a broker incarnation token. Absence sweeps
+    /// only affect reservations accepted strictly before their cutoff.
+    /// CTK uses separate control/telemetry planes: this orders consumption in
+    /// Quoin, not the owner's real lifetime across both broker connections.
+    citizen_receipt: u64,
+    disconnected_citizens: BTreeMap<String, u64>,
+    /// Request id, connection generation and conservative acceptance cutoff.
+    citizen_snapshot: Option<(u64, u64, u64)>,
+    citizen_snapshot_retry: bool,
     frame: u64,
 }
 
@@ -69,7 +74,10 @@ impl Default for ShellBusState {
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
-            disconnected_citizens: Vec::new(),
+            citizen_receipt: 0,
+            disconnected_citizens: BTreeMap::new(),
+            citizen_snapshot: None,
+            citizen_snapshot_retry: false,
             frame: 0,
         }
     }
@@ -97,6 +105,7 @@ pub(crate) struct ShellBusPlugin;
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
+            .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
             .init_resource::<cosmix_scene_bevy::SceneEvents>()
             .init_resource::<crate::wallpaper::WallpaperState>()
@@ -119,6 +128,7 @@ struct SceneBus<'w, 's> {
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
+    registry: ResMut<'w, SubPanelRegistryState>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -205,6 +215,9 @@ fn service_bus(
     if let Some(generation) = state.snapshot_retry.take() {
         request_power_snapshot(&bridge, &mut state, generation);
     }
+    if state.citizen_snapshot_retry {
+        request_citizen_snapshot(&bridge, &mut state);
+    }
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
@@ -222,6 +235,7 @@ fn service_bus(
                 }
                 state.live_generation = Some(generation);
                 request_power_snapshot(&bridge, &mut state, generation);
+                request_citizen_snapshot(&bridge, &mut state);
                 power_changed = true;
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
@@ -229,6 +243,9 @@ fn service_bus(
                 state.power.invalidate();
                 state.snapshot_retry = None;
                 state.live_generation = None;
+                state.citizen_snapshot = None;
+                state.citizen_snapshot_retry = false;
+                state.disconnected_citizens.clear();
                 // Replies stashed under the epoch that just ended: the worker
                 // drops a response stamped with a stale generation anyway, so
                 // retrying them only re-fires dead sends.
@@ -242,9 +259,31 @@ fn service_bus(
                 power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
-                power_changed |= state.power.accept_reply(request_id, result);
+                if state
+                    .citizen_snapshot
+                    .is_some_and(|(id, _, _)| id == request_id)
+                {
+                    let (_, generation, cutoff) = state.citizen_snapshot.take().unwrap();
+                    if state.live_generation == Some(generation) {
+                        if let Ok(reply) = result
+                            && reply.rc == 0
+                            && let Ok(body) = serde_json::from_str::<Value>(&reply.body)
+                            && let Some(live) =
+                                body.pointer("/services/registered").and_then(service_names)
+                        {
+                            // A reply may have been captured before a new load.
+                            // Use the request's fence, never the later reply time.
+                            reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                        } else {
+                            warn!("citizen registry snapshot failed; awaiting next Bus trigger");
+                        }
+                    }
+                } else {
+                    power_changed |= state.power.accept_reply(request_id, result);
+                }
             }
             BusBridgeEvent::DroppedMessages(_) => {
+                request_citizen_snapshot(&bridge, &mut state);
                 if let Some(generation) = state.power.generation() {
                     request_power_snapshot(&bridge, &mut state, generation);
                 } else {
@@ -254,19 +293,32 @@ fn service_bus(
                 }
                 power_changed = true;
             }
+            BusBridgeEvent::ObservationDroppedMessages(_) => {
+                request_citizen_snapshot(&bridge, &mut state);
+            }
             BusBridgeEvent::ObservationConnection { .. }
-            | BusBridgeEvent::ObservationReply { .. }
-            | BusBridgeEvent::ObservationDroppedMessages(_) => {}
+            | BusBridgeEvent::ObservationReply { .. } => {}
         }
     }
     for message in bridge.drain_messages() {
         wallpaper.0.message(&message, time.elapsed());
-        for citizen in disconnected_citizens(&message) {
-            // Same live-generation gate as the power resync below: a
-            // stale-epoch event drained after a reconnect may name a citizen
-            // that has already re-registered.
-            if state.live_generation == Some(message.connection_generation) {
-                state.disconnected_citizens.push(citizen);
+        if state.live_generation == Some(message.connection_generation) {
+            if let Some(live) = registered_services(&message) {
+                state.citizen_receipt = state
+                    .citizen_receipt
+                    .checked_add(1)
+                    .expect("receipt sequence exhausted");
+                let cutoff = state.citizen_receipt;
+                // This full observation supersedes any in-flight snapshot.
+                state.citizen_snapshot = None;
+                state.citizen_snapshot_retry = false;
+                reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+            } else if message
+                .headers
+                .get("gap")
+                .is_some_and(|value| value == "true")
+            {
+                request_citizen_snapshot(&bridge, &mut state);
             }
         }
         match state.power.observe_message(message) {
@@ -315,7 +367,42 @@ fn service_bus(
         let (rc, body, command) =
             if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
                 let args = parse_args(&request).unwrap_or(Value::Null);
-                let (rc, body) = content.scenes.dispatch(verb, &request.body, &args, &bridge);
+                let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
+                    (
+                        10,
+                        json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
+                    )
+                } else if state
+                    .live_generation
+                    .is_some_and(|generation| generation != request.connection_generation)
+                {
+                    (
+                        10,
+                        json!({"error":"scene request belongs to a stale Quoin connection"})
+                            .to_string(),
+                    )
+                } else {
+                    state.citizen_receipt = state
+                        .citizen_receipt
+                        .checked_add(1)
+                        .expect("receipt sequence exhausted");
+                    let owner = scene_owner(&request, state.citizen_receipt);
+                    let SceneBus {
+                        scenes, registry, ..
+                    } = &mut content;
+                    scenes.dispatch(
+                        verb,
+                        &request.body,
+                        &args,
+                        &bridge,
+                        &mut cosmix_scene_bevy::SceneMount {
+                            registry: &mut registry.0,
+                            output: &frame.0.geometry.output,
+                            owner: &owner,
+                            accepted_at: state.citizen_receipt,
+                        },
+                    )
+                };
                 (rc, body, None)
             } else if request.command == "shell.debug.status" {
                 (
@@ -396,47 +483,96 @@ fn service_bus(
     }
 }
 
-/// Citizens the broker just dropped, read from a `noded.props.changed` event
-/// on the `services.registered` leaf: every name present in `old` and absent
-/// from `new`.
-///
-/// The broker releases a service name only when its Bus connection drops
-/// (or it deregisters), so a vanished name IS the citizen disconnect — never
-/// a scene unload. Other topics, other leaves and unparseable bodies yield
-/// nothing rather than guessing an owner.
-fn disconnected_citizens(message: &BusMessage) -> Vec<String> {
+/// The full registration set is authoritative; `old` is deliberately ignored.
+/// A missed diff is repaired by the next full observation, reconnect or gap.
+fn registered_services(message: &BusMessage) -> Option<BTreeSet<String>> {
     if message.topic() != Some("noded.props.changed") {
-        return Vec::new();
+        return None;
     }
-    let Ok(body) = serde_json::from_str::<Value>(&message.body) else {
-        return Vec::new();
-    };
+    let body = serde_json::from_str::<Value>(&message.body).ok()?;
     if body["path"] != "services.registered" {
-        return Vec::new();
+        return None;
     }
-    let (Some(old), Some(new)) = (body["old"].as_array(), body["new"].as_array()) else {
-        return Vec::new();
-    };
-    old.iter()
-        .filter_map(Value::as_str)
-        .filter(|name| !new.iter().any(|kept| kept.as_str() == Some(*name)))
-        .map(str::to_owned)
+    service_names(&body["new"])
+}
+
+fn service_names(value: &Value) -> Option<BTreeSet<String>> {
+    // A partial/malformed list is not evidence that an owner disappeared.
+    value
+        .as_array()?
+        .iter()
+        .map(|name| name.as_str().map(str::to_owned))
         .collect()
 }
 
+fn reconcile_citizens(
+    state: &mut ShellBusState,
+    registry: &cosmix_shell::core::SubPanelRegistry,
+    live: &BTreeSet<String>,
+    cutoff: u64,
+) {
+    for owner in registry.live_owners().difference(live) {
+        state
+            .disconnected_citizens
+            .entry(owner.clone())
+            .and_modify(|before| *before = (*before).max(cutoff))
+            .or_insert(cutoff);
+    }
+}
+
+/// A registered local sender is broker-restamped `from`. Attested mesh
+/// identity is qualified so a remote service cannot alias a local owner.
+/// Anonymous callers remain mesh-open, but have no discoverable lifetime or
+/// stable identity for same-owner updates. Give each acceptance a distinct
+/// untracked seat owner instead of conflating unrelated anonymous callers.
+fn scene_owner(request: &InboundRequest, receipt: u64) -> String {
+    if let (Some(peer), Some(service)) = (
+        request.headers.get("broker_peer"),
+        request.headers.get("broker_service"),
+    ) {
+        return format!("{service}@{peer}");
+    }
+    if request.from.is_empty() {
+        format!("anonymous@{receipt}")
+    } else {
+        request.from.clone()
+    }
+}
+
+/// Event-driven resync only. A full outbound queue retries this one request
+/// on the next update; a failed RPC waits for the next observation/gap/connect.
+fn request_citizen_snapshot(bridge: &BusBridge, state: &mut ShellBusState) {
+    state.citizen_snapshot_retry = false;
+    let Some(generation) = state.live_generation else {
+        return;
+    };
+    state.next_request_id = state.next_request_id.saturating_add(1);
+    let id = state.next_request_id;
+    state.citizen_receipt = state
+        .citizen_receipt
+        .checked_add(1)
+        .expect("receipt sequence exhausted");
+    state.citizen_snapshot = Some((id, generation, state.citizen_receipt));
+    if bridge
+        .try_call(id, "noded", "noded.props.get", BTreeMap::new(), "{}")
+        .is_err()
+    {
+        state.citizen_snapshot = None;
+        state.citizen_snapshot_retry = !bridge.worker_is_gone();
+    }
+}
+
 /// Apply broker-reported citizen disconnects with world access: for each
-/// owner, every sub-panel seat and its carousel content are removed first
+/// owner, older sub-panel seats and their carousel content are removed first
 /// (landing per the carousel's removal rule), then its scenes unload so the
-/// scene reconcile in this frame destroys the mounted content and the
-/// page-list rebuild preserves that landing.
+/// scene reconcile in this frame destroys the mounted content without
+/// rebuilding the carousel or changing its remembered selection.
 fn apply_citizen_disconnects(world: &mut World) {
-    let citizens = std::mem::take(
-        &mut world.resource_mut::<ShellBusState>().disconnected_citizens,
-    );
-    for citizen in &citizens {
-        remove_all_owned_subpanels(world, citizen);
+    let citizens = std::mem::take(&mut world.resource_mut::<ShellBusState>().disconnected_citizens);
+    for (citizen, before) in &citizens {
+        remove_owned_subpanels_before(world, citizen, *before);
         if let Some(mut store) = world.get_resource_mut::<cosmix_scene_bevy::SceneStore>() {
-            let scenes = store.unload_owned_by(citizen);
+            let scenes = store.unload_owned_before(citizen, *before);
             if !scenes.is_empty() {
                 println!(
                     "QUOIN_CITIZEN_DISCONNECT citizen={citizen} scenes={}",
@@ -915,10 +1051,8 @@ fn edge_name(edge: Edge) -> &'static str {
 mod tests {
     use super::*;
     use cosmix_shell::core::PanelInput;
-    use cosmix_shell::runtime::{
-        CarouselInput, SceneVerb, ShellCommandKind, SubPanelRegistryState, set_shell_pages,
-    };
-    use ctk::bus::{BusMessage, test_bridge};
+    use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
+    use ctk::bus::test_bridge;
 
     fn request(command: &str) -> InboundRequest {
         InboundRequest {
@@ -991,12 +1125,12 @@ mod tests {
             "shell.panel.toggle",
             "shell.panel.unpin",
         ] {
-            let (rc, body, command_out) = dispatch_shell_request(
-                &unregistered(command),
-                &frame,
-                std::time::Duration::ZERO,
+            let (rc, body, command_out) =
+                dispatch_shell_request(&unregistered(command), &frame, std::time::Duration::ZERO);
+            assert_eq!(
+                rc, 0,
+                "{command} refused an unregistered local caller: {body}"
             );
-            assert_eq!(rc, 0, "{command} refused an unregistered local caller: {body}");
             // rc alone is not acceptance. A regression that answered
             // `(0, accepted, None)` for anonymous callers specifically would
             // report success and do nothing, which is the shape a gate tends
@@ -1015,7 +1149,10 @@ mod tests {
             &frame,
             std::time::Duration::ZERO,
         );
-        assert_eq!(rc, 0, "shell.quit refused an unregistered local caller: {body}");
+        assert_eq!(
+            rc, 0,
+            "shell.quit refused an unregistered local caller: {body}"
+        );
         assert_eq!(command_out.map(|c| c.kind), Some(ShellCommandKind::Quit));
 
         let mut resize = unregistered("shell.panel.resize");
@@ -1531,6 +1668,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "power.props.get",
+                "noded.props.get",
                 "wallpaper.props.get",
                 "background.status",
                 "capture.status"
@@ -1563,8 +1701,13 @@ mod tests {
         peer.deliver_message(gap_change(2));
         app.update();
         let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1, "a live-generation resync must be honored");
-        assert_eq!(calls[0].command, "power.props.get");
+        assert_eq!(
+            calls.len(),
+            2,
+            "a live-generation gap resyncs both projections"
+        );
+        assert_eq!(calls[0].command, "noded.props.get");
+        assert_eq!(calls[1].command, "power.props.get");
     }
 
     /// The drain order the gate depends on: `drain_events` BEFORE
@@ -1591,6 +1734,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "power.props.get",
+                "noded.props.get",
+                "noded.props.get",
                 "power.props.get",
                 "wallpaper.props.get",
                 "background.status",
@@ -1600,8 +1745,8 @@ mod tests {
         );
     }
 
-    /// A `noded.props.changed` registry diff: `old` minus `new` names the
-    /// citizens the broker just dropped.
+    /// A broker registry observation. Consumers must reconcile against `new`,
+    /// even if a dropped or coalesced event omitted the owner from `old`.
     fn services_registered_change(generation: u64, old: &[&str], new: &[&str]) -> BusMessage {
         let mut headers = BTreeMap::new();
         headers.insert("topic".to_owned(), "noded.props.changed".to_owned());
@@ -1620,83 +1765,332 @@ mod tests {
         }
     }
 
-    /// Sub-panel ownership on citizen disconnect: the live-epoch registry
-    /// diff removes the owner's seat, lands the carousel on the surviving
-    /// neighbour, and unloads its scenes; a stale-epoch diff removes nothing.
-    #[test]
-    fn citizen_disconnect_removes_owned_subpanels_and_scenes() {
+    fn mounted_bus_app() -> (App, ctk::bus::TestBusPeer) {
+        use cosmix_shell::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            spawn_quoin_chrome,
+        };
         let (bridge, peer) = test_bridge("quoin");
         let mut app = bus_app(bridge);
-        let output = test_model().output().clone();
-        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
-        set_shell_pages(
-            app.world_mut(),
-            Edge::Left,
-            vec!["scene-notes".into(), "keep".into()],
-            Some("scene-notes"),
-        );
-        app.world_mut()
-            .resource_mut::<SubPanelRegistryState>()
-            .0
-            .register("scene-notes", output, Edge::Left, "quoin-panel")
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()))
+            .add_plugins(QuoinChromePlugin)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(
+                Update,
+                cosmix_scene_bevy::reconcile_scene_mounts
+                    .after(ShellRuntimeSet::Input)
+                    .before(ShellRuntimeSet::Model),
+            );
+        let world = app.world_mut();
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
             .unwrap();
-        let source = "---\nscene: 1\nname: notes\ncitizen: quoin-panel\nwindow: {\"kind\":\"edge\",\"edge\":\"left\"}\n---\n```mix\nroot: {widget: \"column\", children: []}\n```\n";
-        app.world_mut()
-            .resource_scope(|world, mut store: Mut<cosmix_scene_bevy::SceneStore>| {
-                let (rc, _) = store.dispatch(
-                    SceneVerb::Load,
-                    source,
-                    &Value::Null,
-                    world.resource::<BusBridge>(),
-                );
-                assert_eq!(rc, 0, "the scene fixture must load");
-            });
-
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
         peer.deliver_event(BusBridgeEvent::Connection {
             state: BusConnectionState::Connected,
-            generation: 2,
+            generation: 1,
         });
         app.update();
+        peer.drain_calls();
+        (app, peer)
+    }
 
-        // A stale-epoch disconnect must not act: drained after a reconnect,
-        // it may name a citizen that has already re-registered.
+    fn scene_load(name: &str, owner: &str, edge: &str) -> InboundRequest {
+        let mut req = local("shell.scene.load");
+        req.from = owner.into();
+        // Deliberately unrelated metadata: it must never choose lifetime ownership.
+        req.body = format!(
+            "---\nscene: 1\nname: {name}\ncitizen: authored-metadata\nwindow: {{\"kind\":\"edge\",\"edge\":\"{edge}\"}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"
+        );
+        req
+    }
+
+    fn load_scene(
+        app: &mut App,
+        peer: &ctk::bus::TestBusPeer,
+        name: &str,
+        owner: &str,
+        edge: &str,
+    ) {
+        peer.send(scene_load(name, owner, edge));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(match edge {
+                    "left" => Edge::Left,
+                    "right" => Edge::Right,
+                    "top" => Edge::Top,
+                    _ => Edge::Bottom,
+                })
+                .page_ids
+                .iter()
+                .any(|id| id == &format!("scene-{name}")),
+            "fixture must have real mounted chrome"
+        );
+    }
+
+    fn absent(peer: &ctk::bus::TestBusPeer) {
+        // The missed owner's name is not even in old: old-minus-new cannot pass.
         peer.deliver_message(services_registered_change(
             1,
-            &["shell", "quoin-panel"],
             &["shell"],
+            &["shell", "keeper"],
         ));
+    }
+
+    #[test]
+    fn citizen_disconnect_removes_owned_subpanels_and_scenes() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "alpha", "keeper", "left");
+        load_scene(&mut app, &peer, "beta", "keeper", "left");
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        load_scene(&mut app, &peer, "other-edge", "owner", "right");
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-notes")
+        );
+        peer.deliver_message(services_registered_change(0, &["owner"], &[]));
         app.update();
         assert!(
             app.world()
                 .resource::<SubPanelRegistryState>()
                 .0
                 .seat("scene-notes")
-                .is_some(),
-            "a stale-epoch disconnect must remove nothing"
+                .is_some()
         );
-
-        // The live-epoch disconnect removes the owner's seat, lands the
-        // carousel on the surviving neighbour, and unloads its scene.
-        peer.deliver_message(services_registered_change(
-            2,
-            &["shell", "quoin-panel"],
-            &["shell"],
-        ));
+        absent(&peer);
         app.update();
-        let frame = app.world().resource::<ShellFrameState>();
         assert!(
-            !frame
+            app.world()
+                .resource::<SubPanelRegistryState>()
                 .0
-                .panel(Edge::Left)
-                .page_ids
-                .iter()
-                .any(|id| id == "scene-notes")
+                .names_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner")
+                .is_empty()
         );
         assert_eq!(
-            frame.0.panel(Edge::Left).active_page_id.as_deref(),
-            Some("keep"),
-            "the carousel lands on the surviving neighbour"
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-beta")
         );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Right)
+                .page_ids
+                .is_empty()
+        );
+        // Actual scene teardown has run. A fresh reveal must remember the primary,
+        // not rewrite the previous-neighbour landing as last_selected.
+        for input in [PanelInput::Hide, PanelInput::Reveal] {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(),
+                at: Default::default(),
+                kind: ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input,
+                },
+            });
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-alpha")
+        );
+    }
+
+    #[test]
+    fn citizen_disconnect_queued_before_replacement_load_preserves_replacement() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        load_scene(&mut app, &peer, "old-only", "owner", "right");
+        absent(&peer);
+        peer.send(scene_load("notes", "owner", "left"));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        assert!(registry.seat("scene-notes").is_some());
+        assert!(registry.seat("scene-old-only").is_none());
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner"),
+            ["notes"]
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-notes")
+        );
+    }
+
+    #[test]
+    fn citizen_scene_load_rejects_cross_owner_output_and_edge_collisions() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        for (owner, edge) in [("other", "left"), ("owner", "right")] {
+            peer.send(scene_load("notes", owner, edge));
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies[0].rc, 10);
+            assert!(replies[0].body.contains("SUBPANEL_COLLISION"));
+            assert_eq!(
+                app.world()
+                    .resource::<SubPanelRegistryState>()
+                    .0
+                    .seat("scene-notes")
+                    .unwrap()
+                    .owner,
+                "owner"
+            );
+        }
+        // Reserve elsewhere, then enter through the actual scene-load mount path.
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "scene-remote",
+                cosmix_shell::core::OutputKey::new("other-output").unwrap(),
+                Edge::Left,
+                "owner",
+                0,
+            )
+            .unwrap();
+        peer.send(scene_load("remote", "owner", "left"));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 10);
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner"),
+            ["notes"]
+        );
+        // Same owner/seat is a successful update, regardless of authored citizen.
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("authored-metadata")
+                .is_empty()
+        );
+    }
+
+    fn citizen_snapshot_id(peer: &ctk::bus::TestBusPeer) -> u64 {
+        peer.drain_calls()
+            .into_iter()
+            .find(|call| call.command == "noded.props.get")
+            .expect("registry reconciliation must request a full snapshot")
+            .request_id
+    }
+
+    fn reply_citizen_snapshot(peer: &ctk::bus::TestBusPeer, request_id: u64, names: &[&str]) {
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id,
+            result: Ok(ctk::bus::BusReply {
+                rc: 0,
+                result: None,
+                body: json!({"services":{"registered":names}}).to_string(),
+            }),
+        });
+    }
+
+    #[test]
+    fn citizen_reconnect_and_dropped_messages_reconcile_full_snapshot() {
+        for trigger in [
+            BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation: 2,
+            },
+            BusBridgeEvent::DroppedMessages(1),
+            BusBridgeEvent::ObservationDroppedMessages(1),
+        ] {
+            let (mut app, peer) = mounted_bus_app();
+            load_scene(&mut app, &peer, "notes", "owner", "left");
+            peer.deliver_event(trigger);
+            app.update();
+            let id = citizen_snapshot_id(&peer);
+            reply_citizen_snapshot(&peer, id, &["shell"]);
+            app.update();
+            assert!(
+                app.world()
+                    .resource::<SubPanelRegistryState>()
+                    .0
+                    .seat("scene-notes")
+                    .is_none()
+            );
+            assert!(
+                app.world()
+                    .resource::<ShellFrameState>()
+                    .0
+                    .panel(Edge::Left)
+                    .page_ids
+                    .is_empty()
+            );
+            app.update();
+            assert!(peer.drain_calls().is_empty(), "no periodic polling");
+        }
+    }
+
+    #[test]
+    fn citizen_snapshot_cannot_remove_load_accepted_after_request() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        peer.deliver_event(BusBridgeEvent::DroppedMessages(1));
+        app.update();
+        let id = citizen_snapshot_id(&peer);
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        reply_citizen_snapshot(&peer, id, &[]);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_some()
+        );
+        // A later observation still cleans this seat when it really disappears.
+        absent(&peer);
+        app.update();
         assert!(
             app.world()
                 .resource::<SubPanelRegistryState>()
@@ -1704,12 +2098,82 @@ mod tests {
                 .seat("scene-notes")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn citizen_malformed_snapshot_and_stale_reply_remove_nothing() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        peer.deliver_event(BusBridgeEvent::DroppedMessages(1));
+        app.update();
+        let id = citizen_snapshot_id(&peer);
+        peer.deliver_message(services_registered_change(1, &[], &["owner"]));
+        app.update();
+        reply_citizen_snapshot(&peer, id, &[]);
+        let mut malformed = services_registered_change(1, &[], &[]);
+        malformed.body = json!({"path":"services.registered", "new":["shell", 3]}).to_string();
+        peer.deliver_message(malformed);
+        app.update();
         assert!(
             app.world()
-                .resource::<cosmix_scene_bevy::SceneStore>()
-                .scenes_owned_by("quoin-panel")
-                .is_empty(),
-            "the owner's scene document is unloaded"
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn citizen_mesh_and_anonymous_scene_callers_remain_open() {
+        let (mut app, peer) = mounted_bus_app();
+        let mut remote = scene_load("remote", "bridge-peer", "left");
+        remote.headers.insert("broker_origin".into(), "mesh".into());
+        remote
+            .headers
+            .insert("broker_peer".into(), "remote-node".into());
+        remote
+            .headers
+            .insert("broker_service".into(), "notes".into());
+        peer.send(remote);
+        peer.send(scene_load("anonymous", "", "right"));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| reply.rc == 0));
+        absent(&peer);
+        app.update();
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        assert_eq!(
+            registry.seat("scene-remote").unwrap().owner,
+            "notes@remote-node"
+        );
+        assert!(registry.seat("scene-anonymous").is_some());
+        // No local registration set can attest either lifetime. Do not guess.
+        // Nor may another anonymous request silently become that same owner.
+        peer.send(scene_load("anonymous", "", "right"));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 10);
+    }
+
+    #[test]
+    fn citizen_scene_load_refuses_stale_connection_and_unattested_sender() {
+        let (mut app, peer) = mounted_bus_app();
+        let mut stale = scene_load("stale", "owner", "left");
+        stale.connection_generation = 0;
+        peer.send(stale);
+        let mut unattested = scene_load("unattested", "owner", "left");
+        unattested.headers.clear();
+        peer.send(unattested);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| reply.rc == 10));
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("owner")
+                .is_empty()
         );
     }
 

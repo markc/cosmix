@@ -34,8 +34,8 @@ pub struct ShellFrameState(pub ShellFrame);
 ///
 /// Inserted by [`ShellRuntimePlugin`], so exactly one instance exists per
 /// process (the Quoin host and each embedded host run one runtime plugin);
-/// output replacement swaps the model underneath without touching it. Hosts
-/// feed it through [`reseat_shell_subpanel`] / [`forget_shell_subpanel`];
+/// output replacement migrates the selected model's seats. Hosts
+/// reserve seats transactionally before accepting scene content;
 /// citizen disconnect is applied with [`remove_all_owned_subpanels`].
 #[derive(Resource, Clone, Debug, Default)]
 pub struct SubPanelRegistryState(pub SubPanelRegistry);
@@ -102,6 +102,10 @@ impl Plugin for ShellRuntimePlugin {
 /// The layer host drains and destroys the old surfaces first, then calls this
 /// before mapping fresh surfaces on the replacement output.
 pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
+    let old_output = world.resource::<ShellRuntime>().model.output().clone();
+    if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
+        registry.0.migrate_output(&old_output, model.output());
+    }
     model.carry_live_state(&world.resource::<ShellRuntime>().model);
     let frame = ShellFrame::from_model(&model);
     *world.resource_mut::<ShellRuntime>() = ShellRuntime {
@@ -146,21 +150,15 @@ pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: 
     world.resource_mut::<ShellFrameState>().0 = frame;
 }
 
-/// Record or refresh the sub-panel registry seat for a page a host just
-/// mounted under `name`, owned by `owner` on the live frame's output.
-///
-/// A no-op until the registry exists (every runtime plugin inserts one), so
-/// hosts and tests without the resource skip the feed cleanly.
-pub fn reseat_shell_subpanel(world: &mut World, edge: Edge, name: &str, owner: &str) {
-    let Some(output) = world
-        .get_resource::<ShellFrameState>()
-        .map(|frame| frame.0.geometry.output.clone())
-    else {
+/// Remove host content without rebuilding the carousel or selecting its landing.
+/// Owner cleanup may already have removed it; that second removal is a no-op.
+pub fn remove_shell_page(world: &mut World, edge: Edge, name: &str) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
         return;
     };
-    if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
-        registry.0.reseat(name, output, edge, owner);
-    }
+    let _ = runtime.model.carousel_mut(edge).remove(name);
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
 }
 
 /// Drop the sub-panel registry seat for a page a host unmounted, without
@@ -176,9 +174,18 @@ pub fn forget_shell_subpanel(world: &mut World, name: &str) {
 /// rule, and refresh the frame. Returns the removed seats.
 ///
 /// Runs before the scene reconcile that tears the owner's mounted content
-/// down; the carousel removal decides the landing first so the page-list
-/// rebuild the unmount performs preserves it.
+/// down. The later host unmount is idempotent and preserves both the landing
+/// and the remembered selection; it must not rebuild the page list.
 pub fn remove_all_owned_subpanels(world: &mut World, owner: &str) -> Vec<SubPanelSeat> {
+    remove_owned_subpanels_before(world, owner, u64::MAX)
+}
+
+/// Deferred reconciliation must not remove a mount accepted after the absence.
+pub fn remove_owned_subpanels_before(
+    world: &mut World,
+    owner: &str,
+    before: u64,
+) -> Vec<SubPanelSeat> {
     if !world.contains_resource::<SubPanelRegistryState>()
         || !world.contains_resource::<ShellRuntime>()
     {
@@ -188,10 +195,12 @@ pub fn remove_all_owned_subpanels(world: &mut World, owner: &str) -> Vec<SubPane
         let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() else {
             return Vec::new();
         };
-        registry.0.remove_all_owned(owner, &mut runtime.model)
+        registry
+            .0
+            .remove_owned_before(owner, before, &mut runtime.model)
     });
     if !seats.is_empty()
-        && let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>()
+        && let Some(runtime) = world.get_resource::<ShellRuntime>()
     {
         let frame = ShellFrame::from_model(&runtime.model);
         world.resource_mut::<ShellFrameState>().0 = frame;
@@ -460,6 +469,52 @@ mod tests {
     }
 
     #[test]
+    fn chrome_teardown_preserves_removal_landing_and_selection_memory() {
+        use crate::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            mount_page, spawn_quoin_chrome, unmount_page,
+        };
+        let mut app = app();
+        app.add_plugins(QuoinChromePlugin);
+        let world = app.world_mut();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        for edge in Edge::ALL {
+            for name in ["primary", "neighbour", "removed"] {
+                let content = world.spawn_empty().id();
+                assert!(mount_page(world, edge, name, name, content));
+            }
+            // Owner cleanup lands first; actual chrome teardown must neither
+            // resurrect removed pages nor remember the landing as a selection.
+            remove_shell_page(world, edge, "removed");
+            unmount_page(world, edge, "removed");
+            let mut runtime = world.resource_mut::<ShellRuntime>();
+            let carousel = runtime.model.carousel(edge);
+            assert_eq!(carousel.page_ids(), ["primary", "neighbour"]);
+            assert_eq!(carousel.active_id(), Some("neighbour"));
+            assert_eq!(carousel.last_selected(), Some("primary"));
+            runtime
+                .model
+                .panel_input(edge, Duration::ZERO, PanelInput::Reveal)
+                .unwrap();
+            assert_eq!(runtime.model.carousel(edge).active_id(), Some("primary"));
+        }
+    }
+
+    #[test]
     fn unmounting_last_dynamic_page_clears_carousel() {
         let mut app = app();
         set_shell_pages(app.world_mut(), Edge::Top, vec!["scene-only".into()], None);
@@ -706,6 +761,17 @@ mod tests {
     #[test]
     fn output_migration_carries_live_pin_page_and_thickness() {
         let mut app = app();
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "places",
+                OutputKey::new("DP-1").unwrap(),
+                Edge::Left,
+                "owner",
+                7,
+            )
+            .unwrap();
         {
             let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
             runtime.model.restore_thickness(Edge::Left, 137.0).unwrap();
@@ -738,6 +804,10 @@ mod tests {
             Some("places")
         );
         assert_eq!(frame.panel(Edge::Right).mode, PanelMode::Hidden);
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        let seat = registry.seat("places").unwrap();
+        assert_eq!(seat.output.as_str(), "HDMI-A-1");
+        assert_eq!(seat.accepted_at, 7);
     }
 
     #[test]

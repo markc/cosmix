@@ -570,11 +570,6 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
     parts.page_titles.retain(|(page, _)| page != id);
     parts.page_chromeless.retain(|(page, _)| page != id);
     parts.page_wrappers.retain(|(page, _)| page != id);
-    let ids = parts
-        .page_wrappers
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect();
     if let Some(label) = dot_label
         && let Some(parent) = world.get::<ChildOf>(label).map(ChildOf::parent)
     {
@@ -588,7 +583,7 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
     if let Some(wrapper) = wrapper {
         world.despawn(wrapper);
     }
-    crate::runtime::set_shell_pages(world, edge, ids, None);
+    crate::runtime::remove_shell_page(world, edge, id);
 }
 
 fn spawn_panel(
