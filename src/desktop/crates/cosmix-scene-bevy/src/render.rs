@@ -2161,7 +2161,9 @@ mod tests {
         world.insert_resource(store);
         reconcile(world);
         let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
-        assert_eq!(right.as_ref(), &["settings.appearance", "scene-plain"]);
+        // Reconciliation visits scenes in name order (BTreeMap), not load
+        // order. The envelope overrides the page id, not that traversal.
+        assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
         // The mount survives a revision under the same declared name.
         world
             .resource_mut::<SceneStore>()
@@ -2173,8 +2175,8 @@ mod tests {
             .unwrap();
         reconcile(world);
         let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
-        assert_eq!(right.as_ref(), &["settings.appearance", "scene-plain"]);
-        // An empty or non-string panel field falls back to the anonymous id.
+        assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
+        // A live panel address cannot be aliased or renamed.
         for (name, panel) in [("impostor", "settings.appearance"), ("settings", "renamed")] {
             let result = world.resource_mut::<SceneStore>().request(
                 SceneVerb::Load,
@@ -2183,6 +2185,7 @@ mod tests {
             );
             assert!(result.is_err(), "a live address cannot be aliased or renamed");
         }
+        // An empty or non-string panel field falls back to the anonymous id.
         for window in ["{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":\"\"}", "{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":7}"] {
             let mut fallback = SceneStore::default();
             fallback

@@ -144,8 +144,7 @@ fn maintain(
     mut selections: MessageReader<QuoinSchemeSelected>,
     frame: Res<ShellFrameState>,
     config: Res<ShellConfig>,
-    mut registry: ResMut<SubPanelRegistryState>,
-    mut scenes: ResMut<SceneStore>,
+    (mut registry, mut scenes): (ResMut<SubPanelRegistryState>, ResMut<SceneStore>),
     bridge: Res<BusBridge>,
     time: Res<Time>,
 ) {
@@ -836,7 +835,7 @@ mod tests {
             &frame_for("DP-1"),
             &mut config,
             &path,
-            &mut writer.get_mut(app.world_mut()),
+            &mut writer.get_mut(app.world_mut()).unwrap(),
             Duration::ZERO,
         );
         assert_eq!(rc, 10, "{body}");
@@ -846,7 +845,7 @@ mod tests {
             &frame_for("DP-1"),
             &mut config,
             &path,
-            &mut writer.get_mut(app.world_mut()),
+            &mut writer.get_mut(app.world_mut()).unwrap(),
             Duration::ZERO,
         );
         assert_eq!(rc, 0, "{body}");
