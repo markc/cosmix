@@ -161,6 +161,26 @@ undock hides at once: conceal animation starts immediately, without grace.
 `set_mode(edge, at, mode)`; new
 compositor corner-event discrimination is a separate integration.
 
+Those holder rules are the model's **local** driver, used by the dev host and
+whenever the compositor does not report its holder plane. While it does, the
+model is **command-driven** (`ShellModel::set_holder_plane`, applied through
+`ShellCommandKind::HolderPlane`): the compositor owns the pointer, focus and
+popup holders and the 800 ms conceal delay, and its commands arrive as
+`PanelInput::HolderReveal` (some holder holds the edge) and
+`PanelInput::HolderConceal` (the last one released, its delay already served).
+Corner and pointer membership then only record state — they neither reveal nor
+arm grace, and no grace deadline is ever armed. A conceal waits only for a
+local hold to end: an open corner menu, a resize, the startup intro, or an
+explicit `show`/`toggle`, which a repeated verdict does not end but a release
+after a hold (the pointer came and went) does. A deliberate hide from a
+persistent mode (`SetMode(Hidden)`, an unheld undock) latches against the
+compositor's verdict on the hidden report until it next reports the holders
+released, so a still-open menu cannot reopen the panel it just hid; a held
+unpin or undock keeps its reveal until that verdict. Going command-driven drops
+any local grace deadline, concealing at once a reveal the local membership no
+longer holds; going back to local rules re-arms grace for an unheld reveal. A
+model replacement keeps the current driver.
+
 ## Event-driven wake contract
 
 There is no fixed rendering tick or animation sleep. The calloop runner
@@ -417,7 +437,9 @@ A normal cold start transiently reveals hidden panels for two seconds, then rele
 a temporary startup hold into normal 800 ms grace. This discovery pulse is
 an explicit exception to compositor-only corner reveal. Real corner and
 pointer membership remain independent and can keep panels revealed after
-the pulse expires. Restored pins and docks keep their persistent modes.
+the pulse expires. Restored pins and docks keep their persistent modes. When the
+model is command-driven the pulse ends without grace: the panel conceals at
+once unless comp reports a holder.
 
 `setup.mix --desktop` installs `dev.cosmix.quoin.desktop` into the user's XDG
 applications directory, pointing at the installed checkout binary. Quit
@@ -443,8 +465,9 @@ The standalone host reads the selected comp's read-only
 `input.corners.holders` capability (`comp.props.get`) before sending
 `comp.panel.mode` or `comp.panel.hold`; like every comp verb these are literal
 commands addressed to the `--comp-service` instance. Missing, false or failed
-reads leave the plane inactive, and comp currently reports `false` until its
-holder tracking and enforcement exist, so today the plane stays inactive.
+reads leave the plane inactive, and comp currently reports `false` until it
+also enforces concealment on a stalled Quoin, so today the plane stays
+inactive and the model keeps its local rules.
 Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
 client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present
@@ -480,10 +503,30 @@ tokens are ignored.
 Comp's `<service>.panel.command` topic carries version 1, output, edge,
 surface, an `action` of `reveal` or `conceal`, and `event_seq`. Quoin only accepts
 them with current capability, connection generation, layer identity and an
-advancing sequence. This slice exposes typed commands for the later
-command-driven model: existing local reveal/conceal behaviour remains active
-until the holder tracking and timer switchover lands. The embedded host has no
-Wayland panel layers and does not install this standalone transport adapter.
+advancing sequence. The gate drives the model: the host hands every change of
+it to the model (`ShellCommandKind::HolderPlane`) after draining Bus events and
+again after messages, so the model is command-driven before the first command
+an opened gate admits and back on local rules the moment the gate closes.
+Accepted commands become `HolderReveal`/`HolderConceal` inputs for that edge.
+Comp answers every hidden mode report with its current verdict, which is how a
+model that has just gone command-driven — after a reconnect, a gap or a comp
+restart — learns whether anything still holds a panel it shows.
+
+Comp tracks the holders per `(output, edge)` itself (shell design §4.3). The
+**pointer** holder is acquired by dwelling in the edge's hotspot or by entering
+the panel's layer (which exists only while the panel is visible) or a popup it
+holds; any contact with those keeps it, and leaving them all starts the 800 ms
+conceal delay, which re-entry — even an undwelled pass through the hotspot —
+cancels. The **focus** holder is keyboard focus on the panel's layer or a held
+popup, released at once when focus moves elsewhere. The **popup** holder is the
+explicit `comp.panel.hold` Quoin sends for its corner menu, released at once by
+Quoin's release or by the menu layer's destruction, whichever comes first; comp
+records the keyboard focus the menu displaced (a toplevel or a layer such as the
+panel) and restores it when the menu closes, unless focus has since moved
+elsewhere. The one timer is a one-shot armed when a lingering pointer becomes
+the last holder and cancelled when any holder returns; nothing polls. Pinned and
+docked panels have no holders. The embedded host has no Wayland panel layers
+and does not install this standalone transport adapter.
 
 ### Corner input
 
@@ -535,9 +578,9 @@ choice uses the same `SetMode` command as the precise mode verbs. Extra items
 invoke their declared Bus target and verb, with the string list in `args`.
 The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
 Return or Space chooses it. Escape, click-away and item choice close the menu,
-end its local reveal hold and release its exclusive keyboard layer. Comp's
-existing policy then focuses the top toplevel; exact previous-surface focus
-restoration belongs to the forthcoming compositor popup holder. Pin and Dock
+end its local reveal hold and release its exclusive keyboard layer. Without the
+holder plane comp's existing policy then focuses the top toplevel; with it, the
+menu's popup holder returns focus to the surface the menu displaced. Pin and Dock
 apply before the local hold is released, so concealment cannot race the choice.
 Opening a menu at a hidden corner does not itself reveal the panel.
 
@@ -584,9 +627,11 @@ refresh it before accepting mapped corner state again.
 A lost click is a missed toggle and is never replayed or synthetically recovered.
 If only a click is dropped at the host-to-runner queue, existing holds are retained.
 
-A compositor enter reveals and holds the counter-clockwise edge (TL→left, BL→bottom,
-BR→right, TR→top). Matching left starts the 800 ms grace only when the native
-pointer is also outside. Native SCTK pointer enter/leave supplies the second
+Under the model's local rules, a compositor enter reveals and holds the
+counter-clockwise edge (TL→left, BL→bottom, BR→right, TR→top). Matching left
+starts the 800 ms grace only when the native pointer is also outside. When comp
+reports the holder plane, these events only record membership and comp's
+commands reveal and conceal instead (see the holder control plane above). Native SCTK pointer enter/leave supplies the second
 hold; Bevy pointer button events drive both carousel chevrons and page
 dots. Pin survives both leaves, and unpin outside both holds starts normal
 grace. Wheel events are delivered to Bevy although current chrome does not
@@ -613,15 +658,18 @@ Stable transition markers are:
 
 ```text
 QUOIN_REVEAL edge=left trigger=corner
+QUOIN_REVEAL edge=left trigger=holders
 QUOIN_CONCEAL edge=left reason=corner-left
 QUOIN_CONCEAL edge=left reason=grace
+QUOIN_CONCEAL edge=left reason=holders
 QUOIN_MODE edge=left mode=pinned
 QUOIN_MODE edge=left mode=docked
 QUOIN_MODE edge=left mode=hidden
 ```
 
 The edge is one of `left`, `bottom`, `right` or `top`. A marker is printed once
-per real semantic transition. `--smoke-all-panels` starts all four panels
+per real semantic transition. The `holders` forms come only from the
+command-driven model. `--smoke-all-panels` starts all four panels
 docked and retains the compatibility `QUOIN_PIN edge=... state=pinned` smoke
 marker per edge before the existing four-surface
 ready marker. Mutually exclusive `--smoke-hidden` starts them hidden and prints

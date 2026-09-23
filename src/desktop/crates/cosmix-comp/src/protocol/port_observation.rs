@@ -51,11 +51,15 @@ pub(crate) const CORNER_CLICKED_V2_TOPIC_SUFFIX: &str = "corner.clicked.v2";
 const DISCOVERY_PATH: &str = "input.corners.discovery";
 pub(crate) const POINTER_TOPIC_SUFFIX: &str = "pointer.changed";
 pub(crate) const PANEL_COMMAND_TOPIC_SUFFIX: &str = "panel.command";
-/// The `input.corners.holders` leaf. It stays false while only the protocol
-/// verbs exist: Quoin switches to command-driven reveal/conceal on this leaf,
-/// so it may only turn true in the same comp build that also tracks holders,
-/// runs the conceal timer and enforces it (refactor chunk 15 flips it).
+/// The `input.corners.holders` leaf. Quoin switches to command-driven
+/// reveal/conceal on this leaf, so it may only turn true in the comp build that
+/// also enforces the conceal on a stalled Quoin. Holder tracking and the
+/// conceal timer exist; enforcement does not yet (refactor chunk 15 flips it).
 pub(crate) const HOLDER_PLANE_AVAILABLE: bool = false;
+/// Shell design §4.3: a pointer holder releases only after the pointer has
+/// been away from the hotspot, the panel and its popups this long. Focus and
+/// popup releases are deliberate and conceal at once.
+pub(crate) const CONCEAL_DELAY: Duration = Duration::from_millis(800);
 
 const PANEL_ARGS: &[&str] = &["output", "edge", "surface", "holder", "acquire", "mode"];
 
@@ -125,6 +129,10 @@ impl PanelRequest {
     }
 }
 
+/// The holder sets of one `(output, edge)` panel (shell design §4.3): the
+/// explicit holds Quoin requests plus the pointer and focus membership comp
+/// tracks itself. Pure state with an injected clock; the timer and the
+/// Wayland lookups live in [`service_panel_holders`].
 #[derive(Debug)]
 pub(crate) struct PanelHolders {
     pub(crate) surface: String,
@@ -135,6 +143,115 @@ pub(crate) struct PanelHolders {
     /// a replaced layer always carries a new token, so a held id only ever
     /// names the layer it was acquired against.
     pub(crate) held: BTreeMap<String, (String, SurfaceId)>,
+    /// The pointer holder comp tracks from its hotspot and hit-testing.
+    pub(crate) pointer: PointerHold,
+    /// Keyboard focus is on the panel's layer or a held popup's.
+    pub(crate) focused: bool,
+    /// The last command sent for this edge; `None` while persistent (pinned
+    /// and docked panels have no holders) and before the first verdict.
+    pub(crate) verdict: Option<bool>,
+}
+
+/// The pointer holder. `Lingering` is a released pointer still inside its
+/// conceal delay: it holds until the delay ends, and re-entering the hotspot
+/// or the panel within it makes the pointer `Inside` again.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PointerHold {
+    #[default]
+    Out,
+    Inside,
+    Lingering(Instant),
+}
+
+/// What comp observed of one panel at a stable dispatch boundary.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Membership {
+    /// The pointer dwelled in this edge's hotspot (the corner is engaged).
+    pub(crate) dwelled: bool,
+    /// The pointer is in this edge's hotspot, dwelled or not.
+    pub(crate) hotspot: bool,
+    /// The pointer is over the panel's layer or a held popup's.
+    pub(crate) surface: bool,
+    /// Keyboard focus is on the panel's layer or a held popup's.
+    pub(crate) focused: bool,
+}
+
+impl PanelHolders {
+    fn new(surface: String, id: Option<SurfaceId>) -> Self {
+        Self {
+            surface,
+            id,
+            mode: "hidden".into(),
+            held: BTreeMap::new(),
+            pointer: PointerHold::Out,
+            focused: false,
+            verdict: None,
+        }
+    }
+
+    fn hidden(&self) -> bool {
+        self.mode == "hidden"
+    }
+
+    /// Fold one observation into the automatic holders. The pointer acquires
+    /// by dwelling in the hotspot or by entering the panel (whose layer exists
+    /// only while it is visible) or a popup it holds; any contact with those
+    /// keeps it; leaving all of them starts its conceal delay.
+    pub(crate) fn observe(&mut self, seen: Membership, now: Instant) {
+        let acquire = seen.dwelled || seen.surface;
+        let contact = acquire || seen.hotspot;
+        self.pointer = match self.pointer {
+            PointerHold::Out if acquire => PointerHold::Inside,
+            PointerHold::Out => PointerHold::Out,
+            PointerHold::Inside | PointerHold::Lingering(_) if contact => PointerHold::Inside,
+            PointerHold::Inside => PointerHold::Lingering(now),
+            lingering @ PointerHold::Lingering(_) => lingering,
+        };
+        self.focused = seen.focused;
+    }
+
+    /// A lingering pointer whose delay has run out has released.
+    pub(crate) fn expire(&mut self, now: Instant) {
+        if let PointerHold::Lingering(since) = self.pointer
+            && now >= since + CONCEAL_DELAY
+        {
+            self.pointer = PointerHold::Out;
+        }
+    }
+
+    fn holding(&self) -> bool {
+        self.pointer != PointerHold::Out || self.focused || !self.held.is_empty()
+    }
+
+    /// The one-shot conceal deadline. It exists only while the lingering
+    /// pointer is the last holder of a hidden panel, so it is armed by the
+    /// last release and cancelled by any holder returning.
+    pub(crate) fn conceal_deadline(&self) -> Option<Instant> {
+        match self.pointer {
+            PointerHold::Lingering(since)
+                if self.hidden() && !self.focused && self.held.is_empty() =>
+            {
+                Some(since + CONCEAL_DELAY)
+            }
+            _ => None,
+        }
+    }
+
+    /// The command owed to Quoin: `Some(true)` reveal, `Some(false)` conceal.
+    /// Emitted on a change of verdict, or always when `restate` (a hidden
+    /// mode report, which may come from a Quoin that has just gone
+    /// command-driven and knows nothing of comp's holders).
+    pub(crate) fn settle(&mut self, restate: bool) -> Option<bool> {
+        if !self.hidden() {
+            self.verdict = None;
+            return None;
+        }
+        let holding = self.holding();
+        (restate || self.verdict != Some(holding)).then(|| {
+            self.verdict = Some(holding);
+            holding
+        })
+    }
 }
 
 /// Exact namespace resolution. `candidates` are every layer whose namespace
@@ -171,8 +288,10 @@ fn panel_surface_candidates<'a>(
     })
 }
 
-/// Idempotent explicit requests. Automatic membership and deadlines attach to
-/// this state in the holder-tracking slice, not to the Bus worker thread.
+/// Idempotent explicit requests, returning the command owed to Quoin (see
+/// [`PanelHolders::settle`]): a hidden mode report always re-states the
+/// verdict, a hold only reports a change of it. Automatic membership and the
+/// conceal deadline attach to the same state at the dispatch boundary.
 fn apply_panel_request(
     panels: &mut BTreeMap<(String, String), PanelHolders>,
     request: &PanelRequest,
@@ -184,18 +303,15 @@ fn apply_panel_request(
     if request.acquire == Some(false) && !panels.contains_key(&key) {
         return None;
     }
-    let panel = panels.entry(key).or_insert_with(|| PanelHolders {
-        surface: request.surface.clone(), id, mode: "hidden".into(), held: BTreeMap::new(),
-    });
+    let panel = panels.entry(key).or_insert_with(|| PanelHolders::new(request.surface.clone(), id));
     if let Some(mode) = &request.mode {
         panel.surface.clone_from(&request.surface);
         panel.id = id;
         panel.mode.clone_from(mode);
         if mode != "hidden" { panel.held.clear(); }
-        return None;
+        return panel.settle(true);
     }
     if panel.mode != "hidden" { return None; }
-    let before = !panel.held.is_empty();
     if let (Some(holder), Some(acquire)) = (&request.holder, request.acquire) {
         if acquire {
             if let Some(id) = id { panel.held.insert(holder.clone(), (request.surface.clone(), id)); }
@@ -203,8 +319,7 @@ fn apply_panel_request(
             panel.held.remove(holder);
         }
     }
-    let after = !panel.held.is_empty();
-    (before != after).then_some(after)
+    panel.settle(false)
 }
 
 pub(crate) fn topic_name(service: &str, suffix: &str) -> String {
@@ -773,6 +888,16 @@ pub(crate) struct CornerRegion {
 
 pub(crate) struct ObservationState {
     pub(crate) panel_holders: BTreeMap<(String, String), PanelHolders>,
+    /// The one-shot conceal timer and the deadline it is armed for.
+    conceal_timer: Option<RegistrationToken>,
+    pub(crate) conceal_deadline: Option<Instant>,
+    #[cfg(test)]
+    pub(crate) conceal_timer_arms: usize,
+    /// Popup layer -> the keyboard focus it displaced (surface ids), restored
+    /// when the popup closes.
+    pub(crate) popup_restores: BTreeMap<u64, u64>,
+    /// The latest keyboard focus change as `(to, from)` surface ids.
+    last_focus_change: Option<(Option<u64>, Option<u64>)>,
     pointer_lease: PointerLease,
     pointer_seen: Option<(CursorPositionSnapshot, bool)>,
     pointer_timer: Option<RegistrationToken>,
@@ -833,6 +958,12 @@ impl ObservationState {
         let corner_config = CornerConfig::default();
         Self {
             panel_holders: BTreeMap::new(),
+            conceal_timer: None,
+            conceal_deadline: None,
+            #[cfg(test)]
+            conceal_timer_arms: 0,
+            popup_restores: BTreeMap::new(),
+            last_focus_change: None,
             pointer_lease: PointerLease::default(),
             pointer_seen: None,
             pointer_timer: None,
@@ -1734,6 +1865,7 @@ fn service_focus_edge(state: &mut WaylandState) {
     if let Some(id) = current.keyboard {
         state.mark_surface_dirty(SurfaceId(id), "wayland.focus");
     }
+    state.observations.last_focus_change = Some((current.keyboard, previous.keyboard));
     state
         .observations
         .offer(|event_seq| ObservationRecord::FocusChanged {
@@ -2890,10 +3022,17 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
     mutated
 }
 
-/// Holder state follows the layers and outputs it names. Runs only on the
-/// edges that can change the answer, not on every pointer sample.
+/// Holder state follows the layers and outputs it names, and comp tracks the
+/// pointer and focus holders itself (shell design §4.3). Membership moves with
+/// the pointer, so this runs at every stable dispatch boundary while Quoin has
+/// reported a panel — a few lookups per edge — but a command is emitted only
+/// when an edge's verdict changes, and the only timer is the one-shot conceal
+/// deadline: armed when a lingering pointer becomes the last holder, cancelled
+/// when any holder returns. Nothing polls.
 fn service_panel_holders(state: &mut WaylandState) {
+    service_popup_restores(state);
     if state.observations.panel_holders.is_empty() {
+        rearm_conceal_timer(state, None);
         return;
     }
     // Output removal drops that output's modes and holds without a signal to
@@ -2917,6 +3056,165 @@ fn service_panel_holders(state: &mut WaylandState) {
             }
         }
     }
+    track_panel_holders(state, Instant::now());
+}
+
+/// The surface is still a layer comp knows: a destroyed layer (or its role)
+/// is a closed popup.
+fn layer_alive(state: &WaylandState, id: SurfaceId) -> bool {
+    state
+        .surface_objects
+        .get(&id)
+        .and_then(|object| state.surfaces.get(object))
+        .is_some_and(|record| matches!(record.role, super::SurfaceRole::Layer(_)))
+}
+
+fn focus_surface_id(
+    state: &WaylandState,
+    target: Option<super::focus::SeatFocusTarget>,
+) -> Option<SurfaceId> {
+    target
+        .and_then(|target| target.surface_id())
+        .and_then(|object| state.surfaces.get(&object))
+        .map(|record| record.id)
+}
+
+/// Observe every reported panel's membership at `now`, emit the verdicts that
+/// changed and arm the earliest conceal deadline.
+fn track_panel_holders(state: &mut WaylandState, now: Instant) {
+    let pointer = focus_surface_id(state, state.pointer.current_focus());
+    let keyboard = focus_surface_id(state, state.keyboard.current_focus());
+    // The hotspot the pointer is in, by output key; dwelling engages it.
+    let detector = &state.observations.corner_detector;
+    let corner = state
+        .observations
+        .corner_output
+        .and_then(|index| state.observations.corner_output_keys.get(index))
+        .zip(detector.contact_corner())
+        .map(|(key, corner)| (key.clone(), corner, detector.engaged_corner() == Some(corner)));
+    // A popup's closing is its release, whether or not Quoin's release request
+    // has arrived yet (it may be stalled, or overtaken by the destruction).
+    let closed: BTreeSet<u64> = state
+        .observations
+        .panel_holders
+        .values()
+        .flat_map(|panel| panel.held.iter())
+        .filter(|(kind, (_, id))| *kind == "popup" && !layer_alive(state, *id))
+        .map(|(_, (_, id))| id.0)
+        .collect();
+    let mut commands = Vec::new();
+    let mut deadline: Option<Instant> = None;
+    for ((output, edge), panel) in &mut state.observations.panel_holders {
+        panel.held.retain(|kind, (_, id)| kind != "popup" || !closed.contains(&id.0));
+        let on_hotspot = corner.as_ref().filter(|(key, corner, _)| {
+            corner.summoned_edge() == edge.as_str() && *key == super::workspaces::output_key(output)
+        });
+        let over = |target: Option<SurfaceId>| {
+            target.is_some_and(|target| {
+                panel.id == Some(target) || panel.held.values().any(|(_, id)| *id == target)
+            })
+        };
+        let seen = Membership {
+            dwelled: on_hotspot.is_some_and(|(_, _, engaged)| *engaged),
+            hotspot: on_hotspot.is_some(),
+            surface: over(pointer),
+            focused: over(keyboard),
+        };
+        panel.observe(seen, now);
+        panel.expire(now);
+        if let Some(reveal) = panel.settle(false) {
+            commands.push((output.clone(), edge.clone(), panel.surface.clone(), reveal));
+        }
+        if let Some(at) = panel.conceal_deadline() {
+            deadline = Some(deadline.map_or(at, |current| current.min(at)));
+        }
+    }
+    for (output, edge, surface, reveal) in commands {
+        state.observations.offer(|event_seq| ObservationRecord::PanelCommand {
+            output, edge, surface, reveal, event_seq,
+        });
+    }
+    rearm_conceal_timer(state, deadline);
+}
+
+/// One-shot: the callback only clears the registration; the dispatch-cycle
+/// epilogue that follows expires the pointer and emits the conceal.
+fn rearm_conceal_timer(state: &mut WaylandState, deadline: Option<Instant>) {
+    let observations = &mut state.observations;
+    if deadline == observations.conceal_deadline
+        && (deadline.is_none() || observations.conceal_timer.is_some())
+    {
+        return;
+    }
+    if let Some(token) = observations.conceal_timer.take() {
+        observations.loop_handle.remove(token);
+    }
+    observations.conceal_deadline = None;
+    let Some(deadline) = deadline else {
+        return;
+    };
+    let delay = deadline.saturating_duration_since(Instant::now());
+    let timer = observations
+        .loop_handle
+        .insert_source(Timer::from_duration(delay), |_, _, state| {
+            state.observations.conceal_timer = None;
+            state.observations.conceal_deadline = None;
+            TimeoutAction::Drop
+        });
+    match timer {
+        Ok(token) => {
+            observations.conceal_timer = Some(token);
+            observations.conceal_deadline = Some(deadline);
+            #[cfg(test)]
+            {
+                observations.conceal_timer_arms += 1;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "panel conceal timer unavailable"),
+    }
+}
+
+/// A closed popup hands keyboard focus back to what it displaced (a toplevel
+/// or a layer such as the panel itself) — but only when its departure is
+/// what moved focus, which comp's own fallback would otherwise send to the
+/// top toplevel. Focus the user has since moved elsewhere is left alone.
+fn service_popup_restores(state: &mut WaylandState) {
+    if state.observations.popup_restores.is_empty() {
+        return;
+    }
+    let closed: Vec<(u64, u64)> = state
+        .observations
+        .popup_restores
+        .iter()
+        .filter(|(popup, _)| !layer_alive(state, SurfaceId(**popup)))
+        .map(|(popup, prior)| (*popup, *prior))
+        .collect();
+    for (popup, prior) in closed {
+        state.observations.popup_restores.remove(&popup);
+        let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
+        let moved_by_popup = current.is_none()
+            || state
+                .observations
+                .pending_focus
+                .is_some_and(|start| start.keyboard == Some(popup))
+            || state
+                .observations
+                .last_focus_change
+                .is_some_and(|(to, from)| to == current && from == Some(popup));
+        if !moved_by_popup || current == Some(prior) {
+            continue;
+        }
+        let Some(surface) = state
+            .surface_objects
+            .get(&SurfaceId(prior))
+            .and_then(|object| state.surfaces.get(object))
+            .filter(|record| record.mapped)
+            .map(|record| record.role.wl_surface().clone())
+        else {
+            continue;
+        };
+        state.arbitrate_keyboard_focus(Some(surface), false, false);
+    }
 }
 
 /// Resolve the exact namespace on the named output. Wayland object numbers
@@ -2935,13 +3233,43 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
     if id.is_none() && request.acquire == Some(true) {
         return ControlReply::refused("unknown_panel_surface", json!({"surface":request.surface}));
     }
+    if request.holder.as_deref() == Some("popup")
+        && request.acquire == Some(true)
+        && let Some(popup) = id
+    {
+        record_popup_focus(state, popup);
+    }
     if let Some(reveal) = apply_panel_request(&mut state.observations.panel_holders, request, id) {
+        let key = (request.output.clone(), request.edge.clone());
+        // Commands name the panel's own token when comp has one; Quoin
+        // accepts either its current panel or popup token for the edge.
+        let surface = state.observations.panel_holders.get(&key)
+            .map_or_else(|| request.surface.clone(), |panel| panel.surface.clone());
         state.observations.offer(|event_seq| ObservationRecord::PanelCommand {
             output: request.output.clone(), edge: request.edge.clone(),
-            surface: request.surface.clone(), reveal, event_seq,
+            surface, reveal, event_seq,
         });
     }
     ControlReply::Body(json!({"accepted":true,"surface":request.surface}))
+}
+
+/// Remember the focus a popup displaced: exclusive keyboard layers take focus
+/// when they map, which is usually before their hold arrives, so the focus
+/// recorded is the one the popup's own mapping replaced.
+fn record_popup_focus(state: &mut WaylandState, popup: SurfaceId) {
+    let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
+    let prior = if current == Some(popup.0) {
+        state
+            .observations
+            .last_focus_change
+            .filter(|(to, _)| *to == Some(popup.0))
+            .and_then(|(_, from)| from)
+    } else {
+        current
+    };
+    if let Some(prior) = prior.filter(|prior| *prior != popup.0) {
+        state.observations.popup_restores.entry(popup.0).or_insert(prior);
+    }
 }
 
 fn service_set(
@@ -3756,7 +4084,12 @@ mod tests {
             let report = PanelRequest::parse("comp.panel.mode", &json!({
                 "output":"DP-1","edge":"left","surface":token,"mode":mode,
             })).unwrap();
-            assert_eq!(apply_panel_request(&mut panels, &report, layer), None);
+            // A hidden report re-states comp's verdict (nothing holds here);
+            // persistent modes have no holders and draw no command.
+            assert_eq!(
+                apply_panel_request(&mut panels, &report, layer),
+                (mode == "hidden").then_some(false)
+            );
             let hold = PanelRequest::parse("comp.panel.hold", &json!({
                 "output":"DP-1","edge":"left","surface":"menu-1","holder":"popup","acquire":true,
             })).unwrap();
@@ -3824,6 +4157,115 @@ mod tests {
             assert_eq!(body["field"], field, "{verb} {args}");
             assert_eq!(body["allowed"], json!(PANEL_ARGS));
         }
+    }
+
+    /// A hidden panel as Quoin reports it, with the pointer engaged on its
+    /// hotspot (so its first verdict, a reveal, is already out).
+    fn dwelled_panel(at: Instant) -> PanelHolders {
+        let mut panel = PanelHolders::new("quoin-panel-1".into(), Some(SurfaceId(3)));
+        assert_eq!(panel.settle(true), Some(false));
+        panel.observe(Membership { dwelled: true, hotspot: true, ..Membership::default() }, at);
+        assert_eq!(panel.settle(false), Some(true), "dwelling acquires the pointer");
+        panel
+    }
+
+    fn popup(panel: &mut PanelHolders, acquire: bool) {
+        if acquire {
+            panel.held.insert("popup".into(), ("menu-1".into(), SurfaceId(9)));
+        } else {
+            panel.held.remove("popup");
+        }
+    }
+
+    #[test]
+    fn conceal_arms_only_on_last_holder_release() {
+        let start = Instant::now();
+        let ms = |n: u64| start + Duration::from_millis(n);
+        let mut panel = dwelled_panel(ms(0));
+        popup(&mut panel, true);
+        // The pointer leaves while the popup still holds: no deadline.
+        panel.observe(Membership::default(), ms(100));
+        assert_eq!(panel.pointer, PointerHold::Lingering(ms(100)));
+        assert_eq!(panel.conceal_deadline(), None, "the pointer is not the last holder");
+        assert_eq!(panel.settle(false), None);
+        // The popup releases inside the pointer's delay: the pointer is now
+        // the last holder, and its deadline is where its own delay ends.
+        popup(&mut panel, false);
+        panel.observe(Membership::default(), ms(300));
+        panel.expire(ms(300));
+        assert_eq!(panel.conceal_deadline(), Some(ms(900)));
+        assert_eq!(panel.settle(false), None, "still held until the deadline");
+        panel.expire(ms(899));
+        assert_eq!(panel.settle(false), None);
+        panel.expire(ms(900));
+        assert_eq!(panel.settle(false), Some(false), "the deadline conceals");
+        assert_eq!(panel.conceal_deadline(), None, "and nothing re-arms");
+        // A popup released after the pointer's delay ran out conceals at once.
+        let mut panel = dwelled_panel(ms(0));
+        popup(&mut panel, true);
+        panel.observe(Membership::default(), ms(100));
+        panel.expire(ms(2000));
+        assert_eq!(panel.conceal_deadline(), None);
+        assert_eq!(panel.settle(false), None);
+        popup(&mut panel, false);
+        assert_eq!(panel.settle(false), Some(false), "a popup's release is immediate");
+        // Persistent panels arm nothing whatever the pointer does.
+        let mut panel = dwelled_panel(ms(0));
+        panel.mode = "pinned".into();
+        panel.observe(Membership::default(), ms(100));
+        assert_eq!(panel.conceal_deadline(), None);
+        assert_eq!(panel.settle(false), None);
+    }
+
+    #[test]
+    fn reentry_within_delay_cancels_conceal() {
+        let start = Instant::now();
+        let ms = |n: u64| start + Duration::from_millis(n);
+        let mut panel = dwelled_panel(ms(0));
+        panel.observe(Membership::default(), ms(100));
+        assert_eq!(panel.conceal_deadline(), Some(ms(900)));
+        // Back into the hotspot, not yet dwelled: re-entry keeps the hold.
+        panel.observe(Membership { hotspot: true, ..Membership::default() }, ms(500));
+        assert_eq!(panel.pointer, PointerHold::Inside);
+        assert_eq!(panel.conceal_deadline(), None, "re-entry cancels the deadline");
+        panel.expire(ms(2000));
+        assert_eq!(panel.settle(false), None);
+        // Into the visible panel itself: the same.
+        panel.observe(Membership::default(), ms(2000));
+        panel.observe(Membership { surface: true, ..Membership::default() }, ms(2700));
+        assert_eq!(panel.conceal_deadline(), None);
+        panel.expire(ms(5000));
+        assert_eq!(panel.settle(false), None);
+        // A new departure starts a fresh delay.
+        panel.observe(Membership::default(), ms(5000));
+        assert_eq!(panel.conceal_deadline(), Some(ms(5800)));
+        panel.expire(ms(5800));
+        assert_eq!(panel.settle(false), Some(false));
+        // Once released, crossing the hotspot without dwelling acquires nothing.
+        panel.observe(Membership { hotspot: true, ..Membership::default() }, ms(6000));
+        assert_eq!(panel.pointer, PointerHold::Out);
+        assert_eq!(panel.settle(false), None);
+    }
+
+    #[test]
+    fn focus_holder_survives_pointer_departure() {
+        let start = Instant::now();
+        let ms = |n: u64| start + Duration::from_millis(n);
+        let mut panel = dwelled_panel(ms(0));
+        // A click inside the panel moved keyboard focus there.
+        panel.observe(Membership { surface: true, focused: true, ..Membership::default() }, ms(50));
+        // The pointer drifts away while the user types.
+        panel.observe(Membership { focused: true, ..Membership::default() }, ms(100));
+        assert_eq!(panel.conceal_deadline(), None, "focus holds: no timer");
+        panel.expire(ms(10_000));
+        assert_eq!(panel.pointer, PointerHold::Out);
+        assert_eq!(panel.settle(false), None, "focus alone keeps the reveal");
+        // Focus moving elsewhere is deliberate: the conceal is immediate.
+        panel.observe(Membership::default(), ms(10_000));
+        assert_eq!(panel.conceal_deadline(), None);
+        assert_eq!(panel.settle(false), Some(false));
+        // A hidden mode report re-states the verdict even when unchanged.
+        assert_eq!(panel.settle(true), Some(false));
     }
 
     #[test]

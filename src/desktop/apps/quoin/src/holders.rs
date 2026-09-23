@@ -5,7 +5,9 @@
 //! receives comp's reveal/conceal commands. Everything is gated on comp's
 //! `input.corners.holders` leaf: until a read of it answers `true` on the
 //! current connection nothing is sent and every command is dropped, so a comp
-//! without the plane leaves today's local behaviour untouched.
+//! without the plane leaves today's local behaviour untouched. The host hands
+//! the gate to the model (`ShellCommandKind::HolderPlane`), which is
+//! command-driven exactly while it is open; any doubt closes it.
 //!
 //! Comp verbs are literal `comp.*` commands addressed to the selected service;
 //! only the subscribed topics carry the service name.
@@ -19,7 +21,7 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::time::Real;
-use cosmix_shell::core::{Edge, PanelMode};
+use cosmix_shell::core::{Edge, OutputKey, PanelInput, PanelMode};
 use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
 use cosmix_shell_host::LayerHostDeadline;
 use cosmix_shell_host::holders::{PanelLayerIdentities, PopupLayerIdentity};
@@ -37,16 +39,30 @@ const RETRY_CAP: Duration = Duration::from_secs(8);
 /// `(layer token, verb)`: one desired request per layer and verb.
 type Key = (String, String);
 
-/// Capability-gated transport seam. Chunk 14 consumes these commands instead
-/// of local conceal timers; this slice deliberately leaves the model unchanged,
-/// so outside tests nothing reads the fields yet.
-#[derive(Message, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
+/// One accepted comp command, already matched to a current layer token. It
+/// drives the model only while the model is command-driven, which the host
+/// keeps in step with [`HolderClient::capable`] through
+/// [`HolderClient::plane_change`]; the model ignores it otherwise.
+#[derive(Debug, PartialEq)]
 pub(crate) struct HolderCommand {
     pub(crate) output: String,
     pub(crate) edge: Edge,
-    pub(crate) surface: String,
     pub(crate) reveal: bool,
+}
+
+impl HolderCommand {
+    /// The model input on the named output: comp's reveal is a holder gained,
+    /// its conceal the last holder released (its delay already served).
+    pub(crate) fn shell_command(&self, at: Duration) -> Option<ShellCommand> {
+        Some(ShellCommand {
+            output: OutputKey::new(self.output.clone()).ok()?,
+            at,
+            kind: ShellCommandKind::Panel {
+                edge: self.edge,
+                input: if self.reveal { PanelInput::HolderReveal } else { PanelInput::HolderConceal },
+            },
+        })
+    }
 }
 
 /// What a refused request waits for. An unchanged request is resent only
@@ -71,6 +87,8 @@ pub(crate) struct HolderClient {
     /// current connection.
     present: Option<bool>,
     pub(crate) capable: bool,
+    /// The capability last handed to the model; see [`HolderClient::plane_change`].
+    plane_reported: bool,
     read_needed: bool,
     capability_read: Option<u64>,
     next_id: u64,
@@ -131,7 +149,8 @@ fn wait_for(code: Option<&str>) -> Wait {
 impl HolderClient {
     fn new(service: String) -> Self {
         Self {
-            service, generation: None, present: None, capable: false, read_needed: false,
+            service, generation: None, present: None, capable: false, plane_reported: false,
+            read_needed: false,
             capability_read: None, next_id: 0x49_0000_0000, last_sequence: 0,
             desired: BTreeMap::new(), acknowledged: BTreeMap::new(), failed: BTreeMap::new(),
             maybe_held: BTreeMap::new(), pending: None, retry_wanted: false, retry_read: false,
@@ -154,6 +173,17 @@ impl HolderClient {
         self.retry_read = false;
         self.retry_at = None;
         self.backoff = RETRY_FIRST;
+    }
+
+    /// The capability to hand the model when it differs from what the model
+    /// was last told. The host calls this after draining events and again
+    /// after messages, so a gate that opened is applied before the commands it
+    /// admits and one that closed returns the model to local rules at once.
+    pub(crate) fn plane_change(&mut self) -> Option<bool> {
+        (self.plane_reported != self.capable).then(|| {
+            self.plane_reported = self.capable;
+            self.capable
+        })
     }
 
     pub(crate) fn presence(&mut self, live: &BTreeSet<String>) {
@@ -304,7 +334,7 @@ impl HolderClient {
             return None;
         }
         self.last_sequence = sequence;
-        Some(HolderCommand { output, edge, surface, reveal })
+        Some(HolderCommand { output, edge, reveal })
     }
 
     /// One host update: fire a due retry, send, then arm a deadline for any
@@ -391,7 +421,8 @@ impl HolderClient {
 }
 
 /// Mirror the actual mode after Model, and the existing chunk-11 menu holds.
-/// Local holders remain active until the command-driven model slice lands.
+/// Every hidden mode report comp accepts draws its current reveal/conceal
+/// verdict, which is how a model that just went command-driven learns it.
 pub(crate) fn report_holders(
     bridge: Res<BusBridge>,
     (time, mut deadline): (Res<Time<Real>>, ResMut<LayerHostDeadline>),

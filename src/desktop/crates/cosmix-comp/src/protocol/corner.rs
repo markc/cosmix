@@ -83,6 +83,17 @@ impl Corner {
         }
     }
 
+    /// The panel edge this corner's hotspot governs: the next edge
+    /// counter-clockwise (shell design §2), named as the holder plane names it.
+    pub(crate) const fn summoned_edge(self) -> &'static str {
+        match self {
+            Self::TopLeft => "left",
+            Self::BottomLeft => "bottom",
+            Self::BottomRight => "right",
+            Self::TopRight => "top",
+        }
+    }
+
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::TopLeft => "tl",
@@ -143,6 +154,13 @@ impl CornerDetector {
 
     pub(crate) fn engaged_corner(&self) -> Option<Corner> {
         self.engaged.map(|e| e.corner)
+    }
+
+    /// The hotspot the pointer is in, dwelled or not.
+    pub(crate) fn contact_corner(&self) -> Option<Corner> {
+        self.engaged
+            .map(|engaged| engaged.corner)
+            .or(self.candidate.map(|candidate| candidate.corner))
     }
 
     pub(crate) fn engaged_dwell_ms(&self) -> Option<u64> {

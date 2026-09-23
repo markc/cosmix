@@ -1158,15 +1158,31 @@ act on the surface identity comp resolved from the token, never on a namespace
 prefix match. Output
 removal drops that output's state without a signal; Quoin rebuilds its panels
 with fresh tokens when an output goes, so nothing stale is suppressed.
-For hidden panels, the first explicit holder emits `reveal` and the last release
-emits `conceal` on `<service>.panel.command`, through the existing bounded
-observation outbox and its gap reporting. The version-1 body contains `output`,
-`edge`, `surface`, `action` and `event_seq`.
+Besides the explicit holds, comp tracks two holders per reported panel itself
+(shell design §4.3). The pointer holder is acquired by dwelling in the edge's
+hotspot (the corner engaging) or by the pointer entering the panel's layer or a
+held popup's; any contact with those, including an undwelled pass through the
+hotspot, keeps it; leaving them all starts an 800 ms conceal delay that re-entry
+cancels. The focus holder is keyboard focus on the panel's layer or a held
+popup's. A held popup's layer being destroyed releases its hold at once, even
+before the client's release arrives; the popup hold also records the keyboard
+focus the popup displaced and, when the popup closes, restores it (toplevel or
+layer) unless focus has meanwhile moved somewhere other than comp's fallback.
+Membership is evaluated at the stable post-dispatch boundary, so a command is
+emitted only when an edge's verdict changes: `reveal` when the first holder
+arrives, `conceal` when the last leaves — at once for focus and popup, after the
+delay for the pointer. The delay is a single one-shot calloop timer, armed only
+while a lingering pointer is the last holder of a hidden panel. A hidden
+`comp.panel.mode` report always re-states the current verdict, so a client that
+has just started following the commands learns it. Commands go out on
+`<service>.panel.command` through the existing bounded observation outbox and
+its gap reporting; the version-1 body contains `output`, `edge`, `surface` (the
+panel's token when comp has one), `action` and `event_seq`.
 
 The read-only `input.corners.holders` leaf is the switch clients gate on, and it
-currently reads `false`: the verbs above are live, but automatic pointer/focus
-tracking, the conceal timer and comp-side enforcement are not yet implemented.
-The leaf turns `true` only in the build that has all three, because Quoin hands
+currently reads `false`: the verbs, holder tracking and the conceal timer are
+live, but comp does not yet enforce a conceal on a client that has stalled.
+The leaf turns `true` only in the build that does, because Quoin hands
 reveal/conceal over to comp when it does.
 
 Hot-corner detection is compositor-side and uses the current logical output.

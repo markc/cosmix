@@ -929,6 +929,53 @@ pub(crate) fn test_wiring_with_observation_capacity(
     )
 }
 
+/// One Bus command through the real dispatch boundary as the named service
+/// receives it; `pump` runs the compositor cycle that answers it. Returns the
+/// reply's rc and JSON body.
+#[cfg(test)]
+pub(crate) fn test_dispatch(
+    ingress: &PortIngress,
+    service: &str,
+    verb: &str,
+    args: Value,
+    pump: impl FnOnce(),
+) -> (u8, Value) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("test runtime");
+    let _entered = runtime.enter();
+    let mut responders = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+    let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+    let (reply_sender, mut replies) = tokio_mpsc::channel(1);
+    let reply_timeouts = Arc::new(AtomicU64::new(0));
+    let command = cosmix_client::IncomingCommand {
+        from: "test-caller".into(),
+        command: verb.into(),
+        id: Some("0".into()),
+        body: args.to_string(),
+        args,
+        headers: BTreeMap::new(),
+    };
+    dispatch_incoming(
+        ingress,
+        &mut responders,
+        &permits,
+        &long_permits,
+        &reply_sender,
+        &reply_timeouts,
+        service,
+        command,
+    );
+    pump();
+    runtime.block_on(async {
+        while responders.join_next().await.is_some() {}
+    });
+    let reply = replies.try_recv().expect("the command is answered");
+    (reply.rc, serde_json::from_str(&reply.body).expect("reply body is JSON"))
+}
+
 pub(crate) struct PortStarter {
     service: String,
     noded_url: String,
