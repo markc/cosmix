@@ -1362,6 +1362,7 @@ struct CornerActionBody {
     kind: String,
     /// Absence selects the old RMB brief=dock / hold=menu mapping. Presence
     /// (even an empty list) selects Shift+LMB=dock / RMB brief=menu, no RMB hold.
+    /// Names are unique and exactly lowercase shift, ctrl, alt or super.
     /// Deploy this decoder before the producer: old decoders reject the new
     /// field. Rolling the producer back is safe because absence stays legacy.
     #[serde(default, deserialize_with = "present_modifiers")]
@@ -1456,6 +1457,15 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
         let body: CornerActionBody =
             serde_json::from_str(&command.body).map_err(|error| error.to_string())?;
         let modifiers = body.modifiers.as_deref().unwrap_or_default();
+        let mut seen = BTreeSet::new();
+        for modifier in modifiers {
+            if !matches!(modifier.as_str(), "shift" | "ctrl" | "alt" | "super") {
+                return Err("unknown corner modifier".to_owned());
+            }
+            if !seen.insert(modifier.as_str()) {
+                return Err("duplicate corner modifier".to_owned());
+            }
+        }
         let pairs_with_legacy = body.button == "left" && modifiers.is_empty();
         if pairs_with_legacy && body.event_seq == 0 {
             return Err("paired corner action has no legacy sequence".to_owned());
@@ -2095,6 +2105,54 @@ mod tests {
             assert!(clicks.accept(&decoded.kind, decoded.event_seq, decoded.pairs_with_legacy));
             assert_eq!(clicks.last_sequence, Some(0));
         }
+    }
+
+    #[test]
+    fn unknown_and_duplicate_modifiers_use_decode_rejection_path() {
+        let (sender, channel) = sync_channel(8);
+        let overflow = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let mut state = WorkerState::new("comp", OutputKey::new("DP-1").unwrap());
+        for (index, modifiers) in [
+            json!(["Shift"]),
+            json!(["meta"]),
+            json!(["shift", "shift"]),
+            json!(["ctrl", "ctrl"]),
+            json!(["alt", "alt"]),
+            json!(["super", "super"]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(decode_action("left", "brief", Some(modifiers.clone()), 1).is_err());
+            state.decode_and_apply(
+                incoming(
+                    "comp.corner.clicked.v2",
+                    "corner.clicked.v2",
+                    &action_body("left", "brief", Some(modifiers), 1).to_string(),
+                ),
+                &sender,
+                &overflow,
+                &epoch,
+            );
+            assert_eq!(state.diagnostics, index as u64 + 1);
+            assert!(state.queued.is_empty());
+            assert!(!state.clicks.v2_seen);
+            assert_eq!(state.clicks.last_sequence, None);
+            assert!(channel.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn super_left_brief_is_accepted_and_standalone() {
+        let decoded = decode_action("left", "brief", Some(json!(["super"])), 0).unwrap();
+        assert_eq!(decoded.kind, CornerKind::Action(CornerAction::PinToggle));
+        assert!(!decoded.pairs_with_legacy);
+        modified_click_never_pairs_in_either_order(json!(["super"]), CornerAction::PinToggle);
+        modified_click_never_pairs_in_either_order(
+            json!(["shift", "ctrl", "alt", "super"]),
+            CornerAction::DockToggle,
+        );
     }
 
     #[test]
