@@ -30036,7 +30036,11 @@ fn flash_fires_on_recognised_release() {
     harness.server.state.install_hotspot_bridge(bridge.clone());
     engage_top_left_corner(&mut harness);
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
-    assert_eq!(bridge.view().flash, None, "the flash acknowledges the release");
+    assert_eq!(
+        bridge.view().flash,
+        None,
+        "the flash acknowledges the release"
+    );
     let before = Instant::now();
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let view = bridge.view();
@@ -30117,14 +30121,16 @@ fn discovery_flash_ends_at_the_first_reveal() {
     assert_eq!(view.discovery, None, "the first reveal ends discovery");
     assert_eq!(view.frame(since).len(), 1, "only the hover remains");
     assert!(
-        drain_observations(&observations).iter().any(|record| matches!(
-            record,
-            ObservationRecord::PropsChanged {
-                path,
-                cause: "corner.entered",
-                ..
-            } if path == "input.corners.discovery"
-        )),
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                ObservationRecord::PropsChanged {
+                    path,
+                    cause: "corner.entered",
+                    ..
+                } if path == "input.corners.discovery"
+            )),
         "the leaf reports its own change"
     );
     // Re-arming restarts the blink; a later engagement ends it again.
