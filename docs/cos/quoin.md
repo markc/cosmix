@@ -462,8 +462,9 @@ Horizontal panels (bottom, top) carry a paging chevron at each end, inset from
 the panel ends by comp's corner-hotspot size, with the title and page dots as a
 centred overlay across the content strip; vertical panels (left, right) keep a
 `< [title] >` header with the chevrons inside it, the header's top grown by the
-same inset. Only the chevrons are inset — page content always fills the panel —
-and an edge with a single page shows no chevrons and no inset. Chevron paging slides the
+same inset. Only the chevrons are inset — page content fills the panel below the
+header on a side edge, and the full width on a top/bottom edge with a single
+page — and an edge with a single page shows no chevrons and no inset. Chevron paging slides the
 carousel 300 ms, collapsing to zero under reduced motion; named jumps — the
 dots, `panel.page.set`, activation, restore and a removal's landing — go
 directly to the page without the slide. Headers carry no pin glyph or mode

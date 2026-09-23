@@ -1380,7 +1380,10 @@ fn present_panels(
         // so no inset (panel doc §7). The inset is re-read every frame so an
         // observed comp deadzone moves the chevrons live; page content is
         // never inset.
-        let paging = parts.page_wrappers.len() > 1;
+        // The model's carousel, not the chrome's wrapper list: chevrons walk
+        // the carousel, and a mounted page the carousel refused (an empty id)
+        // has a wrapper but nothing to page to.
+        let paging = panel.page_ids.len() > 1;
         let inset = chevron_inset(hotspot.as_deref().copied().unwrap_or_default(), paging);
         for control in &parts.controls {
             let controls_enabled =
@@ -2811,6 +2814,137 @@ mod tests {
                 "{edge:?}: chunk 10's furniture structure is kept"
             );
         }
+    }
+
+    /// The live dynamic-page path: a real shell runtime, production chrome
+    /// with no authored pages, and pages arriving through `mount_page` —
+    /// which registers them with the model's carousel — as chunk 21's
+    /// sub-panels do.
+    fn runtime_chrome_app() -> App {
+        use crate::runtime::ShellRuntimePlugin;
+
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .add_message::<RequestRedraw>();
+        let world = app.world_mut();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        app
+    }
+
+    /// Present `edge` as mapped (so a -1 tab index is the paging rule's
+    /// doing) and return its chevrons' `(display, tab index, margin)`.
+    fn present_chevrons(world: &mut World, edge: Edge) -> Vec<(Display, TabIndex, UiRect)> {
+        world.resource_mut::<ShellFrameState>().0.panels[edge.index()].mapped = true;
+        world.run_system_once(present_panels).unwrap();
+        let mut query = world.query::<(&QuoinPanelChrome, &QuoinPanelParts)>();
+        let chevrons = query
+            .iter(world)
+            .find(|(chrome, _)| chrome.edge == edge)
+            .map(|(_, parts)| parts.chevrons)
+            .unwrap();
+        chevrons
+            .iter()
+            .map(|chevron| {
+                let node = world.get::<Node>(*chevron).unwrap();
+                (node.display, *world.get::<TabIndex>(*chevron).unwrap(), node.margin)
+            })
+            .collect()
+    }
+
+    /// Chevrons follow the model's page count through `present_panels` as
+    /// pages come and go: one page, none; a second mounted, both appear,
+    /// reachable and inset; back to one, gone again with no inset.
+    #[test]
+    fn chevrons_follow_mounted_page_count() {
+        let mut app = runtime_chrome_app();
+        let world = app.world_mut();
+        world.insert_resource(QuoinHotspotSize(30.0));
+        let edge = Edge::Bottom;
+        let hidden = vec![(Display::None, TabIndex(-1), UiRect::DEFAULT); 2];
+        let content = world.spawn_empty().id();
+        assert!(mount_page(world, edge, "first", "First", content));
+        assert_eq!(present_chevrons(world, edge), hidden, "one page: no chevrons");
+        let content = world.spawn_empty().id();
+        assert!(mount_page(world, edge, "second", "Second", content));
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.len(),
+            2
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            vec![
+                (Display::Flex, TabIndex(0), UiRect::left(px(30.0))),
+                (Display::Flex, TabIndex(0), UiRect::right(px(30.0))),
+            ],
+            "two pages: chevrons shown, tabbable and inset by the hotspot size"
+        );
+        unmount_page(world, edge, "second");
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.len(),
+            1
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            hidden,
+            "back to one page: chevrons hidden, untabbable, not inset"
+        );
+    }
+
+    /// Paging follows the model's carousel, not the chrome's wrapper list:
+    /// a mounted page the carousel refuses (a whitespace-only id) still gets
+    /// a wrapper, but Next/Previous have nothing to walk, so the chevrons
+    /// stay hidden rather than showing inert.
+    #[test]
+    fn chevrons_ignore_a_mounted_page_the_carousel_refused() {
+        let mut app = runtime_chrome_app();
+        let world = app.world_mut();
+        let edge = Edge::Bottom;
+        for id in ["only", "  "] {
+            let content = world.spawn_empty().id();
+            assert!(mount_page(world, edge, id, id, content));
+        }
+        let mut query = world.query::<(&QuoinPanelChrome, &QuoinPanelParts)>();
+        let wrappers = query
+            .iter(world)
+            .find(|(chrome, _)| chrome.edge == edge)
+            .map(|(_, parts)| parts.page_wrappers.len())
+            .unwrap();
+        assert_eq!(wrappers, 2, "precondition: the refused page still has a wrapper");
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.as_ref(),
+            ["only".to_owned()],
+            "precondition: the model's carousel refused the empty id"
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            vec![(Display::None, TabIndex(-1), UiRect::DEFAULT); 2]
+        );
     }
 
     /// Panel doc §8: the slide is 300 ms and collapses to zero under reduced
