@@ -8,8 +8,8 @@
 //! docked hides immediately unless a hold keeps the panel revealed: the grace delay
 //! exists to forgive pointer overshoot and never applies to a deliberate action.
 //! An interim local menu input suppresses concealment until the popup closes.
-//! Escape on a transient reveal hides it and, while the pointer is still in
-//! the panel or hotspot, latches: hover re-entry cannot re-reveal until the
+//! Hide, Escape or toggle-off on a transient reveal hides it and, while the
+//! pointer is still in the panel or hotspot, latches: hover re-entry cannot re-reveal until the
 //! conceal has finished and the pointer is out of the hotspot (§4.3).
 //!
 //! Two drivers, one machine (shell design §4.3). Locally (the dev host, and any
@@ -199,8 +199,8 @@ pub struct PanelSnapshot {
     pub corner_inside: bool,
     pub hide_at: Option<Duration>,
     pub conceal_reason: Option<ConcealReason>,
-    /// A deliberate conceal is latched against re-reveal. Locally: Escape
-    /// concealed a transient reveal while the pointer was still in the panel
+    /// A deliberate conceal is latched against re-reveal. Locally: Hide,
+    /// Escape or toggle-off concealed a transient reveal while the pointer was still in the panel
     /// or hotspot, and hover re-entry cannot re-reveal until the conceal has
     /// finished and the pointer is out of the hotspot. Command-driven (holder
     /// plane): a deliberate conceal the compositor's holders have not yet
@@ -250,18 +250,27 @@ pub struct PanelStateMachine {
     /// A deliberate conceal the compositor's holders have not yet released:
     /// its reveals are ignored until it reports the holders released.
     ///
-    /// This is THE command-driven (holder-plane) latch: set by a hide from a
-    /// persistent mode, and by Hide/Escape/toggle-off while the compositor
-    /// (or the local membership shows the pointer) holds; cleared by
-    /// `HolderConceal`, by a mode change to pinned or docked (a change to
-    /// hidden sets it), and, with no compositor hold, once the local
-    /// membership is gone — so it can never wedge. The local Escape latch is
-    /// `hover_latched`, set only by a local Escape and read only by the
-    /// unguarded corner/pointer arms: the Hide/Escape arm takes
-    /// `if plane { latch_deliberate_conceal } else { hover latch }` before
-    /// `conceal_now()`, and the snapshot reports `hover_latched || latched`.
+    /// This is THE command-driven (holder-plane) latch.
+    /// - Set by a mode change to hidden (plane only), and by Hide, Escape and
+    ///   toggle-off while the compositor holds or the local membership shows
+    ///   the pointer inside.
+    /// - Cleared by `HolderConceal`; by a mode change to pinned or docked; by
+    ///   an explicit `Reveal` or toggle-on; by `release()` (unpin/undock); by
+    ///   `set_holder_plane` in either direction; and, for a latch armed on
+    ///   local membership alone, once that membership is gone — so it can
+    ///   never wedge.
+    ///
+    /// `hover_latched` is the local driver's latch. BOTH arms that conceal
+    /// deliberately — Hide/Escape and Toggle-off — take
+    /// `if plane { self.latch_deliberate_conceal() } else { hover latch }`
+    /// before `conceal_now()`, and the snapshot's latch reads
+    /// `hover_latched || latched`.
     latched: bool,
-    /// The local-driver Escape latch (see `PanelSnapshot::hover_latched`).
+    /// The local driver's deliberate-conceal latch (see
+    /// `PanelSnapshot::hover_latched`): set by Hide, Escape or toggle-off with
+    /// the pointer in the panel or hotspot; read by the unguarded corner and
+    /// pointer arms; cleared by `release_latch_once_left`, by an input that
+    /// shows the panel, and by `set_holder_plane` and `leave_output`.
     hover_latched: bool,
     /// The latch was armed on local membership with no compositor hold, so
     /// no release is certain to clear it: leaving clears it instead.
@@ -388,7 +397,11 @@ impl PanelStateMachine {
                     && !self.menu_hold
                 {
                     // Mirrors Hide: persistent panels ignore both directions.
-                    self.latch_deliberate_conceal();
+                    if plane {
+                        self.latch_deliberate_conceal();
+                    } else if self.pointer_inside || self.corner_inside {
+                        self.hover_latched = true;
+                    }
                     self.conceal_now();
                 }
             }
@@ -468,12 +481,11 @@ impl PanelStateMachine {
                 {
                     if plane {
                         self.latch_deliberate_conceal();
-                    } else if input == PanelInput::Escape
-                        && (self.pointer_inside || self.corner_inside)
-                    {
-                        // Escape with the pointer still inside must not pop
-                        // the panel straight back on the next motion event:
-                        // the pointer has to leave and dwell again (§4.3).
+                    } else if self.pointer_inside || self.corner_inside {
+                        // A deliberate conceal with the pointer still inside
+                        // must not pop the panel straight back on the next
+                        // motion event: the pointer has to leave and dwell
+                        // again (§4.3), as the plane latch also requires.
                         self.hover_latched = true;
                     }
                     self.conceal_now();

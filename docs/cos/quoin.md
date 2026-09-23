@@ -740,7 +740,8 @@ clicked. Escape or the cycle key releases it. Click-away release waits for
 the compositor focus holder.
 
 The latch described above is the local one, used while comp does not report
-the holder plane. When comp does report it, Escape takes the command-driven
+the holder plane. A `hide` or a toggle-off with the pointer inside latches in
+the same way. When comp does report the holder plane, all three take the command-driven
 latch described earlier: the panel stays concealed against comp's reveals
 until comp reports that the holders have been released.
 
