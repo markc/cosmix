@@ -1937,16 +1937,16 @@ mod tests {
         let lmb = PanelInput::PinToggle;
         let shift_lmb = PanelInput::DockToggle;
         let mode_verb = |mode: &str| ("shell.panel.mode", json!({"edge":"left","mode":mode}));
-        let dock_verb = ("shell.panel.dock", json!({"edge":"left"}));
+        let dock_verb = || ("shell.panel.dock", json!({"edge":"left"}));
         let cells = [
             // hidden (incl. transiently revealed): LMB → pinned, Shift+LMB → docked
             (PanelMode::Hidden, false, lmb, mode_verb("pinned"), PanelMode::Pinned),
             (PanelMode::Hidden, true, lmb, mode_verb("pinned"), PanelMode::Pinned),
-            (PanelMode::Hidden, false, shift_lmb, dock_verb, PanelMode::Docked),
-            (PanelMode::Hidden, true, shift_lmb, dock_verb, PanelMode::Docked),
+            (PanelMode::Hidden, false, shift_lmb, dock_verb(), PanelMode::Docked),
+            (PanelMode::Hidden, true, shift_lmb, dock_verb(), PanelMode::Docked),
             // pinned: LMB → hidden, Shift+LMB → docked
             (PanelMode::Pinned, false, lmb, mode_verb("hidden"), PanelMode::Hidden),
-            (PanelMode::Pinned, false, shift_lmb, dock_verb, PanelMode::Docked),
+            (PanelMode::Pinned, false, shift_lmb, dock_verb(), PanelMode::Docked),
             // docked: LMB → pinned, Shift+LMB → hidden
             (PanelMode::Docked, false, lmb, mode_verb("pinned"), PanelMode::Pinned),
             (PanelMode::Docked, false, shift_lmb, mode_verb("hidden"), PanelMode::Hidden),
