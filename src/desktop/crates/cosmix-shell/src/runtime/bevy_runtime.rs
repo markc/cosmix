@@ -348,6 +348,8 @@ fn update_model(
         match &command.kind {
             // Scene content is owned by the host adapter; it has no motion effect.
             ShellCommandKind::Scene(_) => {}
+            // Lifecycle commands were applied (and `continue`d) above the output gate.
+            ShellCommandKind::SubPanelRegister { .. } | ShellCommandKind::SubPanelRemove { .. } => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
                 let thickness_px = if thickness_px.is_finite() {
                     thickness_px.min(runtime.model.max_thickness(*edge))
