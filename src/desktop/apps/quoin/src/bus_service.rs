@@ -114,7 +114,6 @@ pub(crate) struct ShellBusDispatch;
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
-            .add_message::<crate::holders::HolderCommand>()
             .init_resource::<cosmix_shell::chrome::QuoinHotspotSize>()
             .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
@@ -150,7 +149,6 @@ impl Plugin for ShellBusPlugin {
 #[derive(bevy::ecs::system::SystemParam)]
 struct SceneBus<'w, 's> {
     holders: Option<ResMut<'w, crate::holders::HolderClient>>,
-    holder_commands: MessageWriter<'w, crate::holders::HolderCommand>,
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
@@ -340,10 +338,27 @@ fn service_bus(
             | BusBridgeEvent::ObservationReply { .. } => {}
         }
     }
+    // The model goes command-driven before the commands the open gate admits,
+    // and back to local rules the moment the gate closes.
+    let holder_plane = |client: &mut crate::holders::HolderClient,
+                        commands: &mut MessageWriter<ShellCommand>| {
+        if let Some(available) = client.plane_change() {
+            commands.write(ShellCommand {
+                output: frame.0.geometry.output.clone(),
+                at: time.elapsed(),
+                kind: ShellCommandKind::HolderPlane(available),
+            });
+        }
+    };
+    if let Some(client) = content.holders.as_deref_mut() {
+        holder_plane(client, &mut shell_commands);
+    }
     for message in bridge.drain_messages() {
         if let Some(client) = content.holders.as_deref_mut()
-            && let Some(command) = client.message(&message) {
-            content.holder_commands.write(command);
+            && let Some(command) = client.message(&message)
+            && let Some(command) = command.shell_command(time.elapsed())
+        {
+            shell_commands.write(command);
         }
         if let Some(observer) = hotspot.as_deref_mut() {
             observer.message(&message);
@@ -385,6 +400,9 @@ fn service_bus(
                 }
             }
         }
+    }
+    if let Some(client) = content.holders.as_deref_mut() {
+        holder_plane(client, &mut shell_commands);
     }
     if let Some(observer) = hotspot.as_deref_mut() {
         observer.flush(&bridge);
@@ -1473,6 +1491,68 @@ mod tests {
         assert_eq!(release["acquire"], false, "the stranded hold is released");
         app.update();
         assert!(comp_calls().is_empty(), "and, acknowledged, goes quiet");
+    }
+
+    /// The model follows comp's commands exactly while the holder plane is
+    /// open, and any doubt (here a gap frame) hands it back to local rules.
+    #[test]
+    fn comp_commands_drive_the_model_only_while_capable() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        let comp_frame = |sequence: u64, body: Value| ctk::bus::BusMessage {
+            connection_generation: 1,
+            from: "comp-nested".into(),
+            command: "panel.command".into(),
+            body: body.to_string(),
+            headers: BTreeMap::from([
+                ("topic".into(), "comp-nested.panel.command".into()),
+                ("command".into(), "panel.command".into()),
+                ("event_seq".into(), sequence.to_string()),
+            ]),
+        };
+        let command = |sequence: u64, action: &str| comp_frame(sequence, json!({"version":1,
+            "output":"test","edge":"left","surface":"panel-token","action":action,
+            "event_seq":sequence}));
+        let revealed = |app: &App| {
+            app.world().resource::<ShellFrameState>().0.panel(Edge::Left).transient_revealed
+        };
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        app.update();
+        peer.deliver_message(command(1, "reveal"));
+        app.update();
+        assert!(!revealed(&app), "no capability yet: comp's reveal is ignored");
+        let read = peer.drain_calls().into_iter()
+            .find(|call| call.command == "comp.props.get").expect("the capability read");
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id: read.request_id,
+            result: Ok(ctk::bus::BusReply { rc: 0, body: "true".into(), result: None }),
+        });
+        app.update();
+        peer.deliver_message(command(2, "reveal"));
+        app.update();
+        assert!(revealed(&app), "a holder reveals the hidden panel");
+        peer.deliver_message(command(3, "conceal"));
+        app.update();
+        assert!(!revealed(&app), "the last release conceals at once");
+        peer.deliver_message(command(4, "reveal"));
+        app.update();
+        assert!(revealed(&app));
+        // Lost records may include commands: back to local rules, and comp's
+        // later commands are dropped until the plane is confirmed again.
+        peer.deliver_message(comp_frame(5, json!({"gap":true,"lost_count":1,
+            "cause":"outbox.overflow"})));
+        app.update();
+        peer.deliver_message(command(6, "conceal"));
+        app.update();
+        assert!(revealed(&app), "a local reveal is left to local grace");
     }
 
     use cosmix_shell::core::PanelInput;

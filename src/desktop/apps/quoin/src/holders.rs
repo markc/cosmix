@@ -5,7 +5,9 @@
 //! receives comp's reveal/conceal commands. Everything is gated on comp's
 //! `input.corners.holders` leaf: until a read of it answers `true` on the
 //! current connection nothing is sent and every command is dropped, so a comp
-//! without the plane leaves today's local behaviour untouched.
+//! without the plane leaves today's local behaviour untouched. The host hands
+//! the gate to the model (`ShellCommandKind::HolderPlane`), which is
+//! command-driven exactly while it is open; any doubt closes it.
 //!
 //! Comp verbs are literal `comp.*` commands addressed to the selected service;
 //! only the subscribed topics carry the service name.
@@ -19,8 +21,8 @@ use std::time::Duration;
 
 use bevy::prelude::*;
 use bevy::time::Real;
-use cosmix_shell::core::{Edge, PanelMode};
-use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
+use cosmix_shell::core::{Edge, OutputKey, PanelEffect, PanelInput, PanelMode};
+use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellEffects, ShellFrameState};
 use cosmix_shell_host::LayerHostDeadline;
 use cosmix_shell_host::holders::{PanelLayerIdentities, PopupLayerIdentity};
 use ctk::bus::{BusBridge, BusBridgeConfig, BusBridgeEvent, BusConnectionState, BusMessage, BusReply};
@@ -37,16 +39,30 @@ const RETRY_CAP: Duration = Duration::from_secs(8);
 /// `(layer token, verb)`: one desired request per layer and verb.
 type Key = (String, String);
 
-/// Capability-gated transport seam. Chunk 14 consumes these commands instead
-/// of local conceal timers; this slice deliberately leaves the model unchanged,
-/// so outside tests nothing reads the fields yet.
-#[derive(Message, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
+/// One accepted comp command, already matched to a current layer token. It
+/// drives the model only while the model is command-driven, which the host
+/// keeps in step with [`HolderClient::capable`] through
+/// [`HolderClient::plane_change`]; the model ignores it otherwise.
+#[derive(Debug, PartialEq)]
 pub(crate) struct HolderCommand {
     pub(crate) output: String,
     pub(crate) edge: Edge,
-    pub(crate) surface: String,
     pub(crate) reveal: bool,
+}
+
+impl HolderCommand {
+    /// The model input on the named output: comp's reveal is a holder gained,
+    /// its conceal the last holder released (its delay already served).
+    pub(crate) fn shell_command(&self, at: Duration) -> Option<ShellCommand> {
+        Some(ShellCommand {
+            output: OutputKey::new(self.output.clone()).ok()?,
+            at,
+            kind: ShellCommandKind::Panel {
+                edge: self.edge,
+                input: if self.reveal { PanelInput::HolderReveal } else { PanelInput::HolderConceal },
+            },
+        })
+    }
 }
 
 /// What a refused request waits for. An unchanged request is resent only
@@ -71,6 +87,8 @@ pub(crate) struct HolderClient {
     /// current connection.
     present: Option<bool>,
     pub(crate) capable: bool,
+    /// The capability last handed to the model; see [`HolderClient::plane_change`].
+    plane_reported: bool,
     read_needed: bool,
     capability_read: Option<u64>,
     next_id: u64,
@@ -86,6 +104,9 @@ pub(crate) struct HolderClient {
     /// acknowledged release, or one refused `unknown_output`, retires it.
     maybe_held: BTreeMap<Key, Value>,
     pending: Option<(u64, Key, Value)>,
+    /// A mode change happened while the pending report was in flight: its
+    /// acknowledgement must not stand for the change comp has not seen.
+    pending_superseded: bool,
     retry_wanted: bool,
     retry_read: bool,
     retry_at: Option<Duration>,
@@ -131,10 +152,12 @@ fn wait_for(code: Option<&str>) -> Wait {
 impl HolderClient {
     fn new(service: String) -> Self {
         Self {
-            service, generation: None, present: None, capable: false, read_needed: false,
+            service, generation: None, present: None, capable: false, plane_reported: false,
+            read_needed: false,
             capability_read: None, next_id: 0x49_0000_0000, last_sequence: 0,
             desired: BTreeMap::new(), acknowledged: BTreeMap::new(), failed: BTreeMap::new(),
-            maybe_held: BTreeMap::new(), pending: None, retry_wanted: false, retry_read: false,
+            maybe_held: BTreeMap::new(), pending: None, pending_superseded: false,
+            retry_wanted: false, retry_read: false,
             retry_at: None, backoff: RETRY_FIRST, popup: BTreeMap::new(),
             popup_surfaces: BTreeMap::new(),
         }
@@ -147,6 +170,7 @@ impl HolderClient {
         self.capability_read = None;
         self.read_needed = reread && self.generation.is_some();
         self.pending = None;
+        self.pending_superseded = false;
         self.acknowledged.clear();
         self.failed.clear();
         self.last_sequence = 0;
@@ -154,6 +178,33 @@ impl HolderClient {
         self.retry_read = false;
         self.retry_at = None;
         self.backoff = RETRY_FIRST;
+    }
+
+    /// The capability to hand the model when it differs from what the model
+    /// was last told. The host calls this after draining events and again
+    /// after messages, so a gate that opened is applied before the commands it
+    /// admits and one that closed returns the model to local rules at once.
+    pub(crate) fn plane_change(&mut self) -> Option<bool> {
+        (self.plane_reported != self.capable).then(|| {
+            self.plane_reported = self.capable;
+            self.capable
+        })
+    }
+
+    /// The model changed an edge's mode. The command-driven model waits for
+    /// comp's verdict on the hidden report that follows (an unpin keeps its
+    /// reveal until then, a hide latches until then), so that report must be
+    /// sent and answered even when its body equals the last one acknowledged:
+    /// a pin and unpin in one pass, or both inside a retry backoff.
+    pub(crate) fn mode_changed(&mut self, output: &str, edge: &str) {
+        let stale = |key: &Key, body: &Value| {
+            key.1 == "panel.mode" && body["output"] == output && body["edge"] == edge
+        };
+        self.acknowledged.retain(|key, body| !stale(key, body));
+        self.failed.retain(|key, (body, _)| !stale(key, body));
+        if self.pending.as_ref().is_some_and(|(_, key, body)| stale(key, body)) {
+            self.pending_superseded = true;
+        }
     }
 
     pub(crate) fn presence(&mut self, live: &BTreeSet<String>) {
@@ -212,7 +263,15 @@ impl HolderClient {
                 if self.pending.as_ref().is_some_and(|(id, _, _)| id == request_id) =>
             {
                 let (_, key, body) = self.pending.take().unwrap();
-                self.settle(key, body, result);
+                let superseded = std::mem::take(&mut self.pending_superseded);
+                self.settle(key.clone(), body, result);
+                if superseded {
+                    // Neither verdict stands for a change comp has not seen:
+                    // the edge's current report goes out on the next flush
+                    // (or, if a retry is armed, at its deadline).
+                    self.acknowledged.remove(&key);
+                    self.failed.remove(&key);
+                }
             }
             _ => {}
         }
@@ -304,7 +363,7 @@ impl HolderClient {
             return None;
         }
         self.last_sequence = sequence;
-        Some(HolderCommand { output, edge, surface, reveal })
+        Some(HolderCommand { output, edge, reveal })
     }
 
     /// One host update: fire a due retry, send, then arm a deadline for any
@@ -320,7 +379,10 @@ impl HolderClient {
     /// bounds the delay, not the attempts: a comp that stays busy is retried
     /// every [`RETRY_CAP`] until it answers or the connection changes. Capping
     /// attempts instead would give up on a release and strand comp's hold;
-    /// comp leaving or a success are the only exits.
+    /// comp leaving or a success are the only exits. A reply that never comes
+    /// is not timed here: the pending request relies on the bus bridge
+    /// completing every call (with its own timeout error when comp is silent),
+    /// which then settles as a transient failure.
     fn tick(&mut self, now: Duration, deadline: &mut LayerHostDeadline) {
         if self.retry_at.is_some_and(|at| at <= now) {
             // One firing covers every transient failure so far.
@@ -391,17 +453,24 @@ impl HolderClient {
 }
 
 /// Mirror the actual mode after Model, and the existing chunk-11 menu holds.
-/// Local holders remain active until the command-driven model slice lands.
+/// Every hidden mode report comp accepts draws its current reveal/conceal
+/// verdict, which is how a model that just went command-driven learns it.
 pub(crate) fn report_holders(
     bridge: Res<BusBridge>,
     (time, mut deadline): (Res<Time<Real>>, ResMut<LayerHostDeadline>),
     mut client: Option<ResMut<HolderClient>>,
     identities: Option<Res<PanelLayerIdentities>>,
     popup_identity: Option<Res<PopupLayerIdentity>>,
-    frame: Res<ShellFrameState>,
+    (frame, effects): (Res<ShellFrameState>, Option<Res<ShellEffects>>),
     mut commands: MessageReader<ShellCommand>,
 ) {
     let Some(client) = client.as_deref_mut() else { commands.clear(); return; };
+    let output = &frame.0.geometry.output;
+    for effect in effects.iter().flat_map(|effects| &effects.0) {
+        if matches!(effect.effect, PanelEffect::ModeChanged { .. }) {
+            client.mode_changed(output.as_str(), edge_name(effect.edge));
+        }
+    }
     for command in commands.read() {
         if let ShellCommandKind::Panel { edge, input: cosmix_shell::core::PanelInput::MenuHold(open) } = &command.kind {
             client.popup.insert((command.output.as_str().into(), edge_name(*edge).into()), *open);
@@ -411,7 +480,6 @@ pub(crate) fn report_holders(
         client.popup_surfaces.insert((identity.output.as_str().into(), edge_name(identity.edge).into()),
             identity.surface.clone());
     }
-    let output = &frame.0.geometry.output;
     client.desired.clear();
     if let Some(identities) = identities {
         for edge in Edge::ALL {
@@ -718,5 +786,79 @@ mod tests {
             client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
             client.acknowledged.insert(mode_key("panel-1"), mode_body("panel-1"));
         }
+    }
+
+    /// A pin and unpin in one pass nets to the report comp already holds,
+    /// yet the model waits for comp's verdict on it: it is sent again.
+    #[test]
+    fn mode_change_resends_an_unchanged_report() {
+        let (mut client, bridge, peer) = capable_client();
+        acknowledge_mode(&mut client, &bridge, &peer, "panel-1");
+        client.flush(&bridge);
+        assert!(peer.drain_calls().is_empty(), "an acknowledged report is quiet");
+        client.mode_changed("test", "left");
+        client.flush(&bridge);
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].command, "comp.panel.mode");
+        client.event(&reply(calls[0].request_id, 0, r#"{"accepted":true}"#));
+        client.flush(&bridge);
+        assert!(peer.drain_calls().is_empty(), "answered once, quiet again");
+        // Another edge's change leaves this report alone.
+        client.mode_changed("test", "top");
+        client.flush(&bridge);
+        assert!(peer.drain_calls().is_empty());
+    }
+
+    /// The same when the change lands while the old report is in flight or
+    /// while a retry backoff holds every send.
+    #[test]
+    fn mode_change_survives_in_flight_reports_and_backoff() {
+        let (mut client, bridge, peer) = capable_client();
+        client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
+        client.flush(&bridge);
+        let in_flight = peer.drain_calls();
+        client.mode_changed("test", "left");
+        client.event(&reply(in_flight[0].request_id, 0, r#"{"accepted":true}"#));
+        client.flush(&bridge);
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1, "the superseded acknowledgement does not stand");
+        client.event(&reply(calls[0].request_id, 0, r#"{"accepted":true}"#));
+        // Backoff: another request met a busy comp and armed the deadline.
+        let mut deadline = LayerHostDeadline::default();
+        client.desired.insert(mode_key("panel-2"), json!({"output":"test","edge":"top",
+            "surface":"panel-2","mode":"hidden"}));
+        client.flush(&bridge);
+        client.event(&reply(peer.drain_calls()[0].request_id, 10, r#"{"error":"busy"}"#));
+        client.tick(Duration::ZERO, &mut deadline);
+        client.mode_changed("test", "left");
+        client.flush(&bridge);
+        assert!(peer.drain_calls().is_empty(), "nothing before the deadline");
+        client.tick(RETRY_FIRST, &mut deadline);
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            client.flush(&bridge);
+            for call in peer.drain_calls() {
+                sent.push(serde_json::from_str::<Value>(&call.body).unwrap()["edge"].clone());
+                client.event(&reply(call.request_id, 0, r#"{"accepted":true}"#));
+            }
+        }
+        assert!(sent.contains(&json!("left")), "the changed edge is reported after backoff");
+    }
+
+    /// A refusal of the superseded report (here `locked`, which otherwise
+    /// waits for an unlock) does not hold back the report of the change.
+    #[test]
+    fn superseded_refusal_does_not_suppress_the_changed_report() {
+        let (mut client, bridge, peer) = capable_client();
+        client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
+        client.flush(&bridge);
+        let in_flight = peer.drain_calls();
+        client.mode_changed("test", "left");
+        client.event(&reply(in_flight[0].request_id, 10, r#"{"error":"locked"}"#));
+        client.flush(&bridge);
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1, "sent again without waiting for an unlock");
+        assert_eq!(calls[0].command, "comp.panel.mode");
     }
 }

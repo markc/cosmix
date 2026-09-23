@@ -46,6 +46,11 @@ pub enum ShellCommandKind {
         request_id: u64,
     },
     Corner(CornerEvent),
+    /// The compositor's holder-plane capability changed: `true` hands
+    /// transient reveal/conceal to its commands, `false` restores the local
+    /// corner/pointer/grace rules. Process-wide, so it applies to whichever
+    /// model is current regardless of `output`, and survives model replacement.
+    HolderPlane(bool),
     Panel {
         edge: Edge,
         input: PanelInput,
