@@ -64,8 +64,13 @@ $state = {
   -- register pass in flight, and whether this host generation has selected
   -- and pinned the taskbar page yet
   reg_launcher: false, reg_calendar: false, reg_notes: false,
-  registering: false, panel_shown: false
+  registering: false, panel_shown: false,
+  -- consecutive show_page refusals this host generation; past PANEL_SHOW_CAP
+  -- we stop paying the bounded select wait on every render (a host that keeps
+  -- refusing its own bottom edge is a host bug, logged once per attempt)
+  panel_show_fails: 0
 }
+$PANEL_SHOW_CAP = 5
 
 fn note($line)
   try
@@ -681,13 +686,24 @@ fn render_panel()
     $state.reg_calendar = false
     $state.reg_notes = false
     $state.panel_shown = false
+    $state.panel_show_fails = 0
   end
   if not all_registered() then register_popups() end
   -- First render of this citizen life or host generation: select and pin the
   -- taskbar page. Keyed on our own flag, not revision 1 -- the revision
-  -- counter is per scene name and survives a citizen-only restart.
-  if not $state.panel_shown then
-    if show_page("bottom", "scene-panel") then $state.panel_shown = true end
+  -- counter is per scene name and survives a citizen-only restart. Capped so
+  -- a host that keeps refusing does not cost every render a ~1 s wait; a new
+  -- host generation (revision 1) re-arms it.
+  if not $state.panel_shown and $state.panel_show_fails < $PANEL_SHOW_CAP then
+    if show_page("bottom", "scene-panel") then
+      $state.panel_shown = true
+      $state.panel_show_fails = 0
+    else
+      $state.panel_show_fails = $state.panel_show_fails + 1
+      if $state.panel_show_fails == $PANEL_SHOW_CAP then
+        note("taskbar page refused " .. to_string($PANEL_SHOW_CAP) .. " times; giving up until the host restarts")
+      end
+    end
   end
 end
 
