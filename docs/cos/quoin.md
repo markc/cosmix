@@ -227,17 +227,19 @@ Quoin registers the stable Bus service identity `shell`; its subscription
 plane is `shell-sub`. `shell.ping` and `shell.info` provide presence and
 discovery. Live panel state is read through the uniform
 `shell.props.{get,list,describe}` surface under
-`panels.<edge>.{visible,pinned,width_px,page,pages,output}`.
+`panels.<edge>.{visible,pinned,mode,width_px,page,pages,output}`.
 
-`pinned` is a read-compatibility shim: true for either persistent `Pinned` or
-`Docked`, false for `Hidden` even while transiently revealed. It is not a precise
-mode signal. Existing Bus `pin` retains its reserving behaviour (`Docked`),
-including the corner-addressed alias. Existing Bus `unpin` releases either
-persistent mode into transient grace; follow it with `hide` to conceal.
-No new mode property or Bus verb is introduced here. Taskbar, popup and capture
-callers retain their existing verb mapping pending the separate caller update.
+`mode` is the precise mode signal: `hidden`, `pinned` (a persistent overlay
+that reserves no space) or `docked` (reserves its full thickness), independent
+of transient visibility. `pinned` is a read-compatibility shim: true for either
+persistent `Pinned` or `Docked`, false for `Hidden` even while transiently
+revealed. Existing Bus `pin` retains its reserving behaviour (`Docked`),
+including the corner-addressed alias, and existing Bus `unpin` releases either
+persistent mode into transient grace; follow it with `hide` to conceal. The
+legacy pair is deliberately unchanged; the corner menu, keyboard bindings and
+citizens that need to drive a mode explicitly use the precise verbs below.
 
-The semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin}`,
+The semantic verbs are `shell.panel.{show,hide,toggle,pin,unpin,dock,mode}`,
 `shell.panel.page.{next,prev,set}` and `shell.quit`. They require a broker-stamped local,
 registered caller and are translated to the same `ShellCommand` ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
@@ -245,6 +247,14 @@ persistence. `shell.quit` and the right Monitoring page's Quit Quoin button
 request a successful Bevy exit through the normal render and surface drain
 (`QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit`). `shell.panel.resize` accepts
 `edge` and `thickness_px` in the supported 120–500 range.
+
+`shell.panel.dock` takes `edge` and enters `Docked` from any current mode —
+the explicit docking route, since docking reflows the workspace and is never
+a side effect of another verb. `shell.panel.mode` takes `edge` and
+`mode=hidden|pinned|docked` and sets that persistent mode exactly: unlike the
+legacy verbs it never leaves a transient reveal behind, and `mode=hidden`
+conceals at once with no grace delay, because it is a deliberate action. Read
+back `shell.props.get path="panels.<edge>.mode"` to verify the applied mode.
 
 Quoin 0.10.1 also accepts `shell.corner.{show,hide,toggle,pin,unpin}` with a
 `corner` argument. These use the same panel state machine and caller checks:

@@ -469,7 +469,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -567,6 +567,27 @@ fn dispatch_shell_request(
             None,
         );
     }
+    // Validate the precise mode verb's argument before `semantic_verb`, which
+    // would otherwise collapse a bad mode into "unknown shell command".
+    if request.command == "shell.panel.mode" {
+        match argument(request, "mode") {
+            None => {
+                return (
+                    10,
+                    json!({"error":"panel.mode requires a mode argument"}).to_string(),
+                    None,
+                );
+            }
+            Some(value) if PanelMode::parse(&value).is_none() => {
+                return (
+                    10,
+                    json!({"error":"mode must be hidden, pinned or docked"}).to_string(),
+                    None,
+                );
+            }
+            Some(_) => {}
+        }
+    }
     let Some(verb) = semantic_verb(request) else {
         return (
             10,
@@ -661,6 +682,10 @@ fn semantic_verb(request: &InboundRequest) -> Option<ShellSemanticVerb> {
         "shell.panel.toggle" | "shell.corner.toggle" => ShellSemanticVerb::PanelToggle,
         "shell.panel.pin" | "shell.corner.pin" => ShellSemanticVerb::PanelPin,
         "shell.panel.unpin" | "shell.corner.unpin" => ShellSemanticVerb::PanelUnpin,
+        "shell.panel.dock" => ShellSemanticVerb::PanelDock,
+        "shell.panel.mode" => {
+            ShellSemanticVerb::PanelMode(PanelMode::parse(&argument(request, "mode")?)?)
+        }
         "shell.panel.page.next" => ShellSemanticVerb::PageNext,
         "shell.panel.page.prev" => ShellSemanticVerb::PagePrevious,
         "shell.panel.page.set" => ShellSemanticVerb::PageSet(argument(request, "id")?),
@@ -769,6 +794,9 @@ impl PropTree for ShellProps<'_> {
                     // visibility of a Hidden panel must never read as pinned.
                     (panel.mode != PanelMode::Hidden).into(),
                 ),
+                // The precise signal: the panel's persistent mode, independent
+                // of transient visibility.
+                leaf(format!("panels.{name}.mode"), panel.mode.as_str().into()),
                 leaf(
                     format!("panels.{name}.width_px"),
                     (panel.thickness_px as f64).into(),
@@ -796,7 +824,7 @@ impl PropTree for ShellProps<'_> {
     fn list(&self) -> Vec<PropPath> {
         let mut paths = Vec::new();
         for edge in Edge::ALL {
-            for field in ["visible", "pinned", "width_px", "page", "pages", "output"] {
+            for field in ["visible", "pinned", "mode", "width_px", "page", "pages", "output"] {
                 paths.push(PropPath::new(format!("panels.{}.{}", edge_name(edge), field)).unwrap());
             }
         }
@@ -807,18 +835,22 @@ impl PropTree for ShellProps<'_> {
         let field = path.as_str().rsplit('.').next()?;
         let ty = match field {
             "visible" | "pinned" => PropType::Bool,
+            "mode" | "page" | "output" => PropType::String,
             "width_px" => PropType::Number,
-            "page" | "output" => PropType::String,
             "pages" => PropType::List,
             _ => return None,
         };
         Some(PropDescribe::leaf(
             path.clone(),
             ty,
-            if field == "pinned" {
-                "compatibility shim: true for persistent Pinned or Docked; false for Hidden, including transient reveal"
-            } else {
-                "live Quoin panel state"
+            match field {
+                "pinned" => {
+                    "compatibility shim: true for persistent Pinned or Docked; false for Hidden, including transient reveal"
+                }
+                "mode" => {
+                    "persistent panel mode: hidden, pinned (overlay, reserves nothing) or docked (reserves its thickness)"
+                }
+                _ => "live Quoin panel state",
             },
         ))
     }
@@ -1217,9 +1249,10 @@ mod tests {
     #[test]
     fn every_panel_verb_resolves_its_edge_from_the_live_wire_shape() {
         let frame = paged_frame();
-        for (command, expected) in [
+        for (command, body, expected) in [
             (
                 "shell.panel.show",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Reveal,
@@ -1227,6 +1260,7 @@ mod tests {
             ),
             (
                 "shell.panel.hide",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Hide,
@@ -1234,6 +1268,7 @@ mod tests {
             ),
             (
                 "shell.panel.toggle",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Toggle,
@@ -1241,6 +1276,7 @@ mod tests {
             ),
             (
                 "shell.panel.pin",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Dock,
@@ -1248,13 +1284,31 @@ mod tests {
             ),
             (
                 "shell.panel.unpin",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Release,
                 },
             ),
             (
+                "shell.panel.dock",
+                json!({"edge":"bottom"}),
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Dock,
+                },
+            ),
+            (
+                "shell.panel.mode",
+                json!({"edge":"bottom","mode":"pinned"}),
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::SetMode(PanelMode::Pinned),
+                },
+            ),
+            (
                 "shell.panel.page.next",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Carousel {
                     edge: Edge::Bottom,
                     input: CarouselInput::Next,
@@ -1262,13 +1316,14 @@ mod tests {
             ),
             (
                 "shell.panel.page.prev",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Carousel {
                     edge: Edge::Bottom,
                     input: CarouselInput::Previous,
                 },
             ),
         ] {
-            let request = wire(command, json!({"edge":"bottom"}));
+            let request = wire(command, body);
             let (rc, body, enqueued) = dispatch_shell_request(&request, &frame, Default::default());
             assert_eq!(rc, 0, "{command}: {body}");
             assert_eq!(
@@ -1276,6 +1331,80 @@ mod tests {
                 expected,
                 "{command}"
             );
+        }
+    }
+
+    /// The precise dock verb: `Docked` is never a side effect of another
+    /// verb (shell doc §3.1 — docking reflows the workspace), so it gets its
+    /// own named verb enqueuing the model's `Dock` input for the addressed
+    /// edge. Distinct from legacy `pin`, which happens to map to the same
+    /// input only for popup-space compatibility.
+    #[test]
+    fn panel_dock_verb_enqueues_dock_input() {
+        let frame = test_frame();
+        let dock_request = wire("shell.panel.dock", json!({"edge":"right"}));
+        let (rc, body, command) = dispatch_shell_request(&dock_request, &frame, Default::default());
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(
+            command.expect("accepted dock verb enqueues a command").kind,
+            ShellCommandKind::Panel {
+                edge: Edge::Right,
+                input: PanelInput::Dock,
+            }
+        );
+        // An unstamped caller is refused like every other semantic verb.
+        let (rc, _, command) = dispatch_shell_request(
+            &request("shell.panel.dock"),
+            &frame,
+            Default::default(),
+        );
+        assert_eq!(rc, 10);
+        assert!(command.is_none());
+    }
+
+    /// The precise mode verb carries its mode as a string argument: every
+    /// token the `panels.<edge>.mode` leaf can emit is accepted, and anything
+    /// else — missing, unknown, or the wrong JSON type — is refused with a
+    /// precise error rather than the generic "unknown shell command".
+    #[test]
+    fn panel_mode_verb_validates_mode_string() {
+        let frame = test_frame();
+        for (token, mode) in [
+            ("hidden", PanelMode::Hidden),
+            ("pinned", PanelMode::Pinned),
+            ("docked", PanelMode::Docked),
+        ] {
+            let request = wire("shell.panel.mode", json!({"edge":"left","mode":token}));
+            let (rc, body, command) = dispatch_shell_request(&request, &frame, Default::default());
+            assert_eq!(rc, 0, "{token}: {body}");
+            assert_eq!(
+                command
+                    .expect("accepted mode verb enqueues a command")
+                    .kind,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: PanelInput::SetMode(mode),
+                },
+                "{token}"
+            );
+        }
+        for (body, fragment) in [
+            (json!({"edge":"left"}), "requires a mode argument"),
+            (
+                json!({"edge":"left","mode":"sideways"}),
+                "mode must be hidden, pinned or docked",
+            ),
+            (
+                json!({"edge":"left","mode":""}),
+                "mode must be hidden, pinned or docked",
+            ),
+            (json!({"edge":"left","mode":7}), "requires a mode argument"),
+        ] {
+            let request = wire("shell.panel.mode", body.clone());
+            let (rc, error, command) = dispatch_shell_request(&request, &frame, Default::default());
+            assert_eq!(rc, 10, "{body}");
+            assert!(error.contains(fragment), "{body}: {error}");
+            assert!(command.is_none(), "{body} must not enqueue a command");
         }
     }
 
@@ -1755,6 +1884,7 @@ mod tests {
             };
             let before = props(&model);
             assert_eq!(before["pinned"], json!(mode != PanelMode::Hidden));
+            assert_eq!(before["mode"], json!(mode.as_str()));
             assert_eq!(
                 before["visible"],
                 json!(mode != PanelMode::Hidden || transient)
@@ -1780,11 +1910,155 @@ mod tests {
             model.panel_input(edge, at, input).unwrap();
             assert_eq!(model.panel(edge).exclusive_zone_px, 0.0);
             assert_eq!(props(&model)["pinned"], json!(false));
+            assert_eq!(props(&model)["mode"], json!("hidden"));
             model.panel_input(edge, at, PanelInput::Hide).unwrap();
             model.tick(Duration::from_millis(400)).unwrap();
             let confirmed = props(&model);
             assert_eq!(confirmed["pinned"], json!(false));
+            assert_eq!(confirmed["mode"], json!("hidden"));
             assert_eq!(confirmed["visible"], json!(false));
+        }
+    }
+
+    /// Chunk-2 acceptance gate: every mode-changing cell of the shell
+    /// design's §3.1 transition table (the LMB and Shift+LMB columns; RMB
+    /// opens the menu and changes nothing here, the drag gestures are
+    /// deferred), walked twice — once as the raw corner-click input each
+    /// gesture decodes to, once through the precise Bus verbs — asserting
+    /// the APPLIED state, not the verb round-trip: resulting mode, the
+    /// reservation that mode owes (only `Docked` claims an exclusive zone,
+    /// and it claims its full thickness), and the persistence effect. The
+    /// verb rows also read the applied mode back through the
+    /// `panels.<edge>.mode` leaf.
+    #[test]
+    fn every_s31_mode_cell_applies_mode_and_reservation_via_verbs_and_clicks() {
+        use std::time::Duration;
+        let at = Duration::from_millis(100);
+        let lmb = PanelInput::PinToggle;
+        let shift_lmb = PanelInput::DockToggle;
+        let mode_verb = |mode: &str| ("shell.panel.mode", json!({"edge":"left","mode":mode}));
+        let dock_verb = || ("shell.panel.dock", json!({"edge":"left"}));
+        let cells = [
+            // hidden (incl. transiently revealed): LMB → pinned, Shift+LMB → docked
+            (PanelMode::Hidden, false, lmb, mode_verb("pinned"), PanelMode::Pinned),
+            (PanelMode::Hidden, true, lmb, mode_verb("pinned"), PanelMode::Pinned),
+            (PanelMode::Hidden, false, shift_lmb, dock_verb(), PanelMode::Docked),
+            (PanelMode::Hidden, true, shift_lmb, dock_verb(), PanelMode::Docked),
+            // pinned: LMB → hidden, Shift+LMB → docked
+            (PanelMode::Pinned, false, lmb, mode_verb("hidden"), PanelMode::Hidden),
+            (PanelMode::Pinned, false, shift_lmb, dock_verb(), PanelMode::Docked),
+            // docked: LMB → pinned, Shift+LMB → hidden
+            (PanelMode::Docked, false, lmb, mode_verb("pinned"), PanelMode::Pinned),
+            (PanelMode::Docked, false, shift_lmb, mode_verb("hidden"), PanelMode::Hidden),
+        ];
+        for (start, transient, click, (verb, body), target) in cells {
+            let context = format!("{start:?} + {click:?} → {target:?}");
+            // Click path: the gesture's decoded input, held and unheld — the
+            // corner holds the panel while the pointer rests in it.
+            for held in [false, true] {
+                let mut model = test_model();
+                if start != PanelMode::Hidden {
+                    model.set_mode(Edge::Left, Duration::ZERO, start).unwrap();
+                } else if transient {
+                    model
+                        .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+                        .unwrap();
+                }
+                if held {
+                    model
+                        .panel_input(Edge::Left, at, PanelInput::CornerEntered)
+                        .unwrap();
+                }
+                let update = model.panel_input(Edge::Left, at, click).unwrap();
+                assert_applied_mode(&model, target, &context);
+                assert_eq!(
+                    update.effect,
+                    Some(cosmix_shell::core::PanelEffect::ModeChanged { mode: target }),
+                    "{context} (held={held})"
+                );
+                // Chunk 3's arm: a deliberate undock from Docked hides at
+                // once only when nothing holds the panel; held keeps the
+                // transient reveal (§4.3 — grace never applies to the
+                // deliberate action itself, but the holder still holds).
+                if start == PanelMode::Docked && click == PanelInput::DockToggle {
+                    let snapshot = model.panel(Edge::Left);
+                    assert_eq!(snapshot.transient_revealed, held, "{context}");
+                    assert_eq!(snapshot.hide_at, None, "{context}");
+                }
+            }
+
+            // Verb path: the precise Bus verb, applied to the model and read
+            // back through the props leaf.
+            let mut model = test_model();
+            if start != PanelMode::Hidden {
+                model.set_mode(Edge::Left, Duration::ZERO, start).unwrap();
+            } else if transient {
+                model
+                    .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+                    .unwrap();
+            }
+            let verb_request = wire(verb, body);
+            let (rc, reply, command) = dispatch_shell_request(
+                &verb_request,
+                &ShellFrame::from_model(&model),
+                at,
+            );
+            assert_eq!(rc, 0, "{context}: {reply}");
+            let ShellCommandKind::Panel {
+                edge,
+                input: panel_input,
+            } = command.expect("accepted verb enqueues a command").kind
+            else {
+                panic!("{context}: panel command");
+            };
+            let update = model.panel_input(edge, at, panel_input).unwrap();
+            assert_applied_mode(&model, target, &context);
+            assert_eq!(
+                update.effect,
+                Some(cosmix_shell::core::PanelEffect::ModeChanged { mode: target }),
+                "{context}"
+            );
+            // A deliberate Hide through the mode verb conceals at once: no
+            // transient reveal survives, no grace deadline is armed.
+            if target == PanelMode::Hidden {
+                let snapshot = model.panel(Edge::Left);
+                assert!(!snapshot.transient_revealed, "{context}");
+                assert_eq!(snapshot.hide_at, None, "{context}");
+            }
+            let mut props = request("shell.props.get");
+            props.body = json!({"path":"panels.left.mode"}).to_string();
+            let (rc, leaf, _) = dispatch_shell_request(
+                &props,
+                &ShellFrame::from_model(&model),
+                model.last_update(),
+            );
+            assert_eq!(rc, 0);
+            assert_eq!(
+                serde_json::from_str::<Value>(&leaf).unwrap(),
+                json!(target.as_str()),
+                "{context}: the mode leaf must report the applied mode"
+            );
+        }
+
+        fn assert_applied_mode(
+            model: &cosmix_shell::core::ShellModel,
+            target: PanelMode,
+            context: &str,
+        ) {
+            let snapshot = model.panel(Edge::Left);
+            assert_eq!(snapshot.mode, target, "{context}");
+            if target == PanelMode::Docked {
+                // Docked reserves its full thickness (shell doc §3).
+                assert!(snapshot.exclusive_zone_px > 0.0, "{context}");
+                assert_eq!(
+                    snapshot.exclusive_zone_px, snapshot.thickness_px,
+                    "{context}"
+                );
+            } else {
+                // Hidden and Pinned reserve nothing; a transient reveal
+                // never reads as a reservation.
+                assert_eq!(snapshot.exclusive_zone_px, 0.0, "{context}");
+            }
         }
     }
 

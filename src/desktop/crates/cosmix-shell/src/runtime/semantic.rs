@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::core::{Edge, OutputKey, PanelInput};
+use crate::core::{Edge, OutputKey, PanelInput, PanelMode};
 
 use super::{CarouselInput, ShellCommand, ShellCommandKind};
 
@@ -39,6 +39,13 @@ pub enum ShellSemanticVerb {
     PanelToggle,
     PanelPin,
     PanelUnpin,
+    /// Precise dock: enter `Docked` regardless of the current mode. Docking
+    /// reflows the workspace, so it is never a side effect of another verb.
+    PanelDock,
+    /// Precise per-edge mode set: drive `Hidden`/`Pinned`/`Docked` explicitly
+    /// (shell doc §3.1's verb surface for the menu, keyboard and citizens).
+    /// Unlike the legacy verbs this never leaves a transient reveal behind.
+    PanelMode(PanelMode),
     PageNext,
     PagePrevious,
     PageSet(String),
@@ -71,13 +78,22 @@ pub fn semantic_shell_command(
         },
         ShellSemanticVerb::PanelPin => ShellCommandKind::Panel {
             edge,
-            // Legacy Bus pin reserves space; precise mode verbs are deferred.
+            // Legacy Bus pin keeps its reserving behaviour so popup citizens
+            // hold their space; the precise verbs are PanelDock/PanelMode.
             input: PanelInput::Dock,
         },
         ShellSemanticVerb::PanelUnpin => ShellCommandKind::Panel {
             edge,
             // Includes legacy popup records restored as Docked, and new pins.
             input: PanelInput::Release,
+        },
+        ShellSemanticVerb::PanelDock => ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::Dock,
+        },
+        ShellSemanticVerb::PanelMode(mode) => ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::SetMode(mode),
         },
         ShellSemanticVerb::PageNext => ShellCommandKind::Carousel {
             edge,

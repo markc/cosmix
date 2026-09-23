@@ -34,6 +34,16 @@ impl PanelMode {
             Self::Docked => "docked",
         }
     }
+
+    /// Parse the token [`PanelMode::as_str`] emits; anything else is refused.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "hidden" => Some(Self::Hidden),
+            "pinned" => Some(Self::Pinned),
+            "docked" => Some(Self::Docked),
+            _ => None,
+        }
+    }
 }
 
 /// Inputs accepted by the pure panel state machine.

@@ -637,15 +637,17 @@ the patterns below.</p>
 plane is <code>shell-sub</code>. <code>shell.ping</code> and <code>shell.info</code> provide presence and
 discovery. Live panel state is read through the uniform
 <code>shell.props.{get,list,describe}</code> surface under
-<code>panels.&lt;edge&gt;.{visible,pinned,width_px,page,pages,output}</code>.</p>
-<p><code>pinned</code> is a read-compatibility shim: true for either persistent <code>Pinned</code> or
-<code>Docked</code>, false for <code>Hidden</code> even while transiently revealed. It is not a precise
-mode signal. Existing Bus <code>pin</code> retains its reserving behaviour (<code>Docked</code>),
-including the corner-addressed alias. Existing Bus <code>unpin</code> releases either
-persistent mode into transient grace; follow it with <code>hide</code> to conceal.
-No new mode property or Bus verb is introduced here. Taskbar, popup and capture
-callers retain their existing verb mapping pending the separate caller update.</p>
-<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin}</code>,
+<code>panels.&lt;edge&gt;.{visible,pinned,mode,width_px,page,pages,output}</code>.</p>
+<p><code>mode</code> is the precise mode signal: <code>hidden</code>, <code>pinned</code> (a persistent overlay
+that reserves no space) or <code>docked</code> (reserves its full thickness), independent
+of transient visibility. <code>pinned</code> is a read-compatibility shim: true for either
+persistent <code>Pinned</code> or <code>Docked</code>, false for <code>Hidden</code> even while transiently
+revealed. Existing Bus <code>pin</code> retains its reserving behaviour (<code>Docked</code>),
+including the corner-addressed alias, and existing Bus <code>unpin</code> releases either
+persistent mode into transient grace; follow it with <code>hide</code> to conceal. The
+legacy pair is deliberately unchanged; the corner menu, keyboard bindings and
+citizens that need to drive a mode explicitly use the precise verbs below.</p>
+<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin,dock,mode}</code>,
 <code>shell.panel.page.{next,prev,set}</code> and <code>shell.quit</code>. They require a broker-stamped local,
 registered caller and are translated to the same <code>ShellCommand</code> ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
@@ -653,6 +655,13 @@ persistence. <code>shell.quit</code> and the right Monitoring page's Quit Quoin 
 request a successful Bevy exit through the normal render and surface drain
 (<code>QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit</code>). <code>shell.panel.resize</code> accepts
 <code>edge</code> and <code>thickness_px</code> in the supported 120–500 range.</p>
+<p><code>shell.panel.dock</code> takes <code>edge</code> and enters <code>Docked</code> from any current mode —
+the explicit docking route, since docking reflows the workspace and is never
+a side effect of another verb. <code>shell.panel.mode</code> takes <code>edge</code> and
+<code>mode=hidden|pinned|docked</code> and sets that persistent mode exactly: unlike the
+legacy verbs it never leaves a transient reveal behind, and <code>mode=hidden</code>
+conceals at once with no grace delay, because it is a deliberate action. Read
+back <code>shell.props.get path="panels.&lt;edge&gt;.mode"</code> to verify the applied mode.</p>
 <p>Quoin 0.10.1 also accepts <code>shell.corner.{show,hide,toggle,pin,unpin}</code> with a
 <code>corner</code> argument. These use the same panel state machine and caller checks:</p>
 <table><thead><tr><th>Corner</th><th>Controlled panel</th></tr></thead><tbody>
