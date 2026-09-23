@@ -1914,6 +1914,7 @@ mod tests {
                 ("left", json!(["shift"]), CornerAction::DockToggle),
                 ("left", json!(["ctrl"]), CornerAction::PinToggle),
                 ("left", json!(["alt"]), CornerAction::PinToggle),
+                ("left", json!(["super"]), CornerAction::PinToggle),
                 (
                     "left",
                     json!(["shift", "ctrl", "alt"]),
@@ -2050,10 +2051,11 @@ mod tests {
         }
     }
 
-    /// RMB hold is retired, not merely unmapped: a well-formed new-format
-    /// hold takes the ordinary rejection path and never marks v2 as seen.
+    /// A new-format hold was already refused before chunk 18; this pins only
+    /// which counter the refusal lands in: `diagnostics`, never
+    /// `old_format_rejections`.
     #[test]
-    fn right_hold_with_modifiers_is_refused_as_retired() {
+    fn new_format_right_hold_counts_as_decode_rejection_not_old_format() {
         let (sender, channel) = sync_channel(8);
         let overflow = AtomicBool::new(false);
         let epoch = AtomicU64::new(0);

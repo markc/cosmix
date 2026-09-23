@@ -971,7 +971,11 @@ current Quoin — is louder but no better: Quoin refuses every v2 body from it
 (ERROR `quoin_corner_old_format_rejected`, `field=modifiers`), so RMB does
 nothing and the corner menu is unreachable from the corner. That compositor
 also emitted legacy for every LMB, modified or not, so unmodified LMB still
-pins and Shift+LMB pins instead of docking.
+pins and Shift+LMB pins instead of docking — but only on a fresh Quoin
+connection. Rolling the compositor back in place while Quoin stays connected
+is worse still: Quoin has already seen v2, so it ignores legacy, and the
+rewound sequences drop as stale, so no corner click acts until Quoin
+reconnects.
 Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
 to overlay pinning, Shift+LMB to docking, and RMB to the corner menu.
 Ctrl/Alt/Super without Shift retain LMB pinning. LMB from docked becomes pinned;

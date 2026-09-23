@@ -532,7 +532,10 @@ this input model — and logs ERROR `quoin_corner_old_format_rejected` with
 rejections); `kind: "hold"` is likewise refused for either button. Against such
 a compositor RMB does nothing, unmodified LMB still pins through the legacy
 topic below, and Shift+LMB pins instead of docking, because that compositor
-emits legacy for every LMB. The compositor consumes
+emits legacy for every LMB. That holds only on a fresh Quoin connection: a
+compositor rolled back in place, without Quoin reconnecting, leaves v2 marked
+as seen (so legacy stays ignored) and rewinds sequences (so records drop as
+stale), and no corner click acts until Quoin reconnects. The compositor consumes
 engaged corner presses and their releases, cancelling pending actions on excess
 movement or disengagement. Both buttons act on release; neither has a hold action.
 The menu action calls `CornerMenuHook(fn(&mut World, &OutputKey, Corner))`.
@@ -556,7 +559,7 @@ compositor emits each unmodified LMB's legacy record at sequence N and its v2
 record at N+1, including when the v2 payload has `modifiers: []`;
 the host maps both to N and admits that logical click once, in either delivery
 order. Every modified click emits only v2 and keeps its own sequence, including
-Ctrl/Alt+LMB. On observing v2 it ignores all subsequent legacy clicks for that connection.
+Ctrl/Alt/Super+LMB. On observing v2 it ignores all subsequent legacy clicks for that connection.
 A sequence high-water mark also rejects duplicate/stale click records, before
 output-map queueing. Reconnect clears preference and sequence state; ordinary
 output refreshes and loss markers retain them. This relies on the compositor's
