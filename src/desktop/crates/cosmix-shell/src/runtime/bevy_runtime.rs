@@ -236,6 +236,7 @@ fn update_model(
     time: Res<Time<Real>>,
     mut commands: MessageReader<ShellCommand>,
     mut runtime: ResMut<ShellRuntime>,
+    mut registry: ResMut<SubPanelRegistryState>,
     mut frame: ResMut<ShellFrameState>,
     mut effects: ResMut<ShellEffects>,
     mut replies: (
@@ -363,6 +364,44 @@ fn update_model(
                     }
                 }
                 if carousel.active_index() != before {
+                    effects.1.push(*edge);
+                }
+            }
+            ShellCommandKind::SubPanelRegister { edge, name, owner } => {
+                // Dispatch reserved the seat (receipt-stamped) before acking;
+                // fill the carousel only while that reservation still stands.
+                // An owner sweep between dispatch and application must not
+                // leave an untracked page no verb can address again.
+                let reserved = registry.0.seat(name).is_some_and(|seat| {
+                    seat.edge == *edge
+                        && seat.owner == *owner
+                        && seat.output == *runtime.model.output()
+                });
+                let before = runtime.model.carousel(*edge).active_index();
+                let result = if reserved {
+                    runtime.model.carousel_mut(*edge).register(name)
+                } else {
+                    bevy::log::warn!(
+                        "sub-panel register for '{name}' arrived without its reserved seat"
+                    );
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    bevy::log::warn!("sub-panel register refused at the model: {error}");
+                }
+                if runtime.model.carousel(*edge).active_index() != before {
+                    effects.1.push(*edge);
+                }
+            }
+            ShellCommandKind::SubPanelRemove { edge, name, .. } => {
+                // The registry owns both halves: the seat and the carousel
+                // page leave together, the selection landing per the
+                // carousel's removal rule (previous, else next, else
+                // primary). A seat already gone (owner sweep between
+                // dispatch and here) has had its landing applied there.
+                let before = runtime.model.carousel(*edge).active_index();
+                let _ = registry.0.remove(name, &mut runtime.model);
+                if runtime.model.carousel(*edge).active_index() != before {
                     effects.1.push(*edge);
                 }
             }

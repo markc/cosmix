@@ -386,7 +386,7 @@ fn service_bus(
                         .citizen_receipt
                         .checked_add(1)
                         .expect("receipt sequence exhausted");
-                    let owner = scene_owner(&request, state.citizen_receipt);
+                    let owner = attested_owner(&request, state.citizen_receipt);
                     let SceneBus {
                         scenes, registry, ..
                     } = &mut content;
@@ -404,6 +404,18 @@ fn service_bus(
                     )
                 };
                 (rc, body, None)
+            } else if matches!(
+                request.command.as_str(),
+                "shell.sub.register" | "shell.sub.remove"
+            ) {
+                let (rc, body, command) = dispatch_sub_panel_verb(
+                    &request,
+                    &frame.0,
+                    &mut content.registry.0,
+                    &mut state,
+                    time.elapsed(),
+                );
+                (rc, body, command)
             } else if request.command == "shell.debug.status" {
                 (
                     0,
@@ -525,7 +537,11 @@ fn reconcile_citizens(
 /// Anonymous callers remain mesh-open, but have no discoverable lifetime or
 /// stable identity for same-owner updates. Give each acceptance a distinct
 /// untracked seat owner instead of conflating unrelated anonymous callers.
-fn scene_owner(request: &InboundRequest, receipt: u64) -> String {
+///
+/// The one owner-derivation rule for every citizen-facing ingress (scene
+/// mounts and the sub-panel verbs alike): caller-authored metadata or verb
+/// arguments never choose lifetime ownership.
+fn attested_owner(request: &InboundRequest, receipt: u64) -> String {
     if let (Some(peer), Some(service)) = (
         request.headers.get("broker_peer"),
         request.headers.get("broker_service"),
@@ -659,6 +675,119 @@ fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generat
     }
 }
 
+/// The sub-panel lifecycle verbs (panel doc §3): `sub.register` and
+/// `sub.remove` — activation is a later, separate verb.
+///
+/// These validate against the process-wide registry, not just the frame: a
+/// name is globally unique across all four edges and all outputs, and only
+/// the registry knows names outside the selected model. Correctness checks
+/// alone refuse (duplicate name, unknown name, stale generation) — the
+/// mesh's full-verb-access law applies, so there is deliberately no "who
+/// may" gate beyond the provenance stamp every verb requires.
+///
+/// Registering reserves the seat transactionally at dispatch,
+/// receipt-stamped exactly like a scene mount, so two same-name
+/// registrations drained in one batch cannot both be acked; the enqueued
+/// command fills the carousel at the Model stage of this update. Removing
+/// only checks the seat here — the registry applies the carousel's removal
+/// landing rule at the Model stage, atomically with the seat.
+fn dispatch_sub_panel_verb(
+    request: &InboundRequest,
+    frame: &ShellFrame,
+    registry: &mut cosmix_shell::core::SubPanelRegistry,
+    state: &mut ShellBusState,
+    at: std::time::Duration,
+) -> (u8, String, Option<ShellCommand>) {
+    if let Err(error) = verify_caller_provenance(request) {
+        return (
+            10,
+            json!({"error":format!("sub-panel caller provenance: {error:?}")}).to_string(),
+            None,
+        );
+    }
+    // The bridge drops stale epochs before dispatch; this is the same fence
+    // the scene verbs keep — a stale request must not spend a seat.
+    if state
+        .live_generation
+        .is_some_and(|generation| generation != request.connection_generation)
+    {
+        return (
+            10,
+            json!({"error":"sub-panel request belongs to a stale Quoin connection"}).to_string(),
+            None,
+        );
+    }
+    let register = request.command == "shell.sub.register";
+    let verb = if register { "register" } else { "remove" };
+    let Some(name) = argument(request, "name").filter(|name| !name.trim().is_empty()) else {
+        return (
+            10,
+            json!({"error":format!("sub.{verb} requires a name argument")}).to_string(),
+            None,
+        );
+    };
+    if register {
+        let Some(edge) = argument(request, "edge").and_then(parse_edge) else {
+            return (
+                10,
+                json!({"error":"edge must be left, bottom, right or top"}).to_string(),
+                None,
+            );
+        };
+        // Global duplicate first (the registry is the address space), then
+        // the frame: a live page without a seat (host chrome content) is as
+        // taken as a seated one, because the name is the address.
+        if registry.seat(&name).is_some() {
+            let error = cosmix_shell::core::SubPanelRegistryError::Duplicate(name);
+            return (10, json!({"error":error.to_string()}).to_string(), None);
+        }
+        if frame.panel(edge).page_ids.iter().any(|page| page == &name) {
+            return (
+                10,
+                json!({"error":format!("name '{name}' is already a page on this edge")})
+                    .to_string(),
+                None,
+            );
+        }
+        state.citizen_receipt = state
+            .citizen_receipt
+            .checked_add(1)
+            .expect("receipt sequence exhausted");
+        let receipt = state.citizen_receipt;
+        // Ownership is the attested caller, never a caller-supplied field:
+        // an `owner=` argument off the wire is simply not read.
+        let owner = attested_owner(request, receipt);
+        if let Err(error) =
+            registry.mount(&name, frame.geometry.output.clone(), edge, &owner, receipt)
+        {
+            return (10, json!({"error":error.to_string()}).to_string(), None);
+        }
+        let command = semantic_shell_command(
+            frame.geometry.output.clone(),
+            at,
+            edge,
+            ShellSemanticVerb::SubRegister { name, owner },
+        );
+        return (0, json!({"accepted":true}).to_string(), Some(command));
+    }
+    // Removal: the name is the address; the seat supplies the edge and owner
+    // the command carries. An unknown name is refused, never a creation.
+    let Some((edge, owner)) = registry
+        .seat(&name)
+        .map(|seat| (seat.edge, seat.owner.clone()))
+    else {
+        let error = cosmix_shell::core::SubPanelRegistryError::Unknown(name);
+        return (10, json!({"error":error.to_string()}).to_string(), None);
+    };
+    let command = semantic_shell_command(
+        frame.geometry.output.clone(),
+        at,
+        edge,
+        ShellSemanticVerb::SubRemove { name, owner },
+    );
+    (0, json!({"accepted":true}).to_string(), Some(command))
+}
+
 fn dispatch_shell_request(
     request: &InboundRequest,
     frame: &ShellFrame,
@@ -676,7 +805,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -2338,6 +2467,304 @@ mod tests {
         );
         // Positive control: the same live, attested sender can still load.
         load_scene(&mut app, &peer, "accepted", "owner", "left");
+    }
+
+    /// Chunk-8 fixture: the sub-panel verbs address the process-wide
+    /// registry and the model's carousels, which the runtime plugin owns —
+    /// no chrome needed, so a plain bus app with its model connected.
+    fn sub_panel_app() -> (App, ctk::bus::TestBusPeer) {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        peer.drain_calls();
+        (app, peer)
+    }
+
+    /// Send one sub-panel verb over the live wire shape and drain its reply.
+    fn sub_send(
+        app: &mut App,
+        peer: &ctk::bus::TestBusPeer,
+        command: &str,
+        body: Value,
+    ) -> (u8, Value) {
+        peer.send(wire(command, body));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(
+            replies.len(),
+            1,
+            "one request must produce exactly one reply"
+        );
+        (
+            replies[0].rc,
+            serde_json::from_str(&replies[0].body).unwrap(),
+        )
+    }
+
+    #[test]
+    fn sub_register_remove_round_trip() {
+        let (mut app, peer) = sub_panel_app();
+        // Ownership is the attested caller; a caller-supplied `owner`
+        // argument is never read.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"left","name":"notify.n42","owner":"spoofed"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["accepted"], true);
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["notify.n42"],
+            "registration fills the carousel without chrome content"
+        );
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        let seat = registry.seat("notify.n42").unwrap();
+        assert_eq!(seat.owner, "peer", "the attested caller owns the seat");
+        assert_eq!(seat.edge, Edge::Left);
+        assert!(
+            seat.accepted_at >= 1,
+            "the seat carries its acceptance receipt for disconnect sweeps"
+        );
+
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.remove",
+            json!({"name":"notify.n42"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.n42")
+                .is_none()
+        );
+
+        // The name is free again after removal — for anyone.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"right","name":"notify.n42"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.n42")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sub_register_duplicate_name_refused() {
+        let (mut app, peer) = sub_panel_app();
+        let (rc, _) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"left","name":"notify.n42"}),
+        );
+        assert_eq!(rc, 0);
+        // The same name again — same edge and owner, then another edge: a
+        // name is globally unique across all edges and outputs (panel doc
+        // §5), and both refusals happen at dispatch, before any ack.
+        for edge in ["left", "right"] {
+            let (rc, body) = sub_send(
+                &mut app,
+                &peer,
+                "shell.sub.register",
+                json!({"edge":edge,"name":"notify.n42"}),
+            );
+            assert_eq!(rc, 10, "{edge}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already registered"),
+                "{edge}: {body}"
+            );
+        }
+        // Neither refusal disturbed the original registration.
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(
+            frame
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["notify.n42"]
+        );
+        assert!(frame.panel(Edge::Right).page_ids.is_empty());
+        assert_eq!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.n42")
+                .unwrap()
+                .owner,
+            "peer"
+        );
+        // A live page WITHOUT a seat (host chrome content) is equally taken:
+        // the frame check catches what the registry cannot see.
+        cosmix_shell::runtime::set_shell_pages(
+            app.world_mut(),
+            Edge::Bottom,
+            vec!["launcher".to_owned()],
+            None,
+        );
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"bottom","name":"launcher"}),
+        );
+        assert_eq!(rc, 10, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("already a page"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn sub_remove_unknown_is_refused() {
+        let (mut app, peer) = sub_panel_app();
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"ghost"}));
+        assert_eq!(rc, 10, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("not registered"),
+            "{body}"
+        );
+        // Malformed requests are refused with precise errors; nothing
+        // enqueues and no seat is spent.
+        for (command, body_value, fragment) in [
+            ("shell.sub.remove", json!({}), "requires a name"),
+            ("shell.sub.remove", json!({"name":"  "}), "requires a name"),
+            ("shell.sub.register", json!({"name":"x"}), "edge must be"),
+            (
+                "shell.sub.register",
+                json!({"edge":"sideways","name":"x"}),
+                "edge must be",
+            ),
+        ] {
+            let (rc, body) = sub_send(&mut app, &peer, command, body_value.clone());
+            assert_eq!(rc, 10, "{command} {body_value}: {body}");
+            assert!(body["error"].as_str().unwrap().contains(fragment));
+        }
+        // An unattested caller is refused before any argument is read — the
+        // provenance stamp every verb requires, not a "who may" gate.
+        let mut unattested = request("shell.sub.register");
+        unattested.body = json!({"edge":"left","name":"x"}).to_string();
+        peer.send(unattested);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(replies[0].body.contains("sub-panel caller provenance"));
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("x")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sub_remove_lands_per_removal_rule() {
+        let (mut app, peer) = sub_panel_app();
+        for name in ["alpha", "beta", "gamma"] {
+            let (rc, body) = sub_send(
+                &mut app,
+                &peer,
+                "shell.sub.register",
+                json!({"edge":"left","name":name}),
+            );
+            assert_eq!(rc, 0, "{name}: {body}");
+        }
+        let pages = |app: &App| {
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        };
+        let active = |app: &App| {
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .clone()
+        };
+        assert_eq!(pages(&app), ["alpha", "beta", "gamma"]);
+        // Activation is chunk 16; page.set selects today.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.panel.page.set",
+            json!({"edge":"left","id":"gamma"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(active(&app).as_deref(), Some("gamma"));
+
+        // Removing the shown page lands on the previous registered
+        // neighbour (panel doc §3).
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"gamma"}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(active(&app).as_deref(), Some("beta"));
+        assert_eq!(pages(&app), ["alpha", "beta"]);
+
+        // The remembered selection fell back to the primary, not to the
+        // landing: a fresh reveal shows alpha (chunk 5's rule, reached
+        // through the verb).
+        for verb in ["shell.panel.hide", "shell.panel.show"] {
+            let (rc, body) = sub_send(&mut app, &peer, verb, json!({"edge":"left"}));
+            assert_eq!(rc, 0, "{verb}: {body}");
+        }
+        assert_eq!(active(&app).as_deref(), Some("alpha"));
+
+        // Removing a page that is not shown never moves the selection.
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(active(&app).as_deref(), Some("alpha"));
+        assert_eq!(pages(&app), ["alpha"]);
+        assert_eq!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("peer"),
+            ["alpha"],
+            "each removal took its seat with its page"
+        );
     }
 
     /// A reply that failed because the worker is GONE must be dropped, not
