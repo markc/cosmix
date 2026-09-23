@@ -388,6 +388,13 @@ mod tests {
         .init_resource::<EmbeddedWorkArea>()
         .add_systems(Update, present);
 
+        // A deliberate undock hides immediately when nothing holds the panel,
+        // so hold the bottom edge with the pointer first: the undock iteration
+        // must still land in an overlay state (transient reveal) for this
+        // stacking walk.
+        model
+            .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::PointerEntered)
+            .unwrap();
         for input in [PanelInput::Pin, PanelInput::Dock, PanelInput::Undock] {
             model
                 .panel_input(Edge::Bottom, Duration::ZERO, input)

@@ -85,7 +85,7 @@ fn corner_and_pointer_are_independent_holds_with_explicit_causes() {
 }
 
 #[test]
-fn dock_survives_both_leaves_and_undock_outside_arms_grace() {
+fn dock_survives_both_leaves_and_undock_outside_hides_at_once() {
     let mut panel = panel();
     assert_eq!(
         panel.apply(ms(0), PanelInput::Dock).unwrap().effect,
@@ -103,7 +103,9 @@ fn dock_survives_both_leaves_and_undock_outside_arms_grace() {
             mode: PanelMode::Hidden
         })
     );
-    assert_eq!(panel.snapshot().conceal_reason, Some(ConcealReason::Grace));
+    assert!(!panel.snapshot().transient_revealed);
+    assert_eq!(panel.snapshot().hide_at, None);
+    assert_eq!(panel.snapshot().conceal_reason, None);
 }
 
 #[test]
@@ -236,18 +238,23 @@ fn escape_never_undocks() {
 }
 
 #[test]
-fn undock_outside_starts_normal_grace_timer() {
+fn undock_outside_hides_immediately_without_grace() {
     let mut panel = panel();
     panel.apply(ms(0), PanelInput::Dock).unwrap();
     panel.tick(ms(200)).unwrap();
     panel.apply(ms(250), PanelInput::Undock).unwrap();
     assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
-    assert!(panel.snapshot().transient_revealed);
-    assert_eq!(panel.snapshot().hide_at, Some(ms(1_050)));
+    assert!(!panel.snapshot().transient_revealed);
+    assert_eq!(panel.snapshot().hide_at, None);
     assert_eq!(panel.snapshot().exclusive_zone_px, 0.0);
+    // The conceal animation starts at once: fraction 0.75 at 50 ms of the
+    // 200 ms travel, fully hidden well before the old 1_050 ms deadline.
+    panel.tick(ms(300)).unwrap();
+    assert_eq!(panel.snapshot().visible_fraction, 0.75);
     panel.tick(ms(1_250)).unwrap();
     assert_eq!(panel.snapshot().visible_fraction, 0.0);
     assert!(!panel.snapshot().mapped);
+    assert_eq!(panel.next_deadline(), None);
 }
 
 #[test]

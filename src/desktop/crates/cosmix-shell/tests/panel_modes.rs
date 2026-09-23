@@ -40,8 +40,12 @@ fn every_mode_and_transient_visibility_cross_every_input() {
         (Unpin, [0, 1, 1, 3]),
         (PinToggle, [2, 2, 1, 2]),
         (Dock, [3, 3, 3, 3]),
-        (Undock, [0, 1, 2, 1]),
-        (DockToggle, [3, 3, 3, 1]),
+        // Undock/DockToggle from docked hide immediately: these rows apply
+        // with no pointer or corner hold, and the grace delay never applies
+        // to a deliberate action. Held undocks land in state 1 instead
+        // (asserted in panel.rs).
+        (Undock, [0, 1, 2, 0]),
+        (DockToggle, [3, 3, 3, 0]),
         (Release, [0, 1, 1, 1]),
         (SetMode(Hidden), [0, 0, 0, 0]),
         (SetMode(Pinned), [2, 2, 2, 2]),

@@ -4,7 +4,9 @@
 //!
 //! Ordinary hide and Escape are intentional no-ops while pinned or docked. Corner and
 //! pointer containment are independent holds; concealment after either hold is
-//! attributed to the event which armed the grace deadline.
+//! attributed to the event which armed the grace deadline. A deliberate undock from
+//! docked hides immediately unless a hold keeps the panel revealed: the grace delay
+//! exists to forgive pointer overshoot and never applies to a deliberate action.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -55,11 +57,15 @@ pub enum PanelInput {
     /// effects as Pin/Unpin so persistence observes both directions.
     PinToggle,
     Dock,
+    /// Leave `Docked`: while the pointer or corner holds the panel it degrades
+    /// to a transient reveal with normal grace; with no hold it hides
+    /// immediately.
     Undock,
     DockToggle,
-    /// Set a persistent mode. Hidden conceals immediately; unlike Unpin/Undock
-    /// it does not leave a transient grace hold. Repeating Hidden also dismisses
-    /// a transient reveal, without emitting a persistence effect.
+    /// Set a persistent mode. Hidden conceals immediately, even when a pointer
+    /// or corner hold would keep an undocked panel transiently revealed.
+    /// Repeating Hidden also dismisses a transient reveal, without emitting a
+    /// persistence effect.
     SetMode(PanelMode),
     /// Compatibility release for legacy Bus unpin: releases either persistent
     /// mode into transient visibility with normal grace.
@@ -286,7 +292,15 @@ impl PanelStateMachine {
                 effect = self.release(at).or(effect);
             }
             PanelInput::Undock | PanelInput::DockToggle if self.mode == PanelMode::Docked => {
-                effect = self.release(at).or(effect);
+                // A deliberate undock hides at once when nothing holds the
+                // panel; the grace delay only ever forgives pointer overshoot,
+                // never a deliberate action. A held undock keeps its transient
+                // reveal.
+                if self.pointer_inside || self.corner_inside {
+                    effect = self.release(at).or(effect);
+                } else {
+                    effect = self.change_mode(PanelMode::Hidden).or(effect);
+                }
             }
             PanelInput::Release => effect = self.release(at).or(effect),
             PanelInput::Pin | PanelInput::PinToggle => {
@@ -575,7 +589,7 @@ mod intro_tests {
     }
 
     #[test]
-    fn dock_toggle_flips_both_ways_with_mode_effects_and_undock_grace() {
+    fn deliberate_undock_hides_immediately_only_when_unheld() {
         let mut panel = panel();
         for held in [false, true] {
             if held {
@@ -594,17 +608,20 @@ mod intro_tests {
             );
             let unpinned = panel.apply(Duration::ZERO, PanelInput::DockToggle).unwrap();
             assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
-            assert!(panel.snapshot().transient_revealed);
+            assert_eq!(panel.snapshot().transient_revealed, held);
             assert_eq!(
                 unpinned.effect,
                 Some(PanelEffect::ModeChanged {
                     mode: PanelMode::Hidden
                 })
             );
-            assert_eq!(
-                panel.snapshot().hide_at,
-                (!held).then_some(Duration::from_millis(800))
-            );
+            // Held keeps the transient reveal open; unheld hides at once —
+            // no grace deadline, conceal motion already targeted at hidden.
+            assert_eq!(panel.snapshot().hide_at, None);
+            if !held {
+                assert_eq!(panel.snapshot().conceal_reason, None);
+                assert_eq!(panel.snapshot().target_fraction, 0.0);
+            }
         }
     }
 
