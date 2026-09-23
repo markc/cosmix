@@ -623,6 +623,10 @@ end
 fn mark_loaded($name, $rev)
   if $rev > 0 then
     $state["reg_" .. $name] = true
+  elif $state["reg_" .. $name] then
+    -- a routine refresh of an already-registered page; nothing re-registers,
+    -- the page simply keeps its last accepted content
+    note($name .. " refresh refused; page keeps its last content")
   else
     note($name .. " registration refused; retried on the next panel render")
   end
