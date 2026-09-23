@@ -1332,6 +1332,7 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
             }),
     );
     app.insert_resource(LayerHostWake(external_wake))
+        .init_resource::<crate::file_watch::LayerHostFileWatches>()
         .init_resource::<LayerHostUpdateWake>()
         .init_resource::<LayerHostDeadline>()
         .add_systems(Last, capture_layer_host_redraw);
@@ -1753,6 +1754,17 @@ fn run_layer_host(
         Ok(event_loop) => event_loop,
         Err(error) => return state_exit(state, &format!("calloop-create-failed-{error}"), true),
     };
+    for watch in std::mem::take(
+        &mut state
+            .app
+            .world_mut()
+            .resource_mut::<crate::file_watch::LayerHostFileWatches>()
+            .0,
+    ) {
+        if let Err(error) = watch.insert(&event_loop.handle(), |state| state.needs_update = true) {
+            return state_exit(state, &format!("file-watch-insert-failed-{error}"), true);
+        }
+    }
     if let Err(error) = event_loop
         .handle()
         .insert_source(external_wakes, |event, _, state| {

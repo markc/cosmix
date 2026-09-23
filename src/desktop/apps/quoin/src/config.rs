@@ -20,14 +20,13 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 use cosmix_config::{CosmixDir, Value, cosmix_path, parse_mix_data};
 use cosmix_shell::core::Edge;
 use cosmix_shell::runtime::{ShellRuntimeSet, redeclare_shell_pages};
-use cosmix_shell_host::LayerHostWake;
+use cosmix_shell_host::file_watch::{LayerHostFileWatch, LayerHostFileWatches};
 
 pub const SETTINGS_APPEARANCE: &str = "settings.appearance";
 
@@ -311,24 +310,37 @@ impl ShellConfig {
     }
 }
 
-type Pending = Arc<Mutex<Option<Result<ShellConfig, String>>>>;
+type Pending = Arc<Mutex<ConfigInbox>>;
+type ReportRefusal = Arc<dyn Fn(&Path, &str) + Send + Sync>;
+
+/// Only application is coalesced. Parsing and refusal reporting occur for every
+/// dispatched write event, before replacing this last-write-wins slot.
+#[derive(Default)]
+struct ConfigInbox {
+    generation: u64,
+    candidate: Option<Result<ShellConfig, String>>,
+}
+
+impl ConfigInbox {
+    fn publish(&mut self, candidate: Result<ShellConfig, String>) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("config generation exhausted");
+        self.candidate = Some(candidate);
+    }
+
+    fn restore_if_current(&mut self, generation: u64, config: ShellConfig) {
+        if self.generation == generation && self.candidate.is_none() {
+            self.candidate = Some(Ok(config));
+        }
+    }
+}
 
 #[derive(Resource)]
 struct ConfigReader {
-    path: PathBuf,
     pending: Pending,
     applied: bool,
-    stop: Option<mpsc::Sender<()>>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Drop for ConfigReader {
-    fn drop(&mut self) {
-        self.stop.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 
 fn read(path: &Path) -> Result<String, String> {
@@ -336,7 +348,26 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 impl ConfigReader {
-    fn start(path: PathBuf, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+    fn start(path: PathBuf, report: ReportRefusal) -> std::io::Result<(Self, LayerHostFileWatch)> {
+        let pending = Arc::new(Mutex::new(ConfigInbox::default()));
+        let inbox = Arc::clone(&pending);
+        let file = path.clone();
+        let event_report = Arc::clone(&report);
+        // Watch before reading, so an edit during initial ingestion stays queued
+        // for calloop. Watching the parent survives rename-replace and re-creation.
+        let watch = LayerHostFileWatch::new(
+            path.clone(),
+            Arc::new(move || {
+                let candidate = read(&file).and_then(|source| ShellConfig::parse(&source));
+                if let Err(error) = &candidate {
+                    event_report(&file, error);
+                }
+                inbox
+                    .lock()
+                    .expect("config inbox poisoned")
+                    .publish(candidate);
+            }),
+        )?;
         // A missing file at startup means defaults. Subsequent deletion is a
         // refused edit; writing {} is the explicit reset-to-defaults operation.
         let initial = std::fs::read_to_string(&path);
@@ -345,46 +376,20 @@ impl ConfigReader {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ShellConfig::default()),
             Err(e) => Err(e.to_string()),
         };
-        let mut observed = initial.map_err(|e| e.to_string());
-        let pending = Arc::new(Mutex::new(Some(candidate)));
-        let inbox = Arc::clone(&pending);
-        let file = path.clone();
-        let (stop, stopped) = mpsc::channel();
-        let worker = std::thread::Builder::new()
-            .name("quoin-config".into())
-            .spawn(move || {
-                while matches!(
-                    stopped.recv_timeout(Duration::from_millis(250)),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    let next = read(&file);
-                    if next != observed {
-                        let candidate = next
-                            .as_ref()
-                            .map_err(Clone::clone)
-                            .and_then(|source| ShellConfig::parse(source));
-                        // Diagnose every observed refusal, even if a later edit
-                        // replaces it before the host consumes the pending value.
-                        if let Err(error) = &candidate {
-                            eprintln!(
-                                "QUOIN_CONFIG refused path={} reason={error}",
-                                file.display()
-                            );
-                        }
-                        *inbox.lock().expect("config inbox poisoned") = Some(candidate);
-                        observed = next;
-                        wake();
-                    }
-                }
-            })
-            .expect("start Quoin config reader");
-        Self {
-            path,
-            pending,
-            applied: false,
-            stop: Some(stop),
-            worker: Some(worker),
+        if let Err(error) = &candidate {
+            report(&path, error);
         }
+        pending
+            .lock()
+            .expect("config inbox poisoned")
+            .publish(candidate);
+        Ok((
+            Self {
+                pending,
+                applied: false,
+            },
+            watch,
+        ))
     }
 }
 
@@ -394,30 +399,36 @@ pub(crate) fn install(app: &mut App, smoke: bool) {
     if smoke {
         return;
     }
-    let wake = app.world().resource::<LayerHostWake>().callback();
-    let reader = ConfigReader::start(cosmix_path(CosmixDir::Etc).join("quoin/conf.mix"), wake);
+    let (reader, watch) = ConfigReader::start(
+        cosmix_path(CosmixDir::Etc).join("quoin/conf.mix"),
+        Arc::new(|path, error| {
+            eprintln!(
+                "QUOIN_CONFIG refused path={} reason={error}",
+                path.display()
+            )
+        }),
+    )
+    .expect("install Quoin config directory watch");
+    app.world_mut()
+        .resource_mut::<LayerHostFileWatches>()
+        .0
+        .push(watch);
     app.init_resource::<ShellConfig>()
         .insert_resource(reader)
         .add_systems(Update, ingest.in_set(ShellRuntimeSet::Input));
 }
 
 fn ingest(world: &mut World) {
-    let pending = world
-        .resource::<ConfigReader>()
-        .pending
-        .lock()
-        .expect("config inbox poisoned")
-        .take();
-    let mut candidate = None;
-    if let Some(result) = pending {
-        match result {
-            Ok(config) => candidate = Some(config),
-            Err(error) => eprintln!(
-                "QUOIN_CONFIG refused path={} reason={error}",
-                world.resource::<ConfigReader>().path.display()
-            ),
-        }
-    }
+    let (generation, pending) = {
+        let mut inbox = world
+            .resource::<ConfigReader>()
+            .pending
+            .lock()
+            .expect("config inbox poisoned");
+        (inbox.generation, inbox.candidate.take())
+    };
+    // Refusals were already reported at the read boundary, before coalescing.
+    let candidate = pending.and_then(Result::ok);
     let initial = !world.resource::<ConfigReader>().applied;
     if candidate.is_none() && !initial {
         return;
@@ -429,11 +440,12 @@ fn ingest(world: &mut World) {
             world.resource_mut::<ConfigReader>().applied = true;
         }
         Ok(false) => {
-            *world
+            world
                 .resource::<ConfigReader>()
                 .pending
                 .lock()
-                .expect("config inbox poisoned") = Some(Ok(config));
+                .expect("config inbox poisoned")
+                .restore_if_current(generation, config);
         }
         Err(error) => eprintln!("QUOIN_CONFIG refused reason={error}"),
     }
@@ -444,6 +456,7 @@ mod tests {
     use super::*;
     use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
     use cosmix_shell::runtime::{ShellFrameState, ShellRuntimePlugin};
+    use std::time::Duration;
 
     fn model() -> ShellModel {
         ShellModel::new(
@@ -461,22 +474,20 @@ mod tests {
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
             .init_resource::<ShellConfig>()
             .insert_resource(ConfigReader {
-                path: PathBuf::from("conf.mix"),
-                pending: Arc::new(Mutex::new(None)),
+                pending: Arc::new(Mutex::new(ConfigInbox::default())),
                 applied: false,
-                stop: None,
-                worker: None,
             })
             .add_systems(Update, ingest.in_set(ShellRuntimeSet::Input));
         app
     }
 
     fn edit(app: &mut App, source: &str) {
-        *app.world()
+        app.world()
             .resource::<ConfigReader>()
             .pending
             .lock()
-            .unwrap() = Some(ShellConfig::parse(source));
+            .unwrap()
+            .publish(ShellConfig::parse(source));
         app.update();
     }
 
@@ -498,11 +509,12 @@ mod tests {
             }
         }
         let mut app = app(model);
-        *app.world()
+        app.world()
             .resource::<ConfigReader>()
             .pending
             .lock()
-            .unwrap() = Some(Ok(config.clone()));
+            .unwrap()
+            .publish(Ok(config.clone()));
         app.update();
         for edge in Edge::ALL {
             assert_eq!(
@@ -718,13 +730,7 @@ mod tests {
     fn file_change_wakes_idle_host_and_recovers_after_refusal() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("conf.mix");
-        let (wakes, wake) = mpsc::channel();
-        let reader = ConfigReader::start(
-            path.clone(),
-            Arc::new(move || {
-                let _ = wakes.send(());
-            }),
-        );
+        let (reader, watch) = ConfigReader::start(path.clone(), Arc::new(|_, _| {})).unwrap();
         let mut app = app(model());
         app.insert_resource(reader);
         app.update();
@@ -741,20 +747,88 @@ mod tests {
             let replacement = directory.path().join("replacement.mix");
             std::fs::write(&replacement, source).unwrap();
             std::fs::rename(replacement, &path).unwrap();
-            wake.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(watch.dispatch_pending().unwrap() > 0);
             app.update();
             assert_eq!(
                 app.world().resource::<ShellConfig>().carousel_motion,
                 motion
             );
         }
-        std::fs::remove_file(path).unwrap();
-        wake.recv_timeout(Duration::from_secs(5)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(watch.dispatch_pending().unwrap() > 0);
         app.update();
         assert_eq!(
             app.world().resource::<ShellConfig>().carousel_motion,
             CarouselMotion::Slide
         );
-        // Drop stops and joins the polling thread without waiting for a frame.
+        std::fs::write(path, r#"{carousel_motion: "fade"}"#).unwrap();
+        assert!(watch.dispatch_pending().unwrap() > 0);
+        app.update();
+        assert_eq!(
+            app.world().resource::<ShellConfig>().carousel_motion,
+            CarouselMotion::Fade
+        );
+        assert_eq!(watch.dispatch_pending().unwrap(), 0);
+        // The calloop source owns the descriptor: no reader thread to shut down.
+    }
+
+    #[test]
+    fn refused_write_is_reported_before_valid_write_coalesces_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("conf.mix");
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&reports);
+        let (reader, watch) = ConfigReader::start(
+            path.clone(),
+            Arc::new(move |_, error| {
+                recorded.lock().unwrap().push(error.to_owned());
+            }),
+        )
+        .unwrap();
+        let mut app = app(model());
+        app.insert_resource(reader);
+        app.update();
+
+        // Dispatch the refused write immediately, then a valid write, without
+        // giving Bevy an update between them. No timer or debounce window.
+        // The kernel does not snapshot bytes overwritten before dispatch.
+        std::fs::write(&path, r#"{carousel_motion: "typo"}"#).unwrap();
+        let invalid_events = watch.dispatch_pending().unwrap();
+        assert!(invalid_events > 0);
+        assert_eq!(reports.lock().unwrap().len(), invalid_events);
+        std::fs::write(&path, r#"{carousel_motion: "fade"}"#).unwrap();
+        assert!(watch.dispatch_pending().unwrap() > 0);
+        app.update();
+        assert_eq!(
+            app.world().resource::<ShellConfig>().carousel_motion,
+            CarouselMotion::Fade
+        );
+        let reports = reports.lock().unwrap();
+        assert_eq!(reports.len(), invalid_events);
+        assert!(
+            reports
+                .iter()
+                .all(|error| error.contains("expected slide or fade"))
+        );
+    }
+
+    #[test]
+    fn deferred_candidate_never_clobbers_a_newer_generation() {
+        let mut inbox = ConfigInbox::default();
+        let original = ShellConfig::default();
+        inbox.publish(Ok(original.clone()));
+        let generation = inbox.generation;
+        inbox.candidate.take();
+        let newer = ShellConfig::parse(r#"{carousel_motion: "fade"}"#).unwrap();
+        inbox.publish(Ok(newer.clone()));
+        inbox.restore_if_current(generation, original.clone());
+        assert_eq!(inbox.candidate.as_ref().unwrap().as_ref().unwrap(), &newer);
+        // Even if another consumer took the newer candidate, the old generation
+        // must not be resurrected merely because the slot is empty again.
+        inbox.candidate.take();
+        inbox.restore_if_current(generation, original);
+        assert!(inbox.candidate.is_none());
+        inbox.restore_if_current(inbox.generation, newer.clone());
+        assert_eq!(inbox.candidate.unwrap().unwrap(), newer);
     }
 }
