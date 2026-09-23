@@ -2151,6 +2151,17 @@ mod tests {
         load_scene(&mut app, &peer, "beta", "keeper", "left");
         load_scene(&mut app, &peer, "notes", "owner", "left");
         load_scene(&mut app, &peer, "other-edge", "owner", "right");
+        // Mounting only registers; select the owner's page so disconnect must
+        // exercise removal landing and selection-memory fallback.
+        app.world_mut().write_message(ShellCommand {
+            output: test_model().output().clone(),
+            at: Default::default(),
+            kind: ShellCommandKind::Carousel {
+                edge: Edge::Left,
+                input: CarouselInput::SelectId("scene-notes".into()),
+            },
+        });
+        app.update();
         assert_eq!(
             app.world()
                 .resource::<ShellFrameState>()

@@ -642,6 +642,15 @@ mod tests {
                 let content = world.spawn_empty().id();
                 assert!(mount_page(world, edge, name, name, content));
             }
+            // Registration preserves selection; explicitly visit the page whose
+            // removal must land on its neighbour and reset memory to primary.
+            assert!(
+                world
+                    .resource_mut::<ShellRuntime>()
+                    .model
+                    .carousel_mut(edge)
+                    .select_id("removed")
+            );
             // Owner cleanup lands first; actual chrome teardown must neither
             // resurrect removed pages nor remember the landing as a selection.
             remove_shell_page(world, edge, "removed");

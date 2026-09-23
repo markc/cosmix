@@ -1118,15 +1118,29 @@ mod tests {
 
     fn mount_test_chrome(world: &mut World) {
         use cosmix_shell::chrome::{
-            QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts, spawn_quoin_chrome,
+            QuoinContentBindings, QuoinPageContent, QuoinPageRegistry, QuoinPageSpec,
+            QuoinPanelMounts, spawn_quoin_chrome,
         };
         use cosmix_shell::runtime::ShellFrameState;
-        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+        // Late chrome construction must bind the pages already in the model.
+        let frame = world.resource::<ShellFrameState>().0.clone();
+        let mut bindings = QuoinContentBindings::default();
+        let specs = Edge::ALL.map(|edge| {
+            let ids = &frame.panel(edge).page_ids;
+            bindings.set(
+                edge,
+                ids.iter()
+                    .map(|id| QuoinPageContent::new(id.clone(), world.spawn_empty().id()))
+                    .collect(),
+            );
+            ids.iter()
+                .map(|id| QuoinPageSpec::new(id.clone(), id.clone()))
+                .collect()
+        });
+        let [left, bottom, right, top] = specs;
+        let props = QuoinPageRegistry::new(left, bottom, right, top)
             .unwrap()
-            .bind(
-                &world.resource::<ShellFrameState>().0,
-                QuoinContentBindings::default(),
-            )
+            .bind(&frame, bindings)
             .unwrap();
         let mounts = QuoinPanelMounts::new(
             world.spawn_empty().id(),
