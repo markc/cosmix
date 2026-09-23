@@ -1323,7 +1323,12 @@ pair to admit the first click once in either delivery order, then ignores legacy
 after observing v2. The legacy sibling is required even with <code>modifiers: []</code>:
 Quoin canonicalises the v2 sequence to N. Modified clicks keep their own sequence.
 This versioning preserves old
-shell-hosts with strict JSON decoding; they receive no RMB actions during rollout.
+shell-hosts with strict JSON decoding, but only partly. A host that predates v2
+entirely sees legacy LMB and nothing else. A v2-aware host from before
+<code>modifiers</code> existed is worse: its strict decoder rejects every v2 body, so it
+never marks v2 as seen and acts only on legacy. On that skew RMB and every
+Shift/Ctrl/Alt/Super+LMB click is lost silently; only unmodified LMB works.
+Upgrade the shell-host before, or together with, the compositor.
 Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
 to overlay pinning, Shift+LMB to docking, and RMB to the corner menu.
 Ctrl/Alt/Super without Shift retain LMB pinning. LMB from docked becomes pinned;

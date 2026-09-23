@@ -29723,9 +29723,16 @@ fn port_corner_captures_modifiers_at_press_and_suppresses_every_modified_legacy(
     }
 }
 
+/// Producer-side pin only. The comp crate cannot reach cosmix-shell-host's real
+/// decoder (`corner_bus::decode` and `ClickPreference` are private, and a
+/// shell-host dev-dependency would pull bevy_winit into comp's test graph), so
+/// the canonicalisation below MODELS chunk 4's rule rather than running it. What
+/// this proves is comp's half: every unmodified LMB emits legacy at N and v2 at
+/// N+1, adjacent, with no gap after a preceding standalone click. The decoder's
+/// half is pinned by the corner_bus pair tests.
 #[cfg(feature = "bus")]
 #[test]
-fn port_corner_unmodified_left_keeps_consecutive_siblings_in_both_delivery_orders() {
+fn port_corner_unmodified_left_emits_adjacent_siblings_for_pairing_model() {
     use port_observation::ObservationRecord;
 
     for v2_first in [false, true] {
@@ -29771,7 +29778,7 @@ fn port_corner_unmodified_left_keeps_consecutive_siblings_in_both_delivery_order
             let order = if v2_first { [1, 0] } else { [0, 1] };
             let mut accepted = 0;
             for index in order {
-                // Pin the producer side of chunk 4's payload-based pairing contract.
+                // Model of chunk 4's canonicalisation (v2 seq - 1), not the decoder.
                 let canonical = records[index].event_seq() - u64::from(index == 1);
                 if canonical > last {
                     accepted += 1;

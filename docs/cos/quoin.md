@@ -455,7 +455,9 @@ menu. Ctrl/Alt/Super+LMB without Shift retain pinning. All use the
 counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
-the change. Unpinning leaves transient reveal/grace to the panel model.
+the change. Unpinning leaves transient reveal/grace to the panel model;
+undocking with Shift+LMB does so only while the panel is held, otherwise it
+starts concealment immediately. The menu's Hide conceals at once from any mode.
 Horizontal panels (bottom, top) carry a paging chevron at each end, inset from
 the panel ends by comp's corner-hotspot size, with the title and page dots as a
 centred overlay across the content strip; vertical panels (left, right) keep a
