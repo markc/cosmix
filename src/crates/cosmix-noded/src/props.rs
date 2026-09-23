@@ -199,7 +199,7 @@ fn describe_path(path: &PropPath) -> Option<PropDescribe> {
 
 /// Collect a fresh snapshot from live AppState.
 pub async fn collect(
-    started: Instant,
+    started: std::time::Instant,
     started_iso: &str,
     bind: &str,
     node_name: &str,
