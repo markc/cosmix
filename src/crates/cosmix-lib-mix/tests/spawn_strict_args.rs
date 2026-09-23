@@ -73,10 +73,10 @@ fn wait_for(path: &std::path::Path) -> bool {
 /// command writes it), so an existence-only wait can race.
 fn wait_for_contents(path: &std::path::Path, needle: &str) -> bool {
     for _ in 0..100 {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if s.trim() == needle {
-                return true;
-            }
+        if let Ok(s) = std::fs::read_to_string(path)
+            && s.trim() == needle
+        {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -87,10 +87,10 @@ fn wait_for_contents(path: &std::path::Path, needle: &str) -> bool {
 /// than the needle, e.g. appended content).
 fn wait_for_contents_containing(path: &std::path::Path, needle: &str) -> bool {
     for _ in 0..100 {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if s.contains(needle) {
-                return true;
-            }
+        if let Ok(s) = std::fs::read_to_string(path)
+            && s.contains(needle)
+        {
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
