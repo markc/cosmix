@@ -57,7 +57,7 @@ pub enum PanelInput {
     /// effects as Pin/Unpin so persistence observes both directions.
     PinToggle,
     Dock,
-    /// Leave `Docked`: while the pointer or corner holds the panel it degrades
+    /// Leave `Docked`: while the pointer, corner or resize holds the panel it degrades
     /// to a transient reveal with normal grace; with no hold it hides
     /// immediately.
     Undock,
@@ -296,7 +296,7 @@ impl PanelStateMachine {
                 // panel; the grace delay only ever forgives pointer overshoot,
                 // never a deliberate action. A held undock keeps its transient
                 // reveal.
-                if self.pointer_inside || self.corner_inside {
+                if self.pointer_inside || self.corner_inside || self.resize_start.is_some() {
                     effect = self.release(at).or(effect);
                 } else {
                     effect = self.change_mode(PanelMode::Hidden).or(effect);

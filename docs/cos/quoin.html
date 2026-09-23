@@ -552,9 +552,14 @@ intent without a new commit. This never bypasses an outstanding configure.</p>
 without changing its mode. Only transient visibility auto-hides. An idle hidden
 panel is unmapped; during concealment it stays mapped until its slide finishes.
 Hide, Escape and ordinary visibility toggle do not release either persistent
-mode. Core <code>PinToggle</code> and <code>DockToggle</code> select their respective mode, or release
-it to hidden with transient grace if already selected. <code>SetMode(Hidden)</code> instead
-conceals directly. The Rust model exposes <code>set_mode(edge, at, mode)</code>; new
+mode. Core <code>PinToggle</code> and <code>DockToggle</code> select their respective mode.
+<code>PinToggle</code> from pinned releases into transient visibility with normal conceal
+rules. <code>Undock</code> or <code>DockToggle</code> from docked keeps a transient reveal while held,
+following the normal conceal rules once the holds end. Holders today are the
+pointer in the hotspot or panel, or an active resize. With no holder, a deliberate
+undock hides at once: conceal animation starts immediately, without grace.
+<code>SetMode(Hidden)</code> conceals directly regardless of holds. The Rust model exposes
+<code>set_mode(edge, at, mode)</code>; new
 compositor corner-event discrimination is a separate integration.</p>
 <h2 id="event-driven-wake-contract">Event-driven wake contract</h2>
 <p>There is no fixed rendering tick or animation sleep. The calloop runner
@@ -741,7 +746,8 @@ Brief LMB toggles <strong>Pinned</strong> (persistent overlay); brief RMB toggle
 (reserves space). Both use the existing counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
-the change. Unpinning or undocking leaves transient reveal/grace to the panel model.
+the change. Unpinning leaves transient reveal/grace to the panel model; undocking
+does so only while held, otherwise it starts concealment immediately.
 The header pin control toggles overlay pinning; its glyph is <code>◇</code> for hidden
 (including transient reveal), <code>◆</code> for pinned and <code>▣</code> for docked.</p>
 <p>The compositor also publishes <code>corner.clicked.v2</code> with <code>button</code> and <code>kind</code> for

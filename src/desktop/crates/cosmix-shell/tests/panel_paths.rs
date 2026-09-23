@@ -258,6 +258,62 @@ fn undock_outside_hides_immediately_without_grace() {
 }
 
 #[test]
+fn undock_during_resize_keeps_reveal_until_resize_ends() {
+    for undock in [PanelInput::Undock, PanelInput::DockToggle] {
+        for end in [PanelInput::ResizeCompleted, PanelInput::ResizeCancelled] {
+            let mut panel = panel();
+            panel.apply(ms(0), PanelInput::Dock).unwrap();
+            panel.tick(ms(200)).unwrap();
+            for input in [
+                PanelInput::PointerEntered,
+                PanelInput::ResizeStarted,
+                PanelInput::PointerLeft,
+                undock,
+            ] {
+                panel.apply(ms(250), input).unwrap();
+            }
+            let held = panel.snapshot();
+            assert_eq!(held.mode, PanelMode::Hidden);
+            assert!(held.resize_active);
+            assert!(!held.pointer_inside);
+            assert!(!held.corner_inside);
+            assert!(held.transient_revealed, "{undock:?} / {end:?}");
+            assert_eq!(held.target_fraction, 1.0);
+            assert_eq!(held.exclusive_zone_px, 0.0);
+            assert_eq!(held.hide_at, None);
+            assert_eq!(held.conceal_reason, None);
+
+            // The resize hold outlives both the conceal delay and travel time.
+            panel.tick(ms(2_000)).unwrap();
+            assert_eq!(panel.snapshot().visible_fraction, 1.0);
+            assert!(panel.snapshot().mapped);
+            assert_eq!(panel.next_deadline(), None);
+
+            panel.apply(ms(2_000), end).unwrap();
+            assert!(!panel.snapshot().resize_active);
+            assert!(panel.snapshot().transient_revealed);
+            assert_eq!(panel.snapshot().hide_at, Some(ms(2_800)));
+            assert_eq!(panel.snapshot().conceal_reason, Some(ConcealReason::Grace));
+            panel.tick(ms(2_799)).unwrap();
+            assert_eq!(panel.snapshot().visible_fraction, 1.0);
+            let concealed = panel.tick(ms(2_800)).unwrap();
+            assert_eq!(
+                concealed.effect,
+                Some(PanelEffect::Conceal {
+                    reason: ConcealReason::Grace,
+                })
+            );
+            assert!(!concealed.snapshot.transient_revealed);
+            assert_eq!(concealed.snapshot.target_fraction, 0.0);
+            panel.tick(ms(3_000)).unwrap();
+            assert_eq!(panel.snapshot().visible_fraction, 0.0);
+            assert!(!panel.snapshot().mapped);
+            assert_eq!(panel.next_deadline(), None);
+        }
+    }
+}
+
+#[test]
 fn docking_hidden_panel_maps_it_and_claims_zone_immediately() {
     let mut panel = panel();
     panel.apply(ms(0), PanelInput::Dock).unwrap();

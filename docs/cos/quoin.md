@@ -127,9 +127,14 @@ The persistent modes are `Hidden`, `Pinned` and `Docked`. A separate
 without changing its mode. Only transient visibility auto-hides. An idle hidden
 panel is unmapped; during concealment it stays mapped until its slide finishes.
 Hide, Escape and ordinary visibility toggle do not release either persistent
-mode. Core `PinToggle` and `DockToggle` select their respective mode, or release
-it to hidden with transient grace if already selected. `SetMode(Hidden)` instead
-conceals directly. The Rust model exposes `set_mode(edge, at, mode)`; new
+mode. Core `PinToggle` and `DockToggle` select their respective mode.
+`PinToggle` from pinned releases into transient visibility with normal conceal
+rules. `Undock` or `DockToggle` from docked keeps a transient reveal while held,
+following the normal conceal rules once the holds end. Holders today are the
+pointer in the hotspot or panel, or an active resize. With no holder, a deliberate
+undock hides at once: conceal animation starts immediately, without grace.
+`SetMode(Hidden)` conceals directly regardless of holds. The Rust model exposes
+`set_mode(edge, at, mode)`; new
 compositor corner-event discrimination is a separate integration.
 
 ## Event-driven wake contract
@@ -350,7 +355,8 @@ Brief LMB toggles **Pinned** (persistent overlay); brief RMB toggles **Docked**
 (reserves space). Both use the existing counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
-the change. Unpinning or undocking leaves transient reveal/grace to the panel model.
+the change. Unpinning leaves transient reveal/grace to the panel model; undocking
+does so only while held, otherwise it starts concealment immediately.
 The header pin control toggles overlay pinning; its glyph is `◇` for hidden
 (including transient reveal), `◆` for pinned and `▣` for docked.
 
