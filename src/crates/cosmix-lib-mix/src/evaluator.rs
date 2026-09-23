@@ -11771,8 +11771,10 @@ impl Evaluator {
                     // serve_name() — the Bus service name this `--serve`
                     // citizen registered under, read from the installed
                     // serve runtime; nil for a plain script / REPL (no
-                    // runtime). Zero-arg; extra args are ignored like
-                    // quit(). Registered as an EVAL_SPECIAL builtin: the
+                    // runtime). Zero-arg: under strict arity the `()`
+                    // contract rejects `serve_name(1)` at the top of this
+                    // arm; in the default lenient mode surplus args are
+                    // ignored. Registered as an EVAL_SPECIAL builtin: the
                     // answer lives in evaluator state call_builtin cannot see.
                     if name == "serve_name" {
                         self.check_capability(name)?; // Knob A

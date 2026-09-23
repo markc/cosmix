@@ -134,6 +134,22 @@ fn builtin_shadowing_definition_errors() {
 }
 
 #[test]
+fn builtin_shadowing_covers_evaluator_special_forms() {
+    // MIX-E1303 (0.91.0): the evaluator-special builtins (`serve_name`,
+    // outside `is_builtin` by design) and the Bus forms that are not in
+    // the table at all (`quit`) also win over a same-named user function —
+    // `fn quit() return 1 end; print(quit())` printed nil, undiagnosed.
+    for name in ["serve_name", "quit", "printf"] {
+        let src = format!("function {name}()\n  return 1\nend\nprint({name}())\n");
+        let path = write_temp(&format!("shadow_special_{name}"), &src);
+        let (code, out) = lint(&[path.to_str().unwrap()]);
+        assert_ne!(code, 0, "`function {name}` fails a plain lint: {out}");
+        assert!(out.contains("MIX-E1303"), "{name}: {out}");
+        assert!(out.contains(&format!("function '{name}' shadows")), "{name}: {out}");
+    }
+}
+
+#[test]
 fn pad_loop_idiom_gets_a_note_not_a_warning() {
     // MIX-D3013 (0.74.0): the hand-rolled pad loop notes toward
     // lpad/rpad — and stays a NOTE, so it never denies a deploy gate.

@@ -919,10 +919,18 @@ fn check_pad_loop_idiom(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
 /// encodes its severity permanently (`MIX-W2xxx` are warnings that were
 /// BORN warnings), so W2403 is retired, never reused, and its `mix explain`
 /// entry points here.
+///
+/// The name set is `is_builtin` PLUS the evaluator's inline special forms
+/// (0.91.0). `is_builtin` deliberately excludes the evaluator-special names
+/// (`printf`, `serve_name`, …) and never knew the Bus forms (`quit`,
+/// `reply`, `subscribe`, …) at all, yet the `FunctionCall` eval arm
+/// dispatches each of them before any user-function lookup — `fn quit() return 1 end;
+/// print(quit())` printed nil with no diagnostic.
 fn check_builtin_shadowing(stmts: &[Stmt], ctx: &FileContext, a: &mut Analysis) {
     walk_stmts(stmts, &mut |stmt| {
         if let StmtKind::FunctionDef { name, .. } = &stmt.kind
-            && crate::builtins::is_builtin(name)
+            && (crate::builtins::is_builtin(name)
+                || INLINE_SPECIAL_FORMS.contains(&name.as_str()))
         {
             a.diagnostics.push(diag(
                 ctx,
