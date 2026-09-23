@@ -68,9 +68,11 @@ pub(crate) enum CornerAction {
 }
 
 /// Click sequence numbers belong to one compositor observation stream.
-/// The compositor emits an LMB legacy record immediately before its v2 record,
-/// allocating consecutive sequence numbers. Canonicalise both to the legacy
-/// number, so even the first click (before v2 discovery) acts exactly once.
+/// The compositor emits a legacy record immediately before an unmodified LMB
+/// v2 record, allocating consecutive sequence numbers. Canonicalise that pair
+/// to the legacy number so even the first click acts exactly once. Pairing is
+/// decoded from button + modifiers, never from the action: Ctrl/Alt+LMB still
+/// pin, but every modified click is standalone and keeps its own sequence.
 #[derive(Default)]
 struct ClickPreference {
     v2_seen: bool,
@@ -79,13 +81,13 @@ struct ClickPreference {
 }
 
 impl ClickPreference {
-    fn accept(&mut self, kind: &CornerKind, sequence: u64) -> bool {
+    fn accept(&mut self, kind: &CornerKind, sequence: u64, pairs_with_legacy: bool) -> bool {
         let canonical = match kind {
             CornerKind::Clicked if self.v2_seen => return false,
             CornerKind::Clicked => sequence,
-            CornerKind::Action(action) => {
+            CornerKind::Action(_) => {
                 self.v2_seen = true;
-                if *action == CornerAction::PinToggle {
+                if pairs_with_legacy {
                     let Some(previous) = sequence.checked_sub(1) else {
                         return false;
                     };
@@ -487,7 +489,10 @@ impl WorkerState {
                 // Broker subscriptions accept unpublished topics: subscribing
                 // successfully cannot tell us whether comp supports v2.
                 // Filter before queueing so refreshes cannot double a click.
-                if !self.clicks.accept(&corner.kind, corner.event_seq) {
+                if !self
+                    .clicks
+                    .accept(&corner.kind, corner.event_seq, corner.pairs_with_legacy)
+                {
                     return DecodeAction::None;
                 }
                 if !self.map_valid {
@@ -1327,6 +1332,8 @@ struct DecodedCorner {
     dwell_ms: u64,
     kind: CornerKind,
     event_seq: u64,
+    /// Only an unmodified left-button v2 payload has a legacy sibling.
+    pairs_with_legacy: bool,
 }
 
 enum Decoded {
@@ -1353,6 +1360,21 @@ struct CornerActionBody {
     event_seq: u64,
     button: String,
     kind: String,
+    /// Absence selects the old RMB brief=dock / hold=menu mapping. Presence
+    /// (even an empty list) selects Shift+LMB=dock / RMB brief=menu, no RMB hold.
+    /// Deploy this decoder before the producer: old decoders reject the new
+    /// field. Rolling the producer back is safe because absence stays legacy.
+    #[serde(default, deserialize_with = "present_modifiers")]
+    modifiers: Option<Vec<String>>,
+}
+
+// Missing means legacy with no modifiers; a present value must be a list.
+// In particular, null must not silently select the old mapping.
+fn present_modifiers<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -1430,13 +1452,24 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
         );
         return Ok(Decoded::Refresh);
     }
-    let (body, action) = if expected == "corner.clicked.v2" {
+    let (body, action, pairs_with_legacy) = if expected == "corner.clicked.v2" {
         let body: CornerActionBody =
             serde_json::from_str(&command.body).map_err(|error| error.to_string())?;
-        let action = match (body.button.as_str(), body.kind.as_str()) {
-            ("left", "brief") if body.event_seq > 0 => CornerAction::PinToggle,
-            ("right", "brief") => CornerAction::DockToggle,
-            ("right", "hold") => CornerAction::Menu,
+        let modifiers = body.modifiers.as_deref().unwrap_or_default();
+        let pairs_with_legacy = body.button == "left" && modifiers.is_empty();
+        if pairs_with_legacy && body.event_seq == 0 {
+            return Err("paired corner action has no legacy sequence".to_owned());
+        }
+        let shift = modifiers.iter().any(|modifier| modifier == "shift");
+        let action = match (
+            body.modifiers.is_some(),
+            body.button.as_str(),
+            body.kind.as_str(),
+        ) {
+            (true, "left", "brief") if shift => CornerAction::DockToggle,
+            (_, "left", "brief") => CornerAction::PinToggle,
+            (false, "right", "brief") => CornerAction::DockToggle,
+            (false, "right", "hold") | (true, "right", "brief") => CornerAction::Menu,
             _ => return Err("invalid corner action".to_owned()),
         };
         (
@@ -1447,11 +1480,13 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
                 event_seq: body.event_seq,
             },
             Some(action),
+            pairs_with_legacy,
         )
     } else {
         (
             serde_json::from_str::<CornerBody>(&command.body).map_err(|error| error.to_string())?,
             None,
+            false,
         )
     };
     if !valid_slug(&body.output) || body.dwell_ms > MAX_DWELL_MS {
@@ -1480,6 +1515,7 @@ fn decode(topics: &Topics, command: &IncomingCommand) -> Result<Decoded, String>
         dwell_ms: body.dwell_ms,
         kind,
         event_seq: body.event_seq,
+        pairs_with_legacy,
     }))
 }
 
@@ -1824,15 +1860,50 @@ mod tests {
             ("br", Corner::BottomRight, cosmix_shell::core::Edge::Right),
             ("tr", Corner::TopRight, cosmix_shell::core::Edge::Top),
         ] {
-            for (button, kind, action) in [
-                ("left", "brief", CornerAction::PinToggle),
-                ("right", "brief", CornerAction::DockToggle),
-                ("right", "hold", CornerAction::Menu),
+            // None also exercises producer rollback after this decoder deploys.
+            for (button, kind, modifiers, action) in [
+                ("left", "brief", None, CornerAction::PinToggle),
+                ("right", "brief", None, CornerAction::DockToggle),
+                ("right", "hold", None, CornerAction::Menu),
+                ("left", "brief", Some(json!([])), CornerAction::PinToggle),
+                (
+                    "left",
+                    "brief",
+                    Some(json!(["shift"])),
+                    CornerAction::DockToggle,
+                ),
+                (
+                    "left",
+                    "brief",
+                    Some(json!(["ctrl"])),
+                    CornerAction::PinToggle,
+                ),
+                (
+                    "left",
+                    "brief",
+                    Some(json!(["alt"])),
+                    CornerAction::PinToggle,
+                ),
+                (
+                    "left",
+                    "brief",
+                    Some(json!(["shift", "ctrl", "alt"])),
+                    CornerAction::DockToggle,
+                ),
+                ("right", "brief", Some(json!([])), CornerAction::Menu),
+                ("right", "brief", Some(json!(["shift"])), CornerAction::Menu),
             ] {
-                let body = json!({
+                let mut body = json!({
                     "output": "o_dp_1", "corner": wire, "button": button,
                     "kind": kind, "dwell_ms": 200, "event_seq": 10,
                 });
+                let pairs = button == "left"
+                    && modifiers
+                        .as_ref()
+                        .is_none_or(|value| value.as_array().unwrap().is_empty());
+                if let Some(modifiers) = modifiers {
+                    body["modifiers"] = modifiers;
+                }
                 let command = incoming(
                     "comp.corner.clicked.v2",
                     "corner.clicked.v2",
@@ -1845,6 +1916,7 @@ mod tests {
                 assert_eq!(decoded.corner.summoned_edge(), edge);
                 assert_eq!(decoded.kind, CornerKind::Action(action));
                 assert_eq!(decoded.event_seq, 10);
+                assert_eq!(decoded.pairs_with_legacy, pairs);
             }
         }
         for (button, kind) in [("left", "hold"), ("middle", "brief"), ("right", "drag")] {
@@ -1876,7 +1948,7 @@ mod tests {
 
     #[test]
     fn legacy_and_v2_pair_toggle_once_in_either_order_even_while_map_is_pending() {
-        for v2_first in [false, true] {
+        for (v2_first, new_format) in [(false, false), (true, false), (false, true), (true, true)] {
             for map_pending in [false, true] {
                 let (sender, channel) = sync_channel(8);
                 let overflow = AtomicBool::new(false);
@@ -1891,12 +1963,17 @@ mod tests {
                     "output": "o_dp_1", "corner": "tl", "dwell_ms": 200, "event_seq": 9,
                 })
                 .to_string();
-                let v2 = json!({
+                let mut v2 = json!({
                     "output": "o_dp_1", "corner": "tl", "dwell_ms": 200, "event_seq": 10,
                     "button": "left", "kind": "brief",
-                })
-                .to_string();
-                let mut pair = [("corner.clicked", legacy), ("corner.clicked.v2", v2)];
+                });
+                if new_format {
+                    v2["modifiers"] = json!([]);
+                }
+                let mut pair = [
+                    ("corner.clicked", legacy),
+                    ("corner.clicked.v2", v2.to_string()),
+                ];
                 if v2_first {
                     pair.reverse();
                 }
@@ -1932,42 +2009,338 @@ mod tests {
     }
 
     #[test]
+    fn shift_left_brief_decodes_dock_toggle() {
+        let decoded = decode_action("left", "brief", Some(json!(["shift"])), 1).unwrap();
+        assert_eq!(decoded.kind, CornerKind::Action(CornerAction::DockToggle));
+        assert!(!decoded.pairs_with_legacy);
+    }
+
+    #[test]
+    fn new_format_right_hold_is_rejected() {
+        for modifiers in [json!([]), json!(["shift"]), json!(["ctrl", "alt"])] {
+            assert!(decode_action("right", "hold", Some(modifiers), 1).is_err());
+        }
+    }
+
+    #[test]
+    fn old_format_right_hold_still_menus() {
+        let decoded = decode_action("right", "hold", None, 1).unwrap();
+        assert_eq!(decoded.kind, CornerKind::Action(CornerAction::Menu));
+        assert!(!decoded.pairs_with_legacy);
+    }
+
+    fn action_body(button: &str, kind: &str, modifiers: Option<Value>, sequence: u64) -> Value {
+        let mut body = json!({
+            "output": "o_dp_1", "corner": "tl", "dwell_ms": 200,
+            "event_seq": sequence, "button": button, "kind": kind,
+        });
+        if let Some(modifiers) = modifiers {
+            body["modifiers"] = modifiers;
+        }
+        body
+    }
+
+    fn decode_action(
+        button: &str,
+        kind: &str,
+        modifiers: Option<Value>,
+        sequence: u64,
+    ) -> Result<DecodedCorner, String> {
+        match decode(
+            &Topics::new("comp"),
+            &incoming(
+                "comp.corner.clicked.v2",
+                "corner.clicked.v2",
+                &action_body(button, kind, modifiers, sequence).to_string(),
+            ),
+        )? {
+            Decoded::Corner(corner) => Ok(corner),
+            _ => panic!("action decoded as a non-corner event"),
+        }
+    }
+
+    #[test]
+    fn modifiers_keep_strict_schema_and_only_paired_clicks_require_previous_sequence() {
+        for malformed in [
+            json!(null),
+            json!("shift"),
+            json!([1]),
+            json!({"shift": true}),
+        ] {
+            assert!(decode_action("left", "brief", Some(malformed), 1).is_err());
+        }
+        for modifiers in [None, Some(json!([])), Some(json!(["shift"]))] {
+            for (button, kind) in [("left", "hold"), ("middle", "brief"), ("right", "drag")] {
+                assert!(decode_action(button, kind, modifiers.clone(), 1).is_err());
+            }
+            let mut body = action_body("left", "brief", modifiers, 1);
+            body["unknown"] = json!(true);
+            assert!(
+                decode(
+                    &Topics::new("comp"),
+                    &incoming(
+                        "comp.corner.clicked.v2",
+                        "corner.clicked.v2",
+                        &body.to_string()
+                    ),
+                )
+                .is_err()
+            );
+        }
+        assert!(decode_action("left", "brief", None, 0).is_err());
+        assert!(decode_action("left", "brief", Some(json!([])), 0).is_err());
+        for modifiers in [json!(["shift"]), json!(["ctrl"]), json!(["alt"])] {
+            let decoded = decode_action("left", "brief", Some(modifiers), 0).unwrap();
+            let mut clicks = ClickPreference::default();
+            assert!(clicks.accept(&decoded.kind, decoded.event_seq, decoded.pairs_with_legacy));
+            assert_eq!(clicks.last_sequence, Some(0));
+        }
+    }
+
+    #[test]
+    fn shift_click_never_pairs_with_legacy() {
+        modified_click_never_pairs_in_either_order(json!(["shift"]), CornerAction::DockToggle);
+        modified_click_never_pairs_in_either_order(
+            json!(["shift", "ctrl", "alt"]),
+            CornerAction::DockToggle,
+        );
+    }
+
+    #[test]
+    fn ctrl_left_brief_never_pairs_in_either_order() {
+        modified_click_never_pairs_in_either_order(json!(["ctrl"]), CornerAction::PinToggle);
+        modified_click_never_pairs_in_either_order(json!(["ctrl", "alt"]), CornerAction::PinToggle);
+    }
+
+    #[test]
+    fn alt_left_brief_never_pairs_in_either_order() {
+        modified_click_never_pairs_in_either_order(json!(["alt"]), CornerAction::PinToggle);
+    }
+
+    fn modified_click_never_pairs_in_either_order(modifiers: Value, action: CornerAction) {
+        for v2_first in [false, true] {
+            for map_pending in [false, true] {
+                let (sender, channel) = sync_channel(8);
+                let overflow = AtomicBool::new(false);
+                let epoch = AtomicU64::new(0);
+                let output = OutputKey::new("DP-1").unwrap();
+                let mut state = WorkerState::new("comp", output.clone());
+                let outputs = BTreeMap::from([("o_dp_1".to_owned(), output.clone())]);
+                if !map_pending {
+                    state.install_outputs(outputs.clone(), &sender, &overflow, &epoch);
+                }
+                // The legacy record is an earlier, separate click, not a sibling.
+                let legacy = json!({
+                    "output": "o_dp_1", "corner": "tl", "dwell_ms": 200, "event_seq": 9,
+                })
+                .to_string();
+                let modified =
+                    action_body("left", "brief", Some(modifiers.clone()), 10).to_string();
+                let mut records = [("corner.clicked", legacy), ("corner.clicked.v2", modified)];
+                if v2_first {
+                    records.reverse();
+                }
+                for _ in 0..2 {
+                    for (command, body) in &records {
+                        state.decode_and_apply(
+                            incoming(&format!("comp.{command}"), command, body),
+                            &sender,
+                            &overflow,
+                            &epoch,
+                        );
+                    }
+                }
+                assert_eq!(state.clicks.last_sequence, Some(10));
+                if map_pending {
+                    assert!(channel.try_recv().is_err());
+                    state.install_outputs(outputs, &sender, &overflow, &epoch);
+                }
+                if !v2_first {
+                    assert_eq!(
+                        channel.try_recv().unwrap(),
+                        CornerIngress::Action {
+                            output: output.clone(),
+                            epoch: 0,
+                            corner: Corner::TopLeft,
+                            action: CornerAction::PinToggle,
+                        }
+                    );
+                }
+                assert_eq!(
+                    channel.try_recv().unwrap(),
+                    CornerIngress::Action {
+                        output: output.clone(),
+                        epoch: 0,
+                        corner: Corner::TopLeft,
+                        action,
+                    }
+                );
+                assert!(channel.try_recv().is_err());
+                // Consecutive standalone clicks must each act without a legacy record.
+                state.decode_and_apply(
+                    incoming(
+                        "comp.corner.clicked.v2",
+                        "corner.clicked.v2",
+                        &action_body("left", "brief", Some(modifiers.clone()), 11).to_string(),
+                    ),
+                    &sender,
+                    &overflow,
+                    &epoch,
+                );
+                assert_eq!(
+                    channel.try_recv().unwrap(),
+                    CornerIngress::Action {
+                        output,
+                        epoch: 0,
+                        corner: Corner::TopLeft,
+                        action,
+                    }
+                );
+                assert!(channel.try_recv().is_err());
+                assert!(state.engaged.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_payloads_keep_semantics_and_pairing_across_reconnect_and_sequence_rewind() {
+        for v2_first in [false, true] {
+            for map_pending in [false, true] {
+                // A new worker is a new connection; low sequences are valid again.
+                for base in [500_000, 0] {
+                    let (sender, channel) = sync_channel(16);
+                    let overflow = AtomicBool::new(false);
+                    let epoch = AtomicU64::new(0);
+                    let output = OutputKey::new("DP-1").unwrap();
+                    let outputs = BTreeMap::from([("o_dp_1".to_owned(), output.clone())]);
+                    let mut state = WorkerState::new("comp", output.clone());
+                    if !map_pending {
+                        state.install_outputs(outputs.clone(), &sender, &overflow, &epoch);
+                    }
+                    let mut expected = Vec::new();
+                    // Old producer -> new producer -> rollback, on one connection.
+                    for (index, modifiers) in [None, Some(json!([])), None].into_iter().enumerate()
+                    {
+                        let sequence = base + 1 + index as u64 * 4;
+                        let legacy = json!({
+                            "output": "o_dp_1", "corner": "tl", "dwell_ms": 200,
+                            "event_seq": sequence,
+                        })
+                        .to_string();
+                        let v2 = action_body("left", "brief", modifiers.clone(), sequence + 1)
+                            .to_string();
+                        let mut pair = [("corner.clicked", legacy), ("corner.clicked.v2", v2)];
+                        if v2_first {
+                            pair.reverse();
+                        }
+                        let right = action_body("right", "brief", modifiers.clone(), sequence + 2)
+                            .to_string();
+                        let modified =
+                            action_body("left", "brief", Some(json!(["ctrl"])), sequence + 3)
+                                .to_string();
+                        for _ in 0..2 {
+                            for (command, body) in &pair {
+                                state.decode_and_apply(
+                                    incoming(&format!("comp.{command}"), command, body),
+                                    &sender,
+                                    &overflow,
+                                    &epoch,
+                                );
+                            }
+                            for body in [&right, &modified] {
+                                state.decode_and_apply(
+                                    incoming("comp.corner.clicked.v2", "corner.clicked.v2", body),
+                                    &sender,
+                                    &overflow,
+                                    &epoch,
+                                );
+                            }
+                        }
+                        expected.extend([
+                            CornerAction::PinToggle,
+                            if modifiers.is_some() {
+                                CornerAction::Menu
+                            } else {
+                                CornerAction::DockToggle
+                            },
+                            CornerAction::PinToggle,
+                        ]);
+                    }
+                    assert_eq!(state.clicks.last_sequence, Some(base + 12));
+                    // A rewind without reconnect remains stale in both formats.
+                    let rejections = state.clicks.sequence_rejections;
+                    for modifiers in [None, Some(json!([])), Some(json!(["ctrl"]))] {
+                        state.decode_and_apply(
+                            incoming(
+                                "comp.corner.clicked.v2",
+                                "corner.clicked.v2",
+                                &action_body("left", "brief", modifiers, 1).to_string(),
+                            ),
+                            &sender,
+                            &overflow,
+                            &epoch,
+                        );
+                    }
+                    assert_eq!(state.clicks.sequence_rejections, rejections + 3);
+                    if map_pending {
+                        assert!(channel.try_recv().is_err());
+                        state.install_outputs(outputs, &sender, &overflow, &epoch);
+                    }
+                    for action in expected {
+                        assert_eq!(
+                            channel.try_recv().unwrap(),
+                            CornerIngress::Action {
+                                output: output.clone(),
+                                epoch: 0,
+                                corner: Corner::TopLeft,
+                                action,
+                            }
+                        );
+                    }
+                    assert!(channel.try_recv().is_err());
+                    assert!(!overflow.load(Ordering::Acquire));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn v2_preference_ignores_legacy_and_duplicate_actions_until_new_connection() {
         let mut clicks = ClickPreference::default();
         let pin = CornerKind::Action(CornerAction::PinToggle);
         let dock = CornerKind::Action(CornerAction::DockToggle);
         let menu = CornerKind::Action(CornerAction::Menu);
-        assert!(clicks.accept(&pin, 10));
-        assert!(!clicks.accept(&CornerKind::Clicked, 11));
-        assert!(clicks.accept(&dock, 12));
-        assert!(!clicks.accept(&dock, 12));
-        assert!(clicks.accept(&menu, 13));
-        assert!(!clicks.accept(&menu, 13));
-        assert!(!clicks.accept(&pin, 10));
-        assert!(clicks.accept(&pin, 15));
+        assert!(clicks.accept(&pin, 10, true));
+        assert!(!clicks.accept(&CornerKind::Clicked, 11, false));
+        assert!(clicks.accept(&dock, 12, false));
+        assert!(!clicks.accept(&dock, 12, false));
+        assert!(clicks.accept(&menu, 13, false));
+        assert!(!clicks.accept(&menu, 13, false));
+        assert!(!clicks.accept(&pin, 10, true));
+        assert!(clicks.accept(&pin, 15, true));
         clicks = ClickPreference::default();
-        assert!(clicks.accept(&CornerKind::Clicked, 1));
-        assert!(!clicks.accept(&CornerKind::Clicked, 1));
-        assert!(clicks.accept(&CornerKind::Clicked, 2));
+        assert!(clicks.accept(&CornerKind::Clicked, 1, false));
+        assert!(!clicks.accept(&CornerKind::Clicked, 1, false));
+        assert!(clicks.accept(&CornerKind::Clicked, 2, false));
     }
 
     #[test]
     fn publisher_sequence_restart_is_counted_without_resetting_high_water_mark() {
         let mut clicks = ClickPreference::default();
         let dock = CornerKind::Action(CornerAction::DockToggle);
-        assert!(clicks.accept(&dock, 500_000));
+        assert!(clicks.accept(&dock, 500_000, false));
         // Normal legacy suppression must not count as a sequence rejection.
-        assert!(!clicks.accept(&CornerKind::Clicked, 1));
+        assert!(!clicks.accept(&CornerKind::Clicked, 1, false));
         assert_eq!(clicks.sequence_rejections, 0);
         for sequence in [1, 2, 500_000] {
-            assert!(!clicks.accept(&dock, sequence));
+            assert!(!clicks.accept(&dock, sequence, false));
         }
         assert_eq!(clicks.sequence_rejections, 3);
         assert_eq!(clicks.last_sequence, Some(500_000));
-        assert!(clicks.accept(&dock, 500_001));
+        assert!(clicks.accept(&dock, 500_001, false));
         clicks = ClickPreference::default();
         assert_eq!(clicks.sequence_rejections, 0);
-        assert!(clicks.accept(&dock, 1));
+        assert!(clicks.accept(&dock, 1, false));
     }
 
     #[test]
@@ -2136,6 +2509,7 @@ mod tests {
             dwell_ms: 10,
             kind: CornerKind::Entered,
             event_seq: 1,
+            pairs_with_legacy: false,
         };
         state.apply_corner(foreign, &sender, &overflow, &epoch);
         assert!(channel.try_recv().is_err());
@@ -2145,6 +2519,7 @@ mod tests {
             dwell_ms: 10,
             kind: CornerKind::Entered,
             event_seq: 2,
+            pairs_with_legacy: false,
         };
         state.apply_corner(selected.clone(), &sender, &overflow, &epoch);
         state.apply_corner(selected, &sender, &overflow, &epoch);
@@ -2170,6 +2545,7 @@ mod tests {
             dwell_ms: 20,
             kind: CornerKind::Entered,
             event_seq: 1,
+            pairs_with_legacy: false,
         });
         assert!(channel.try_recv().is_err());
         state.install_outputs(
@@ -2220,6 +2596,7 @@ mod tests {
                 dwell_ms: 20,
                 kind: CornerKind::Entered,
                 event_seq: 1,
+                pairs_with_legacy: false,
             },
             &sender,
             &overflow,
