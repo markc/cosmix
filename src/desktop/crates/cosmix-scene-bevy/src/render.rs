@@ -245,7 +245,9 @@ struct View {
 #[derive(Component)]
 struct SceneLayoutBase(Node);
 
-pub(crate) fn reconcile(world: &mut World) {
+/// Apply accepted scene transactions to mounted chrome. `ScenePlugin` schedules
+/// this between shell input and model updates; minimal hosts may do so directly.
+pub fn reconcile(world: &mut World) {
     let scale = icons::effective_scale(world);
     let scale_changed = world
         .get_resource::<IconScale>()
@@ -257,6 +259,28 @@ pub(crate) fn reconcile(world: &mut World) {
         }
         for entry in store.scenes.values_mut() {
             let edge = scene_edge(&entry.tree);
+            // Production ingress reserved this exact name before replying.
+            // Rendering never creates or steals a registry seat.
+            if let Some(owner) = &entry.owner {
+                let valid = world
+                    .get_resource::<cosmix_shell::runtime::SubPanelRegistryState>()
+                    .and_then(|registry| registry.0.seat(&page_id(&entry.tree)))
+                    .is_some_and(|seat| {
+                        seat.owner == owner.citizen
+                            && seat.accepted_at == owner.accepted_at
+                            && seat.edge == edge
+                            && world
+                                .get_resource::<cosmix_shell::runtime::ShellFrameState>()
+                                .is_some_and(|frame| seat.output == frame.0.geometry.output)
+                    });
+                if !valid {
+                    warn!(
+                        scene = entry.tree.name,
+                        "scene mount has no matching reserved seat"
+                    );
+                    continue;
+                }
+            }
             if entry.mounted.as_ref().is_some_and(|m| m.edge != edge) {
                 // Reparent the existing page when its edge changes: fields survive.
                 let m = entry.mounted.as_mut().unwrap();
@@ -344,15 +368,18 @@ pub(crate) fn reconcile(world: &mut World) {
 }
 
 fn destroy(world: &mut World, mounted: Mounted) {
-    cosmix_shell::chrome::unmount_page(world, mounted.edge, &page_id(&mounted.tree));
+    let id = page_id(&mounted.tree);
+    // The acceptance/unload transaction owns the reservation. An old mounted
+    // tree can be destroyed after a same-name replacement has reserved it.
+    cosmix_shell::chrome::unmount_page(world, mounted.edge, &id);
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
     }
 }
-fn page_id(tree: &ResolvedScene) -> String {
+pub(crate) fn page_id(tree: &ResolvedScene) -> String {
     format!("scene-{}", tree.name)
 }
-fn scene_edge(tree: &ResolvedScene) -> Edge {
+pub(crate) fn scene_edge(tree: &ResolvedScene) -> Edge {
     match mount_config(tree)
         .as_ref()
         .and_then(|w| w["edge"].as_str())
@@ -1746,6 +1773,209 @@ mod tests {
                 .is_empty()
         );
         assert!(world.get_entity(page).is_err());
+    }
+
+    /// Exercise the reservation used by production ingress and actual chrome.
+    #[test]
+    fn scene_mounts_feed_the_subpanel_owner_map() {
+        use cosmix_shell::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            spawn_quoin_chrome,
+        };
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{
+            SceneVerb, ShellFrameState, ShellRuntimePlugin, SubPanelRegistryState,
+        };
+        fn request(
+            world: &mut World,
+            verb: SceneVerb,
+            body: &str,
+            args: &Value,
+            owner: &str,
+            receipt: u64,
+        ) -> Result<(Value, Option<Value>), Value> {
+            world.resource_scope(|world, mut store: Mut<SceneStore>| {
+                world.resource_scope(|world, mut registry: Mut<SubPanelRegistryState>| {
+                    store.request_mounted(
+                        verb,
+                        body,
+                        args,
+                        Some(&mut super::super::SceneMount {
+                            registry: &mut registry.0,
+                            output: &world.resource::<ShellFrameState>().0.geometry.output,
+                            owner,
+                            accepted_at: receipt,
+                        }),
+                    )
+                })
+            })
+        }
+        let mut app = App::new();
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ShellRuntimePlugin::new(model))
+            .add_plugins(QuoinChromePlugin)
+            .init_resource::<SceneStore>();
+        let world = app.world_mut();
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        let source = |citizen: &str| {
+            format!(
+                "---\nscene: 1\nname: feed-test\ncitizen: {citizen}\n---\n```mix\nroot: {{widget: \"window\", kind: \"edge\", edge: \"left\", w: 200}}\n```\n"
+            )
+        };
+        request(
+            world,
+            SceneVerb::Load,
+            &source("metadata"),
+            &Value::Null,
+            "sender",
+            1,
+        )
+        .unwrap();
+        reconcile(world);
+        let page = world.resource::<SceneStore>().scenes["feed-test"]
+            .mounted
+            .as_ref()
+            .unwrap()
+            .page;
+        let seat = world
+            .resource::<SubPanelRegistryState>()
+            .0
+            .seat("scene-feed-test")
+            .unwrap();
+        assert_eq!(
+            (seat.edge, seat.owner.as_str(), seat.accepted_at),
+            (Edge::Left, "sender", 1)
+        );
+
+        // Authored citizen revisions cannot transfer lifecycle ownership.
+        request(
+            world,
+            SceneVerb::Load,
+            &source("other-metadata"),
+            &Value::Null,
+            "sender",
+            2,
+        )
+        .unwrap();
+        reconcile(world);
+        assert_eq!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .unwrap()
+                .owner,
+            "sender"
+        );
+        assert_eq!(
+            world.resource::<SceneStore>().scenes["feed-test"]
+                .mounted
+                .as_ref()
+                .unwrap()
+                .page,
+            page
+        );
+        assert!(
+            request(
+                world,
+                SceneVerb::Load,
+                &source("metadata"),
+                &Value::Null,
+                "other-sender",
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            request(
+                world,
+                SceneVerb::Patch,
+                "",
+                &json!({
+                    "scene":"feed-test", "path":"root.edge", "value":"right"
+                }),
+                "sender",
+                3
+            )
+            .is_err()
+        );
+
+        // Old teardown must not release a replacement accepted in the same frame.
+        request(
+            world,
+            SceneVerb::Unload,
+            "",
+            &json!({"scene":"feed-test"}),
+            "sender",
+            3,
+        )
+        .unwrap();
+        request(
+            world,
+            SceneVerb::Load,
+            &source("metadata"),
+            &Value::Null,
+            "replacement",
+            3,
+        )
+        .unwrap();
+        reconcile(world);
+        assert!(world.get_entity(page).is_err());
+        assert_eq!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .unwrap()
+                .owner,
+            "replacement"
+        );
+        assert!(
+            world.resource::<SceneStore>().scenes["feed-test"]
+                .mounted
+                .as_ref()
+                .unwrap()
+                .registered
+        );
+        request(
+            world,
+            SceneVerb::Unload,
+            "",
+            &json!({"scene":"feed-test"}),
+            "replacement",
+            4,
+        )
+        .unwrap();
+        reconcile(world);
+        assert!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .is_none()
+        );
     }
 
     #[test]

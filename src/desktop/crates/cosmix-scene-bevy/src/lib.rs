@@ -2,10 +2,11 @@
 #[cfg(feature = "gate")]
 mod gate;
 mod render;
-pub use render::Events as SceneEvents;
+pub use render::{Events as SceneEvents, reconcile as reconcile_scene_mounts};
 
 use bevy::prelude::*;
 use cosmix_scene::{ResolvedScene, SceneDocument, Severity};
+use cosmix_shell::core::{OutputKey, SubPanelRegistry};
 use cosmix_shell::runtime::{SceneVerb, ShellRuntimeSet};
 use ctk::bus::BusBridge;
 use serde_json::{Value, json};
@@ -33,6 +34,22 @@ pub(crate) struct SceneEntry {
     pub tree: ResolvedScene,
     revision: u64,
     pub mounted: Option<render::Mounted>,
+    owner: Option<SceneOwner>,
+}
+
+#[derive(Clone)]
+struct SceneOwner {
+    citizen: String,
+    accepted_at: u64,
+}
+
+/// Host-supplied identity and seat, independent of authored scene metadata.
+/// The caller must derive `owner` from broker-attested request provenance.
+pub struct SceneMount<'a> {
+    pub registry: &'a mut SubPanelRegistry,
+    pub output: &'a OutputKey,
+    pub owner: &'a str,
+    pub accepted_at: u64,
 }
 
 #[derive(Resource, Default)]
@@ -50,9 +67,10 @@ impl SceneStore {
         body: &str,
         args: &Value,
         bridge: &BusBridge,
+        mount: &mut SceneMount<'_>,
     ) -> (u8, String) {
         let changes_scene = matches!(verb, SceneVerb::Load | SceneVerb::Patch);
-        match self.request(verb, body, args) {
+        match self.request_mounted(verb, body, args, Some(mount)) {
             Ok((reply, summary)) => {
                 if let Some(summary) = summary {
                     let wire = format!("---\ncommand: shell.scene.changed\n---\n{summary}");
@@ -87,17 +105,28 @@ impl SceneStore {
         }
     }
 
+    #[cfg(test)]
     fn request(
         &mut self,
         verb: SceneVerb,
         body: &str,
         args: &Value,
     ) -> Result<(Value, Option<Value>), Value> {
+        self.request_mounted(verb, body, args, None)
+    }
+
+    fn request_mounted(
+        &mut self,
+        verb: SceneVerb,
+        body: &str,
+        args: &Value,
+        mount: Option<&mut SceneMount<'_>>,
+    ) -> Result<(Value, Option<Value>), Value> {
         let name = args["scene"].as_str().unwrap_or_default();
         match verb {
             SceneVerb::Load => {
                 let document = cosmix_scene::parse(body).map_err(|d| json!({"diagnostics":d}))?;
-                self.accept(document)
+                self.accept(document, mount, true)
             }
             SceneVerb::Describe => {
                 let families = [
@@ -179,13 +208,16 @@ impl SceneStore {
                         "message":"patched document exceeds 256 KiB"
                     }]}));
                 }
-                self.accept(document)
+                self.accept(document, mount, false)
             }
             SceneVerb::Unload => {
                 let entry = self
                     .scenes
                     .remove(name)
                     .ok_or_else(|| json!({"error":"unknown scene"}))?;
+                if let Some(mount) = mount {
+                    mount.registry.forget(&render::page_id(&entry.tree));
+                }
                 if let Some(mounted) = entry.mounted {
                     self.removed.push(mounted);
                 }
@@ -194,12 +226,93 @@ impl SceneStore {
         }
     }
 
-    fn accept(&mut self, document: SceneDocument) -> Result<(Value, Option<Value>), Value> {
+    /// Names of the scenes currently owned by `citizen`.
+    pub fn scenes_owned_by(&self, citizen: &str) -> Vec<String> {
+        self.scenes
+            .values()
+            .filter(|entry| {
+                entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.citizen == citizen)
+            })
+            .map(|entry| entry.tree.name.clone())
+            .collect()
+    }
+
+    /// Unload every scene owned by `citizen`, returning the scene names.
+    ///
+    /// The owner-disconnect half of sub-panel ownership (panel doc §3): the
+    /// broker dropped the citizen's Bus connection, so its content goes too.
+    /// Mirrors the `Unload` arm — entries leave the store, mounted pages join
+    /// `removed` for the next reconcile to destroy — but works by owner,
+    /// because the disconnect names the citizen, not the scenes.
+    pub fn unload_owned_by(&mut self, citizen: &str) -> Vec<String> {
+        self.unload_owned_before(citizen, u64::MAX)
+    }
+
+    /// A deferred absence only removes content accepted before its receipt.
+    pub fn unload_owned_before(&mut self, citizen: &str, before: u64) -> Vec<String> {
+        let names: Vec<String> = self
+            .scenes
+            .values()
+            .filter(|entry| {
+                entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.citizen == citizen && owner.accepted_at < before)
+            })
+            .map(|entry| entry.tree.name.clone())
+            .collect();
+        for name in &names {
+            if let Some(entry) = self.scenes.remove(name)
+                && let Some(mounted) = entry.mounted
+            {
+                self.removed.push(mounted);
+            }
+        }
+        names
+    }
+
+    fn accept(
+        &mut self,
+        document: SceneDocument,
+        mount: Option<&mut SceneMount<'_>>,
+        loading: bool,
+    ) -> Result<(Value, Option<Value>), Value> {
         let diagnostics = cosmix_scene::lint(&document);
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {
             return Err(json!({"scene":document.name,"diagnostics":diagnostics}));
         }
         let tree = cosmix_scene::resolve(&document).map_err(|d| json!({"diagnostics":d}))?;
+        let old_owner = self
+            .scenes
+            .get(&tree.name)
+            .and_then(|entry| entry.owner.clone());
+        let owner = if let Some(mount) = mount {
+            // Patching content is mesh-open but does not take ownership or
+            // refresh another citizen's lifetime. Loads are owner registrations.
+            let owner = if loading {
+                SceneOwner {
+                    citizen: mount.owner.to_owned(),
+                    accepted_at: mount.accepted_at,
+                }
+            } else {
+                old_owner.unwrap_or_else(|| SceneOwner {
+                    citizen: mount.owner.to_owned(),
+                    accepted_at: mount.accepted_at,
+                })
+            };
+            mount.registry.mount(
+                &render::page_id(&tree), mount.output.clone(), render::scene_edge(&tree),
+                &owner.citizen, owner.accepted_at,
+            ).map_err(|error| json!({
+                "scene":tree.name, "error_code":"SUBPANEL_COLLISION", "error":error.to_string()
+            }))?;
+            Some(owner)
+        } else {
+            old_owner
+        };
         let ops = self.scenes.get(&tree.name).map_or(tree.nodes.len(), |old| {
             cosmix_scene::diff(&old.tree, &tree).len()
         });
@@ -217,6 +330,7 @@ impl SceneStore {
                 tree,
                 revision,
                 mounted,
+                owner,
             },
         );
         Ok((reply, Some(summary)))

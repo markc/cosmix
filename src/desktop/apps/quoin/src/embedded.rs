@@ -97,6 +97,7 @@ impl Plugin for EmbeddedQuoinPlugin {
                 "power.props.changed",
                 "wallpaper.props.changed",
                 "bg-showcase.props.changed",
+                "noded.props.changed",
             ]
             .map(str::to_owned),
         );

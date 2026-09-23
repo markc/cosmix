@@ -6,6 +6,7 @@ mod corner;
 mod motion;
 mod panel;
 mod shell;
+mod subpanel;
 mod types;
 
 pub use carousel::{Carousel, CarouselError};
@@ -20,6 +21,7 @@ pub use panel::{
     RESIZE_THICKNESS_RANGE, RevealTrigger,
 };
 pub use shell::{ShellError, ShellModel};
+pub use subpanel::{SubPanelRegistry, SubPanelRegistryError, SubPanelSeat};
 pub use types::{
     Corner, Edge, GeometryError, LogicalPoint, LogicalSize, LogicalVector, Orientation, OutputKey,
     OutputKeyError, seed_panel_thickness,
