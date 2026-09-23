@@ -191,8 +191,7 @@ fn reply_resizes(
 
 fn service_bus(
     bridge: Res<BusBridge>,
-    frame: Res<ShellFrameState>,
-    time: Res<Time<Real>>,
+    (frame, time): (Res<ShellFrameState>, Res<Time<Real>>),
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut content: SceneBus,
