@@ -8,6 +8,9 @@
 //! docked hides immediately unless a hold keeps the panel revealed: the grace delay
 //! exists to forgive pointer overshoot and never applies to a deliberate action.
 //! An interim local menu input suppresses concealment until the popup closes.
+//! Escape on a transient reveal hides it and, while the pointer is still in
+//! the panel or hotspot, latches: hover re-entry cannot re-reveal until both
+//! memberships have been left (shell doc §4.3).
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -171,6 +174,13 @@ pub struct PanelSnapshot {
     pub corner_inside: bool,
     pub hide_at: Option<Duration>,
     pub conceal_reason: Option<ConcealReason>,
+    /// ESCAPE-LATCH SEAM. True after Escape concealed a transient reveal
+    /// while the pointer was still in the panel or hotspot; hover re-entry
+    /// cannot re-reveal until both memberships have been left. Today the latch
+    /// is enforced only on this model's local path. Chunk 14 wires this to the
+    /// comp command stream, so comp's dwell also stays suppressed while the
+    /// pointer remains inside after Escape.
+    pub hover_latched: bool,
 }
 
 /// Result of applying input or advancing real time.
@@ -203,6 +213,7 @@ pub struct PanelStateMachine {
     intro_until: Option<Duration>,
     hide_at: Option<Duration>,
     conceal_reason: Option<ConcealReason>,
+    hover_latched: bool,
     last_update: Duration,
 }
 
@@ -220,6 +231,7 @@ impl PanelStateMachine {
             intro_until: None,
             hide_at: None,
             conceal_reason: None,
+            hover_latched: false,
             last_update: start_at,
         })
     }
@@ -236,6 +248,23 @@ impl PanelStateMachine {
             self.clear_deadline();
         }
         let mut effect = self.advance_to(at)?;
+        // The Escape latch suppresses hover only; an explicit reveal or mode
+        // action is deliberate and clears it.
+        if matches!(
+            input,
+            PanelInput::Reveal
+                | PanelInput::Toggle
+                | PanelInput::Pin
+                | PanelInput::Unpin
+                | PanelInput::PinToggle
+                | PanelInput::Dock
+                | PanelInput::Undock
+                | PanelInput::DockToggle
+                | PanelInput::SetMode(_)
+                | PanelInput::Release
+        ) {
+            self.hover_latched = false;
+        }
         match input {
             PanelInput::MenuHold(open) => {
                 self.menu_hold = open;
@@ -299,7 +328,7 @@ impl PanelStateMachine {
                 }
                 self.corner_inside = true;
                 self.clear_deadline();
-                if self.mode == PanelMode::Hidden {
+                if self.mode == PanelMode::Hidden && !self.hover_latched {
                     if !self.transient_revealed {
                         effect = Some(PanelEffect::Reveal {
                             trigger: RevealTrigger::Corner,
@@ -314,6 +343,7 @@ impl PanelStateMachine {
                     return Ok(self.update_since(before, effect));
                 }
                 self.corner_inside = false;
+                self.release_latch_once_left();
                 if self.transient_revealed && !self.pointer_inside && self.intro_until.is_none() {
                     self.arm_deadline(at, ConcealReason::CornerLeft);
                 }
@@ -321,6 +351,12 @@ impl PanelStateMachine {
             PanelInput::Hide | PanelInput::Escape => {
                 if self.mode == PanelMode::Hidden && self.resize_start.is_none() && !self.menu_hold
                 {
+                    // Escape with the pointer still inside must not pop the
+                    // panel straight back on the next motion event: the pointer
+                    // has to leave and dwell again (shell doc §4.3).
+                    if input == PanelInput::Escape && (self.pointer_inside || self.corner_inside) {
+                        self.hover_latched = true;
+                    }
                     self.transient_revealed = false;
                     self.clear_deadline();
                     self.motion.conceal();
@@ -359,7 +395,10 @@ impl PanelStateMachine {
                 }
                 self.pointer_inside = true;
                 self.clear_deadline();
-                if self.mode == PanelMode::Hidden && self.motion.visible_fraction() > 0.0 {
+                if self.mode == PanelMode::Hidden
+                    && !self.hover_latched
+                    && self.motion.visible_fraction() > 0.0
+                {
                     self.transient_revealed = true;
                     self.motion.reveal();
                 }
@@ -369,6 +408,7 @@ impl PanelStateMachine {
                     return Ok(self.update_since(before, effect));
                 }
                 self.pointer_inside = false;
+                self.release_latch_once_left();
                 if self.transient_revealed && !self.corner_inside && self.intro_until.is_none() {
                     self.arm_deadline(at, ConcealReason::Grace);
                 }
@@ -421,6 +461,7 @@ impl PanelStateMachine {
         }
         self.corner_inside = false;
         self.pointer_inside = false;
+        self.hover_latched = false;
         if held && self.transient_revealed && self.intro_until.is_none() {
             self.arm_deadline(self.last_update, ConcealReason::Grace);
         }
@@ -450,6 +491,7 @@ impl PanelStateMachine {
             corner_inside: self.corner_inside,
             hide_at: self.hide_at,
             conceal_reason: self.conceal_reason,
+            hover_latched: self.hover_latched,
         }
     }
 
@@ -544,6 +586,14 @@ impl PanelStateMachine {
             changed: snapshot != before,
             snapshot,
             effect,
+        }
+    }
+
+    /// The latch ends only once the pointer is outside both the panel and its
+    /// hotspot; a re-reveal then needs a fresh dwell.
+    fn release_latch_once_left(&mut self) {
+        if !self.pointer_inside && !self.corner_inside {
+            self.hover_latched = false;
         }
     }
 
@@ -897,6 +947,69 @@ mod intro_tests {
         assert_eq!(panel.snapshot().mode, PanelMode::Hidden);
         assert!(panel.snapshot().transient_revealed);
         assert_eq!(panel.snapshot().hide_at, None);
+    }
+
+    #[test]
+    fn escape_hides_transient_and_latches_until_pointer_leaves() {
+        let ms = Duration::from_millis;
+        // Dwell reveals, the pointer moves from the hotspot into the panel.
+        let mut panel = panel();
+        for input in [
+            PanelInput::CornerEntered,
+            PanelInput::PointerEntered,
+            PanelInput::CornerLeft,
+        ] {
+            panel.apply(Duration::ZERO, input).unwrap();
+        }
+        let hidden = panel.apply(ms(10), PanelInput::Escape).unwrap().snapshot;
+        assert_eq!(hidden.mode, PanelMode::Hidden);
+        assert!(!hidden.transient_revealed);
+        assert_eq!(hidden.target_fraction, 0.0);
+        assert!(hidden.hover_latched);
+        // Still mid-slide: motion in the panel or back through the hotspot
+        // must not pop it straight back.
+        for input in [
+            PanelInput::PointerEntered,
+            PanelInput::CornerEntered,
+            PanelInput::CornerLeft,
+        ] {
+            let snapshot = panel.apply(ms(20), input).unwrap().snapshot;
+            assert!(!snapshot.transient_revealed, "{input:?} re-revealed");
+            assert!(snapshot.hover_latched, "{input:?} released the latch");
+        }
+        let left = panel.apply(ms(30), PanelInput::PointerLeft).unwrap().snapshot;
+        assert!(!left.hover_latched);
+        assert!(!left.transient_revealed);
+        // Leaving re-arms hover: a fresh dwell reveals again.
+        let again = panel.apply(ms(40), PanelInput::CornerEntered).unwrap();
+        assert!(again.snapshot.transient_revealed);
+        assert_eq!(
+            again.effect,
+            Some(PanelEffect::Reveal {
+                trigger: RevealTrigger::Corner
+            })
+        );
+
+        // Hotspot-only: the latch holds until the hotspot is left.
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
+        assert!(panel.apply(ms(10), PanelInput::Escape).unwrap().snapshot.hover_latched);
+        assert!(!panel.apply(ms(20), PanelInput::CornerLeft).unwrap().snapshot.hover_latched);
+
+        // Escape with the pointer already outside hides without latching.
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::Reveal).unwrap();
+        let snapshot = panel.apply(ms(10), PanelInput::Escape).unwrap().snapshot;
+        assert!(!snapshot.transient_revealed);
+        assert!(!snapshot.hover_latched);
+
+        // An explicit reveal is deliberate and overrides the latch.
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
+        panel.apply(ms(10), PanelInput::Escape).unwrap();
+        let shown = panel.apply(ms(20), PanelInput::Reveal).unwrap().snapshot;
+        assert!(shown.transient_revealed);
+        assert!(!shown.hover_latched);
     }
 
     #[test]

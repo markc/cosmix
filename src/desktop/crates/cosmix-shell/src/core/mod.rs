@@ -3,6 +3,7 @@
 
 mod carousel;
 mod corner;
+mod keyboard;
 mod motion;
 mod panel;
 mod shell;
@@ -14,6 +15,7 @@ pub use corner::{
     CornerDetector, CornerDetectorConfig, CornerDetectorError, CornerDiagnostics, CornerEvent,
     CornerTrigger, PointerSample,
 };
+pub use keyboard::{FocusDirective, FocusStop, keyboard_target_output, next_focus_stop};
 pub use motion::{MotionError, PanelMotion};
 pub use panel::{
     ConcealReason, PanelConfig, PanelConfigError, PanelEffect, PanelInput, PanelMode,

@@ -20,7 +20,9 @@ use bevy::time::Real;
 use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent, WindowFocused};
 use bevy_winit::converters::{convert_logical_key, convert_physical_key_code};
 use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
-use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellRuntimeSet};
+use cosmix_shell::runtime::{
+    KeyboardCommand, ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimeSet,
+};
 use smithay_client_toolkit::seat::keyboard::{
     KeyEvent as SctkKeyEvent, Keymap as SctkKeymap, Keysym, Modifiers, RepeatInfo,
 };
@@ -143,6 +145,7 @@ impl KeyboardBridge {
             surface: Some(target.surface.clone()),
             window: target.window,
         });
+        stage_keyboard_focus(app, Some(target.edge));
         set_window_focused(app, target.window, true);
         emit_window(
             app,
@@ -318,6 +321,7 @@ impl KeyboardBridge {
             emit_keyboard(app, focus.window, &mapped, ButtonState::Released, false);
         }
         self.cancel_repeat();
+        stage_keyboard_focus(app, None);
         set_window_focused(app, focus.window, false);
         emit_window(
             app,
@@ -653,6 +657,25 @@ pub(crate) fn stage_shell_command_world(
         .push((output, kind));
 }
 
+/// Tell the model which panel surface holds the keyboard, so Escape and the
+/// focus cycle act on that panel and a focus directive can end. Fixtures
+/// without a shell runtime or command staging have no model to tell.
+fn stage_keyboard_focus(app: &mut App, edge: Option<Edge>) {
+    let world = app.world_mut();
+    let Some(output) = world
+        .get_resource::<ShellFrameState>()
+        .map(|frame| frame.0.geometry.output.clone())
+    else {
+        return;
+    };
+    if let Some(mut staged) = world.get_resource_mut::<StagedShellCommands>() {
+        staged.0.push((
+            output,
+            ShellCommandKind::Keyboard(KeyboardCommand::FocusObserved(edge)),
+        ));
+    }
+}
+
 pub(crate) fn staged_shell_commands_pending(app: &App) -> bool {
     !app.world().resource::<StagedShellCommands>().0.is_empty()
 }
@@ -670,6 +693,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Corner(CornerEvent::Clicked { .. }) => "corner-clicked",
         ShellCommandKind::Panel { .. } => "panel",
         ShellCommandKind::Carousel { .. } => "carousel",
+        ShellCommandKind::Keyboard(_) => "keyboard",
         ShellCommandKind::SubPanelRegister { .. } => "sub-register",
         ShellCommandKind::SubPanelRemove { .. } => "sub-remove",
     }

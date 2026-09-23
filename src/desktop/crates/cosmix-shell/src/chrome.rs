@@ -34,8 +34,8 @@ use ctk::theme::{Mode, Scheme, ThemeSpec, ThemeState, tokens};
 
 use crate::core::{Carousel, CarouselError, Edge, Orientation, PanelInput, PanelMode};
 use crate::runtime::{
-    CarouselInput, PageChange, ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState,
-    ShellRuntimeSet,
+    CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellFrame,
+    ShellFrameState, ShellRuntimeSet,
 };
 
 /// The four host-owned attachment points. Chrome assumes nothing about their
@@ -1324,21 +1324,17 @@ fn escape_panels(
     time: Res<Time<Real>>,
     mut commands: MessageWriter<ShellCommand>,
 ) {
+    // Keys reach chrome only while a shell surface holds the keyboard, so
+    // Escape here is never an application's. The model picks the focused
+    // panel, hides it only if transient and gives focus back (§4.3).
     if !keys.just_pressed(KeyCode::Escape) {
         return;
     }
-    for edge in Edge::ALL {
-        if frame.0.panel(edge).mapped {
-            commands.write(ShellCommand {
-                output: frame.0.geometry.output.clone(),
-                at: time.elapsed(),
-                kind: ShellCommandKind::Panel {
-                    edge,
-                    input: PanelInput::Escape,
-                },
-            });
-        }
-    }
+    commands.write(ShellCommand {
+        output: frame.0.geometry.output.clone(),
+        at: time.elapsed(),
+        kind: ShellCommandKind::Keyboard(KeyboardCommand::Escape),
+    });
 }
 
 /// Optional presentation settings `present_panels` reads when present.

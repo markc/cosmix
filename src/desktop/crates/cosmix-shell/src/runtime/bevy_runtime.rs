@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime};
 use crate::chrome::QuoinCommittedMotionModes;
 use crate::core::{Edge, PanelInput, ShellModel, SubPanelRegistry, SubPanelSeat};
 use crate::runtime::{
-    CarouselInput, PageChange, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, WakePolicy,
+    CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellEffect,
+    ShellFrame, WakePolicy,
 };
 
 #[derive(Resource)]
@@ -495,6 +496,19 @@ fn update_model(
                         edge: *edge,
                         effect,
                     });
+                }
+            }
+            ShellCommandKind::Keyboard(KeyboardCommand::FocusObserved(edge)) => {
+                runtime.model.keyboard_focus_observed(*edge);
+            }
+            ShellCommandKind::Keyboard(KeyboardCommand::CycleFocus) => {
+                runtime.model.cycle_keyboard_focus();
+            }
+            ShellCommandKind::Keyboard(KeyboardCommand::Escape) => {
+                if let Ok(updates) = runtime.model.escape(at) {
+                    effects.0.extend(updates.into_iter().filter_map(|(edge, update)| {
+                        update.effect.map(|effect| ShellEffect { edge, effect })
+                    }));
                 }
             }
             ShellCommandKind::Carousel { edge, input } => {

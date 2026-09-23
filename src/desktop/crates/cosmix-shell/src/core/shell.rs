@@ -9,9 +9,9 @@ use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 use super::{
-    Carousel, CarouselError, CornerEvent, Edge, LogicalSize, OutputKey, PanelConfig,
-    PanelConfigError, PanelInput, PanelMode, PanelSnapshot, PanelStateMachine, PanelTimeError,
-    PanelUpdate, PanelWake, seed_panel_thickness,
+    Carousel, CarouselError, CornerEvent, Edge, FocusDirective, FocusStop, LogicalSize, OutputKey,
+    PanelConfig, PanelConfigError, PanelInput, PanelMode, PanelSnapshot, PanelStateMachine,
+    PanelTimeError, PanelUpdate, PanelWake, next_focus_stop, seed_panel_thickness,
 };
 
 /// Complete pure shell state for one output.
@@ -22,6 +22,9 @@ pub struct ShellModel {
     panels: [PanelStateMachine; 4],
     carousels: [Carousel; 4],
     thickness_set: [bool; 4],
+    /// The panel whose surface holds the keyboard, as the host last reported.
+    keyboard_focus: Option<Edge>,
+    focus_directive: FocusDirective,
     last_update: Duration,
 }
 
@@ -50,6 +53,8 @@ impl ShellModel {
             panels,
             carousels: std::array::from_fn(|_| Carousel::empty()),
             thickness_set: [false; 4],
+            keyboard_focus: None,
+            focus_directive: FocusDirective::Follow,
             last_update: start_at,
         })
     }
@@ -270,6 +275,87 @@ impl ShellModel {
         }
     }
 
+    /// The panel whose surface holds the keyboard, as the host last reported.
+    pub const fn keyboard_focus(&self) -> Option<Edge> {
+        self.keyboard_focus
+    }
+
+    pub const fn focus_directive(&self) -> FocusDirective {
+        self.focus_directive
+    }
+
+    /// Host report of which panel surface now holds the keyboard. A
+    /// [`FocusDirective::Panel`] ends once focus has landed there and then
+    /// left; a [`FocusDirective::Release`] ends once no panel holds it.
+    pub fn keyboard_focus_observed(&mut self, edge: Option<Edge>) {
+        let previous = std::mem::replace(&mut self.keyboard_focus, edge);
+        self.focus_directive = match self.focus_directive {
+            FocusDirective::Panel(target) if previous == Some(target) && edge != Some(target) => {
+                FocusDirective::Follow
+            }
+            FocusDirective::Release if edge.is_none() => FocusDirective::Follow,
+            directive => directive,
+        };
+    }
+
+    /// The "cycle focus through shell panels" binding (shell doc §5): the
+    /// visible pinned and docked panels on this output in [`Edge::ALL`]
+    /// order, then back to the application. Never changes a mode.
+    pub fn cycle_keyboard_focus(&mut self) -> FocusStop {
+        let current = match self.focus_directive {
+            FocusDirective::Panel(edge) => Some(edge),
+            _ => self.keyboard_focus,
+        };
+        let stops: Vec<Edge> = Edge::ALL
+            .into_iter()
+            .filter(|&edge| {
+                let panel = self.panel(edge);
+                panel.mode != PanelMode::Hidden && panel.mapped
+            })
+            .collect();
+        let stop = next_focus_stop(&stops, current);
+        self.focus_directive = match stop {
+            FocusStop::Panel(edge) => FocusDirective::Panel(edge),
+            FocusStop::Application => self.release_directive(),
+        };
+        stop
+    }
+
+    /// Escape from a focused panel (shell doc §4.3). A transient reveal hides
+    /// (latching while the pointer is still inside); a pinned or docked panel
+    /// changes nothing. Either way keyboard focus is given back. With no
+    /// reported focus (a host without per-panel surfaces) every mapped panel
+    /// receives the Escape, as before keyboard focus was tracked.
+    pub fn escape(&mut self, at: Duration) -> Result<Vec<(Edge, PanelUpdate)>, PanelTimeError> {
+        let focused = self.keyboard_focus.or(match self.focus_directive {
+            FocusDirective::Panel(edge) => Some(edge),
+            _ => None,
+        });
+        let targets: Vec<Edge> = match focused {
+            Some(edge) => vec![edge],
+            None => Edge::ALL
+                .into_iter()
+                .filter(|&edge| self.panel(edge).mapped)
+                .collect(),
+        };
+        let mut updates = Vec::with_capacity(targets.len());
+        for edge in targets {
+            updates.push((edge, self.panel_input(edge, at, PanelInput::Escape)?));
+        }
+        self.focus_directive = self.release_directive();
+        Ok(updates)
+    }
+
+    /// Only a panel that holds the keyboard has anything to give back; a
+    /// release nobody observes ending would leave every panel refusing focus.
+    fn release_directive(&self) -> FocusDirective {
+        if self.keyboard_focus.is_some() {
+            FocusDirective::Release
+        } else {
+            FocusDirective::Follow
+        }
+    }
+
     pub fn tick(&mut self, at: Duration) -> Result<[PanelUpdate; 4], PanelTimeError> {
         self.ensure_monotonic(at)?;
         let [left, bottom, right, top] = &mut self.panels;
@@ -279,6 +365,13 @@ impl ShellModel {
             right.tick(at)?,
             top.tick(at)?,
         ];
+        // A focus target that has finished unmapping has no surface to hold
+        // the keyboard; a later hover reveal must never inherit the grab.
+        if let FocusDirective::Panel(edge) = self.focus_directive
+            && !self.panel(edge).mapped
+        {
+            self.focus_directive = FocusDirective::Follow;
+        }
         self.last_update = at;
         Ok(updates)
     }

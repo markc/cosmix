@@ -8,7 +8,8 @@ mod semantic;
 mod bevy_runtime;
 
 pub use messages::{
-    CarouselInput, HostGeometry, KeyboardInteractivity, PageChange, PanelPresentation,
+    CarouselInput, HostGeometry, KeyboardCommand, KeyboardInteractivity, PageChange,
+    PanelPresentation,
     ShellCommand, ShellCommandKind, ShellContentPresentation, ShellEffect, ShellFrame,
     ShellResizeError, ShellResizeResult, WakePolicy,
 };
