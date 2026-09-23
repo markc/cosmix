@@ -7,12 +7,12 @@
 use bevy::app::{App, AppExit, Plugin, Update};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
-use bevy::prelude::{Res, ResMut, Resource, Time, World};
+use bevy::prelude::{Mut, Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
 use std::time::{Duration, SystemTime};
 
 use crate::chrome::QuoinCommittedMotionModes;
-use crate::core::{Edge, PanelInput, ShellModel};
+use crate::core::{Edge, PanelInput, ShellModel, SubPanelRegistry, SubPanelSeat};
 use crate::runtime::{
     CarouselInput, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, WakePolicy,
 };
@@ -27,6 +27,18 @@ struct ShellRuntime {
 /// Current renderer-neutral output. This is the sole presentation input.
 #[derive(Resource, Clone, Debug)]
 pub struct ShellFrameState(pub ShellFrame);
+
+/// The process-wide sub-panel registry: every live sub-panel name with its
+/// `(output, edge, owner)` seat, held above the one live [`ShellModel`]
+/// because names are globally unique across outputs while a model is not.
+///
+/// Inserted by [`ShellRuntimePlugin`], so exactly one instance exists per
+/// process (the Quoin host and each embedded host run one runtime plugin);
+/// output replacement swaps the model underneath without touching it. Hosts
+/// feed it through [`reseat_shell_subpanel`] / [`forget_shell_subpanel`];
+/// citizen disconnect is applied with [`remove_all_owned_subpanels`].
+#[derive(Resource, Clone, Debug, Default)]
+pub struct SubPanelRegistryState(pub SubPanelRegistry);
 
 /// Semantic effects emitted during the current model update only.
 /// The first list records panel transitions; the second records edges whose
@@ -68,6 +80,7 @@ impl Plugin for ShellRuntimePlugin {
             })
             .insert_resource(ShellFrameState(ShellFrame::from_model(&self.model)))
             .init_resource::<ShellEffects>()
+            .init_resource::<SubPanelRegistryState>()
             .add_message::<super::ShellResizeResult>()
             .configure_sets(
                 Update,
@@ -131,6 +144,59 @@ pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: 
     runtime.model.set_carousel(edge, carousel);
     let frame = ShellFrame::from_model(&runtime.model);
     world.resource_mut::<ShellFrameState>().0 = frame;
+}
+
+/// Record or refresh the sub-panel registry seat for a page a host just
+/// mounted under `name`, owned by `owner` on the live frame's output.
+///
+/// A no-op until the registry exists (every runtime plugin inserts one), so
+/// hosts and tests without the resource skip the feed cleanly.
+pub fn reseat_shell_subpanel(world: &mut World, edge: Edge, name: &str, owner: &str) {
+    let Some(output) = world
+        .get_resource::<ShellFrameState>()
+        .map(|frame| frame.0.geometry.output.clone())
+    else {
+        return;
+    };
+    if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
+        registry.0.reseat(name, output, edge, owner);
+    }
+}
+
+/// Drop the sub-panel registry seat for a page a host unmounted, without
+/// touching any carousel (the host unmount drives its own page removal).
+pub fn forget_shell_subpanel(world: &mut World, name: &str) {
+    if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
+        registry.0.forget(name);
+    }
+}
+
+/// Citizen disconnect: remove every sub-panel seat `owner` holds plus its
+/// carousel content in the live model, landing per the carousel's removal
+/// rule, and refresh the frame. Returns the removed seats.
+///
+/// Runs before the scene reconcile that tears the owner's mounted content
+/// down; the carousel removal decides the landing first so the page-list
+/// rebuild the unmount performs preserves it.
+pub fn remove_all_owned_subpanels(world: &mut World, owner: &str) -> Vec<SubPanelSeat> {
+    if !world.contains_resource::<SubPanelRegistryState>()
+        || !world.contains_resource::<ShellRuntime>()
+    {
+        return Vec::new();
+    }
+    let seats = world.resource_scope(|world, mut runtime: Mut<ShellRuntime>| {
+        let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() else {
+            return Vec::new();
+        };
+        registry.0.remove_all_owned(owner, &mut runtime.model)
+    });
+    if !seats.is_empty()
+        && let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>()
+    {
+        let frame = ShellFrame::from_model(&runtime.model);
+        world.resource_mut::<ShellFrameState>().0 = frame;
+    }
+    seats
 }
 
 fn update_model(

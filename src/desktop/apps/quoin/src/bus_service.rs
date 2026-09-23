@@ -8,7 +8,7 @@ use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 use cosmix_shell::core::{Corner, Edge, PanelMode};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
-    ShellSemanticVerb, semantic_shell_command,
+    ShellSemanticVerb, remove_all_owned_subpanels, semantic_shell_command,
 };
 use ctk::app_control::verify_caller_provenance;
 use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, InboundRequest};
@@ -50,6 +50,11 @@ struct ShellBusState {
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
     pending_resizes: BTreeMap<u64, (InboundRequest, u64)>,
+    /// Citizens the broker just reported disconnected, pending sub-panel
+    /// removal. Collected by [`service_bus`] (which has no world access),
+    /// applied by [`apply_citizen_disconnects`] before the scene reconcile
+    /// runs in the same frame.
+    disconnected_citizens: Vec<String>,
     frame: u64,
 }
 
@@ -64,6 +69,7 @@ impl Default for ShellBusState {
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
+            disconnected_citizens: Vec::new(),
             frame: 0,
         }
     }
@@ -98,6 +104,12 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
             .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input))
+            .add_systems(
+                Update,
+                apply_citizen_disconnects
+                    .in_set(ShellRuntimeSet::Input)
+                    .after(service_bus),
+            )
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation));
     }
 }
@@ -249,6 +261,14 @@ fn service_bus(
     }
     for message in bridge.drain_messages() {
         wallpaper.0.message(&message, time.elapsed());
+        for citizen in disconnected_citizens(&message) {
+            // Same live-generation gate as the power resync below: a
+            // stale-epoch event drained after a reconnect may name a citizen
+            // that has already re-registered.
+            if state.live_generation == Some(message.connection_generation) {
+                state.disconnected_citizens.push(citizen);
+            }
+        }
         match state.power.observe_message(message) {
             PowerAction::None => {}
             PowerAction::Changed => power_changed = true,
@@ -373,6 +393,57 @@ fn service_bus(
             command,
             &mut dispatch,
         );
+    }
+}
+
+/// Citizens the broker just dropped, read from a `noded.props.changed` event
+/// on the `services.registered` leaf: every name present in `old` and absent
+/// from `new`.
+///
+/// The broker releases a service name only when its Bus connection drops
+/// (or it deregisters), so a vanished name IS the citizen disconnect — never
+/// a scene unload. Other topics, other leaves and unparseable bodies yield
+/// nothing rather than guessing an owner.
+fn disconnected_citizens(message: &BusMessage) -> Vec<String> {
+    if message.topic() != Some("noded.props.changed") {
+        return Vec::new();
+    }
+    let Ok(body) = serde_json::from_str::<Value>(&message.body) else {
+        return Vec::new();
+    };
+    if body["path"] != "services.registered" {
+        return Vec::new();
+    }
+    let (Some(old), Some(new)) = (body["old"].as_array(), body["new"].as_array()) else {
+        return Vec::new();
+    };
+    old.iter()
+        .filter_map(Value::as_str)
+        .filter(|name| !new.iter().any(|kept| kept.as_str() == Some(*name)))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Apply broker-reported citizen disconnects with world access: for each
+/// owner, every sub-panel seat and its carousel content are removed first
+/// (landing per the carousel's removal rule), then its scenes unload so the
+/// scene reconcile in this frame destroys the mounted content and the
+/// page-list rebuild preserves that landing.
+fn apply_citizen_disconnects(world: &mut World) {
+    let citizens = std::mem::take(
+        &mut world.resource_mut::<ShellBusState>().disconnected_citizens,
+    );
+    for citizen in &citizens {
+        remove_all_owned_subpanels(world, citizen);
+        if let Some(mut store) = world.get_resource_mut::<cosmix_scene_bevy::SceneStore>() {
+            let scenes = store.unload_owned_by(citizen);
+            if !scenes.is_empty() {
+                println!(
+                    "QUOIN_CITIZEN_DISCONNECT citizen={citizen} scenes={}",
+                    scenes.join(",")
+                );
+            }
+        }
     }
 }
 
@@ -844,7 +915,9 @@ fn edge_name(edge: Edge) -> &'static str {
 mod tests {
     use super::*;
     use cosmix_shell::core::PanelInput;
-    use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
+    use cosmix_shell::runtime::{
+        CarouselInput, SceneVerb, ShellCommandKind, SubPanelRegistryState, set_shell_pages,
+    };
     use ctk::bus::{BusMessage, test_bridge};
 
     fn request(command: &str) -> InboundRequest {
@@ -1524,6 +1597,119 @@ mod tests {
                 "capture.status"
             ],
             "drain_events must run before drain_messages"
+        );
+    }
+
+    /// A `noded.props.changed` registry diff: `old` minus `new` names the
+    /// citizens the broker just dropped.
+    fn services_registered_change(generation: u64, old: &[&str], new: &[&str]) -> BusMessage {
+        let mut headers = BTreeMap::new();
+        headers.insert("topic".to_owned(), "noded.props.changed".to_owned());
+        BusMessage {
+            connection_generation: generation,
+            from: "noded".to_owned(),
+            command: "noded.topic.event".to_owned(),
+            body: json!({
+                "path": "services.registered",
+                "old": old,
+                "new": new,
+                "cause": "disconnect:quoin-panel",
+            })
+            .to_string(),
+            headers,
+        }
+    }
+
+    /// Sub-panel ownership on citizen disconnect: the live-epoch registry
+    /// diff removes the owner's seat, lands the carousel on the surviving
+    /// neighbour, and unloads its scenes; a stale-epoch diff removes nothing.
+    #[test]
+    fn citizen_disconnect_removes_owned_subpanels_and_scenes() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        let output = test_model().output().clone();
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
+        set_shell_pages(
+            app.world_mut(),
+            Edge::Left,
+            vec!["scene-notes".into(), "keep".into()],
+            Some("scene-notes"),
+        );
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .register("scene-notes", output, Edge::Left, "quoin-panel")
+            .unwrap();
+        let source = "---\nscene: 1\nname: notes\ncitizen: quoin-panel\nwindow: {\"kind\":\"edge\",\"edge\":\"left\"}\n---\n```mix\nroot: {widget: \"column\", children: []}\n```\n";
+        app.world_mut()
+            .resource_scope(|world, mut store: Mut<cosmix_scene_bevy::SceneStore>| {
+                let (rc, _) = store.dispatch(
+                    SceneVerb::Load,
+                    source,
+                    &Value::Null,
+                    world.resource::<BusBridge>(),
+                );
+                assert_eq!(rc, 0, "the scene fixture must load");
+            });
+
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+
+        // A stale-epoch disconnect must not act: drained after a reconnect,
+        // it may name a citizen that has already re-registered.
+        peer.deliver_message(services_registered_change(
+            1,
+            &["shell", "quoin-panel"],
+            &["shell"],
+        ));
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_some(),
+            "a stale-epoch disconnect must remove nothing"
+        );
+
+        // The live-epoch disconnect removes the owner's seat, lands the
+        // carousel on the surviving neighbour, and unloads its scene.
+        peer.deliver_message(services_registered_change(
+            2,
+            &["shell", "quoin-panel"],
+            &["shell"],
+        ));
+        app.update();
+        let frame = app.world().resource::<ShellFrameState>();
+        assert!(
+            !frame
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .any(|id| id == "scene-notes")
+        );
+        assert_eq!(
+            frame.0.panel(Edge::Left).active_page_id.as_deref(),
+            Some("keep"),
+            "the carousel lands on the surviving neighbour"
+        );
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_none()
+        );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("quoin-panel")
+                .is_empty(),
+            "the owner's scene document is unloaded"
         );
     }
 

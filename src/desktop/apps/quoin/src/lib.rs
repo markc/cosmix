@@ -120,6 +120,9 @@ pub fn run_layer_host() -> AppExit {
     bus.subscriptions.push("wallpaper.props.changed".to_owned());
     bus.subscriptions
         .push("bg-showcase.props.changed".to_owned());
+    // Broker service-registry diffs: the citizen-disconnect notification
+    // sub-panel ownership keys on (the `services.registered` leaf).
+    bus.subscriptions.push("noded.props.changed".to_owned());
     bus.inbound_prefixes.push("shell.".to_owned());
     bus.max_inbound_body_bytes = cosmix_scene::MAX_DOCUMENT_BYTES;
     bus.worker_wake = Some(BusWorkerWake::new(wake));

@@ -194,6 +194,39 @@ impl SceneStore {
         }
     }
 
+    /// Names of the scenes currently owned by `citizen`.
+    pub fn scenes_owned_by(&self, citizen: &str) -> Vec<String> {
+        self.scenes
+            .values()
+            .filter(|entry| entry.tree.citizen == citizen)
+            .map(|entry| entry.tree.name.clone())
+            .collect()
+    }
+
+    /// Unload every scene owned by `citizen`, returning the scene names.
+    ///
+    /// The owner-disconnect half of sub-panel ownership (panel doc §3): the
+    /// broker dropped the citizen's Bus connection, so its content goes too.
+    /// Mirrors the `Unload` arm — entries leave the store, mounted pages join
+    /// `removed` for the next reconcile to destroy — but works by owner,
+    /// because the disconnect names the citizen, not the scenes.
+    pub fn unload_owned_by(&mut self, citizen: &str) -> Vec<String> {
+        let names: Vec<String> = self
+            .scenes
+            .values()
+            .filter(|entry| entry.tree.citizen == citizen)
+            .map(|entry| entry.tree.name.clone())
+            .collect();
+        for name in &names {
+            if let Some(entry) = self.scenes.remove(name)
+                && let Some(mounted) = entry.mounted
+            {
+                self.removed.push(mounted);
+            }
+        }
+        names
+    }
+
     fn accept(&mut self, document: SceneDocument) -> Result<(Value, Option<Value>), Value> {
         let diagnostics = cosmix_scene::lint(&document);
         if diagnostics.iter().any(|d| d.severity == Severity::Error) {

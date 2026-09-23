@@ -339,12 +339,28 @@ pub(crate) fn reconcile(world: &mut World) {
                     });
                 }
             }
+            // Feed the process-wide sub-panel owner map: the page id is the
+            // address, the scene's citizen its owner. Reseating every pass
+            // keeps the seat fresh when a revision changes the citizen or
+            // edge; a page awaiting its chrome holds no seat.
+            if mounted.registered {
+                cosmix_shell::runtime::reseat_shell_subpanel(
+                    world,
+                    edge,
+                    &page_id(&entry.tree),
+                    &entry.tree.citizen,
+                );
+            } else {
+                cosmix_shell::runtime::forget_shell_subpanel(world, &page_id(&entry.tree));
+            }
         }
     });
 }
 
 fn destroy(world: &mut World, mounted: Mounted) {
-    cosmix_shell::chrome::unmount_page(world, mounted.edge, &page_id(&mounted.tree));
+    let id = page_id(&mounted.tree);
+    cosmix_shell::runtime::forget_shell_subpanel(world, &id);
+    cosmix_shell::chrome::unmount_page(world, mounted.edge, &id);
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
     }
@@ -1746,6 +1762,103 @@ mod tests {
                 .is_empty()
         );
         assert!(world.get_entity(page).is_err());
+    }
+
+    /// The owner-map feed: mounting seats the page id under the scene's
+    /// citizen, a revision that changes the citizen reseats it in place, an
+    /// edge change moves the seat, and unload forgets it.
+    #[test]
+    fn scene_mounts_feed_the_subpanel_owner_map() {
+        use cosmix_shell::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            spawn_quoin_chrome,
+        };
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{
+            SceneVerb, ShellFrameState, ShellRuntimePlugin, SubPanelRegistryState,
+        };
+        let mut app = App::new();
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ShellRuntimePlugin::new(model))
+            .add_plugins(QuoinChromePlugin);
+        let world = app.world_mut();
+        let registry = QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap();
+        let props = registry
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
+        queue.apply(world);
+
+        let seat_of = |world: &mut World| {
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .cloned()
+        };
+        let source = |citizen: &str| {
+            format!(
+                "---\nscene: 1\nname: feed-test\ncitizen: {citizen}\n---\n```mix\nroot: {{widget: \"window\", kind: \"edge\", edge: \"left\", w: 200}}\n```\n"
+            )
+        };
+        let mut store = SceneStore::default();
+        store
+            .request(SceneVerb::Load, &source("panel-citizen"), &Value::Null)
+            .unwrap();
+        world.insert_resource(store);
+        reconcile(world);
+        let seat = seat_of(world).expect("a mounted page holds a seat");
+        assert_eq!(
+            (seat.output.as_str(), seat.edge, seat.owner.as_str()),
+            ("test", Edge::Left, "panel-citizen")
+        );
+
+        // A revision that changes the citizen reseats the owner in place.
+        world
+            .resource_mut::<SceneStore>()
+            .request(SceneVerb::Load, &source("other-citizen"), &Value::Null)
+            .unwrap();
+        reconcile(world);
+        let seat = seat_of(world).expect("the seat survives a citizen revision");
+        assert_eq!(seat.owner, "other-citizen");
+
+        // An edge change moves the seat with the page.
+        world
+            .resource_mut::<SceneStore>()
+            .request(
+                SceneVerb::Patch,
+                "",
+                &json!({"scene":"feed-test","path":"root.edge","value":"right"}),
+            )
+            .unwrap();
+        reconcile(world);
+        assert_eq!(seat_of(world).unwrap().edge, Edge::Right);
+
+        // Unload forgets the seat.
+        world
+            .resource_mut::<SceneStore>()
+            .request(SceneVerb::Unload, "", &json!({"scene":"feed-test"}))
+            .unwrap();
+        reconcile(world);
+        assert!(seat_of(world).is_none());
     }
 
     #[test]
