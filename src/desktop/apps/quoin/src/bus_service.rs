@@ -102,6 +102,15 @@ impl BusDiagnostics {
 
 pub(crate) struct ShellBusPlugin;
 
+/// Ordering seam for hosts that prepare the selected output inside the
+/// Update schedule: the embedded host replaces the shell model in its
+/// `prepare` system, and a seat reserved by a dispatch against the outgoing
+/// output must queue its command against the replacement — not against an
+/// output the Model stage would drop. Hosts order their output preparation
+/// `.before` this set.
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ShellBusDispatch;
+
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
@@ -112,7 +121,12 @@ impl Plugin for ShellBusPlugin {
             .init_resource::<crate::demos::DemoState>()
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
-            .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input))
+            .add_systems(
+                Update,
+                service_bus
+                    .in_set(ShellBusDispatch)
+                    .in_set(ShellRuntimeSet::Input),
+            )
             .add_systems(
                 Update,
                 apply_citizen_disconnects
@@ -689,8 +703,10 @@ fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generat
 /// receipt-stamped exactly like a scene mount, so two same-name
 /// registrations drained in one batch cannot both be acked; the enqueued
 /// command fills the carousel at the Model stage of this update. Removing
-/// only checks the seat here — the registry applies the carousel's removal
-/// landing rule at the Model stage, atomically with the seat.
+/// resolves the seat here and carries its owner and acceptance receipt in
+/// the command — the registry applies the carousel's removal landing rule
+/// at the Model stage, atomically with the seat, and only while that exact
+/// registration still stands.
 fn dispatch_sub_panel_verb(
     request: &InboundRequest,
     frame: &ShellFrame,
@@ -736,15 +752,23 @@ fn dispatch_sub_panel_verb(
         };
         // Global duplicate first (the registry is the address space), then
         // the frame: a live page without a seat (host chrome content) is as
-        // taken as a seated one, because the name is the address.
+        // taken as a seated one, on ANY edge of this output — names are
+        // globally unique, so a seat-less page on another edge refuses a
+        // registration the requested edge alone would have accepted.
         if registry.seat(&name).is_some() {
             let error = cosmix_shell::core::SubPanelRegistryError::Duplicate(name);
             return (10, json!({"error":error.to_string()}).to_string(), None);
         }
-        if frame.panel(edge).page_ids.iter().any(|page| page == &name) {
+        if Edge::ALL.into_iter().any(|live_edge| {
+            frame
+                .panel(live_edge)
+                .page_ids
+                .iter()
+                .any(|page| page == &name)
+        }) {
             return (
                 10,
-                json!({"error":format!("name '{name}' is already a page on this edge")})
+                json!({"error":format!("name '{name}' is already a page on this output")})
                     .to_string(),
                 None,
             );
@@ -770,11 +794,15 @@ fn dispatch_sub_panel_verb(
         );
         return (0, json!({"accepted":true}).to_string(), Some(command));
     }
-    // Removal: the name is the address; the seat supplies the edge and owner
-    // the command carries. An unknown name is refused, never a creation.
-    let Some((edge, owner)) = registry
+    // Removal: the name is the address; the seat supplies the edge, owner
+    // and acceptance receipt the command carries. An unknown name is
+    // refused, never a creation. The Model stage applies the removal only
+    // while that exact registration (same owner AND same receipt) still
+    // stands, so a replacement accepted after this seat was dropped
+    // survives the stale command.
+    let Some((edge, owner, accepted_at)) = registry
         .seat(&name)
-        .map(|seat| (seat.edge, seat.owner.clone()))
+        .map(|seat| (seat.edge, seat.owner.clone(), seat.accepted_at))
     else {
         let error = cosmix_shell::core::SubPanelRegistryError::Unknown(name);
         return (10, json!({"error":error.to_string()}).to_string(), None);
@@ -783,7 +811,11 @@ fn dispatch_sub_panel_verb(
         frame.geometry.output.clone(),
         at,
         edge,
-        ShellSemanticVerb::SubRemove { name, owner },
+        ShellSemanticVerb::SubRemove {
+            name,
+            owner,
+            accepted_at,
+        },
     );
     (0, json!({"accepted":true}).to_string(), Some(command))
 }
@@ -2630,25 +2662,29 @@ mod tests {
                 .owner,
             "peer"
         );
-        // A live page WITHOUT a seat (host chrome content) is equally taken:
-        // the frame check catches what the registry cannot see.
+        // A live page WITHOUT a seat (host chrome content) is equally taken,
+        // wherever it sits: the frame check sweeps every edge of the output,
+        // so a seat-less page on ANOTHER edge refuses a registration that
+        // the requested edge alone would have accepted.
         cosmix_shell::runtime::set_shell_pages(
             app.world_mut(),
             Edge::Bottom,
             vec!["launcher".to_owned()],
             None,
         );
-        let (rc, body) = sub_send(
-            &mut app,
-            &peer,
-            "shell.sub.register",
-            json!({"edge":"bottom","name":"launcher"}),
-        );
-        assert_eq!(rc, 10, "{body}");
-        assert!(
-            body["error"].as_str().unwrap().contains("already a page"),
-            "{body}"
-        );
+        for edge in ["bottom", "right"] {
+            let (rc, body) = sub_send(
+                &mut app,
+                &peer,
+                "shell.sub.register",
+                json!({"edge":edge,"name":"launcher"}),
+            );
+            assert_eq!(rc, 10, "{edge}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("already a page"),
+                "{edge}: {body}"
+            );
+        }
     }
 
     #[test]
@@ -2764,6 +2800,167 @@ mod tests {
                 .names_owned_by("peer"),
             ["alpha"],
             "each removal took its seat with its page"
+        );
+    }
+
+    /// Review #4 (chunk 8): a queued removal applies only to the exact
+    /// registration its dispatch resolved — same owner AND same acceptance
+    /// receipt — never to whatever holds the name at the Model stage. In
+    /// one batch: `sub.remove` queues against the seat; a scene unload
+    /// drops that seat; another caller's load reserves a replacement under
+    /// the same name. The stale removal must drop silently and the
+    /// replacement survive.
+    #[test]
+    fn sub_remove_spared_a_replacement_reserved_in_the_same_batch() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        // Arrival order is the race: the removal resolves the live seat
+        // first, the unload then drops it, and the replacement load
+        // re-reserves the name before the Model stage drains the queue.
+        peer.send(wire("shell.sub.remove", json!({"name":"scene-notes"})));
+        peer.send(wire("shell.scene.unload", json!({"scene":"notes"})));
+        peer.send(scene_load("notes", "other", "left"));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 3);
+        for reply in &replies {
+            assert_eq!(reply.rc, 0, "{}", reply.body);
+        }
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        let seat = registry.seat("scene-notes").expect("replacement seat");
+        assert_eq!(seat.owner, "other");
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("other"),
+            ["notes"]
+        );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .any(|page| page == "scene-notes"),
+            "the replacement's carousel page survives the stale removal"
+        );
+        // The spared replacement is itself removable through a fresh verb.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.remove",
+            json!({"name":"scene-notes"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_none()
+        );
+    }
+
+    /// Review #5 (chunk 8): a dispatch reserves its seat and queues its
+    /// command against the current output; an output replacement landing
+    /// before the Model stage (the embedded host's model swap — now ordered
+    /// before the dispatch — or a stashed reply drained a frame later)
+    /// migrates the seat. The Model stage must apply the lifecycle command
+    /// against the replacement model rather than drop it at the output
+    /// gate: the register fills the replacement's carousel, and a later
+    /// acked removal still lands.
+    #[test]
+    fn lifecycle_commands_apply_across_an_output_replacement() {
+        #[derive(Resource)]
+        struct PendingReplacement(cosmix_shell::core::ShellModel);
+        // A one-shot host system standing in for the embedded `prepare`
+        // race: it replaces the model after the Input stage has dispatched
+        // against the outgoing output, and before the Model stage applies.
+        fn replace_output(world: &mut World) {
+            if let Some(pending) = world.remove_resource::<PendingReplacement>() {
+                cosmix_shell::runtime::replace_shell_model(world, pending.0);
+            }
+        }
+        fn model_on(output: &str) -> cosmix_shell::core::ShellModel {
+            cosmix_shell::core::ShellModel::new(
+                cosmix_shell::core::OutputKey::new(output).unwrap(),
+                cosmix_shell::core::LogicalSize::new(1000.0, 800.0).unwrap(),
+                Default::default(),
+                std::time::Duration::from_millis(800),
+                std::time::Duration::from_millis(200),
+            )
+            .unwrap()
+        }
+
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(model_on("test")))
+            .add_systems(
+                Update,
+                replace_output
+                    .after(ShellRuntimeSet::Input)
+                    .before(ShellRuntimeSet::Model),
+            );
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        peer.drain_calls();
+
+        // Register dispatched against "test"; the model becomes
+        // "replacement" between dispatch and application.
+        peer.send(wire(
+            "shell.sub.register",
+            json!({"edge":"left","name":"notify.migrate"}),
+        ));
+        app.insert_resource(PendingReplacement(model_on("replacement")));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "replacement");
+        assert_eq!(
+            frame
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["notify.migrate"],
+            "a register dispatched against the replaced output fills the \
+             replacement's carousel"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.migrate")
+                .unwrap()
+                .output
+                .as_str(),
+            "replacement"
+        );
+
+        // An acked removal across a second replacement still lands: the
+        // seat migrates again and the Model stage applies the removal
+        // against the current registry.
+        peer.send(wire("shell.sub.remove", json!({"name":"notify.migrate"})));
+        app.insert_resource(PendingReplacement(model_on("third")));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "third");
+        assert!(
+            frame.panel(Edge::Left).page_ids.is_empty(),
+            "the removal took the migrated page with its seat"
+        );
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.migrate")
+                .is_none()
         );
     }
 

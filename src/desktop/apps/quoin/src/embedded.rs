@@ -102,7 +102,18 @@ impl Plugin for EmbeddedQuoinPlugin {
             .map(str::to_owned),
         );
         crate::configure_content(app, bus, registry, store, false, false);
-        app.add_systems(Update, prepare.in_set(ShellRuntimeSet::Input))
+        // Output preparation runs BEFORE the Bus dispatch drains: a
+        // dispatch reserves its registry seat and queues its command
+        // against the current frame's output, so the model replacement
+        // must land first or the command targets an output the Model stage
+        // would drop — a reserved seat no page ever fills, and an acked
+        // removal lost.
+        app.add_systems(
+            Update,
+            prepare
+                .in_set(ShellRuntimeSet::Input)
+                .before(crate::bus_service::ShellBusDispatch),
+        )
             .add_systems(Update, present.in_set(ShellRuntimeSet::Host))
             .add_observer(grip_start)
             .add_observer(grip_move)

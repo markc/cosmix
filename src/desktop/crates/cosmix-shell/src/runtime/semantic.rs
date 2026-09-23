@@ -59,12 +59,14 @@ pub enum ShellSemanticVerb {
         owner: String,
     },
     /// Remove a sub-panel (panel doc §3). The name is the address (§5): the
-    /// verb's edge is the sub-panel's own seat edge, resolved at dispatch —
-    /// a caller never picks the edge a removal lands on. Routed like
-    /// [`Self::SubRegister`].
+    /// verb's edge, owner and acceptance receipt are the sub-panel's own
+    /// seat values, resolved at dispatch — a caller never picks the edge a
+    /// removal lands on, and the Model stage applies only against that
+    /// exact registration. Routed like [`Self::SubRegister`].
     SubRemove {
         name: String,
         owner: String,
+        accepted_at: u64,
     },
 }
 
@@ -130,9 +132,16 @@ pub fn semantic_shell_command(
         ShellSemanticVerb::SubRegister { name, owner } => {
             ShellCommandKind::SubPanelRegister { edge, name, owner }
         }
-        ShellSemanticVerb::SubRemove { name, owner } => {
-            ShellCommandKind::SubPanelRemove { edge, name, owner }
-        }
+        ShellSemanticVerb::SubRemove {
+            name,
+            owner,
+            accepted_at,
+        } => ShellCommandKind::SubPanelRemove {
+            edge,
+            name,
+            owner,
+            accepted_at,
+        },
     };
     ShellCommand { output, at, kind }
 }

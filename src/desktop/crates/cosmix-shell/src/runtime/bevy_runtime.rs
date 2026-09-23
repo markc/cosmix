@@ -250,6 +250,83 @@ fn update_model(
     effects.0.clear();
     effects.1.clear();
     for command in commands.read() {
+        // Sub-panel lifecycle commands address the process-wide registry, so
+        // the seat — not the command's dispatch-time output — is the
+        // authority: an output replaced between dispatch and application
+        // (the embedded host's model swap, a stashed reply drained a frame
+        // later) must not void an acked command at the output gate below.
+        // A register applies to the current model when its reservation
+        // migrated with it (or rolls a stranded reservation back); a remove
+        // lands against the current registry.
+        match &command.kind {
+            ShellCommandKind::SubPanelRegister { edge, name, owner } => {
+                // Dispatch reserved the seat (receipt-stamped) before
+                // acking; fill the carousel only while that reservation
+                // still stands, assessed against the CURRENT model. A
+                // reservation left on an output the model no longer runs
+                // can never fill: roll it back rather than leak a seat no
+                // verb can address again.
+                let (reserved, stranded) = match registry.0.seat(name) {
+                    Some(seat) => (
+                        seat.edge == *edge
+                            && seat.owner == *owner
+                            && seat.output == *runtime.model.output(),
+                        seat.edge == *edge
+                            && seat.owner == *owner
+                            && seat.output == command.output,
+                    ),
+                    None => (false, false),
+                };
+                let before = runtime.model.carousel(*edge).active_index();
+                if reserved {
+                    if let Err(error) = runtime.model.carousel_mut(*edge).register(name) {
+                        bevy::log::warn!("sub-panel register refused at the model: {error}");
+                    }
+                } else if stranded {
+                    bevy::log::warn!(
+                        "sub-panel register for '{name}' stranded on a replaced output; \
+                         rolling back its reservation"
+                    );
+                    registry.0.forget(name);
+                } else {
+                    bevy::log::warn!(
+                        "sub-panel register for '{name}' arrived without its reserved seat"
+                    );
+                }
+                if runtime.model.carousel(*edge).active_index() != before {
+                    effects.1.push(*edge);
+                }
+                continue;
+            }
+            ShellCommandKind::SubPanelRemove {
+                edge,
+                name,
+                owner,
+                accepted_at,
+            } => {
+                // The registry owns both halves: the seat and the carousel
+                // page leave together, the selection landing per the
+                // carousel's removal rule (previous, else next, else
+                // primary). Only that exact registration — same owner AND
+                // same acceptance receipt as the one dispatch resolved —
+                // is this command's target: a name re-reserved by a later
+                // load after this seat was dropped is a replacement and
+                // survives, the stale removal dropping silently because
+                // its target is already gone.
+                let exact = registry.0.seat(name).is_some_and(|seat| {
+                    seat.owner == *owner && seat.accepted_at == *accepted_at
+                });
+                if exact {
+                    let before = runtime.model.carousel(*edge).active_index();
+                    let _ = registry.0.remove(name, &mut runtime.model);
+                    if runtime.model.carousel(*edge).active_index() != before {
+                        effects.1.push(*edge);
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
         if command.output != *runtime.model.output() {
             if let ShellCommandKind::ResizeChecked {
                 edge,
@@ -365,44 +442,6 @@ fn update_model(
                     }
                 }
                 if carousel.active_index() != before {
-                    effects.1.push(*edge);
-                }
-            }
-            ShellCommandKind::SubPanelRegister { edge, name, owner } => {
-                // Dispatch reserved the seat (receipt-stamped) before acking;
-                // fill the carousel only while that reservation still stands.
-                // An owner sweep between dispatch and application must not
-                // leave an untracked page no verb can address again.
-                let reserved = registry.0.seat(name).is_some_and(|seat| {
-                    seat.edge == *edge
-                        && seat.owner == *owner
-                        && seat.output == *runtime.model.output()
-                });
-                let before = runtime.model.carousel(*edge).active_index();
-                let result = if reserved {
-                    runtime.model.carousel_mut(*edge).register(name)
-                } else {
-                    bevy::log::warn!(
-                        "sub-panel register for '{name}' arrived without its reserved seat"
-                    );
-                    Ok(())
-                };
-                if let Err(error) = result {
-                    bevy::log::warn!("sub-panel register refused at the model: {error}");
-                }
-                if runtime.model.carousel(*edge).active_index() != before {
-                    effects.1.push(*edge);
-                }
-            }
-            ShellCommandKind::SubPanelRemove { edge, name, .. } => {
-                // The registry owns both halves: the seat and the carousel
-                // page leave together, the selection landing per the
-                // carousel's removal rule (previous, else next, else
-                // primary). A seat already gone (owner sweep between
-                // dispatch and here) has had its landing applied there.
-                let before = runtime.model.carousel(*edge).active_index();
-                let _ = registry.0.remove(name, &mut runtime.model);
-                if runtime.model.carousel(*edge).active_index() != before {
                     effects.1.push(*edge);
                 }
             }
