@@ -1,5 +1,6 @@
 //! Cosmix Quoin's real SCTK layer-shell host.
 
+mod activation;
 mod bus_service;
 pub mod config;
 mod corner_menu;
@@ -124,6 +125,7 @@ pub fn run_layer_host() -> AppExit {
     let mut bus = BusBridgeConfig::new(cli.bus_service, resolve_noded_url());
     hotspot::install(&mut app, &mut bus, cli.comp_service.clone());
     hotspot::arm_first_run(&mut app, state_store.first_run());
+    activation::install(&mut app, &mut bus, cli.comp_service.clone());
     holders::install(&mut app, &mut bus, cli.comp_service);
     bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
     bus.subscriptions.push("power.props.changed".to_owned());

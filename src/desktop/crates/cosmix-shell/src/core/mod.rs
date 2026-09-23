@@ -7,6 +7,7 @@ mod motion;
 mod panel;
 mod shell;
 mod subpanel;
+mod targeting;
 mod types;
 
 pub use carousel::{Carousel, CarouselError};
@@ -22,6 +23,7 @@ pub use panel::{
 };
 pub use shell::{ShellError, ShellModel};
 pub use subpanel::{SubPanelRegistry, SubPanelRegistryError, SubPanelSeat};
+pub use targeting::target_output;
 pub use types::{
     Corner, Edge, GeometryError, LogicalPoint, LogicalSize, LogicalVector, Orientation, OutputKey,
     OutputKeyError, seed_panel_thickness,

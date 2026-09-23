@@ -693,6 +693,33 @@ a side effect of another verb. <code>shell.panel.mode</code> takes <code>edge</c
 legacy verbs it never leaves a transient reveal behind, and <code>mode=hidden</code>
 conceals at once with no grace delay, because it is a deliberate action. Read
 back <code>shell.props.get path="panels.&lt;edge&gt;.mode"</code> to verify the applied mode.</p>
+<p>Sub-panels are addressed by their stable name, unique across every edge and
+output. <code>shell.sub.register</code> takes <code>edge</code> and <code>name</code> (the owner is the
+broker-attested caller) and fills a carousel slot without revealing or
+selecting it; <code>shell.sub.remove</code> takes <code>name</code> and lands per the removal rule.
+<code>shell.sub.activate</code> takes <code>name</code> and reveals and shows that sub-panel (panel
+design §6). On a hidden edge it is a transient reveal held by focus: the
+carousel jumps to the page (no slide) and Quoin acquires a <code>focus</code> hold on the
+panel's layer, which keeps it shown until keyboard focus first moves after comp
+acknowledges the hold (a move into the panel is then held by comp's own focus
+holder), or until Escape, a hide or a corner action ends the reveal. It never
+changes the persisted mode. On a pinned or docked edge it only switches the
+carousel to the page. Activation does not itself move keyboard focus into the
+panel yet: a layer client cannot focus its own surface on demand, and the
+keyboard slice's focus request is what will do it. The reply is
+<code>{"accepted":true,"name":…,"edge":…,"output":…,"target":…}</code>: <code>output</code> is where
+the sub-panel lives, and <code>target</code> the output the user is at (the focused
+surface's, else the pointer's, as comp last reported them; <code>null</code> when
+unknown). This Quoin runs one output, so a <code>target</code> elsewhere is reported but
+the sub-panel still shows on its own output. Refusals: an unregistered name is
+refused exactly like <code>sub.remove</code> (<code>sub-panel name 'NAME' is not registered</code>)
+— activation never creates. While the compositor does not report its holder
+plane (below) nothing could hold the reveal, so the verb is refused rather
+than shown and left to vanish:
+<code>{"error_code":"ACTIVATION_UNAVAILABLE","error":"named activation unavailable: compositor holder plane not available","reason":"compositor holder plane not available","name":…}</code>.
+That is the answer from a comp without the plane — every build before the one
+that turns <code>input.corners.holders</code> true (restart C) — and from the embedded
+host, which has no holder client; callers get the error, never a silent no-op.</p>
 <p>Quoin 0.10.1 also accepts <code>shell.corner.{show,hide,toggle,pin,unpin}</code> with a
 <code>corner</code> argument. These use the same panel state machine and caller checks:</p>
 <table><thead><tr><th>Corner</th><th>Controlled panel</th></tr></thead><tbody>
@@ -864,8 +891,15 @@ client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present
 keeps the gate open and re-reads and replays in the background, since comp may
 have re-registered in between. Actual mode reports precede popup acquisitions
-from the corner-menu call sites. Pointer and focus are also accepted holder
-kinds; named activation integration belongs to its later slice.</p>
+from the corner-menu call sites. Named activation of a hidden edge acquires a
+<code>focus</code> hold naming the panel's own layer token once that layer maps (an
+acquisition that overtakes the mapping is refused and resent on the next
+<code>surface.mapped</code>). Quoin subscribes to comp's <code>focus.changed</code> and releases the
+hold on the first keyboard-focus change after comp acknowledged it, or when the
+reveal ends or the edge goes persistent; a gap forgets it (released once the
+gate reopens). The same topic drives activation targeting: each change starts
+one <code>comp.props.get path=focus</code> read, then the <code>surfaces.s&lt;id&gt;.output</code> of the
+focused surface and of the one under the pointer. No pointer lease is held.</p>
 <p>A refused request is resent only on the event that can change the answer: a
 layer mapping for surface and output refusals, a session-lock change for
 <code>locked</code>, and a changed intent otherwise. A busy comp, a timeout or a transport

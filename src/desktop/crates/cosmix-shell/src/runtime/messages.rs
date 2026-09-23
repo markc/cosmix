@@ -82,6 +82,20 @@ pub enum ShellCommandKind {
         owner: String,
         accepted_at: u64,
     },
+    /// Named activation (panel doc §6): show the registered sub-panel `name`
+    /// on its edge. Addressed like [`Self::SubPanelRemove`] — `edge`, `owner`
+    /// and `accepted_at` are the seat's own values resolved at dispatch, and
+    /// the Model stage applies only while that exact registration stands.
+    /// The carousel jumps to the page (a named change, never animated); a
+    /// `Hidden` edge also gets a transient reveal, which the host holds with
+    /// a compositor focus hold. A pinned or docked edge only switches pages:
+    /// activation never changes a mode.
+    SubPanelActivate {
+        edge: Edge,
+        name: String,
+        owner: String,
+        accepted_at: u64,
+    },
 }
 
 #[cfg_attr(feature = "chrome-core", derive(bevy::prelude::Message))]

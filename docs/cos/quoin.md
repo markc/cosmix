@@ -288,6 +288,34 @@ legacy verbs it never leaves a transient reveal behind, and `mode=hidden`
 conceals at once with no grace delay, because it is a deliberate action. Read
 back `shell.props.get path="panels.<edge>.mode"` to verify the applied mode.
 
+Sub-panels are addressed by their stable name, unique across every edge and
+output. `shell.sub.register` takes `edge` and `name` (the owner is the
+broker-attested caller) and fills a carousel slot without revealing or
+selecting it; `shell.sub.remove` takes `name` and lands per the removal rule.
+`shell.sub.activate` takes `name` and reveals and shows that sub-panel (panel
+design §6). On a hidden edge it is a transient reveal held by focus: the
+carousel jumps to the page (no slide) and Quoin acquires a `focus` hold on the
+panel's layer, which keeps it shown until keyboard focus first moves after comp
+acknowledges the hold (a move into the panel is then held by comp's own focus
+holder), or until Escape, a hide or a corner action ends the reveal. It never
+changes the persisted mode. On a pinned or docked edge it only switches the
+carousel to the page. Activation does not itself move keyboard focus into the
+panel yet: a layer client cannot focus its own surface on demand, and the
+keyboard slice's focus request is what will do it. The reply is
+`{"accepted":true,"name":…,"edge":…,"output":…,"target":…}`: `output` is where
+the sub-panel lives, and `target` the output the user is at (the focused
+surface's, else the pointer's, as comp last reported them; `null` when
+unknown). This Quoin runs one output, so a `target` elsewhere is reported but
+the sub-panel still shows on its own output. Refusals: an unregistered name is
+refused exactly like `sub.remove` (`sub-panel name 'NAME' is not registered`)
+— activation never creates. While the compositor does not report its holder
+plane (below) nothing could hold the reveal, so the verb is refused rather
+than shown and left to vanish:
+`{"error_code":"ACTIVATION_UNAVAILABLE","error":"named activation unavailable: compositor holder plane not available","reason":"compositor holder plane not available","name":…}`.
+That is the answer from a comp without the plane — every build before the one
+that turns `input.corners.holders` true (restart C) — and from the embedded
+host, which has no holder client; callers get the error, never a silent no-op.
+
 Quoin 0.10.1 also accepts `shell.corner.{show,hide,toggle,pin,unpin}` with a
 `corner` argument. These use the same panel state machine and caller checks:
 
@@ -482,8 +510,15 @@ client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present
 keeps the gate open and re-reads and replays in the background, since comp may
 have re-registered in between. Actual mode reports precede popup acquisitions
-from the corner-menu call sites. Pointer and focus are also accepted holder
-kinds; named activation integration belongs to its later slice.
+from the corner-menu call sites. Named activation of a hidden edge acquires a
+`focus` hold naming the panel's own layer token once that layer maps (an
+acquisition that overtakes the mapping is refused and resent on the next
+`surface.mapped`). Quoin subscribes to comp's `focus.changed` and releases the
+hold on the first keyboard-focus change after comp acknowledged it, or when the
+reveal ends or the edge goes persistent; a gap forgets it (released once the
+gate reopens). The same topic drives activation targeting: each change starts
+one `comp.props.get path=focus` read, then the `surfaces.s<id>.output` of the
+focused surface and of the one under the pointer. No pointer lease is held.
 
 A refused request is resent only on the event that can change the answer: a
 layer mapping for surface and output refusals, a session-lock change for

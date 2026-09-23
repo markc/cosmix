@@ -673,6 +673,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Carousel { .. } => "carousel",
         ShellCommandKind::SubPanelRegister { .. } => "sub-register",
         ShellCommandKind::SubPanelRemove { .. } => "sub-remove",
+        ShellCommandKind::SubPanelActivate { .. } => "sub-activate",
     }
 }
 
