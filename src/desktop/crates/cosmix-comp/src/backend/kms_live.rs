@@ -4190,8 +4190,6 @@ fn prepare_live_operation(
     bus_service: String,
     f9_bus: Option<crate::bus_key::BusKeyConfig>,
 ) -> Result<Option<PreparedLiveOperation>, KmsLiveError> {
-    #[cfg(not(feature = "bus"))]
-    drop(bus_service);
     let mut session = start_session_device_owner(grant.drm_device)?;
     let signals = LiveSignalWatcher::start(session.event_sender())?;
     let target_pairing = LiveTargetPairingLedger::default();
@@ -4202,7 +4200,12 @@ fn prepare_live_operation(
         target_pairing.clone(),
         grant.scene_mode,
         grant.decoration.clone(),
+        bus_service.clone(),
     )?;
+    // The render pump took its copy for the embedded Quoin's service
+    // selection; without the Bus port there is no further consumer here.
+    #[cfg(not(feature = "bus"))]
+    drop(bus_service);
     let started = Instant::now();
     let outcome = match supervise_live_pump_preparation(
         &mut session,

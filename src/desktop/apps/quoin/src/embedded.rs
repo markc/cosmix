@@ -59,7 +59,32 @@ struct EmbeddedHost {
 #[derive(Resource, Default)]
 struct GripDrag(Option<(Edge, f32)>);
 
-pub struct EmbeddedQuoinPlugin;
+/// Quoin hosted inside the compositor's renderer. `comp_service` names the
+/// compositor's registered Bus service (default `comp`) for the hotspot
+/// observer's deadzone mirror, supplied by the host the same way the
+/// layer host takes `--comp-service`.
+pub struct EmbeddedQuoinPlugin {
+    comp_service: String,
+}
+
+impl Default for EmbeddedQuoinPlugin {
+    fn default() -> Self {
+        Self {
+            comp_service: "comp".to_owned(),
+        }
+    }
+}
+
+impl EmbeddedQuoinPlugin {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_comp_service(mut self, service: impl Into<String>) -> Self {
+        self.comp_service = service.into();
+        self
+    }
+}
 
 impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
@@ -100,6 +125,7 @@ impl Plugin for EmbeddedQuoinPlugin {
             size: Vec2::new(1920.0, 1080.0),
         });
         let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
+        crate::hotspot::install(app, &mut bus, self.comp_service.clone());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
         bus.inbound_prefixes.push("shell.".into());
         bus.subscriptions.extend(

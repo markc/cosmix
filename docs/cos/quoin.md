@@ -420,7 +420,16 @@ Quoin creates no corner hotspot surfaces. `--comp-service NAME` selects the
 registered compositor instance (default `comp`), giving topic headers
 `<service>.corner.entered`, `<service>.corner.left`, `<service>.corner.clicked.v2`,
 `<service>.corner.clicked` and `<service>.output.changed`. Their inner commands
-are the same suffixes without the service prefix.
+are the same suffixes without the service prefix. The same selection scopes the
+carousel furniture's hotspot inset: Quoin observes `<service>.props.changed` and
+reads `input.corners.deadzone_px` through a path-scoped `<service>.props.get`
+(whose reply body is the bare value at that path), re-reading on a relevant
+change, reconnect, delivery gap, or any registry observation that reports the
+service registered — a restarted comp republishes no initial value. Until a
+read lands, or while no cosmix comp is present, the inset falls back to 12 px,
+mirroring comp's own default; a failed read keeps that fallback and logs one
+`QUOIN_HOTSPOT_READ_FAILED` notice per run of failures. The compositor's
+embedded Quoin host passes its own registered service name the same way.
 With legacy corner payloads, brief LMB toggles **Pinned** (persistent overlay);
 brief RMB toggles **Docked**
 (reserves space). Both use the existing counter-clockwise mapping: TL→left,
@@ -428,8 +437,15 @@ BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corn
 membership; the model resolves the toggle from its current mode and persists
 the change. Unpinning leaves transient reveal/grace to the panel model; undocking
 does so only while held, otherwise it starts concealment immediately.
-Panel headers have carousel controls, with no pin glyph or mode button. Change
-mode at the corner, in its menu, or through the precise mode verbs.
+Horizontal panels (bottom, top) carry a paging chevron at each end, inset from
+the panel ends by comp's corner-hotspot size, with the title and page dots as a
+centred overlay across the content strip; vertical panels (left, right) keep a
+`< [title] >` header with the chevrons inside it. Chevron paging slides the
+carousel 300 ms, collapsing to zero under reduced motion; named jumps — the
+dots, `panel.page.set`, activation, restore and a removal's landing — go
+directly to the page without the slide. Headers carry no pin glyph or mode
+button; change mode at the corner, in its menu, or through the precise mode
+verbs.
 
 The compositor also publishes `corner.clicked.v2` with `button` and `kind` for
 LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and

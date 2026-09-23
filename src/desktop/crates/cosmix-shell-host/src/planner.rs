@@ -342,6 +342,7 @@ mod tests {
             },
             page_ids: Arc::default(),
             active_page_id: None,
+            page_change: Default::default(),
         }
     }
 

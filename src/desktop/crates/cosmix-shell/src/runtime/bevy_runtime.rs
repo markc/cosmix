@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 use crate::chrome::QuoinCommittedMotionModes;
 use crate::core::{Edge, PanelInput, ShellModel, SubPanelRegistry, SubPanelSeat};
 use crate::runtime::{
-    CarouselInput, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, WakePolicy,
+    CarouselInput, PageChange, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, WakePolicy,
 };
 
 #[derive(Resource)]
@@ -22,6 +22,9 @@ struct ShellRuntime {
     model: ShellModel,
     clock_text: String,
     clock_deadline: Option<Duration>,
+    /// Carousel change markers for the update in flight; merged into the
+    /// frame after the model rebuild and cleared on the next update.
+    page_changes: [PageChange; 4],
 }
 
 /// Current renderer-neutral output. This is the sole presentation input.
@@ -81,6 +84,7 @@ impl Plugin for ShellRuntimePlugin {
                 model: self.model.clone(),
                 clock_text: String::new(),
                 clock_deadline: None,
+                page_changes: [PageChange::None; 4],
             })
             .insert_resource(ShellFrameState(ShellFrame::from_model(&self.model)))
             .init_resource::<ShellEffects>()
@@ -135,6 +139,7 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
         model,
         clock_text: String::new(),
         clock_deadline: None,
+        page_changes: [PageChange::None; 4],
     };
     world.resource_mut::<ShellFrameState>().0 = frame;
     if let Some(mut modes) = world.get_resource_mut::<QuoinCommittedMotionModes>() {
@@ -306,6 +311,7 @@ fn update_model(
     let now = time.elapsed();
     effects.0.clear();
     effects.1.clear();
+    runtime.page_changes = [PageChange::None; 4];
     for command in commands.read() {
         // Sub-panel lifecycle commands address the process-wide registry, so
         // the seat — not the command's dispatch-time output — is the
@@ -352,6 +358,9 @@ fn update_model(
                 }
                 if runtime.model.carousel(*edge).active_index() != before {
                     effects.1.push(*edge);
+                    // A registration only shifts the resting page (a pending
+                    // restore landing); never a sequential change.
+                    runtime.page_changes[edge.index()] = PageChange::Named;
                 }
                 continue;
             }
@@ -378,6 +387,8 @@ fn update_model(
                     let _ = registry.0.remove(name, &mut runtime.model);
                     if runtime.model.carousel(*edge).active_index() != before {
                         effects.1.push(*edge);
+                        // Removal lands on a neighbour directly (panel doc §3).
+                        runtime.page_changes[edge.index()] = PageChange::Named;
                     }
                 }
                 continue;
@@ -489,6 +500,7 @@ fn update_model(
             ShellCommandKind::Carousel { edge, input } => {
                 let carousel = runtime.model.carousel_mut(*edge);
                 let before = carousel.active_index();
+                let mut named = false;
                 match input {
                     CarouselInput::Next => {
                         carousel.next_page();
@@ -497,11 +509,22 @@ fn update_model(
                         carousel.previous_page();
                     }
                     CarouselInput::SelectId(id) => {
-                        carousel.select_id(id);
+                        named = carousel.select_id(id);
                     }
                 }
                 if carousel.active_index() != before {
                     effects.1.push(*edge);
+                    // Only chevron paging is sequential (panel doc §5): a
+                    // selection — dots, `page.set`, activate — jumps directly.
+                    runtime.page_changes[edge.index()] = match input {
+                        CarouselInput::Next => PageChange::Sequential { forward: true },
+                        CarouselInput::Previous => PageChange::Sequential { forward: false },
+                        CarouselInput::SelectId(_) => PageChange::Named,
+                    };
+                }
+                // Naming the page already sliding in must also land it now.
+                if named {
+                    runtime.page_changes[edge.index()] = PageChange::Named;
                 }
             }
         }
@@ -533,6 +556,9 @@ fn update_model(
         }
     } else {
         runtime.clock_deadline = None;
+    }
+    for (index, change) in runtime.page_changes.into_iter().enumerate() {
+        next_frame.panels[index].page_change = change;
     }
     frame.0 = next_frame;
 }
