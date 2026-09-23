@@ -1128,6 +1128,47 @@ intended draw was submitted. An independent 30-second settlement deadline preven
 fallback presentations from indefinitely hiding pending assets or pipelines.
 The budget resets for a replacement output generation after resume.
 
+The panel holder plane is two verbs, sent like every comp verb as the literal
+command (`comp.panel.hold`, not `<service>.panel.hold`) addressed to the
+selected service. `comp.panel.hold` takes `output` (raw connector name), `edge`
+(`top`, `bottom`, `left`, `right`), `surface` (the layer-shell namespace token),
+`holder` (`pointer`, `focus`, `popup`) and boolean `acquire`. `comp.panel.mode`
+takes the same output/edge/surface address and `mode` (`hidden`, `pinned`,
+`docked`). Both run at the stable observation dispatch boundary and return
+`{"accepted":true,"surface":...}`. Malformed arguments are refused as
+`invalid_args` naming the offending `field`, with the `allowed` list.
+Acquisitions require a live layer on that output. Mode reports survive concealed
+panel-layer destruction; releases match their recorded token even if the layer
+has already gone, and a release for an edge comp holds no state for is a no-op.
+Refusals are `unknown_output`, `unknown_panel_surface` (acquire with no layer),
+`panel_output_mismatch` (the token's one layer is on another output),
+`ambiguous_panel_surface` (the token names more than one layer, whatever their
+order) and `locked` (session lock). Explicit requests are idempotent; persistent
+modes clear holders and ignore acquisitions.
+
+The namespace token is created by Quoin for each layer lifetime. It resolves
+to comp's own surface identity without relying on client-local Wayland object
+numbers or choosing the topmost layer. Popup holds name the menu's own layer
+because the panel can be hidden. The association is re-resolved whenever a layer
+maps or unmaps, so a mode report that overtakes its layer binds when the layer
+maps; tokens are never reused. Namespaces are not authenticated: a client that
+copies a token makes it ambiguous, which refuses rather than misdirects. For
+the same reason, any enforcement that hides a panel or excludes its input must
+act on the surface identity comp resolved from the token, never on a namespace
+prefix match. Output
+removal drops that output's state without a signal; Quoin rebuilds its panels
+with fresh tokens when an output goes, so nothing stale is suppressed.
+For hidden panels, the first explicit holder emits `reveal` and the last release
+emits `conceal` on `<service>.panel.command`, through the existing bounded
+observation outbox and its gap reporting. The version-1 body contains `output`,
+`edge`, `surface`, `action` and `event_seq`.
+
+The read-only `input.corners.holders` leaf is the switch clients gate on, and it
+currently reads `false`: the verbs above are live, but automatic pointer/focus
+tracking, the conceal timer and comp-side enforcement are not yet implemented.
+The leaf turns `true` only in the build that has all three, because Quoin hands
+reveal/conceal over to comp when it does.
+
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry
 change, session lock, disable, or config invalidation. `corner` is `tl`, `tr`,

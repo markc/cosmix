@@ -12,6 +12,17 @@ use ctk::bus::{BusBridge, BusBridgeConfig, BusBridgeEvent, BusConnectionState, B
 use serde_json::{Value, json};
 
 const DEADZONE_PATH: &str = "input.corners.deadzone_px";
+/// Comp verbs are literal `comp.*` commands addressed to the selected service
+/// (`to`); only topics carry the service name.
+pub(crate) const COMP_PROPS_GET: &str = "comp.props.get";
+
+/// Comp reports lost observation records in the frame's body
+/// (`{"gap":true,"lost_count":N,"cause":...}`), on the topic that lost them;
+/// there is no `gap` header.
+pub(crate) fn is_comp_gap(body: &Value) -> bool {
+    body.get("gap").and_then(Value::as_bool) == Some(true)
+}
+
 const DISCOVERY_PATH: &str = "input.corners.discovery";
 
 /// One pending write of comp's `input.corners.discovery` (shell design
@@ -253,13 +264,11 @@ impl HotspotObserver {
         {
             return;
         }
-        let gap = message
-            .headers
-            .get("gap")
-            .is_some_and(|value| value == "true");
-        let relevant = serde_json::from_str::<Value>(&message.body)
-            .ok()
-            .and_then(|body| body.get("path").and_then(Value::as_str).map(str::to_owned))
+        let body = serde_json::from_str::<Value>(&message.body).ok();
+        let gap = body.as_ref().is_some_and(is_comp_gap);
+        let relevant = body
+            .as_ref()
+            .and_then(|body| body.get("path").and_then(Value::as_str))
             .is_some_and(|path| {
                 path == DEADZONE_PATH || path == "input.corners" || path == "input"
             });
@@ -285,7 +294,7 @@ impl HotspotObserver {
             .try_call(
                 self.next_id,
                 &self.service,
-                format!("{}.props.get", self.service),
+                COMP_PROPS_GET,
                 BTreeMap::new(),
                 body,
             )
@@ -408,7 +417,8 @@ mod tests {
         let calls = peer.drain_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].to, "comp-nested");
-        assert_eq!(calls[0].command, "comp-nested.props.get");
+        // A literal comp verb addressed to the selected service.
+        assert_eq!(calls[0].command, "comp.props.get");
         assert_eq!(calls[0].body, r#"{"path":"input.corners.deadzone_px"}"#);
         reply(&mut observer, &mut size, calls[0].request_id, json!(24.0));
         assert_eq!(size.0, 24.0);
@@ -468,6 +478,34 @@ mod tests {
             json!(18.0),
         );
         assert_eq!(size.0, 18.0);
+    }
+
+    /// Comp's gap frame, byte for byte: the marker is in the body, and the
+    /// headers carry only the topic, command and last lost sequence.
+    #[test]
+    fn hotspot_comp_gap_body_forces_a_reread() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut observer = HotspotObserver::new("comp-nested".into());
+        let mut size = QuoinHotspotSize::default();
+        connect(&mut observer, &mut size, 1);
+        observer.presence(&BTreeSet::from(["comp-nested".to_owned()]), &mut size);
+        observer.flush(&bridge);
+        reply(&mut observer, &mut size, peer.drain_calls()[0].request_id, json!(24.0));
+        observer.flush(&bridge);
+        assert!(peer.drain_calls().is_empty());
+        observer.message(&BusMessage {
+            connection_generation: 1,
+            from: "comp-nested".into(),
+            command: "props.changed".into(),
+            body: r#"{"gap":true,"lost_count":3,"cause":"outbox.overflow"}"#.into(),
+            headers: BTreeMap::from([
+                ("topic".into(), "comp-nested.props.changed".into()),
+                ("command".into(), "props.changed".into()),
+                ("event_seq".into(), "41".into()),
+            ]),
+        });
+        observer.flush(&bridge);
+        assert_eq!(peer.drain_calls().len(), 1, "lost changes are re-read");
     }
 
     /// A registered→registered observation is a re-registration receipt: no

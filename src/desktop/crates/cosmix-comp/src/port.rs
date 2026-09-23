@@ -68,6 +68,7 @@ const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
 const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 
 pub(crate) enum PortCommand {
+    Panel(PortPanelRequest),
     Snapshot(PortRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
@@ -88,6 +89,12 @@ pub(crate) struct PortRequest {
 pub(crate) struct PortReply {
     pub(crate) order: u64,
     pub(crate) reply: tokio::sync::oneshot::Sender<ControlReply>,
+}
+
+pub(crate) struct PortPanelRequest {
+    pub(crate) order: u64,
+    pub(crate) op: port_observation::PanelRequest,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
 
 pub(crate) struct PortSetRequest {
@@ -620,6 +627,7 @@ impl ControlReply {
 }
 
 pub(crate) enum PortControl {
+    Panel(PortPanelRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
@@ -632,6 +640,7 @@ pub(crate) enum PortControl {
 impl PortControl {
     pub(crate) fn order(&self) -> u64 {
         match self {
+            Self::Panel(request) => request.order,
             Self::Watch(request) => request.order,
             Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
@@ -653,6 +662,12 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
+    pub(crate) fn request_panel(&self, op: port_observation::PanelRequest) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(PortCommand::Panel(PortPanelRequest {
+            order: self.next_control_order(), op, reply: Some(reply),
+        }), receive)
+    }
     /// Whole-tree snapshot; production reads go through the scoped form.
     #[cfg(test)]
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
@@ -1768,6 +1783,38 @@ fn dispatch_incoming(
             admission,
             permit,
         );
+        return;
+    }
+    // Literal `comp.*` commands addressed to the service, like every other
+    // verb: `comp-nested.panel.hold` is an unknown verb, not an alias.
+    if matches!(command.command.as_str(), "comp.panel.hold" | "comp.panel.mode") {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "{output, edge, surface, ...}"))
+        } else {
+            port_observation::PanelRequest::parse(&command.command, &command.args)
+        };
+        let op = match parsed {
+            Ok(op) => op,
+            Err(reply) => {
+                queue_reply(reply_sender, reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()));
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(reply_sender, reply_timeouts,
+                    PendingReply::new(command, error("busy")));
+                return;
+            }
+        };
+        match ingress.request_panel(op) {
+            Ok(admission) => spawn_control_responder(responders, reply_sender,
+                reply_timeouts, command, admission, permit),
+            Err(()) => queue_reply(reply_sender, reply_timeouts,
+                PendingReply::new(command, error("busy"))),
+        }
         return;
     }
     let needs_snapshot = matches!(
@@ -4598,6 +4645,72 @@ mod tests {
         assert_eq!(long_permits.available_permits(), 1);
         drop(other_operations);
         assert_eq!(long_permits.available_permits(), LONG_VERB_PERMITS);
+    }
+
+    #[tokio::test]
+    async fn panel_verbs_dispatch_by_literal_command_under_a_non_default_service() {
+        let (ingress, source, _depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let hold = json!({"output":"Output-1","edge":"left","surface":"quoin.panel.1",
+            "holder":"popup","acquire":true});
+        for (index, (verb, args)) in [
+            ("comp.panel.hold", hold.clone()),
+            ("comp-nested.panel.hold", hold),
+            (
+                "comp.panel.mode",
+                json!({"output":"Output-1","edge":"left","surface":"quoin.panel.1",
+                    "mode":"hidden","sticky":true}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut incoming = command(verb, index);
+            incoming.body = args.to_string();
+            incoming.args = args;
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                incoming,
+            );
+        }
+        // The service-prefixed spelling is not a verb, and a typo names its field.
+        let mut refusals = BTreeMap::new();
+        for _ in 0..2 {
+            let reply = replies.try_recv().unwrap();
+            let body: Value = serde_json::from_str(&reply.body).unwrap();
+            refusals.insert(reply.id.clone().unwrap(), (reply.rc, body));
+        }
+        assert_eq!(refusals["1"].0, 10);
+        assert_eq!(refusals["1"].1["error"], "unknown_verb");
+        assert_eq!(refusals["2"].0, 10);
+        assert_eq!(refusals["2"].1["error"], "invalid_args");
+        assert_eq!(refusals["2"].1["field"], "sticky");
+        // The literal verb reaches the compositor thread under any service name.
+        let Ok(PortCommand::Panel(mut request)) = source.try_recv() else {
+            panic!("comp.panel.hold must be admitted");
+        };
+        assert_eq!(request.op.surface, "quoin.panel.1");
+        assert_eq!(request.op.acquire, Some(true));
+        assert!(source.try_recv().is_err(), "refused requests are never admitted");
+        request
+            .reply
+            .take()
+            .unwrap()
+            .send(ControlReply::Body(json!({"accepted":true,"surface":"quoin.panel.1"})))
+            .unwrap();
+        responders.join_next().await.unwrap().unwrap();
+        let reply = replies.try_recv().unwrap();
+        assert_eq!((reply.id.as_deref(), reply.rc), (Some("0"), 0));
     }
 
     #[tokio::test]

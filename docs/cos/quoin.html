@@ -482,7 +482,10 @@ launches need to run under a separate desktop user.</p>
 <p><code>cosmix-quoin</code> is the Cosmix desktop furniture shell. It owns four independent
 <code>zwlr_layer_surface_v1</code> panels — left, bottom, right and top — and renders the
 existing Quoin chrome into one explicit Bevy window target per surface. The
-installable application id and layer namespace are <code>dev.cosmix.quoin</code>.</p>
+installable application id is <code>dev.cosmix.quoin</code>, and every layer namespace
+starts with it: each panel layer is <code>dev.cosmix.quoin.panel.&lt;unique&gt;</code> and the
+corner menu <code>dev.cosmix.quoin-corner-menu.&lt;unique&gt;</code> (see
+<a href="/cos/quoin#holder-control-plane">holder control plane</a>).</p>
 <p>Quoin presents real layer-shell buffers through <code>cosmix-shell-host</code>,
 <code>cosmix-shell</code> and SCTK. See <a href="/VERSIONS">component versions</a> for the
 current source versions. <code>cosmix-quoin-demo</code> remains a
@@ -818,6 +821,50 @@ names missing charge or state explicitly; a full reading renders only the
 supplied percentage, state, time, rate and health fields. Missing values are
 never rendered as zero.</p>
 <h2 id="interaction-boundary">Interaction boundary</h2>
+<h3 id="holder-control-plane">Holder control plane</h3>
+<p>The standalone host reads the selected comp's read-only
+<code>input.corners.holders</code> capability (<code>comp.props.get</code>) before sending
+<code>comp.panel.mode</code> or <code>comp.panel.hold</code>; like every comp verb these are literal
+commands addressed to the <code>--comp-service</code> instance. Missing, false or failed
+reads leave the plane inactive, and comp currently reports <code>false</code> until its
+holder tracking and enforcement exist, so today the plane stays inactive.
+Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
+client-side inbound drops) and a change to the leaf close the gate, re-read it
+and replay the desired state. A registry receipt that finds comp still present
+keeps the gate open and re-reads and replays in the background, since comp may
+have re-registered in between. Actual mode reports precede popup acquisitions
+from the corner-menu call sites. Pointer and focus are also accepted holder
+kinds; named activation integration belongs to its later slice.</p>
+<p>A refused request is resent only on the event that can change the answer: a
+layer mapping for surface and output refusals, a session-lock change for
+<code>locked</code>, and a changed intent otherwise. A busy comp, a timeout or a transport
+failure is retried once on a one-shot deadline whose delay doubles from 250 ms
+to 8 s (a cap on the delay, not the attempts); nothing at all is sent while
+that deadline is pending, and there is no polling. Comp keeps a hold while
+Quoin reconnects or comp's own registration lapses, so an acquired hold is
+remembered until its release is acknowledged: a menu that closes during either
+outage is released afterwards, and an acknowledged release is never replayed.</p>
+<p>Each panel gets a unique layer-shell namespace token at creation, exposed to
+the client through <code>PanelLayerIdentities</code>. Requests carry that token as
+<code>surface</code>, plus the raw output name and edge. Comp resolves the exact namespace
+on that output, refusing a token that names more than one layer. Concealment
+destroys the panel layer, so its mode report may
+retain an unresolved token until the next reveal creates a new layer. A menu
+can open with its panel hidden: popup holds therefore name the menu's own
+unique layer token, exposed through <code>PopupLayerIdentity</code>. Releases accept that
+same token even after Wayland destruction overtakes the Bus request. Client-local
+Wayland object numbers cannot identify a surface across connections; an explicit
+namespace token avoids that ambiguity, so no topmost-surface fallback is used.
+Replacement panels and menus receive new tokens; delayed commands for old
+tokens are ignored.</p>
+<p>Comp's <code>&lt;service&gt;.panel.command</code> topic carries version 1, output, edge,
+surface, an <code>action</code> of <code>reveal</code> or <code>conceal</code>, and <code>event_seq</code>. Quoin only accepts
+them with current capability, connection generation, layer identity and an
+advancing sequence. This slice exposes typed commands for the later
+command-driven model: existing local reveal/conceal behaviour remains active
+until the holder tracking and timer switchover lands. The embedded host has no
+Wayland panel layers and does not install this standalone transport adapter.</p>
+<h3 id="corner-input">Corner input</h3>
 <p>Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. <code>--comp-service NAME</code> selects the
 registered compositor instance (default <code>comp</code>), giving topic headers

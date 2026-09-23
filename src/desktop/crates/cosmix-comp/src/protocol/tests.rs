@@ -35056,6 +35056,111 @@ fn layer_surface_receives_no_configure_before_its_first_empty_commit() {
     );
 }
 
+#[cfg(feature = "bus")]
+#[test]
+fn holder_surface_association_uses_layer_namespace() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.sync();
+    let id = test_layer_record(&harness, layer.surface).id;
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    let call = |harness: &mut KeybindingHarness, acquire, surface: &str| {
+        let request = port_observation::PanelRequest::parse("comp.panel.hold", &json!({
+            "output":output,"edge":"left","surface":surface,"holder":"popup","acquire":acquire,
+        })).unwrap();
+        let admission = ingress.request_panel(request).unwrap();
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+        runtime.block_on(admission.receive()).unwrap().into_wire()
+    };
+    drain_observations(&observations);
+    assert_eq!(call(&mut harness, true, "unknown-token").0, 10);
+    assert_eq!(call(&mut harness, true, "cosmix-test-layer").0, 0);
+    let key = (output.clone(), "left".into());
+    assert_eq!(harness.server.state.observations.panel_holders[&key].held["popup"].1, id);
+    assert!(drain_observations(&observations).iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::PanelCommand { reveal: true, .. })));
+    // Same namespace twice is rejected, never resolved by stack order.
+    let duplicate = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.sync();
+    assert_eq!(call(&mut harness, true, "cosmix-test-layer").0, 10);
+    send_request(&mut harness.client, duplicate.layer_surface, 7, &[]);
+    send_request(&mut harness.client, layer.layer_surface, 7, &[]);
+    harness.sync();
+    assert_eq!(call(&mut harness, false, "cosmix-test-layer").0, 0);
+    assert!(harness.server.state.observations.panel_holders[&key].held.is_empty());
+    assert!(drain_observations(&observations).iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::PanelCommand { reveal: false, .. })));
+}
+
+#[cfg(feature = "bus")]
+fn panel_call(
+    harness: &mut KeybindingHarness,
+    ingress: &crate::port::PortIngress,
+    verb: &str,
+    args: Value,
+) -> (u8, Value) {
+    let request = port_observation::PanelRequest::parse(verb, &args).unwrap();
+    let admission = ingress.request_panel(request).unwrap();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    let (rc, body) = runtime.block_on(admission.receive()).unwrap().into_wire();
+    (rc, serde_json::from_str(&body).unwrap())
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn holder_association_rebinds_across_layer_lifecycle() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let key = (output.clone(), "left".to_owned());
+    let mode = json!({"output":output,"edge":"left","surface":"cosmix-test-layer","mode":"hidden"});
+    // The mode report can overtake the layer's creation on the other connection.
+    assert_eq!(panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    assert_eq!(harness.server.state.observations.panel_holders[&key].id, None);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.sync();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let id = test_layer_record(&harness, layer.surface).id;
+    assert_eq!(
+        harness.server.state.observations.panel_holders[&key].id,
+        Some(id),
+        "mapping the named layer binds it"
+    );
+    // Concealment destroys the layer; the mode outlives it, unresolved.
+    send_request(&mut harness.client, layer.layer_surface, 7, &[]);
+    send_request(&mut harness.client, layer.surface, 0, &[]);
+    harness.sync();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let panel = &harness.server.state.observations.panel_holders[&key];
+    assert_eq!((panel.id, panel.mode.as_str()), (None, "hidden"));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn panel_requests_refuse_unknown_output_and_session_lock() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let _ = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.sync();
+    let hold = |output: &str| json!({"output":output,"edge":"left","surface":"cosmix-test-layer",
+        "holder":"popup","acquire":true});
+    let (rc, body) = panel_call(&mut harness, &ingress, "comp.panel.hold", hold("Nope-1"));
+    assert_eq!((rc, body["error"].as_str()), (10, Some("unknown_output")));
+    let lock = begin_test_session_lock(&mut harness);
+    ack_and_map_test_lock_surface(&mut harness, lock);
+    assert!(harness.server.state.session_lock_active());
+    drain_observations(&observations);
+    let (rc, body) = panel_call(&mut harness, &ingress, "comp.panel.hold", hold(output.as_str()));
+    assert_eq!((rc, body["error"].as_str()), (10, Some("locked")));
+    assert!(
+        harness.server.state.observations.panel_holders.is_empty(),
+        "a refused request changes no holder state"
+    );
+    assert!(!drain_observations(&observations).iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::PanelCommand { .. })));
+}
+
 #[test]
 fn layer_role_creation_rejects_a_previously_committed_buffer() {
     let mut harness = KeybindingHarness::new(true);

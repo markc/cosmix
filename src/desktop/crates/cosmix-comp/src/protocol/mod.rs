@@ -3496,6 +3496,11 @@ impl ProtocolServer {
             event_loop
                 .handle()
                 .insert_source(source, |event, (), state| match event {
+                    ChannelEvent::Msg(PortCommand::Panel(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Panel(request));
+                        }
+                    }
                     ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
                         if state.pending_port_requests.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_requests.push(request);

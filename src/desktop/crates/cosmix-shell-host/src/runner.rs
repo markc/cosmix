@@ -2007,13 +2007,15 @@ impl PanelWaylandFactory<'_> {
         wl_surface::WlSurface,
         LayerSurface,
         Option<FractionalObjects>,
+        String,
     ) {
         let wl_surface = self.compositor_state.create_surface(qh);
+        let identity = crate::holders::new_layer_identity(&format!("{}.panel", self.namespace));
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             wl_surface.clone(),
             Layer::Overlay,
-            Some(self.namespace.to_owned()),
+            Some(identity.clone()),
             Some(output),
         );
         let fractional = match (self.fractional_manager, self.viewporter) {
@@ -2023,7 +2025,7 @@ impl PanelWaylandFactory<'_> {
             }),
             _ => None,
         };
-        (wl_surface, layer_surface, fractional)
+        (wl_surface, layer_surface, fractional, identity)
     }
 }
 
@@ -2042,9 +2044,11 @@ impl RunnerState {
             namespace: &self.namespace,
         };
         let mut panel_vec = Vec::with_capacity(Edge::ALL.len());
+        let mut identities = crate::holders::PanelLayerIdentities::default();
         for edge in Edge::ALL {
-            let (wl_surface, layer_surface, fractional) =
+            let (wl_surface, layer_surface, fractional, identity) =
                 factory.create(qh, &selected.wl_output, edge);
+            identities.0.push((selected.key.clone(), edge, identity));
             let panel = PanelSurface::from_wayland(
                 &mut self.app,
                 &self.connection,
@@ -2059,6 +2063,7 @@ impl RunnerState {
             .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
             panel_vec.push(panel);
         }
+        self.app.insert_resource(identities);
         panel_vec
             .try_into()
             .map_err(|_| LayerHostError::new("panel construction count was not four"))
@@ -2188,11 +2193,15 @@ impl RunnerState {
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
             if !panel.has_wayland_objects() && operations.contains(&ProtocolOp::CreateSurface) {
                 let _trace = frame_trace::span("quoin_panel_create", edge.index() as u64);
-                let (wl_surface, layer_surface, fractional) =
+                let (wl_surface, layer_surface, fractional, identity) =
                     factory.create(qh, &output.wl_output, edge);
                 panel
                     .install_wayland(connection, wl_surface, layer_surface, fractional)
                     .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
+                let mut identities = app.world_mut().resource_mut::<crate::holders::PanelLayerIdentities>();
+                identities.0.retain(|(o, e, _)| o != key || *e != edge);
+                identities.0.push((key.clone(), edge, identity));
+                *needs_update = true;
             }
             if operations.contains(&ProtocolOp::Unmap) {
                 keyboard_bridge.cleanup(app, Some(panel.window));

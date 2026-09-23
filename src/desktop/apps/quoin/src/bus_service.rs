@@ -114,6 +114,7 @@ pub(crate) struct ShellBusDispatch;
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
+            .add_message::<crate::holders::HolderCommand>()
             .init_resource::<cosmix_shell::chrome::QuoinHotspotSize>()
             .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
@@ -136,12 +137,20 @@ impl Plugin for ShellBusPlugin {
                     .in_set(ShellRuntimeSet::Input)
                     .after(service_bus),
             )
-            .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation));
+            .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(
+                Update,
+                crate::holders::report_holders
+                    .in_set(ShellRuntimeSet::Presentation)
+                    .after(service_bus),
+            );
     }
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct SceneBus<'w, 's> {
+    holders: Option<ResMut<'w, crate::holders::HolderClient>>,
+    holder_commands: MessageWriter<'w, crate::holders::HolderCommand>,
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
@@ -244,6 +253,7 @@ fn service_bus(
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
+        if let Some(client) = content.holders.as_deref_mut() { client.event(&event); }
         if let Some(observer) = hotspot.as_deref_mut() {
             observer.event(&event, &mut hotspot_size);
         }
@@ -300,6 +310,7 @@ fn service_bus(
                             // A reply may have been captured before a new load.
                             // Use the request's fence, never the later reply time.
                             reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                            if let Some(client) = content.holders.as_deref_mut() { client.presence(&live); }
                             if let Some(observer) = hotspot.as_deref_mut() {
                                 observer.presence(&live, &mut hotspot_size);
                             }
@@ -330,6 +341,10 @@ fn service_bus(
         }
     }
     for message in bridge.drain_messages() {
+        if let Some(client) = content.holders.as_deref_mut()
+            && let Some(command) = client.message(&message) {
+            content.holder_commands.write(command);
+        }
         if let Some(observer) = hotspot.as_deref_mut() {
             observer.message(&message);
         }
@@ -345,6 +360,7 @@ fn service_bus(
                 state.citizen_snapshot = None;
                 state.citizen_snapshot_retry = false;
                 reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                if let Some(client) = content.holders.as_deref_mut() { client.presence(&live); }
                 if let Some(observer) = hotspot.as_deref_mut() {
                     observer.presence(&live, &mut hotspot_size);
                 }
@@ -1300,7 +1316,7 @@ fn leaf(path: String, value: PropValue) -> (PropPath, PropValue) {
     )
 }
 
-fn edge_name(edge: Edge) -> &'static str {
+pub(crate) fn edge_name(edge: Edge) -> &'static str {
     match edge {
         Edge::Left => "left",
         Edge::Bottom => "bottom",
@@ -1312,6 +1328,153 @@ fn edge_name(edge: Edge) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire contract against a non-default comp: literal `comp.*`
+    /// commands addressed to that service. A menu closed while the Bus was
+    /// down is still released after reconnect (comp kept the hold), and
+    /// once acknowledged its token goes quiet.
+    #[test]
+    fn client_sends_hold_on_popup_open() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        assert!(bus.subscriptions.contains(&"comp-nested.panel.command".into()));
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+        });
+        let reply = |request_id, body: &str| BusBridgeEvent::Reply {
+            request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
+        };
+        let comp_calls = || -> Vec<_> {
+            peer.drain_calls().into_iter().filter(|call| call.command.starts_with("comp")).collect()
+        };
+        let menu = |app: &mut App, open: bool| {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(), at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left,
+                    input: cosmix_shell::core::PanelInput::MenuHold(open) },
+            });
+        };
+        let mode = json!({"output":"test","edge":"left","surface":"panel-token","mode":"hidden"});
+        let hold = |acquire: bool| json!({"output":"test","edge":"left","surface":"menu-token",
+            "holder":"popup","acquire":acquire});
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        menu(&mut app, true);
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1, "only the capability read before capability");
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.props.get"));
+        assert_eq!(calls[0].body, r#"{"path":"input.corners.holders"}"#);
+        peer.deliver_event(reply(calls[0].request_id, "true"));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.panel.mode"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), mode);
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.panel.hold"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold(true));
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        // The Bus drops; the menu closes meanwhile.
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Disconnected, generation: 1,
+        });
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        menu(&mut app, false);
+        app.update();
+        assert!(comp_calls().is_empty(), "nothing is sent while disconnected");
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 2,
+        });
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls[0].command, "comp.props.get");
+        peer.deliver_event(reply(calls[0].request_id, "true"));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls[0].command, "comp.panel.mode", "mode reports replay first");
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold(false));
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        app.update();
+        assert!(comp_calls().is_empty(), "an acknowledged release is never replayed");
+    }
+
+    /// Comp's registration lapses while comp itself (and its hold) lives on.
+    /// The menu closing during that outage is still released on return.
+    #[test]
+    fn hold_is_released_after_comp_registration_outage() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+        });
+        let reply = |request_id, body: &str| BusBridgeEvent::Reply {
+            request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
+        };
+        let comp_calls = || -> Vec<_> {
+            peer.drain_calls().into_iter().filter(|call| call.command.starts_with("comp")).collect()
+        };
+        let menu = |app: &mut App, open: bool| {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(), at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left,
+                    input: cosmix_shell::core::PanelInput::MenuHold(open) },
+            });
+        };
+        let presence = |app: &mut App, services: &[&str]| {
+            let live = services.iter().map(|name| (*name).to_owned()).collect();
+            app.world_mut().resource_mut::<crate::holders::HolderClient>().presence(&live);
+        };
+        // Read, mode report, acquire: each acknowledged in turn.
+        let accept_next = |app: &mut App, command: &str, body: &str| {
+            app.update();
+            let calls = comp_calls();
+            assert_eq!(calls.len(), 1, "{command}");
+            assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", command));
+            peer.deliver_event(reply(calls[0].request_id, body));
+            serde_json::from_str::<Value>(&calls[0].body).unwrap()
+        };
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        menu(&mut app, true);
+        accept_next(&mut app, "comp.props.get", "true");
+        accept_next(&mut app, "comp.panel.mode", r#"{"accepted":true}"#);
+        assert_eq!(accept_next(&mut app, "comp.panel.hold", r#"{"accepted":true}"#)["acquire"], true);
+        presence(&mut app, &[]);
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        menu(&mut app, false);
+        app.update();
+        assert!(comp_calls().is_empty(), "nothing is sent while comp is unregistered");
+        presence(&mut app, &["comp-nested"]);
+        accept_next(&mut app, "comp.props.get", "true");
+        accept_next(&mut app, "comp.panel.mode", r#"{"accepted":true}"#);
+        let release = accept_next(&mut app, "comp.panel.hold", r#"{"accepted":true}"#);
+        assert_eq!(release["surface"], "menu-token");
+        assert_eq!(release["acquire"], false, "the stranded hold is released");
+        app.update();
+        assert!(comp_calls().is_empty(), "and, acknowledged, goes quiet");
+    }
+
     use cosmix_shell::core::PanelInput;
     use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
     use ctk::bus::test_bridge;
@@ -2014,7 +2177,8 @@ mod tests {
         });
         app.update();
         let request = peer.drain_calls().into_iter()
-            .find(|call| call.command == "comp-nested.props.get").unwrap();
+            .find(|call| call.command == "comp.props.get").unwrap();
+        assert_eq!(request.to, "comp-nested");
         peer.deliver_event(BusBridgeEvent::Reply {
             request_id: request.request_id,
             result: Ok(ctk::bus::BusReply {
@@ -2037,7 +2201,8 @@ mod tests {
         app.update();
         let calls = peer.drain_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].command, "comp-nested.props.get");
+        assert_eq!(calls[0].command, "comp.props.get");
+        assert_eq!(calls[0].to, "comp-nested");
         peer.deliver_event(BusBridgeEvent::Reply {
             request_id: calls[0].request_id,
             result: Ok(ctk::bus::BusReply {
