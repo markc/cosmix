@@ -451,6 +451,19 @@ fn ingest(world: &mut World) {
     }
 }
 
+/// Feed the real ingestion path without installing a filesystem watcher.
+#[cfg(test)]
+pub(crate) fn ingest_test_config(world: &mut World, source: &str) {
+    let mut inbox = ConfigInbox::default();
+    inbox.publish(ShellConfig::parse(source));
+    world.init_resource::<ShellConfig>();
+    world.insert_resource(ConfigReader {
+        pending: Arc::new(Mutex::new(inbox)),
+        applied: false,
+    });
+    ingest(world);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

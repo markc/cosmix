@@ -21,6 +21,7 @@ pub struct ShellModel {
     geometry: LogicalSize,
     panels: [PanelStateMachine; 4],
     carousels: [Carousel; 4],
+    thickness_set: [bool; 4],
     last_update: Duration,
 }
 
@@ -48,6 +49,7 @@ impl ShellModel {
             geometry,
             panels,
             carousels: std::array::from_fn(|_| Carousel::empty()),
+            thickness_set: [false; 4],
             last_update: start_at,
         })
     }
@@ -101,7 +103,12 @@ impl ShellModel {
         self.carousels[edge.index()].redeclare(page_ids)
     }
 
-    /// Restored thickness has the same validation as a newly constructed panel.
+    /// Whether this edge has a restored, resized or scene-seeded thickness.
+    pub fn has_remembered_thickness(&self, edge: Edge) -> bool {
+        self.thickness_set[edge.index()]
+    }
+
+    /// Restore an edge preference, preventing later scenes from replacing it.
     pub fn restore_thickness(
         &mut self,
         edge: Edge,
@@ -112,7 +119,9 @@ impl ShellModel {
         } else {
             thickness
         };
-        self.panels[edge.index()].restore_thickness(thickness)
+        self.panels[edge.index()].restore_thickness(thickness)?;
+        self.thickness_set[edge.index()] = true;
+        Ok(())
     }
 
     /// Maximum thickness that leaves space for the opposite panel and work area.
@@ -131,6 +140,7 @@ impl ShellModel {
     }
 
     fn fit_output_budget(&mut self) {
+        let thickness_set = self.thickness_set;
         for (a, b, extent) in [
             (Edge::Left, Edge::Right, self.geometry.width()),
             (Edge::Top, Edge::Bottom, self.geometry.height()),
@@ -147,6 +157,7 @@ impl ShellModel {
                 let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
             }
         }
+        self.thickness_set = thickness_set;
     }
 
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
@@ -159,9 +170,11 @@ impl ShellModel {
             });
         }
         if max < *super::RESIZE_THICKNESS_RANGE.start() && thickness == max {
-            return self.panels[edge.index()].restore_thickness(thickness);
+            return self.restore_thickness(edge, thickness);
         }
-        self.panels[edge.index()].resize_thickness(thickness)
+        self.panels[edge.index()].resize_thickness(thickness)?;
+        self.thickness_set[edge.index()] = true;
+        Ok(())
     }
 
     /// Cold-start discovery is independent of compositor corner membership.
@@ -182,6 +195,7 @@ impl ShellModel {
             panel.leave_output();
         }
         self.carousels = outgoing.carousels.clone();
+        self.thickness_set = outgoing.thickness_set;
         self.last_update = outgoing.last_update;
         self.fit_output_budget();
     }
@@ -204,7 +218,9 @@ impl ShellModel {
             input,
             PanelInput::Dock | PanelInput::DockToggle | PanelInput::SetMode(PanelMode::Docked)
         ) {
+            let remembered = self.thickness_set[edge.index()];
             let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+            self.thickness_set[edge.index()] = remembered;
         }
         let panel = &mut self.panels[edge.index()];
         let before = panel.snapshot();

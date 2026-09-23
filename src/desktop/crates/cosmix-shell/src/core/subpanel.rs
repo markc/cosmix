@@ -17,7 +17,7 @@
 //! selection falls back to the primary).
 //!
 //! The current host has one selected model. Output replacement carries its
-//! live carousels and explicitly migrates their seats; citizen ingress cannot
+//! seats and repopulates the replacement's carousels; citizen ingress cannot
 //! move a name by updating it onto another output.
 
 use std::collections::BTreeMap;
@@ -78,6 +78,23 @@ impl SubPanelRegistry {
     /// The seat a name holds, if it is live.
     pub fn seat(&self, name: &str) -> Option<&SubPanelSeat> {
         self.seats.get(name)
+    }
+
+    /// Repopulate a replacement output in receipt order. The caller must reapply
+    /// accepted declarations first so declared names fill their configured slots;
+    /// undeclared names append in receipt order. Registration fulfils pending
+    /// saved selection without overriding explicit selection. Mounted and
+    /// verb-only registrations both survive.
+    pub fn populate_model(&self, model: &mut ShellModel) {
+        let mut seats: Vec<_> = self
+            .seats
+            .iter()
+            .filter(|(_, seat)| &seat.output == model.output())
+            .collect();
+        seats.sort_by_key(|(_, seat)| seat.accepted_at);
+        for (name, seat) in seats {
+            let _ = model.carousel_mut(seat.edge).register(name);
+        }
     }
 
     /// Every live name owned by `owner`, in name order.
