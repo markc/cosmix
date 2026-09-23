@@ -7,6 +7,7 @@
 //! attributed to the event which armed the grace deadline. A deliberate undock from
 //! docked hides immediately unless a hold keeps the panel revealed: the grace delay
 //! exists to forgive pointer overshoot and never applies to a deliberate action.
+//! An interim local menu input suppresses concealment until the popup closes.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -49,6 +50,8 @@ impl PanelMode {
 /// Inputs accepted by the pure panel state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PanelInput {
+    /// Interim corner-menu hold; replaced by compositor popup ownership later.
+    MenuHold(bool),
     Reveal,
     /// Toggle transient visibility when `Hidden`; persistent panels ignore it (the
     /// same law as [`PanelInput::Hide`]). The direction binds at Model time
@@ -189,6 +192,7 @@ pub enum PanelWake {
 /// Pure semantic and motion state for one edge panel.
 #[derive(Clone, Debug)]
 pub struct PanelStateMachine {
+    menu_hold: bool,
     config: PanelConfig,
     mode: PanelMode,
     transient_revealed: bool,
@@ -205,6 +209,7 @@ pub struct PanelStateMachine {
 impl PanelStateMachine {
     pub fn new(config: PanelConfig, start_at: Duration) -> Result<Self, PanelConfigError> {
         Ok(Self {
+            menu_hold: false,
             config,
             mode: PanelMode::Hidden,
             transient_revealed: false,
@@ -225,8 +230,27 @@ impl PanelStateMachine {
         input: PanelInput,
     ) -> Result<PanelUpdate, PanelTimeError> {
         let before = self.snapshot();
+        // Acquire before advancing a grace deadline at the same timestamp.
+        if input == PanelInput::MenuHold(true) && at >= self.last_update {
+            self.menu_hold = true;
+            self.clear_deadline();
+        }
         let mut effect = self.advance_to(at)?;
         match input {
+            PanelInput::MenuHold(open) => {
+                self.menu_hold = open;
+                self.clear_deadline();
+                if !open
+                    && self.transient_revealed
+                    && !self.pointer_inside
+                    && !self.corner_inside
+                    && self.resize_start.is_none()
+                    && self.intro_until.is_none()
+                {
+                    self.transient_revealed = false;
+                    self.motion.conceal();
+                }
+            }
             PanelInput::ResizeStarted => {
                 self.resize_start.get_or_insert(self.config.thickness_px);
                 self.clear_deadline();
@@ -259,7 +283,10 @@ impl PanelStateMachine {
                     self.transient_revealed = true;
                     self.clear_deadline();
                     self.motion.reveal();
-                } else if self.mode == PanelMode::Hidden && self.resize_start.is_none() {
+                } else if self.mode == PanelMode::Hidden
+                    && self.resize_start.is_none()
+                    && !self.menu_hold
+                {
                     // Mirrors Hide: persistent panels ignore both directions.
                     self.transient_revealed = false;
                     self.clear_deadline();
@@ -292,7 +319,8 @@ impl PanelStateMachine {
                 }
             }
             PanelInput::Hide | PanelInput::Escape => {
-                if self.mode == PanelMode::Hidden && self.resize_start.is_none() {
+                if self.mode == PanelMode::Hidden && self.resize_start.is_none() && !self.menu_hold
+                {
                     self.transient_revealed = false;
                     self.clear_deadline();
                     self.motion.conceal();
@@ -306,7 +334,11 @@ impl PanelStateMachine {
                 // panel; the grace delay only ever forgives pointer overshoot,
                 // never a deliberate action. A held undock keeps its transient
                 // reveal.
-                if self.pointer_inside || self.corner_inside || self.resize_start.is_some() {
+                if self.pointer_inside
+                    || self.corner_inside
+                    || self.resize_start.is_some()
+                    || self.menu_hold
+                {
                     effect = self.release(at).or(effect);
                 } else {
                     effect = self.change_mode(PanelMode::Hidden).or(effect);
@@ -379,7 +411,11 @@ impl PanelStateMachine {
 
     /// Membership of a retired output cannot hold its replacement open.
     pub(super) fn leave_output(&mut self) {
-        let held = self.corner_inside || self.pointer_inside || self.resize_start.is_some();
+        let held = self.corner_inside
+            || self.pointer_inside
+            || self.resize_start.is_some()
+            || self.menu_hold;
+        self.menu_hold = false;
         if let Some(start) = self.resize_start.take() {
             self.config.thickness_px = start;
         }
@@ -453,6 +489,7 @@ impl PanelStateMachine {
             && self.transient_revealed
             && !self.pointer_inside
             && !self.corner_inside
+            && !self.menu_hold
         {
             let before_deadline = deadline.saturating_sub(self.last_update);
             self.motion.advance(before_deadline);
@@ -516,7 +553,7 @@ impl PanelStateMachine {
     }
 
     fn arm_deadline(&mut self, at: Duration, reason: ConcealReason) {
-        if self.resize_start.is_some() {
+        if self.resize_start.is_some() || self.menu_hold {
             return;
         }
         self.hide_at = Some(at + self.config.grace);
@@ -584,6 +621,83 @@ impl Error for PanelTimeError {}
 #[cfg(test)]
 mod intro_tests {
     use super::*;
+
+    #[test]
+    fn open_menu_holds_reveal_until_closed() {
+        for persistent in [None, Some(PanelMode::Pinned), Some(PanelMode::Docked)] {
+            let mut panel = panel();
+            for input in [
+                PanelInput::CornerEntered,
+                PanelInput::MenuHold(true),
+                PanelInput::CornerLeft,
+                PanelInput::PointerEntered,
+                PanelInput::PointerLeft,
+                PanelInput::Hide,
+                PanelInput::Escape,
+                PanelInput::Toggle,
+            ] {
+                panel.apply(Duration::ZERO, input).unwrap();
+            }
+            panel.tick(Duration::from_secs(10)).unwrap();
+            assert!(panel.snapshot().transient_revealed);
+            assert_eq!(panel.next_deadline(), None);
+            if let Some(mode) = persistent {
+                let update = panel
+                    .apply(Duration::from_secs(10), PanelInput::SetMode(mode))
+                    .unwrap();
+                assert_eq!(update.effect, Some(PanelEffect::ModeChanged { mode }));
+            }
+            panel
+                .apply(Duration::from_secs(10), PanelInput::MenuHold(false))
+                .unwrap();
+            assert_eq!(
+                panel.snapshot().mode,
+                persistent.unwrap_or(PanelMode::Hidden)
+            );
+            assert_eq!(
+                panel.snapshot().target_fraction,
+                if persistent.is_some() { 1.0 } else { 0.0 }
+            );
+            assert!(!panel.snapshot().transient_revealed);
+            assert_eq!(panel.next_deadline(), None);
+        }
+    }
+
+    #[test]
+    fn menu_hold_does_not_reveal_hidden_panel_and_preserves_other_holds() {
+        let mut panel = panel();
+        panel
+            .apply(Duration::ZERO, PanelInput::MenuHold(true))
+            .unwrap();
+        assert!(!panel.snapshot().mapped);
+        panel
+            .apply(Duration::ZERO, PanelInput::CornerEntered)
+            .unwrap();
+        panel
+            .apply(Duration::ZERO, PanelInput::MenuHold(false))
+            .unwrap();
+        assert!(panel.snapshot().transient_revealed);
+        panel.apply(Duration::ZERO, PanelInput::CornerLeft).unwrap();
+        panel.tick(Duration::from_secs(1)).unwrap();
+        assert!(!panel.snapshot().transient_revealed);
+    }
+
+    #[test]
+    fn menu_acquisition_at_grace_deadline_prevents_conceal() {
+        let mut panel = panel();
+        panel
+            .apply(Duration::ZERO, PanelInput::CornerEntered)
+            .unwrap();
+        panel.apply(Duration::ZERO, PanelInput::CornerLeft).unwrap();
+        let update = panel
+            .apply(Duration::from_millis(800), PanelInput::MenuHold(true))
+            .unwrap();
+        assert_eq!(update.effect, None);
+        assert!(update.snapshot.transient_revealed);
+        assert_eq!(update.snapshot.target_fraction, 1.0);
+        panel.tick(Duration::from_secs(10)).unwrap();
+        assert!(panel.snapshot().transient_revealed);
+    }
 
     fn panel() -> PanelStateMachine {
         PanelStateMachine::new(

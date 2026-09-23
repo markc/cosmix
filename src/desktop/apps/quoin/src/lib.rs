@@ -2,6 +2,7 @@
 
 mod bus_service;
 pub mod config;
+mod corner_menu;
 mod demos;
 mod desktop_font;
 mod launcher;
@@ -138,6 +139,7 @@ pub fn run_layer_host() -> AppExit {
         smoke_hidden,
     );
     config::install(&mut app, smoke_all_panels || smoke_hidden);
+    corner_menu::install(&mut app);
     app.run()
 }
 

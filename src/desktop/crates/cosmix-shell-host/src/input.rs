@@ -527,6 +527,12 @@ struct Focus {
     output_position: Vec2,
 }
 
+/// Shell commands staged from outside the Bevy schedule (Wayland dispatch,
+/// corner Bus ingress, menu teardown) between updates.
+/// `flush_staged_shell_commands` drains them in push order, and consumers
+/// depend on that FIFO: it is how the corner menu stages a chosen mode
+/// command before its `MenuHold(false)` release so no conceal can race the
+/// mode change.
 #[derive(Resource, Default)]
 pub(crate) struct StagedShellCommands(Vec<(OutputKey, ShellCommandKind)>);
 
