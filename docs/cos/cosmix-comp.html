@@ -765,7 +765,7 @@ owner) or an object subtree with its immediate children.</li>
 the name this compositor instance actually registered. The reply is truthful
 only for a caller that subscribed to that topic before calling <code>watch</code> and
 remains subscribed.</li>
-<li><code>comp.props.set {path,value,generation?}</code> mutates the five corner
+<li><code>comp.props.set {path,value,generation?}</code> mutates the four corner
 properties, <code>windows.s&lt;id&gt;.band</code>, <code>windows.s&lt;id&gt;.minimized</code>,
 <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>, <code>workspaces.current</code>,
 <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>, or
@@ -893,7 +893,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,hold_ms,velocity_max_px_s}
+input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -1285,7 +1285,7 @@ below, so handlers do not depend on the instance name.</p>
 <tr><td><code>&lt;service&gt;.corner.entered</code></td><td><code>corner.entered</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.left</code></td><td><code>corner.left</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.clicked</code></td><td><code>corner.clicked</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
-<tr><td><code>&lt;service&gt;.corner.clicked.v2</code></td><td><code>corner.clicked.v2</code></td><td><code>{output,corner,button,kind,dwell_ms,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.corner.clicked.v2</code></td><td><code>corner.clicked.v2</code></td><td><code>{output,corner,button,kind,modifiers,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.pointer.changed</code></td><td><code>pointer.changed</code></td><td><code>{version:1,instance,output,position,valid,timestamp_ms,event_seq}</code></td></tr>
 </tbody></table>
 <p>Map edges carry the surface's role <code>generation</code> and its <code>app_id</code> and <code>title</code>
@@ -1302,26 +1302,37 @@ condition, use <code>comp.window.wait</code> rather than subscribing and hoping:
 topics are not retained, so an edge that happened before the subscription is
 never delivered.</p>
 <p>Engaged corners consume pointer presses and their matching releases. The v2
-click topic reports <code>button: "left"|"right"</code> and <code>kind: "brief"|"hold"</code>.
-LMB emits brief on release, with no hold behaviour. RMB emits brief on release
-before <code>input.corners.hold_ms</code> (default 500ms), or hold once at that deadline;
-release after hold emits nothing. Other buttons are consumed without an action.
+click topic reports <code>button: "left"|"right"</code> and <code>kind: "brief"</code>.
+Both buttons emit on release, with no hold timer or hold action. <code>modifiers</code>
+contains the active <code>shift</code>, <code>ctrl</code>, <code>alt</code> and <code>super</code> names captured at press
+time in the compositor input path, even if they change before release. The field
+is always present, including <code>modifiers: []</code>; its presence selects the new
+mapping in Quoin. Other buttons are consumed without an action.
 Movement further than <code>input.corners.deadzone_px</code> from the press position cancels
 the pending action, even within the hotspot. Leaving the corner or resetting
 engagement (including output changes, lock, or config changes) also cancels it.
 Cancellation retains release ownership; returning to the corner cannot revive
-the action. A hold already emitted is not retracted by later movement.</p>
+the action.</p>
 <p>The original <code>corner.clicked</code> topic retains its exact JSON body and emits only
-successful LMB brief actions, now on release. V2 consumers should subscribe only
+successful unmodified LMB brief actions, on release. Every modified click,
+including Ctrl/Alt/Super+LMB, emits only v2. V2 consumers should subscribe only
 to <code>corner.clicked.v2</code> to avoid handling LMB twice. Consumers retaining an old-comp
-fallback must deduplicate: each LMB emits legacy at sequence N immediately followed
+fallback must deduplicate: each unmodified LMB emits legacy at sequence N immediately followed
 by v2 at N+1, with the same output, corner and engagement dwell. Quoin uses this
-pair to admit the first click once, then ignores legacy after observing v2.
+pair to admit the first click once in either delivery order, then ignores legacy
+after observing v2. The legacy sibling is required even with <code>modifiers: []</code>:
+Quoin canonicalises the v2 sequence to N. Modified clicks keep their own sequence.
 This versioning preserves old
-shell-hosts with strict JSON decoding; they receive no RMB actions during rollout.
+shell-hosts with strict JSON decoding, but only partly. A host that predates v2
+entirely sees legacy LMB and nothing else. A v2-aware host from before
+<code>modifiers</code> existed is worse: its strict decoder rejects every v2 body, so it
+never marks v2 as seen and acts only on legacy. On that skew RMB and every
+Shift/Ctrl/Alt/Super+LMB click is lost silently; only unmodified LMB works.
+Upgrade the shell-host before, or together with, the compositor.
 Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
-to overlay pinning, RMB brief to docking, and RMB hold to an optional corner menu
-hook; an unconfigured menu does nothing.</p>
+to overlay pinning, Shift+LMB to docking, and RMB to the corner menu.
+Ctrl/Alt/Super without Shift retain LMB pinning. LMB from docked becomes pinned;
+Shift+LMB toggles docked/hidden. No bare button click docks a panel.</p>
 <p>For a reliable property bootstrap: subscribe to the instance topic (for
 example <code>comp.props.changed</code> on the seat or <code>comp-nested.props.changed</code> when
 nested), call <code>comp.props.watch</code>, verify its returned topic, then read the
@@ -1473,10 +1484,9 @@ ranges are:</p>
 <tr><td><code>input.corners.enabled</code></td><td style="text-align: right"><code>true</code></td><td style="text-align: right">boolean</td></tr>
 <tr><td><code>input.corners.deadzone_px</code></td><td style="text-align: right"><code>12.0</code></td><td style="text-align: right"><code>1.0..=256.0</code> logical px</td></tr>
 <tr><td><code>input.corners.dwell_ms</code></td><td style="text-align: right"><code>200</code></td><td style="text-align: right"><code>0..=5000</code> ms</td></tr>
-<tr><td><code>input.corners.hold_ms</code></td><td style="text-align: right"><code>500</code></td><td style="text-align: right"><code>1..=5000</code> ms (RMB only)</td></tr>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
 </tbody></table>
-<p>The mutable leaves are the five corner leaves, <code>windows.s&lt;id&gt;.band</code>,
+<p>The mutable leaves are the four corner leaves, <code>windows.s&lt;id&gt;.band</code>,
 <code>windows.s&lt;id&gt;.minimized</code>, <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>,
 <code>workspaces.current</code>, <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>
 (nested only) and <code>xwayland.enabled</code>. The corner, window and workspace

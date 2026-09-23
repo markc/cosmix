@@ -371,7 +371,7 @@ The control plane exposes these verbs:
   the name this compositor instance actually registered. The reply is truthful
   only for a caller that subscribed to that topic before calling `watch` and
   remains subscribed.
-- `comp.props.set {path,value,generation?}` mutates the five corner
+- `comp.props.set {path,value,generation?}` mutates the four corner
   properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
   `windows.s<id>.workspace`, `workspaces.count`, `workspaces.current`,
   `workspaces.o_<slug>.current`, `input.host.passthrough`, or
@@ -513,7 +513,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,hold_ms,velocity_max_px_s}
+input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -920,7 +920,7 @@ below, so handlers do not depend on the instance name.
 | `<service>.corner.entered` | `corner.entered` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.left` | `corner.left` | `{output,corner,dwell_ms,event_seq}` |
 | `<service>.corner.clicked` | `corner.clicked` | `{output,corner,dwell_ms,event_seq}` |
-| `<service>.corner.clicked.v2` | `corner.clicked.v2` | `{output,corner,button,kind,dwell_ms,event_seq}` |
+| `<service>.corner.clicked.v2` | `corner.clicked.v2` | `{output,corner,button,kind,modifiers,dwell_ms,event_seq}` |
 | `<service>.pointer.changed` | `pointer.changed` | `{version:1,instance,output,position,valid,timestamp_ms,event_seq}` |
 
 Map edges carry the surface's role `generation` and its `app_id` and `title`
@@ -939,27 +939,38 @@ topics are not retained, so an edge that happened before the subscription is
 never delivered.
 
 Engaged corners consume pointer presses and their matching releases. The v2
-click topic reports `button: "left"|"right"` and `kind: "brief"|"hold"`.
-LMB emits brief on release, with no hold behaviour. RMB emits brief on release
-before `input.corners.hold_ms` (default 500ms), or hold once at that deadline;
-release after hold emits nothing. Other buttons are consumed without an action.
+click topic reports `button: "left"|"right"` and `kind: "brief"`.
+Both buttons emit on release, with no hold timer or hold action. `modifiers`
+contains the active `shift`, `ctrl`, `alt` and `super` names captured at press
+time in the compositor input path, even if they change before release. The field
+is always present, including `modifiers: []`; its presence selects the new
+mapping in Quoin. Other buttons are consumed without an action.
 Movement further than `input.corners.deadzone_px` from the press position cancels
 the pending action, even within the hotspot. Leaving the corner or resetting
 engagement (including output changes, lock, or config changes) also cancels it.
 Cancellation retains release ownership; returning to the corner cannot revive
-the action. A hold already emitted is not retracted by later movement.
+the action.
 
 The original `corner.clicked` topic retains its exact JSON body and emits only
-successful LMB brief actions, now on release. V2 consumers should subscribe only
+successful unmodified LMB brief actions, on release. Every modified click,
+including Ctrl/Alt/Super+LMB, emits only v2. V2 consumers should subscribe only
 to `corner.clicked.v2` to avoid handling LMB twice. Consumers retaining an old-comp
-fallback must deduplicate: each LMB emits legacy at sequence N immediately followed
+fallback must deduplicate: each unmodified LMB emits legacy at sequence N immediately followed
 by v2 at N+1, with the same output, corner and engagement dwell. Quoin uses this
-pair to admit the first click once, then ignores legacy after observing v2.
+pair to admit the first click once in either delivery order, then ignores legacy
+after observing v2. The legacy sibling is required even with `modifiers: []`:
+Quoin canonicalises the v2 sequence to N. Modified clicks keep their own sequence.
 This versioning preserves old
-shell-hosts with strict JSON decoding; they receive no RMB actions during rollout.
+shell-hosts with strict JSON decoding, but only partly. A host that predates v2
+entirely sees legacy LMB and nothing else. A v2-aware host from before
+`modifiers` existed is worse: its strict decoder rejects every v2 body, so it
+never marks v2 as seen and acts only on legacy. On that skew RMB and every
+Shift/Ctrl/Alt/Super+LMB click is lost silently; only unmodified LMB works.
+Upgrade the shell-host before, or together with, the compositor.
 Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
-to overlay pinning, RMB brief to docking, and RMB hold to an optional corner menu
-hook; an unconfigured menu does nothing.
+to overlay pinning, Shift+LMB to docking, and RMB to the corner menu.
+Ctrl/Alt/Super without Shift retain LMB pinning. LMB from docked becomes pinned;
+Shift+LMB toggles docked/hidden. No bare button click docks a panel.
 
 For a reliable property bootstrap: subscribe to the instance topic (for
 example `comp.props.changed` on the seat or `comp-nested.props.changed` when
@@ -1130,10 +1141,9 @@ ranges are:
 | `input.corners.enabled` | `true` | boolean |
 | `input.corners.deadzone_px` | `12.0` | `1.0..=256.0` logical px |
 | `input.corners.dwell_ms` | `200` | `0..=5000` ms |
-| `input.corners.hold_ms` | `500` | `1..=5000` ms (RMB only) |
 | `input.corners.velocity_max_px_s` | `1500.0` | `1.0..=20000.0` logical px/s |
 
-The mutable leaves are the five corner leaves, `windows.s<id>.band`,
+The mutable leaves are the four corner leaves, `windows.s<id>.band`,
 `windows.s<id>.minimized`, `windows.s<id>.workspace`, `workspaces.count`,
 `workspaces.current`, `workspaces.o_<slug>.current`, `input.host.passthrough`
 (nested only) and `xwayland.enabled`. The corner, window and workspace

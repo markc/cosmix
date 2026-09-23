@@ -10,7 +10,6 @@ pub(crate) struct CornerConfig {
     pub(crate) enabled: bool,
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
-    pub(crate) hold_ms: u64,
     pub(crate) velocity_max_px_s: f64,
 }
 
@@ -20,7 +19,6 @@ impl Default for CornerConfig {
             enabled: true,
             deadzone_px: 12.0,
             dwell_ms: 200,
-            hold_ms: 500,
             velocity_max_px_s: 1_500.0,
         }
     }
@@ -31,7 +29,6 @@ impl CornerConfig {
         self.deadzone_px.is_finite()
             && (1.0..=256.0).contains(&self.deadzone_px)
             && self.dwell_ms <= 5_000
-            && (1..=5_000).contains(&self.hold_ms)
             && self.velocity_max_px_s.is_finite()
             && (1.0..=20_000.0).contains(&self.velocity_max_px_s)
     }

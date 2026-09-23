@@ -833,13 +833,15 @@ read lands, or while no cosmix comp is present, the inset falls back to 12 px,
 mirroring comp's own default; a failed read keeps that fallback and logs one
 <code>QUOIN_HOTSPOT_READ_FAILED</code> notice per run of failures. The compositor's
 embedded Quoin host passes its own registered service name the same way.
-With legacy corner payloads, brief LMB toggles <strong>Pinned</strong> (persistent overlay);
-brief RMB toggles <strong>Docked</strong>
-(reserves space). Both use the existing counter-clockwise mapping: TL→left,
+LMB toggles <strong>Pinned</strong> (persistent overlay); from Docked it becomes Pinned.
+Shift+LMB toggles <strong>Docked</strong> (reserves space) and Hidden. RMB opens the corner
+menu. Ctrl/Alt/Super+LMB without Shift retain pinning. All use the
+counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
-the change. Unpinning leaves transient reveal/grace to the panel model; undocking
-does so only while held, otherwise it starts concealment immediately.
+the change. Unpinning leaves transient reveal/grace to the panel model;
+undocking with Shift+LMB does so only while the panel is held, otherwise it
+starts concealment immediately. The menu's Hide conceals at once from any mode.
 Horizontal panels (bottom, top) carry a paging chevron at each end, inset from
 the panel ends by comp's corner-hotspot size, with the title and page dots as a
 centred overlay across the content strip; vertical panels (left, right) keep a
@@ -849,9 +851,10 @@ dots, <code>panel.page.set</code>, activation, restore and a removal's landing �
 directly to the page without the slide. Headers carry no pin glyph or mode
 button; change mode at the corner, in its menu, or through the precise mode
 verbs.</p>
-<p>The compositor also publishes <code>corner.clicked.v2</code> with <code>button</code> and <code>kind</code> for
-LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
-their releases, cancelling pending actions on excess movement or disengagement.
+<p>The compositor publishes <code>corner.clicked.v2</code> with <code>button</code>, <code>kind: "brief"</code> and
+<code>modifiers</code> captured at press time (always present, even when empty). It consumes
+engaged corner presses and their releases, cancelling pending actions on excess
+movement or disengagement. Both buttons act on release; neither has a hold action.
 The menu action calls <code>CornerMenuHook(fn(&amp;mut World, &amp;OutputKey, Corner))</code>.
 The host always provides <strong>Pin / Dock / Hide</strong>, with the current mode checked
 and disabled; Quoin appends <code>conf.mix</code>'s <code>menu_items</code> for that edge. Each mode
@@ -864,19 +867,18 @@ existing policy then focuses the top toplevel; exact previous-surface focus
 restoration belongs to the forthcoming compositor popup holder. Pin and Dock
 apply before the local hold is released, so concealment cannot race the choice.
 Opening a menu at a hidden corner does not itself reveal the panel.</p>
-<p>With the newer modifier-aware corner protocol, brief RMB opens this menu.
-Until the compositor remapping lands, legacy brief RMB still toggles Docked
-and RMB hold opens the menu.</p>
 <p>Both click topics are subscribed for old-compositor compatibility. Successful
 subscription is not capability discovery: the broker accepts unpublished topics.
 Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The current
-compositor emits each LMB's legacy record at sequence N and its v2 record at N+1;
+compositor emits each unmodified LMB's legacy record at sequence N and its v2
+record at N+1, including when the v2 payload has <code>modifiers: []</code>;
 the host maps both to N and admits that logical click once, in either delivery
-order. On observing v2 it ignores all subsequent legacy clicks for that connection.
+order. Every modified click emits only v2 and keeps its own sequence, including
+Ctrl/Alt+LMB. On observing v2 it ignores all subsequent legacy clicks for that connection.
 A sequence high-water mark also rejects duplicate/stale click records, before
 output-map queueing. Reconnect clears preference and sequence state; ordinary
 output refreshes and loss markers retain them. This relies on the compositor's
-consecutive LMB pair and monotonically increasing observation stream, not a
+consecutive unmodified LMB pair and monotonically increasing observation stream, not a
 timing window. It is not an exactly-once guarantee across a connection reset or
 publisher sequence restart; a publisher restart requires a fresh host/connection.
 High-water rejections emit <code>quoin_corner_sequence_rejected</code> WARNs at counts
