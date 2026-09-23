@@ -9,9 +9,9 @@ use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 use super::{
-    Carousel, CornerEvent, Edge, LogicalSize, OutputKey, PanelConfig, PanelConfigError, PanelInput,
-    PanelMode, PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake,
-    seed_panel_thickness,
+    Carousel, CarouselError, CornerEvent, Edge, LogicalSize, OutputKey, PanelConfig,
+    PanelConfigError, PanelInput, PanelMode, PanelSnapshot, PanelStateMachine, PanelTimeError,
+    PanelUpdate, PanelWake, seed_panel_thickness,
 };
 
 /// Complete pure shell state for one output.
@@ -84,6 +84,22 @@ impl ShellModel {
 
     pub fn set_carousel(&mut self, edge: Edge, carousel: Carousel) {
         self.carousels[edge.index()] = carousel;
+    }
+
+    /// Declare an edge's ordered page list, every slot starting empty.
+    ///
+    /// This is the config-driven construction path: registering attaches
+    /// content to the declared names afterwards — a declared name fills its
+    /// slot in order, an undeclared name appends to the tail. Re-declaring
+    /// replaces the edge's registry wholesale, dropping its registrations,
+    /// selection and last-selected memory with it.
+    pub fn declare_carousel(
+        &mut self,
+        edge: Edge,
+        page_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<(), CarouselError> {
+        self.carousels[edge.index()] = Carousel::declared(page_ids)?;
+        Ok(())
     }
 
     /// Restored thickness has the same validation as a newly constructed panel.

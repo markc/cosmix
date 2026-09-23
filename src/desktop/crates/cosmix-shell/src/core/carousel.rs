@@ -1,90 +1,316 @@
-//! Stable page selection for one edge panel carousel.
+//! Name-addressed page registry for one edge panel carousel.
+//!
+//! A carousel holds one edge's ordered sub-panel names. Order comes from the
+//! declared list (position 0 is the primary, the page shown by default);
+//! names registered without a declaration append to the tail in registration
+//! order. A declared name whose content is not registered yet is an empty
+//! slot: paging and selection skip it, so the carousel never rests on one.
+//!
+//! Identity is the name, never the position — registering and removing shift
+//! positions freely. The remembered "last selected" name is what a default
+//! reveal shows; it falls back to the primary when the remembered page is
+//! removed.
 
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
-/// Ordered stable page IDs and the active selection.
+/// Ordered carousel slots and the current selection.
+///
+/// Slots hold the declared list first (in declared order, possibly with
+/// empty slots) followed by tail registrations. Selection and paging only
+/// rest on registered slots; the cached registered names in slot order let
+/// frames share the page schema without cloning its strings.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Carousel {
-    page_ids: Arc<[String]>,
-    active: usize,
+    slots: Vec<Slot>,
+    /// Leading `slots` count that came from the declared list.
+    declared_len: usize,
+    /// Last explicit selection; always a registered slot when set.
+    active: Option<usize>,
+    /// Registered names in slot order, shared with rendered frames.
+    pages: Arc<[String]>,
+    /// Page a default reveal shows; `None` until one is selected.
+    last_selected: Option<String>,
+}
+
+/// One ordered carousel position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Slot {
+    name: String,
+    /// `false` for a declared name whose content is not registered.
+    registered: bool,
 }
 
 impl Carousel {
+    /// Build a live page set in the given order.
+    ///
+    /// Every name starts registered and selectable, with the first active:
+    /// the pre-registry behaviour dynamic hosts still use when rebuilding a
+    /// carousel from mounted pages. These pages carry no declaration, so
+    /// removing one deletes it outright.
     pub fn new(
         page_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, CarouselError> {
-        let page_ids: Vec<String> = page_ids.into_iter().map(Into::into).collect();
-        let mut seen = HashSet::with_capacity(page_ids.len());
-        for id in &page_ids {
-            if id.trim().is_empty() {
-                return Err(CarouselError::EmptyId);
-            }
-            if !seen.insert(id.clone()) {
-                return Err(CarouselError::DuplicateId(id.clone()));
-            }
-        }
+        let slots = validated_slots(page_ids, true)?;
+        let mut carousel = Self {
+            active: (!slots.is_empty()).then_some(0),
+            slots,
+            declared_len: 0,
+            pages: Arc::from([]),
+            last_selected: None,
+        };
+        carousel.rebuild_pages();
+        Ok(carousel)
+    }
+
+    /// Build from the declared ordered list with every slot empty.
+    ///
+    /// Position 0 is the primary — the page a default reveal shows once its
+    /// content registers. Nothing is selectable until `register` fills a
+    /// declared slot or appends a tail name; an edge with no declarations
+    /// and no registrations is empty.
+    pub fn declared(
+        page_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, CarouselError> {
+        let slots = validated_slots(page_ids, false)?;
+        let declared_len = slots.len();
         Ok(Self {
-            page_ids: page_ids.into(),
-            active: 0,
+            slots,
+            declared_len,
+            active: None,
+            pages: Arc::from([]),
+            last_selected: None,
         })
     }
 
     pub fn empty() -> Self {
-        Self {
-            page_ids: Arc::from([]),
-            active: 0,
-        }
+        Self::default()
     }
 
+    /// Registered page IDs in slot order; empty slots are absent.
     pub fn page_ids(&self) -> &[String] {
-        &self.page_ids
+        &self.pages
     }
 
-    /// Clone the shared immutable page schema without cloning its strings.
+    /// Clone the shared page schema without cloning its strings.
     pub fn shared_page_ids(&self) -> Arc<[String]> {
-        Arc::clone(&self.page_ids)
+        Arc::clone(&self.pages)
     }
 
     pub fn active_index(&self) -> Option<usize> {
-        (!self.page_ids.is_empty()).then_some(self.active)
+        let slot = self.resting_slot()?;
+        Some(self.slots[..slot].iter().filter(|page| page.registered).count())
     }
 
     pub fn active_id(&self) -> Option<&str> {
-        self.page_ids.get(self.active).map(String::as_str)
+        self.resting_slot()
+            .map(|slot| self.slots[slot].name.as_str())
+    }
+
+    /// The remembered "last selected" name; `None` means a default reveal
+    /// shows the primary (nothing, while the primary slot is empty).
+    pub fn last_selected(&self) -> Option<&str> {
+        self.last_selected.as_deref()
     }
 
     pub fn next_page(&mut self) -> Option<&str> {
-        if !self.page_ids.is_empty() {
-            self.active = (self.active + 1) % self.page_ids.len();
-        }
+        let current = self.resting_slot()?;
+        let next = self.slots[current + 1..]
+            .iter()
+            .position(|page| page.registered)
+            .map(|offset| offset + current + 1)
+            .or_else(|| self.slots[..current].iter().position(|page| page.registered))
+            .unwrap_or(current);
+        self.select_slot(next);
         self.active_id()
     }
 
     pub fn previous_page(&mut self) -> Option<&str> {
-        if !self.page_ids.is_empty() {
-            self.active = (self.active + self.page_ids.len() - 1) % self.page_ids.len();
-        }
+        let current = self.resting_slot()?;
+        let previous = self.slots[..current]
+            .iter()
+            .rposition(|page| page.registered)
+            .or_else(|| {
+                self.slots[current + 1..]
+                    .iter()
+                    .rposition(|page| page.registered)
+                    .map(|offset| offset + current + 1)
+            })
+            .unwrap_or(current);
+        self.select_slot(previous);
         self.active_id()
     }
 
+    /// Select by position among the registered pages (see [`Self::page_ids`]).
     pub fn select_index(&mut self, index: usize) -> bool {
-        if index >= self.page_ids.len() {
+        let Some(slot) = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, page)| page.registered)
+            .nth(index)
+            .map(|(slot, _)| slot)
+        else {
             return false;
-        }
-        self.active = index;
+        };
+        self.select_slot(slot);
         true
     }
 
     pub fn select_id(&mut self, id: &str) -> bool {
-        let Some(index) = self.page_ids.iter().position(|candidate| candidate == id) else {
+        let Some(slot) = self.registered_slot(id) else {
             return false;
         };
-        self.active = index;
+        self.select_slot(slot);
         true
     }
+
+    /// Register content for `name`.
+    ///
+    /// A declared name fills its slot in declared order; any other name
+    /// appends to the tail in registration order. Registering never moves
+    /// the selection. The name must be non-empty and not already live.
+    pub fn register(&mut self, name: &str) -> Result<(), CarouselError> {
+        if name.trim().is_empty() {
+            return Err(CarouselError::EmptyId);
+        }
+        match self.slots.iter_mut().find(|page| page.name == name) {
+            Some(page) if page.registered => {
+                return Err(CarouselError::DuplicateId(name.to_owned()));
+            }
+            Some(page) => page.registered = true,
+            None => self.slots.push(Slot {
+                name: name.to_owned(),
+                registered: true,
+            }),
+        }
+        self.rebuild_pages();
+        Ok(())
+    }
+
+    /// Activate a registered name: select it and remember it as the edge's
+    /// last selection.
+    ///
+    /// Activating a name without registered content — unknown, or a declared
+    /// empty slot — is an error and never a creation.
+    pub fn activate(&mut self, name: &str) -> Result<(), CarouselError> {
+        if name.trim().is_empty() {
+            return Err(CarouselError::EmptyId);
+        }
+        let Some(slot) = self.registered_slot(name) else {
+            return Err(CarouselError::Unregistered(name.to_owned()));
+        };
+        self.select_slot(slot);
+        Ok(())
+    }
+
+    /// Remove a registered name's content.
+    ///
+    /// Removing the page being shown lands the selection on the previous
+    /// registered neighbour, else the next, else the primary; removing the
+    /// remembered last selection falls that memory back to the primary when
+    /// the primary still has content, else clears it. A declared name keeps
+    /// its now-empty slot for re-registration; a tail name is deleted.
+    pub fn remove(&mut self, name: &str) -> Result<(), CarouselError> {
+        if name.trim().is_empty() {
+            return Err(CarouselError::EmptyId);
+        }
+        let Some(slot) = self.registered_slot(name) else {
+            return Err(CarouselError::Unregistered(name.to_owned()));
+        };
+        let showing = self.resting_slot() == Some(slot);
+        let remembered = self.last_selected.as_deref() == Some(name);
+        // Decide the landing before the slot empties or later slots shift.
+        let landing = self.landing_slot(slot);
+        let tail = slot >= self.declared_len;
+        if tail {
+            self.slots.remove(slot);
+        } else {
+            self.slots[slot].registered = false;
+        }
+        let shift = |index: usize| index - usize::from(tail && index > slot);
+        if showing {
+            self.active = landing.map(shift);
+        } else if let Some(active) = self.active {
+            self.active = Some(shift(active));
+        }
+        if remembered {
+            self.last_selected = match self.slots.first() {
+                Some(primary) if primary.registered => Some(primary.name.clone()),
+                _ => None,
+            };
+        }
+        self.rebuild_pages();
+        Ok(())
+    }
+
+    /// The slot the carousel rests on: the last explicit selection, else the
+    /// first registered slot (the primary once its content registers).
+    fn resting_slot(&self) -> Option<usize> {
+        self.active
+            .filter(|&slot| self.slots.get(slot).is_some_and(|page| page.registered))
+            .or_else(|| self.slots.iter().position(|page| page.registered))
+    }
+
+    /// Position of `name` when its content is registered.
+    fn registered_slot(&self, name: &str) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|page| page.registered && page.name == name)
+    }
+
+    /// Previous registered neighbour, else the next. Scanning back reaches
+    /// the primary (position 0) last, which is the landing rule's final
+    /// fallback.
+    fn landing_slot(&self, removed: usize) -> Option<usize> {
+        self.slots[..removed]
+            .iter()
+            .rposition(|page| page.registered)
+            .or_else(|| {
+                self.slots[removed + 1..]
+                    .iter()
+                    .position(|page| page.registered)
+                    .map(|offset| offset + removed + 1)
+            })
+    }
+
+    fn select_slot(&mut self, slot: usize) {
+        self.active = Some(slot);
+        self.last_selected = Some(self.slots[slot].name.clone());
+    }
+
+    fn rebuild_pages(&mut self) {
+        self.pages = Arc::from(
+            self.slots
+                .iter()
+                .filter(|page| page.registered)
+                .map(|page| page.name.clone())
+                .collect::<Vec<_>>(),
+        );
+    }
+}
+
+/// Validate an ordered name list and materialise its slots.
+fn validated_slots(
+    page_ids: impl IntoIterator<Item = impl Into<String>>,
+    registered: bool,
+) -> Result<Vec<Slot>, CarouselError> {
+    let names: Vec<String> = page_ids.into_iter().map(Into::into).collect();
+    let mut seen = HashSet::with_capacity(names.len());
+    for name in &names {
+        if name.trim().is_empty() {
+            return Err(CarouselError::EmptyId);
+        }
+        if !seen.insert(name.clone()) {
+            return Err(CarouselError::DuplicateId(name.clone()));
+        }
+    }
+    Ok(names
+        .into_iter()
+        .map(|name| Slot { name, registered })
+        .collect())
 }
 
 /// Invalid stable page IDs.
@@ -92,6 +318,8 @@ impl Carousel {
 pub enum CarouselError {
     EmptyId,
     DuplicateId(String),
+    /// Activate or remove targeted a name without registered content.
+    Unregistered(String),
 }
 
 impl Display for CarouselError {
@@ -99,8 +327,184 @@ impl Display for CarouselError {
         match self {
             Self::EmptyId => formatter.write_str("carousel page ID must not be empty"),
             Self::DuplicateId(id) => write!(formatter, "duplicate carousel page ID '{id}'"),
+            Self::Unregistered(id) => write!(formatter, "carousel page '{id}' is not registered"),
         }
     }
 }
 
 impl Error for CarouselError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_appends_to_tail_in_registration_order() {
+        let mut carousel = Carousel::declared(["alpha", "beta"]).unwrap();
+        carousel.register("tail-one").unwrap();
+        carousel.register("tail-two").unwrap();
+        // Filling a declared slot keeps its declared position.
+        carousel.register("beta").unwrap();
+        carousel.register("tail-three").unwrap();
+        assert_eq!(carousel.page_ids(), ["beta", "tail-one", "tail-two", "tail-three"]);
+    }
+
+    #[test]
+    fn undeclared_slots_are_skipped_by_paging() {
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        carousel.register("alpha").unwrap();
+        carousel.register("gamma").unwrap();
+        assert_eq!(carousel.page_ids(), ["alpha", "gamma"]);
+        assert_eq!(carousel.active_id(), Some("alpha"));
+        assert_eq!(carousel.next_page(), Some("gamma"));
+        assert_eq!(carousel.next_page(), Some("alpha"));
+        assert_eq!(carousel.previous_page(), Some("gamma"));
+        assert_eq!(carousel.active_index(), Some(1));
+        assert!(!carousel.select_id("beta"));
+        assert!(carousel.select_index(1));
+        assert!(!carousel.select_index(2));
+        assert_eq!(carousel.active_id(), Some("gamma"));
+    }
+
+    #[test]
+    fn remove_lands_on_previous_else_next_else_primary() {
+        // Previous neighbour.
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            carousel.register(name).unwrap();
+        }
+        carousel.activate("gamma").unwrap();
+        carousel.remove("gamma").unwrap();
+        assert_eq!(carousel.active_id(), Some("beta"));
+
+        // Next when nothing registered precedes it; the declared slot stays.
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            carousel.register(name).unwrap();
+        }
+        carousel.activate("alpha").unwrap();
+        carousel.remove("alpha").unwrap();
+        assert_eq!(carousel.active_id(), Some("beta"));
+        assert_eq!(carousel.page_ids(), ["beta", "gamma"]);
+
+        // The primary when both neighbours are empty slots.
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        carousel.register("alpha").unwrap();
+        carousel.register("gamma").unwrap();
+        carousel.activate("gamma").unwrap();
+        carousel.remove("gamma").unwrap();
+        assert_eq!(carousel.active_id(), Some("alpha"));
+
+        // Next when the default-shown page (never explicitly selected) goes.
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        carousel.register("beta").unwrap();
+        carousel.register("gamma").unwrap();
+        assert_eq!(carousel.active_id(), Some("beta"));
+        carousel.remove("beta").unwrap();
+        assert_eq!(carousel.active_id(), Some("gamma"));
+
+        // Tail names are deleted outright and later positions shift.
+        let mut carousel = Carousel::declared(["alpha"]).unwrap();
+        carousel.register("alpha").unwrap();
+        carousel.register("tail-one").unwrap();
+        carousel.register("tail-two").unwrap();
+        carousel.activate("tail-two").unwrap();
+        carousel.remove("tail-one").unwrap();
+        assert_eq!(carousel.page_ids(), ["alpha", "tail-two"]);
+        assert_eq!(carousel.active_id(), Some("tail-two"));
+
+        // Unknown and still-empty names are refused.
+        let mut carousel = Carousel::declared(["alpha", "beta"]).unwrap();
+        carousel.register("beta").unwrap();
+        assert_eq!(
+            carousel.remove("alpha"),
+            Err(CarouselError::Unregistered("alpha".into()))
+        );
+        assert_eq!(
+            carousel.remove("missing"),
+            Err(CarouselError::Unregistered("missing".into()))
+        );
+    }
+
+    #[test]
+    fn remove_falls_back_last_selected_to_primary() {
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            carousel.register(name).unwrap();
+        }
+        carousel.activate("gamma").unwrap();
+        assert_eq!(carousel.last_selected(), Some("gamma"));
+        carousel.remove("gamma").unwrap();
+        assert_eq!(carousel.last_selected(), Some("alpha"));
+        // Landing and memory are separate rules: the view moved to the
+        // previous neighbour while the memory fell back to the primary.
+        assert_eq!(carousel.active_id(), Some("beta"));
+
+        // Removing some other page leaves the memory alone.
+        let mut carousel = Carousel::declared(["alpha", "beta", "gamma"]).unwrap();
+        for name in ["alpha", "beta", "gamma"] {
+            carousel.register(name).unwrap();
+        }
+        carousel.activate("beta").unwrap();
+        carousel.remove("gamma").unwrap();
+        assert_eq!(carousel.last_selected(), Some("beta"));
+        assert_eq!(carousel.active_id(), Some("beta"));
+
+        // Removing the remembered primary itself clears the memory: its
+        // slot is empty, so a default reveal has nothing to fall back to.
+        let mut carousel = Carousel::declared(["alpha", "beta"]).unwrap();
+        carousel.register("alpha").unwrap();
+        carousel.register("beta").unwrap();
+        carousel.activate("alpha").unwrap();
+        carousel.remove("alpha").unwrap();
+        assert_eq!(carousel.last_selected(), None);
+        assert_eq!(carousel.active_id(), Some("beta"));
+    }
+
+    #[test]
+    fn activate_unregistered_is_an_error() {
+        let mut carousel = Carousel::declared(["alpha", "beta"]).unwrap();
+        carousel.register("alpha").unwrap();
+        assert_eq!(
+            carousel.activate("beta"),
+            Err(CarouselError::Unregistered("beta".into()))
+        );
+        assert_eq!(
+            carousel.activate("missing"),
+            Err(CarouselError::Unregistered("missing".into()))
+        );
+        assert_eq!(carousel.activate(""), Err(CarouselError::EmptyId));
+        assert_eq!(carousel.active_id(), Some("alpha"));
+        carousel.activate("alpha").unwrap();
+        assert_eq!(carousel.active_id(), Some("alpha"));
+        assert_eq!(carousel.last_selected(), Some("alpha"));
+
+        // Live page sets built by `Carousel::new` stay activatable.
+        let mut live = Carousel::new(["nav"]).unwrap();
+        live.activate("nav").unwrap();
+        assert_eq!(live.active_id(), Some("nav"));
+    }
+
+    #[test]
+    fn duplicate_name_within_model_is_rejected() {
+        let mut carousel = Carousel::declared(["alpha"]).unwrap();
+        carousel.register("alpha").unwrap();
+        assert_eq!(
+            carousel.register("alpha"),
+            Err(CarouselError::DuplicateId("alpha".into()))
+        );
+        carousel.register("tail").unwrap();
+        assert_eq!(
+            carousel.register("tail"),
+            Err(CarouselError::DuplicateId("tail".into()))
+        );
+        assert_eq!(carousel.register(""), Err(CarouselError::EmptyId));
+
+        // Names already live through `Carousel::new` are duplicates too.
+        let mut live = Carousel::new(["nav", "places"]).unwrap();
+        assert_eq!(
+            live.register("places"),
+            Err(CarouselError::DuplicateId("places".into()))
+        );
+    }
+}
