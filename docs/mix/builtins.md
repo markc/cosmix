@@ -372,6 +372,7 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
 
   bus_call        Call a host-injected Bus verb under delegated identity: bus_call(verb, args) → reply. The embedder bounds which verbs are reachable and injects the delegation envelope; the script names no host/peer/actor
   publish         One-call topic publish (0.63.0): publish(topic, body[, opts]) builds the SPEC-02 wire frame and sends it via noded topic.publish — no hand-built ---\n frames, no body=/name= header-route trap. body is the payload STRING (json_encode a map first); opts: {retain: bool, command: string (inner frame header override, defaults to topic), headers: map}. Sets $rc/$result like `send`; returns rc (0 = published)
+  serve_name      The Bus service name this `mix --serve` citizen registered under — the `--name` value, else the script-stem derivation — or nil in a plain script or the REPL. Read it instead of hard-coding the name: a second instance started with `--name other` must publish `other`, not the first instance's name, in anything that routes replies or clicks back to it. `$me = serve_name() ?? "quoin-panel"` keeps a script runnable outside serve mode (v0.91.0)
 
 ## db  — see [capabilities](capabilities.md)
 

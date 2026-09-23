@@ -288,6 +288,7 @@ builtin_table! {
     ("jmap_upload", CapabilityClass::Jmap,     "jmap",    "Upload bytes as a JMAP blob via the host-injected upstream: jmap_upload(body[, content_type]) → blobId (the compose half of the mail seam; Email/set create is blob-only)", contract!((body: any_of(string, bytes, buffer), content_type?: string) -> string; effects[blocking]; failure[raises])),
     ("bus_call", CapabilityClass::Bus,         "bus",     "Call a host-injected Bus verb under delegated identity: bus_call(verb, args) → reply. The embedder bounds which verbs are reachable and injects the delegation envelope; the script names no host/peer/actor", contract!((verb: string, args?: map) -> any; effects[blocking]; failure[raises])),
     ("publish", CapabilityClass::Bus,          "bus",     "One-call topic publish (0.63.0): publish(topic, body[, opts]) builds the SPEC-02 wire frame and sends it via noded topic.publish — no hand-built ---\\n frames, no body=/name= header-route trap. body is the payload STRING (json_encode a map first); opts: {retain: bool, command: string (inner frame header override, defaults to topic), headers: map}. Sets $rc/$result like `send`; returns rc (0 = published)", contract!((topic: string, body?: any_of(string, nil), opts?: map) -> number; effects[blocking]; failure[raises])),
+    ("serve_name", CapabilityClass::Pure,      "bus",     "The Bus service name this `mix --serve` citizen registered under — the `--name` value, else the script-stem derivation — or nil in a plain script or the REPL. Read it instead of hard-coding the name: a second instance started with `--name other` must publish `other`, not the first instance's name, in anything that routes replies or clicks back to it. `$me = serve_name() ?? \"quoin-panel\"` keeps a script runnable outside serve mode (v0.91.0)", contract!(() -> any_of(string, nil))),
 
     ("env", CapabilityClass::Env,             "system",  "Get environment variable value (\"\" if unset); env(name, default) returns default when unset or empty", contract!((name: string, default?: any) -> any)),
     ("time", CapabilityClass::Pure,            "system",  "Return current Unix timestamp as float", contract!(() -> number)),
@@ -863,7 +864,8 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
 /// branch in the evaluator (`if name == …`), never through `call_builtin`.
 /// They are deliberately NOT in the `is_builtin` gate: the gate answers
 /// "will `call_builtin` handle this name", and for these it will not.
-/// Keep in sync with the stdio special-form arms in `evaluator.rs`.
+/// Keep in sync with the stdio special-form arms in `evaluator.rs` (and
+/// `serve_name`, which reads the evaluator's installed serve runtime).
 pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
     "printf",
     "eprintf",
@@ -874,6 +876,7 @@ pub const EVAL_SPECIAL_BUILTINS: &[&str] = &[
     "write_stderr",
     "print_raw",
     "eprint_raw",
+    "serve_name",
 ];
 
 /// Membership gate the evaluator consults before dispatching to

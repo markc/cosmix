@@ -1959,6 +1959,16 @@ pub trait ServeRuntime {
     /// looking *healthy* while blind. Default no-op for runtimes without
     /// a health surface.
     fn record_handler_fault(&self, _summary: &str) {}
+
+    /// The Bus service name this citizen registered under (the
+    /// `--name` value, else the script-stem derivation) — what the
+    /// `serve_name()` builtin returns, so a script never hard-codes its
+    /// own name and a second instance under another `--name` cannot
+    /// write the first one's name into state it publishes. Default
+    /// `None` for runtimes that are not a registered service.
+    fn service_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Result of servicing a runtime-reserved verb (see [`ServeRuntime`]).
@@ -2772,6 +2782,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "reply",
     "quit",
     "publish",
+    "serve_name",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -11757,6 +11768,20 @@ impl Evaluator {
                         return Ok(Value::Nil);
                     }
 
+                    // serve_name() — the Bus service name this `--serve`
+                    // citizen registered under, read from the installed
+                    // serve runtime; nil for a plain script / REPL (no
+                    // runtime). Zero-arg; extra args are ignored like
+                    // quit(). Registered as an EVAL_SPECIAL builtin: the
+                    // answer lives in evaluator state call_builtin cannot see.
+                    if name == "serve_name" {
+                        self.check_capability(name)?; // Knob A
+                        let runtime = self.globals.borrow().serve_runtime.clone();
+                        return Ok(runtime
+                            .and_then(|rt| rt.service_name().map(|s| Value::String(s.to_string())))
+                            .unwrap_or(Value::Nil));
+                    }
+
                     // subscribe(name) / unsubscribe(name) — Ch03 topic
                     // (un)subscription (SPEC 18 WS2). One chokepoint for
                     // both init-body and handler-body callers: the
@@ -12556,6 +12581,7 @@ impl Evaluator {
                     | "unsubscribe"
                     | "reply"
                     | "quit"
+                    | "serve_name"
                     | "push"
                     | "pop"
                     | "shift"

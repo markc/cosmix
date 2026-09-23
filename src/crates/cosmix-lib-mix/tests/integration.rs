@@ -5157,3 +5157,69 @@ mod rc_band_contract_tests {
         assert_eq!(eval.get_global("after").unwrap(), Value::Number(4.0));
     }
 }
+
+/// `serve_name()` (0.91.0) is nil outside `--serve`: a plain evaluator has
+/// no serve runtime installed, so the script must not be handed a name it
+/// never registered under.
+#[tokio::test(flavor = "current_thread")]
+async fn serve_name_is_nil_outside_serve_mode() {
+    let out = run_mix_capturing("print(type(serve_name()))\nprint(serve_name() ?? \"fallback\")\n")
+        .await
+        .unwrap();
+    assert_eq!(out, "nil\nfallback\n");
+}
+
+/// `serve_name()` reads the installed serve runtime's service name — the
+/// seam `cosmix-mix`'s `run_serve` threads the derived `--name` through.
+/// A runtime that is not a registered service (the trait default) still
+/// answers nil.
+#[tokio::test(flavor = "current_thread")]
+async fn serve_name_reads_the_serve_runtime() {
+    use cosmix_mix::evaluator::{ReservedOutcome, ServeRuntime};
+    use std::rc::Rc;
+
+    struct Named(Option<&'static str>);
+    impl ServeRuntime for Named {
+        fn handle_reserved(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &str,
+            _: &[(&str, Option<&str>)],
+            _: bool,
+        ) -> Option<ReservedOutcome> {
+            None
+        }
+        fn service_name(&self) -> Option<&str> {
+            self.0
+        }
+    }
+    struct Unnamed;
+    impl ServeRuntime for Unnamed {
+        fn handle_reserved(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &str,
+            _: &[(&str, Option<&str>)],
+            _: bool,
+        ) -> Option<ReservedOutcome> {
+            None
+        }
+    }
+
+    async fn probe(rt: Rc<dyn ServeRuntime>) -> String {
+        let source = "print(serve_name() ?? \"<nil>\")\n";
+        let stmts = Parser::new(Lexer::new(source).tokenize().unwrap(), source)
+            .parse_program()
+            .unwrap();
+        let stdout = SharedBuf::new();
+        let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(SharedBuf::new()));
+        eval.set_serve_runtime(rt);
+        eval.execute(&stmts).await.unwrap();
+        stdout.to_string_lossy()
+    }
+
+    assert_eq!(probe(Rc::new(Named(Some("probe")))).await, "probe\n");
+    assert_eq!(probe(Rc::new(Unnamed)).await, "<nil>\n");
+}

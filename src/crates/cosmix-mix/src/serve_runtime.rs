@@ -494,6 +494,10 @@ impl ServeRuntime for MixServeRuntime {
         *self.last_fault.borrow_mut() = Some(s);
     }
 
+    fn service_name(&self) -> Option<&str> {
+        Some(&self.service_name)
+    }
+
     fn handle_reserved(
         &self,
         command: &str,

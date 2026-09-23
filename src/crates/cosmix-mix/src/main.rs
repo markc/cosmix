@@ -2272,4 +2272,42 @@ mod serve_name_tests {
             "state.cache"
         );
     }
+
+    /// `serve_name()` (0.91.0) answers the DERIVED name, through the same
+    /// seam `run_serve`'s `build_serve_eval` uses: the derivation feeds
+    /// `MixServeRuntime::with_script_path`, which `set_serve_runtime`
+    /// installs. The broker connect in front of it is not needed to prove
+    /// the plumbing, so this drives the evaluator directly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_name_builtin_answers_the_derived_name() {
+        use cosmix_mix::evaluator::{Evaluator, SharedBuf};
+        use cosmix_mix::lexer::Lexer;
+        use cosmix_mix::parser::Parser;
+        use std::rc::Rc;
+
+        async fn probe(explicit: Option<&str>, script: &str) -> String {
+            let name = derive_serve_name(explicit, script).unwrap();
+            let rt = crate::serve_runtime::MixServeRuntime::with_script_path(
+                name,
+                script,
+                Rc::new(crate::serve_runtime::ReloadIdentity::new()),
+            );
+            let source = "print(serve_name())\n";
+            let stmts = Parser::new(Lexer::new(source).tokenize().unwrap(), source)
+                .parse_program()
+                .unwrap();
+            let stdout = SharedBuf::new();
+            let mut eval =
+                Evaluator::with_output(Box::new(stdout.clone()), Box::new(SharedBuf::new()));
+            eval.set_serve_runtime(Rc::new(rt));
+            eval.execute(&stmts).await.unwrap();
+            stdout.to_string_lossy()
+        }
+
+        // --name wins.
+        assert_eq!(probe(Some("probe"), "/x/quoin-panel.mix").await, "probe\n");
+        // Stem fallback, with the `cosmix-` prefix normalised away.
+        assert_eq!(probe(None, "/x/quoin-panel.mix").await, "quoin-panel\n");
+        assert_eq!(probe(None, "/opt/cosmix-statecache.mix").await, "statecache\n");
+    }
 }

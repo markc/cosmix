@@ -571,6 +571,18 @@ Usage: mix --serve &lt;script&gt; [--name &lt;svc&gt;]
 </code></pre>
 <p>Only <code>--name &lt;svc&gt;</code> and <code>--no-prelude</code> may follow the script path, in any order; a
 daemon has no argv, so positional script args are a usage error.</p>
+<p><strong>The script reads its own name with <code>serve_name()</code></strong> (0.91.0) — the derived name
+above, after normalization, or <code>nil</code> outside <code>--serve</code>. Never hard-code it: anything
+the citizen publishes that routes traffic back to it (a scene document's click
+target, a reply topic, a registration record) must carry the name it actually
+registered under, or a second instance started with another <code>--name</code> silently
+routes its traffic to the first.</p>
+<pre><code class="language-mix">$me = serve_name() ?? "quoin-panel"   -- nil in a plain script / the REPL
+publish("scene.update", json_encode({owner: $me, target: $me .. ".click"}))
+</code></pre>
+<pre><code class="language-text">mix --serve quoin-panel.mix                        # serve_name() = "quoin-panel"
+mix --serve quoin-panel.mix --name quoin-panel-n   # serve_name() = "quoin-panel-n"
+</code></pre>
 <hr />
 <h2 id="the-handler-model">The handler model</h2>
 <p>Inbound Bus messages dispatch to matching <code>on &lt;cmd&gt; … end</code> handlers. The
@@ -953,7 +965,7 @@ resident <code>--serve</code> daemon is what requires the broker to be up.</p>
 <h2 id="quick-reference">Quick reference</h2>
 <table><thead><tr><th>Thing</th><th>Value</th></tr></thead><tbody>
 <tr><td>Start a citizen</td><td><code>mix --serve &lt;script&gt; [--name &lt;svc&gt;] [--no-prelude]</code></td></tr>
-<tr><td>Service name</td><td><code>--name</code>, else the script file stem; leading <code>cosmix-</code> stripped</td></tr>
+<tr><td>Service name</td><td><code>--name</code>, else the script file stem; leading <code>cosmix-</code> stripped; the script reads it with <code>serve_name()</code></td></tr>
 <tr><td>Anonymous serve</td><td>a launch error — no nameless citizen</td></tr>
 <tr><td>Init</td><td>top-level body runs <strong>once</strong>, then the pump runs forever</td></tr>
 <tr><td>Reserved (injected)</td><td><code>HELP</code>, <code>INFO</code>, <code>QUIT</code>, <code>&lt;svc&gt;.props.{get,list,describe}</code></td></tr>

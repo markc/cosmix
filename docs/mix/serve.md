@@ -169,6 +169,23 @@ Usage: mix --serve <script> [--name <svc>]
 Only `--name <svc>` and `--no-prelude` may follow the script path, in any order; a
 daemon has no argv, so positional script args are a usage error.
 
+**The script reads its own name with `serve_name()`** (0.91.0) — the derived name
+above, after normalization, or `nil` outside `--serve`. Never hard-code it: anything
+the citizen publishes that routes traffic back to it (a scene document's click
+target, a reply topic, a registration record) must carry the name it actually
+registered under, or a second instance started with another `--name` silently
+routes its traffic to the first.
+
+```mix
+$me = serve_name() ?? "quoin-panel"   -- nil in a plain script / the REPL
+publish("scene.update", json_encode({owner: $me, target: $me .. ".click"}))
+```
+
+```text
+mix --serve quoin-panel.mix                        # serve_name() = "quoin-panel"
+mix --serve quoin-panel.mix --name quoin-panel-n   # serve_name() = "quoin-panel-n"
+```
+
 ---
 
 ## The handler model
@@ -647,7 +664,7 @@ resident `--serve` daemon is what requires the broker to be up.
 | Thing | Value |
 |---|---|
 | Start a citizen | `mix --serve <script> [--name <svc>] [--no-prelude]` |
-| Service name | `--name`, else the script file stem; leading `cosmix-` stripped |
+| Service name | `--name`, else the script file stem; leading `cosmix-` stripped; the script reads it with `serve_name()` |
 | Anonymous serve | a launch error — no nameless citizen |
 | Init | top-level body runs **once**, then the pump runs forever |
 | Reserved (injected) | `HELP`, `INFO`, `QUIT`, `<svc>.props.{get,list,describe}` |
