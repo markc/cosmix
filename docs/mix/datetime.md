@@ -60,7 +60,7 @@ epoch or a zero-duration result.
 
 ## monotonic() — the clock that never goes backwards
 
-`monotonic()` returns seconds on the kernel's `CLOCK_MONOTONIC` clock as a **float**. Use it **instead of `time()` whenever you are measuring an interval rather than stamping a calendar moment**: `time()` is wall-clock time, and NTP can step or slew it, so a `time() - $start` difference can come out wrong — even negative — across a clock adjustment. `monotonic()` never goes backwards (two successive reads always satisfy `later >= $earlier`), which is exactly the property an elapsed-time, timeout, or "did this happen before that" computation needs. It is also the clock the compositor's frame traces stamp (`mono_us` in `FRAME_TRACE`), so a Mix measurement can be correlated with a compositor trace from the same machine.
+`monotonic()` returns seconds on the kernel's `CLOCK_MONOTONIC` clock as a **float**. Use it **instead of `time()` whenever you are measuring an interval rather than stamping a calendar moment**: `time()` is wall-clock time, and NTP can step or slew it, so a `time() - $start` difference can come out wrong — even negative — across a clock adjustment. `monotonic()` never goes backwards (two successive reads always satisfy `later >= $earlier`), which is exactly the property an elapsed-time, timeout, or "did this happen before that" computation needs. It is also the clock the compositor's frame traces stamp (`start_us`/`end_us` in the compositor's `FRAME_TRACE` records), so a Mix measurement can be correlated with a compositor trace from the same machine.
 
 ```mix
 $start = monotonic()

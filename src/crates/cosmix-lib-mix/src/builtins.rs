@@ -291,7 +291,7 @@ builtin_table! {
 
     ("env", CapabilityClass::Env,             "system",  "Get environment variable value (\"\" if unset); env(name, default) returns default when unset or empty", contract!((name: string, default?: any) -> any)),
     ("time", CapabilityClass::Pure,            "system",  "Return current Unix timestamp as float", contract!(() -> number)),
-    ("monotonic", CapabilityClass::Pure,        "system",  "Return CLOCK_MONOTONIC seconds as a float — the kernel monotonic clock (the one compositor FRAME_TRACE mono_us stamps), never stepped by NTP or wall-clock adjustment, so it never goes backwards and differences are true elapsed intervals. The epoch is unspecified (on Linux it counts from boot); use time() for calendar timestamps, this for measuring and for correlating with compositor traces", contract!(() -> number)),
+    ("monotonic", CapabilityClass::Pure,        "system",  "Return CLOCK_MONOTONIC seconds as a float — the kernel monotonic clock (the one compositor FRAME_TRACE start_us/end_us stamp), never stepped by NTP or wall-clock adjustment, so it never goes backwards and differences are true elapsed intervals. The epoch is unspecified (on Linux it counts from boot); use time() for calendar timestamps, this for measuring and for correlating with compositor traces", contract!(() -> number)),
     ("pid", CapabilityClass::Env,             "system",  "Return current process ID", contract!(() -> number)),
     ("uid", CapabilityClass::Env,             "system",  "Effective user id of this process (geteuid) — normally the id a file access is checked against (Linux checks fsuid, which tracks euid unless setfsuid(2) is called; no Mix script can call it, though an embedder can), so it is the one to compare a stat() map's `uid` against when deciding whether a path is yours (v0.41.0)", contract!(() -> number)),
     ("gid", CapabilityClass::Env,             "system",  "Effective group id of this process (getegid) — the companion to uid(), for comparing against a stat() map's `gid`; same fsgid caveat, and it answers only whether a file's group is the EFFECTIVE one, so use groups() to decide which permission class applies (v0.41.0)", contract!(() -> number)),
@@ -3281,7 +3281,7 @@ fn builtin_time(_args: Vec<Value>) -> MixResult<Option<Value>> {
 /// `time() - time()` difference can come out wrong (even negative) across
 /// a clock adjustment. This clock never goes backwards, which is what an
 /// elapsed-time or ordering comparison needs, and it is the same kernel
-/// clock the compositor's frame traces stamp (`mono_us` in FRAME_TRACE),
+/// clock the compositor's frame traces stamp (`start_us`/`end_us` in FRAME_TRACE),
 /// so a Mix measurement correlates with a compositor trace from the same
 /// machine. Its epoch is unspecified (on Linux it commonly counts from
 /// boot) and it does not include suspended time — only differences and
@@ -27897,9 +27897,11 @@ mod monotonic_tests {
             panic!("monotonic() must return numbers");
         };
         let delta = b - a;
+        // No upper bound: a descheduled or stopped process can legitimately
+        // see a large gap between two correct reads.
         assert!(
-            (0.0..=1.0).contains(&delta),
-            "back-to-back monotonic() reads should be ~0s apart, got {delta}"
+            delta.is_finite() && delta >= 0.0,
+            "back-to-back monotonic() reads must be a finite non-negative interval, got {delta}"
         );
     }
 }
