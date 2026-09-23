@@ -2713,7 +2713,9 @@ mod tests {
                 .0
                 .panel(Edge::Left)
                 .page_ids
-                .clone()
+                .iter()
+                .cloned()
+                .collect::<Vec<String>>()
         };
         let active = |app: &App| {
             app.world()
