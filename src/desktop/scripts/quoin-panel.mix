@@ -10,6 +10,14 @@
 --             clicking the clock
 --   notes     right edge: live notifications (the `notify` adapter)
 --
+-- All four are registered sub-panels (shell refactor phase 1): mounting a
+-- document registers its name (scene-<name>) on its edge, so every scene is
+-- mounted at startup and again whenever a fresh host is detected (revision
+-- 1). A closed popup keeps its registration and its content -- only its
+-- edge is released. Opening selects the page, reveals it
+-- (shell.panel.show) and pins the edge (the legacy pin still reserves the
+-- popup's space); phase 2 replaces that with named activation.
+--
 -- Run: mix --serve quoin-panel.mix --name quoin-panel
 -- Env: SCENE_HOST (default shell), COMP_SERVICE (comp), APPS_SERVICE (apps),
 --      TRAY_SERVICE (tray), NOTIFY_SERVICE (notify) -- a nested dev desktop
@@ -49,7 +57,8 @@ $state = {
   launcher_open: false, calendar_open: false,
   query: "", category: "", apps: [], apps_loaded: false,
   cal_offset: 0, icons: {},
-  popup_gen: 0, clock_running: false, peek_busy: false, dirty: false, scheduled: false
+  popup_gen: 0, clock_running: false, peek_busy: false, dirty: false, scheduled: false,
+  popups_registered: false
 }
 
 fn note($line)
@@ -75,7 +84,8 @@ end
 
 -- Load a document; returns the host's revision for it (0 = refused or no
 -- host). Revisions only restart at 1 when the HOST restarts, so revision 1
--- is how the panel notices a Quoin restart and re-pins itself.
+-- is how the panel notices a Quoin restart, re-registers its sub-panels and
+-- re-pins itself.
 fn load_scene($doc)
   send $HOST shell.scene.load body=$doc timeout=5
   if $rc != 0 then
@@ -91,10 +101,6 @@ fn load_scene($doc)
     end
   end
   return (type($r) == "map" and $r.revision != nil) ? $r.revision : 0
-end
-
-fn unload_scene($name)
-  send $HOST shell.scene.unload body=json_encode({scene: $name}) timeout=3
 end
 
 fn panel_verb($verb, $edge, $id)
@@ -585,9 +591,46 @@ fn notes_doc()
 end
 
 -- ── rebuilds ────────────────────────────────────────────────────────────
+-- Mount every popup document once per host generation: mounting is what
+-- registers a sub-panel's name on its edge, so this is the register-at-
+-- startup pass -- at init, after a citizen restart (the host's revision
+-- counter is then mid-stream, so render_panel's revision-1 branch cannot
+-- carry it) and after a host restart wiped the scene store. Content mounted
+-- here is whatever $state holds; the open render passes refresh it. A
+-- refused document (host down, diagnostics) leaves that name unregistered
+-- until its open handler's own load retries it.
+fn register_popups()
+  fetch_apps()
+  try
+    load_scene(launcher_doc())
+  catch $e
+    note("launcher registration failed: " .. to_string($e))
+  end
+  try
+    load_scene(calendar_doc())
+  catch $e
+    note("calendar registration failed: " .. to_string($e))
+  end
+  try
+    load_scene(notes_doc())
+  catch $e
+    note("notes registration failed: " .. to_string($e))
+  end
+  $state.popups_registered = true
+end
+
 fn render_panel()
-  if load_scene(panel_doc()) == 1 then
+  $rev = load_scene(panel_doc())
+  if $rev == 0 then return end
+  if $rev == 1 then
+    -- A host that has never seen us: its scene store is empty and every
+    -- registration of ours went with it. Re-register, then select and pin
+    -- the taskbar page as before.
+    $state.popups_registered = false
+    register_popups()
     show_page("bottom", "scene-panel")
+  elif not $state.popups_registered then
+    register_popups()
   end
 end
 
@@ -643,6 +686,10 @@ end
 -- open when Quoin or this citizen went down would come back as a pinned
 -- native page. We record every popup pin we make in a small state file and,
 -- at start, release ONLY those -- a pin the user made is never touched.
+-- Owner-disconnect cleanup removes our registrations but not the persisted
+-- modes, so the file stays through shell refactor phase 1: without it, a
+-- crash with a popup pinned would strand a docked, empty edge. Phase 2
+-- (popup pins retired) deletes it.
 $PIN_FILE = env("XDG_STATE_HOME", env("HOME", "/tmp") .. "/.local/state") .. "/cosmix/quoin-panel-pins.json"
 
 fn read_pins()
@@ -663,10 +710,12 @@ fn write_pins($pins)
   end
 end
 
--- Show a popup page and pin its edge -- but the page.set/pin sends are
--- yield points too: re-check the popup is still live after each, and if a
--- close landed meanwhile, undo the pin instead of leaving a closed popup
--- pinned open.
+-- Show a popup page and pin its edge. Mounting no longer reveals anything
+-- (register-only mounts), so the reveal is this explicit shell.panel.show
+-- and the legacy pin behind it reserves the popup's space. The
+-- page.set/show/pin sends are yield points too: re-check the popup is still
+-- live after each, and if a close landed meanwhile, undo the pin instead of
+-- leaving a closed popup pinned open.
 fn show_popup($edge, $page, $flag, $gen)
   $pins = read_pins()
   if index_of($pins, $edge) < 0 then
@@ -680,6 +729,8 @@ fn show_popup($edge, $page, $flag, $gen)
     sleep(0.05)
     if not popup_live($flag, $gen) then return end
   end
+  if not popup_live($flag, $gen) then return end
+  panel_verb("shell.panel.show", $edge, nil)
   if not popup_live($flag, $gen) then return end
   panel_verb("shell.panel.pin", $edge, nil)
   if not popup_live($flag, $gen) and not edge_in_use($edge) then hide_popup($edge) end
@@ -702,11 +753,13 @@ fn hide_popup($edge)
   write_pins($kept)
 end
 
+-- Closing a popup releases its edge (unpin + confirmed hide) but NOT its
+-- registration: the sub-panel and its content stay mounted, so the next
+-- open only has to select, reveal and pin again.
 fn close_notes()
   $state.notes_open = false
   bump_popups()
   hide_popup("right")
-  unload_scene("notes")
 end
 
 -- One popup at a time, like Plasma: opening any closes the others.
@@ -720,14 +773,12 @@ fn close_launcher()
   $state.launcher_open = false
   bump_popups()
   hide_popup("left")
-  unload_scene("launcher")
 end
 
 fn close_calendar()
   $state.calendar_open = false
   bump_popups()
   hide_popup("right")
-  unload_scene("calendar")
 end
 
 -- Coalesce bursts (a window opening changes many props at once) into one
@@ -1063,8 +1114,9 @@ fetch_windows()
 fetch_tray()
 fetch_status()
 -- A popup that was open when Quoin or this citizen went down comes back as
--- a pinned native page. Release exactly the popup pins this panel recorded
--- (show_popup/hide_popup keep $PIN_FILE); a pin the user made is untouched.
+-- a pinned edge with no content (the modes persist; the scenes do not).
+-- Release exactly the popup pins this panel recorded (show_popup/hide_popup
+-- keep $PIN_FILE); a pin the user made is untouched.
 for each $edge in read_pins()
   hide_popup($edge)
 end
