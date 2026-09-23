@@ -1323,14 +1323,17 @@ fn escape_panels(
     }
 }
 
+/// Optional presentation settings `present_panels` reads when present.
+type PresentSettings<'w> = (
+    Option<Res<'w, QuoinHotspotSize>>,
+    Option<Res<'w, QuoinReducedMotion>>,
+    Option<Res<'w, QuoinCommittedMotionModes>>,
+);
+
 fn present_panels(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    (hotspot, reduced_motion, committed_modes): (
-        Option<Res<QuoinHotspotSize>>,
-        Option<Res<QuoinReducedMotion>>,
-        Option<Res<QuoinCommittedMotionModes>>,
-    ),
+    (hotspot, reduced_motion, committed_modes): PresentSettings,
     (time, mut slides, mut redraw): (
         Res<Time<Real>>,
         ResMut<QuoinCarouselSlides>,
