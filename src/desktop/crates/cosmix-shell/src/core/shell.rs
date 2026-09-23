@@ -193,11 +193,23 @@ impl ShellModel {
     /// [`ShellModel::new`] only applies while the plane is inactive: the dev
     /// host and a compositor that does not report the plane.
     /// `at` is when the capability changed; a fall back to local rules gives
-    /// an unheld reveal its full grace from then.
-    pub fn set_holder_plane(&mut self, available: bool, at: Duration) {
-        for panel in &mut self.panels {
-            panel.set_holder_plane(available, at);
-        }
+    /// an unheld reveal its full grace from then. Like any input it advances
+    /// the model to `at` first, so later inputs cannot be timed before it.
+    pub fn set_holder_plane(
+        &mut self,
+        available: bool,
+        at: Duration,
+    ) -> Result<[PanelUpdate; 4], PanelTimeError> {
+        self.ensure_monotonic(at)?;
+        let [left, bottom, right, top] = &mut self.panels;
+        let updates = [
+            left.set_holder_plane(available, at)?,
+            bottom.set_holder_plane(available, at)?,
+            right.set_holder_plane(available, at)?,
+            top.set_holder_plane(available, at)?,
+        ];
+        self.last_update = at;
+        Ok(updates)
     }
 
     /// Whether the compositor's holder plane drives transient visibility.

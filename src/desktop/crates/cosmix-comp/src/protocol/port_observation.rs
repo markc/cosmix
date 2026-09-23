@@ -165,14 +165,18 @@ pub(crate) enum PointerHold {
 
 /// Focus restoration for one held popup (surface ids). Restoration happens
 /// only when the popup's own destruction moved focus and focus is still
-/// where that destruction put it; focus leaving the popup while it lives is a
-/// deliberate move and cancels the restoration.
+/// where that destruction put it. Focus leaving the popup while it lives is a
+/// deliberate move and cancels the restoration — unless it went to another
+/// held popup (a nested menu), which restores back to this one when it closes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PopupRestore {
     /// The focus the popup displaced when it took focus; `None` until then.
     pub(crate) prior: Option<u64>,
     /// Where focus went when the popup's destruction moved it.
     pub(crate) fallback: Option<Option<u64>>,
+    /// Focus left the popup while it lived, to this surface. A deliberate
+    /// move unless that surface becomes (or is) a held popup.
+    pub(crate) departed_to: Option<Option<u64>>,
 }
 
 /// What comp observed of one panel at a stable dispatch boundary.
@@ -909,6 +913,10 @@ pub(crate) struct ObservationState {
     pub(crate) popup_restores: BTreeMap<u64, PopupRestore>,
     /// The latest keyboard focus change as `(to, from)` surface ids.
     last_focus_change: Option<(Option<u64>, Option<u64>)>,
+    /// A holder request ran in this cycle's controls: reconcile after them.
+    panel_request_serviced: bool,
+    #[cfg(test)]
+    pub(crate) conceal_timer_fired: usize,
     pointer_lease: PointerLease,
     pointer_seen: Option<(CursorPositionSnapshot, bool)>,
     pointer_timer: Option<RegistrationToken>,
@@ -975,6 +983,9 @@ impl ObservationState {
             conceal_timer_arms: 0,
             popup_restores: BTreeMap::new(),
             last_focus_change: None,
+            panel_request_serviced: false,
+            #[cfg(test)]
+            conceal_timer_fired: 0,
             pointer_lease: PointerLease::default(),
             pointer_seen: None,
             pointer_timer: None,
@@ -1679,7 +1690,10 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     }
     service_output_edges(state);
     service_property_diffs(state);
-    match service_controls(state) {
+    let mutation = service_controls(state);
+    let retrack = std::mem::take(&mut state.observations.panel_request_serviced)
+        || !matches!(mutation, ControlMutation::None);
+    match mutation {
         // A mutation moved state after the edge passes above ran; report it
         // in this cycle rather than on whatever event wakes the loop next.
         // Injected input can only move focus (and the rows that show it).
@@ -1699,7 +1713,7 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     // after the pass above tracked the holders: reconcile again before the
     // loop sleeps, or a release that leaves a lingering pointer as the last
     // holder (or a mode that retires a deadline) waits for an unrelated event.
-    if !state.observations.panel_holders.is_empty() {
+    if retrack && !state.observations.panel_holders.is_empty() {
         track_panel_holders(state, Instant::now());
     }
     state.service_window_waiters();
@@ -2949,6 +2963,7 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
     for control in &mut controls {
         match control {
             PortControl::Panel(request) => {
+                state.observations.panel_request_serviced = true;
                 let reply = service_panel_request(state, &request.op);
                 if let Some(sender) = request.reply.take() {
                     let _ = sender.send(reply);
@@ -3182,6 +3197,10 @@ fn rearm_conceal_timer(state: &mut WaylandState, deadline: Option<Instant>) {
         .insert_source(Timer::from_duration(delay), |_, _, state| {
             state.observations.conceal_timer = None;
             state.observations.conceal_deadline = None;
+            #[cfg(test)]
+            {
+                state.observations.conceal_timer_fired += 1;
+            }
             TimeoutAction::Drop
         });
     match timer {
@@ -3207,17 +3226,25 @@ fn note_popup_focus(state: &mut WaylandState, to: Option<u64>, from: Option<u64>
     }
     let from_alive = from.is_some_and(|id| layer_alive(state, SurfaceId(id)));
     let restores = &mut state.observations.popup_restores;
+    let to_held_popup = to.is_some_and(|to| restores.contains_key(&to));
     if let Some(to) = to
         && let Some(entry) = restores.get_mut(&to)
-        && entry.prior.is_none()
     {
-        entry.prior = from;
+        // Focus came back: whatever departure was recorded is undone.
+        entry.departed_to = None;
+        if entry.prior.is_none() {
+            entry.prior = from;
+        }
     }
-    if let Some(from) = from {
-        if from_alive {
-            restores.remove(&from);
-        } else if let Some(entry) = restores.get_mut(&from) {
+    if let Some(from) = from
+        && let Some(entry) = restores.get_mut(&from)
+    {
+        if !from_alive {
             entry.fallback = Some(to);
+        } else if !to_held_popup {
+            // Deliberate, unless `to` is a popup whose hold is still to come
+            // (an exclusive menu takes focus as it maps): see record_popup_focus.
+            entry.departed_to = Some(to);
         }
     }
 }
@@ -3241,7 +3268,9 @@ fn service_popup_restores(state: &mut WaylandState) -> bool {
     let mut restored = false;
     for (popup, restore) in closed {
         state.observations.popup_restores.remove(&popup);
-        let (Some(prior), Some(fallback)) = (restore.prior, restore.fallback) else {
+        let (Some(prior), Some(fallback), None) =
+            (restore.prior, restore.fallback, restore.departed_to)
+        else {
             continue;
         };
         let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
@@ -3315,11 +3344,18 @@ fn record_popup_focus(state: &mut WaylandState, popup: SurfaceId) {
         })
         .flatten()
         .filter(|prior| *prior != popup.0);
+    // A popup that focus left for this one was not left deliberately: it
+    // is the parent of a nested menu, restored when this one closes.
+    for entry in state.observations.popup_restores.values_mut() {
+        if entry.departed_to == Some(Some(popup.0)) {
+            entry.departed_to = None;
+        }
+    }
     state
         .observations
         .popup_restores
         .entry(popup.0)
-        .or_insert(PopupRestore { prior, fallback: None });
+        .or_insert(PopupRestore { prior, fallback: None, departed_to: None });
 }
 
 fn service_set(

@@ -128,7 +128,8 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     // conceal timers while the compositor still drives reveal/conceal.
     let plane = world.resource::<ShellRuntime>().model.holder_plane();
     let at = model.last_update();
-    model.set_holder_plane(plane, at);
+    // At the model's own last update: cannot be refused as out of order.
+    let _ = model.set_holder_plane(plane, at);
     if let Some(declarations) = world.get_resource::<ShellPageDeclarations>() {
         for edge in Edge::ALL {
             model
@@ -401,7 +402,13 @@ fn update_model(
             }
             ShellCommandKind::HolderPlane(available) => {
                 let at = command.at.clamp(runtime.model.last_update(), now);
-                runtime.model.set_holder_plane(*available, at);
+                if let Ok(updates) = runtime.model.set_holder_plane(*available, at) {
+                    for (edge, update) in Edge::ALL.into_iter().zip(updates) {
+                        if let Some(effect) = update.effect {
+                            effects.0.push(ShellEffect { edge, effect });
+                        }
+                    }
+                }
                 continue;
             }
             _ => {}

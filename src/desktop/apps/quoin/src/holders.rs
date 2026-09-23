@@ -266,7 +266,11 @@ impl HolderClient {
                 let superseded = std::mem::take(&mut self.pending_superseded);
                 self.settle(key.clone(), body, result);
                 if superseded {
+                    // Neither verdict stands for a change comp has not seen:
+                    // the edge's current report goes out on the next flush
+                    // (or, if a retry is armed, at its deadline).
                     self.acknowledged.remove(&key);
+                    self.failed.remove(&key);
                 }
             }
             _ => {}
@@ -375,7 +379,10 @@ impl HolderClient {
     /// bounds the delay, not the attempts: a comp that stays busy is retried
     /// every [`RETRY_CAP`] until it answers or the connection changes. Capping
     /// attempts instead would give up on a release and strand comp's hold;
-    /// comp leaving or a success are the only exits.
+    /// comp leaving or a success are the only exits. A reply that never comes
+    /// is not timed here: the pending request relies on the bus bridge
+    /// completing every call (with its own timeout error when comp is silent),
+    /// which then settles as a transient failure.
     fn tick(&mut self, now: Duration, deadline: &mut LayerHostDeadline) {
         if self.retry_at.is_some_and(|at| at <= now) {
             // One firing covers every transient failure so far.
@@ -837,5 +844,21 @@ mod tests {
             }
         }
         assert!(sent.contains(&json!("left")), "the changed edge is reported after backoff");
+    }
+
+    /// A refusal of the superseded report (here `locked`, which otherwise
+    /// waits for an unlock) does not hold back the report of the change.
+    #[test]
+    fn superseded_refusal_does_not_suppress_the_changed_report() {
+        let (mut client, bridge, peer) = capable_client();
+        client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
+        client.flush(&bridge);
+        let in_flight = peer.drain_calls();
+        client.mode_changed("test", "left");
+        client.event(&reply(in_flight[0].request_id, 10, r#"{"error":"locked"}"#));
+        client.flush(&bridge);
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1, "sent again without waiting for an unlock");
+        assert_eq!(calls[0].command, "comp.panel.mode");
     }
 }

@@ -241,12 +241,22 @@ pub struct PanelStateMachine {
     ///
     /// This is THE command-driven (holder-plane) latch: set by a hide from a
     /// persistent mode, and by Hide/Escape/toggle-off while the compositor
-    /// holds; cleared by `HolderConceal` and by any mode change. Chunk 20's
+    /// (or the local membership shows the pointer) holds; cleared by
+    /// `HolderConceal`, by a mode change to pinned or docked (a change to
+    /// hidden sets it), and, with no compositor hold, once the local
+    /// membership is gone — so it can never wedge. Chunk 20's
     /// `hover_latched` stays local-only (set and cleared only in the unguarded
     /// corner/pointer arms); at that merge the Hide/Escape arm becomes
     /// `if plane { latch_deliberate_conceal } else { hover latch }` before
     /// `conceal_now()`, and the snapshot's latch reads `hover_latched || latched`.
     latched: bool,
+    /// The latch was armed on local membership with no compositor hold, so
+    /// no release is certain to clear it: leaving clears it instead.
+    latch_local: bool,
+    /// Command-driven: an unpin or undock kept its reveal for the verdict on
+    /// its hidden report. If none arrives by then (a backoff, repeated
+    /// failures), the reveal is treated as unheld: local by default on doubt.
+    verdict_due: Option<Duration>,
 }
 
 impl PanelStateMachine {
@@ -256,6 +266,8 @@ impl PanelStateMachine {
             comp_held: false,
             shown: false,
             latched: false,
+            verdict_due: None,
+            latch_local: false,
             menu_hold: false,
             config,
             mode: PanelMode::Hidden,
@@ -355,11 +367,24 @@ impl PanelStateMachine {
             // local flags stay current for the undock hold check and for a
             // fall back to local behaviour.
             PanelInput::CornerEntered if plane => self.corner_inside = true,
-            PanelInput::CornerLeft if plane => self.corner_inside = false,
             PanelInput::PointerEntered if plane => self.pointer_inside = true,
-            PanelInput::PointerLeft if plane => self.pointer_inside = false,
+            PanelInput::CornerLeft | PanelInput::PointerLeft if plane => {
+                if input == PanelInput::CornerLeft {
+                    self.corner_inside = false;
+                } else {
+                    self.pointer_inside = false;
+                }
+                // A latch armed on local membership alone ends with it.
+                if self.latch_local && !self.corner_inside && !self.pointer_inside {
+                    self.latched = false;
+                    self.latch_local = false;
+                }
+            }
             PanelInput::HolderReveal if plane => {
                 self.comp_held = true;
+                self.verdict_due = None;
+                // A hold now exists, whose release will clear any latch.
+                self.latch_local = false;
                 if self.mode == PanelMode::Hidden && !self.latched {
                     if !self.transient_revealed {
                         effect = Some(PanelEffect::Reveal {
@@ -378,6 +403,8 @@ impl PanelStateMachine {
                     self.shown = false;
                 }
                 self.latched = false;
+                self.latch_local = false;
+                self.verdict_due = None;
                 effect = self.settle_holders().or(effect);
             }
             PanelInput::HolderReveal | PanelInput::HolderConceal => {}
@@ -526,26 +553,35 @@ impl PanelStateMachine {
     /// re-states one for every hidden mode report the host replays), and one
     /// they no longer hold conceals at once. Going local resumes the normal
     /// rules from the current membership, arming grace for an unheld reveal
-    /// from `at`, the moment of the change (never earlier than the last update).
-    pub fn set_holder_plane(&mut self, available: bool, at: Duration) {
+    /// from `at`, the moment of the change. Like every input, the change first
+    /// advances the machine to `at`, so it cannot be timed before earlier ones.
+    pub fn set_holder_plane(
+        &mut self,
+        available: bool,
+        at: Duration,
+    ) -> Result<PanelUpdate, PanelTimeError> {
+        let before = self.snapshot();
+        let mut effect = self.advance_to(at)?;
         if self.holder_plane == available {
-            return;
+            return Ok(self.update_since(before, effect));
         }
         self.holder_plane = available;
         self.comp_held = false;
         self.latched = false;
+        self.latch_local = false;
+        self.verdict_due = None;
         self.clear_deadline();
-        if self.mode != PanelMode::Hidden || !self.transient_revealed {
-            return;
-        }
-        let hinted = self.pointer_inside || self.corner_inside;
-        if available {
-            if !hinted {
-                let _ = self.settle_holders();
+        if self.mode == PanelMode::Hidden && self.transient_revealed {
+            let hinted = self.pointer_inside || self.corner_inside;
+            if available {
+                if !hinted {
+                    effect = self.settle_holders().or(effect);
+                }
+            } else if !hinted && !self.shown && self.intro_until.is_none() {
+                self.arm_deadline(at, ConcealReason::Grace);
             }
-        } else if !hinted && !self.shown && self.intro_until.is_none() {
-            self.arm_deadline(at.max(self.last_update), ConcealReason::Grace);
         }
+        Ok(self.update_since(before, effect))
     }
 
     pub const fn holder_plane(&self) -> bool {
@@ -590,7 +626,11 @@ impl PanelStateMachine {
     }
 
     pub fn next_deadline(&self) -> Option<Duration> {
-        self.hide_at.into_iter().chain(self.intro_until).min()
+        self.hide_at
+            .into_iter()
+            .chain(self.intro_until)
+            .chain(self.verdict_due)
+            .min()
     }
 
     fn advance_to(&mut self, at: Duration) -> Result<Option<PanelEffect>, PanelTimeError> {
@@ -611,6 +651,14 @@ impl PanelStateMachine {
             } else if self.transient_revealed && !self.pointer_inside && !self.corner_inside {
                 self.arm_deadline(deadline, ConcealReason::Grace);
             }
+        }
+        let mut verdict_lapsed = false;
+        if let Some(due) = self.verdict_due
+            && due <= at
+        {
+            self.verdict_due = None;
+            self.comp_held = false;
+            verdict_lapsed = true;
         }
         let mut effect = None;
         if let Some(deadline) = self.hide_at
@@ -635,7 +683,7 @@ impl PanelStateMachine {
             self.motion.advance(at.saturating_sub(self.last_update));
         }
         self.last_update = at;
-        if intro_ended {
+        if intro_ended || verdict_lapsed {
             effect = self.settle_holders().or(effect);
         }
         Ok(effect)
@@ -649,9 +697,11 @@ impl PanelStateMachine {
         // the panel. Its next release clears the latch.
         if changed {
             self.latched = self.holder_plane && mode == PanelMode::Hidden;
+            self.latch_local = false;
         }
         // Persistent panels have no holders, so there is no verdict to keep.
         self.comp_held = false;
+        self.verdict_due = None;
         self.mode = mode;
         self.transient_revealed = false;
         self.shown = false;
@@ -673,13 +723,16 @@ impl PanelStateMachine {
         self.transient_revealed = true;
         self.shown = false;
         self.latched = false;
+        self.latch_local = false;
         self.motion.reveal();
         self.clear_deadline();
         if self.holder_plane {
             // The hidden mode report draws the compositor's verdict; until it
             // lands the reveal counts as held, so no local hold ending first
-            // can conceal a panel the pointer still holds.
+            // can conceal a panel the pointer still holds. If no verdict comes
+            // within the grace, doubt defaults local: it counts as unheld.
             self.comp_held = true;
+            self.verdict_due = Some(at + self.config.grace);
         } else if !self.pointer_inside && !self.corner_inside && self.intro_until.is_none() {
             self.arm_deadline(at, ConcealReason::Grace);
         }
@@ -712,12 +765,21 @@ impl PanelStateMachine {
     /// Hide, Escape and toggle-off conceal without a mode change, but a
     /// hidden mode report the host replays (a registry receipt, a gap) draws
     /// the compositor's restated verdict — a reveal while the pointer still
-    /// rests in the hotspot or the layer keeps focus. Latch only while the
-    /// compositor holds: only then is its release, which clears the latch,
-    /// certain to arrive.
+    /// rests in the hotspot or the layer keeps focus — and a reveal already on
+    /// its way when the pointer is inside but comp has not yet said so. Latch
+    /// while comp holds (its release clears the latch) or while the local
+    /// membership shows the pointer (leaving clears it), never otherwise, so
+    /// the latch cannot outlive both.
     fn latch_deliberate_conceal(&mut self) {
-        if self.holder_plane && self.comp_held {
+        if !self.holder_plane {
+            return;
+        }
+        if self.comp_held {
             self.latched = true;
+            self.latch_local = false;
+        } else if (self.corner_inside || self.pointer_inside) && !self.latched {
+            self.latched = true;
+            self.latch_local = true;
         }
     }
 
@@ -1089,7 +1151,7 @@ mod intro_tests {
 
     fn commanded() -> PanelStateMachine {
         let mut panel = panel();
-        panel.set_holder_plane(true, Duration::ZERO);
+        panel.set_holder_plane(true, Duration::ZERO).unwrap();
         panel
     }
 
@@ -1213,6 +1275,63 @@ mod intro_tests {
         assert_eq!(panel.snapshot().target_fraction, 0.0);
     }
 
+    /// §4.3: Escape with the pointer inside latches even before comp's
+    /// reveal has arrived; the latch ends with the membership it rested on.
+    #[test]
+    fn escape_before_the_reveal_arrives_latches_until_the_pointer_leaves() {
+        let at = Duration::ZERO;
+        let mut panel = commanded();
+        panel.apply(at, PanelInput::CornerEntered).unwrap();
+        panel.apply(at, PanelInput::Escape).unwrap();
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(!panel.snapshot().transient_revealed, "the in-flight reveal is latched");
+        // Comp now holds: its release, not the local leave, ends the latch.
+        panel.apply(at, PanelInput::CornerLeft).unwrap();
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(!panel.snapshot().transient_revealed);
+        panel.apply(at, PanelInput::HolderConceal).unwrap();
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(panel.snapshot().transient_revealed, "a new hold reveals");
+        // With no comp hold ever arriving, leaving ends the latch: it cannot wedge.
+        let mut panel = commanded();
+        panel.apply(at, PanelInput::PointerEntered).unwrap();
+        panel.apply(at, PanelInput::Hide).unwrap();
+        panel.apply(at, PanelInput::PointerLeft).unwrap();
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(panel.snapshot().transient_revealed, "the next dwell reveals");
+    }
+
+    /// Doubt defaults local: an unpin's reveal held for a verdict that never
+    /// comes (a backoff, repeated failures) ends after the grace.
+    #[test]
+    fn unpin_without_a_verdict_falls_back_to_a_local_conceal() {
+        let ms = Duration::from_millis;
+        let mut panel = commanded();
+        panel.apply(ms(0), PanelInput::Pin).unwrap();
+        panel.apply(ms(0), PanelInput::PinToggle).unwrap();
+        assert!(panel.snapshot().transient_revealed);
+        assert_eq!(panel.next_deadline(), Some(ms(800)));
+        assert!(panel.tick(ms(799)).unwrap().snapshot.transient_revealed);
+        let update = panel.tick(ms(800)).unwrap();
+        assert!(!update.snapshot.transient_revealed);
+        assert_eq!(update.effect, Some(holders_conceal()));
+        // A verdict arriving first cancels the fallback.
+        let mut panel = commanded();
+        panel.apply(ms(0), PanelInput::Pin).unwrap();
+        panel.apply(ms(0), PanelInput::PinToggle).unwrap();
+        panel.apply(ms(100), PanelInput::HolderReveal).unwrap();
+        assert_eq!(panel.next_deadline(), None);
+        assert!(panel.tick(ms(10_000)).unwrap().snapshot.transient_revealed);
+        // A local hold outlasting the fallback defers the conceal to its end.
+        let mut panel = commanded();
+        panel.apply(ms(0), PanelInput::Pin).unwrap();
+        panel.apply(ms(0), PanelInput::PinToggle).unwrap();
+        panel.apply(ms(100), PanelInput::MenuHold(true)).unwrap();
+        assert!(panel.tick(ms(900)).unwrap().snapshot.transient_revealed);
+        let update = panel.apply(ms(1000), PanelInput::MenuHold(false)).unwrap();
+        assert_eq!(update.effect, Some(holders_conceal()));
+    }
+
     #[test]
     fn holder_plane_switch_defaults_to_local_rules() {
         // Commands are ignored while the plane is inactive.
@@ -1225,12 +1344,12 @@ mod intro_tests {
         panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
         panel.apply(Duration::ZERO, PanelInput::CornerLeft).unwrap();
         assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(800)));
-        panel.set_holder_plane(true, Duration::ZERO);
+        panel.set_holder_plane(true, Duration::ZERO).unwrap();
         assert_eq!(panel.snapshot().hide_at, None);
         assert!(!panel.snapshot().transient_revealed);
         // A reveal the local hints still hold waits for comp's verdict.
         let mut panel = panel_with_corner_held();
-        panel.set_holder_plane(true, Duration::ZERO);
+        panel.set_holder_plane(true, Duration::ZERO).unwrap();
         panel.tick(Duration::from_secs(10)).unwrap();
         assert!(panel.snapshot().transient_revealed);
         panel
@@ -1241,8 +1360,12 @@ mod intro_tests {
         // from the moment of the fall back — not from the last idle update.
         let mut panel = commanded();
         panel.apply(Duration::ZERO, PanelInput::HolderReveal).unwrap();
-        panel.set_holder_plane(false, Duration::from_secs(5));
+        panel.set_holder_plane(false, Duration::from_secs(5)).unwrap();
         assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(5800)));
+        assert!(
+            panel.apply(Duration::from_secs(4), PanelInput::PointerLeft).is_err(),
+            "the change advanced time: nothing can be timed before it"
+        );
         let update = panel.tick(Duration::from_millis(5799)).unwrap();
         assert!(update.snapshot.transient_revealed, "grace is not cut short");
         let update = panel.tick(Duration::from_millis(5800)).unwrap();
@@ -1256,7 +1379,7 @@ mod intro_tests {
         let mut panel = commanded();
         panel.apply(Duration::ZERO, PanelInput::PointerEntered).unwrap();
         panel.apply(Duration::ZERO, PanelInput::HolderReveal).unwrap();
-        panel.set_holder_plane(false, Duration::ZERO);
+        panel.set_holder_plane(false, Duration::ZERO).unwrap();
         assert_eq!(panel.snapshot().hide_at, None);
         panel
             .apply(Duration::from_secs(1), PanelInput::PointerLeft)
@@ -1304,7 +1427,7 @@ mod intro_tests {
             for mode in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {
                 for held in holders {
                     let mut panel = panel();
-                    panel.set_holder_plane(plane, Duration::ZERO);
+                    panel.set_holder_plane(plane, Duration::ZERO).unwrap();
                     panel.apply(Duration::ZERO, PanelInput::SetMode(mode)).unwrap();
                     for input in held {
                         panel.apply(Duration::ZERO, *input).unwrap();

@@ -178,7 +178,10 @@ compositor's verdict on the hidden report until it next reports the holders
 released, so a still-open menu cannot reopen the panel it just hid. Hide,
 Escape and toggle-off latch the same way while the compositor holds the edge,
 because a replayed hidden report (a registry receipt, a gap) restates its
-reveal. A held unpin or undock keeps its reveal until that verdict. Every mode
+reveal, and also while the local membership shows the pointer inside before
+comp has said so; that membership-only latch ends when the pointer leaves. A
+held unpin or undock keeps its reveal until that verdict, or for at most the
+800 ms grace: with no verdict by then it counts as unheld and conceals. Every mode
 change re-sends the edge's report even when it nets to the one comp last
 acknowledged (a pin and unpin in one pass, or both inside a retry backoff), so
 that verdict always comes. Going command-driven drops
@@ -530,7 +533,8 @@ Quoin's release or by the menu layer's destruction, whichever comes first; comp
 records the keyboard focus the menu displaced when it takes focus (a toplevel or
 a layer such as the panel) and restores it only when the menu's destruction is
 what moved focus and focus is still where comp's fallback put it; focus the
-user moved off the live menu is left alone. The one timer is a one-shot armed
+user moved off the live menu is left alone, except into a nested held menu,
+which restores focus back to its parent menu when it closes. The one timer is a one-shot armed
 when a lingering pointer becomes the last holder and cancelled when any holder
 returns; comp reconciles holders and the timer again after handling holder
 requests in the same cycle, so a release never waits for an unrelated event.
