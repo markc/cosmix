@@ -37,9 +37,11 @@ $p = require("lib/panel.mix")
 -- instance registered under (`mix --serve … --name`): a second instance (the
 -- nested dev stack's `quoin-panel-n`) that still said "quoin-panel" had its
 -- clicks delivered to the LIVE panel (found 2026-09-24 by the chunk-21 gate).
--- Mix has no "my serve name" builtin yet (TODO-mix), so the launcher must
--- pass PANEL_NAME whenever --name is not the default.
-$ME = env("PANEL_NAME", "quoin-panel")
+-- `serve_name()` (mix 0.91.0) is the name this citizen registered under;
+-- PANEL_NAME stays as the override for a pre-0.91 mix (it returns nil there
+-- only if the builtin is missing — has_builtin guards the call so an old
+-- interpreter does not raise on an unknown name).
+$ME = has_builtin("serve_name") ? (serve_name() ?? env("PANEL_NAME", "quoin-panel")) : env("PANEL_NAME", "quoin-panel")
 $HOST = env("SCENE_HOST", "shell")
 $COMP = env("COMP_SERVICE", "comp")
 $APPS = env("APPS_SERVICE", "apps")
