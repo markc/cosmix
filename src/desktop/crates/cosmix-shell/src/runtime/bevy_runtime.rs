@@ -68,6 +68,13 @@ pub enum ShellRuntimeSet {
     Host,
 }
 
+/// Host-staged ingress drained at the start of [`ShellRuntimeSet::Input`]:
+/// keyboard focus reports and other commands a host queued between updates.
+/// Keyboard systems order after it, so an Escape or binding in the same
+/// update as a focus change is applied against the new focus.
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ShellStagedIngress;
+
 pub struct ShellRuntimePlugin {
     model: ShellModel,
 }
@@ -101,6 +108,7 @@ impl Plugin for ShellRuntimePlugin {
                 )
                     .chain(),
             )
+            .configure_sets(Update, ShellStagedIngress.in_set(ShellRuntimeSet::Input))
             .add_systems(Update, update_model.in_set(ShellRuntimeSet::Model));
     }
 }
@@ -502,7 +510,7 @@ fn update_model(
                 runtime.model.keyboard_focus_observed(*edge);
             }
             ShellCommandKind::Keyboard(KeyboardCommand::CycleFocus) => {
-                runtime.model.cycle_keyboard_focus();
+                runtime.model.cycle_keyboard_focus(at);
             }
             ShellCommandKind::Keyboard(KeyboardCommand::Escape) => {
                 if let Ok(updates) = runtime.model.escape(at) {

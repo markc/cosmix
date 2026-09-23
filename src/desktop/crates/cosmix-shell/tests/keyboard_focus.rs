@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use cosmix_shell::core::{
-    Edge, FocusDirective, FocusStop, LogicalSize, OutputKey, PanelInput, PanelMode, ShellModel,
+    Edge, FOCUS_GRANT_TIMEOUT, FocusDirective, FocusStop, LogicalSize, OutputKey, PanelInput,
+    PanelMode, ShellModel,
 };
 use cosmix_shell::runtime::{KeyboardInteractivity, ShellFrame};
 
@@ -39,20 +40,20 @@ fn cycle_focus_walks_visible_panels_then_apps() {
     model.tick(ms(300)).unwrap();
     // The user clicked into the transient bottom panel, then cycles.
     model.keyboard_focus_observed(Some(Edge::Bottom));
-    assert_eq!(model.cycle_keyboard_focus(), FocusStop::Panel(Edge::Left));
+    assert_eq!(model.cycle_keyboard_focus(ms(300)), FocusStop::Panel(Edge::Left));
     assert_eq!(keyboard(&model, Edge::Left), Exclusive);
     assert_eq!(keyboard(&model, Edge::Right), OnDemand);
     assert_eq!(keyboard(&model, Edge::Bottom), OnDemand);
 
     model.keyboard_focus_observed(Some(Edge::Left));
-    assert_eq!(model.cycle_keyboard_focus(), FocusStop::Panel(Edge::Right));
+    assert_eq!(model.cycle_keyboard_focus(ms(300)), FocusStop::Panel(Edge::Right));
     assert_eq!(keyboard(&model, Edge::Left), OnDemand);
     assert_eq!(keyboard(&model, Edge::Right), Exclusive);
 
     // Past the last persistent panel focus goes back to the application:
     // every panel refuses the keyboard until the host reports it has left.
     model.keyboard_focus_observed(Some(Edge::Right));
-    assert_eq!(model.cycle_keyboard_focus(), FocusStop::Application);
+    assert_eq!(model.cycle_keyboard_focus(ms(300)), FocusStop::Application);
     assert_eq!(model.focus_directive(), FocusDirective::Release);
     for edge in [Edge::Left, Edge::Right, Edge::Bottom] {
         assert_eq!(keyboard(&model, edge), Refuse);
@@ -71,7 +72,7 @@ fn cycle_focus_walks_visible_panels_then_apps() {
     // From the application the walk starts again at the first stop, and a
     // cycle target that unmaps drops its grab rather than keep it for a
     // later hover reveal.
-    assert_eq!(model.cycle_keyboard_focus(), FocusStop::Panel(Edge::Left));
+    assert_eq!(model.cycle_keyboard_focus(ms(300)), FocusStop::Panel(Edge::Left));
     model.set_mode(Edge::Left, ms(400), PanelMode::Hidden).unwrap();
     model.tick(ms(1_000)).unwrap();
     assert!(!model.panel(Edge::Left).mapped);
@@ -149,4 +150,46 @@ fn escape_on_a_focused_transient_hides_only_that_panel() {
     assert!(!model.panel(Edge::Left).transient_revealed);
     assert!(!model.panel(Edge::Bottom).transient_revealed);
     assert_eq!(model.focus_directive(), FocusDirective::Follow);
+
+    // Once the host reports focus, "no panel holds it" is an answer, not an
+    // absence of one: an Escape then addresses no panel at all.
+    let mut model = self::model();
+    for edge in [Edge::Left, Edge::Bottom] {
+        model.panel_input(edge, ms(0), PanelInput::Reveal).unwrap();
+    }
+    model.tick(ms(300)).unwrap();
+    model.keyboard_focus_observed(Some(Edge::Left));
+    model.keyboard_focus_observed(None);
+    assert!(model.escape(ms(310)).unwrap().is_empty());
+    assert!(model.panel(Edge::Left).transient_revealed);
+    assert!(model.panel(Edge::Bottom).transient_revealed);
+}
+
+#[test]
+fn an_ungranted_cycle_request_expires() {
+    let mut model = model();
+    model.set_mode(Edge::Left, ms(0), PanelMode::Pinned).unwrap();
+    model.tick(ms(300)).unwrap();
+    assert_eq!(
+        model.cycle_keyboard_focus(ms(300)),
+        FocusStop::Panel(Edge::Left)
+    );
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::Exclusive);
+    // The host wakes for the give-up deadline even with nothing animating.
+    let deadline = ms(300) + FOCUS_GRANT_TIMEOUT;
+    assert_eq!(model.next_deadline(), Some(deadline));
+    model.tick(deadline - ms(1)).unwrap();
+    assert_eq!(model.focus_directive(), FocusDirective::Panel(Edge::Left));
+    // Comp never granted it: the request lapses rather than grab later.
+    model.tick(deadline).unwrap();
+    assert_eq!(model.focus_directive(), FocusDirective::Follow);
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::OnDemand);
+    assert_eq!(model.next_deadline(), None);
+
+    // A granted request keeps its grab past the deadline.
+    model.cycle_keyboard_focus(ms(1_000));
+    model.keyboard_focus_observed(Some(Edge::Left));
+    model.tick(ms(5_000)).unwrap();
+    assert_eq!(model.focus_directive(), FocusDirective::Panel(Edge::Left));
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::Exclusive);
 }

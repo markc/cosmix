@@ -8,7 +8,9 @@
 //! `args` an optional list of strings. These are additions to the mode menu.
 //! `bindings.{edge}.{pin,dock,hide}` and `bindings.cycle_focus` are optional
 //! chords (`Super+Shift+Left`), or nil to disable. Defaults are unbound, avoiding
-//! unsolicited global grabs. Modifier tokens are Ctrl, Alt, Shift and Super;
+//! unsolicited global grabs. A chord needs Ctrl, Alt or Super: a bare or
+//! Shift-only key would take typing from the panel's own controls. Modifier
+//! tokens are Ctrl, Alt, Shift and Super;
 //! keys are ASCII letters/digits, F1–F35, arrows, Tab, Return, space, Escape,
 //! Home, End, Page_Up, Page_Down, Insert, Delete and BackSpace. Super+Escape is
 //! reserved for comp. `carousel_motion` is `slide` (default) or `fade`; renderer
@@ -173,6 +175,15 @@ fn chord(value: &Value, path: &str) -> Result<Option<String>, String> {
             .is_some_and(|n| (1..=35).contains(&n) && key == format!("F{n}"));
     if !valid_key || (key == "Escape" && seen.len() == 1 && seen.contains("Super")) {
         return Err(format!("{path}: invalid or reserved key chord {text}"));
+    }
+    // A bare or Shift-only key would steal typing from the panel's own
+    // controls (a Tab, letter or capital from the launcher's search field),
+    // and a bare Escape would turn the panel's Escape into a mode change
+    // (shell doc §4.3).
+    if !["Ctrl", "Alt", "Super"].iter().any(|m| seen.contains(m)) {
+        return Err(format!(
+            "{path}: key chord {text} needs Ctrl, Alt or Super"
+        ));
     }
     let mut canonical: Vec<String> = modifiers
         .into_iter()
@@ -683,6 +694,13 @@ mod tests {
             r#"{bindings: {cycle_focus: "Shfit+Left"}}"#,
             r#"{bindings: {cycle_focus: "Super+MadeUpKey"}}"#,
             r#"{bindings: {left: {pin: "Ctrl+Super+a"}, cycle_focus: "Super+Ctrl+A"}}"#,
+            // Bare keys: Escape would become a mode change, Tab and letters
+            // would steal typing from the panel's own controls.
+            r#"{bindings: {left: {hide: "Escape"}}}"#,
+            r#"{bindings: {cycle_focus: "Tab"}}"#,
+            r#"{bindings: {right: {pin: "a"}}}"#,
+            r#"{bindings: {top: {dock: "F2"}}}"#,
+            r#"{bindings: {top: {dock: "Shift+A"}}}"#,
         ] {
             assert!(ShellConfig::parse(source).is_err(), "accepted {source}");
             edit(&mut app, source);

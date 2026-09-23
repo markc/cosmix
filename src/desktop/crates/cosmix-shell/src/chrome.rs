@@ -21,6 +21,8 @@ use bevy::a11y::AccessibilityNode;
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::observer::On;
 use bevy::ecs::system::SystemParam;
+use bevy::input::ButtonState;
+use bevy::input::keyboard::KeyboardInput;
 use bevy::input_focus::InputFocus;
 use bevy::input_focus::tab_navigation::{TabGroup, TabIndex};
 use bevy::picking::Pickable;
@@ -35,7 +37,7 @@ use ctk::theme::{Mode, Scheme, ThemeSpec, ThemeState, tokens};
 use crate::core::{Carousel, CarouselError, Edge, Orientation, PanelInput, PanelMode};
 use crate::runtime::{
     CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellFrame,
-    ShellFrameState, ShellRuntimeSet,
+    ShellFrameState, ShellRuntimeSet, ShellStagedIngress,
 };
 
 /// The four host-owned attachment points. Chrome assumes nothing about their
@@ -498,6 +500,9 @@ impl Plugin for QuoinChromePlugin {
             .init_resource::<QuoinHotspotSize>()
             .init_resource::<QuoinReducedMotion>()
             .add_message::<QuoinSchemeSelected>()
+            // Escape reads key messages; a host's InputPlugin registers the
+            // same (idempotent) message type.
+            .add_message::<KeyboardInput>()
             // Chrome requests redraws even in hosts without WindowPlugin.
             .add_message::<RequestRedraw>()
             .add_observer(on_activate)
@@ -505,7 +510,8 @@ impl Plugin for QuoinChromePlugin {
                 Update,
                 (panel_hover, escape_panels)
                     .chain()
-                    .in_set(ShellRuntimeSet::Input),
+                    .in_set(ShellRuntimeSet::Input)
+                    .after(ShellStagedIngress),
             )
             .add_systems(
                 Update,
@@ -1319,15 +1325,20 @@ fn panel_hover(
 }
 
 fn escape_panels(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut keys: MessageReader<KeyboardInput>,
     frame: Res<ShellFrameState>,
     time: Res<Time<Real>>,
     mut commands: MessageWriter<ShellCommand>,
 ) {
     // Keys reach chrome only while a shell surface holds the keyboard, so
     // Escape here is never an application's. The model picks the focused
-    // panel, hides it only if transient and gives focus back (§4.3).
-    if !keys.just_pressed(KeyCode::Escape) {
+    // panel, hides it only if transient and gives focus back (§4.3). Only a
+    // fresh press counts: repeats and keys already held when focus arrived
+    // (which the host marks `repeat`) never do.
+    let pressed = keys.read().any(|key| {
+        key.key_code == KeyCode::Escape && key.state == ButtonState::Pressed && !key.repeat
+    });
+    if !pressed {
         return;
     }
     commands.write(ShellCommand {
@@ -2555,6 +2566,52 @@ mod tests {
         let panel = &mut world.resource_mut::<ShellFrameState>().0.panels[edge.index()];
         panel.active_page_id = Some(id.to_owned());
         panel.page_change = change;
+    }
+
+    /// A key the host marks `repeat` — a held repeat, or one already held
+    /// when focus arrived — is not an Escape; only a fresh press is.
+    #[test]
+    fn escape_acts_only_on_a_fresh_press() {
+        use crate::runtime::ShellRuntimePlugin;
+        use bevy::input::keyboard::Key;
+
+        let mut model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_message::<RequestRedraw>();
+        let escape = |app: &mut App, repeat| {
+            app.world_mut().write_message(KeyboardInput {
+                key_code: KeyCode::Escape,
+                logical_key: Key::Escape,
+                state: ButtonState::Pressed,
+                text: None,
+                repeat,
+                window: Entity::PLACEHOLDER,
+            });
+            app.update();
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .transient_revealed
+        };
+        assert!(escape(&mut app, true), "a held key hid the panel");
+        assert!(!escape(&mut app, false));
     }
 
     /// The chevron actions page sequentially and wrap in both directions,

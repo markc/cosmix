@@ -624,11 +624,20 @@ default:
 ```
 
 Chords are canonicalised at ingestion, so modifier order does not matter.
-Duplicates, unknown keys and the reserved `Super+Escape` are refused. The
-refusal is loud and the previous configuration is kept. Letters match the key
-labelled with that letter in the current layout. Digits, arrows, function keys
-and the other named keys match the physical key, so `Shift+1` is the 1 key
-even though it types `!`. Key repeat never re-fires a binding.
+Every chord needs Ctrl, Alt or Super. A bare or Shift-only key would take
+typing from the panel's own controls, and a bare Escape would turn the
+panel's Escape into a mode change. Duplicates, unknown keys, modifier-less
+chords and the reserved `Super+Escape` are refused. The refusal is loud and
+the previous configuration is kept.
+
+Letters and digits match the key labelled with them in the current layout,
+and named keys match by meaning, so a keypad arrow is `Left`. Any other key
+falls back to its physical position, so `Ctrl+Shift+1` is the 1 key even
+though it types `!`. Modifiers count as they were at the moment of the press.
+A binding fires only on a fresh press. Key repeat does not fire it, and
+neither does a key that was already held when a panel received focus. Such
+keys have to be released and pressed again, so a cycle stop can never be
+triggered by the chord that moved focus there.
 
 - **pin / dock / hide** each send the precise mode command
   (`SetMode(pinned|docked|hidden)`), the same one the corner menu and
@@ -638,15 +647,21 @@ even though it types `!`. Key repeat never re-fires a binding.
   panel, focus goes back to the application. Transient reveals are not stops.
   A Wayland client cannot focus its own layer surface, so the cycle requests
   `Exclusive` interactivity on the target panel. The panel keeps the keyboard
-  until Escape or the next cycle stop, or until it unmaps.
+  until Escape or the next cycle stop, or until it unmaps. Comp grants the
+  request only for a panel it is actually showing. If the keyboard has not
+  arrived within 500 ms, the request is withdrawn, so a panel shown later
+  never takes the keyboard on its own.
 - **Escape** from a focused panel hides it only if it is a transient reveal.
-  If the pointer is still in the panel or its hotspot, the reveal latches: no
-  hover can re-reveal it until the pointer has left both. Escape on a pinned
-  or docked panel changes neither mode nor reservation. In every case focus
-  goes back: all panels refuse the keyboard, comp's policy focuses the top
-  toplevel, and ordinary `OnDemand` resumes once Quoin sees that no panel has
-  the keyboard. Exact restoration of the previous surface belongs to the
-  compositor focus holder.
+  Only the focused panel receives it. If the pointer is still in the panel or
+  its hotspot, the reveal latches: no hover can re-reveal it until the slide
+  out has finished and the pointer is out of the hotspot. Pointer leaves and
+  re-entries during the slide do not end the latch, because the slide itself
+  moves the pointer off the surface. Escape on a pinned or docked panel
+  changes neither mode nor reservation. In every case focus goes back: all
+  panels refuse the keyboard, comp's policy focuses the top toplevel, and
+  ordinary `OnDemand` resumes once Quoin sees that no panel has the keyboard.
+  Exact restoration of the previous surface belongs to the compositor focus
+  holder.
 
 **Scope.** Quoin has no global key grab. A binding works only while one of
 Quoin's own panels holds the keyboard, after a click into it or a cycle stop.

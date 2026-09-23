@@ -20,7 +20,7 @@ use bevy::time::Real;
 use cosmix_shell::core::{Edge, PanelMode, keyboard_target_output};
 use cosmix_shell::runtime::{
     KeyboardCommand, ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimeSet,
-    ShellSemanticVerb, semantic_shell_command,
+    ShellSemanticVerb, ShellStagedIngress, semantic_shell_command,
 };
 
 use crate::config::{ConfigIngest, ShellConfig};
@@ -41,31 +41,89 @@ pub(crate) struct Modifiers {
     pub super_key: bool,
 }
 
-impl Modifiers {
-    fn held(keys: &ButtonInput<KeyCode>) -> Self {
-        Self {
-            ctrl: keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]),
-            alt: keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]),
-            shift: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
-            super_key: keys.any_pressed([KeyCode::SuperLeft, KeyCode::SuperRight]),
+/// Modifier keys held, as the key stream itself reports them in event order —
+/// so a chord is judged by the modifiers down at that press, not by the state
+/// at the end of the frame. Either side counts (Right Alt included; a layout
+/// that makes it AltGr reports a different keysym but the same physical key).
+#[derive(Default)]
+struct HeldModifiers(Vec<KeyCode>);
+
+impl HeldModifiers {
+    const KEYS: [KeyCode; 8] = [
+        KeyCode::ControlLeft,
+        KeyCode::ControlRight,
+        KeyCode::AltLeft,
+        KeyCode::AltRight,
+        KeyCode::ShiftLeft,
+        KeyCode::ShiftRight,
+        KeyCode::SuperLeft,
+        KeyCode::SuperRight,
+    ];
+
+    /// Track one event; true when it was a modifier key.
+    fn observe(&mut self, input: &KeyboardInput) -> bool {
+        if !Self::KEYS.contains(&input.key_code) {
+            return false;
+        }
+        self.0.retain(|&key| key != input.key_code);
+        if input.state == ButtonState::Pressed {
+            self.0.push(input.key_code);
+        }
+        true
+    }
+
+    fn modifiers(&self) -> Modifiers {
+        let any = |pair: [KeyCode; 2]| self.0.iter().any(|key| pair.contains(key));
+        Modifiers {
+            ctrl: any([KeyCode::ControlLeft, KeyCode::ControlRight]),
+            alt: any([KeyCode::AltLeft, KeyCode::AltRight]),
+            shift: any([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
+            super_key: any([KeyCode::SuperLeft, KeyCode::SuperRight]),
         }
     }
 }
 
-/// A binding's key name in the config grammar. Letters follow the layout
-/// (the logical key, as comp's own bindings do), so `Super+Shift+D` is the
-/// key labelled D; everything else is the physical key, so a shifted digit
-/// still reads as its digit. `KeyCode`'s derived names are the W3C UI Events
-/// `code` values (`KeyA`, `Digit1`, `F12`, `ArrowLeft`), parsed here rather
-/// than restating every variant; a test pins the mapping.
+/// Named keys by their logical value, so a keypad arrow or keypad Enter
+/// (NumLock off) matches `Left` or `Return` like the main-block key.
+fn logical_name(logical: &Key) -> Option<&'static str> {
+    Some(match logical {
+        Key::ArrowLeft => "Left",
+        Key::ArrowRight => "Right",
+        Key::ArrowUp => "Up",
+        Key::ArrowDown => "Down",
+        Key::Tab => "Tab",
+        Key::Enter => "Return",
+        Key::Space => "space",
+        Key::Escape => "Escape",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "Page_Up",
+        Key::PageDown => "Page_Down",
+        Key::Insert => "Insert",
+        Key::Delete => "Delete",
+        Key::Backspace => "BackSpace",
+        _ => return None,
+    })
+}
+
+/// A binding's key name in the config grammar. Letters and digits follow the
+/// layout (the logical key, as comp's own bindings do), so `Super+Shift+D` is
+/// the key labelled D; named keys use their logical value. Otherwise the
+/// physical key decides, so a shifted digit (`!`) still reads as its digit
+/// and a non-Latin letter as its key position. `KeyCode`'s derived names are
+/// the W3C UI Events `code` values (`KeyA`, `Digit1`, `F12`, `ArrowLeft`),
+/// parsed here rather than restating every variant; a test pins the mapping.
 fn key_name(key_code: KeyCode, logical: &Key) -> Option<String> {
     if let Key::Character(text) = logical {
         let mut chars = text.chars();
-        if let (Some(letter), None) = (chars.next(), chars.next())
-            && letter.is_ascii_alphabetic()
+        if let (Some(key), None) = (chars.next(), chars.next())
+            && key.is_ascii_alphanumeric()
         {
-            return Some(letter.to_ascii_uppercase().to_string());
+            return Some(key.to_ascii_uppercase().to_string());
         }
+    }
+    if let Some(name) = logical_name(logical) {
+        return Some(name.to_owned());
     }
     let code = format!("{key_code:?}");
     if let Some(rest) = code.strip_prefix("Key").or_else(|| code.strip_prefix("Digit"))
@@ -143,30 +201,37 @@ pub(crate) fn install(app: &mut App) {
         Update,
         dispatch_bindings
             .in_set(ShellRuntimeSet::Input)
-            .after(ConfigIngest),
+            .after(ConfigIngest)
+            // A focus report staged in the same update applies first.
+            .after(ShellStagedIngress),
     );
 }
 
 fn dispatch_bindings(
     mut keys: MessageReader<KeyboardInput>,
-    held: Res<ButtonInput<KeyCode>>,
+    mut held: Local<HeldModifiers>,
     config: Option<Res<ShellConfig>>,
     frame: Res<ShellFrameState>,
     time: Res<Time<Real>>,
     mut commands: MessageWriter<ShellCommand>,
 ) {
-    // Smoke hosts install no config: nothing is bound.
-    let Some(config) = config else {
-        keys.clear();
-        return;
-    };
     for input in keys.read() {
-        // Holding a binding must not re-fire it at the repeat rate.
+        // Modifiers count from every event, repeats and enter-held ones too.
+        if held.observe(input) {
+            continue;
+        }
+        // Smoke hosts install no config: nothing is bound. A held repeat, or
+        // a key already down when focus arrived (the host marks those
+        // `repeat`), never fires: a binding that moves focus would otherwise
+        // see its own chord again on the new surface.
+        let Some(config) = config.as_deref() else {
+            continue;
+        };
         if input.state != ButtonState::Pressed || input.repeat {
             continue;
         }
-        let Some(action) = chord(input.key_code, &input.logical_key, Modifiers::held(&held))
-            .and_then(|chord| binding_action(&config, &chord))
+        let Some(action) = chord(input.key_code, &input.logical_key, held.modifiers())
+            .and_then(|chord| binding_action(config, &chord))
         else {
             continue;
         };
@@ -227,13 +292,25 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
             .add_message::<KeyboardInput>()
-            .init_resource::<ButtonInput<KeyCode>>()
             .insert_resource(config);
         install(&mut app);
         app
     }
 
-    /// Press one key with `modifiers` held; returns the commands it produced.
+    fn key(key_code: KeyCode, logical_key: Key, state: ButtonState, repeat: bool) -> KeyboardInput {
+        KeyboardInput {
+            key_code,
+            logical_key,
+            state,
+            text: None,
+            repeat,
+            window: Entity::PLACEHOLDER,
+        }
+    }
+
+    /// Press and release one key inside `modifiers`, all in one update, with
+    /// every event marked `repeat` when asked (a held repeat, or keys already
+    /// down when focus arrived). Returns the commands produced.
     fn press(
         app: &mut App,
         key_code: KeyCode,
@@ -241,28 +318,24 @@ mod tests {
         modifiers: Modifiers,
         repeat: bool,
     ) -> Vec<ShellCommand> {
-        {
-            let mut held = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-            held.release_all();
-            for (on, key) in [
-                (modifiers.ctrl, KeyCode::ControlLeft),
-                (modifiers.alt, KeyCode::AltRight),
-                (modifiers.shift, KeyCode::ShiftLeft),
-                (modifiers.super_key, KeyCode::SuperLeft),
-            ] {
-                if on {
-                    held.press(key);
-                }
-            }
+        let held: Vec<(KeyCode, Key)> = [
+            (modifiers.ctrl, KeyCode::ControlLeft, Key::Control),
+            (modifiers.alt, KeyCode::AltRight, Key::Alt),
+            (modifiers.shift, KeyCode::ShiftLeft, Key::Shift),
+            (modifiers.super_key, KeyCode::SuperLeft, Key::Super),
+        ]
+        .into_iter()
+        .filter_map(|(on, code, logical)| on.then_some((code, logical)))
+        .collect();
+        let world = app.world_mut();
+        for (code, logical) in &held {
+            world.write_message(key(*code, logical.clone(), ButtonState::Pressed, repeat));
         }
-        app.world_mut().write_message(KeyboardInput {
-            key_code,
-            logical_key,
-            state: ButtonState::Pressed,
-            text: None,
-            repeat,
-            window: Entity::PLACEHOLDER,
-        });
+        world.write_message(key(key_code, logical_key.clone(), ButtonState::Pressed, repeat));
+        world.write_message(key(key_code, logical_key, ButtonState::Released, false));
+        for (code, logical) in held {
+            world.write_message(key(code, logical, ButtonState::Released, false));
+        }
         app.update();
         app.world_mut()
             .resource_mut::<bevy::ecs::message::Messages<ShellCommand>>()
@@ -341,6 +414,48 @@ mod tests {
         );
         assert_eq!(mode(&app, Edge::Left), PanelMode::Hidden);
 
+        // The whole chord already held when focus arrived (the host marks it
+        // `repeat`) does not fire: a focus move the cycle itself caused would
+        // otherwise re-deliver Super+Tab and walk every stop in one press.
+        assert!(press(&mut app, KeyCode::Tab, Key::Tab, SUPER, true).is_empty());
+        // A modifier still held from before focus arrived counts; the key
+        // pressed afresh inside it fires.
+        {
+            let world = app.world_mut();
+            world.write_message(key(KeyCode::SuperRight, Key::Super, ButtonState::Pressed, true));
+            world.write_message(key(KeyCode::Tab, Key::Tab, ButtonState::Pressed, false));
+            world.write_message(key(KeyCode::Tab, Key::Tab, ButtonState::Released, false));
+            world.write_message(key(KeyCode::SuperRight, Key::Super, ButtonState::Released, false));
+        }
+        app.update();
+        let fired: Vec<ShellCommand> = app
+            .world_mut()
+            .resource_mut::<bevy::ecs::message::Messages<ShellCommand>>()
+            .drain()
+            .collect();
+        assert_eq!(
+            fired.iter().map(|c| &c.kind).collect::<Vec<_>>(),
+            [&ShellCommandKind::Keyboard(KeyboardCommand::CycleFocus)]
+        );
+        // Modifier state follows event order, not the end of the frame: a
+        // Super released before Tab is pressed does not make Super+Tab.
+        {
+            let world = app.world_mut();
+            world.write_message(key(KeyCode::SuperLeft, Key::Super, ButtonState::Pressed, false));
+            world.write_message(key(KeyCode::SuperLeft, Key::Super, ButtonState::Released, false));
+            world.write_message(key(KeyCode::Tab, Key::Tab, ButtonState::Pressed, false));
+        }
+        app.update();
+        assert!(
+            app.world_mut()
+                .resource_mut::<bevy::ecs::message::Messages<ShellCommand>>()
+                .drain()
+                .next()
+                .is_none()
+        );
+        app.world_mut()
+            .write_message(key(KeyCode::Tab, Key::Tab, ButtonState::Released, false));
+
         let cycle = press(&mut app, KeyCode::Tab, Key::Tab, SUPER, false);
         assert_eq!(
             cycle.iter().map(|c| &c.kind).collect::<Vec<_>>(),
@@ -350,7 +465,8 @@ mod tests {
 
     #[test]
     fn chords_match_the_config_canonical_form() {
-        let shift = Modifiers {
+        let ctrl_shift = Modifiers {
+            ctrl: true,
             shift: true,
             ..Modifiers::default()
         };
@@ -361,7 +477,16 @@ mod tests {
             super_key: true,
         };
         let cases = [
-            (KeyCode::Digit1, Key::Character("!".into()), shift, "Shift+1"),
+            (
+                KeyCode::Digit1,
+                Key::Character("!".into()),
+                ctrl_shift,
+                "Ctrl+Shift+1",
+            ),
+            // Keypad keys with NumLock off match by their logical value.
+            (KeyCode::Numpad4, Key::ArrowLeft, SUPER, "Super+Left"),
+            (KeyCode::NumpadEnter, Key::Enter, SUPER, "Super+Return"),
+            (KeyCode::Numpad7, Key::Character("7".into()), SUPER, "Super+7"),
             (KeyCode::KeyA, Key::Character("a".into()), SUPER, "Super+A"),
             // A non-Latin letter falls back to the physical key.
             (KeyCode::KeyQ, Key::Character("й".into()), SUPER, "Super+Q"),

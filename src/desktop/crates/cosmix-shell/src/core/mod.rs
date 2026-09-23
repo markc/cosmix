@@ -22,7 +22,7 @@ pub use panel::{
     PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake,
     RESIZE_THICKNESS_RANGE, RevealTrigger,
 };
-pub use shell::{ShellError, ShellModel};
+pub use shell::{FOCUS_GRANT_TIMEOUT, ShellError, ShellModel};
 pub use subpanel::{SubPanelRegistry, SubPanelRegistryError, SubPanelSeat};
 pub use types::{
     Corner, Edge, GeometryError, LogicalPoint, LogicalSize, LogicalVector, Orientation, OutputKey,

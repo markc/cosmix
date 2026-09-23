@@ -9,8 +9,8 @@
 //! exists to forgive pointer overshoot and never applies to a deliberate action.
 //! An interim local menu input suppresses concealment until the popup closes.
 //! Escape on a transient reveal hides it and, while the pointer is still in
-//! the panel or hotspot, latches: hover re-entry cannot re-reveal until both
-//! memberships have been left (shell doc §4.3).
+//! the panel or hotspot, latches: hover re-entry cannot re-reveal until the
+//! conceal has finished and the pointer is out of the hotspot (§4.3).
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -176,10 +176,11 @@ pub struct PanelSnapshot {
     pub conceal_reason: Option<ConcealReason>,
     /// ESCAPE-LATCH SEAM. True after Escape concealed a transient reveal
     /// while the pointer was still in the panel or hotspot; hover re-entry
-    /// cannot re-reveal until both memberships have been left. Today the latch
-    /// is enforced only on this model's local path. Chunk 14 wires this to the
-    /// comp command stream, so comp's dwell also stays suppressed while the
-    /// pointer remains inside after Escape.
+    /// cannot re-reveal until the conceal has finished and the pointer is
+    /// out of the hotspot. Today the latch is enforced only on this model's
+    /// local path. Chunk 14 wires this to the comp command stream, so comp's
+    /// dwell also stays suppressed while the pointer remains inside after
+    /// Escape.
     pub hover_latched: bool,
 }
 
@@ -248,20 +249,18 @@ impl PanelStateMachine {
             self.clear_deadline();
         }
         let mut effect = self.advance_to(at)?;
-        // The Escape latch suppresses hover only; an explicit reveal or mode
-        // action is deliberate and clears it.
+        // The Escape latch suppresses hover only; an explicit action that
+        // shows the panel is deliberate and clears it. Inputs that leave a
+        // hidden panel hidden (SetMode(Hidden), Unpin, Undock, Release) do not.
         if matches!(
             input,
             PanelInput::Reveal
                 | PanelInput::Toggle
                 | PanelInput::Pin
-                | PanelInput::Unpin
                 | PanelInput::PinToggle
                 | PanelInput::Dock
-                | PanelInput::Undock
                 | PanelInput::DockToggle
-                | PanelInput::SetMode(_)
-                | PanelInput::Release
+                | PanelInput::SetMode(PanelMode::Pinned | PanelMode::Docked)
         ) {
             self.hover_latched = false;
         }
@@ -546,6 +545,9 @@ impl PanelStateMachine {
         } else {
             self.motion.advance(at.saturating_sub(self.last_update));
         }
+        if self.hover_latched {
+            self.release_latch_once_left();
+        }
         self.last_update = at;
         Ok(effect)
     }
@@ -589,10 +591,14 @@ impl PanelStateMachine {
         }
     }
 
-    /// The latch ends only once the pointer is outside both the panel and its
-    /// hotspot; a re-reveal then needs a fresh dwell.
+    /// The latch ends once the conceal has finished and the pointer is out of
+    /// the hotspot; a re-reveal then needs a fresh dwell. It deliberately
+    /// survives pointer leaves during the slide: the conceal itself retargets
+    /// the pointer (a leave the user never made), and a wiggle back over the
+    /// still-mapped surface must not re-reveal it. Once the surface is gone,
+    /// panel membership no longer matters — only the hotspot can reveal.
     fn release_latch_once_left(&mut self) {
-        if !self.pointer_inside && !self.corner_inside {
+        if !self.corner_inside && self.motion.visible_fraction() == 0.0 {
             self.hover_latched = false;
         }
     }
@@ -952,7 +958,8 @@ mod intro_tests {
     #[test]
     fn escape_hides_transient_and_latches_until_pointer_leaves() {
         let ms = Duration::from_millis;
-        // Dwell reveals, the pointer moves from the hotspot into the panel.
+        // Dwell reveals, the pointer moves from the hotspot into the panel,
+        // and the reveal slides fully in (200 ms travel).
         let mut panel = panel();
         for input in [
             PanelInput::CornerEntered,
@@ -961,27 +968,35 @@ mod intro_tests {
         ] {
             panel.apply(Duration::ZERO, input).unwrap();
         }
-        let hidden = panel.apply(ms(10), PanelInput::Escape).unwrap().snapshot;
+        panel.tick(ms(300)).unwrap();
+        let hidden = panel.apply(ms(300), PanelInput::Escape).unwrap().snapshot;
         assert_eq!(hidden.mode, PanelMode::Hidden);
         assert!(!hidden.transient_revealed);
         assert_eq!(hidden.target_fraction, 0.0);
         assert!(hidden.hover_latched);
-        // Still mid-slide: motion in the panel or back through the hotspot
-        // must not pop it straight back.
+        // Mid-slide: motion in the panel or back through the hotspot must not
+        // pop it straight back. The leave the conceal itself causes (the
+        // pointer retargeted off the sliding surface) is not the user leaving,
+        // and a wiggle back over the still-mapped surface stays latched.
         for input in [
             PanelInput::PointerEntered,
             PanelInput::CornerEntered,
             PanelInput::CornerLeft,
+            PanelInput::PointerLeft,
+            PanelInput::PointerEntered,
         ] {
-            let snapshot = panel.apply(ms(20), input).unwrap().snapshot;
+            let snapshot = panel.apply(ms(350), input).unwrap().snapshot;
+            assert!(snapshot.visible_fraction > 0.0, "slide still running");
             assert!(!snapshot.transient_revealed, "{input:?} re-revealed");
             assert!(snapshot.hover_latched, "{input:?} released the latch");
         }
-        let left = panel.apply(ms(30), PanelInput::PointerLeft).unwrap().snapshot;
-        assert!(!left.hover_latched);
-        assert!(!left.transient_revealed);
-        // Leaving re-arms hover: a fresh dwell reveals again.
-        let again = panel.apply(ms(40), PanelInput::CornerEntered).unwrap();
+        // The slide finishes with the pointer out of the hotspot: released.
+        let settled = panel.tick(ms(600)).unwrap().snapshot;
+        assert_eq!(settled.visible_fraction, 0.0);
+        assert!(!settled.hover_latched);
+        assert!(!settled.transient_revealed);
+        // Only a fresh dwell reveals again.
+        let again = panel.apply(ms(610), PanelInput::CornerEntered).unwrap();
         assert!(again.snapshot.transient_revealed);
         assert_eq!(
             again.effect,
@@ -990,11 +1005,30 @@ mod intro_tests {
             })
         );
 
-        // Hotspot-only: the latch holds until the hotspot is left.
+        // Hotspot-only: the latch outlasts the slide while the pointer stays
+        // in the hotspot, and ends when it leaves.
         let mut panel = self::panel();
         panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
-        assert!(panel.apply(ms(10), PanelInput::Escape).unwrap().snapshot.hover_latched);
-        assert!(!panel.apply(ms(20), PanelInput::CornerLeft).unwrap().snapshot.hover_latched);
+        panel.tick(ms(300)).unwrap();
+        assert!(panel.apply(ms(300), PanelInput::Escape).unwrap().snapshot.hover_latched);
+        assert!(panel.tick(ms(600)).unwrap().snapshot.hover_latched);
+        assert!(!panel.apply(ms(610), PanelInput::CornerLeft).unwrap().snapshot.hover_latched);
+
+        // A mode input that leaves the hidden panel hidden is not a reveal
+        // and keeps the latch.
+        let mut panel = self::panel();
+        panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
+        panel.tick(ms(300)).unwrap();
+        panel.apply(ms(300), PanelInput::Escape).unwrap();
+        for input in [
+            PanelInput::SetMode(PanelMode::Hidden),
+            PanelInput::Unpin,
+            PanelInput::Undock,
+            PanelInput::Release,
+            PanelInput::Hide,
+        ] {
+            assert!(panel.apply(ms(310), input).unwrap().snapshot.hover_latched, "{input:?}");
+        }
 
         // Escape with the pointer already outside hides without latching.
         let mut panel = self::panel();
