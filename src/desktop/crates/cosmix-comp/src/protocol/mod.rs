@@ -307,7 +307,7 @@ const CAPTURE_SHM_BYTES_PER_TURN: usize = 256 * 1024;
 /// reservation remains charged until Bevy reports completion.
 pub(crate) const CAPTURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SurfaceId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -8611,6 +8611,9 @@ impl WaylandState {
 
     fn handle_client_disconnect(&mut self, client_id: &ClientId) {
         self.destroy_client_acquire_gates(client_id);
+        // A Quoin that crashed or exited takes its panel holds with it.
+        #[cfg(feature = "bus")]
+        port_observation::panel_owner_disconnected(self, client_id);
         let frames = self
             .capture_frames
             .iter()
@@ -10573,6 +10576,11 @@ impl WaylandState {
         let mut observed = Vec::new();
         // Read once: the loop holds `surfaces` mutably.
         let current_workspace = self.workspace_current();
+        // Panel layers comp hides for a stalled shell (holder-plane
+        // enforcement): exactly the surface ids it recorded, and through this
+        // one funnel, so rendering, hit-testing and focus all agree.
+        #[cfg(feature = "bus")]
+        let enforced_layers = self.observations.enforced_surfaces.clone();
         while let Some((id, ancestor_visible)) = stack.pop() {
             let Some(object) = self.surface_objects.get(&id).cloned() else {
                 continue;
@@ -10595,12 +10603,17 @@ impl WaylandState {
             };
             // The own-buffer term: hidden = minimised OR off the current
             // workspace (managed toplevels only; bands, layers, popups and
-            // locks are on every workspace). Both hide through this one
-            // funnel, so `visible:false, minimized:false` needs no reader
-            // change.
+            // locks are on every workspace) OR an enforced panel layer. All
+            // hide through this one funnel, so `visible:false,
+            // minimized:false` needs no reader change.
+            #[cfg(feature = "bus")]
+            let enforced = enforced_layers.contains(&record.id);
+            #[cfg(not(feature = "bus"))]
+            let enforced = false;
             let visible = effectively_visible(
                 record.mapped
                     && !record.minimized
+                    && !enforced
                     && workspaces::on_workspace(record, current_workspace),
                 ancestor_visible,
                 association_visible,

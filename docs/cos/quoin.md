@@ -474,9 +474,9 @@ The standalone host reads the selected comp's read-only
 `input.corners.holders` capability (`comp.props.get`) before sending
 `comp.panel.mode` or `comp.panel.hold`; like every comp verb these are literal
 commands addressed to the `--comp-service` instance. Missing, false or failed
-reads leave the plane inactive, and comp currently reports `false` until it
-also enforces concealment on a stalled Quoin, so today the plane stays
-inactive and the model keeps its local rules.
+reads leave the plane inactive and the model keeps its local rules. A comp
+that reports `true` also enforces concealment on a stalled Quoin (below), so
+the plane goes live with that comp build.
 Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
 client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present
@@ -541,6 +541,23 @@ requests in the same cycle, so a release never waits for an unrelated event.
 Nothing polls. Pinned and
 docked panels have no holders. The embedded host has no Wayland panel layers
 and does not install this standalone transport adapter.
+
+A slow or crashed Quoin cannot keep a panel shown, take input, or leave holds
+behind (shell design §7, implemented). Comp identifies Quoin by the Wayland
+client of its layers, never by a namespace token, and refuses another live
+client's layer under a copied token (`panel_owner_mismatch`). When a conceal
+ends a reveal comp commanded and Quoin has not applied it within 1 s — it is
+stopped or wedged — comp hides that edge's panel and popup layers itself and
+excludes them from input; nothing of any other client is touched. A first or
+re-stated conceal is never enforced, because Quoin's own local holds (the
+startup intro, an explicit show) keep a panel comp did not reveal on screen.
+When Quoin's Wayland connection dies, comp drops every hold it acquired and
+conceals by the normal rules; a restarted Quoin is a new client with fresh
+tokens and inherits nothing. Any mode report — the replay after a restart, a
+Bus reconnect or a gap, or the next report of a Quoin resuming from a stall —
+lifts comp's enforcement for that edge, and the resumed Quoin applies the
+verdict the report draws. Comp's read-only `input.corners.enforced.<edge>` and
+`input.corners.held.<edge>` counts show the state.
 
 ### Corner input
 

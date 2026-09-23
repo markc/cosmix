@@ -513,7 +513,9 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery}
+input.corners.{holders,enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery,
+               enforced.{top,bottom,left,right},
+               held.{top,bottom,left,right}}     (enforced, held: volatile)
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -1143,8 +1145,10 @@ has already gone, and a release for an edge comp holds no state for is a no-op.
 Refusals are `unknown_output`, `unknown_panel_surface` (acquire with no layer),
 `panel_output_mismatch` (the token's one layer is on another output),
 `ambiguous_panel_surface` (the token names more than one layer, whatever their
-order) and `locked` (session lock). Explicit requests are idempotent; persistent
-modes clear holders and ignore acquisitions.
+order), `panel_owner_mismatch` (the token's layer belongs to a different live
+Wayland client than the one that owns the edge) and `locked` (session lock).
+Explicit requests are idempotent; persistent modes clear holders and ignore
+acquisitions.
 
 The namespace token is created by Quoin for each layer lifetime. It resolves
 to comp's own surface identity without relying on client-local Wayland object
@@ -1182,11 +1186,50 @@ has just started following the commands learns it. Commands go out on
 its gap reporting; the version-1 body contains `output`, `edge`, `surface` (the
 panel's token when comp has one), `action` and `event_seq`.
 
-The read-only `input.corners.holders` leaf is the switch clients gate on, and it
-currently reads `false`: the verbs, holder tracking and the conceal timer are
-live, but comp does not yet enforce a conceal on a client that has stalled.
-The leaf turns `true` only in the build that does, because Quoin hands
-reveal/conceal over to comp when it does.
+Each edge belongs to one Quoin incarnation, identified by the Wayland client
+of the first layer comp resolves for it — an identity comp attests itself,
+unlike the token. A layer from a different client that is still connected is
+refused as `panel_owner_mismatch` and never binds, even when it is the only
+layer the (copied) token names; an edge whose owner has gone is taken over by
+the next client with nothing of the old incarnation carried across. When the
+owning client disconnects (Quoin crashed or exited), comp drops every explicit
+hold it acquired — pointer, focus and popup — and the edge conceals by the
+normal rules: the automatic pointer and focus holders are comp's own and
+still apply.
+
+Comp enforces its conceals (shell design §7: a slow or crashed shell must not
+keep a panel shown or taking input). When a conceal ends a reveal comp itself
+commanded and Quoin has not applied it 1 s later (its slide takes 200 ms),
+comp hides the owner's layers it recorded for that edge — the panel layer and
+any popup layer acquired for it — that are still mapped, and excludes them
+from input. It does so through the same effective-visibility funnel as
+minimising, so the layers stop rendering, stop being hit-tested, lose keyboard
+and pointer focus and can no longer hold an exclusive keyboard grab; their
+subsurfaces and popups go with them. Exclusion acts only on those surface ids,
+never on a namespace or prefix match, so no other client's surface — a
+foreign layer or toplevel on the same output — is touched. A first or
+re-stated conceal (a hidden mode report) arms nothing: a panel comp never
+revealed is shown by one of Quoin's own local holds, such as its startup
+intro or an explicit show. Enforcement ends when comp reveals the edge again,
+when the client unmaps or destroys the layer itself, on any mode report for
+the edge (a live Quoin resynchronising after a stall, a Bus reconnect or a
+restart applies the verdict the report draws on its own), on a persistent
+mode, and with the owner's disconnect. Its grace shares the single one-shot
+timer with the conceal delay.
+
+The read-only `input.corners.holders` leaf is the switch clients gate on. It
+reads `true`: the verbs, holder tracking, the conceal timer, enforcement on a
+stalled client, disconnect cleanup and resynchronisation are all live, and
+Quoin hands reveal/conceal over to comp when it reads it. Two families of
+read-only, volatile leaves (served by `comp.props.get`/`list`/`describe`,
+never in `props.changed`) report the plane per edge, summed over outputs:
+`input.corners.enforced.{top,bottom,left,right}` counts the layers comp is
+hiding and excluding right now, and `input.corners.held.{top,bottom,left,right}`
+the explicit holds it records. A stalled-shell check reads them: with the
+shell stopped (`SIGSTOP`) after a pointer reveal, the pointer's departure
+conceals after 800 ms and `enforced.<edge>` reads 1 about a second later;
+after `SIGCONT` the shell's own conceal or its next mode report returns it to
+0, and `held.<edge>` returns to 0 once its menus have closed.
 
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry
