@@ -347,7 +347,10 @@ mod tests {
             .frame(now)
             .is_empty()
         );
-        assert!(view().frame(now).is_empty(), "nothing engaged, nothing drawn");
+        assert!(
+            view().frame(now).is_empty(),
+            "nothing engaged, nothing drawn"
+        );
     }
 
     #[test]
@@ -370,7 +373,10 @@ mod tests {
             usize::from(FLASH_STEPS) + 1,
             "one distinct frame per step plus the clear: {levels:?}"
         );
-        assert!(levels.windows(2).all(|pair| pair[0] > pair[1]), "{levels:?}");
+        assert!(
+            levels.windows(2).all(|pair| pair[0] > pair[1]),
+            "{levels:?}"
+        );
         assert_eq!(levels.last(), Some(&0));
         assert!(flashed.frame(at + Duration::from_secs(3600)).is_empty());
     }

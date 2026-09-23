@@ -571,7 +571,10 @@ mod tests {
     fn first_run_is_a_missing_state_file_and_is_consumed_once() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quoin.state.mix");
-        assert!(!StateStore::load(None).first_run(), "smoke runs are not first runs");
+        assert!(
+            !StateStore::load(None).first_run(),
+            "smoke runs are not first runs"
+        );
 
         let store = StateStore::load(Some(path.clone()));
         assert!(store.first_run());
@@ -579,12 +582,19 @@ mod tests {
         assert!(path.exists());
         assert_eq!(store.writes(), 1);
         store.consume_first_run();
-        assert_eq!(store.writes(), 1, "an existing file is never rewritten for it");
+        assert_eq!(
+            store.writes(),
+            1,
+            "an existing file is never rewritten for it"
+        );
         assert!(!StateStore::load(Some(path.clone())).first_run());
 
         std::fs::write(&path, "not mix state").unwrap();
         let unreadable = StateStore::load(Some(path.clone()));
-        assert!(!unreadable.first_run(), "an unreadable file is not a first run");
+        assert!(
+            !unreadable.first_run(),
+            "an unreadable file is not a first run"
+        );
         unreadable.consume_first_run();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not mix state");
     }

@@ -998,8 +998,10 @@ impl WaylandState {
             .iter()
             .position(|key| *key == press.output)
         {
-            self.observations.hotspot_flash =
-                Some((region * Corner::ALL.len() + press.corner.index(), Instant::now()));
+            self.observations.hotspot_flash = Some((
+                region * Corner::ALL.len() + press.corner.index(),
+                Instant::now(),
+            ));
             self.publish_hotspots();
         }
         let left = button == super::PRIMARY_POINTER_BUTTON;
@@ -1237,11 +1239,7 @@ impl WaylandState {
         self.publish_hotspots();
     }
 
-    fn emit_corner_event_records(
-        &mut self,
-        events: [Option<CornerEvent>; 2],
-        output_index: usize,
-    ) {
+    fn emit_corner_event_records(&mut self, events: [Option<CornerEvent>; 2], output_index: usize) {
         for event in events.into_iter().flatten() {
             if matches!(event, CornerEvent::Left { .. }) {
                 self.cancel_corner_presses();

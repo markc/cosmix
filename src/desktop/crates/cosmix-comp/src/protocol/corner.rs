@@ -481,7 +481,10 @@ mod tests {
         assert_eq!(config.deadzone_px, 10.0);
         assert!(config.valid());
         assert!(config.affordance, "hover reveal is on unless disabled");
-        assert!(!config.discovery, "the shell opts in to the first-run flash");
+        assert!(
+            !config.discovery,
+            "the shell opts in to the first-run flash"
+        );
         assert_eq!(corner_at((10.0, 10.0), SIZE, 10.0), Some(Corner::TopLeft));
         assert_eq!(corner_at((10.5, 1.0), SIZE, 10.0), None);
         assert_eq!(corner_at((11.0, 11.0), SIZE, 10.0), None);
@@ -511,7 +514,9 @@ mod tests {
         let needle = "pub const DEFAULT_COMP_HOTSPOT_PX: f32 = ";
         let start = chrome.find(needle).expect("Quoin mirror constant exists") + needle.len();
         let literal = chrome[start..].split(';').next().unwrap().trim();
-        let mirrored = literal.parse::<f64>().expect("mirror is a plain float literal");
+        let mirrored = literal
+            .parse::<f64>()
+            .expect("mirror is a plain float literal");
         assert_eq!(mirrored, CornerConfig::default().deadzone_px);
     }
 
