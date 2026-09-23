@@ -188,6 +188,35 @@ impl ShellModel {
         }
     }
 
+    /// Hand transient reveal/conceal to the compositor's holder plane, or take
+    /// it back (see [`PanelStateMachine::set_holder_plane`]). The grace given to
+    /// [`ShellModel::new`] only applies while the plane is inactive: the dev
+    /// host and a compositor that does not report the plane.
+    /// `at` is when the capability changed; a fall back to local rules gives
+    /// an unheld reveal its full grace from then. Like any input it advances
+    /// the model to `at` first, so later inputs cannot be timed before it.
+    pub fn set_holder_plane(
+        &mut self,
+        available: bool,
+        at: Duration,
+    ) -> Result<[PanelUpdate; 4], PanelTimeError> {
+        self.ensure_monotonic(at)?;
+        let [left, bottom, right, top] = &mut self.panels;
+        let updates = [
+            left.set_holder_plane(available, at)?,
+            bottom.set_holder_plane(available, at)?,
+            right.set_holder_plane(available, at)?,
+            top.set_holder_plane(available, at)?,
+        ];
+        self.last_update = at;
+        Ok(updates)
+    }
+
+    /// Whether the compositor's holder plane drives transient visibility.
+    pub fn holder_plane(&self) -> bool {
+        self.panels[0].holder_plane()
+    }
+
     /// Output migration preserves live panel state, including stored sizes and pages.
     pub fn carry_live_state(&mut self, outgoing: &Self) {
         self.panels = outgoing.panels.clone();

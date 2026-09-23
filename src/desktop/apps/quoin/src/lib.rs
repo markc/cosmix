@@ -272,12 +272,18 @@ fn log_transitions(
             PanelEffect::Reveal {
                 trigger: RevealTrigger::Corner,
             } => println!("QUOIN_REVEAL edge={edge} trigger=corner"),
+            PanelEffect::Reveal {
+                trigger: RevealTrigger::Holders,
+            } => println!("QUOIN_REVEAL edge={edge} trigger=holders"),
             PanelEffect::Conceal {
                 reason: ConcealReason::CornerLeft,
             } => println!("QUOIN_CONCEAL edge={edge} reason=corner-left"),
             PanelEffect::Conceal {
                 reason: ConcealReason::Grace,
             } => println!("QUOIN_CONCEAL edge={edge} reason=grace"),
+            PanelEffect::Conceal {
+                reason: ConcealReason::Holders,
+            } => println!("QUOIN_CONCEAL edge={edge} reason=holders"),
             PanelEffect::ModeChanged { mode } => {
                 println!("QUOIN_MODE edge={edge} mode={}", mode.as_str())
             }

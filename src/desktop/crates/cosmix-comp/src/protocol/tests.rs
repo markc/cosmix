@@ -12114,6 +12114,15 @@ fn create_test_layer_surface(
     output: u32,
     spec: TestLayerSpec,
 ) -> TestLayerSurface {
+    create_named_test_layer_surface(harness, output, spec, "cosmix-test-layer")
+}
+
+fn create_named_test_layer_surface(
+    harness: &mut KeybindingHarness,
+    output: u32,
+    spec: TestLayerSpec,
+    namespace: &str,
+) -> TestLayerSurface {
     let surface = harness.allocate_object_id();
     let layer_surface = harness.allocate_object_id();
     send_request(
@@ -12123,7 +12132,7 @@ fn create_test_layer_surface(
         &words(&[surface]),
     );
     let mut get_layer_surface = words(&[layer_surface, surface, output, spec.layer]);
-    get_layer_surface.extend_from_slice(&wire_string_argument("cosmix-test-layer"));
+    get_layer_surface.extend_from_slice(&wire_string_argument(namespace));
     send_request(
         &mut harness.client,
         TEST_LAYER_SHELL_ID,
@@ -12208,7 +12217,16 @@ fn map_test_layer_surface(
     output: u32,
     spec: TestLayerSpec,
 ) -> (TestLayerSurface, (u32, u32, u32)) {
-    let layer = create_test_layer_surface(harness, output, spec);
+    map_named_test_layer_surface(harness, output, spec, "cosmix-test-layer")
+}
+
+fn map_named_test_layer_surface(
+    harness: &mut KeybindingHarness,
+    output: u32,
+    spec: TestLayerSpec,
+    namespace: &str,
+) -> (TestLayerSurface, (u32, u32, u32)) {
+    let layer = create_named_test_layer_surface(harness, output, spec, namespace);
     let configured = initial_configure_test_layer(harness, layer);
     send_request(
         &mut harness.client,
@@ -35159,6 +35177,382 @@ fn panel_requests_refuse_unknown_output_and_session_lock() {
     );
     assert!(!drain_observations(&observations).iter().any(|record| matches!(record,
         port_observation::ObservationRecord::PanelCommand { .. })));
+}
+
+/// A holder-plane verb through the real Bus dispatch boundary, as a
+/// non-default comp instance receives it.
+#[cfg(feature = "bus")]
+fn nested_panel_call(
+    harness: &mut KeybindingHarness,
+    ingress: &crate::port::PortIngress,
+    verb: &str,
+    args: Value,
+) -> (u8, Value) {
+    crate::port::test_dispatch(ingress, "comp-nested", verb, args, || {
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    })
+}
+
+#[cfg(feature = "bus")]
+fn panel_commands(
+    observations: &port_observation::ObservationOutbox,
+) -> Vec<(String, bool)> {
+    drain_observations(observations)
+        .into_iter()
+        .filter_map(|record| match record {
+            port_observation::ObservationRecord::PanelCommand { surface, reveal, .. } => {
+                Some((surface, reveal))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn popup_holder_release_restores_previous_focus() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    // The panel holds keyboard focus from a click, as a launcher's search
+    // field would: a layer, which comp's own fallback never picks.
+    let (panel, _) = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32,
+            ..TestLayerSpec::default()
+        },
+        "quoin.panel.1",
+    );
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    let panel_surface = test_layer_record(&harness, panel.surface).role.wl_surface().clone();
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    assert_eq!(focus(&harness), Some(panel_surface.clone()));
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.1","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    // The corner menu is an exclusive layer: it takes focus as it maps,
+    // before its popup hold arrives.
+    let (menu, _) = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+        "quoin-corner-menu.1",
+    );
+    let _ = harness.sync();
+    let menu_surface = test_layer_record(&harness, menu.surface).role.wl_surface().clone();
+    assert_eq!(focus(&harness), Some(menu_surface));
+    let hold = |acquire: bool| json!({"output":output,"edge":"left","surface":"quoin-corner-menu.1",
+        "holder":"popup","acquire":acquire});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold(true)).0, 0);
+    let key = (output.clone(), "left".to_owned());
+    assert!(harness.server.state.observations.panel_holders[&key].held.contains_key("popup"));
+    drain_observations(&observations);
+    // The menu closes. Its destruction is the release (Quoin's request may
+    // be stalled or overtaken), and focus returns to the panel rather than
+    // to the top toplevel comp's fallback chose.
+    send_request(&mut harness.client, menu.layer_surface, 7, &[]);
+    send_request(&mut harness.client, menu.surface, 0, &[]);
+    let _ = harness.sync();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert!(harness.server.state.observations.panel_holders[&key].held.is_empty());
+    assert_eq!(focus(&harness), Some(panel_surface.clone()));
+    assert!(harness.server.state.observations.popup_restores.is_empty());
+    // Quoin's own release, arriving late, is a harmless no-op.
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold(false)).0, 0);
+    assert_eq!(focus(&harness), Some(panel_surface));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn panel_pointer_holder_reveals_and_departure_arms_one_shot_conceal() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let away = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let _ = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() },
+        "quoin.panel.2",
+    );
+    route_pointer_to(&mut harness, away.0, away.1);
+    let _ = harness.sync();
+    drain_observations(&observations);
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.2","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    assert_eq!(
+        panel_commands(&observations),
+        [("quoin.panel.2".to_owned(), false)],
+        "a hidden mode report states the verdict"
+    );
+    let cycle = |harness: &mut KeybindingHarness, at: (f64, f64)| {
+        route_pointer_to(harness, at.0, at.1);
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    };
+    // Into the visible panel, outside its hotspot: the pointer acquires.
+    cycle(&mut harness, (20.0, 12.0));
+    assert_eq!(panel_commands(&observations), [("quoin.panel.2".to_owned(), true)]);
+    let arms = harness.server.state.observations.conceal_timer_arms;
+    assert_eq!(harness.server.state.observations.conceal_deadline, None);
+    // Away: the pointer is the last holder, so exactly one timer is armed
+    // and nothing is concealed before it fires.
+    cycle(&mut harness, away);
+    let deadline = harness.server.state.observations.conceal_deadline.expect("armed");
+    assert!(deadline > Instant::now(), "the conceal waits out the delay");
+    assert_eq!(harness.server.state.observations.conceal_timer_arms, arms + 1);
+    assert!(panel_commands(&observations).is_empty());
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(
+        harness.server.state.observations.conceal_timer_arms,
+        arms + 1,
+        "an idle cycle does not re-arm the one-shot"
+    );
+    // Back within the delay: the conceal is cancelled, and nothing is sent.
+    cycle(&mut harness, (20.0, 12.0));
+    assert_eq!(harness.server.state.observations.conceal_deadline, None);
+    assert!(panel_commands(&observations).is_empty());
+}
+
+/// A holder released over the Bus after the pointer left makes the lingering
+/// pointer the last holder: the timer arms in that same cycle (the controls
+/// run after the epilogue's first tracking pass), and firing it conceals.
+#[cfg(feature = "bus")]
+#[test]
+fn release_after_departure_arms_the_conceal_and_the_timer_fires_it() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let away = (f64::from(width) * 0.75, f64::from(height) * 0.75);
+    let _ = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() },
+        "quoin.panel.3",
+    );
+    let _ = map_named_test_layer_surface(&mut harness, 0, TestLayerSpec::default(), "quoin-menu.3");
+    route_pointer_to(&mut harness, away.0, away.1);
+    let _ = harness.sync();
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.3","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    let hold = |acquire: bool| json!({"output":output,"edge":"left","surface":"quoin-menu.3",
+        "holder":"popup","acquire":acquire});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold(true)).0, 0);
+    let cycle = |harness: &mut KeybindingHarness, at: (f64, f64)| {
+        route_pointer_to(harness, at.0, at.1);
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    };
+    cycle(&mut harness, (20.0, 12.0));
+    cycle(&mut harness, away);
+    assert_eq!(
+        harness.server.state.observations.conceal_deadline,
+        None,
+        "the popup still holds: no timer"
+    );
+    drain_observations(&observations);
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold(false)).0, 0);
+    let released = Instant::now();
+    assert!(
+        harness.server.state.observations.conceal_deadline.is_some(),
+        "the release armed the conceal in its own cycle"
+    );
+    assert!(panel_commands(&observations).is_empty(), "the pointer still lingers");
+    // Block far past the deadline: the calloop timer must be what wakes the
+    // loop (its callback runs), and that cycle's epilogue conceals.
+    let fired = harness.server.state.observations.conceal_timer_fired;
+    let mut commands = Vec::new();
+    while harness.server.state.observations.conceal_timer_fired == fired
+        && released.elapsed() < Duration::from_secs(10)
+    {
+        harness.server.dispatch_cycle(Some(Duration::from_secs(5))).unwrap();
+        commands.extend(panel_commands(&observations));
+    }
+    assert_eq!(harness.server.state.observations.conceal_timer_fired, fired + 1, "the timer fired");
+    assert!(released.elapsed() < Duration::from_secs(5), "it woke the loop early");
+    assert_eq!(commands, [("quoin.panel.3".to_owned(), false)]);
+    assert!(released.elapsed() >= Duration::from_millis(700), "after the delay, not before");
+    assert_eq!(harness.server.state.observations.conceal_deadline, None);
+}
+
+/// Dwelling in the hotspot is the pointer holder's acquisition: the corner's
+/// output key and summoned edge must match the panel comp was told about.
+#[cfg(feature = "bus")]
+#[test]
+fn dwelling_in_the_hotspot_acquires_the_pointer_holder() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    // A concealed panel: the mode exists, its layer does not.
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.4","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    drain_observations(&observations);
+    harness
+        .server
+        .state
+        .handle_host_input(HostInput::PointerMotionAbsolute { x: 5.0, y: 5.0, time: 1 });
+    let mut records = Vec::new();
+    for _ in 0..10 {
+        harness
+            .server
+            .event_loop
+            .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+            .expect("corner deadline dispatches");
+        port_observation::service_observations(&mut harness.server.state);
+        records.extend(drain_observations(&observations));
+        if records.iter().any(|record| {
+            matches!(record, port_observation::ObservationRecord::PanelCommand { .. })
+        }) {
+            break;
+        }
+    }
+    assert!(records.iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::CornerEntered { .. })));
+    assert!(records.iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::PanelCommand { surface, edge, reveal: true, .. }
+            if surface == "quoin.panel.4" && edge == "left")));
+    let key = (output, "left".to_owned());
+    assert_eq!(
+        harness.server.state.observations.panel_holders[&key].pointer,
+        port_observation::PointerHold::Inside
+    );
+}
+
+/// A nested menu is not a deliberate departure from its parent: closing the
+/// child restores the parent, closing the parent restores the panel.
+#[cfg(feature = "bus")]
+#[test]
+fn nested_popups_restore_focus_in_chain() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let (panel, _) = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32,
+            ..TestLayerSpec::default()
+        },
+        "quoin.panel.6",
+    );
+    route_pointer_to(&mut harness, 20.0, 12.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    let panel_surface = test_layer_record(&harness, panel.surface).role.wl_surface().clone();
+    assert_eq!(focus(&harness), Some(panel_surface.clone()));
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.6","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    let hold = |surface: &str| json!({"output":output,"edge":"left","surface":surface,
+        "holder":"popup","acquire":true});
+    let open = |harness: &mut KeybindingHarness, spec: TestLayerSpec, token: &str| {
+        let (menu, _) = map_named_test_layer_surface(harness, 0, spec, token);
+        let _ = harness.sync();
+        let surface = test_layer_record(harness, menu.surface).role.wl_surface().clone();
+        assert_eq!(focus(harness), Some(surface.clone()), "{token} takes focus as it maps");
+        assert_eq!(nested_panel_call(harness, &ingress, "comp.panel.hold", hold(token)).0, 0);
+        (menu, surface)
+    };
+    let (parent, parent_surface) = open(
+        &mut harness,
+        TestLayerSpec { keyboard_interactivity: exclusive, ..TestLayerSpec::default() },
+        "quoin-menu.6a",
+    );
+    let (child, _) = open(
+        &mut harness,
+        TestLayerSpec {
+            layer: WlrLayer::Overlay as u32,
+            keyboard_interactivity: exclusive,
+            ..TestLayerSpec::default()
+        },
+        "quoin-menu.6b",
+    );
+    let close = |harness: &mut KeybindingHarness, menu: TestLayerSurface| {
+        send_request(&mut harness.client, menu.layer_surface, 7, &[]);
+        send_request(&mut harness.client, menu.surface, 0, &[]);
+        let _ = harness.sync();
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    };
+    close(&mut harness, child);
+    assert_eq!(focus(&harness), Some(parent_surface), "the child returns focus to its parent");
+    close(&mut harness, parent);
+    assert_eq!(focus(&harness), Some(panel_surface), "and the parent to the panel");
+    assert!(harness.server.state.observations.popup_restores.is_empty());
+}
+
+/// Focus the user moved off a live popup is theirs: the popup's later
+/// destruction must not pull it back to what the popup displaced.
+#[cfg(feature = "bus")]
+#[test]
+fn popup_restore_yields_to_focus_moved_deliberately() {
+    const TOP_LEFT: u32 = 1 | 4;
+    const BOTTOM_RIGHT: u32 = 2 | 8;
+    let on_demand = zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32;
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let click = |harness: &mut KeybindingHarness, x: f64, y: f64| {
+        route_pointer_to(harness, x, y);
+        route_pointer_button(harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+        route_pointer_button(harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+        let _ = harness.sync();
+    };
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
+    let (panel, _) = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec { anchor: TOP_LEFT, keyboard_interactivity: on_demand, ..TestLayerSpec::default() },
+        "quoin.panel.5",
+    );
+    click(&mut harness, 20.0, 12.0);
+    let panel_surface = test_layer_record(&harness, panel.surface).role.wl_surface().clone();
+    assert_eq!(focus(&harness), Some(panel_surface.clone()));
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.5","mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
+    let (menu, _) = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec { anchor: BOTTOM_RIGHT, keyboard_interactivity: on_demand, ..TestLayerSpec::default() },
+        "quoin-menu.5",
+    );
+    let _ = harness.sync();
+    // The hold arrives before the menu has focus; it takes focus on a click.
+    let hold = json!({"output":output,"edge":"left","surface":"quoin-menu.5",
+        "holder":"popup","acquire":true});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold).0, 0);
+    click(&mut harness, f64::from(width) - 30.0, f64::from(height) - 16.0);
+    let menu_surface = test_layer_record(&harness, menu.surface).role.wl_surface().clone();
+    assert_eq!(focus(&harness), Some(menu_surface));
+    // The user clicks a window while the menu still lives.
+    let layout = test_toplevel_record(&harness).layout;
+    click(
+        &mut harness,
+        f64::from(layout.x + layout.width / 2.0),
+        f64::from(layout.y + layout.height / 2.0),
+    );
+    let window = test_toplevel_record(&harness).role.wl_surface().clone();
+    assert_eq!(focus(&harness), Some(window.clone()));
+    send_request(&mut harness.client, menu.layer_surface, 7, &[]);
+    send_request(&mut harness.client, menu.surface, 0, &[]);
+    let _ = harness.sync();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert_eq!(focus(&harness), Some(window), "the deliberate move stands");
+    assert!(harness.server.state.observations.popup_restores.is_empty());
 }
 
 #[test]

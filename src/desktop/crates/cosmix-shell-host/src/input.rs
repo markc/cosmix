@@ -668,6 +668,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Corner(CornerEvent::Entered { .. }) => "corner-entered",
         ShellCommandKind::Corner(CornerEvent::Left { .. }) => "corner-left",
         ShellCommandKind::Corner(CornerEvent::Clicked { .. }) => "corner-clicked",
+        ShellCommandKind::HolderPlane(_) => "holder-plane",
         ShellCommandKind::Panel { .. } => "panel",
         ShellCommandKind::Carousel { .. } => "carousel",
         ShellCommandKind::SubPanelRegister { .. } => "sub-register",

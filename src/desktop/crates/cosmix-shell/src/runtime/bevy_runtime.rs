@@ -123,6 +123,13 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     if model.output() == &old_output {
         model.carry_live_state(&world.resource::<ShellRuntime>().model);
     }
+    // The holder plane is the compositor's capability, not the output's: a
+    // replacement's factory builds a local model, which must not resume local
+    // conceal timers while the compositor still drives reveal/conceal.
+    let plane = world.resource::<ShellRuntime>().model.holder_plane();
+    let at = model.last_update();
+    // At the model's own last update: cannot be refused as out of order.
+    let _ = model.set_holder_plane(plane, at);
     if let Some(declarations) = world.get_resource::<ShellPageDeclarations>() {
         for edge in Edge::ALL {
             model
@@ -393,6 +400,17 @@ fn update_model(
                 }
                 continue;
             }
+            ShellCommandKind::HolderPlane(available) => {
+                let at = command.at.clamp(runtime.model.last_update(), now);
+                if let Ok(updates) = runtime.model.set_holder_plane(*available, at) {
+                    for (edge, update) in Edge::ALL.into_iter().zip(updates) {
+                        if let Some(effect) = update.effect {
+                            effects.0.push(ShellEffect { edge, effect });
+                        }
+                    }
+                }
+                continue;
+            }
             _ => {}
         }
         if command.output != *runtime.model.output() {
@@ -416,8 +434,11 @@ fn update_model(
         match &command.kind {
             // Scene content is owned by the host adapter; it has no motion effect.
             ShellCommandKind::Scene(_) => {}
-            // Lifecycle commands were applied (and `continue`d) above the output gate.
-            ShellCommandKind::SubPanelRegister { .. } | ShellCommandKind::SubPanelRemove { .. } => {}
+            // Lifecycle and capability commands were applied (and
+            // `continue`d) above the output gate.
+            ShellCommandKind::SubPanelRegister { .. }
+            | ShellCommandKind::SubPanelRemove { .. }
+            | ShellCommandKind::HolderPlane(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
                 let thickness_px = if thickness_px.is_finite() {
                     thickness_px.min(runtime.model.max_thickness(*edge))
