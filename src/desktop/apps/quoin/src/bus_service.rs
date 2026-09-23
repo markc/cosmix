@@ -1406,6 +1406,68 @@ mod tests {
         assert!(comp_calls().is_empty(), "an acknowledged release is never replayed");
     }
 
+    /// Comp's registration lapses while comp itself (and its hold) lives on.
+    /// The menu closing during that outage is still released on return.
+    #[test]
+    fn hold_is_released_after_comp_registration_outage() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+        });
+        let reply = |request_id, body: &str| BusBridgeEvent::Reply {
+            request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
+        };
+        let comp_calls = || -> Vec<_> {
+            peer.drain_calls().into_iter().filter(|call| call.command.starts_with("comp")).collect()
+        };
+        let menu = |app: &mut App, open: bool| {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(), at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left,
+                    input: cosmix_shell::core::PanelInput::MenuHold(open) },
+            });
+        };
+        let presence = |app: &mut App, services: &[&str]| {
+            let live = services.iter().map(|name| (*name).to_owned()).collect();
+            app.world_mut().resource_mut::<crate::holders::HolderClient>().presence(&live);
+        };
+        // Read, mode report, acquire: each acknowledged in turn.
+        let accept_next = |app: &mut App, command: &str, body: &str| {
+            app.update();
+            let calls = comp_calls();
+            assert_eq!(calls.len(), 1, "{command}");
+            assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", command));
+            peer.deliver_event(reply(calls[0].request_id, body));
+            serde_json::from_str::<Value>(&calls[0].body).unwrap()
+        };
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        menu(&mut app, true);
+        accept_next(&mut app, "comp.props.get", "true");
+        accept_next(&mut app, "comp.panel.mode", r#"{"accepted":true}"#);
+        assert_eq!(accept_next(&mut app, "comp.panel.hold", r#"{"accepted":true}"#)["acquire"], true);
+        presence(&mut app, &[]);
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        menu(&mut app, false);
+        app.update();
+        assert!(comp_calls().is_empty(), "nothing is sent while comp is unregistered");
+        presence(&mut app, &["comp-nested"]);
+        accept_next(&mut app, "comp.props.get", "true");
+        accept_next(&mut app, "comp.panel.mode", r#"{"accepted":true}"#);
+        let release = accept_next(&mut app, "comp.panel.hold", r#"{"accepted":true}"#);
+        assert_eq!(release["surface"], "menu-token");
+        assert_eq!(release["acquire"], false, "the stranded hold is released");
+        app.update();
+        assert!(comp_calls().is_empty(), "and, acknowledged, goes quiet");
+    }
+
     use cosmix_shell::core::PanelInput;
     use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
     use ctk::bus::test_bridge;

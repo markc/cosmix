@@ -80,8 +80,10 @@ pub(crate) struct HolderClient {
     acknowledged: BTreeMap<Key, Value>,
     failed: BTreeMap<Key, (Value, Wait)>,
     /// Acquisitions comp may still record: sent, and no release acknowledged
-    /// since. Comp keeps holds while Quoin reconnects, so this survives
-    /// invalidation and a menu that closed meanwhile is still released.
+    /// since. Comp keeps holds while Quoin reconnects or while its own
+    /// registration lapses, so this survives invalidation and presence
+    /// changes, and a menu that closed meanwhile is still released. Only an
+    /// acknowledged release, or one refused `unknown_output`, retires it.
     maybe_held: BTreeMap<Key, Value>,
     pending: Option<(u64, Key, Value)>,
     retry_wanted: bool,
@@ -168,11 +170,10 @@ impl HolderClient {
                 self.acknowledged.clear();
                 self.failed.clear();
             }
-            // Comp left or arrived: its holds belong to a finished lifetime.
-            _ => {
-                self.maybe_held.clear();
-                self.invalidate(present);
-            }
+            // Comp left or arrived. `maybe_held` stays: a living comp can lose
+            // its registration and keep its holds, and a release to a comp
+            // that has none is a harmless no-op.
+            _ => self.invalidate(present),
         }
     }
 
@@ -194,6 +195,7 @@ impl HolderClient {
                 self.capability_read = None;
                 match (refusal(result), result) {
                     (Ok(()), Ok(reply)) => {
+                        self.backoff = RETRY_FIRST;
                         self.capable = serde_json::from_str::<Value>(&reply.body).ok() == Some(json!(true));
                     }
                     // A background re-read keeps its answer until a real one.
@@ -303,8 +305,18 @@ impl HolderClient {
         Some(HolderCommand { output, edge, surface, reveal })
     }
 
+    /// One host update: fire a due retry, send, then arm a deadline for any
+    /// send that just failed, so the next unrelated update cannot resend early.
+    fn update(&mut self, bridge: &BusBridge, now: Duration, deadline: &mut LayerHostDeadline) {
+        self.tick(now, deadline);
+        self.flush(bridge);
+        self.tick(now, deadline);
+    }
+
     /// Fires the one-shot retry, then arms the next one if a transient failure
-    /// asked for it, and publishes it as the host's wake deadline.
+    /// asked for it, and publishes it as the host's wake deadline. The cap
+    /// bounds the delay, not the attempts: a comp that stays busy is retried
+    /// every [`RETRY_CAP`] until it answers or the connection changes.
     fn tick(&mut self, now: Duration, deadline: &mut LayerHostDeadline) {
         if self.retry_at.is_some_and(|at| at <= now) {
             // One firing covers every transient failure so far.
@@ -330,8 +342,10 @@ impl HolderClient {
             && self.acknowledged.get(key) == Some(mode))
     }
 
+    /// Sends nothing while a retry is armed: a full outbound queue or a busy
+    /// comp backs off everything, not just the request that met it.
     fn flush(&mut self, bridge: &BusBridge) {
-        if self.generation.is_none() {
+        if self.generation.is_none() || self.retry_at.is_some() {
             return;
         }
         if self.read_needed && self.capability_read.is_none() {
@@ -342,6 +356,7 @@ impl HolderClient {
                 self.read_needed = false;
             } else {
                 self.retry_wanted = true;
+                return;
             }
         }
         if !self.capable || self.pending.is_some() {
@@ -432,8 +447,7 @@ pub(crate) fn report_holders(
     client.failed.retain(|key, _| live.contains(key));
     client.popup.retain(|(popup_output, _), _| popup_output == output.as_str());
     client.popup_surfaces.retain(|(popup_output, _), _| popup_output == output.as_str());
-    client.tick(time.elapsed(), &mut deadline);
-    client.flush(&bridge);
+    client.update(&bridge, time.elapsed(), &mut deadline);
 }
 
 #[cfg(test)]
@@ -632,6 +646,37 @@ mod tests {
         client.tick(RETRY_FIRST * 4, &mut deadline);
         assert_eq!(deadline.0, None, "success arms nothing");
         assert_eq!(client.backoff, RETRY_FIRST);
+    }
+
+    /// A full outbound queue is a transient failure too: it arms the deadline
+    /// in the same update, and nothing is sent until that deadline fires.
+    #[test]
+    fn immediate_send_failure_backs_off_until_the_deadline() {
+        let (mut client, bridge, peer) = capable_client();
+        let mut deadline = LayerHostDeadline::default();
+        let fill = || while bridge.try_call(0, "filler", "filler", BTreeMap::new(), "").is_ok() {};
+        let sent = || peer.drain_calls().into_iter().filter(|call| call.to == "comp-nested").count();
+        client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
+        fill();
+        client.update(&bridge, Duration::ZERO, &mut deadline);
+        assert_eq!(deadline.0, Some(RETRY_FIRST), "the failed send armed a deadline");
+        assert_eq!(sent(), 0);
+        client.update(&bridge, RETRY_FIRST / 2, &mut deadline);
+        assert_eq!(sent(), 0, "an unrelated update before the deadline sends nothing");
+        fill();
+        client.update(&bridge, RETRY_FIRST, &mut deadline);
+        assert_eq!(sent(), 0, "the expiry's one attempt failed again");
+        assert_eq!(client.retry_at, Some(RETRY_FIRST * 3), "and doubled the delay");
+        client.update(&bridge, RETRY_FIRST * 2, &mut deadline);
+        assert_eq!(sent(), 0);
+        client.update(&bridge, RETRY_FIRST * 3, &mut deadline);
+        let calls: Vec<_> = peer.drain_calls();
+        assert_eq!(calls.len(), 1, "exactly one send at the expiry");
+        assert_eq!(calls[0].command, "comp.panel.mode");
+        client.event(&reply(calls[0].request_id, 0, r#"{"accepted":true}"#));
+        assert_eq!(client.backoff, RETRY_FIRST);
+        client.update(&bridge, RETRY_FIRST * 4, &mut deadline);
+        assert_eq!(client.retry_at, None, "no re-arm without a new failure");
     }
 
     #[test]

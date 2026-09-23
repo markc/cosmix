@@ -28,6 +28,9 @@ impl PanelLayerIdentities {
 /// clock separates processes, since a reused pid cannot recur at the same
 /// monotonic instant and that clock never steps back (the realtime clock
 /// can). Comp's layer state does not outlive the boot, so neither must this.
+/// Namespaces are not authenticated, so comp-side enforcement (hiding a panel,
+/// excluding its input) must act on the surface comp resolved from the exact
+/// token, never on a namespace prefix match.
 pub(crate) fn new_layer_identity(prefix: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let now = clock_gettime(ClockId::Monotonic);

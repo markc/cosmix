@@ -81,6 +81,21 @@ impl PanelRequest {
         if let Some(unknown) = object.keys().find(|name| !PANEL_ARGS.contains(&name.as_str())) {
             return Err(invalid(unknown.as_str()));
         }
+        // A missing required field or a wrong JSON type names that field too.
+        let typed: [(&str, bool, fn(&Value) -> bool); 6] = [
+            ("output", true, Value::is_string),
+            ("edge", true, Value::is_string),
+            ("surface", true, Value::is_string),
+            ("holder", false, Value::is_string),
+            ("acquire", false, Value::is_boolean),
+            ("mode", false, Value::is_string),
+        ];
+        for (name, required, ok) in typed {
+            let valid = object.get(name).filter(|value| !value.is_null()).map_or(!required, ok);
+            if !valid {
+                return Err(invalid(name));
+            }
+        }
         let request: Self = serde_json::from_value(args.clone()).map_err(|_| invalid("args"))?;
         let hold = verb == "comp.panel.hold";
         let bounded = |value: &str| !value.is_empty() && value.len() <= 256;
@@ -3664,6 +3679,11 @@ mod tests {
             ("comp.panel.mode", with(json!({"mode":"hidden","surface":""})), "surface"),
             ("comp.panel.mode", with(json!({"mode":"hidden","acquire":false})), "acquire"),
             ("comp.panel.mode", json!([1]), "args"),
+            ("comp.panel.hold", with(json!({"output":7,"holder":"popup","acquire":true})), "output"),
+            ("comp.panel.hold", with(json!({"holder":"popup","acquire":"yes"})), "acquire"),
+            ("comp.panel.hold", with(json!({"holder":["popup"],"acquire":true})), "holder"),
+            ("comp.panel.mode", json!({"output":"DP-1","edge":"left","mode":"hidden"}), "surface"),
+            ("comp.panel.mode", json!({"output":"DP-1","surface":"s","mode":"hidden"}), "edge"),
         ] {
             let Err(reply) = PanelRequest::parse(verb, &args) else {
                 panic!("{verb} {args} must be refused");

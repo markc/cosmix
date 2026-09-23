@@ -1485,7 +1485,10 @@ numbers or choosing the topmost layer. Popup holds name the menu's own layer
 because the panel can be hidden. The association is re-resolved whenever a layer
 maps or unmaps, so a mode report that overtakes its layer binds when the layer
 maps; tokens are never reused. Namespaces are not authenticated: a client that
-copies a token makes it ambiguous, which refuses rather than misdirects. Output
+copies a token makes it ambiguous, which refuses rather than misdirects. For
+the same reason, any enforcement that hides a panel or excludes its input must
+act on the surface identity comp resolved from the token, never on a namespace
+prefix match. Output
 removal drops that output's state without a signal; Quoin rebuilds its panels
 with fresh tokens when an output goes, so nothing stale is suppressed.
 For hidden panels, the first explicit holder emits <code>reveal</code> and the last release

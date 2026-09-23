@@ -457,10 +457,11 @@ A refused request is resent only on the event that can change the answer: a
 layer mapping for surface and output refusals, a session-lock change for
 `locked`, and a changed intent otherwise. A busy comp, a timeout or a transport
 failure is retried once on a one-shot deadline whose delay doubles from 250 ms
-to 8 s; there is no polling. Comp keeps a hold while Quoin reconnects, so an
-acquired hold is remembered until its release is acknowledged: a menu that
-closes while the Bus is down is released after reconnect, and an acknowledged
-release is never replayed.
+to 8 s (a cap on the delay, not the attempts); nothing at all is sent while
+that deadline is pending, and there is no polling. Comp keeps a hold while
+Quoin reconnects or comp's own registration lapses, so an acquired hold is
+remembered until its release is acknowledged: a menu that closes during either
+outage is released afterwards, and an acknowledged release is never replayed.
 
 Each panel gets a unique layer-shell namespace token at creation, exposed to
 the client through `PanelLayerIdentities`. Requests carry that token as
