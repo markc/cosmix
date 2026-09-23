@@ -446,15 +446,14 @@ fn update_model(
                 // does (the layer turns exclusive until focus lands and leaves,
                 // Escape, or the grant times out).
                 let at = command.at.clamp(runtime.model.last_update(), now);
-                if runtime.model.panel(*edge).mode == PanelMode::Hidden {
-                    if let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
-                        && let Some(effect) = update.effect
-                    {
-                        effects.0.push(ShellEffect {
-                            edge: *edge,
-                            effect,
-                        });
-                    }
+                if runtime.model.panel(*edge).mode == PanelMode::Hidden
+                    && let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
+                    && let Some(effect) = update.effect
+                {
+                    effects.0.push(ShellEffect {
+                        edge: *edge,
+                        effect,
+                    });
                 }
                 runtime.model.request_keyboard_focus(*edge, at);
                 continue;
