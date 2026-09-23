@@ -3297,6 +3297,9 @@ mod tests {
         let snapshot = fixture();
         assert_eq!(snapshot.select(&["input", "corners", "holders"]),
             Some(json!(super::super::port_observation::HOLDER_PLANE_AVAILABLE)));
+        // Quoin goes command-driven on this leaf: it must stay false until
+        // holder tracking, the conceal timer and enforcement all exist.
+        assert_eq!(snapshot.select(&["input", "corners", "holders"]), Some(json!(false)));
         let path = PropPath::new("input.corners.holders").unwrap();
         let descriptor: Value = serde_json::from_str(&describe(&snapshot, &path).unwrap()).unwrap();
         assert_eq!(descriptor["mutable"], false);

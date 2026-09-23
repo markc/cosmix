@@ -5,6 +5,7 @@ pub mod config;
 mod corner_menu;
 mod demos;
 mod desktop_font;
+mod holders;
 mod hotspot;
 mod launcher;
 pub mod embedded;
@@ -122,7 +123,7 @@ pub fn run_layer_host() -> AppExit {
     let wake = app.world().resource::<LayerHostWake>().callback();
     let mut bus = BusBridgeConfig::new(cli.bus_service, resolve_noded_url());
     hotspot::install(&mut app, &mut bus, cli.comp_service.clone());
-    bus_service::install_holders(&mut app, &mut bus, cli.comp_service);
+    holders::install(&mut app, &mut bus, cli.comp_service);
     bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
     bus.subscriptions.push("power.props.changed".to_owned());
     bus.subscriptions.push("wallpaper.props.changed".to_owned());

@@ -47,7 +47,10 @@ launches need to run under a separate desktop user.
 `cosmix-quoin` is the Cosmix desktop furniture shell. It owns four independent
 `zwlr_layer_surface_v1` panels — left, bottom, right and top — and renders the
 existing Quoin chrome into one explicit Bevy window target per surface. The
-installable application id and layer namespace are `dev.cosmix.quoin`.
+installable application id is `dev.cosmix.quoin`, and every layer namespace
+starts with it: each panel layer is `dev.cosmix.quoin.panel.<unique>` and the
+corner menu `dev.cosmix.quoin-corner-menu.<unique>` (see
+[holder control plane](#holder-control-plane)).
 
 Quoin presents real layer-shell buffers through `cosmix-shell-host`,
 `cosmix-shell` and SCTK. See [component versions](../VERSIONS.md) for the
@@ -437,17 +440,33 @@ never rendered as zero.
 ### Holder control plane
 
 The standalone host reads the selected comp's read-only
-`input.corners.holders` capability before sending `<service>.panel.mode` or
-`<service>.panel.hold`. Missing, false or failed reads leave the plane inactive.
-Reconnects, delivery gaps and comp registry receipts invalidate the capability
-and trigger a fresh read. Actual mode reports precede popup acquire/release
-requests from the corner-menu call sites. Pointer and focus are also accepted
-holder kinds; named activation integration belongs to its later slice.
+`input.corners.holders` capability (`comp.props.get`) before sending
+`comp.panel.mode` or `comp.panel.hold`; like every comp verb these are literal
+commands addressed to the `--comp-service` instance. Missing, false or failed
+reads leave the plane inactive, and comp currently reports `false` until its
+holder tracking and enforcement exist, so today the plane stays inactive.
+Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
+client-side inbound drops) and a change to the leaf close the gate, re-read it
+and replay the desired state. A registry receipt that finds comp still present
+keeps the gate open and re-reads and replays in the background, since comp may
+have re-registered in between. Actual mode reports precede popup acquisitions
+from the corner-menu call sites. Pointer and focus are also accepted holder
+kinds; named activation integration belongs to its later slice.
+
+A refused request is resent only on the event that can change the answer: a
+layer mapping for surface and output refusals, a session-lock change for
+`locked`, and a changed intent otherwise. A busy comp, a timeout or a transport
+failure is retried once on a one-shot deadline whose delay doubles from 250 ms
+to 8 s; there is no polling. Comp keeps a hold while Quoin reconnects, so an
+acquired hold is remembered until its release is acknowledged: a menu that
+closes while the Bus is down is released after reconnect, and an acknowledged
+release is never replayed.
 
 Each panel gets a unique layer-shell namespace token at creation, exposed to
 the client through `PanelLayerIdentities`. Requests carry that token as
 `surface`, plus the raw output name and edge. Comp resolves the exact namespace
-on that output. Concealment destroys the panel layer, so its mode report may
+on that output, refusing a token that names more than one layer. Concealment
+destroys the panel layer, so its mode report may
 retain an unresolved token until the next reveal creates a new layer. A menu
 can open with its panel hidden: popup holds therefore name the menu's own
 unique layer token, exposed through `PopupLayerIdentity`. Releases accept that
@@ -457,7 +476,7 @@ namespace token avoids that ambiguity, so no topmost-surface fallback is used.
 Replacement panels and menus receive new tokens; delayed commands for old
 tokens are ignored.
 
-Comp's `<service>.panel.command` observations carry version 1, output, edge,
+Comp's `<service>.panel.command` topic carries version 1, output, edge,
 surface, an `action` of `reveal` or `conceal`, and `event_seq`. Quoin only accepts
 them with current capability, connection generation, layer identity and an
 advancing sequence. This slice exposes typed commands for the later

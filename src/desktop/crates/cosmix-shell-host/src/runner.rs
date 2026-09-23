@@ -2010,7 +2010,7 @@ impl PanelWaylandFactory<'_> {
         String,
     ) {
         let wl_surface = self.compositor_state.create_surface(qh);
-        let identity = crate::holders::new_panel_identity(self.namespace);
+        let identity = crate::holders::new_layer_identity(&format!("{}.panel", self.namespace));
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             wl_surface.clone(),

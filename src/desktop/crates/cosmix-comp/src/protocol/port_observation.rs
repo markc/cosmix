@@ -49,8 +49,13 @@ pub(crate) const CORNER_CLICKED_TOPIC_SUFFIX: &str = "corner.clicked";
 pub(crate) const CORNER_CLICKED_V2_TOPIC_SUFFIX: &str = "corner.clicked.v2";
 pub(crate) const POINTER_TOPIC_SUFFIX: &str = "pointer.changed";
 pub(crate) const PANEL_COMMAND_TOPIC_SUFFIX: &str = "panel.command";
-/// Protocol availability only; pointer/focus tracking and timers are separate.
-pub(crate) const HOLDER_PLANE_AVAILABLE: bool = true;
+/// The `input.corners.holders` leaf. It stays false while only the protocol
+/// verbs exist: Quoin switches to command-driven reveal/conceal on this leaf,
+/// so it may only turn true in the same comp build that also tracks holders,
+/// runs the conceal timer and enforces it (refactor chunk 15 flips it).
+pub(crate) const HOLDER_PLANE_AVAILABLE: bool = false;
+
+const PANEL_ARGS: &[&str] = &["output", "edge", "surface", "holder", "acquire", "mode"];
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,32 +69,88 @@ pub(crate) struct PanelRequest {
 }
 
 impl PanelRequest {
+    /// Refusals name the offending argument, like the window/input verbs.
     pub(crate) fn parse(verb: &str, args: &Value) -> Result<Self, ControlReply> {
-        let invalid = || ControlReply::InvalidArgs {
-            field: "panel".into(),
-            allowed: &["output", "edge", "surface", "holder", "acquire", "mode"],
+        let invalid = |field: &str| ControlReply::InvalidArgs {
+            field: field.to_owned(),
+            allowed: PANEL_ARGS,
         };
-        let request: Self = serde_json::from_value(args.clone()).map_err(|_| invalid())?;
-        let valid = !request.output.is_empty() && request.output.len() <= 256
-            && !request.surface.is_empty() && request.surface.len() <= 256
-            && matches!(request.edge.as_str(), "top" | "bottom" | "left" | "right")
-            && match verb {
-                "comp.panel.hold" => request.mode.is_none() && request.acquire.is_some()
-                    && matches!(request.holder.as_deref(), Some("pointer" | "focus" | "popup")),
-                "comp.panel.mode" => request.holder.is_none() && request.acquire.is_none()
-                    && matches!(request.mode.as_deref(), Some("hidden" | "pinned" | "docked")),
-                _ => false,
-            };
-        if valid { Ok(request) } else { Err(invalid()) }
+        let Some(object) = args.as_object() else {
+            return Err(invalid("args"));
+        };
+        if let Some(unknown) = object.keys().find(|name| !PANEL_ARGS.contains(&name.as_str())) {
+            return Err(invalid(unknown.as_str()));
+        }
+        let request: Self = serde_json::from_value(args.clone()).map_err(|_| invalid("args"))?;
+        let hold = verb == "comp.panel.hold";
+        let bounded = |value: &str| !value.is_empty() && value.len() <= 256;
+        let checks = [
+            ("output", bounded(&request.output)),
+            ("surface", bounded(&request.surface)),
+            ("edge", matches!(request.edge.as_str(), "top" | "bottom" | "left" | "right")),
+            ("holder", if hold {
+                matches!(request.holder.as_deref(), Some("pointer" | "focus" | "popup"))
+            } else {
+                request.holder.is_none()
+            }),
+            ("acquire", request.acquire.is_some() == hold),
+            ("mode", if hold {
+                request.mode.is_none()
+            } else {
+                matches!(request.mode.as_deref(), Some("hidden" | "pinned" | "docked"))
+            }),
+        ];
+        match checks.into_iter().find(|(_, ok)| !ok) {
+            Some((field, _)) => Err(invalid(field)),
+            None => Ok(request),
+        }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct PanelHolders {
     pub(crate) surface: String,
+    /// Re-resolved from `surface` on layer lifecycle edges.
     pub(crate) id: Option<SurfaceId>,
     pub(crate) mode: String,
+    /// Holder kind -> (token, layer id at acquire). The id is not refreshed:
+    /// a replaced layer always carries a new token, so a held id only ever
+    /// names the layer it was acquired against.
     pub(crate) held: BTreeMap<String, (String, SurfaceId)>,
+}
+
+/// Exact namespace resolution. `candidates` are every layer whose namespace
+/// is the token, flagged by whether it is on the requested output. All of
+/// them are considered, so the verdict never depends on surface order.
+pub(crate) fn resolve_panel_surface(
+    candidates: impl IntoIterator<Item = (SurfaceId, bool)>,
+) -> Result<Option<SurfaceId>, &'static str> {
+    let mut candidates = candidates.into_iter();
+    let Some((id, on_output)) = candidates.next() else {
+        return Ok(None);
+    };
+    if candidates.next().is_some() {
+        Err("ambiguous_panel_surface")
+    } else if on_output {
+        Ok(Some(id))
+    } else {
+        Err("panel_output_mismatch")
+    }
+}
+
+fn panel_surface_candidates<'a>(
+    state: &'a WaylandState,
+    token: &'a str,
+    output: &'a str,
+) -> impl Iterator<Item = (SurfaceId, bool)> + 'a {
+    state.surfaces.values().filter_map(move |record| {
+        let super::SurfaceRole::Layer(layer) = &record.role else {
+            return None;
+        };
+        (layer.surface.namespace() == token).then(|| {
+            (record.id, layer.output.output().is_some_and(|bound| bound.name() == output))
+        })
+    })
 }
 
 /// Idempotent explicit requests. Automatic membership and deadlines attach to
@@ -100,6 +161,11 @@ fn apply_panel_request(
     id: Option<SurfaceId>,
 ) -> Option<bool> {
     let key = (request.output.clone(), request.edge.clone());
+    // A release for an edge comp has no state for has nothing to release;
+    // it must not invent an entry keyed to a token comp never saw.
+    if request.acquire == Some(false) && !panels.contains_key(&key) {
+        return None;
+    }
     let panel = panels.entry(key).or_insert_with(|| PanelHolders {
         surface: request.surface.clone(), id, mode: "hidden".into(), held: BTreeMap::new(),
     });
@@ -1338,25 +1404,7 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     if !stable {
         return;
     }
-    // Modes outlive concealed (destroyed) panel layers. Automatic holder
-    // release on surface/focus loss belongs to the tracking slice.
-    let live_outputs: BTreeSet<_> = state.backend.port_outputs().into_iter().map(|o| o.name).collect();
-    state.observations.panel_holders.retain(|(output, _), _| live_outputs.contains(output));
-    // A mode RPC can arrive before its layer creation on the other connection.
-    // Re-resolve only on surface lifecycle work, not on every pointer sample.
-    if !state.observations.pending_surface_edges.is_empty() {
-        for ((output, _), panel) in &mut state.observations.panel_holders {
-            let mut matches = state.surfaces.values().filter_map(|record| {
-                let super::SurfaceRole::Layer(layer) = &record.role else { return None; };
-                (layer.surface.namespace() == panel.surface
-                    && layer.output.output().is_some_and(|bound| bound.name() == *output))
-                    .then_some(record.id)
-            });
-            let id = matches.next();
-            let resolved = if matches.next().is_some() { None } else { id };
-            if panel.id != resolved { panel.id = resolved; }
-        }
-    }
+    service_panel_holders(state);
     service_surface_edges(state);
     service_focus_edge(state);
     service_output_edges(state);
@@ -2709,6 +2757,35 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
     mutated
 }
 
+/// Holder state follows the layers and outputs it names. Runs only on the
+/// edges that can change the answer, not on every pointer sample.
+fn service_panel_holders(state: &mut WaylandState) {
+    if state.observations.panel_holders.is_empty() {
+        return;
+    }
+    // Output removal drops that output's modes and holds without a signal to
+    // Quoin. None is needed: the removal destroys the wl_output, the Quoin
+    // host rebuilds every panel with fresh namespace tokens, and requests
+    // for new tokens are never suppressed as already acknowledged.
+    if state.observations.output_topology_dirty || !state.observations.dirty_outputs.is_empty() {
+        let live: BTreeSet<_> = state.backend.port_outputs().into_iter().map(|o| o.name).collect();
+        state.observations.panel_holders.retain(|(output, _), _| live.contains(output));
+    }
+    // A mode RPC can arrive before its layer maps on the other connection,
+    // and concealment destroys the layer; both are surface edges.
+    if !state.observations.pending_surface_edges.is_empty() {
+        let resolved: Vec<_> = state.observations.panel_holders.iter()
+            .map(|(key, panel)| (key.clone(), resolve_panel_surface(
+                panel_surface_candidates(state, &panel.surface, &key.0)).ok().flatten()))
+            .collect();
+        for (key, id) in resolved {
+            if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
+                panel.id = id;
+            }
+        }
+    }
+}
+
 /// Resolve the exact namespace on the named output. Wayland object numbers
 /// alone are client-local and are deliberately not accepted as identities.
 fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> ControlReply {
@@ -2716,23 +2793,14 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
     if !state.backend.port_outputs().iter().any(|output| output.name == request.output) {
         return ControlReply::refused("unknown_output", json!({"output":request.output}));
     }
-    let mut matches = state.surfaces.values().filter_map(|record| {
-        let super::SurfaceRole::Layer(layer) = &record.role else { return None; };
-        (layer.surface.namespace() == request.surface).then_some((record.id,
-            layer.output.output().is_some_and(|output| output.name() == request.output)))
-    });
-    let id = match matches.next() {
-        Some((id, true)) => Some(id),
-        Some((_, false)) => return ControlReply::refused("panel_output_mismatch", json!({"surface":request.surface})),
-        None => None,
+    let id = match resolve_panel_surface(panel_surface_candidates(state, &request.surface, &request.output)) {
+        Ok(id) => id,
+        Err(code) => return ControlReply::refused(code, json!({"surface":request.surface})),
     };
     // A concealed panel has no layer. Its mode still exists. Release also
     // remains valid after the popup's Wayland destruction overtakes its RPC.
     if id.is_none() && request.acquire == Some(true) {
         return ControlReply::refused("unknown_panel_surface", json!({"surface":request.surface}));
-    }
-    if matches.next().is_some() {
-        return ControlReply::refused("ambiguous_panel_surface", json!({"surface":request.surface}));
     }
     if let Some(reveal) = apply_panel_request(&mut state.observations.panel_holders, request, id) {
         state.observations.offer(|event_seq| ObservationRecord::PanelCommand {
@@ -3532,26 +3600,94 @@ mod tests {
     #[test]
     fn mode_report_updates_comp_state() {
         let mut panels = BTreeMap::new();
-        for mode in ["hidden", "pinned", "docked", "hidden"] {
+        let key = ("DP-1".to_owned(), "left".to_owned());
+        // Revealed modes arrive with a live layer; a concealed (hidden) panel
+        // has none, and its recreation carries a fresh token.
+        for (mode, token, layer) in [
+            ("pinned", "quoin-panel-1", Some(SurfaceId(3))),
+            ("hidden", "quoin-panel-1", None),
+            ("docked", "quoin-panel-2", Some(SurfaceId(4))),
+            ("hidden", "quoin-panel-3", None),
+        ] {
             let report = PanelRequest::parse("comp.panel.mode", &json!({
-                "output":"DP-1","edge":"left","surface":"quoin-panel-1","mode":mode,
+                "output":"DP-1","edge":"left","surface":token,"mode":mode,
             })).unwrap();
-            assert_eq!(apply_panel_request(&mut panels, &report, None), None);
+            assert_eq!(apply_panel_request(&mut panels, &report, layer), None);
             let hold = PanelRequest::parse("comp.panel.hold", &json!({
-                "output":"DP-1","edge":"left","surface":"quoin-panel-1","holder":"popup","acquire":true,
+                "output":"DP-1","edge":"left","surface":"menu-1","holder":"popup","acquire":true,
             })).unwrap();
-            apply_panel_request(&mut panels, &hold, Some(SurfaceId(7)));
-            let panel = &panels[&("DP-1".into(), "left".into())];
+            let revealed = apply_panel_request(&mut panels, &hold, Some(SurfaceId(7)));
+            let panel = &panels[&key];
             assert_eq!(panel.mode, mode);
-            assert_eq!(panel.id, None, "concealed panel mode outlives its layer");
-            assert_eq!(panel.held.is_empty(), mode != "hidden");
+            assert_eq!(panel.surface, token, "the mode report rebinds the token");
+            assert_eq!(panel.id, layer, "the mode report records its layer");
+            assert_eq!(panel.held.is_empty(), mode != "hidden", "persistent modes ignore holds");
+            assert_eq!(revealed, (mode == "hidden").then_some(true));
+            let release = PanelRequest::parse("comp.panel.hold", &json!({
+                "output":"DP-1","edge":"left","surface":"menu-1","holder":"popup","acquire":false,
+            })).unwrap();
+            apply_panel_request(&mut panels, &release, None);
         }
-        assert!(PanelRequest::parse("comp.panel.hold", &json!({
-            "output":"DP-1","edge":"left","surface":"quoin-panel-1","holder":"typo","acquire":true,
-        })).is_err());
-        assert!(PanelRequest::parse("comp.panel.mode", &json!({
-            "output":"DP-1","edge":"left","surface":"quoin-panel-1","mode":"revealed",
-        })).is_err());
+        // A persistent mode clears holds already recorded under hidden.
+        let hold = PanelRequest::parse("comp.panel.hold", &json!({
+            "output":"DP-1","edge":"left","surface":"menu-2","holder":"popup","acquire":true,
+        })).unwrap();
+        assert_eq!(apply_panel_request(&mut panels, &hold, Some(SurfaceId(8))), Some(true));
+        let pin = PanelRequest::parse("comp.panel.mode", &json!({
+            "output":"DP-1","edge":"left","surface":"quoin-panel-3","mode":"pinned",
+        })).unwrap();
+        apply_panel_request(&mut panels, &pin, Some(SurfaceId(5)));
+        assert!(panels[&key].held.is_empty());
+        // A release for an edge comp never saw invents no state.
+        let stray = PanelRequest::parse("comp.panel.hold", &json!({
+            "output":"DP-1","edge":"top","surface":"menu-9","holder":"popup","acquire":false,
+        })).unwrap();
+        assert_eq!(apply_panel_request(&mut panels, &stray, None), None);
+        assert!(!panels.contains_key(&("DP-1".to_owned(), "top".to_owned())));
+    }
+
+    #[test]
+    fn panel_request_refusals_name_the_offending_argument() {
+        let base = json!({"output":"DP-1","edge":"left","surface":"quoin-panel-1"});
+        let with = |extra: Value| {
+            let mut args = base.clone();
+            args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            args
+        };
+        for (verb, args, field) in [
+            ("comp.panel.hold", with(json!({"holder":"typo","acquire":true})), "holder"),
+            ("comp.panel.hold", with(json!({"holder":"popup"})), "acquire"),
+            ("comp.panel.hold", with(json!({"holder":"popup","acquire":true,"mode":"hidden"})), "mode"),
+            ("comp.panel.hold", with(json!({"holder":"popup","acquire":true,"sticky":true})), "sticky"),
+            ("comp.panel.mode", with(json!({"mode":"revealed"})), "mode"),
+            ("comp.panel.mode", with(json!({"mode":"hidden","edge":"middle"})), "edge"),
+            ("comp.panel.mode", with(json!({"mode":"hidden","surface":""})), "surface"),
+            ("comp.panel.mode", with(json!({"mode":"hidden","acquire":false})), "acquire"),
+            ("comp.panel.mode", json!([1]), "args"),
+        ] {
+            let Err(reply) = PanelRequest::parse(verb, &args) else {
+                panic!("{verb} {args} must be refused");
+            };
+            let (rc, body) = reply.into_wire();
+            let body: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(rc, 10);
+            assert_eq!(body["error"], "invalid_args");
+            assert_eq!(body["field"], field, "{verb} {args}");
+            assert_eq!(body["allowed"], json!(PANEL_ARGS));
+        }
+    }
+
+    #[test]
+    fn panel_surface_resolution_is_order_independent() {
+        let (a, b) = (SurfaceId(1), SurfaceId(2));
+        assert_eq!(resolve_panel_surface(std::iter::empty()), Ok(None));
+        assert_eq!(resolve_panel_surface([(a, true)]), Ok(Some(a)));
+        assert_eq!(resolve_panel_surface([(a, false)]), Err("panel_output_mismatch"));
+        // A token on two layers is refused whichever one iteration meets
+        // first, including when only one of them is on the right output.
+        for pair in [[(a, true), (b, false)], [(b, false), (a, true)], [(a, true), (b, true)]] {
+            assert_eq!(resolve_panel_surface(pair), Err("ambiguous_panel_surface"));
+        }
     }
 
     use std::{

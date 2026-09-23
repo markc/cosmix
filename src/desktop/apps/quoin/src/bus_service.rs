@@ -24,238 +24,6 @@ use crate::power::{PowerAction, PowerSync};
 const MAX_PENDING_REPLIES: usize = 32;
 const RESIZE_RECEIPT_FRAMES: u64 = 120;
 
-/// Capability-gated transport seam. Chunk 14 consumes these commands instead
-/// of local conceal timers; this slice deliberately leaves the model unchanged.
-#[derive(Message, Debug, PartialEq)]
-pub(crate) struct HolderCommand {
-    pub(crate) output: String,
-    pub(crate) edge: Edge,
-    pub(crate) surface: String,
-    pub(crate) reveal: bool,
-}
-
-#[derive(Resource)]
-pub(crate) struct HolderClient {
-    service: String,
-    generation: Option<u64>,
-    pub(crate) capable: bool,
-    read_needed: bool,
-    capability_read: Option<u64>,
-    next_id: u64,
-    last_sequence: u64,
-    // Desired state survives a Bus reconnect and is replayed after capability.
-    desired: BTreeMap<(String, String), Value>,
-    acknowledged: BTreeMap<(String, String), Value>,
-    failed: BTreeMap<(String, String), Value>,
-    pending: Option<(u64, (String, String), Value)>,
-    popup: BTreeMap<(String, String), bool>,
-    popup_surfaces: BTreeMap<(String, String), String>,
-}
-
-pub(crate) fn install_holders(app: &mut App, bus: &mut ctk::bus::BusBridgeConfig, service: String) {
-    for suffix in ["props.changed", "panel.command", "surface.mapped"] {
-        let topic = format!("{service}.{suffix}");
-        if !bus.subscriptions.contains(&topic) { bus.subscriptions.push(topic); }
-    }
-    app.insert_resource(HolderClient::new(service));
-}
-
-impl HolderClient {
-    fn new(service: String) -> Self {
-        Self {
-            service, generation: None, capable: false, read_needed: false,
-            capability_read: None, next_id: 0x49_0000_0000, last_sequence: 0,
-            desired: BTreeMap::new(), acknowledged: BTreeMap::new(),
-            failed: BTreeMap::new(), pending: None, popup: BTreeMap::new(),
-            popup_surfaces: BTreeMap::new(),
-        }
-    }
-
-    fn invalidate(&mut self, reread: bool) {
-        self.capable = false;
-        self.capability_read = None;
-        self.read_needed = reread && self.generation.is_some();
-        self.pending = None;
-        self.acknowledged.clear();
-        self.failed.clear();
-        self.last_sequence = 0;
-    }
-
-    fn presence(&mut self, live: &BTreeSet<String>) {
-        self.invalidate(live.contains(&self.service));
-    }
-
-    fn event(&mut self, event: &BusBridgeEvent) {
-        match event {
-            BusBridgeEvent::Connection { state: BusConnectionState::Connected, generation } => {
-                self.generation = Some(*generation);
-                self.invalidate(true);
-            }
-            BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
-                self.generation = None;
-                self.invalidate(false);
-            }
-            BusBridgeEvent::DroppedMessages(_) => self.invalidate(true),
-            BusBridgeEvent::Reply { request_id, result } if self.capability_read == Some(*request_id) => {
-                self.capability_read = None;
-                self.capable = result.as_ref().is_ok_and(|reply| reply.rc == 0
-                    && serde_json::from_str::<Value>(&reply.body).ok() == Some(json!(true)));
-            }
-            BusBridgeEvent::Reply { request_id, result }
-                if self.pending.as_ref().is_some_and(|(id, _, _)| id == request_id) => {
-                let (_, key, body) = self.pending.take().unwrap();
-                if result.as_ref().is_ok_and(|reply| reply.rc == 0) {
-                    if key.1 == "panel.mode" && body["mode"] != "hidden" {
-                        // Persistent mode reports clear comp's holds. A later
-                        // hidden mode must replay even an unchanged popup intent.
-                        self.acknowledged.retain(|k, v| k.1 != "panel.hold"
-                            || v["output"] != body["output"] || v["edge"] != body["edge"]);
-                    }
-                    self.acknowledged.insert(key, body);
-                } else {
-                    // A refused layer may not have reached comp yet. A mapping,
-                    // registry receipt or changed intent permits another try.
-                    self.failed.insert(key, body);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn message(&mut self, message: &BusMessage) -> Option<HolderCommand> {
-        if self.generation != Some(message.connection_generation) { return None; }
-        let topic = message.topic()?;
-        if !["props.changed", "panel.command", "surface.mapped"].iter()
-            .any(|suffix| topic == format!("{}.{suffix}", self.service)) { return None; }
-        if message.headers.get("gap").is_some_and(|value| value == "true") {
-            self.invalidate(true);
-            return None;
-        }
-        let body: Value = serde_json::from_str(&message.body).ok()?;
-        if topic == format!("{}.surface.mapped", self.service) {
-            self.failed.clear();
-            return None;
-        }
-        if topic == format!("{}.props.changed", self.service) {
-            if matches!(body["path"].as_str(), Some("input.corners.holders" | "input.corners" | "input")) {
-                self.invalidate(true);
-            }
-            return None;
-        }
-        if !self.capable || body["version"] != 1 { return None; }
-        let sequence = body["event_seq"].as_u64()?;
-        if sequence <= self.last_sequence { return None; }
-        let edge = match body["edge"].as_str()? {
-            "top" => Edge::Top, "bottom" => Edge::Bottom,
-            "left" => Edge::Left, "right" => Edge::Right, _ => return None,
-        };
-        let reveal = match body["action"].as_str()? {
-            "reveal" => true, "conceal" => false, _ => return None,
-        };
-        let output = body["output"].as_str()?.to_owned();
-        let surface = body["surface"].as_str()?.to_owned();
-        // An old layer's delayed command must not control its replacement.
-        let current_panel = self.desired.iter().any(|(key, value)| key.1 == "panel.mode"
-            && value["surface"] == surface && value["output"] == output && value["edge"] == body["edge"]);
-        let current_popup = self.popup_surfaces.get(&(output.clone(), edge_name(edge).into())) == Some(&surface);
-        if !current_panel && !current_popup { return None; }
-        self.last_sequence = sequence;
-        Some(HolderCommand { output, edge, surface, reveal })
-    }
-
-    fn flush(&mut self, bridge: &BusBridge) {
-        if self.generation.is_none() { return; }
-        if self.read_needed && self.capability_read.is_none() {
-            self.next_id += 1;
-            if bridge.try_call(self.next_id, &self.service, format!("{}.props.get", self.service),
-                BTreeMap::new(), json!({"path":"input.corners.holders"}).to_string()).is_ok() {
-                self.capability_read = Some(self.next_id);
-                self.read_needed = false;
-            }
-        }
-        if !self.capable || self.pending.is_some() { return; }
-        // All mode reports precede hold requests, including replay on reconnect.
-        let next = ["panel.mode", "panel.hold"].into_iter().find_map(|verb| {
-            self.desired.iter().find(|(key, body)| key.1 == verb
-                && self.acknowledged.get(*key) != Some(*body)
-                && self.failed.get(*key) != Some(*body)
-                && (verb != "panel.hold" || self.desired.iter().any(|(mode_key, mode)|
-                    mode_key.1 == "panel.mode" && mode["output"] == body["output"]
-                        && mode["edge"] == body["edge"] && self.acknowledged.get(mode_key) == Some(mode))))
-                .map(|(key, body)| (key.clone(), body.clone()))
-        });
-        if let Some((key, body)) = next {
-            self.next_id += 1;
-            if bridge.try_call(self.next_id, &self.service, format!("{}.{}", self.service, key.1),
-                BTreeMap::new(), body.to_string()).is_ok() {
-                self.pending = Some((self.next_id, key, body));
-            }
-        }
-    }
-}
-
-/// Mirror the actual mode after Model, and the existing chunk-11 menu holds.
-/// Local holders remain active until the command-driven model slice lands.
-fn report_holders(
-    bridge: Res<BusBridge>,
-    mut client: Option<ResMut<HolderClient>>,
-    identities: Option<Res<cosmix_shell_host::holders::PanelLayerIdentities>>,
-    popup_identity: Option<Res<cosmix_shell_host::holders::PopupLayerIdentity>>,
-    frame: Res<ShellFrameState>,
-    mut commands: MessageReader<ShellCommand>,
-) {
-    let Some(client) = client.as_deref_mut() else { commands.clear(); return; };
-    for command in commands.read() {
-        if let ShellCommandKind::Panel { edge, input: cosmix_shell::core::PanelInput::MenuHold(open) } = &command.kind {
-            client.popup.insert((command.output.as_str().into(), edge_name(*edge).into()), *open);
-        }
-    }
-    if let Some(identity) = &popup_identity {
-        client.popup_surfaces.insert((identity.output.as_str().into(), edge_name(identity.edge).into()),
-            identity.surface.clone());
-    }
-    // Preserve an old menu's release until acknowledged, even if replacement
-    // skipped an intermediate frame or its successor never reached configure.
-    let releases: BTreeMap<_, _> = client.desired.iter().filter_map(|(key, body)| {
-        if key.1 != "panel.hold" || body["output"] != frame.0.geometry.output.as_str() {
-            return None;
-        }
-        let possibly_held = client.acknowledged.get(key).is_some_and(|v| v["acquire"] == true)
-            || client.failed.get(key).is_some_and(|v| v["acquire"] == true)
-            || client.pending.as_ref().is_some_and(|(_, k, v)| k == key && v["acquire"] == true);
-        if !possibly_held { return None; }
-        let mut release = body.clone();
-        release["acquire"] = json!(false);
-        (client.acknowledged.get(key) != Some(&release)).then(|| (key.clone(), release))
-    }).collect();
-    client.desired = releases;
-    if let Some(identities) = identities {
-        for edge in Edge::ALL {
-            let output = &frame.0.geometry.output;
-            let Some(surface) = identities.get(output, edge) else { continue; };
-            let mode = frame.0.panel(edge).mode;
-            let popup_key = (output.as_str().into(), edge_name(edge).into());
-            let popup = mode == PanelMode::Hidden && client.popup
-                .get(&popup_key).copied().unwrap_or(false)
-                && popup_identity.as_ref().is_some_and(|p| p.output == *output && p.edge == edge);
-            client.desired.insert((surface.into(), "panel.mode".into()), json!({
-                "output":output.as_str(),"edge":edge_name(edge),"surface":surface,"mode":mode.as_str(),
-            }));
-            if let Some(popup_surface) = client.popup_surfaces.get(&popup_key).cloned() {
-                client.desired.insert((popup_surface.clone(), "panel.hold".into()), json!({
-                    "output":output.as_str(),"edge":edge_name(edge),"surface":popup_surface,"holder":"popup","acquire":popup,
-                }));
-            }
-        }
-    }
-    let live: BTreeSet<_> = client.desired.keys().cloned().collect();
-    client.acknowledged.retain(|key, _| live.contains(key));
-    client.failed.retain(|key, _| live.contains(key));
-    client.popup.retain(|(output, _), _| output == frame.0.geometry.output.as_str());
-    client.popup_surfaces.retain(|(output, _), _| output == frame.0.geometry.output.as_str());
-    client.flush(&bridge);
-}
-
 #[derive(Component)]
 pub(crate) struct QuoinPowerText;
 
@@ -346,7 +114,7 @@ pub(crate) struct ShellBusDispatch;
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
-            .add_message::<HolderCommand>()
+            .add_message::<crate::holders::HolderCommand>()
             .init_resource::<cosmix_shell::chrome::QuoinHotspotSize>()
             .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
@@ -370,14 +138,19 @@ impl Plugin for ShellBusPlugin {
                     .after(service_bus),
             )
             .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
-            .add_systems(Update, report_holders.in_set(ShellRuntimeSet::Presentation).after(service_bus));
+            .add_systems(
+                Update,
+                crate::holders::report_holders
+                    .in_set(ShellRuntimeSet::Presentation)
+                    .after(service_bus),
+            );
     }
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct SceneBus<'w, 's> {
-    holders: Option<ResMut<'w, HolderClient>>,
-    holder_commands: MessageWriter<'w, HolderCommand>,
+    holders: Option<ResMut<'w, crate::holders::HolderClient>>,
+    holder_commands: MessageWriter<'w, crate::holders::HolderCommand>,
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
@@ -1536,7 +1309,7 @@ fn leaf(path: String, value: PropValue) -> (PropPath, PropValue) {
     )
 }
 
-fn edge_name(edge: Edge) -> &'static str {
+pub(crate) fn edge_name(edge: Edge) -> &'static str {
     match edge {
         Edge::Left => "left",
         Edge::Bottom => "bottom",
@@ -1549,12 +1322,16 @@ fn edge_name(edge: Edge) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The wire contract against a non-default comp: literal `comp.*`
+    /// commands addressed to that service. A menu closed while the Bus was
+    /// down is still released after reconnect (comp kept the hold), and
+    /// once acknowledged its token goes quiet.
     #[test]
     fn client_sends_hold_on_popup_open() {
         let (bridge, peer) = ctk::bus::test_bridge("shell");
         let mut app = bus_app(bridge);
         let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
-        install_holders(&mut app, &mut bus, "comp-nested".into());
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
         assert!(bus.subscriptions.contains(&"comp-nested.panel.command".into()));
         app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
             test_model().output().clone(), Edge::Left, "panel-token".into(),
@@ -1562,91 +1339,73 @@ mod tests {
         app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
             output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
         });
-        peer.deliver_event(BusBridgeEvent::Connection {
-            state: BusConnectionState::Connected, generation: 1,
-        });
-        app.world_mut().write_message(ShellCommand {
-            output: test_model().output().clone(), at: Default::default(),
-            kind: ShellCommandKind::Panel { edge: Edge::Left,
-                input: cosmix_shell::core::PanelInput::MenuHold(true) },
-        });
-        app.update();
-        let calls = peer.drain_calls();
-        assert!(!calls.iter().any(|call| call.command.ends_with("panel.hold")));
-        let read = calls.iter().find(|call| call.body == r#"{"path":"input.corners.holders"}"#).unwrap();
         let reply = |request_id, body: &str| BusBridgeEvent::Reply {
             request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
         };
-        peer.deliver_event(reply(read.request_id, "true"));
-        app.update();
-        let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].command, "comp-nested.panel.mode");
-        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
-        app.update();
-        let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].to, "comp-nested");
-        assert_eq!(calls[0].command, "comp-nested.panel.hold");
-        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), json!({
-            "output":"test","edge":"left","surface":"menu-token","holder":"popup","acquire":true,
-        }));
-        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
-        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
-        app.world_mut().write_message(ShellCommand {
-            output: test_model().output().clone(), at: Default::default(),
-            kind: ShellCommandKind::Panel { edge: Edge::Left,
-                input: cosmix_shell::core::PanelInput::MenuHold(false) },
-        });
-        app.update();
-        let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap()["acquire"], false);
-    }
-
-    #[test]
-    fn commands_ignored_while_uncapable() {
-        let mut client = HolderClient::new("comp-nested".into());
-        client.event(&BusBridgeEvent::Connection {
+        let comp_calls = || -> Vec<_> {
+            peer.drain_calls().into_iter().filter(|call| call.command.starts_with("comp")).collect()
+        };
+        let menu = |app: &mut App, open: bool| {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(), at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left,
+                    input: cosmix_shell::core::PanelInput::MenuHold(open) },
+            });
+        };
+        let mode = json!({"output":"test","edge":"left","surface":"panel-token","mode":"hidden"});
+        let hold = |acquire: bool| json!({"output":"test","edge":"left","surface":"menu-token",
+            "holder":"popup","acquire":acquire});
+        peer.deliver_event(BusBridgeEvent::Connection {
             state: BusConnectionState::Connected, generation: 1,
         });
-        client.desired.insert(("token".into(), "panel.mode".into()), json!({
-            "surface":"token","output":"test","edge":"left","mode":"hidden",
-        }));
-        let message = BusMessage {
-            connection_generation: 1, from: "comp-nested".into(), command: "panel.command".into(),
-            headers: BTreeMap::from([("topic".into(), "comp-nested.panel.command".into())]),
-            body: json!({"version":1,"output":"test","edge":"left","surface":"token",
-                "action":"reveal","event_seq":1}).to_string(),
-        };
-        let (bridge, peer) = ctk::bus::test_bridge("shell");
-        client.flush(&bridge);
-        let id = peer.drain_calls()[0].request_id;
-        assert!(client.message(&message).is_none());
-        client.event(&BusBridgeEvent::Reply { request_id: id, result: Ok(ctk::bus::BusReply {
-            rc: 0, body: "false".into(), result: None,
-        }) });
-        assert!(client.message(&message).is_none());
-        client.invalidate(true);
-        client.flush(&bridge);
-        let id = peer.drain_calls()[0].request_id;
-        client.event(&BusBridgeEvent::Reply { request_id: id, result: Ok(ctk::bus::BusReply {
-            rc: 0, body: "true".into(), result: None,
-        }) });
-        assert!(client.message(&message).unwrap().reveal);
-        assert!(client.message(&message).is_none(), "duplicate sequence");
-        client.event(&BusBridgeEvent::DroppedMessages(1));
-        assert!(!client.capable);
-        assert!(client.message(&message).is_none());
-        client.event(&BusBridgeEvent::Connection {
+        menu(&mut app, true);
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1, "only the capability read before capability");
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.props.get"));
+        assert_eq!(calls[0].body, r#"{"path":"input.corners.holders"}"#);
+        peer.deliver_event(reply(calls[0].request_id, "true"));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.panel.mode"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), mode);
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.panel.hold"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold(true));
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        // The Bus drops; the menu closes meanwhile.
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Disconnected, generation: 1,
+        });
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        menu(&mut app, false);
+        app.update();
+        assert!(comp_calls().is_empty(), "nothing is sent while disconnected");
+        peer.deliver_event(BusBridgeEvent::Connection {
             state: BusConnectionState::Connected, generation: 2,
         });
-        client.event(&BusBridgeEvent::Reply { request_id: id, result: Ok(ctk::bus::BusReply {
-            rc: 0, body: "true".into(), result: None,
-        }) });
-        assert!(!client.capable, "old lifetime's reply cannot enable the gate");
-        assert!(client.message(&message).is_none());
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls[0].command, "comp.props.get");
+        peer.deliver_event(reply(calls[0].request_id, "true"));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls[0].command, "comp.panel.mode", "mode reports replay first");
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold(false));
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        app.update();
+        assert!(comp_calls().is_empty(), "an acknowledged release is never replayed");
     }
+
     use cosmix_shell::core::PanelInput;
     use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
     use ctk::bus::test_bridge;

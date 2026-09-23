@@ -84,7 +84,7 @@ impl RunnerState {
             }
         }
         let wl = self.compositor_state.create_surface(qh);
-        let identity = crate::holders::new_panel_identity(&format!("{}-corner-menu", self.namespace));
+        let identity = crate::holders::new_layer_identity(&format!("{}-corner-menu", self.namespace));
         let layer = self.layer_shell.create_layer_surface(
             qh,
             wl.clone(),
