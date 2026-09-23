@@ -872,7 +872,7 @@ fn build_live_render_app(
         // inserts this (render_hud_probe.rs); the persistent native path
         // needs it too until the vblank-aligned pulse-admission fix
         // (kms_live.rs pulse skip+rebase, realignment doc finding #2) lands.
-        app.insert_resource(idle::ContinuousRendering);
+        // GATE PROBE: removed to measure embedded idle behaviour.
     }
     app.insert_resource(FirstLiveRenderError::default())
         .insert_resource(RenderErrorHandler(stop_live_rendering_after_first_error));
