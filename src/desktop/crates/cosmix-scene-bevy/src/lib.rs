@@ -26,6 +26,12 @@ impl Plugin for ScenePlugin {
                 .after(ShellRuntimeSet::Input)
                 .before(ShellRuntimeSet::Model),
         );
+        app.add_systems(
+            Update,
+            render::remove_unseated_scenes
+                .after(ShellRuntimeSet::Model)
+                .before(ShellRuntimeSet::Presentation),
+        );
     }
 }
 

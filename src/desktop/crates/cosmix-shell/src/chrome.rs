@@ -467,7 +467,8 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
     mount_page_with(world, edge, id, title, content, false)
 }
 
-/// Mount or update a page, optionally hiding the header while it is active.
+/// Register or update content without revealing or selecting it. Optionally
+/// hide the header when the page is explicitly selected later.
 pub fn mount_page_with(
     world: &mut World,
     edge: Edge,
@@ -536,17 +537,18 @@ pub fn mount_page_with(
     parts.page_titles.push((id.into(), title.into()));
     parts.page_chromeless.push((id.into(), chromeless));
     parts.page_wrappers.push((id.into(), wrapper));
-    let ids = parts
-        .page_wrappers
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect();
-    crate::runtime::set_shell_pages(world, edge, ids, Some(id));
+    crate::runtime::register_shell_page(world, edge, id);
     true
 }
 
 /// Remove a dynamic page and repair the carousel selection.
 pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
+    unmount_page_content(world, edge, id);
+    crate::runtime::remove_shell_page(world, edge, id);
+}
+
+/// Tear down chrome after a registry removal has already applied the landing.
+pub fn unmount_page_content(world: &mut World, edge: Edge, id: &str) {
     let mut query = world.query::<(Entity, &QuoinPanelChrome)>();
     let Some(panel) = query
         .iter(world)
@@ -583,7 +585,6 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
     if let Some(wrapper) = wrapper {
         world.despawn(wrapper);
     }
-    crate::runtime::remove_shell_page(world, edge, id);
 }
 
 fn spawn_panel(
