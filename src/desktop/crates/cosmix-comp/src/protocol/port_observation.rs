@@ -82,7 +82,8 @@ impl PanelRequest {
             return Err(invalid(unknown.as_str()));
         }
         // A missing required field or a wrong JSON type names that field too.
-        let typed: [(&str, bool, fn(&Value) -> bool); 6] = [
+        type Check = (&'static str, bool, fn(&Value) -> bool);
+        let typed: [Check; 6] = [
             ("output", true, Value::is_string),
             ("edge", true, Value::is_string),
             ("surface", true, Value::is_string),
