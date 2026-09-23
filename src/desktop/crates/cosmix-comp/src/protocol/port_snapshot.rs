@@ -380,6 +380,7 @@ pub(crate) struct XwaylandSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct CornersSnapshot {
+    pub(crate) holders: bool,
     pub(crate) enabled: bool,
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
@@ -390,6 +391,7 @@ pub(crate) struct CornersSnapshot {
 impl From<CornerConfig> for CornersSnapshot {
     fn from(config: CornerConfig) -> Self {
         Self {
+            holders: super::port_observation::HOLDER_PLANE_AVAILABLE,
             enabled: config.enabled,
             deadzone_px: config.deadzone_px,
             dwell_ms: config.dwell_ms,
@@ -693,6 +695,7 @@ flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
 flat_snapshot!(
     CornersSnapshot,
+    holders,
     enabled,
     deadzone_px,
     dwell_ms,
@@ -2107,6 +2110,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Compiled keybinding chord/action rows"
     ),
     descriptor!(
+        &[L("input"), L("corners"), L("holders")],
+        Bool,
+        "Whether the panel holder control plane is available"
+    ),
+    descriptor!(
         &[L("input"), L("corners"), L("enabled")],
         Bool,
         "Whether compositor hot-corner detection is enabled",
@@ -3282,6 +3290,20 @@ mod tests {
             snapshot.select(&["windows", "s2", "workspace"]),
             Some(json!(1))
         );
+    }
+
+    #[test]
+    fn capability_leaf_reflects_holder_plane() {
+        let snapshot = fixture();
+        assert_eq!(snapshot.select(&["input", "corners", "holders"]),
+            Some(json!(super::super::port_observation::HOLDER_PLANE_AVAILABLE)));
+        let path = PropPath::new("input.corners.holders").unwrap();
+        let descriptor: Value = serde_json::from_str(&describe(&snapshot, &path).unwrap()).unwrap();
+        assert_eq!(descriptor["mutable"], false);
+        assert_eq!(descriptor["type"], "bool");
+        assert!(matches!(super::super::port_observation::validate_set_request(
+            "input.corners.holders", &json!(false)),
+            Err(super::super::port_observation::SetValidationError::ReadOnly)));
     }
 
     #[test]

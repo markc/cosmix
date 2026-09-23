@@ -1462,6 +1462,28 @@ compile within the call. It does not loop until pipelines settle or prove every
 intended draw was submitted. An independent 30-second settlement deadline prevents
 fallback presentations from indefinitely hiding pending assets or pipelines.
 The budget resets for a replacement output generation after resume.</p>
+<p>The read-only <code>input.corners.holders = true</code> leaf advertises the holder protocol
+plane. <code>comp.panel.hold</code> takes <code>output</code> (raw connector name), <code>edge</code>
+(<code>top</code>, <code>bottom</code>, <code>left</code>, <code>right</code>), <code>surface</code> (the layer-shell namespace token),
+<code>holder</code> (<code>pointer</code>, <code>focus</code>, <code>popup</code>) and boolean <code>acquire</code>. <code>comp.panel.mode</code>
+takes the same output/edge/surface address and <code>mode</code> (<code>hidden</code>, <code>pinned</code>,
+<code>docked</code>). Both run at the stable observation dispatch boundary, return
+<code>{"accepted":true,"surface":...}</code>. Acquisitions require a live, unambiguous
+layer on that output. Mode reports survive concealed panel-layer destruction;
+releases match their recorded token even if the layer has already gone.
+Unknown outputs, ambiguous identities and session locking are refused. Explicit requests are
+idempotent; persistent modes clear holders and ignore acquisitions.</p>
+<p>The namespace token is created by Quoin for each panel lifetime. It resolves
+to comp's own surface identity without relying on client-local Wayland object
+numbers or choosing the topmost layer. Popup holds name the menu's own layer
+because the panel can be hidden. Mode reports update the panel association on
+recreation; tokens are never reused. Output removal drops that output's state.
+For hidden panels, the first explicit holder emits <code>reveal</code> and the last release
+emits <code>conceal</code> on <code>&lt;service&gt;.panel.command</code>, through the existing bounded
+observation outbox and its gap reporting. The version-1 body contains <code>output</code>,
+<code>edge</code>, <code>surface</code>, <code>action</code> and <code>event_seq</code>. Automatic pointer/focus tracking,
+dwell/conceal timers and Quoin's model switchover are subsequent work; this
+capability advertises protocol availability, not those later behaviours.</p>
 <p>Hot-corner detection is compositor-side and uses the current logical output.
 It emits one <code>entered</code>, then one <code>left</code> on deadzone exit, output or geometry
 change, session lock, disable, or config invalidation. <code>corner</code> is <code>tl</code>, <code>tr</code>,

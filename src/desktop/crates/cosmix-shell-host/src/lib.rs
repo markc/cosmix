@@ -8,6 +8,7 @@ mod corner_bus;
 #[cfg(test)]
 mod feature_graph;
 pub mod input;
+pub mod holders;
 mod input_keysym;
 pub mod output;
 pub mod planner;

@@ -34732,6 +34732,43 @@ fn layer_surface_receives_no_configure_before_its_first_empty_commit() {
     );
 }
 
+#[cfg(feature = "bus")]
+#[test]
+fn holder_surface_association_uses_layer_namespace() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    let layer = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.sync();
+    let id = test_layer_record(&harness, layer.surface).id;
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+    let call = |harness: &mut KeybindingHarness, acquire, surface: &str| {
+        let request = port_observation::PanelRequest::parse("comp.panel.hold", &json!({
+            "output":output,"edge":"left","surface":surface,"holder":"popup","acquire":acquire,
+        })).unwrap();
+        let admission = ingress.request_panel(request).unwrap();
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+        runtime.block_on(admission.receive()).unwrap().into_wire()
+    };
+    drain_observations(&observations);
+    assert_eq!(call(&mut harness, true, "unknown-token").0, 10);
+    assert_eq!(call(&mut harness, true, "cosmix-test-layer").0, 0);
+    let key = (output.clone(), "left".into());
+    assert_eq!(harness.server.state.observations.panel_holders[&key].held["popup"].1, id);
+    assert!(drain_observations(&observations).iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::PanelCommand { reveal: true, .. })));
+    // Same namespace twice is rejected, never resolved by stack order.
+    let duplicate = create_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    harness.sync();
+    assert_eq!(call(&mut harness, true, "cosmix-test-layer").0, 10);
+    send_request(&mut harness.client, duplicate.layer_surface, 7, &[]);
+    send_request(&mut harness.client, layer.layer_surface, 7, &[]);
+    harness.sync();
+    assert_eq!(call(&mut harness, false, "cosmix-test-layer").0, 0);
+    assert!(harness.server.state.observations.panel_holders[&key].held.is_empty());
+    assert!(drain_observations(&observations).iter().any(|record| matches!(record,
+        port_observation::ObservationRecord::PanelCommand { reveal: false, .. })));
+}
+
 #[test]
 fn layer_role_creation_rejects_a_previously_committed_buffer() {
     let mut harness = KeybindingHarness::new(true);

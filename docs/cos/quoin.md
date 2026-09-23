@@ -434,6 +434,39 @@ never rendered as zero.
 
 ## Interaction boundary
 
+### Holder control plane
+
+The standalone host reads the selected comp's read-only
+`input.corners.holders` capability before sending `<service>.panel.mode` or
+`<service>.panel.hold`. Missing, false or failed reads leave the plane inactive.
+Reconnects, delivery gaps and comp registry receipts invalidate the capability
+and trigger a fresh read. Actual mode reports precede popup acquire/release
+requests from the corner-menu call sites. Pointer and focus are also accepted
+holder kinds; named activation integration belongs to its later slice.
+
+Each panel gets a unique layer-shell namespace token at creation, exposed to
+the client through `PanelLayerIdentities`. Requests carry that token as
+`surface`, plus the raw output name and edge. Comp resolves the exact namespace
+on that output. Concealment destroys the panel layer, so its mode report may
+retain an unresolved token until the next reveal creates a new layer. A menu
+can open with its panel hidden: popup holds therefore name the menu's own
+unique layer token, exposed through `PopupLayerIdentity`. Releases accept that
+same token even after Wayland destruction overtakes the Bus request. Client-local
+Wayland object numbers cannot identify a surface across connections; an explicit
+namespace token avoids that ambiguity, so no topmost-surface fallback is used.
+Replacement panels and menus receive new tokens; delayed commands for old
+tokens are ignored.
+
+Comp's `<service>.panel.command` observations carry version 1, output, edge,
+surface, an `action` of `reveal` or `conceal`, and `event_seq`. Quoin only accepts
+them with current capability, connection generation, layer identity and an
+advancing sequence. This slice exposes typed commands for the later
+command-driven model: existing local reveal/conceal behaviour remains active
+until the holder tracking and timer switchover lands. The embedded host has no
+Wayland panel layers and does not install this standalone transport adapter.
+
+### Corner input
+
 Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. `--comp-service NAME` selects the
 registered compositor instance (default `comp`), giving topic headers

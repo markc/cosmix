@@ -84,11 +84,12 @@ impl RunnerState {
             }
         }
         let wl = self.compositor_state.create_surface(qh);
+        let identity = crate::holders::new_panel_identity(&format!("{}-corner-menu", self.namespace));
         let layer = self.layer_shell.create_layer_surface(
             qh,
             wl.clone(),
             Layer::Overlay,
-            Some(format!("{}-corner-menu", self.namespace)),
+            Some(identity.clone()),
             Some(&output.wl_output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
@@ -107,6 +108,9 @@ impl RunnerState {
             None,
         )
         .map_err(|e| LayerHostError::new(e.to_string()))?;
+        self.app.insert_resource(crate::holders::PopupLayerIdentity {
+            output: request.output.clone(), edge: request.corner.summoned_edge(), surface: identity,
+        });
         self.app
             .world_mut()
             .get_mut::<Camera>(surface.camera)
@@ -158,6 +162,7 @@ impl RunnerState {
         let Some(mut menu) = self.menu.take() else {
             return;
         };
+        self.app.world_mut().remove_resource::<crate::holders::PopupLayerIdentity>();
         dismiss(&mut self.app, &mut menu, choice);
         menu.surface.retire(&mut self.app);
         self.needs_update = true;

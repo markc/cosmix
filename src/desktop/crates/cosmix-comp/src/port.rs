@@ -68,6 +68,7 @@ const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
 const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 
 pub(crate) enum PortCommand {
+    Panel(PortPanelRequest),
     Snapshot(PortRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
@@ -88,6 +89,12 @@ pub(crate) struct PortRequest {
 pub(crate) struct PortReply {
     pub(crate) order: u64,
     pub(crate) reply: tokio::sync::oneshot::Sender<ControlReply>,
+}
+
+pub(crate) struct PortPanelRequest {
+    pub(crate) order: u64,
+    pub(crate) op: port_observation::PanelRequest,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
 
 pub(crate) struct PortSetRequest {
@@ -620,6 +627,7 @@ impl ControlReply {
 }
 
 pub(crate) enum PortControl {
+    Panel(PortPanelRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
@@ -632,6 +640,7 @@ pub(crate) enum PortControl {
 impl PortControl {
     pub(crate) fn order(&self) -> u64 {
         match self {
+            Self::Panel(request) => request.order,
             Self::Watch(request) => request.order,
             Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
@@ -653,6 +662,12 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
+    pub(crate) fn request_panel(&self, op: port_observation::PanelRequest) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(PortCommand::Panel(PortPanelRequest {
+            order: self.next_control_order(), op, reply: Some(reply),
+        }), receive)
+    }
     /// Whole-tree snapshot; production reads go through the scoped form.
     #[cfg(test)]
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
@@ -1768,6 +1783,32 @@ fn dispatch_incoming(
             admission,
             permit,
         );
+        return;
+    }
+    if matches!(command.command.as_str(), "comp.panel.hold" | "comp.panel.mode") {
+        let parsed = port_observation::PanelRequest::parse(&command.command, &command.args);
+        let op = match parsed {
+            Ok(op) if !malformed => op,
+            _ => {
+                queue_reply(reply_sender, reply_timeouts,
+                    PendingReply::new(command, error("invalid_args")));
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(reply_sender, reply_timeouts,
+                    PendingReply::new(command, error("busy")));
+                return;
+            }
+        };
+        match ingress.request_panel(op) {
+            Ok(admission) => spawn_control_responder(responders, reply_sender,
+                reply_timeouts, command, admission, permit),
+            Err(()) => queue_reply(reply_sender, reply_timeouts,
+                PendingReply::new(command, error("busy"))),
+        }
         return;
     }
     let needs_snapshot = matches!(
