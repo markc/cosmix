@@ -525,7 +525,14 @@ button; change mode at the corner, in its menu, or through the precise mode
 verbs.
 
 The compositor publishes `corner.clicked.v2` with `button`, `kind: "brief"` and
-`modifiers` captured at press time (always present, even when empty). It consumes
+`modifiers` captured at press time (always present, even when empty). Quoin
+refuses a v2 body without `modifiers` — it comes from a compositor older than
+this input model — and logs ERROR `quoin_corner_old_format_rejected` with
+`field=modifiers` at counts 1, 2, 4, 8, … (counted separately from other decode
+rejections); `kind: "hold"` is likewise refused for either button. Against such
+a compositor RMB does nothing, unmodified LMB still pins through the legacy
+topic below, and Shift+LMB pins instead of docking, because that compositor
+emits legacy for every LMB. The compositor consumes
 engaged corner presses and their releases, cancelling pending actions on excess
 movement or disengagement. Both buttons act on release; neither has a hold action.
 The menu action calls `CornerMenuHook(fn(&mut World, &OutputKey, Corner))`.
@@ -541,9 +548,10 @@ restoration belongs to the forthcoming compositor popup holder. Pin and Dock
 apply before the local hold is released, so concealment cannot race the choice.
 Opening a menu at a hidden corner does not itself reveal the panel.
 
-Both click topics are subscribed for old-compositor compatibility. Successful
+Both click topics are subscribed: legacy is the fallback that keeps the first
+unmodified LMB working while the v2 subscription settles. Successful
 subscription is not capability discovery: the broker accepts unpublished topics.
-Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The current
+Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The
 compositor emits each unmodified LMB's legacy record at sequence N and its v2
 record at N+1, including when the v2 payload has `modifiers: []`;
 the host maps both to N and admits that logical click once, in either delivery
