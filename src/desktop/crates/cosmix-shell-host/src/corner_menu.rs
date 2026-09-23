@@ -64,6 +64,10 @@ impl RunnerState {
             self.dismiss_corner_menu(None);
         }
         let Some(output) = self.outputs.get(&request.output) else {
+            // No menu will open: release the hold the corner ingress staged
+            // for this request's edge (it may differ from the incumbent's).
+            let edge = request.corner.summoned_edge();
+            stage_menu_hold(&mut self.app, &request.output, edge, false);
             return Ok(());
         };
         let size = Vec2::new(output.logical_size.width(), output.logical_size.height());
