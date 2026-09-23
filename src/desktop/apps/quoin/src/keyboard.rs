@@ -8,7 +8,8 @@
 //! focused window is its panel on this output. Reaching a binding while an
 //! application is focused needs a compositor-side chord grab; that route is
 //! not built here, and when it is, its target comes from the same
-//! [`keyboard_target_output`] rule fed by comp's focus and pointer reports.
+//! `cosmix_shell::core::keyboard_target_output` rule, fed by comp's focus and
+//! pointer reports.
 //!
 //! Mode bindings dispatch through the precise mode verb, never the legacy
 //! pin/unpin pair, so a keyboard pin is exactly a menu or Bus pin.
@@ -17,7 +18,7 @@ use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::time::Real;
-use cosmix_shell::core::{Edge, PanelMode, keyboard_target_output};
+use cosmix_shell::core::{Edge, PanelMode};
 use cosmix_shell::runtime::{
     KeyboardCommand, ShellCommand, ShellCommandKind, ShellFrameState, ShellRuntimeSet,
     ShellSemanticVerb, ShellStagedIngress, semantic_shell_command,
@@ -43,8 +44,9 @@ pub(crate) struct Modifiers {
 
 /// Modifier keys held, as the key stream itself reports them in event order —
 /// so a chord is judged by the modifiers down at that press, not by the state
-/// at the end of the frame. Either side counts (Right Alt included; a layout
-/// that makes it AltGr reports a different keysym but the same physical key).
+/// at the end of the frame. Either side counts, except that Right Alt is Alt
+/// only when the layout says so: as AltGr (logical `AltGraph`) it selects a
+/// third-level character, so AltGr+Q typing `@` must not be `Alt+Q`.
 #[derive(Default)]
 struct HeldModifiers(Vec<KeyCode>);
 
@@ -66,7 +68,8 @@ impl HeldModifiers {
             return false;
         }
         self.0.retain(|&key| key != input.key_code);
-        if input.state == ButtonState::Pressed {
+        let altgr = input.key_code == KeyCode::AltRight && input.logical_key != Key::Alt;
+        if input.state == ButtonState::Pressed && !altgr {
             self.0.push(input.key_code);
         }
         true
@@ -235,12 +238,11 @@ fn dispatch_bindings(
         else {
             continue;
         };
-        // Receiving the key proves a panel on this output holds the keyboard,
-        // so the focused window's output wins and the pointer is not needed.
-        let Some(output) = keyboard_target_output(Some(&frame.0.geometry.output), None).cloned()
-        else {
-            continue;
-        };
+        // Targeting (`keyboard_target_output`: focused window's output, else
+        // the pointer's) is trivial here: receiving the key proves a panel on
+        // this output holds the keyboard. The pointer arm is for the future
+        // compositor-grabbed route, which has no focused Quoin surface.
+        let output = frame.0.geometry.output.clone();
         let at = time.elapsed();
         commands.write(match action {
             KeyAction::Mode(edge, mode) => {
@@ -286,6 +288,7 @@ mod tests {
             r#"{bindings: {
                 left: {pin: "Super+Shift+Left", dock: "Super+Shift+D", hide: "Super+Shift+H"},
                 right: {dock: "Super+F2"},
+                top: {pin: "Alt+Q"},
                 cycle_focus: "Super+Tab"}}"#,
         )
         .unwrap();
@@ -320,7 +323,7 @@ mod tests {
     ) -> Vec<ShellCommand> {
         let held: Vec<(KeyCode, Key)> = [
             (modifiers.ctrl, KeyCode::ControlLeft, Key::Control),
-            (modifiers.alt, KeyCode::AltRight, Key::Alt),
+            (modifiers.alt, KeyCode::AltLeft, Key::Alt),
             (modifiers.shift, KeyCode::ShiftLeft, Key::Shift),
             (modifiers.super_key, KeyCode::SuperLeft, Key::Super),
         ]
@@ -387,6 +390,27 @@ mod tests {
             assert_eq!(commands[0].kind, mode_command(edge, expected));
             assert_eq!(mode(&app, edge), expected, "{key_code:?}");
         }
+        // Right Alt as AltGr types a third-level character (AltGr+Q is `@` on
+        // many layouts): that is not Alt+Q. As plain Alt, it is.
+        for (logical, expected) in [(Key::AltGraph, PanelMode::Hidden), (Key::Alt, PanelMode::Pinned)] {
+            let typed = if logical == Key::AltGraph { "@" } else { "q" };
+            let world = app.world_mut();
+            world.write_message(key(KeyCode::AltRight, logical.clone(), ButtonState::Pressed, false));
+            world.write_message(key(
+                KeyCode::KeyQ,
+                Key::Character(typed.into()),
+                ButtonState::Pressed,
+                false,
+            ));
+            world.write_message(key(KeyCode::KeyQ, Key::Character(typed.into()), ButtonState::Released, false));
+            world.write_message(key(KeyCode::AltRight, logical, ButtonState::Released, false));
+            app.update();
+            app.world_mut()
+                .resource_mut::<bevy::ecs::message::Messages<ShellCommand>>()
+                .clear();
+            assert_eq!(mode(&app, Edge::Top), expected);
+        }
+
         // The right dock never touched the left edge, and vice versa.
         assert_eq!(mode(&app, Edge::Left), PanelMode::Hidden);
 

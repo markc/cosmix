@@ -35,9 +35,11 @@ pub struct ShellModel {
 }
 
 /// How long a focus-cycle target may ask for the keyboard without receiving
-/// it. Comp grants an Exclusive layer only when it is actually shown; an
-/// ungranted request must not linger and seize the keyboard later with no
-/// user action.
+/// it. Comp grants an Exclusive layer only when it is actually shown and no
+/// session lock is active; an ungranted request must not linger and seize
+/// the keyboard later (on unlock, or once shown) with no user action. A
+/// granted request that a lock then takes the keyboard from ends through the
+/// ordinary landed-then-left rule of `keyboard_focus_observed`.
 pub const FOCUS_GRANT_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl ShellModel {
