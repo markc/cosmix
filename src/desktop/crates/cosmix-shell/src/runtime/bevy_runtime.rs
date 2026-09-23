@@ -232,6 +232,7 @@ pub fn remove_owned_subpanels_before(
     seats
 }
 
+#[allow(clippy::too_many_arguments)] // a Bevy system: each parameter is one resource
 fn update_model(
     time: Res<Time<Real>>,
     mut commands: MessageReader<ShellCommand>,
