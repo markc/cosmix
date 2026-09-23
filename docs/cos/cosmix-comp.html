@@ -765,7 +765,7 @@ owner) or an object subtree with its immediate children.</li>
 the name this compositor instance actually registered. The reply is truthful
 only for a caller that subscribed to that topic before calling <code>watch</code> and
 remains subscribed.</li>
-<li><code>comp.props.set {path,value,generation?}</code> mutates the four corner
+<li><code>comp.props.set {path,value,generation?}</code> mutates the six corner
 properties, <code>windows.s&lt;id&gt;.band</code>, <code>windows.s&lt;id&gt;.minimized</code>,
 <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>, <code>workspaces.current</code>,
 <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>, or
@@ -893,7 +893,7 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s}
+input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery}
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -1482,11 +1482,43 @@ motion constrained by the output edge can enter early. Defaults and inclusive
 ranges are:</p>
 <table><thead><tr><th>Property</th><th style="text-align: right">Default</th><th style="text-align: right">Range</th></tr></thead><tbody>
 <tr><td><code>input.corners.enabled</code></td><td style="text-align: right"><code>true</code></td><td style="text-align: right">boolean</td></tr>
-<tr><td><code>input.corners.deadzone_px</code></td><td style="text-align: right"><code>12.0</code></td><td style="text-align: right"><code>1.0..=256.0</code> logical px</td></tr>
+<tr><td><code>input.corners.deadzone_px</code></td><td style="text-align: right"><code>10.0</code></td><td style="text-align: right"><code>1.0..=256.0</code> logical px</td></tr>
 <tr><td><code>input.corners.dwell_ms</code></td><td style="text-align: right"><code>200</code></td><td style="text-align: right"><code>0..=5000</code> ms</td></tr>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
+<tr><td><code>input.corners.affordance</code></td><td style="text-align: right"><code>true</code></td><td style="text-align: right">boolean</td></tr>
+<tr><td><code>input.corners.discovery</code></td><td style="text-align: right"><code>false</code></td><td style="text-align: right">boolean</td></tr>
 </tbody></table>
-<p>The mutable leaves are the four corner leaves, <code>windows.s&lt;id&gt;.band</code>,
+<p><code>deadzone_px</code> is the hotspot: a square of that many logical units at each
+output corner, so it is the same size on a 2x output as on a 1x one.</p>
+<p>The compositor draws the hotspot affordance itself, above every client —
+layer-shell panels included — and below the cursor, in the scheme accent. With <code>affordance</code> true it
+shows the engaged hotspot while the pointer rests there, flashes it for
+180 ms on every recognised release (the brief LMB or RMB that emits
+<code>corner.clicked.v2</code>), and, while <code>discovery</code> is true, blinks every hotspot
+slowly until the first engagement. That engagement sets <code>discovery</code> back to
+<code>false</code> with cause <code>corner.entered</code>; a shell that reveals a panel another way
+(keyboard) writes <code>false</code> itself. The compositor keeps no record of a first
+run, so it never turns <code>discovery</code> on: a shell does, when its own state says
+the user has not yet found the corners — Quoin writes <code>true</code> once, on the
+launch that finds no <code>quoin.state.mix</code>, and creates that file when the
+compositor accepts the write, so it is never requested again. <code>affordance: false</code> makes the corners
+silent without changing detection. Nothing is drawn under a session lock.
+The affordance renders only when what it draws changes — once on engage, once
+on leave, a few quantised steps for a flash, two frames per 2 s blink — so a
+settled corner leaves the renderer idle.</p>
+<p>The affordance is ordinary on-screen furniture in the base layer, not a
+cursor-plane overlay, so screenshots and screencasts include a hover square
+or flash that is showing when they are taken. With the <code>embedded-quoin</code>
+build feature, the embedded Quoin draws its panels as UI that composites
+above the compositor's scene, so an embedded panel covering a corner hides
+that corner's affordance; the production Quoin is a separate layer-shell
+client and is unaffected, and the ordering belongs to the embedding work.
+Squares are sized and placed in each output's own logical coordinates, but
+the renderer currently places every output camera over one shared logical
+canvas at one output scale — the same limit client placement has — so
+mixed-scale, multi-output correctness depends on the renderer's multi-output
+camera model, not on the affordance.</p>
+<p>The mutable leaves are the six corner leaves, <code>windows.s&lt;id&gt;.band</code>,
 <code>windows.s&lt;id&gt;.minimized</code>, <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>,
 <code>workspaces.current</code>, <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>
 (nested only) and <code>xwayland.enabled</code>. The corner, window and workspace

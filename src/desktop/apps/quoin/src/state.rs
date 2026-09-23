@@ -296,6 +296,9 @@ pub(crate) struct StateStore {
     /// Shared with the host's model factory: restoring claims the migrated
     /// default-output entry, and the claim must reach the next save.
     saved: Arc<Mutex<SavedState>>,
+    /// No state file existed at load: the shell has never saved anything.
+    /// Smoke runs (no path) and unreadable files are not first runs.
+    first_run: bool,
     /// Completed file writes, observed by tests only. Atomic because the
     /// store is interior-mutable: the persist system needs only shared
     /// access, so the counter must not demand `ResMut`.
@@ -324,28 +327,57 @@ impl StateStore {
                 .map_err(StateError::Io)
                 .and_then(|source| SavedState::parse(&source))
         });
-        let (saved, path) = match loaded {
-            None => (SavedState::default(), path),
+        let (saved, path, first_run) = match loaded {
+            None => (SavedState::default(), path, false),
             Some(Ok(saved)) => {
                 eprintln!("QUOIN_STATE restored=true");
-                (saved, path)
+                (saved, path, false)
             }
             Some(Err(error)) => match error {
                 StateError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
                     eprintln!("QUOIN_STATE restored=false reason={io}");
-                    (SavedState::default(), path)
+                    (SavedState::default(), path, true)
                 }
                 error => {
                     eprintln!("QUOIN_STATE restored=false persist=disabled reason={error}");
-                    (SavedState::default(), None)
+                    (SavedState::default(), None, false)
                 }
             },
         };
         Self {
             path,
             saved: Arc::new(Mutex::new(saved)),
+            first_run,
             #[cfg(test)]
             write_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Whether this launch is the shell's first run (no state file yet).
+    pub(crate) fn first_run(&self) -> bool {
+        self.first_run
+    }
+
+    /// Record that the first run's one-time work (the §8.5 discovery write)
+    /// is done, by creating the state file if no transition has yet. The
+    /// next launch then restores it and is not a first run, so the
+    /// discovery blink is requested once per install, never again.
+    pub(crate) fn consume_first_run(&self) {
+        let Some(path) = self.path.as_deref() else {
+            return;
+        };
+        if path.exists() {
+            return;
+        }
+        let saved = self.lock_saved();
+        match atomic_save(path, &saved) {
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    self.write_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Err(error) => bevy::log::warn!("Quoin first-run state save failed: {error}"),
         }
     }
 
@@ -531,6 +563,40 @@ mod tests {
                 input,
             },
         );
+    }
+
+    /// §8.5 first run: only a missing state file is one. Consuming it creates
+    /// the file, so the next launch restores and never re-arms discovery.
+    #[test]
+    fn first_run_is_a_missing_state_file_and_is_consumed_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        assert!(
+            !StateStore::load(None).first_run(),
+            "smoke runs are not first runs"
+        );
+
+        let store = StateStore::load(Some(path.clone()));
+        assert!(store.first_run());
+        store.consume_first_run();
+        assert!(path.exists());
+        assert_eq!(store.writes(), 1);
+        store.consume_first_run();
+        assert_eq!(
+            store.writes(),
+            1,
+            "an existing file is never rewritten for it"
+        );
+        assert!(!StateStore::load(Some(path.clone())).first_run());
+
+        std::fs::write(&path, "not mix state").unwrap();
+        let unreadable = StateStore::load(Some(path.clone()));
+        assert!(
+            !unreadable.first_run(),
+            "an unreadable file is not a first run"
+        );
+        unreadable.consume_first_run();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not mix state");
     }
 
     #[test]

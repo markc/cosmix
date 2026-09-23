@@ -445,7 +445,7 @@ reads `input.corners.deadzone_px` through a path-scoped `<service>.props.get`
 (whose reply body is the bare value at that path), re-reading on a relevant
 change, reconnect, delivery gap, or any registry observation that reports the
 service registered — a restarted comp republishes no initial value. Until a
-read lands, or while no cosmix comp is present, the inset falls back to 12 px,
+read lands, or while no cosmix comp is present, the inset falls back to 10 px,
 mirroring comp's own default; a failed read keeps that fallback and logs one
 `QUOIN_HOTSPOT_READ_FAILED` notice per run of failures. The compositor's
 embedded Quoin host passes its own registered service name the same way.

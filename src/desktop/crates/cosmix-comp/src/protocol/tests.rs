@@ -29838,8 +29838,8 @@ fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
             assert!(harness.server.state.pointer.current_pressed().is_empty());
             match cancellation {
                 "drag" => {
-                    // Still within the square hotspot, but >12px from press.
-                    route_pointer_to(&mut harness, 11.0, 11.0);
+                    // Still within the square 10px hotspot, but >10px from press.
+                    route_pointer_to(&mut harness, 10.0, 10.0);
                     assert!(harness.server.state.corner_engaged());
                     route_pointer_to(&mut harness, 1.0, 1.0);
                 }
@@ -29968,6 +29968,200 @@ fn port_corner_neither_button_holds_and_both_act_on_release() {
             ..
         }
     ));
+}
+
+/// Engage the top-left hotspot the way a resting pointer does.
+#[cfg(feature = "bus")]
+fn engage_top_left_corner(harness: &mut KeybindingHarness) {
+    route_pointer_to(harness, 5.0, 5.0);
+    harness
+        .server
+        .event_loop
+        .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+        .unwrap();
+    assert!(harness.server.state.corner_engaged());
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn affordance_follows_engaged_corner() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    let view = bridge.view();
+    assert!(view.enabled);
+    assert!(!view.squares.is_empty());
+    assert_eq!(view.squares.len() % 4, 0, "four hotspots per output");
+    assert!(
+        view.squares.iter().all(|square| square.side == 10.0),
+        "the default hotspot is 10 logical units: {:?}",
+        view.squares
+    );
+    assert_eq!(view.hover, None);
+    assert!(
+        view.frame(Instant::now()).is_empty(),
+        "nothing is drawn until a corner engages"
+    );
+
+    engage_top_left_corner(&mut harness);
+    let view = bridge.view();
+    assert_eq!(view.hover, Some(0), "output 0, top-left");
+    let frame = view.frame(Instant::now());
+    assert_eq!(frame.len(), 1);
+    assert_eq!(frame[0].square, view.squares[0]);
+
+    route_pointer_to(&mut harness, 100.0, 100.0);
+    assert!(!harness.server.state.corner_engaged());
+    assert_eq!(bridge.view().hover, None, "leaving hides the reveal");
+
+    // §8.7: disabling the affordance silences an engaged corner without
+    // ending the engagement itself.
+    engage_top_left_corner(&mut harness);
+    let config = corner::CornerConfig {
+        affordance: false,
+        ..corner::CornerConfig::default()
+    };
+    harness.server.state.apply_corner_config(config);
+    assert!(harness.server.state.corner_engaged());
+    let view = bridge.view();
+    assert!(!view.enabled);
+    assert!(view.frame(Instant::now()).is_empty());
+}
+
+/// Publishing is per state change, never per motion sample: a burst of
+/// motion inside a hotspot (while a candidate, and while engaged) with no
+/// Entered/Left/action publishes nothing.
+#[cfg(feature = "bus")]
+#[test]
+fn hotspot_motion_inside_a_corner_publishes_nothing() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    let candidate = bridge.sets();
+    for (x, y) in [(6.0, 5.0), (6.0, 6.0), (5.0, 7.0), (4.0, 4.0), (5.0, 5.0)] {
+        route_pointer_to(&mut harness, x, y);
+    }
+    assert!(!harness.server.state.corner_engaged());
+    assert_eq!(bridge.sets(), candidate, "candidate motion publishes nothing");
+    engage_top_left_corner(&mut harness);
+    let engaged = bridge.sets();
+    for (x, y) in [(6.0, 5.0), (2.0, 8.0), (9.0, 9.0), (1.0, 1.0), (5.0, 5.0)] {
+        route_pointer_to(&mut harness, x, y);
+    }
+    assert!(harness.server.state.corner_engaged());
+    assert_eq!(bridge.sets(), engaged, "engaged motion publishes nothing");
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn flash_fires_on_recognised_release() {
+    let (mut harness, _ingress, _observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    engage_top_left_corner(&mut harness);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    assert_eq!(
+        bridge.view().flash,
+        None,
+        "the flash acknowledges the release"
+    );
+    let before = Instant::now();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let view = bridge.view();
+    let (index, at) = view.flash.expect("a recognised release flashes");
+    assert_eq!(index, 0);
+    assert!(at >= before);
+    let flashing = view.frame(at);
+    let settled = view.frame(at + crate::hotspot_scene::FLASH_DURATION);
+    assert_eq!((flashing.len(), settled.len()), (1, 1), "hover stays");
+    assert!(
+        flashing[0].level > settled[0].level,
+        "the flash is brighter than the hover it returns to"
+    );
+
+    // RMB is recognised too.
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Pressed,
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 1,
+        ButtonState::Released,
+    );
+    let (_, right_at) = bridge.view().flash.expect("RMB flashes");
+    assert!(right_at >= at);
+
+    // A press dragged past the deadzone is cancelled: its release is not
+    // recognised and must not flash.
+    route_pointer_to(&mut harness, 1.0, 1.0);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_to(&mut harness, 10.0, 10.0);
+    assert!(harness.server.state.corner_engaged());
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    assert_eq!(bridge.view().flash, Some((0, right_at)));
+
+    // Unconsumed buttons are not corner clicks either.
+    route_pointer_to(&mut harness, 5.0, 5.0);
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 2,
+        ButtonState::Pressed,
+    );
+    route_pointer_button(
+        &mut harness,
+        PRIMARY_POINTER_BUTTON + 2,
+        ButtonState::Released,
+    );
+    assert_eq!(bridge.view().flash, Some((0, right_at)));
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn discovery_flash_ends_at_the_first_reveal() {
+    use port_observation::ObservationRecord;
+
+    let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+    let bridge = crate::hotspot_scene::HotspotBridge::default();
+    harness.server.state.install_hotspot_bridge(bridge.clone());
+    assert_eq!(bridge.view().discovery, None, "off unless the shell asks");
+    let config = corner::CornerConfig {
+        discovery: true,
+        ..corner::CornerConfig::default()
+    };
+    harness.server.state.apply_corner_config(config);
+    let view = bridge.view();
+    let since = view.discovery.expect("discovery blink running");
+    assert_eq!(
+        view.frame(since).len(),
+        view.squares.len(),
+        "every hotspot blinks"
+    );
+    drain_observations(&observations);
+
+    engage_top_left_corner(&mut harness);
+    let view = bridge.view();
+    assert_eq!(view.discovery, None, "the first reveal ends discovery");
+    assert_eq!(view.frame(since).len(), 1, "only the hover remains");
+    assert!(
+        drain_observations(&observations)
+            .iter()
+            .any(|record| matches!(
+                record,
+                ObservationRecord::PropsChanged {
+                    path,
+                    cause: "corner.entered",
+                    ..
+                } if path == "input.corners.discovery"
+            )),
+        "the leaf reports its own change"
+    );
+    // Re-arming restarts the blink; a later engagement ends it again.
+    route_pointer_to(&mut harness, 100.0, 100.0);
+    harness.server.state.apply_corner_config(config);
+    assert!(bridge.view().discovery.is_some());
 }
 
 #[cfg(feature = "bus")]
@@ -30495,13 +30689,15 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
 
     for (path, value, old) in [
         ("input.corners.enabled", json!(false), json!(true)),
-        ("input.corners.deadzone_px", json!(24.5), json!(12.0)),
+        ("input.corners.deadzone_px", json!(24.5), json!(10.0)),
         ("input.corners.dwell_ms", json!(250), json!(200)),
         (
             "input.corners.velocity_max_px_s",
             json!(900.0),
             json!(1500.0),
         ),
+        ("input.corners.affordance", json!(false), json!(true)),
+        ("input.corners.discovery", json!(true), json!(false)),
     ] {
         let set = ingress
             .request_set(path.to_string(), value.clone())
