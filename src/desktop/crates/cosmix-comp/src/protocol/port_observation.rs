@@ -92,7 +92,6 @@ pub(crate) enum ValidatedCornerValue {
     Enabled(bool),
     DeadzonePx(f64),
     DwellMs(u64),
-    HoldMs(u64),
     VelocityMaxPxS(f64),
 }
 
@@ -169,6 +168,7 @@ pub(crate) enum ObservationRecord {
         dwell_ms: u64,
         button: &'static str,
         kind: &'static str,
+        modifiers: Vec<&'static str>,
         event_seq: u64,
     },
 }
@@ -215,6 +215,7 @@ impl ObservationRecord {
                 dwell_ms,
                 button,
                 kind,
+                modifiers,
                 event_seq,
             } => json!({
                 "output": output,
@@ -222,6 +223,7 @@ impl ObservationRecord {
                 "dwell_ms": dwell_ms,
                 "button": button,
                 "kind": kind,
+                "modifiers": modifiers,
                 "event_seq": event_seq,
             })
             .to_string(),
@@ -638,7 +640,7 @@ struct CornerPress {
     corner: Corner,
     dwell_ms: u64,
     position: (f64, f64),
-    hold_deadline_ms: Option<u64>,
+    modifiers: Vec<&'static str>,
 }
 
 impl ObservationState {
@@ -910,14 +912,23 @@ impl WaylandState {
             && (button == super::PRIMARY_POINTER_BUTTON
                 || button == super::PRIMARY_POINTER_BUTTON + 1)
         {
-            let now_ms = self.corner_now_ms();
+            // Read calloop-owned keyboard state now; release may have different modifiers.
+            let state = self.keyboard.modifier_state();
+            let modifiers = [
+                (state.shift, "shift"),
+                (state.ctrl, "ctrl"),
+                (state.alt, "alt"),
+                (state.logo, "super"),
+            ]
+            .into_iter()
+            .filter_map(|(active, name)| active.then_some(name))
+            .collect();
             Some(CornerPress {
                 output,
                 corner,
                 dwell_ms,
                 position: self.cursor_position,
-                hold_deadline_ms: (button == super::PRIMARY_POINTER_BUTTON + 1)
-                    .then_some(now_ms.saturating_add(self.observations.corner_config.hold_ms)),
+                modifiers,
             })
         } else {
             None
@@ -944,14 +955,10 @@ impl WaylandState {
             self.sample_corner_motion(position, region, (0.0, 0.0));
         }
         if let Some(Some(press)) = self.observations.corner_presses.remove(&button) {
-            self.emit_corner_action(press, button, "brief");
+            self.emit_corner_action(press, button);
         }
         self.rearm_corner_timer();
         true
-    }
-
-    fn corner_now_ms(&self) -> u64 {
-        u64::try_from(self.observations.corner_clock.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     fn cancel_corner_presses(&mut self) {
@@ -961,28 +968,20 @@ impl WaylandState {
     }
 
     fn service_corner_presses(&mut self, position: (f64, f64)) {
-        let now_ms = self.corner_now_ms();
         let deadzone = self.observations.corner_config.deadzone_px;
-        let mut held = None;
-        for (&button, action) in &mut self.observations.corner_presses {
+        for action in self.observations.corner_presses.values_mut() {
             let Some(press) = action else { continue };
             if (position.0 - press.position.0).hypot(position.1 - press.position.1) > deadzone {
                 *action = None;
-            } else if press
-                .hold_deadline_ms
-                .is_some_and(|deadline| now_ms >= deadline)
-            {
-                held = action.take().map(|press| (button, press));
             }
-        }
-        if let Some((button, press)) = held {
-            self.emit_corner_action(press, button, "hold");
         }
     }
 
-    fn emit_corner_action(&mut self, press: CornerPress, button: u32, kind: &'static str) {
+    fn emit_corner_action(&mut self, press: CornerPress, button: u32) {
         let left = button == super::PRIMARY_POINTER_BUTTON;
-        if left {
+        // The decoder canonicalises unmodified LMB v2 to the legacy sequence.
+        // Every such click needs its sibling; every modified click is standalone.
+        if left && press.modifiers.is_empty() {
             self.emit_corner_clicked(press.output.clone(), press.corner, press.dwell_ms);
         }
         self.observations
@@ -991,7 +990,8 @@ impl WaylandState {
                 corner: press.corner,
                 dwell_ms: press.dwell_ms,
                 button: if left { "left" } else { "right" },
-                kind,
+                kind: "brief",
+                modifiers: press.modifiers,
                 event_seq,
             });
     }
@@ -1148,18 +1148,7 @@ impl WaylandState {
     }
 
     fn rearm_corner_timer(&mut self) {
-        let deadline = self
-            .observations
-            .corner_detector
-            .next_deadline_ms()
-            .into_iter()
-            .chain(
-                self.observations
-                    .corner_presses
-                    .values()
-                    .filter_map(|action| action.as_ref().and_then(|press| press.hold_deadline_ms)),
-            )
-            .min();
+        let deadline = self.observations.corner_detector.next_deadline_ms();
         if deadline == self.observations.corner_timer_deadline_ms
             && self.observations.corner_timer.is_some()
         {
@@ -3234,12 +3223,6 @@ pub(crate) fn validate_corner_value(
             };
             Ok(ValidatedCornerValue::DwellMs(value))
         }
-        "input.corners.hold_ms" => {
-            let Some(value) = value.as_u64().filter(|value| (1..=5_000).contains(value)) else {
-                return Err(invalid_value(path, "integer", "1..=5000"));
-            };
-            Ok(ValidatedCornerValue::HoldMs(value))
-        }
         "input.corners.velocity_max_px_s" => {
             let value = finite_number(path, value, "finite number", "1.0..=20000.0")?;
             if !(1.0..=20_000.0).contains(&value) {
@@ -3271,11 +3254,6 @@ fn apply_corner_value(
         ValidatedCornerValue::DwellMs(value) => {
             let old = config.dwell_ms;
             config.dwell_ms = value;
-            (PropValue::U64(old), PropValue::U64(value))
-        }
-        ValidatedCornerValue::HoldMs(value) => {
-            let old = config.hold_ms;
-            config.hold_ms = value;
             (PropValue::U64(old), PropValue::U64(value))
         }
         ValidatedCornerValue::VelocityMaxPxS(value) => {
@@ -3920,14 +3898,19 @@ mod tests {
     }
 
     #[test]
-    fn corner_clicked_v2_wire_has_button_and_kind_without_changing_legacy() {
-        for (button, kind) in [("left", "brief"), ("right", "brief"), ("right", "hold")] {
+    fn corner_clicked_v2_wire_has_press_modifiers_even_when_empty() {
+        for (button, modifiers) in [
+            ("left", vec![]),
+            ("left", vec!["shift", "ctrl", "alt", "super"]),
+            ("right", vec![]),
+        ] {
             let record = ObservationRecord::CornerClickedV2 {
                 output: "o_nested".into(),
                 corner: Corner::BottomRight,
                 dwell_ms: 217,
                 button,
-                kind,
+                kind: "brief",
+                modifiers: modifiers.clone(),
                 event_seq: 42,
             };
             let wire = record.wire();
@@ -3938,7 +3921,8 @@ mod tests {
                 serde_json::from_str::<Value>(&wire.body).unwrap(),
                 json!({
                     "output": "o_nested", "corner": "br", "dwell_ms": 217,
-                    "button": button, "kind": kind, "event_seq": 42,
+                    "button": button, "kind": "brief", "modifiers": modifiers,
+                    "event_seq": 42,
                 })
             );
         }
@@ -4100,8 +4084,6 @@ mod tests {
             ("input.corners.deadzone_px", json!(256.0)),
             ("input.corners.dwell_ms", json!(0)),
             ("input.corners.dwell_ms", json!(5_000)),
-            ("input.corners.hold_ms", json!(1)),
-            ("input.corners.hold_ms", json!(5_000)),
             ("input.corners.velocity_max_px_s", json!(1.0)),
             ("input.corners.velocity_max_px_s", json!(20_000.0)),
         ] {
@@ -4115,15 +4097,26 @@ mod tests {
             ("input.corners.deadzone_px", json!("12")),
             ("input.corners.dwell_ms", json!(1.5)),
             ("input.corners.dwell_ms", json!(-1)),
-            ("input.corners.hold_ms", json!(0)),
-            ("input.corners.hold_ms", json!(5_001)),
-            ("input.corners.hold_ms", json!(1.5)),
             ("input.corners.velocity_max_px_s", json!(null)),
         ] {
             assert!(matches!(
                 validate_corner_value(path, &value),
                 Err(SetValidationError::InvalidValue { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn corner_hold_property_is_unknown() {
+        for value in [json!(0), json!(500), json!(5_001), json!(1.5)] {
+            assert_eq!(
+                validate_corner_value("input.corners.hold_ms", &value),
+                Err(SetValidationError::UnknownPath)
+            );
+            assert_eq!(
+                validate_set_request("input.corners.hold_ms", &value),
+                Err(SetValidationError::UnknownPath)
+            );
         }
     }
 

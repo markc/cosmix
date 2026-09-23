@@ -29623,6 +29623,7 @@ fn port_corner_clicked_requires_engaged_left_release() {
             dwell_ms,
             button: "left",
             kind: "brief",
+            modifiers: vec![],
             event_seq: entered_seq + 2,
         }
     );
@@ -29654,6 +29655,138 @@ fn port_corner_clicked_requires_engaged_left_release() {
 
 #[cfg(feature = "bus")]
 #[test]
+fn port_corner_captures_modifiers_at_press_and_suppresses_every_modified_legacy() {
+    use port_observation::ObservationRecord;
+
+    for keys in [
+        vec![(50, "shift")],
+        vec![(37, "ctrl")],
+        vec![(64, "alt")],
+        vec![(133, "super")],
+        vec![(50, "shift"), (37, "ctrl"), (64, "alt"), (133, "super")],
+    ] {
+        for modified_at_press in [true, false] {
+            for button in [PRIMARY_POINTER_BUTTON, PRIMARY_POINTER_BUTTON + 1] {
+                let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+                route_pointer_to(&mut harness, 5.0, 5.0);
+                harness
+                    .server
+                    .event_loop
+                    .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+                    .unwrap();
+                assert!(harness.server.state.corner_engaged());
+                if modified_at_press {
+                    for &(code, _) in &keys {
+                        harness.server.state.handle_host_input(HostInput::Key {
+                            keycode: Keycode::new(code),
+                            state: HostButtonState::Pressed,
+                            time: 1,
+                        });
+                    }
+                }
+                drain_observations(&observations);
+                route_pointer_button(&mut harness, button, ButtonState::Pressed);
+                assert!(drain_observations(&observations).is_empty());
+                for &(code, _) in &keys {
+                    harness.server.state.handle_host_input(HostInput::Key {
+                        keycode: Keycode::new(code),
+                        state: if modified_at_press {
+                            HostButtonState::Released
+                        } else {
+                            HostButtonState::Pressed
+                        },
+                        time: 2,
+                    });
+                }
+                drain_observations(&observations);
+                route_pointer_button(&mut harness, button, ButtonState::Released);
+                let records = drain_observations(&observations);
+                let paired = button == PRIMARY_POINTER_BUTTON && !modified_at_press;
+                assert_eq!(records.len(), if paired { 2 } else { 1 });
+                assert_eq!(
+                    records
+                        .iter()
+                        .any(|r| matches!(r, ObservationRecord::CornerClicked { .. })),
+                    paired
+                );
+                let expected: Vec<_> = if modified_at_press {
+                    keys.iter().map(|&(_, name)| name).collect()
+                } else {
+                    vec![]
+                };
+                let body: Value =
+                    serde_json::from_str(&records.last().unwrap().wire().body).unwrap();
+                assert_eq!(body["modifiers"], json!(expected));
+                assert_eq!(body["kind"], "brief");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
+fn port_corner_unmodified_left_keeps_consecutive_siblings_in_both_delivery_orders() {
+    use port_observation::ObservationRecord;
+
+    for v2_first in [false, true] {
+        let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
+        route_pointer_to(&mut harness, 5.0, 5.0);
+        harness
+            .server
+            .event_loop
+            .dispatch(Some(Duration::from_millis(250)), &mut harness.server.state)
+            .unwrap();
+        assert!(harness.server.state.corner_engaged());
+        drain_observations(&observations);
+        // Seed a preceding standalone click: suppressing the next legacy sibling
+        // would make the decoder's v2 seq-1 collide with this record.
+        route_pointer_button(
+            &mut harness,
+            PRIMARY_POINTER_BUTTON + 1,
+            ButtonState::Pressed,
+        );
+        route_pointer_button(
+            &mut harness,
+            PRIMARY_POINTER_BUTTON + 1,
+            ButtonState::Released,
+        );
+        let previous = drain_observations(&observations);
+        assert_eq!(previous.len(), 1);
+        let mut last = previous[0].event_seq();
+        let mut producer_sequence = last;
+        for _ in 0..2 {
+            route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+            route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+            let records = drain_observations(&observations);
+            assert_eq!(
+                records.len(), 2,
+                "every unmodified LMB needs its legacy sibling"
+            );
+            assert!(matches!(records[0], ObservationRecord::CornerClicked { .. }));
+            assert!(matches!(&records[1], ObservationRecord::CornerClickedV2 {
+                button: "left", kind: "brief", modifiers, ..
+            } if modifiers.is_empty()));
+            assert_eq!(records[0].event_seq(), producer_sequence + 1);
+            assert_eq!(records[1].event_seq(), producer_sequence + 2);
+            let order = if v2_first { [1, 0] } else { [0, 1] };
+            let mut accepted = 0;
+            for index in order {
+                // Pin the producer side of chunk 4's payload-based pairing contract.
+                let canonical = records[index].event_seq() - u64::from(index == 1);
+                if canonical > last {
+                    accepted += 1;
+                    last = canonical;
+                }
+            }
+            assert_eq!(accepted, 1);
+            // The next producer allocation follows the v2 record, not its canonical ID.
+            producer_sequence = records[1].event_seq();
+        }
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
 fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
     use port_observation::ObservationRecord;
 
@@ -29676,10 +29809,7 @@ fn port_corner_consumes_client_buttons_and_cancels_release_tails() {
                     ..TestLayerSpec::default()
                 },
             );
-            let mut config = corner::CornerConfig {
-                hold_ms: 5_000,
-                ..corner::CornerConfig::default()
-            };
+            let mut config = corner::CornerConfig::default();
             harness.server.state.apply_corner_config(config);
             route_pointer_to(&mut harness, 1.0, 1.0);
             harness.sync();
@@ -29775,15 +29905,10 @@ fn port_corner_does_not_steal_release_of_a_client_press() {
 
 #[cfg(feature = "bus")]
 #[test]
-fn port_corner_rmb_hold_timer_fires_once_and_lmb_never_holds() {
+fn port_corner_neither_button_holds_and_both_act_on_release() {
     use port_observation::ObservationRecord;
 
     let (mut harness, _ingress, observations) = KeybindingHarness::new_with_port();
-    let config = corner::CornerConfig {
-        hold_ms: 20,
-        ..corner::CornerConfig::default()
-    };
-    harness.server.state.apply_corner_config(config);
     route_pointer_to(&mut harness, 5.0, 5.0);
     harness
         .server
@@ -29802,32 +29927,29 @@ fn port_corner_rmb_hold_timer_fires_once_and_lmb_never_holds() {
         PRIMARY_POINTER_BUTTON + 1,
         ButtonState::Pressed,
     );
-    assert!(harness.server.state.corner_timer_probe().0.is_some());
+    assert!(harness.server.state.corner_timer_probe().0.is_none());
     harness
         .server
         .event_loop
-        .dispatch(Some(Duration::from_millis(100)), &mut harness.server.state)
+        .dispatch(Some(Duration::from_millis(600)), &mut harness.server.state)
         .unwrap();
-    let records = drain_observations(&observations);
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        records[0],
-        ObservationRecord::CornerClickedV2 {
-            button: "right",
-            kind: "hold",
-            ..
-        }
-    ));
+    assert!(drain_observations(&observations).is_empty());
     assert!(harness.server.state.corner_timer_probe().0.is_none());
     route_pointer_button(
         &mut harness,
         PRIMARY_POINTER_BUTTON + 1,
         ButtonState::Released,
     );
-    assert!(
-        drain_observations(&observations).is_empty(),
-        "no brief after hold"
-    );
+    let records = drain_observations(&observations);
+    assert_eq!(records.len(), 1);
+    assert!(matches!(
+        records[0],
+        ObservationRecord::CornerClickedV2 {
+            button: "right",
+            kind: "brief",
+            ..
+        }
+    ));
     route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     let records = drain_observations(&observations);
     assert_eq!(records.len(), 2);
@@ -30368,7 +30490,6 @@ fn port_watch_and_set_share_the_stable_service_point_and_sequence() {
         ("input.corners.enabled", json!(false), json!(true)),
         ("input.corners.deadzone_px", json!(24.5), json!(12.0)),
         ("input.corners.dwell_ms", json!(250), json!(200)),
-        ("input.corners.hold_ms", json!(750), json!(500)),
         (
             "input.corners.velocity_max_px_s",
             json!(900.0),
