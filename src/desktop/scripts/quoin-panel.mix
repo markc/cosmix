@@ -12,9 +12,11 @@
 --
 -- All four are registered sub-panels (shell refactor phase 1): mounting a
 -- document registers its name (scene-<name>) on its edge, so every scene is
--- mounted at startup and again whenever a fresh host is detected (revision
--- 1). A closed popup keeps its registration and its content -- only its
--- edge is released. Opening selects the page, reveals it
+-- mounted at startup and again whenever a fresh host is detected (panel
+-- revision 1); a refused mount is retried on the next panel render. A closed
+-- popup keeps its registration and its content, which stays current (the
+-- shell can reveal a registered page itself) -- only its edge is released.
+-- Opening selects the page, reveals it
 -- (shell.panel.show) and pins the edge (the legacy pin still reserves the
 -- popup's space); phase 2 replaces that with named activation.
 --
@@ -58,7 +60,11 @@ $state = {
   query: "", category: "", apps: [], apps_loaded: false,
   cal_offset: 0, icons: {},
   popup_gen: 0, clock_running: false, peek_busy: false, dirty: false, scheduled: false,
-  popups_registered: false
+  -- per-page registration (a load the host accepted, revision > 0), the
+  -- register pass in flight, and whether this host generation has selected
+  -- and pinned the taskbar page yet
+  reg_launcher: false, reg_calendar: false, reg_notes: false,
+  registering: false, panel_shown: false
 }
 
 fn note($line)
@@ -83,9 +89,9 @@ fn rpc($target, $verb, $payload)
 end
 
 -- Load a document; returns the host's revision for it (0 = refused or no
--- host). Revisions only restart at 1 when the HOST restarts, so revision 1
--- is how the panel notices a Quoin restart, re-registers its sub-panels and
--- re-pins itself.
+-- host). The host counts revisions per scene NAME and restarts them at 1
+-- only when the HOST restarts (a citizen restart continues mid-stream), so
+-- revision 1 of the panel is how the panel notices a Quoin restart.
 fn load_scene($doc)
   send $HOST shell.scene.load body=$doc timeout=5
   if $rc != 0 then
@@ -112,18 +118,27 @@ fn panel_verb($verb, $edge, $id)
   return $rc
 end
 
--- Select a scene page on its edge and pin that edge open. scene.load replies
--- before the host's next frame mounts a NEW page, so the first select can
--- race the mount ("unknown page id"); retry it briefly -- a bounded wait on
--- the effect of our own command, not a poll of anyone's state.
-fn show_page($edge, $page)
+-- Select a scene page on its edge; true once the host accepted it. scene.load
+-- replies before the host's next frame mounts a NEW page, so the first select
+-- can race the mount ("unknown page id"); retry it briefly -- a bounded wait
+-- on the effect of our own command, not a poll of anyone's state.
+fn select_page($edge, $page)
   $tries = 0
   while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then break end
+    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then return true end
     $tries = $tries + 1
     sleep(0.05)
   end
+  note("page.set " .. $edge .. " " .. $page .. " never accepted")
+  return false
+end
+
+-- Select a scene page and pin its edge open; false (nothing pinned) when the
+-- page could not be selected, so the wrong page is never pinned.
+fn show_page($edge, $page)
+  if not select_page($edge, $page) then return false end
   panel_verb("shell.panel.pin", $edge, nil)
+  return true
 end
 
 -- Legacy Bus unpin releases BOTH Pinned and Docked. This is also the
@@ -591,32 +606,64 @@ fn notes_doc()
 end
 
 -- ── rebuilds ────────────────────────────────────────────────────────────
--- Mount every popup document once per host generation: mounting is what
--- registers a sub-panel's name on its edge, so this is the register-at-
--- startup pass -- at init, after a citizen restart (the host's revision
--- counter is then mid-stream, so render_panel's revision-1 branch cannot
--- carry it) and after a host restart wiped the scene store. Content mounted
--- here is whatever $state holds; the open render passes refresh it. A
--- refused document (host down, diagnostics) leaves that name unregistered
--- until its open handler's own load retries it.
-fn register_popups()
+-- Record the outcome of a popup load: mounting is what registers a
+-- sub-panel's name on its edge, so a load the host accepted (revision > 0)
+-- is the registration. A refused one is logged and retried by the next
+-- render_panel's register pass.
+fn mark_loaded($name, $rev)
+  if $rev > 0 then
+    $state["reg_" .. $name] = true
+  else
+    note($name .. " registration refused; retried on the next panel render")
+  end
+  return $rev
+end
+
+fn all_registered()
+  return $state.reg_launcher and $state.reg_calendar and $state.reg_notes
+end
+
+-- Content-only loads: while a page is registered its content is kept
+-- current whether or not its popup is open, because the shell can reveal a
+-- registered page on its own (corner, chevrons) and it must never show stale
+-- content or dead controls. Only the reveal and pin are gated on *_open.
+fn load_launcher()
   fetch_apps()
+  return mark_loaded("launcher", load_scene(launcher_doc()))
+end
+
+fn load_calendar()
+  return mark_loaded("calendar", load_scene(calendar_doc()))
+end
+
+-- From $state.notes as it stands; render_notes refetches first.
+fn load_notes()
+  $doc = ""
   try
-    load_scene(launcher_doc())
+    $doc = notes_doc()
   catch $e
-    note("launcher registration failed: " .. to_string($e))
+    note("notes_doc failed: " .. to_string($e))
+    return 0
   end
+  return mark_loaded("notes", load_scene($doc))
+end
+
+-- The register pass: mount every popup page not yet registered in this host
+-- generation -- at init, after a citizen restart, after a host restart wiped
+-- the scene store, and again for any name a previous pass could not get
+-- accepted. Loads are idempotent same-owner updates, so the in-flight guard
+-- only saves duplicate work when renders overlap across a yield.
+fn register_popups()
+  if $state.registering then return end
+  $state.registering = true
   try
-    load_scene(calendar_doc())
+    if not $state.reg_launcher then load_launcher() end
+    if not $state.reg_calendar then load_calendar() end
+    if not $state.reg_notes then load_notes() end
   catch $e
-    note("calendar registration failed: " .. to_string($e))
+    note("popup registration failed: " .. to_string($e))
   end
-  try
-    load_scene(notes_doc())
-  catch $e
-    note("notes registration failed: " .. to_string($e))
-  end
-  $state.popups_registered = true
+  $state.registering = false
 end
 
 fn render_panel()
@@ -624,21 +671,27 @@ fn render_panel()
   if $rev == 0 then return end
   if $rev == 1 then
     -- A host that has never seen us: its scene store is empty and every
-    -- registration of ours went with it. Re-register, then select and pin
-    -- the taskbar page as before.
-    $state.popups_registered = false
-    register_popups()
-    show_page("bottom", "scene-panel")
-  elif not $state.popups_registered then
-    register_popups()
+    -- registration of ours went with it.
+    $state.reg_launcher = false
+    $state.reg_calendar = false
+    $state.reg_notes = false
+    $state.panel_shown = false
+  end
+  if not all_registered() then register_popups() end
+  -- First render of this citizen life or host generation: select and pin the
+  -- taskbar page. Keyed on our own flag, not revision 1 -- the revision
+  -- counter is per scene name and survives a citizen-only restart.
+  if not $state.panel_shown then
+    if show_page("bottom", "scene-panel") then $state.panel_shown = true end
   end
 end
 
 -- Popups are opened and closed by click handlers while async rebuilds are in
 -- flight, and every Bus call is a yield point. Each open/close bumps
 -- popup_gen; a render captures it first and re-checks it (and its own open
--- flag) after every yield, so a rebuild that started before a close can
--- never load or pin a popup the user has since closed.
+-- flag) after every yield of the reveal, so a rebuild that started before a
+-- close can never reveal or pin a popup the user has since closed. Loading
+-- its content is harmless: a mount registers, it never reveals.
 fn popup_live($flag, $gen)
   return $state[$flag] and $state.popup_gen == $gen
 end
@@ -647,38 +700,26 @@ fn bump_popups()
   $state.popup_gen = $state.popup_gen + 1
 end
 
+-- Refresh a page's content, then reveal and pin it only if its popup is
+-- still open in the generation captured before the first yield. A refused
+-- load (0) reveals nothing: the edge's current page would be the one shown.
 fn render_launcher()
-  if not $state.launcher_open then return end
   $gen = $state.popup_gen
-  fetch_apps()
-  if not popup_live("launcher_open", $gen) then return end
-  $doc = launcher_doc()
-  if not popup_live("launcher_open", $gen) then return end
-  load_scene($doc)
-  if popup_live("launcher_open", $gen) then show_popup("left", "scene-launcher", "launcher_open", $gen) end
+  $rev = load_launcher()
+  if $rev > 0 and popup_live("launcher_open", $gen) then show_popup("left", "scene-launcher", "launcher_open", $gen) end
 end
 
 fn render_calendar()
-  if not $state.calendar_open then return end
   $gen = $state.popup_gen
-  load_scene(calendar_doc())
-  if popup_live("calendar_open", $gen) then show_popup("right", "scene-calendar", "calendar_open", $gen) end
+  $rev = load_calendar()
+  if $rev > 0 and popup_live("calendar_open", $gen) then show_popup("right", "scene-calendar", "calendar_open", $gen) end
 end
 
 fn render_notes()
-  if not $state.notes_open then return end
   $gen = $state.popup_gen
   fetch_notes()
-  if not popup_live("notes_open", $gen) then return end
-  $doc = ""
-  try
-    $doc = notes_doc()
-  catch $e
-    note("notes_doc failed: " .. to_string($e))
-    return
-  end
-  load_scene($doc)
-  if popup_live("notes_open", $gen) then show_popup("right", "scene-notes", "notes_open", $gen) end
+  $rev = load_notes()
+  if $rev > 0 and popup_live("notes_open", $gen) then show_popup("right", "scene-notes", "notes_open", $gen) end
 end
 
 -- ── popup edge pins: ours, recorded ────────────────────────────────────
@@ -715,21 +756,32 @@ end
 -- and the legacy pin behind it reserves the popup's space. The
 -- page.set/show/pin sends are yield points too: re-check the popup is still
 -- live after each, and if a close landed meanwhile, undo the pin instead of
--- leaving a closed popup pinned open.
+-- leaving a closed popup pinned open. A page the host never accepted is not
+-- revealed or pinned at all: that would show whatever page the edge holds.
 fn show_popup($edge, $page, $flag, $gen)
+  $selected = false
+  $tries = 0
+  while $tries < 20
+    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then
+      $selected = true
+      break
+    end
+    $tries = $tries + 1
+    sleep(0.05)
+    if not popup_live($flag, $gen) then return end
+  end
+  if not $selected then
+    note("page.set " .. $edge .. " " .. $page .. " never accepted; popup not revealed")
+    return
+  end
+  if not popup_live($flag, $gen) then return end
+  -- Record the pin before making it, so a crash between the two still
+  -- leaves the recovery pass something to release.
   $pins = read_pins()
   if index_of($pins, $edge) < 0 then
     push($pins, $edge)
     write_pins($pins)
   end
-  $tries = 0
-  while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then break end
-    $tries = $tries + 1
-    sleep(0.05)
-    if not popup_live($flag, $gen) then return end
-  end
-  if not popup_live($flag, $gen) then return end
   panel_verb("shell.panel.show", $edge, nil)
   if not popup_live($flag, $gen) then return end
   panel_verb("shell.panel.pin", $edge, nil)
@@ -795,7 +847,9 @@ fn schedule()
       fetch_tray()
       fetch_notes()
       render_panel()
-      if $state.notes_open then render_notes() end
+      -- registered, so kept current even while closed (the shell can
+      -- reveal it through the corner); already fetched above
+      if $state.notes_open then render_notes() else load_notes() end
     end
   catch $err
     note("rebuild failed: " .. to_string($err))
@@ -1033,7 +1087,7 @@ fn peek_toggle()
   end
 end
 
-on panel.refresh desc "rebuild every open scene now"
+on panel.refresh desc "rebuild every scene now (reveals only the open popup)"
   reply(0, "")
   fetch_windows()
   fetch_tray()
@@ -1070,8 +1124,8 @@ on notification.closed async
   schedule()
 end
 
--- The clock: wake on each minute boundary and redraw the panel (and the
--- calendar header when it is open) -- one wake per minute. A second kick is
+-- The clock: wake on each minute boundary and redraw the panel and the
+-- calendar page (the notifications page every fifth) -- one wake per minute. A second kick is
 -- ignored so a stray clock.run cannot start a second loop.
 on clock.run async
   if $state.clock_running then return end
@@ -1087,15 +1141,16 @@ on clock.run async
         rpc($COMP, "comp.props.watch", {})
         fetch_windows()
         fetch_tray()
-        fetch_notes()
-        if $state.notes_open then render_notes() end
+        render_notes()
         -- a release that failed while Quoin was down is retried here
         for each $edge in read_pins()
           if not edge_in_use($edge) then hide_popup($edge) end
         end
       end
       render_panel()
-      if $state.calendar_open then render_calendar() end
+      -- the calendar's "today" and header clock stay current while it is
+      -- registered, open or not; it is revealed only while open
+      render_calendar()
     catch $e
       note("clock tick failed: " .. to_string($e))
     end
