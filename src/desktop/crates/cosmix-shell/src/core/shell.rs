@@ -192,9 +192,11 @@ impl ShellModel {
     /// it back (see [`PanelStateMachine::set_holder_plane`]). The grace given to
     /// [`ShellModel::new`] only applies while the plane is inactive: the dev
     /// host and a compositor that does not report the plane.
-    pub fn set_holder_plane(&mut self, available: bool) {
+    /// `at` is when the capability changed; a fall back to local rules gives
+    /// an unheld reveal its full grace from then.
+    pub fn set_holder_plane(&mut self, available: bool, at: Duration) {
         for panel in &mut self.panels {
-            panel.set_holder_plane(available);
+            panel.set_holder_plane(available, at);
         }
     }
 

@@ -163,6 +163,18 @@ pub(crate) enum PointerHold {
     Lingering(Instant),
 }
 
+/// Focus restoration for one held popup (surface ids). Restoration happens
+/// only when the popup's own destruction moved focus and focus is still
+/// where that destruction put it; focus leaving the popup while it lives is a
+/// deliberate move and cancels the restoration.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PopupRestore {
+    /// The focus the popup displaced when it took focus; `None` until then.
+    pub(crate) prior: Option<u64>,
+    /// Where focus went when the popup's destruction moved it.
+    pub(crate) fallback: Option<Option<u64>>,
+}
+
 /// What comp observed of one panel at a stable dispatch boundary.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Membership {
@@ -893,9 +905,8 @@ pub(crate) struct ObservationState {
     pub(crate) conceal_deadline: Option<Instant>,
     #[cfg(test)]
     pub(crate) conceal_timer_arms: usize,
-    /// Popup layer -> the keyboard focus it displaced (surface ids), restored
-    /// when the popup closes.
-    pub(crate) popup_restores: BTreeMap<u64, u64>,
+    /// Held popup layer (surface id) -> the focus to restore when it closes.
+    pub(crate) popup_restores: BTreeMap<u64, PopupRestore>,
     /// The latest keyboard focus change as `(to, from)` surface ids.
     last_focus_change: Option<(Option<u64>, Option<u64>)>,
     pointer_lease: PointerLease,
@@ -1661,6 +1672,11 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     service_panel_holders(state);
     service_surface_edges(state);
     service_focus_edge(state);
+    // After the focus edge, which records a closed popup's focus fallback;
+    // a restoration is itself a focus change, reported in this cycle.
+    if service_popup_restores(state) {
+        service_focus_edge(state);
+    }
     service_output_edges(state);
     service_property_diffs(state);
     match service_controls(state) {
@@ -1678,6 +1694,13 @@ pub(super) fn service_observations(state: &mut WaylandState) {
             service_output_edges(state);
             service_property_diffs(state);
         }
+    }
+    // Holder requests and Bus-driven focus or input changes were handled
+    // after the pass above tracked the holders: reconcile again before the
+    // loop sleeps, or a release that leaves a lingering pointer as the last
+    // holder (or a mode that retires a deadline) waits for an unrelated event.
+    if !state.observations.panel_holders.is_empty() {
+        track_panel_holders(state, Instant::now());
     }
     state.service_window_waiters();
     service_pointer(state);
@@ -1866,6 +1889,7 @@ fn service_focus_edge(state: &mut WaylandState) {
         state.mark_surface_dirty(SurfaceId(id), "wayland.focus");
     }
     state.observations.last_focus_change = Some((current.keyboard, previous.keyboard));
+    note_popup_focus(state, current.keyboard, previous.keyboard);
     state
         .observations
         .offer(|event_seq| ObservationRecord::FocusChanged {
@@ -3030,7 +3054,6 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
 /// deadline: armed when a lingering pointer becomes the last holder, cancelled
 /// when any holder returns. Nothing polls.
 fn service_panel_holders(state: &mut WaylandState) {
-    service_popup_restores(state);
     if state.observations.panel_holders.is_empty() {
         rearm_conceal_timer(state, None);
         return;
@@ -3174,34 +3197,55 @@ fn rearm_conceal_timer(state: &mut WaylandState, deadline: Option<Instant>) {
     }
 }
 
-/// A closed popup hands keyboard focus back to what it displaced (a toplevel
-/// or a layer such as the panel itself) — but only when its departure is
-/// what moved focus, which comp's own fallback would otherwise send to the
-/// top toplevel. Focus the user has since moved elsewhere is left alone.
-fn service_popup_restores(state: &mut WaylandState) {
+/// Popup bookkeeping for one reported keyboard focus change. A held popup
+/// taking focus records what it displaced; focus leaving a popup that still
+/// lives is a deliberate move and cancels its restoration; focus leaving a
+/// destroyed popup records where comp's fallback put it.
+fn note_popup_focus(state: &mut WaylandState, to: Option<u64>, from: Option<u64>) {
     if state.observations.popup_restores.is_empty() {
         return;
     }
-    let closed: Vec<(u64, u64)> = state
+    let from_alive = from.is_some_and(|id| layer_alive(state, SurfaceId(id)));
+    let restores = &mut state.observations.popup_restores;
+    if let Some(to) = to
+        && let Some(entry) = restores.get_mut(&to)
+        && entry.prior.is_none()
+    {
+        entry.prior = from;
+    }
+    if let Some(from) = from {
+        if from_alive {
+            restores.remove(&from);
+        } else if let Some(entry) = restores.get_mut(&from) {
+            entry.fallback = Some(to);
+        }
+    }
+}
+
+/// A closed popup hands keyboard focus back to what it displaced (a toplevel
+/// or a layer such as the panel itself) — only when its destruction is what
+/// moved focus and focus is still where comp's fallback put it (the top
+/// toplevel, or nothing). Runs after the focus edge, so the destruction's own
+/// focus change is already recorded; returns whether focus moved.
+fn service_popup_restores(state: &mut WaylandState) -> bool {
+    if state.observations.popup_restores.is_empty() {
+        return false;
+    }
+    let closed: Vec<(u64, PopupRestore)> = state
         .observations
         .popup_restores
         .iter()
         .filter(|(popup, _)| !layer_alive(state, SurfaceId(**popup)))
-        .map(|(popup, prior)| (*popup, *prior))
+        .map(|(popup, restore)| (*popup, *restore))
         .collect();
-    for (popup, prior) in closed {
+    let mut restored = false;
+    for (popup, restore) in closed {
         state.observations.popup_restores.remove(&popup);
+        let (Some(prior), Some(fallback)) = (restore.prior, restore.fallback) else {
+            continue;
+        };
         let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
-        let moved_by_popup = current.is_none()
-            || state
-                .observations
-                .pending_focus
-                .is_some_and(|start| start.keyboard == Some(popup))
-            || state
-                .observations
-                .last_focus_change
-                .is_some_and(|(to, from)| to == current && from == Some(popup));
-        if !moved_by_popup || current == Some(prior) {
+        if current != fallback || current == Some(prior) {
             continue;
         }
         let Some(surface) = state
@@ -3214,7 +3258,9 @@ fn service_popup_restores(state: &mut WaylandState) {
             continue;
         };
         state.arbitrate_keyboard_focus(Some(surface), false, false);
+        restored = true;
     }
+    restored
 }
 
 /// Resolve the exact namespace on the named output. Wayland object numbers
@@ -3253,23 +3299,27 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
     ControlReply::Body(json!({"accepted":true,"surface":request.surface}))
 }
 
-/// Remember the focus a popup displaced: exclusive keyboard layers take focus
-/// when they map, which is usually before their hold arrives, so the focus
-/// recorded is the one the popup's own mapping replaced.
+/// Start tracking the focus a popup displaces. An exclusive layer usually
+/// takes focus as it maps, before its hold arrives: the displaced focus is
+/// then the one its own focus change replaced. A popup without focus yet
+/// records what it displaces when it takes focus ([`note_popup_focus`]).
 fn record_popup_focus(state: &mut WaylandState, popup: SurfaceId) {
     let current = focus_surface_id(state, state.keyboard.current_focus()).map(|id| id.0);
-    let prior = if current == Some(popup.0) {
-        state
-            .observations
-            .last_focus_change
-            .filter(|(to, _)| *to == Some(popup.0))
-            .and_then(|(_, from)| from)
-    } else {
-        current
-    };
-    if let Some(prior) = prior.filter(|prior| *prior != popup.0) {
-        state.observations.popup_restores.entry(popup.0).or_insert(prior);
-    }
+    let prior = (current == Some(popup.0))
+        .then(|| {
+            state
+                .observations
+                .last_focus_change
+                .filter(|(to, _)| *to == Some(popup.0))
+                .and_then(|(_, from)| from)
+        })
+        .flatten()
+        .filter(|prior| *prior != popup.0);
+    state
+        .observations
+        .popup_restores
+        .entry(popup.0)
+        .or_insert(PopupRestore { prior, fallback: None });
 }
 
 fn service_set(

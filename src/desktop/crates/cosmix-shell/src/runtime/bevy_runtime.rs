@@ -127,7 +127,8 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     // replacement's factory builds a local model, which must not resume local
     // conceal timers while the compositor still drives reveal/conceal.
     let plane = world.resource::<ShellRuntime>().model.holder_plane();
-    model.set_holder_plane(plane);
+    let at = model.last_update();
+    model.set_holder_plane(plane, at);
     if let Some(declarations) = world.get_resource::<ShellPageDeclarations>() {
         for edge in Edge::ALL {
             model
@@ -399,7 +400,8 @@ fn update_model(
                 continue;
             }
             ShellCommandKind::HolderPlane(available) => {
-                runtime.model.set_holder_plane(*available);
+                let at = command.at.clamp(runtime.model.last_update(), now);
+                runtime.model.set_holder_plane(*available, at);
                 continue;
             }
             _ => {}

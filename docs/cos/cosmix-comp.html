@@ -1510,9 +1510,11 @@ hotspot, keeps it; leaving them all starts an 800 ms conceal delay that re-entry
 cancels. The focus holder is keyboard focus on the panel's layer or a held
 popup's. A held popup's layer being destroyed releases its hold at once, even
 before the client's release arrives; the popup hold also records the keyboard
-focus the popup displaced and, when the popup closes, restores it (toplevel or
-layer) unless focus has meanwhile moved somewhere other than comp's fallback.
-Membership is evaluated at the stable post-dispatch boundary, so a command is
+focus the popup displaced when it takes focus and restores it (toplevel or
+layer) only when the popup's destruction moved focus and focus is still where
+comp's fallback put it; focus moved off a live popup cancels the restoration.
+Membership is evaluated at the stable post-dispatch boundary, and again after
+the cycle's Bus controls, so a command is
 emitted only when an edge's verdict changes: <code>reveal</code> when the first holder
 arrives, <code>conceal</code> when the last leaves — at once for focus and popup, after the
 delay for the pointer. The delay is a single one-shot calloop timer, armed only

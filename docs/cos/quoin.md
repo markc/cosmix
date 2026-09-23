@@ -175,10 +175,16 @@ explicit `show`/`toggle`, which a repeated verdict does not end but a release
 after a hold (the pointer came and went) does. A deliberate hide from a
 persistent mode (`SetMode(Hidden)`, an unheld undock) latches against the
 compositor's verdict on the hidden report until it next reports the holders
-released, so a still-open menu cannot reopen the panel it just hid; a held
-unpin or undock keeps its reveal until that verdict. Going command-driven drops
+released, so a still-open menu cannot reopen the panel it just hid. Hide,
+Escape and toggle-off latch the same way while the compositor holds the edge,
+because a replayed hidden report (a registry receipt, a gap) restates its
+reveal. A held unpin or undock keeps its reveal until that verdict. Every mode
+change re-sends the edge's report even when it nets to the one comp last
+acknowledged (a pin and unpin in one pass, or both inside a retry backoff), so
+that verdict always comes. Going command-driven drops
 any local grace deadline, concealing at once a reveal the local membership no
-longer holds; going back to local rules re-arms grace for an unheld reveal. A
+longer holds; going back to local rules gives an unheld reveal its full grace
+from the moment of the change. A
 model replacement keeps the current driver.
 
 ## Event-driven wake contract
@@ -521,10 +527,14 @@ cancels. The **focus** holder is keyboard focus on the panel's layer or a held
 popup, released at once when focus moves elsewhere. The **popup** holder is the
 explicit `comp.panel.hold` Quoin sends for its corner menu, released at once by
 Quoin's release or by the menu layer's destruction, whichever comes first; comp
-records the keyboard focus the menu displaced (a toplevel or a layer such as the
-panel) and restores it when the menu closes, unless focus has since moved
-elsewhere. The one timer is a one-shot armed when a lingering pointer becomes
-the last holder and cancelled when any holder returns; nothing polls. Pinned and
+records the keyboard focus the menu displaced when it takes focus (a toplevel or
+a layer such as the panel) and restores it only when the menu's destruction is
+what moved focus and focus is still where comp's fallback put it; focus the
+user moved off the live menu is left alone. The one timer is a one-shot armed
+when a lingering pointer becomes the last holder and cancelled when any holder
+returns; comp reconciles holders and the timer again after handling holder
+requests in the same cycle, so a release never waits for an unrelated event.
+Nothing polls. Pinned and
 docked panels have no holders. The embedded host has no Wayland panel layers
 and does not install this standalone transport adapter.
 
@@ -582,7 +592,8 @@ end its local reveal hold and release its exclusive keyboard layer. Without the
 holder plane comp's existing policy then focuses the top toplevel; with it, the
 menu's popup holder returns focus to the surface the menu displaced. Pin and Dock
 apply before the local hold is released, so concealment cannot race the choice.
-Opening a menu at a hidden corner does not itself reveal the panel.
+Under local rules, opening a menu at a hidden corner does not itself reveal the
+panel; with the holder plane the menu's popup hold does.
 
 Both click topics are subscribed for old-compositor compatibility. Successful
 subscription is not capability discovery: the broker accepts unpublished topics.

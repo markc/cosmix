@@ -238,6 +238,14 @@ pub struct PanelStateMachine {
     shown: bool,
     /// A deliberate conceal the compositor's holders have not yet released:
     /// its reveals are ignored until it reports the holders released.
+    ///
+    /// This is THE command-driven (holder-plane) latch: set by a hide from a
+    /// persistent mode, and by Hide/Escape/toggle-off while the compositor
+    /// holds; cleared by `HolderConceal` and by any mode change. Chunk 20's
+    /// `hover_latched` stays local-only (set and cleared only in the unguarded
+    /// corner/pointer arms); at that merge the Hide/Escape arm becomes
+    /// `if plane { latch_deliberate_conceal } else { hover latch }` before
+    /// `conceal_now()`, and the snapshot's latch reads `hover_latched || latched`.
     latched: bool,
 }
 
@@ -339,6 +347,7 @@ impl PanelStateMachine {
                     && !self.menu_hold
                 {
                     // Mirrors Hide: persistent panels ignore both directions.
+                    self.latch_deliberate_conceal();
                     self.conceal_now();
                 }
             }
@@ -398,10 +407,9 @@ impl PanelStateMachine {
                 }
             }
             PanelInput::Hide | PanelInput::Escape => {
-                // Command-driven, no latch is needed: a compositor still
-                // holding the edge sends nothing until its holders release.
                 if self.mode == PanelMode::Hidden && self.resize_start.is_none() && !self.menu_hold
                 {
+                    self.latch_deliberate_conceal();
                     self.conceal_now();
                 }
             }
@@ -517,8 +525,9 @@ impl PanelStateMachine {
     /// the local hints still hold waits for the compositor's verdict (it
     /// re-states one for every hidden mode report the host replays), and one
     /// they no longer hold conceals at once. Going local resumes the normal
-    /// rules from the current membership, arming grace for an unheld reveal.
-    pub fn set_holder_plane(&mut self, available: bool) {
+    /// rules from the current membership, arming grace for an unheld reveal
+    /// from `at`, the moment of the change (never earlier than the last update).
+    pub fn set_holder_plane(&mut self, available: bool, at: Duration) {
         if self.holder_plane == available {
             return;
         }
@@ -535,7 +544,7 @@ impl PanelStateMachine {
                 let _ = self.settle_holders();
             }
         } else if !hinted && !self.shown && self.intro_until.is_none() {
-            self.arm_deadline(self.last_update, ConcealReason::Grace);
+            self.arm_deadline(at.max(self.last_update), ConcealReason::Grace);
         }
     }
 
@@ -698,6 +707,18 @@ impl PanelStateMachine {
         Some(PanelEffect::Conceal {
             reason: ConcealReason::Holders,
         })
+    }
+
+    /// Hide, Escape and toggle-off conceal without a mode change, but a
+    /// hidden mode report the host replays (a registry receipt, a gap) draws
+    /// the compositor's restated verdict — a reveal while the pointer still
+    /// rests in the hotspot or the layer keeps focus. Latch only while the
+    /// compositor holds: only then is its release, which clears the latch,
+    /// certain to arrive.
+    fn latch_deliberate_conceal(&mut self) {
+        if self.holder_plane && self.comp_held {
+            self.latched = true;
+        }
     }
 
     fn conceal_now(&mut self) {
@@ -1068,7 +1089,7 @@ mod intro_tests {
 
     fn commanded() -> PanelStateMachine {
         let mut panel = panel();
-        panel.set_holder_plane(true);
+        panel.set_holder_plane(true, Duration::ZERO);
         panel
     }
 
@@ -1153,6 +1174,25 @@ mod intro_tests {
         panel.apply(at, PanelInput::HolderConceal).unwrap();
         let update = panel.apply(at, PanelInput::HolderReveal).unwrap();
         assert!(update.snapshot.transient_revealed, "the next hold reveals again");
+        // Escape, Hide and toggle-off while comp holds: a replayed hidden
+        // report restates the reveal, which must not reopen the panel.
+        for hide in [PanelInput::Escape, PanelInput::Hide, PanelInput::Toggle] {
+            let mut panel = commanded();
+            panel.apply(at, PanelInput::HolderReveal).unwrap();
+            panel.apply(at, hide).unwrap();
+            assert!(!panel.snapshot().transient_revealed, "{hide:?}");
+            panel.apply(at, PanelInput::HolderReveal).unwrap();
+            assert!(!panel.snapshot().transient_revealed, "{hide:?}: restated reveal");
+            panel.apply(at, PanelInput::HolderConceal).unwrap();
+            panel.apply(at, PanelInput::HolderReveal).unwrap();
+            assert!(panel.snapshot().transient_revealed, "{hide:?}: a new hold reveals");
+        }
+        // Without a comp hold nothing is latched: no release would clear it.
+        let mut panel = commanded();
+        panel.apply(at, PanelInput::Reveal).unwrap();
+        panel.apply(at, PanelInput::Escape).unwrap();
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(panel.snapshot().transient_revealed, "the next dwell reveals");
         // A held undock is not deliberate concealment: it keeps its reveal,
         // counted as held, until the verdict on its hidden report arrives.
         let mut panel = commanded();
@@ -1185,24 +1225,27 @@ mod intro_tests {
         panel.apply(Duration::ZERO, PanelInput::CornerEntered).unwrap();
         panel.apply(Duration::ZERO, PanelInput::CornerLeft).unwrap();
         assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(800)));
-        panel.set_holder_plane(true);
+        panel.set_holder_plane(true, Duration::ZERO);
         assert_eq!(panel.snapshot().hide_at, None);
         assert!(!panel.snapshot().transient_revealed);
         // A reveal the local hints still hold waits for comp's verdict.
         let mut panel = panel_with_corner_held();
-        panel.set_holder_plane(true);
+        panel.set_holder_plane(true, Duration::ZERO);
         panel.tick(Duration::from_secs(10)).unwrap();
         assert!(panel.snapshot().transient_revealed);
         panel
             .apply(Duration::from_secs(10), PanelInput::HolderConceal)
             .unwrap();
         assert!(!panel.snapshot().transient_revealed);
-        // Falling back to local rules re-arms grace for an unheld reveal.
+        // Falling back to local rules re-arms full grace for an unheld reveal,
+        // from the moment of the fall back — not from the last idle update.
         let mut panel = commanded();
         panel.apply(Duration::ZERO, PanelInput::HolderReveal).unwrap();
-        panel.set_holder_plane(false);
-        assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(800)));
-        let update = panel.tick(Duration::from_millis(800)).unwrap();
+        panel.set_holder_plane(false, Duration::from_secs(5));
+        assert_eq!(panel.snapshot().hide_at, Some(Duration::from_millis(5800)));
+        let update = panel.tick(Duration::from_millis(5799)).unwrap();
+        assert!(update.snapshot.transient_revealed, "grace is not cut short");
+        let update = panel.tick(Duration::from_millis(5800)).unwrap();
         assert_eq!(
             update.effect,
             Some(PanelEffect::Conceal {
@@ -1213,7 +1256,7 @@ mod intro_tests {
         let mut panel = commanded();
         panel.apply(Duration::ZERO, PanelInput::PointerEntered).unwrap();
         panel.apply(Duration::ZERO, PanelInput::HolderReveal).unwrap();
-        panel.set_holder_plane(false);
+        panel.set_holder_plane(false, Duration::ZERO);
         assert_eq!(panel.snapshot().hide_at, None);
         panel
             .apply(Duration::from_secs(1), PanelInput::PointerLeft)
@@ -1261,7 +1304,7 @@ mod intro_tests {
             for mode in [PanelMode::Hidden, PanelMode::Pinned, PanelMode::Docked] {
                 for held in holders {
                     let mut panel = panel();
-                    panel.set_holder_plane(plane);
+                    panel.set_holder_plane(plane, Duration::ZERO);
                     panel.apply(Duration::ZERO, PanelInput::SetMode(mode)).unwrap();
                     for input in held {
                         panel.apply(Duration::ZERO, *input).unwrap();
@@ -1284,6 +1327,8 @@ mod intro_tests {
                             if mode == PanelMode::Docked { 100.0 } else { 0.0 },
                             "reservation untouched"
                         );
+                    } else {
+                        assert_eq!(update.snapshot.exclusive_zone_px, 0.0, "hover never reserves");
                     }
                 }
             }
