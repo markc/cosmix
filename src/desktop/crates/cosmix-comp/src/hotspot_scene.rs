@@ -132,8 +132,7 @@ impl HotspotBridge {
     pub(crate) fn set(&self, view: View) {
         *self.view.lock().unwrap_or_else(|p| p.into_inner()) = view;
         #[cfg(test)]
-        self.sets
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.sets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -147,7 +146,10 @@ impl HotspotBridge {
     }
 
     fn frame(&self, now: Instant) -> Vec<Quad> {
-        self.view.lock().unwrap_or_else(|p| p.into_inner()).frame(now)
+        self.view
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .frame(now)
     }
 }
 
@@ -272,10 +274,26 @@ mod tests {
     fn squares() -> Vec<Square> {
         // One 320x240 output: TL, TR, BL, BR.
         vec![
-            Square { x: 0.0, y: 0.0, side: SIDE },
-            Square { x: 310.0, y: 0.0, side: SIDE },
-            Square { x: 0.0, y: 230.0, side: SIDE },
-            Square { x: 310.0, y: 230.0, side: SIDE },
+            Square {
+                x: 0.0,
+                y: 0.0,
+                side: SIDE,
+            },
+            Square {
+                x: 310.0,
+                y: 0.0,
+                side: SIDE,
+            },
+            Square {
+                x: 0.0,
+                y: 230.0,
+                side: SIDE,
+            },
+            Square {
+                x: 310.0,
+                y: 230.0,
+                side: SIDE,
+            },
         ]
     }
 
