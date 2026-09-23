@@ -436,17 +436,33 @@ fn service_bus(
             );
             (rc, body, command)
         } else if request.command.starts_with("shell.settings.") {
-            let SceneBus {
-                config, schemes, ..
-            } = &mut content;
-            crate::settings::dispatch_verb(
-                &request,
-                &frame.0,
-                config,
-                &cosmix_config::cosmix_path(cosmix_config::CosmixDir::Etc).join("quoin/conf.mix"),
-                schemes,
-                time.elapsed(),
-            )
+            // The bridge drops stale epochs before dispatch; the same fence
+            // the scene and sub-panel verbs keep — a stale request must not
+            // spend a settings write (a live theme application, a conf.mix
+            // rewrite or a resize command).
+            if state
+                .live_generation
+                .is_some_and(|generation| generation != request.connection_generation)
+            {
+                (
+                    10,
+                    json!({"error":"settings request belongs to a stale Quoin connection"})
+                        .to_string(),
+                    None,
+                )
+            } else {
+                let SceneBus {
+                    config, schemes, ..
+                } = &mut content;
+                crate::settings::dispatch_verb(
+                    &request,
+                    &frame.0,
+                    config,
+                    &crate::config::conf_mix_path(),
+                    schemes,
+                    time.elapsed(),
+                )
+            }
         } else if request.command == "shell.debug.status" {
             (
                 0,
@@ -864,7 +880,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -1317,6 +1333,24 @@ mod tests {
             dispatch_shell_request(&request, &frame, std::time::Duration::ZERO).0,
             0
         );
+    }
+
+    /// `shell.info` is the discovery surface: a verb missing from its list is
+    /// a verb no script can find, so the settings verbs must be advertised.
+    #[test]
+    fn shell_info_lists_the_settings_verbs() {
+        let frame = test_frame();
+        let (rc, body, _) =
+            dispatch_shell_request(&request("shell.info"), &frame, Default::default());
+        assert_eq!(rc, 0);
+        let info: Value = serde_json::from_str(&body).unwrap();
+        let verbs = info["verbs"].as_array().expect("verbs is a list");
+        for verb in ["settings.scheme", "settings.motion", "settings.size"] {
+            assert!(
+                verbs.contains(&json!(verb)),
+                "shell.info must advertise {verb}; got {verbs:?}"
+            );
+        }
     }
 
     /// The filed defect (TODO-cos, 2026-09-20): `send "shell"
@@ -2537,6 +2571,57 @@ mod tests {
         );
         // Positive control: the same live, attested sender can still load.
         load_scene(&mut app, &peer, "accepted", "owner", "left");
+    }
+
+    /// The settings branch keeps the same stale-connection fence as the scene
+    /// and sub-panel verbs. The test bridge's committed generation stays 1,
+    /// so a request stamped 1 still drains after a `Connected` event for
+    /// generation 2 — exactly the leaked-epoch shape the fence exists for:
+    /// the request must be refused before `dispatch_verb`, spending no
+    /// settings write (here, no live theme application).
+    #[test]
+    fn settings_verbs_refuse_a_stale_quoin_connection() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        // Before any connection, the fence is open (no live generation to
+        // mismatch) and the write spends normally.
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<cosmix_shell::chrome::QuoinSchemeSelected>>()
+                .drain()
+                .count(),
+            1,
+            "the live request applied the theme"
+        );
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        peer.drain_calls();
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(
+            replies[0].body.contains("stale Quoin connection"),
+            "{}",
+            replies[0].body
+        );
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<cosmix_shell::chrome::QuoinSchemeSelected>>()
+                .drain()
+                .count(),
+            0,
+            "a stale settings request must not apply a theme"
+        );
     }
 
     /// Chunk-8 fixture: the sub-panel verbs address the process-wide

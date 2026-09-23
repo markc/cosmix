@@ -7,7 +7,10 @@
 //! whole shell; **slide is the only implementable mode** until the scene
 //! renderer can stack sibling documents in one rectangle — fade renders as a
 //! disabled option carrying [`FADE_UNAVAILABLE_REASON`], never a silent
-//! omission and never a workaround), and per-edge size steppers whose writes
+//! omission and never a workaround; the Slide/Fade marks mirror the INGESTED
+//! `carousel_motion`, so a hand-configured fade still shows Fade selected —
+//! it renders as slide, and config's ingest logs a `QUOIN_CONFIG` note
+//! saying so), and per-edge size steppers whose writes
 //! go through `ResizeCommit` — the exact command an edge-drag completion
 //! materialises, so the steppers edit the same remembered per-`(output,
 //! edge)` thickness the drag writes (one source of truth, panel doc §9).
@@ -156,8 +159,15 @@ fn maintain(
     if settings.retired {
         return;
     }
-    // Do not reserve a seat against the embedded host's placeholder output.
-    if frame.0.geometry.output.as_str().starts_with("wl-output-") {
+    // Do not reserve a seat against the embedded host's placeholder output
+    // (state.rs owns the namespace rule).
+    if frame
+        .0
+        .geometry
+        .output
+        .as_str()
+        .starts_with(crate::state::EPHEMERAL_OUTPUT_PREFIX)
+    {
         return;
     }
     let loaded = scenes
@@ -273,6 +283,23 @@ fn document(desired: &Rendered, citizen: &str, primary: &str) -> String {
     }
     let model = json!({
         "schemes": schemes, "sizes": sizes, "fade_reason": FADE_UNAVAILABLE_REASON,
+        // The marks mirror the INGESTED motion, fade included: a hand-edited
+        // conf.mix `carousel_motion: "fade"` selects Fade here (it still
+        // renders as slide; the QUOIN_CONFIG ingest note and the reason text
+        // below carry that), so the panel never claims Slide is configured
+        // when it is not.
+        "motion": {
+            "slide": if desired.motion == CarouselMotion::Slide {
+                "● Slide"
+            } else {
+                "○ Slide"
+            },
+            "fade": if desired.motion == CarouselMotion::Fade {
+                "● Fade (unavailable)"
+            } else {
+                "○ Fade (unavailable)"
+            },
+        },
     });
     let window = json!({
         "kind": "edge", "edge": "right", "title": "Settings", "panel": primary,
@@ -891,6 +918,31 @@ mod tests {
             assert_eq!(
                 tree.nodes[&format!("scheme_{}", desired.scheme)].ports["on_click"],
                 json!("shell.settings.scheme")
+            );
+        }
+
+        // The Slide/Fade marks mirror the INGESTED motion, fade included: a
+        // hand-edited conf.mix `carousel_motion: "fade"` selects Fade here —
+        // still disabled, still carrying the reason — instead of the panel
+        // claiming Slide is configured when it is not.
+        for (motion, slide_mark, fade_mark) in [
+            (CarouselMotion::Slide, "● Slide", "○ Fade (unavailable)"),
+            (CarouselMotion::Fade, "○ Slide", "● Fade (unavailable)"),
+        ] {
+            let desired = Rendered {
+                motion,
+                ..base.clone()
+            };
+            let parsed =
+                cosmix_scene::parse(&document(&desired, "settings-test", SETTINGS_APPEARANCE))
+                    .expect("the document parses");
+            assert!(cosmix_scene::lint(&parsed).is_empty());
+            let tree = cosmix_scene::resolve(&parsed).unwrap();
+            assert_eq!(tree.nodes["motion_slide_t"].ports["text"], json!(slide_mark));
+            assert_eq!(tree.nodes["motion_fade_t"].ports["text"], json!(fade_mark));
+            assert!(
+                !tree.nodes["motion_fade"].ports.contains_key("on_click"),
+                "fade stays unselectable whatever the ingested motion"
             );
         }
     }
