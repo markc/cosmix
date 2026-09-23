@@ -346,7 +346,11 @@ reports for the output — the `outputs` props row name the layer host's
 EDID-based identity tier exists; keys are opaque non-empty strings, so an
 `edid:` tier can be added when comp grows EDID fields without another format
 version. Real identities always carry a prefix, which keeps them clear of the
-reserved `default` entry that legacy files migrate to.
+reserved `default` entry that legacy files migrate to. Only connector names
+are persistent identities: an output the compositor has not named (the layer
+host's `wl-output-<id>` fallback, the embedded host's pre-observation
+placeholder) restores nothing, claims nothing and is never persisted —
+protocol ids are reassigned across sessions and must not anchor state.
 
 Modes are the strings `hidden`, `pinned` or `docked`. Thickness must be finite
 and positive; unknown page IDs use the edge's default page. On restore, an
@@ -363,14 +367,19 @@ legacy files migrate, and an output with no matching entry (and no unclaimed
 until its first save. The next normal persistent mutation writes v3,
 rewriting only the current output's entry — other outputs' remembered state
 stays for reconnection. Loading and transient visibility do not rewrite the
-file. Missing or invalid files use hidden defaults with one diagnostic line
-and no startup write. As before, a later normal mutation may overwrite a
-corrupt file; write inhibition is a separate outstanding issue.
+file. A missing file is a first run: hidden defaults, one diagnostic line,
+and persistence stays enabled so the first accepted mutation creates the
+file. A file that exists but cannot be parsed (or read) also uses hidden
+defaults with one diagnostic line, and disables persistence for the whole
+session: a later mutation must not overwrite a file this Quoin never
+successfully read. Fixing or removing the file restores persistence on the
+next launch.
 
 Accepted mode, page, scheme and completed resize changes save state after the Model stage,
-using a temporary file and atomic rename. Output migration carries live
-mode, page and thickness state; it never reloads disk state. Both smoke modes
-skip restore, saving and the intro pulse.
+using a temporary file and atomic rename. A same-output rebuild carries live
+mode, page and thickness state; an output change keeps the replacement's
+restored or default state, so live state never crosses outputs. Both smoke
+modes skip restore, saving and the intro pulse.
 
 A normal cold start transiently reveals hidden panels for two seconds, then releases
 a temporary startup hold into normal 800 ms grace. This discovery pulse is

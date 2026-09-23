@@ -4,7 +4,10 @@
 //! (shell design §7): the root holds `version: 3`, `scheme`, and an `outputs`
 //! map from identity string to the four edge fields. v1 and v2 files keyed
 //! edges by the implicit single output; they migrate to the reserved
-//! [`DEFAULT_OUTPUT`] entry, which the first output to restore claims.
+//! [`DEFAULT_OUTPUT`] entry, which the first output to restore claims. Only
+//! connector names are persistent identities: outputs in the `wl-output-`
+//! namespace (no advertised connector name, or the embedded host's
+//! pre-observation placeholder) restore nothing and are never persisted.
 
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -25,6 +28,14 @@ use cosmix_shell::runtime::{ShellEffects, ShellFrameState};
 /// claims it (a later unknown output gets the default config instead).
 const DEFAULT_OUTPUT: &str = "default";
 
+/// Namespace of output names that are not persistent identities: the layer
+/// host keys an output with no advertised connector name by its wl_output
+/// protocol id (`wl-output-{id}`, see `cosmix-shell-host`'s `output_key`),
+/// and the embedded host keys its pre-observation placeholder the same way.
+/// Protocol ids are reassigned across sessions, so an output in this
+/// namespace is neither restored from nor persisted to a key.
+const EPHEMERAL_OUTPUT_PREFIX: &str = "wl-output-";
+
 /// Persistent identity of one output for state keying (shell design §7):
 /// EDID make/model/serial when the compositor reports it, else the connector
 /// name, else a new output with the default config. comp's output
@@ -33,9 +44,12 @@ const DEFAULT_OUTPUT: &str = "default";
 /// `connector:<name>` today. File keys are opaque non-empty strings, so an
 /// `edid:` tier can be introduced when comp grows EDID fields without
 /// another format version. Real identities are always prefixed, which keeps
-/// them clear of [`DEFAULT_OUTPUT`].
-fn output_identity(output: &OutputKey) -> String {
-    format!("connector:{}", output.as_str())
+/// them clear of [`DEFAULT_OUTPUT`]. Outputs named in the
+/// [`EPHEMERAL_OUTPUT_PREFIX`] namespace have no persistent identity and map
+/// to `None`.
+fn output_identity(output: &OutputKey) -> Option<String> {
+    let name = output.as_str();
+    (!name.starts_with(EPHEMERAL_OUTPUT_PREFIX)).then(|| format!("connector:{name}"))
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -152,9 +166,14 @@ impl SavedState {
     /// identity is reused as-is, while the migrated default-output entry
     /// moves to the first output that restores it. An unknown output
     /// restores nothing — it keeps the default config and gains no entry
-    /// until its first save.
+    /// until its first save. An ephemeral output name (the `wl-output-`
+    /// namespace, see [`output_identity`]'s rule) restores nothing and
+    /// claims nothing, so it can never take the migrated default-output
+    /// entry.
     pub(crate) fn restore(&mut self, model: &mut ShellModel) {
-        let identity = output_identity(model.output());
+        let Some(identity) = output_identity(model.output()) else {
+            return;
+        };
         let Some(state) = self
             .outputs
             .remove(&identity)
@@ -287,20 +306,36 @@ impl StateStore {
         Self::load((!smoke).then(|| cosmix_path(CosmixDir::Var).join("quoin.state.mix")))
     }
 
-    fn load(path: Option<PathBuf>) -> Self {
-        let saved = match path.as_deref() {
-            None => SavedState::default(),
-            Some(path) => match std::fs::read_to_string(path)
+    /// Load the session's state file.
+    ///
+    /// A missing file is a first run: defaults load and persistence stays
+    /// enabled, so the first accepted transition creates the file. A file
+    /// that exists but cannot be loaded (invalid or mixed-shape content, an
+    /// unreadable file) also loads defaults, but disables persistence for
+    /// the whole session and says so once on stderr: overwriting a file this
+    /// process never successfully parsed would destroy the user's only copy
+    /// of state no running Quoin can read. Fixing the file (or removing it)
+    /// restores persistence on the next launch.
+    pub(crate) fn load(path: Option<PathBuf>) -> Self {
+        let loaded = path.as_deref().map(|file| {
+            std::fs::read_to_string(file)
                 .map_err(StateError::Io)
                 .and_then(|source| SavedState::parse(&source))
-            {
-                Ok(saved) => {
-                    eprintln!("QUOIN_STATE restored=true");
-                    saved
+        });
+        let (saved, path) = match loaded {
+            None => (SavedState::default(), path),
+            Some(Ok(saved)) => {
+                eprintln!("QUOIN_STATE restored=true");
+                (saved, path)
+            }
+            Some(Err(error)) => match error {
+                StateError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("QUOIN_STATE restored=false reason={io}");
+                    (SavedState::default(), path)
                 }
-                Err(error) => {
-                    eprintln!("QUOIN_STATE restored=false reason={error}");
-                    SavedState::default()
+                error => {
+                    eprintln!("QUOIN_STATE restored=false persist=disabled reason={error}");
+                    (SavedState::default(), None)
                 }
             },
         };
@@ -394,15 +429,21 @@ pub(crate) fn persist_transitions(
         // CTK may already have consumed requests in this Update pass.
         redraw.write(bevy::window::RequestRedraw);
     }
-    if store.path.is_none()
-        || (selection.is_none()
-            && !effects.0.iter().any(|effect| {
+    if store.path.is_none() {
+        return;
+    }
+    // Only connector names are persistent identities (see output_identity):
+    // an ephemeral output never gains an entry, though a scheme selection on
+    // it still persists on its own.
+    let identity = output_identity(&frame.0.geometry.output);
+    if selection.is_none()
+        && (identity.is_none()
+            || (!effects.0.iter().any(|effect| {
                 matches!(
                     effect.effect,
                     PanelEffect::ModeChanged { .. } | PanelEffect::ResizeCompleted
                 )
-            })
-            && effects.1.is_empty())
+            }) && effects.1.is_empty()))
     {
         return;
     }
@@ -412,20 +453,21 @@ pub(crate) fn persist_transitions(
     }
     // Only the current output's entry is rewritten; other outputs' remembered
     // state stays for reconnection (shell design §7's output-removal row).
-    let output = output_identity(&frame.0.geometry.output);
-    saved.outputs.insert(
-        output,
-        OutputState {
-            edges: std::array::from_fn(|index| {
-                let panel = frame.0.panel(Edge::ALL[index]);
-                EdgeState {
-                    thickness_px: Some(panel.settled_thickness_px),
-                    mode: panel.mode,
-                    page: panel.active_page_id.clone().unwrap_or_default(),
-                }
-            }),
-        },
-    );
+    if let Some(output) = identity {
+        saved.outputs.insert(
+            output,
+            OutputState {
+                edges: std::array::from_fn(|index| {
+                    let panel = frame.0.panel(Edge::ALL[index]);
+                    EdgeState {
+                        thickness_px: Some(panel.settled_thickness_px),
+                        mode: panel.mode,
+                        page: panel.active_page_id.clone().unwrap_or_default(),
+                    }
+                }),
+            },
+        );
+    }
     let saved_result = match store.path.as_deref() {
         Some(path) => atomic_save(path, &saved),
         None => Ok(()),
@@ -448,6 +490,7 @@ mod tests {
     use cosmix_shell::core::{LogicalSize, OutputKey, PanelInput};
     use cosmix_shell::runtime::{
         CarouselInput, ShellCommand, ShellCommandKind, ShellRuntimePlugin, ShellRuntimeSet,
+        replace_shell_model,
     };
 
     fn resize_app(path: &Path) -> App {
@@ -617,7 +660,7 @@ mod tests {
                 page: model.carousel(edge).page_ids()[1].clone(),
             };
         }
-        let identity = output_identity(&OutputKey::new("DP-1").unwrap());
+        let identity = output_identity(&OutputKey::new("DP-1").unwrap()).unwrap();
         state.outputs.insert(identity, OutputState { edges });
         state
     }
@@ -906,6 +949,20 @@ mod tests {
             );
             assert_eq!(app.world().resource::<StateStore>().writes(), 0);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+            // Persistence stays disabled for the whole session: even
+            // transitions that would write (a pin, a page change) leave the
+            // unloadable file byte-identical, keeping the user's only copy
+            // of state available for manual recovery.
+            resize_input(&mut app, PanelInput::Pin);
+            resize_command(
+                &mut app,
+                ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input: CarouselInput::Next,
+                },
+            );
+            assert_eq!(app.world().resource::<StateStore>().writes(), 0);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         }
     }
 
@@ -1035,16 +1092,17 @@ mod tests {
     fn corrupt_and_missing_files_fall_back_without_writing() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("quoin.state.mix");
-        assert_eq!(
-            StateStore::load(Some(path.clone())).snapshot(),
-            SavedState::default()
-        );
+        let missing = StateStore::load(Some(path.clone()));
+        assert_eq!(missing.snapshot(), SavedState::default());
+        assert!(missing.path.is_some(), "a missing file keeps persistence on");
         assert!(!path.exists());
         for source in ["{broken", "{scheme: run(\"anything\")}", "{}"] {
             std::fs::write(&path, source).unwrap();
-            assert_eq!(
-                StateStore::load(Some(path.clone())).snapshot(),
-                SavedState::default()
+            let store = StateStore::load(Some(path.clone()));
+            assert_eq!(store.snapshot(), SavedState::default());
+            assert!(
+                store.path.is_none(),
+                "an unloadable file disables persistence for the session"
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         }
@@ -1142,11 +1200,11 @@ mod tests {
     fn two_outputs_keep_distinct_selection_and_thickness() {
         let mut state = SavedState::default();
         state.outputs.insert(
-            output_identity(&OutputKey::new("DP-1").unwrap()),
+            output_identity(&OutputKey::new("DP-1").unwrap()).unwrap(),
             output_state("DP-1", 260.0, PanelMode::Docked, 1),
         );
         state.outputs.insert(
-            output_identity(&OutputKey::new("HDMI-1").unwrap()),
+            output_identity(&OutputKey::new("HDMI-1").unwrap()).unwrap(),
             output_state("HDMI-1", 333.0, PanelMode::Pinned, 2),
         );
         assert_eq!(SavedState::parse(&state.encode().unwrap()).unwrap(), state);
@@ -1228,11 +1286,11 @@ mod tests {
             ..SavedState::default()
         };
         state.outputs.insert(
-            output_identity(&OutputKey::new("DP-1").unwrap()),
+            output_identity(&OutputKey::new("DP-1").unwrap()).unwrap(),
             output_state("DP-1", 210.0, PanelMode::Docked, 2),
         );
         state.outputs.insert(
-            output_identity(&OutputKey::new("HDMI-1").unwrap()),
+            output_identity(&OutputKey::new("HDMI-1").unwrap()).unwrap(),
             output_state("HDMI-1", 321.0, PanelMode::Pinned, 1),
         );
         atomic_save(&path, &state).unwrap();
@@ -1266,5 +1324,120 @@ mod tests {
         assert_eq!(model.panel(Edge::Left).thickness_px, 210.0);
         assert_eq!(model.panel(Edge::Left).mode, PanelMode::Docked);
         assert_eq!(model.carousel(Edge::Left).active_id(), Some("info"));
+    }
+
+    #[test]
+    fn unnamed_outputs_are_not_persistent_identities() {
+        // The layer host keys an output with no advertised connector name by
+        // its wl_output protocol id; such ids are reassigned across sessions,
+        // so they are not identities.
+        assert_eq!(output_identity(&OutputKey::new("wl-output-42").unwrap()), None);
+        assert_eq!(
+            output_identity(&OutputKey::new("DP-1").unwrap()),
+            Some("connector:DP-1".to_owned())
+        );
+
+        // Restoring an unnamed output claims nothing — not even the migrated
+        // default-output entry, which waits for a real connector.
+        let mut saved = SavedState::parse(&v2_source()).unwrap();
+        let fresh = model_for("wl-output-42");
+        let mut model = model_for("wl-output-42");
+        saved.restore(&mut model);
+        for edge in Edge::ALL {
+            assert_eq!(
+                model.panel(edge).thickness_px,
+                fresh.panel(edge).thickness_px
+            );
+            assert_eq!(model.panel(edge).mode, PanelMode::Hidden);
+        }
+        assert!(saved.outputs.contains_key(DEFAULT_OUTPUT));
+
+        // And persistence never writes an entry for it.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut app = resize_app_for(&path, "wl-output-42");
+        resize_command_for(
+            &mut app,
+            "wl-output-42",
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Dock,
+            },
+        );
+        assert_eq!(app.world().resource::<StateStore>().writes(), 0);
+        assert!(!path.exists());
+    }
+
+    /// Review fix: an output switch must keep the replacement's restored
+    /// state, not the outgoing output's live state — going through the real
+    /// `replace_shell_model`, exactly as both hosts do.
+    #[test]
+    fn output_switch_through_replace_shell_model_keeps_remembered_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        let mut file = SavedState::default();
+        file.outputs.insert(
+            output_identity(&OutputKey::new("HDMI-1").unwrap()).unwrap(),
+            output_state("HDMI-1", 222.0, PanelMode::Pinned, 1),
+        );
+        atomic_save(&path, &file).unwrap();
+
+        // A session on DP-1 builds up live state that belongs to DP-1.
+        let mut app = resize_app_for(&path, "DP-1");
+        resize_command_for(
+            &mut app,
+            "DP-1",
+            ShellCommandKind::ResizeCommit {
+                edge: Edge::Left,
+                thickness_px: 333.0,
+            },
+        );
+        resize_command_for(
+            &mut app,
+            "DP-1",
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Dock,
+            },
+        );
+        resize_command_for(
+            &mut app,
+            "DP-1",
+            ShellCommandKind::Carousel {
+                edge: Edge::Left,
+                input: CarouselInput::SelectId("info".into()),
+            },
+        );
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 333.0);
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(frame.panel(Edge::Left).active_page_id.as_deref(), Some("info"));
+
+        // The output switches: the host restores HDMI-1's remembered state
+        // into a replacement model and installs it via replace_shell_model.
+        let mut replacement = model_for("HDMI-1");
+        app.world().resource::<StateStore>().restore(&mut replacement);
+        replace_shell_model(app.world_mut(), replacement);
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        assert_eq!(frame.geometry.output.as_str(), "HDMI-1");
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 222.0);
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Pinned);
+        assert_eq!(frame.panel(Edge::Left).active_page_id.as_deref(), Some("places"));
+
+        // The next mutation persists under HDMI-1's key from HDMI-1's own
+        // state; DP-1's live 333/"info" never reaches the HDMI-1 entry.
+        resize_command_for(
+            &mut app,
+            "HDMI-1",
+            ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: PanelInput::Dock,
+            },
+        );
+        let saved = StateStore::load(Some(path)).snapshot();
+        let hdmi = &saved.outputs["connector:HDMI-1"].edges[Edge::Left.index()];
+        assert_eq!(hdmi.thickness_px, Some(222.0));
+        assert_eq!(hdmi.mode, PanelMode::Docked);
+        assert_eq!(hdmi.page, "places");
     }
 }

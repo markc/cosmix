@@ -25,6 +25,13 @@ use std::time::Duration;
 #[derive(Resource)]
 pub(crate) struct EmbeddedPanelMounts(pub QuoinPanelMounts);
 
+/// The output identity used until the host reports the real one. It lives in
+/// the non-persistent `wl-output-` namespace (see `state`'s identity rule):
+/// the placeholder never restores, claims or persists state. The first real
+/// connector observation replaces it and restores then, so the migrated
+/// legacy default entry stays unclaimed until a real output can take it.
+const PLACEHOLDER_OUTPUT: &str = "wl-output-embedded";
+
 /// Host updates this before `ShellRuntimeSet::Input`. Coordinates are logical.
 #[derive(Resource, Default)]
 pub struct EmbeddedOutput {
@@ -58,8 +65,11 @@ impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
         let registry = crate::page_registry();
         let store = crate::state::StateStore::startup(false);
-        let mut model = model("primary", Vec2::new(1920.0, 1080.0), &registry);
-        store.restore(&mut model);
+        // The placeholder model restores nothing: comp has not named the
+        // output yet, and claiming under a placeholder identity would take
+        // the migrated legacy entry away from the real connector. `prepare`
+        // restores when the first real observation arrives.
+        let mut model = model(PLACEHOLDER_OUTPUT, Vec2::new(1920.0, 1080.0), &registry);
         model.start_intro(Duration::from_secs(2));
         app.add_plugins(ShellRuntimePlugin::new(model));
         let mounts: [Entity; 4] = std::array::from_fn(|i| {
@@ -86,7 +96,7 @@ impl Plugin for EmbeddedQuoinPlugin {
                 CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
                     .expect("valid corner tuning"),
             ),
-            name: "primary".into(),
+            name: PLACEHOLDER_OUTPUT.into(),
             size: Vec2::new(1920.0, 1080.0),
         });
         let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
@@ -256,6 +266,12 @@ fn prepare(world: &mut World) {
             // (output, edge) persistence); a same-output resize keeps the
             // fresh-model rebuild.
             world.resource::<crate::state::StateStore>().restore(&mut replacement);
+            // Replacing the placeholder is the first real observation:
+            // replay the startup intro on the output the user can see (the
+            // placeholder never renders).
+            if host.name == PLACEHOLDER_OUTPUT {
+                replacement.start_intro(Duration::from_secs(2));
+            }
         }
         replace_shell_model(world, replacement);
         let mut host = world.resource_mut::<EmbeddedHost>();
@@ -352,6 +368,91 @@ fn present(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A legacy v2 state file as today's Quoin writes it, for the migration
+    /// path (mirrors `state`'s `v2_source` fixture).
+    fn v2_state_file() -> String {
+        let mut source = String::from("{version: 2, scheme: \"v2\"");
+        for (edge, page) in [
+            (Edge::Left, "places"),
+            (Edge::Bottom, "launcher"),
+            (Edge::Right, "monitor"),
+            (Edge::Top, "status"),
+        ] {
+            source.push_str(&format!(
+                ", {}: {{thickness_px: {}, mode: \"{}\", page: \"{}\"}}",
+                crate::edge_name(edge),
+                150 + edge.index(),
+                if edge == Edge::Left { "docked" } else { "hidden" },
+                page,
+            ));
+        }
+        source.push('}');
+        source
+    }
+
+    #[test]
+    fn startup_placeholder_restores_nothing_until_the_first_real_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        std::fs::write(&path, v2_state_file()).unwrap();
+
+        // Mirrors EmbeddedQuoinPlugin::build: a placeholder model with no
+        // restore, waiting for the host's first real observation.
+        let registry = crate::page_registry();
+        let fresh = model(PLACEHOLDER_OUTPUT, Vec2::new(1920.0, 1080.0), &registry);
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            ShellRuntimePlugin::new(model(
+                PLACEHOLDER_OUTPUT,
+                Vec2::new(1920.0, 1080.0),
+                &registry,
+            )),
+        ))
+        .insert_resource(crate::state::StateStore::load(Some(path)))
+        .insert_resource(EmbeddedHost {
+            detector: CornerDetector::new(
+                CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
+                    .expect("valid corner tuning"),
+            ),
+            name: PLACEHOLDER_OUTPUT.into(),
+            size: Vec2::new(1920.0, 1080.0),
+        })
+        .init_resource::<EmbeddedOutput>();
+
+        // The placeholder claims nothing: it keeps the fresh-model defaults,
+        // so the migrated legacy entry waits for a real connector.
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        assert_eq!(frame.geometry.output.as_str(), PLACEHOLDER_OUTPUT);
+        for edge in Edge::ALL {
+            assert_eq!(
+                frame.panel(edge).thickness_px,
+                fresh.panel(edge).thickness_px
+            );
+            assert_eq!(frame.panel(edge).mode, PanelMode::Hidden);
+        }
+
+        // The first real connector observation restores through prepare()
+        // and claims the migrated v2 state for that connector.
+        {
+            let mut output = app.world_mut().resource_mut::<EmbeddedOutput>();
+            output.size = Vec2::new(1920.0, 1080.0);
+            output.name = "DP-1".into();
+            output.active = true;
+        }
+        prepare(app.world_mut());
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        assert_eq!(frame.geometry.output.as_str(), "DP-1");
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 150.0);
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(
+            frame.panel(Edge::Left).active_page_id.as_deref(),
+            Some("places")
+        );
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 152.0);
+        assert_eq!(frame.panel(Edge::Bottom).thickness_px, 151.0);
+    }
 
     #[test]
     fn every_overlay_edge_stacks_above_every_dock_edge() {
