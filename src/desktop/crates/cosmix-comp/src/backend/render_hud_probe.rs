@@ -309,7 +309,7 @@ mod tests {
             .init_resource::<Assets<Image>>()
             .init_resource::<crate::capture::OutputDamageJournal>()
             .init_resource::<crate::compositor_scene::SceneContentRevision>();
-        install(&mut app);
+        install(&mut app, "comp");
         let owner = app
             .world_mut()
             .spawn((Camera2d, KmsOutputCamera, RenderTarget::default()))
