@@ -2477,12 +2477,48 @@ fn sole_string_definitions(stmts: &[Stmt]) -> HashMap<String, (RemoteBody, usize
     out
 }
 
+/// Each function frame → (the frame it is defined in, is it a LAMBDA).
+fn frame_parents(stmts: &[Stmt]) -> HashMap<usize, (usize, bool)> {
+    let mut out = HashMap::new();
+    walk_frames(stmts, TOP_FRAME, &mut |node, frame| match node {
+        FrameNode::Stmt(stmt) if matches!(stmt.kind, StmtKind::FunctionDef { .. }) => {
+            out.insert(std::ptr::from_ref(stmt) as usize, (frame, false));
+        }
+        FrameNode::Expr(expr, _) if matches!(expr, Expr::FunctionLiteral { .. }) => {
+            out.insert(node_id(expr), (frame, true));
+        }
+        _ => {}
+    });
+    out
+}
+
+/// Can code running in frame `at` read a variable bound in frame
+/// `bound_in`? Top-level bindings are readable everywhere (a fn reads
+/// globals), and its own frame's are. Beyond that only LAMBDAS see out:
+/// a lambda is a closure over the frame it is written in (probed: a lambda
+/// in `f` reads `f`'s local), while a NAMED nested fn is not (the same read
+/// is NAME_UNDEFINED). So walk outward through lambda boundaries only.
+fn binding_visible(bound_in: usize, at: usize, parents: &HashMap<usize, (usize, bool)>) -> bool {
+    if bound_in == TOP_FRAME || bound_in == at {
+        return true;
+    }
+    let mut cur = at;
+    while let Some(&(parent, true)) = parents.get(&cur) {
+        if parent == bound_in {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
 /// Every `ssh_mix` call in the file, at any depth — loops, branches, an
 /// `if`-expression's condition, lambda bodies and parameter defaults, a
 /// named function's `= expr` body — with what lint can know about its body
 /// and its injected names.
 fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
     let sole = sole_string_definitions(stmts);
+    let parents = frame_parents(stmts);
     let mut sites = Vec::new();
     walk_frames(stmts, TOP_FRAME, &mut |node, frame| {
         let FrameNode::Expr(expr, line) = node else {
@@ -2493,14 +2529,14 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
             && let Some(body) = args.get(1)
         {
             let body = match body {
-                // Visible at the call only when bound at top level (a fn
-                // reads globals) or in the call's own frame. A local of
-                // another function is undefined here at runtime — the
-                // outer E1101 says so — and analysing its literal would
-                // only add noise about a body that never ships.
+                // Resolved only where the binding is visible at the call
+                // (see `binding_visible`). A local of another function is
+                // undefined here at runtime — the outer E1101 says so — and
+                // analysing its literal would only add noise about a body
+                // that never ships.
                 Expr::Variable(v) => sole
                     .get(v)
-                    .filter(|(_, bound_in)| *bound_in == TOP_FRAME || *bound_in == frame)
+                    .filter(|(_, bound_in)| binding_visible(*bound_in, frame, &parents))
                     .map_or(RemoteBody::Opaque, |(shape, _)| shape.clone()),
                 other => body_shape(other, line).unwrap_or(RemoteBody::Opaque),
             };

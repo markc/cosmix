@@ -392,6 +392,30 @@ fn another_functions_local_is_not_resolved() {
 }
 
 #[test]
+fn a_heredoc_shipped_from_a_lambda_in_its_own_fn_is_resolved() {
+    // Lambdas are closures: `$probe` bound in uptimes() is visible inside
+    // the `map` lambda. The body must be analysed, and W2402 must not fire
+    // on the body's own `$out`.
+    let src = "$out = []\nfn uptimes($hosts)\n  $probe = <<END\n$out = run(\"uptime\")\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($out .. $m)\nEND\n  return map($hosts, function($h) = ssh_mix($h, $probe))\nend\nprint(uptimes([\"a\"]))\n";
+    let d = diags(src);
+    assert!(d.iter().any(|(c, ..)| c == "MIX-E1501"), "body not analysed: {d:?}");
+    assert!(!d.iter().any(|(c, ..)| c == "MIX-D3012"), "{d:?}");
+    assert!(!d.iter().any(|(c, ..)| c == "MIX-W2402"), "{d:?}");
+}
+
+#[test]
+fn a_named_nested_fn_does_not_see_its_parents_local() {
+    // A named fn is NOT a closure (probed: NAME_UNDEFINED), so its call
+    // must not resolve to the enclosing fn's heredoc.
+    let src = format!(
+        "fn outer()\n  $q = {LOST_PUSH}\n  fn inner($h)\n    return ssh_mix($h, $q)\n  end\n  return inner(\"a\")\nend\nprint(outer())\n"
+    );
+    let c = codes(&src);
+    assert!(!c.iter().any(|x| x == "MIX-E1501"), "{c:?}");
+    assert!(c.iter().any(|x| x == "MIX-D3012"), "{c:?}");
+}
+
+#[test]
 fn a_file_with_source_or_include_resolves_nothing() {
     // The loaded file can rebind anything, so "sole binder" is unknowable.
     let src = "source(\"other.mix\")\n$p = 'print(1)'\n$r = ssh_mix(\"a\", $p)\n";

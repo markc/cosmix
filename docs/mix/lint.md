@@ -230,7 +230,8 @@ end
 "Sole" is strict. A second assignment, a loop variable or a parameter of the
 same name anywhere in the file makes the value unknowable, and the body is
 reported as unanalysable instead. The binding must also be visible at the
-call: at top level, or in the same function as the call. Findings in a bound heredoc point at the
+call: at top level, in the same function, or in an enclosing function reached
+through lambdas (a lambda is a closure; a named nested `fn` is not). Findings in a bound heredoc point at the
 heredoc's own lines. A heredoc shipped by several calls reports each finding
 once. Calls are found at any depth: in loops, branches, functions and lambdas.
 
