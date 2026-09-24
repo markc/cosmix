@@ -192,6 +192,8 @@ mod tests {
             })),
             stats: stats.clone(),
             quit: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(String::new())),
+            title_changed: Arc::new(OnceLock::new()),
         };
         let mut grid = Crosswords::new(
             CrosswordsSize::new(80, 24),

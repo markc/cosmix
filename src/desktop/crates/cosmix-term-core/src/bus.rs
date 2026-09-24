@@ -1,11 +1,11 @@
-use crate::tabs::{Cleanup, CompletionNote, Outcome, TabSet};
+use crate::tabs::{Change, Cleanup, CompletionNote, Outcome, TabSet};
 use cosmix_client::{BoundedIncomingEvent, IncomingCommand, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — unless explicit pane/tab selectors are supplied, they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {cwd?:<absolute existing directory>, title?:<string>}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {tab?:<integer>}: list selected tab (default active tab) pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {pane?:<integer>, tab?:<integer>, contents?:<boolean=true>, scrollback_lines?:<integer=0, max 10000>}: read-only selected screen (default active); history above viewport is capped at available lines; pane+tab must agree; contents=false omits text but keeps dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {pane?:<integer>, \"text\":\"<string>\"}: ASCII synthetic keys to the selected pane without changing focus (default active pane) through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nterm.tab.title {id:<integer>, title:<string>}: pin a user title; empty clears the pin and restores the active pane OSC title\nterm.tab.move {id:<integer>, index:<integer>}: reorder tab, clamping index to 0..len-1; focus is preserved\nterm.props.watch {}: enable caller-free change publishing and return JSON {topics,revision}; subscribe through noded topic.subscribe to term.tabs.changed, term.pane.changed and term.title.changed. Bodies are {tab,pane,kind,revision}; revision is a separate monotonic event sequence, not the legacy layout revision. Bounded best-effort delivery; on a gap or reconnect read current state.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 /// The one spelling the handlers in this crate are written in.
 ///
 /// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
@@ -121,14 +121,63 @@ impl Incoming for cosmix_client::BoundedIncomingReceiver {
 
 /// Where the serving loop's replies and completion notes go.
 trait Peer {
-    fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) -> impl std::future::Future<Output = ()>;
-    fn completed(&self, note: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static;
+    fn reply(
+        &self,
+        command: &IncomingCommand,
+        rc: u8,
+        body: &str,
+    ) -> impl std::future::Future<Output = ()>;
+    fn completed(
+        &self,
+        note: CompletionNote,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static;
+    fn changed(
+        &self,
+        service: &str,
+        change: Change,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static;
 }
 impl Peer for Arc<SupervisedClient> {
-    async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
-        let _ = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::respond(self, command, rc, body)).await;
+    fn changed(
+        &self,
+        service: &str,
+        change: Change,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let client = self.clone();
+        let topic = format!("{service}.{}", change.topic);
+        async move {
+            let headers = std::collections::BTreeMap::from([
+                ("name".into(), topic),
+                ("retain".into(), "false".into()),
+            ]);
+            let mut message = cosmix_bus::bus::BusMessage::new();
+            message.set("command", change.topic);
+            message.body = change.body().to_string();
+            let wire = message.to_wire();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                client.call_with_headers_raw("noded", "topic.publish", &headers, &wire),
+            )
+            .await;
+            if !matches!(result, Ok(Ok((0..=9, _, _)))) {
+                eprintln!(
+                    "terminal change topic publication failed at revision {}",
+                    change.revision
+                );
+            }
+        }
     }
-    fn completed(&self, note: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            SupervisedClient::respond(self, command, rc, body),
+        )
+        .await;
+    }
+    fn completed(
+        &self,
+        note: CompletionNote,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let client = self.clone();
         async move { notify_complete(&client, &note).await }
     }
@@ -152,6 +201,9 @@ async fn serve(
     // tab — a Bus verb here, or the frontend (keyboard, child exit, window
     // close) — and the permit survives until this loop next waits.
     let emptied = terminal.lock().unwrap().emptied();
+    let titles_changed = terminal.lock().unwrap().titles_changed();
+    let mut changes = terminal.lock().unwrap().observe();
+    let mut publishing = tokio::task::JoinSet::new();
     // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
     // or closes at shutdown. `recv()` on a closed channel returns `None`
     // immediately and forever, which would spin the select; the
@@ -165,6 +217,13 @@ async fn serve(
         turns += 1;
         tokio::select! {
             _ = emptied.notified() => {},
+            _ = titles_changed.notified(), if terminal.lock().unwrap().is_watching() => {
+                terminal.lock().unwrap().refresh_titles();
+            },
+            Some(change) = changes.recv(), if publishing.is_empty() => {
+                publishing.spawn(peer.changed(service, change));
+            },
+            _ = publishing.join_next(), if !publishing.is_empty() => {},
             note = notify_rx.recv(), if notify_open => {
                 // Sink writes can block under backpressure. Poll them in
                 // separate tracked tasks so verbs remain serviceable.
@@ -202,6 +261,17 @@ async fn serve(
             }
         }
     }
+    // Include final removal records. One total shutdown budget bounds a
+    // stalled broker; publication stays serial to preserve event ordering.
+    changes.close();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while publishing.join_next().await.is_some() {}
+        while let Some(change) = changes.recv().await {
+            peer.changed(service, change).await;
+        }
+    })
+    .await;
+    publishing.abort_all();
     turns
 }
 
@@ -378,6 +448,8 @@ fn mutates(verb: &str) -> bool {
     matches!(
         verb,
         "term.tab.new"
+            | "term.tab.title"
+            | "term.tab.move"
             | "term.tab.select"
             | "term.tab.close"
             | "term.pane.split"
@@ -481,6 +553,7 @@ fn handle(
         panic!("test verb: panic outside the tab-set lock");
     }
     let mut tabs = set.lock().unwrap();
+    tabs.refresh_titles();
     #[cfg(test)]
     if verb == "term.test.panic_locked" {
         panic!("test verb: panic holding the tab-set lock");
@@ -508,10 +581,44 @@ fn handle(
             })
             .collect::<Vec<_>>()
             .join("\n")),
-        "term.tab.new" => tabs.open().map(|id| {
-            let binding = tabs.binding(tabs.active_tab().active_pane);
-            format!("opened id={id} {} binding={binding}", identity(&tabs))
-        }),
+        "term.props.watch" => {
+            let revision = tabs.watch();
+            Ok(
+                serde_json::json!({"topics": [format!("{service}.tabs.changed"),
+                format!("{service}.pane.changed"), format!("{service}.title.changed")],
+                "revision": revision})
+                .to_string(),
+            )
+        }
+        "term.tab.title" => {
+            let id = args["id"].as_u64().unwrap();
+            tabs.set_title(id, args["title"].as_str().unwrap().into())?;
+            let (_, pane) = tabs.resolve(None, Some(id))?;
+            Ok(format!(
+                "retitled id={id} tab={id} pane={pane} revision={}",
+                tabs.revision
+            ))
+        }
+        "term.tab.move" => {
+            let id = args["id"].as_u64().unwrap();
+            // Validated integers below zero clamp to the first slot; u64
+            // also accepts indices above i64::MAX without narrowing them.
+            let index = tabs.move_tab(id, args["index"].as_u64().unwrap_or(0))?;
+            let (_, pane) = tabs.resolve(None, Some(id))?;
+            Ok(format!(
+                "moved id={id} index={index} tab={id} pane={pane} revision={}",
+                tabs.revision
+            ))
+        }
+        "term.tab.new" => tabs
+            .open_options(
+                args["cwd"].as_str().map(str::to_owned),
+                args["title"].as_str().map(str::to_owned),
+            )
+            .map(|id| {
+                let binding = tabs.binding(tabs.active_tab().active_pane);
+                format!("opened id={id} {} binding={binding}", identity(&tabs))
+            }),
         "term.tab.select" => {
             let id = args["id"]
                 .as_u64()
@@ -534,14 +641,22 @@ fn handle(
             cleanup.submit(removed.into_iter().collect());
             match outcome {
                 Outcome::Unknown => Err(format!("unknown tab id={id}")),
-                Outcome::Remaining(count) => {
-                    Ok(format!("closed id={id} remaining={count} revision={revision}"))
-                }
+                Outcome::Remaining(count) => Ok(format!(
+                    "closed id={id} remaining={count} revision={revision}"
+                )),
                 Outcome::Empty => Ok(format!("closed id={id} last revision={revision}")),
             }
         }
-        "term.panes" => Ok(tabs
-            .leaves()
+        "term.panes" => {
+            let tab = args["tab"].as_u64();
+            let (id, panes) = match tab {
+                Some(id) => (id, tabs.leaves_in(id)?),
+                None => (
+                    if tabs.is_empty() { 0 } else { tabs.active_id() },
+                    tabs.leaves(),
+                ),
+            };
+            Ok(panes
             .iter()
             .map(|pane| {
                 let g = pane.geometry;
@@ -556,12 +671,13 @@ fn handle(
                     g.y,
                     g.w,
                     g.h,
-                    tabs.active_id(),
+                    id,
                     tabs.revision
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n")),
+            .join("\n"))
+        }
         // VERIFY: term.pane.split handler — validated JSON direction, new active ID.
         "term.pane.split" => {
             let dir = parse_dir(
@@ -604,22 +720,32 @@ fn handle(
             drop(tabs);
             cleanup.submit(removed.into_iter().collect());
             if tab_closed {
-                Ok(format!("closed id={id} tab-closed tab={tab} revision={revision}"))
+                Ok(format!(
+                    "closed id={id} tab-closed tab={tab} revision={revision}"
+                ))
             } else {
-                Ok(format!("closed id={id} panes={count} tab={tab} revision={revision}"))
+                Ok(format!(
+                    "closed id={id} panes={count} tab={tab} revision={revision}"
+                ))
             }
         }
         // VERIFY: active-pane snapshot/type — selection stays under the set lock.
         "term.snapshot" | "term.type" => {
-            if tabs.is_empty() {
-                return Err("application closing".into());
-            }
-            let active = tabs.active_terminal();
-            let identity = identity(&tabs);
+            let (tab, pane) = tabs.resolve(args["pane"].as_u64(), args["tab"].as_u64())?;
+            let active = tabs
+                .pane_by_id(pane)
+                .expect("resolved pane exists under set lock");
+            let identity = format!("tab={tab} pane={pane} revision={}", tabs.revision);
             let terminal = active.lock().unwrap();
             if verb == "term.snapshot" {
                 // Onto the snapshot's own key=value header line.
-                Ok(format!("{identity} {}", terminal.snapshot()))
+                Ok(format!(
+                    "{identity} {}",
+                    terminal.snapshot_with(
+                        args["contents"].as_bool().unwrap_or(true),
+                        args["scrollback_lines"].as_u64().unwrap_or(0) as usize,
+                    )
+                ))
             } else {
                 // VERIFY: term.type extracts validated text, never the JSON envelope.
                 terminal
@@ -669,11 +795,12 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     }
     let field = match verb {
         "term.snapshot" | "term.tabs" | "term.tab.new" | "term.panes" | "term.pane.close"
-        | "term.session" => None,
+        | "term.session" | "term.props.watch" => None,
         #[cfg(test)]
         "term.test.panic" | "term.test.panic_locked" => None,
         "term.type" => Some("text"),
-        "term.tab.select" | "term.tab.close" | "term.pane.select" => Some("id"),
+        "term.tab.select" | "term.tab.close" | "term.pane.select" | "term.tab.title"
+        | "term.tab.move" => Some("id"),
         "term.pane.split" => Some("dir"),
         _ => return Err("unknown verb; use HELP".into()),
     };
@@ -684,12 +811,20 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     })
     .map_err(|e| format!("body must be a JSON object: {e}"))?;
     let object = args.as_object().ok_or("body must be a JSON object")?;
+    let extra: &[&str] = match verb {
+        "term.snapshot" => &["pane", "tab", "contents", "scrollback_lines"],
+        "term.type" => &["pane"],
+        "term.panes" => &["tab"],
+        "term.tab.new" => &["cwd", "title"],
+        "term.tab.title" => &["title"],
+        "term.tab.move" => &["index"],
+        _ => &[],
+    };
     // `request_id` rides alongside any verb's own argument: it addresses the
     // reply-replay cache in dispatch(), never the verb itself.
-    if object
-        .keys()
-        .any(|key| Some(key.as_str()) != field && key != "request_id")
-    {
+    if object.keys().any(|key| {
+        Some(key.as_str()) != field && key != "request_id" && !extra.contains(&key.as_str())
+    }) {
         return Err(format!("unexpected argument for {verb}"));
     }
     if object.contains_key("request_id") {
@@ -714,12 +849,317 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
         }
         _ => {}
     }
+    for key in ["pane", "tab", "scrollback_lines"] {
+        if object.contains_key(key) && args[key].as_u64().is_none() {
+            return Err(format!(
+                "invalid-argument: {key} must be a non-negative integer (u64)"
+            ));
+        }
+    }
+    if args["scrollback_lines"].as_u64().is_some_and(|n| n > 10000) {
+        return Err("invalid-argument: scrollback_lines must be 0..=10000".into());
+    }
+    if object.contains_key("contents") && !args["contents"].is_boolean() {
+        return Err("invalid-argument: contents must be a boolean".into());
+    }
+    for key in ["cwd", "title"] {
+        if object.contains_key(key) && !args[key].is_string() {
+            return Err(format!("invalid-argument: {key} must be a string"));
+        }
+    }
+    if let Some(cwd) = args["cwd"].as_str() {
+        crate::terminal::validate_cwd(cwd)?;
+    }
+    if verb == "term.tab.title" && !args["title"].is_string() {
+        return Err("invalid-argument: title must be a string".into());
+    }
+    if verb == "term.tab.move"
+        && args["index"].as_u64().is_none()
+        && args["index"].as_i64().is_none()
+    {
+        return Err("invalid-argument: index must be an integer".into());
+    }
     Ok(args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn c6_fixture() -> Option<(Mutex<TabSet>, Cleanup, std::thread::JoinHandle<()>)> {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP C6 PTY test: Mix unavailable");
+            return None;
+        }
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        Some((Mutex::new(TabSet::new().unwrap()), cleanup, worker))
+    }
+
+    #[test]
+    fn c6_selectors_cross_tabs_and_type_preserves_focus() {
+        let Some((set, cleanup, worker)) = c6_fixture() else {
+            return;
+        };
+        let first = set.lock().unwrap().active_tab().active_pane;
+        handle(&set, &cleanup, "term.tab.new", "").unwrap();
+        let focus = identity(&set.lock().unwrap());
+        let target = set.lock().unwrap().pane_by_id(first).unwrap();
+        let before = target.lock().unwrap().listener.foreground_generation();
+        let typed = handle(
+            &set,
+            &cleanup,
+            "term.type",
+            &format!(r#"{{"pane":{first},"text":"c6_probe"}}"#),
+        )
+        .unwrap();
+        assert!(typed.ends_with(&format!("tab=1 pane={first} revision=2")));
+        assert_eq!(identity(&set.lock().unwrap()), focus);
+        assert!(target.lock().unwrap().listener.foreground_generation() > before);
+        let snapshot = handle(
+            &set,
+            &cleanup,
+            "term.snapshot",
+            &format!(r#"{{"pane":{first},"contents":false}}"#),
+        )
+        .unwrap();
+        assert!(snapshot.starts_with(&format!("tab=1 pane={first} ")));
+        assert!(!snapshot.contains("--- screen ---"));
+        assert!(
+            handle(&set, &cleanup, "term.snapshot", r#"{"tab":1}"#)
+                .unwrap()
+                .contains("--- screen ---")
+        );
+        let panes = handle(&set, &cleanup, "term.panes", r#"{"tab":1}"#).unwrap();
+        assert_eq!(panes.lines().count(), 1);
+        assert!(panes.contains("tab=1"));
+        assert_eq!(identity(&set.lock().unwrap()), focus);
+        assert!(
+            handle(
+                &set,
+                &cleanup,
+                "term.snapshot",
+                &format!(r#"{{"pane":{first},"tab":2}}"#)
+            )
+            .unwrap_err()
+            .contains("invalid-argument")
+        );
+        handle(&set, &cleanup, "term.tab.close", r#"{"id":1}"#).unwrap();
+        for (verb, body) in [
+            ("term.snapshot", format!(r#"{{"pane":{first}}}"#)),
+            ("term.type", format!(r#"{{"pane":{first},"text":""}}"#)),
+            ("term.panes", r#"{"tab":1}"#.into()),
+            ("term.snapshot", r#"{"tab":1}"#.into()),
+        ] {
+            assert!(
+                handle(&set, &cleanup, verb, &body)
+                    .unwrap_err()
+                    .contains("not-found")
+            );
+        }
+        cleanup.submit(set.lock().unwrap().shutdown());
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn c6_tab_new_cwd_title_and_refusal_are_atomic() {
+        let Some((set, cleanup, worker)) = c6_fixture() else {
+            return;
+        };
+        for cwd in [
+            "relative",
+            "/a-directory-that-does-not-exist-c6",
+            "/dev/null",
+        ] {
+            let body = serde_json::json!({"cwd":cwd,"title":"refused"}).to_string();
+            assert!(
+                handle(&set, &cleanup, "term.tab.new", &body)
+                    .unwrap_err()
+                    .contains("invalid-argument")
+            );
+            assert_eq!(set.lock().unwrap().list().len(), 1);
+        }
+        let body = serde_json::json!({"cwd":"/", "title":"build"}).to_string();
+        assert!(
+            handle(&set, &cleanup, "term.tab.new", &body)
+                .unwrap()
+                .starts_with("opened id=2 ")
+        );
+        let tabs = set.lock().unwrap();
+        assert_eq!(tabs.active_tab().title, "build");
+        let pid = tabs.list()[1].child_pid;
+        assert_eq!(
+            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap(),
+            std::path::Path::new("/")
+        );
+        drop(tabs);
+        cleanup.submit(set.lock().unwrap().shutdown());
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn c6_title_move_and_replays() {
+        use rio_vt::event::{EventListener, RioEvent, WindowId};
+        let Some((set, cleanup, worker)) = c6_fixture() else {
+            return;
+        };
+        let mut replies = ReplyCache::default();
+        let pane = set.lock().unwrap().active_terminal();
+        let listener = pane.lock().unwrap().listener.clone();
+        listener.send_event(RioEvent::Title("program".into()), WindowId::from(0));
+        let pin = r#"{"id":1,"title":"pinned","request_id":"pin"}"#;
+        let reply = dispatch(true, &set, &cleanup, &mut replies, "term.tab.title", pin).unwrap();
+        listener.send_event(RioEvent::Title("latest".into()), WindowId::from(0));
+        assert!(
+            handle(&set, &cleanup, "term.tabs", "")
+                .unwrap()
+                .contains("title=pinned")
+        );
+        handle(&set, &cleanup, "term.tab.title", r#"{"id":1,"title":""}"#).unwrap();
+        assert_eq!(set.lock().unwrap().active_tab().title, "latest");
+        assert_eq!(
+            dispatch(true, &set, &cleanup, &mut replies, "term.tab.title", pin).unwrap(),
+            reply
+        );
+        assert_eq!(
+            set.lock().unwrap().active_tab().title,
+            "latest",
+            "replay does not repin"
+        );
+        assert!(
+            handle(
+                &set,
+                &cleanup,
+                "term.tab.title",
+                r#"{"id":999,"title":"x"}"#
+            )
+            .unwrap_err()
+            .contains("not-found")
+        );
+        handle(&set, &cleanup, "term.tab.new", "").unwrap();
+        let moved = r#"{"id":1,"index":18446744073709551615,"request_id":"move"}"#;
+        let reply = dispatch(true, &set, &cleanup, &mut replies, "term.tab.move", moved).unwrap();
+        assert!(reply.contains("index=1"));
+        assert_eq!(
+            set.lock()
+                .unwrap()
+                .list()
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(set.lock().unwrap().active_id(), 2);
+        handle(&set, &cleanup, "term.tab.move", r#"{"id":1,"index":-1}"#).unwrap();
+        assert_eq!(
+            dispatch(true, &set, &cleanup, &mut replies, "term.tab.move", moved).unwrap(),
+            reply
+        );
+        assert_eq!(set.lock().unwrap().list()[0].id, 1);
+        assert!(
+            handle(&set, &cleanup, "term.tab.move", r#"{"id":999,"index":0}"#)
+                .unwrap_err()
+                .contains("not-found")
+        );
+        cleanup.submit(set.lock().unwrap().shutdown());
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn c6_watch_events_cover_local_mutations_and_noops() {
+        let Some((set, cleanup, worker)) = c6_fixture() else {
+            return;
+        };
+        let mut events = set.lock().unwrap().observe();
+        let reply = super::handle("bterm", &set, &cleanup, "term.props.watch", "{}").unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply["topics"],
+            serde_json::json!([
+                "bterm.tabs.changed",
+                "bterm.pane.changed",
+                "bterm.title.changed"
+            ])
+        );
+        assert!(handle(&set, &cleanup, "term.props.watch", r#"{"caller":"spoof"}"#).is_err());
+        assert!(events.try_recv().is_err());
+        let mut tabs = set.lock().unwrap();
+        let pane = tabs.split_active(crate::panes::SplitDir::Vertical).unwrap();
+        tabs.focus(1);
+        tabs.resized(1, 100, 30);
+        tabs.set_title(1, "label".into()).unwrap();
+        let other = tabs.open().unwrap();
+        tabs.move_tab(1, 1).unwrap();
+        tabs.select(1);
+        tabs.focus(pane);
+        cleanup.submit(tabs.close_active().1.into_iter().collect());
+        cleanup.submit(tabs.close(other).1.into_iter().collect());
+        let mut got = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            got.push(event);
+        }
+        for (topic, kind) in [
+            ("tabs.changed", "added"),
+            ("tabs.changed", "removed"),
+            ("tabs.changed", "moved"),
+            ("tabs.changed", "selected"),
+            ("tabs.changed", "retitled"),
+            ("title.changed", "retitled"),
+            ("pane.changed", "added"),
+            ("pane.changed", "removed"),
+            ("pane.changed", "selected"),
+            ("pane.changed", "resized"),
+        ] {
+            assert!(
+                got.iter().any(|e| e.topic == topic && e.kind == kind),
+                "{topic}/{kind}: {got:?}"
+            );
+        }
+        assert!(
+            got.windows(2)
+                .all(|pair| pair[0].revision < pair[1].revision)
+        );
+        let body = got[0].body();
+        assert_eq!(body.as_object().unwrap().len(), 4);
+        assert_eq!(body["tab"], 1);
+        assert_eq!(body["pane"], pane);
+        tabs.select(1);
+        tabs.focus(1);
+        tabs.resized(1, 100, 30);
+        tabs.move_tab(1, 0).unwrap();
+        tabs.set_title(1, "label".into()).unwrap();
+        assert!(events.try_recv().is_err(), "no-op mutations stay quiet");
+        cleanup.submit(tabs.shutdown());
+        drop(tabs);
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn c6_optional_argument_validation() {
+        for (verb, body) in [
+            ("term.snapshot", r#"{"pane":null}"#),
+            ("term.snapshot", r#"{"tab":-1}"#),
+            ("term.snapshot", r#"{"contents":1}"#),
+            ("term.snapshot", r#"{"scrollback_lines":10001}"#),
+            ("term.snapshot", r#"{"scrollback_lines":-1}"#),
+            ("term.snapshot", r#"{"scrollback_lines":1.5}"#),
+            ("term.type", r#"{"pane":"1","text":""}"#),
+            ("term.panes", r#"{"tab":null}"#),
+            ("term.tab.new", r#"{"title":null}"#),
+            ("term.tab.new", r#"{"cwd":false}"#),
+            ("term.tab.title", r#"{"id":1}"#),
+            ("term.tab.move", r#"{"id":1,"index":1.5}"#),
+            ("term.tab.move", r#"{"id":1}"#),
+        ] {
+            assert!(parse_args(verb, body).is_err(), "{verb} {body}");
+        }
+        for n in [0, 10000] {
+            assert!(parse_args("term.snapshot", &format!(r#"{{"scrollback_lines":{n}}}"#)).is_ok());
+        }
+    }
 
     /// The existing suite predates the service-name parameter and exercises
     /// the canonical `term` frontend, so it reads unchanged through this
@@ -856,8 +1296,18 @@ mod tests {
     }
     struct Mute;
     impl Peer for Mute {
+        fn changed(
+            &self,
+            _: &str,
+            _: Change,
+        ) -> impl std::future::Future<Output = ()> + Send + 'static {
+            std::future::ready(())
+        }
         async fn reply(&self, _: &IncomingCommand, _: u8, _: &str) {}
-        fn completed(&self, _: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+        fn completed(
+            &self,
+            _: CompletionNote,
+        ) -> impl std::future::Future<Output = ()> + Send + 'static {
             std::future::ready(())
         }
     }
@@ -1032,10 +1482,24 @@ mod tests {
 
     struct Recorder(std::sync::mpsc::Sender<(String, u8, String)>);
     impl Peer for Recorder {
+        fn changed(
+            &self,
+            service: &str,
+            change: Change,
+        ) -> impl std::future::Future<Output = ()> + Send + 'static {
+            let sender = self.0.clone();
+            let topic = format!("{service}.{}", change.topic);
+            async move {
+                let _ = sender.send((topic, 0, change.body().to_string()));
+            }
+        }
         async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
             let _ = self.0.send((command.command.clone(), rc, body.into()));
         }
-        fn completed(&self, _: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+        fn completed(
+            &self,
+            _: CompletionNote,
+        ) -> impl std::future::Future<Output = ()> + Send + 'static {
             std::future::ready(())
         }
     }
@@ -1073,10 +1537,73 @@ mod tests {
                 .block_on(async {
                     let mut tasks = tokio::task::JoinSet::new();
                     let mut incoming = Quiet(commands);
-                    serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut incoming, &Recorder(replies_tx)).await;
+                    serve(
+                        CANONICAL,
+                        &set,
+                        &cleanup,
+                        &mut notify_rx,
+                        &mut tasks,
+                        &mut incoming,
+                        &Recorder(replies_tx),
+                    )
+                    .await;
                 });
         });
         (commands_tx, replies, thread)
+    }
+
+    #[test]
+    fn c6_serve_publishes_local_changes_and_drains_last_close() {
+        let Some((set, cleanup, worker)) = c6_fixture() else {
+            return;
+        };
+        let set = Arc::new(set);
+        let (commands, replies, thread) = serving(&set, &cleanup);
+        // Real shell startup may emit OSC titles. Ignore those independent
+        // events while requiring each requested event within one deadline.
+        let receive = |expected: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let (verb, rc, body) = replies
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if verb == expected {
+                    break (verb, rc, body);
+                }
+                assert!(matches!(
+                    verb.as_str(),
+                    "term.tabs.changed" | "term.title.changed"
+                ));
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body).unwrap()["kind"],
+                    "retitled"
+                );
+            }
+        };
+        commands
+            .blocking_send(command("term.props.watch", ""))
+            .unwrap();
+        let (verb, rc, _) = receive("term.props.watch");
+        assert_eq!((verb.as_str(), rc), ("term.props.watch", 0));
+        set.lock().unwrap().resized(1, 100, 30);
+        let (topic, rc, body) = receive("term.pane.changed");
+        assert_eq!((topic.as_str(), rc), ("term.pane.changed", 0));
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["kind"], "resized");
+        commands
+            .blocking_send(command("term.tab.close", r#"{"id":1}"#))
+            .unwrap();
+        let (verb, rc, _) = receive("term.tab.close");
+        assert_eq!((verb.as_str(), rc), ("term.tab.close", 0));
+        for expected in ["term.pane.changed", "term.tabs.changed"] {
+            let (topic, _, body) = receive(expected);
+            assert_eq!(topic, expected);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["kind"], "removed");
+        }
+        thread.join().unwrap();
+        drop(cleanup);
+        worker.join().unwrap();
     }
 
     /// Through the real serve() path: a verb that panics outside the set
@@ -1612,5 +2139,32 @@ mod tests {
         assert!(rendered.starts_with("bterm: "));
         // Serving as `term` renders the canonical text unchanged.
         assert_eq!(help(CANONICAL), HELP);
+        for service in ["term", "bterm"] {
+            let rendered = help(service);
+            for suffix in [
+                "snapshot",
+                "type",
+                "panes",
+                "tab.new",
+                "tab.title",
+                "tab.move",
+                "props.watch",
+            ] {
+                let name = format!("{service}.{suffix}");
+                assert!(rendered.contains(&name), "HELP missing {name}");
+                assert_eq!(routed(service, &name), Some(format!("term.{suffix}")));
+            }
+            for arg in [
+                "pane?",
+                "tab?",
+                "contents?",
+                "scrollback_lines?",
+                "cwd?",
+                "title?",
+                "index:",
+            ] {
+                assert!(rendered.contains(arg), "HELP missing {arg}");
+            }
+        }
     }
 }

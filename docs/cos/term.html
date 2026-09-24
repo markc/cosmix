@@ -522,20 +522,60 @@ make the same change, and the window follows a verb straight away. Every body
 is a JSON object, and <code>{}</code> means no arguments.</p>
 <table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
 <tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid, revision</td></tr>
-<tr><td><code>term.tab.new</code></td><td><code>{}</code></td><td>open a tab and select it</td></tr>
+<tr><td><code>term.tab.new</code></td><td><code>{"cwd":"/absolute/directory","title":"build"}</code> (both optional)</td><td>open and select a tab; explicit cwd must exist and never falls back; title pins the tab label</td></tr>
+<tr><td><code>term.tab.title</code></td><td><code>{"id":N,"title":"build"}</code></td><td>pin a label; empty string clears the pin and restores the focused pane's program-set OSC title (default <code>mix</code>)</td></tr>
+<tr><td><code>term.tab.move</code></td><td><code>{"id":N,"index":0}</code></td><td>reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane</td></tr>
 <tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
 <tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
-<tr><td><code>term.panes</code></td><td><code>{}</code></td><td>list the active tab's panes: id, focus, cols, rows, child pid, geometry, tab, revision</td></tr>
+<tr><td><code>term.panes</code></td><td><code>{"tab":N}</code> (optional)</td><td>list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision</td></tr>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
-<tr><td><code>term.snapshot</code></td><td><code>{}</code></td><td>read the focused pane's screen, size and cursor</td></tr>
-<tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td><td>type ASCII into the focused pane, as keys</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}</code> (all optional)</td><td>read a pane anywhere; default is the focused pane in the selected/active tab; <code>contents</code> defaults true; history defaults 0, accepts 0–10000, capped at history above the current viewport</td></tr>
+<tr><td><code>term.type</code></td><td><code>{"pane":N,"text":"..."}</code> (<code>pane</code> optional)</td><td>type ASCII as keys into that pane, default focused pane; does not change focus</td></tr>
+<tr><td><code>term.props.watch</code></td><td><code>{}</code></td><td>enable caller-free topic publishing; return JSON <code>{topics,revision}</code>; callers subscribe to the returned topics through noded</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send term term.tab.new
 send term term.pane.split dir=v
 send term term.panes
+send term term.tab.new cwd="/tmp" title="build"
+send term term.tab.title id=1 title="logs"
+send term term.tab.move id=1 index=0
+send term term.panes tab=1
+send term term.snapshot pane=1 contents=true scrollback_lines=100
+send term term.type pane=1 text="pwd\n"
+send term term.props.watch
 </code></pre>
+<p>The same surface is served by bterm as <code>bterm.*</code>. The target-bound native
+session lane is unchanged. Explicit stale tab/pane IDs return a <code>not-found</code>
+error, never the active pane. With both snapshot selectors, the pane must
+belong to the tab or the call returns <code>invalid-argument</code>. <code>contents:false</code>
+returns the usual metadata and diagnostic timings without the screen marker
+or text. Scrollback is prepended after the screen marker, oldest first;
+<code>rows</code> still describes the viewport. Reading never moves the scroll offset.</p>
+<p>Existing replies keep their key=value format. New title replies are
+<code>retitled id=N tab=N pane=P revision=R</code>; move replies are
+<code>moved id=N index=I tab=N pane=P revision=R</code>. Tab creation still replies
+<code>opened id=N tab=N pane=P revision=R binding=...</code>. All mutations, including
+title/move and pane-selected typing, accept <code>request_id</code>; a retry with the
+same verb and arguments replays the original success or refusal. Different
+arguments with the same ID are a conflict. The JSON envelope limit remains
+8192 bytes. Index must be an integer; invalid optional argument
+types are refused.</p>
+<p>Watch publishes <code>&lt;service&gt;.tabs.changed</code> (added, removed, moved, selected,
+retitled), <code>&lt;service&gt;.pane.changed</code> (added, removed, selected, resized) and
+<code>&lt;service&gt;.title.changed</code> (retitled). Each body is
+<code>{tab,pane,kind,revision}</code>; the embedded Bus command is the topic suffix.
+Events cover local UI actions and Bus mutations. OSC updates wake the core;
+multiple updates before it handles the wake may coalesce to the latest title.
+Pinned titles hide OSC updates until cleared. Unchanged values and replayed
+mutations produce no new events. There is no timer or caller identity lease.</p>
+<p>The watch revision is a separate monotonic event sequence, preserving the
+older layout revision in verb replies. Publishing uses a bounded 256-record
+queue and a serial, best-effort Bus sender. Subscribe before enabling watch,
+then read current state; on a revision gap or reconnect read state again.
+The watch response gives the current event revision. Events are not retained
+by noded; publication failures are logged and do not block terminal input.</p>
 <p><code>term.panes</code> reports each pane's geometry in logical pixels, relative to the
 pane area below the tab strip, as bterm does.</p>
 <p>With no broker, term prints that the Bus is unavailable and works as a

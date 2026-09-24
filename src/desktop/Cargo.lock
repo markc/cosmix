@@ -3007,7 +3007,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-bterm"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "bevy",
  "cosmix-actions",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "cosmix-design",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",

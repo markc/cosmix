@@ -102,21 +102,65 @@ is a JSON object, and `{}` means no arguments.
 | Verb | Body | Effect |
 |---|---|---|
 | `term.tabs` | `{}` | list tabs: id, active, title, cols, rows, child pid, revision |
-| `term.tab.new` | `{}` | open a tab and select it |
+| `term.tab.new` | `{"cwd":"/absolute/directory","title":"build"}` (both optional) | open and select a tab; explicit cwd must exist and never falls back; title pins the tab label |
+| `term.tab.title` | `{"id":N,"title":"build"}` | pin a label; empty string clears the pin and restores the focused pane's program-set OSC title (default `mix`) |
+| `term.tab.move` | `{"id":N,"index":0}` | reorder to a zero-based index, clamped to 0–(tab count − 1); preserve selected tab and pane |
 | `term.tab.select` | `{"id":N}` | select tab N |
 | `term.tab.close` | `{"id":N}` | close tab N; closing the last tab quits |
-| `term.panes` | `{}` | list the active tab's panes: id, focus, cols, rows, child pid, geometry, tab, revision |
+| `term.panes` | `{"tab":N}` (optional) | list that tab's panes, default active tab: id, focus within the tab, cols, rows, child pid, geometry, tab, revision |
 | `term.pane.split` | `{"dir":"v"}` or `{"dir":"h"}` | split the focused pane side by side (`v`) or top and bottom (`h`) |
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |
-| `term.snapshot` | `{}` | read the focused pane's screen, size and cursor |
-| `term.type` | `{"text":"..."}` | type ASCII into the focused pane, as keys |
+| `term.snapshot` | `{"pane":N,"tab":T,"contents":true,"scrollback_lines":100}` (all optional) | read a pane anywhere; default is the focused pane in the selected/active tab; `contents` defaults true; history defaults 0, accepts 0–10000, capped at history above the current viewport |
+| `term.type` | `{"pane":N,"text":"..."}` (`pane` optional) | type ASCII as keys into that pane, default focused pane; does not change focus |
+| `term.props.watch` | `{}` | enable caller-free topic publishing; return JSON `{topics,revision}`; callers subscribe to the returned topics through noded |
 
 ```mix
 send term term.tab.new
 send term term.pane.split dir=v
 send term term.panes
+send term term.tab.new cwd="/tmp" title="build"
+send term term.tab.title id=1 title="logs"
+send term term.tab.move id=1 index=0
+send term term.panes tab=1
+send term term.snapshot pane=1 contents=true scrollback_lines=100
+send term term.type pane=1 text="pwd\n"
+send term term.props.watch
 ```
+
+The same surface is served by bterm as `bterm.*`. The target-bound native
+session lane is unchanged. Explicit stale tab/pane IDs return a `not-found`
+error, never the active pane. With both snapshot selectors, the pane must
+belong to the tab or the call returns `invalid-argument`. `contents:false`
+returns the usual metadata and diagnostic timings without the screen marker
+or text. Scrollback is prepended after the screen marker, oldest first;
+`rows` still describes the viewport. Reading never moves the scroll offset.
+
+Existing replies keep their key=value format. New title replies are
+`retitled id=N tab=N pane=P revision=R`; move replies are
+`moved id=N index=I tab=N pane=P revision=R`. Tab creation still replies
+`opened id=N tab=N pane=P revision=R binding=...`. All mutations, including
+title/move and pane-selected typing, accept `request_id`; a retry with the
+same verb and arguments replays the original success or refusal. Different
+arguments with the same ID are a conflict. The JSON envelope limit remains
+8192 bytes. Index must be an integer; invalid optional argument
+types are refused.
+
+Watch publishes `<service>.tabs.changed` (added, removed, moved, selected,
+retitled), `<service>.pane.changed` (added, removed, selected, resized) and
+`<service>.title.changed` (retitled). Each body is
+`{tab,pane,kind,revision}`; the embedded Bus command is the topic suffix.
+Events cover local UI actions and Bus mutations. OSC updates wake the core;
+multiple updates before it handles the wake may coalesce to the latest title.
+Pinned titles hide OSC updates until cleared. Unchanged values and replayed
+mutations produce no new events. There is no timer or caller identity lease.
+
+The watch revision is a separate monotonic event sequence, preserving the
+older layout revision in verb replies. Publishing uses a bounded 256-record
+queue and a serial, best-effort Bus sender. Subscribe before enabling watch,
+then read current state; on a revision gap or reconnect read state again.
+The watch response gives the current event revision. Events are not retained
+by noded; publication failures are logged and do not block terminal input.
 
 `term.panes` reports each pane's geometry in logical pixels, relative to the
 pane area below the tab strip, as bterm does.

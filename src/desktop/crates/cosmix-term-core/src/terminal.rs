@@ -91,8 +91,28 @@ pub struct Listener {
     writes: Arc<Mutex<Writes>>,
     stats: Stats,
     pub quit: Arc<AtomicBool>,
+    title: Arc<Mutex<String>>,
+    title_changed: Arc<OnceLock<Arc<tokio::sync::Notify>>>,
 }
 impl Listener {
+    pub(crate) fn title(&self) -> String {
+        self.title.lock().unwrap().clone()
+    }
+    pub(crate) fn watch_title(&self, notify: Arc<tokio::sync::Notify>) {
+        let _ = self.title_changed.set(notify);
+    }
+    fn set_title(&self, title: String) {
+        let mut current = self.title.lock().unwrap();
+        if *current == title {
+            return;
+        }
+        *current = title;
+        drop(current);
+        if let Some(notify) = self.title_changed.get() {
+            notify.notify_one();
+        }
+        self.wake();
+    }
     #[cfg(test)]
     pub(crate) fn block_control_writes(&self, block: bool) {
         self.writes.lock().unwrap().block_control = block;
@@ -235,6 +255,8 @@ impl Listener {
 impl EventListener for Listener {
     fn send_event(&self, event: RioEvent, _: WindowId) {
         match event {
+            RioEvent::Title(title) | RioEvent::TitleWithSubtitle(title, _) => self.set_title(title),
+            RioEvent::ResetTitle => self.set_title(String::new()),
             RioEvent::PtyWrite(_, text) => {
                 if let Err(e) = self.write(text.into_bytes(), None) {
                     eprintln!("PTY reply failed: {e}");
@@ -517,6 +539,14 @@ struct LaunchSettings<'a> {
     environment: Vec<(String, String)>,
 }
 
+pub(crate) fn validate_cwd(cwd: &str) -> Result<(), String> {
+    let path = std::path::Path::new(cwd);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err("invalid-argument: cwd must be an absolute existing directory".into());
+    }
+    Ok(())
+}
+
 fn launch_directory(term_cwd: Option<String>, home: Option<String>) -> Result<String, String> {
     term_cwd
         .filter(|dir| {
@@ -541,14 +571,33 @@ impl Terminal {
         native: Option<&crate::native_session::NativeSession>,
         pane_id: u64,
     ) -> Result<Self, String> {
+        Self::start_session_in(settings, native, pane_id, None)
+    }
+
+    pub(crate) fn start_session_in(
+        settings: crate::config::Settings,
+        native: Option<&crate::native_session::NativeSession>,
+        pane_id: u64,
+        cwd: Option<String>,
+    ) -> Result<Self, String> {
+        if let Some(cwd) = &cwd {
+            validate_cwd(cwd)?;
+        }
+        let explicit_cwd = cwd.is_some();
         Self::start_session_with_launch(
             settings,
             native,
             pane_id,
             LaunchSettings {
                 program: MIX_BIN,
-                home: std::env::var("HOME").ok(),
-                cwd: std::env::var("TERM_CWD").ok(),
+                // Explicit cwd must never silently fall back to HOME, even
+                // when a directory disappears between validation and chdir.
+                home: if explicit_cwd {
+                    None
+                } else {
+                    std::env::var("HOME").ok()
+                },
+                cwd: cwd.or_else(|| std::env::var("TERM_CWD").ok()),
                 environment: Vec::new(),
             },
         )
@@ -606,6 +655,8 @@ impl Terminal {
             writes: Arc::new(Mutex::new(Writes::default())),
             stats: stats.clone(),
             quit: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(String::new())),
+            title_changed: Arc::new(OnceLock::new()),
         };
         let grid = Arc::new(FairMutex::new(Crosswords::new(
             CrosswordsSize::new(80, 24),
@@ -833,19 +884,37 @@ impl Terminal {
         }
     }
     pub fn snapshot(&self) -> String {
-        let s = self.screen(false);
+        self.snapshot_with(true, 0)
+    }
+    pub fn snapshot_with(&self, contents: bool, scrollback_lines: usize) -> String {
+        use rio_vt::crosswords::{grid::Dimensions, pos::Line};
+        // One grid lock makes history and viewport a coherent capture, without
+        // moving the scroll offset or consuming the renderer's damage.
+        let term = self.grid.lock();
+        let cols = term.columns();
+        let rows = term.screen_lines();
+        let cursor = term.grid.cursor.pos;
         let mut out = format!(
-            "cols={} rows={} cursor={},{} child_pid={}\n{}\n--- screen ---\n",
-            s.cols,
-            s.rows,
-            s.cursor.0,
-            s.cursor.1,
+            "cols={} rows={} cursor={},{} child_pid={}\n{}\n",
+            cols,
+            rows,
+            cursor.col.0,
+            cursor.row.0.max(0),
             self.pid,
             self.stats.lock().unwrap().summary()
         );
-        for row in s.cells.chunks(s.cols) {
-            for cell in row {
-                out.push(cell.c);
+        if !contents {
+            return out;
+        }
+        out.push_str("--- screen ---\n");
+        let offset = term.display_offset();
+        let history = scrollback_lines
+            .min(10000)
+            .min(term.grid.history_size().saturating_sub(offset));
+        for y in -(offset as i32) - history as i32..rows as i32 - offset as i32 {
+            let row = &term.grid[Line(y)];
+            for x in 0..cols {
+                out.push(row[Column(x)].c());
             }
             out.push('\n');
         }
@@ -1027,6 +1096,8 @@ mod tests {
             writes: Arc::new(Mutex::new(Writes::default())),
             stats: Arc::new(Mutex::new(Metrics::default())),
             quit: Arc::new(AtomicBool::new(false)),
+            title: Arc::new(Mutex::new(String::new())),
+            title_changed: Arc::new(OnceLock::new()),
         };
         let grid = Arc::new(FairMutex::new(Crosswords::new(
             CrosswordsSize::new(80, 24),
@@ -1110,6 +1181,8 @@ mod tests {
                 writes: Arc::new(Mutex::new(Writes::default())),
                 stats: stats.clone(),
                 quit: Arc::new(AtomicBool::new(false)),
+                title: Arc::new(Mutex::new(String::new())),
+                title_changed: Arc::new(OnceLock::new()),
             };
             let grid = Arc::new(FairMutex::new(Crosswords::new(
                 CrosswordsSize::new(80, 24),
@@ -1274,6 +1347,72 @@ mod tests {
         assert!(all(&f.settled_snapshot().dirty_rows), "scroll-back");
         // Still scrolled back: repainted whole, and still no self-wake.
         assert!(all(&f.quiet_snapshot().dirty_rows), "scrolled view");
+    }
+
+    #[test]
+    fn snapshot_history_caps_at_available_lines_and_preserves_viewport() {
+        use rio_vt::crosswords::grid::Dimensions;
+        let mut f = GridFixture::new();
+        let mut bytes = Vec::new();
+        for n in 0..40 {
+            bytes.extend_from_slice(format!("line{n:02}\r\n").as_bytes());
+        }
+        bytes.push(b'Z');
+        f.feed(&bytes, |t| cell(t, 23, 0) == 'Z');
+        f.settled_snapshot();
+        let lines = |n| {
+            f.terminal
+                .snapshot_with(true, n)
+                .split_once("--- screen ---\n")
+                .unwrap()
+                .1
+                .lines()
+                .map(str::trim_end)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let history = f.terminal.grid.lock().grid.history_size();
+        assert_eq!(history, 17);
+        assert_eq!(lines(0).len(), 24);
+        assert_eq!(lines(3).len(), 27);
+        assert_eq!(lines(10000).len(), 41);
+        assert_eq!(lines(10000)[0], "line00");
+        assert_eq!(lines(10000)[40], "Z");
+        assert!(
+            !f.terminal
+                .snapshot_with(false, 10000)
+                .contains("--- screen ---")
+        );
+        f.quiet_snapshot();
+        f.terminal.grid.lock().scroll_display(Scroll::Delta(5));
+        f.settled_snapshot();
+        assert_eq!(lines(10000).len(), 36);
+        assert_eq!(lines(10000)[0], "line00");
+        assert_eq!(lines(0)[0], "line12");
+        assert_eq!(f.terminal.grid.lock().display_offset(), 5);
+        f.quiet_snapshot();
+    }
+
+    #[test]
+    fn osc_titles_wake_without_taking_the_tab_set_lock() {
+        let mut f = GridFixture::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        f.terminal.listener.watch_title(notify.clone());
+        f.feed(b"\x1b]2;program title\x07X", |t| cell(t, 0, 0) == 'X');
+        assert_eq!(f.terminal.listener.title(), "program title");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(1), notify.notified())
+                .await
+                .unwrap();
+        });
+        f.terminal
+            .listener
+            .send_event(RioEvent::ResetTitle, WindowId::from(0));
+        assert_eq!(f.terminal.listener.title(), "");
     }
 
     #[test]
