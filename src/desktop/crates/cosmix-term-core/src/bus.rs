@@ -1,5 +1,5 @@
 use crate::tabs::{Cleanup, CompletionNote, Outcome, TabSet};
-use cosmix_client::{BoundedIncomingEvent, SupervisedClient};
+use cosmix_client::{BoundedIncomingEvent, IncomingCommand, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -93,50 +93,8 @@ pub(crate) fn start_at(
             let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options(service, &url).bounded_incoming(16).connect()).await;
             let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("{service} Bus unavailable or connection timed out"); return; } };
             let Some(mut incoming) = client.incoming_bounded() else { return; };
-            // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
-            // or closes at shutdown. `recv()` on a closed channel returns `None`
-            // immediately and forever, which would spin the select; the
-            // precondition retires the branch on the first `None` so it is never
-            // re-polled, while the loop keeps serving Bus verbs until the TabSet
-            // empties.
-            let mut notify_open = true;
             let mut notifications = tokio::task::JoinSet::new();
-            let mut replies = ReplyCache::default();
-            while !terminal.lock().unwrap().is_empty() {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                    note = notify_rx.recv(), if notify_open => {
-                        // Sink writes can block under backpressure. Poll them in
-                        // separate tracked tasks so verbs remain serviceable.
-                        match note {
-                            Some(note) => {
-                                let client = client.clone();
-                                notifications.spawn(async move { notify_complete(&client, &note).await });
-                            },
-                            None => notify_open = false,
-                        }
-                    },
-                    _ = notifications.join_next(), if !notifications.is_empty() => {},
-                    event = incoming.recv() => {
-                        let command = match event {
-                            Some(BoundedIncomingEvent::Command(c)) => c,
-                            Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
-                            None => break,
-                        };
-                        let result = dispatch(
-                            crate::control::mesh_open(),
-                            service,
-                            &terminal,
-                            &cleanup,
-                            &mut replies,
-                            &command.command,
-                            &command.body,
-                        );
-                        let (rc,body) = match result { Ok(body) => (0,body), Err(error) => (10,error) };
-                        let _ = tokio::time::timeout(Duration::from_secs(2),client.respond(&command,rc,&body)).await;
-                    }
-                }
-            }
+            serve(service, &terminal, &cleanup, &mut notify_rx, &mut notifications, &mut incoming, &client).await;
             // The final reap can queue notes just after the TabSet becomes
             // empty. Wait for channel closure and outstanding sends together,
             // under one total deadline (not two seconds per pane).
@@ -147,6 +105,96 @@ pub(crate) fn start_at(
             let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
         });
     }).expect("Bus thread")
+}
+
+/// Where the serving loop's commands come from. The broker's bounded lane in
+/// production; a plain channel under test, so the loop itself runs without a
+/// broker.
+trait Incoming {
+    fn next(&mut self) -> impl std::future::Future<Output = Option<BoundedIncomingEvent>>;
+}
+impl Incoming for cosmix_client::BoundedIncomingReceiver {
+    fn next(&mut self) -> impl std::future::Future<Output = Option<BoundedIncomingEvent>> {
+        self.recv()
+    }
+}
+
+/// Where the serving loop's replies and completion notes go.
+trait Peer {
+    fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) -> impl std::future::Future<Output = ()>;
+    fn completed(&self, note: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static;
+}
+impl Peer for Arc<SupervisedClient> {
+    async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::respond(self, command, rc, body)).await;
+    }
+    fn completed(&self, note: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let client = self.clone();
+        async move { notify_complete(&client, &note).await }
+    }
+}
+
+/// Serve verbs until the TabSet empties. Event-driven throughout: every
+/// branch is a real event (a command, a completion note, a finished send, the
+/// last tab closing), so an idle terminal never runs a turn — the loop used
+/// to tick a 100 ms sleep purely to re-check `is_empty()`. Returns the number
+/// of turns taken, which is what the idle test counts.
+async fn serve(
+    service: &str,
+    terminal: &Mutex<TabSet>,
+    cleanup: &Cleanup,
+    notify_rx: &mut tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
+    notifications: &mut tokio::task::JoinSet<()>,
+    incoming: &mut impl Incoming,
+    peer: &impl Peer,
+) -> usize {
+    // Taken once: the TabSet signals this whichever thread closes the last
+    // tab — a Bus verb here, or the frontend (keyboard, child exit, window
+    // close) — and the permit survives until this loop next waits.
+    let emptied = terminal.lock().unwrap().emptied();
+    // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
+    // or closes at shutdown. `recv()` on a closed channel returns `None`
+    // immediately and forever, which would spin the select; the
+    // precondition retires the branch on the first `None` so it is never
+    // re-polled, while the loop keeps serving Bus verbs until the TabSet
+    // empties.
+    let mut notify_open = true;
+    let mut replies = ReplyCache::default();
+    let mut turns = 0;
+    while !terminal.lock().unwrap().is_empty() {
+        turns += 1;
+        tokio::select! {
+            _ = emptied.notified() => {},
+            note = notify_rx.recv(), if notify_open => {
+                // Sink writes can block under backpressure. Poll them in
+                // separate tracked tasks so verbs remain serviceable.
+                match note {
+                    Some(note) => { notifications.spawn(peer.completed(note)); },
+                    None => notify_open = false,
+                }
+            },
+            _ = notifications.join_next(), if !notifications.is_empty() => {},
+            event = incoming.next() => {
+                let command = match event {
+                    Some(BoundedIncomingEvent::Command(c)) => c,
+                    Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
+                    None => break,
+                };
+                let result = dispatch(
+                    crate::control::mesh_open(),
+                    service,
+                    terminal,
+                    cleanup,
+                    &mut replies,
+                    &command.command,
+                    &command.body,
+                );
+                let (rc, body) = match result { Ok(body) => (0, body), Err(error) => (10, error) };
+                peer.reply(&command, rc, &body).await;
+            }
+        }
+    }
+    turns
 }
 
 async fn drain_notifications<F, Fut>(
@@ -700,6 +748,91 @@ mod tests {
                 }
                 drop(tx);
             });
+    }
+
+    struct Quiet(tokio::sync::mpsc::Receiver<BoundedIncomingEvent>);
+    impl Incoming for Quiet {
+        fn next(&mut self) -> impl std::future::Future<Output = Option<BoundedIncomingEvent>> {
+            self.0.recv()
+        }
+    }
+    struct Mute;
+    impl Peer for Mute {
+        async fn reply(&self, _: &IncomingCommand, _: u8, _: &str) {}
+        fn completed(&self, _: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+            std::future::ready(())
+        }
+    }
+
+    /// Event-driven law: an idle terminal's Bus loop must not wake. Every
+    /// input stays open and silent for a window that the old 100 ms re-poll
+    /// would have ticked through several times; the only turn allowed is the
+    /// one the last-tab close causes, and that close must end the loop.
+    #[test]
+    fn idle_bus_loop_takes_no_turns_until_the_last_tab_closes() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP idle Bus loop test: Mix unavailable");
+            return;
+        }
+        let set = Arc::new(Mutex::new(TabSet::new().unwrap()));
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        // Both senders stay alive, so neither branch retires with a `None`.
+        let (_notes, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_commands, commands) = tokio::sync::mpsc::channel(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let serving = {
+            let (set, cleanup) = (set.clone(), cleanup.clone());
+            std::thread::spawn(move || {
+                let turns = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut tasks = tokio::task::JoinSet::new();
+                        let mut incoming = Quiet(commands);
+                        serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut incoming, &Mute).await
+                    });
+                done_tx.send(turns).unwrap();
+            })
+        };
+        // Quiet window: 3.5 ticks of the retired re-poll.
+        assert!(
+            done.recv_timeout(Duration::from_millis(350)).is_err(),
+            "loop ended while the terminal still had a tab"
+        );
+        cleanup.submit(set.lock().unwrap().shutdown());
+        let turns = done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("closing the last tab must wake and end the loop");
+        assert_eq!(turns, 1, "an idle loop woke without an event");
+        serving.join().unwrap();
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    /// A set already empty when the loop starts is never waited on.
+    #[test]
+    fn bus_loop_on_an_empty_set_returns_without_a_turn() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP empty Bus loop test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        cleanup.submit(set.lock().unwrap().shutdown());
+        let (_notes, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_commands, commands) = tokio::sync::mpsc::channel(1);
+        let turns = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut tasks = tokio::task::JoinSet::new();
+                serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut Quiet(commands), &Mute).await
+            });
+        assert_eq!(turns, 0);
+        drop(cleanup);
+        worker.join().unwrap();
     }
 
     #[test]

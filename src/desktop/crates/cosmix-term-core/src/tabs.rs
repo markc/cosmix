@@ -116,6 +116,9 @@ pub struct TabSet {
     wake: Option<Wake>,
     closing: bool,
     pending: Arc<AtomicUsize>,
+    /// Fired once when the last tab goes, whichever thread closed it. The
+    /// Bus loop waits on this instead of re-polling `is_empty()`.
+    emptied: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -214,6 +217,7 @@ impl TabSet {
             wake: None,
             closing: false,
             pending: Arc::new(AtomicUsize::new(0)),
+            emptied: Arc::new(tokio::sync::Notify::new()),
         };
         set.open_with(start)?;
         Ok(set)
@@ -552,6 +556,10 @@ impl TabSet {
         if self.tabs.is_empty() {
             self.closing = true;
             self.notify();
+            // `notify_one` keeps a permit when nobody is waiting yet, so a
+            // close that lands between the Bus loop's emptiness check and its
+            // next wait is not lost.
+            self.emptied.notify_one();
             return (Outcome::Empty, removed);
         }
         if was_active {
@@ -607,6 +615,10 @@ impl TabSet {
     }
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
+    }
+    /// Signalled when the last tab closes (see the `emptied` field).
+    pub fn emptied(&self) -> Arc<tokio::sync::Notify> {
+        self.emptied.clone()
     }
     pub fn resized(&mut self, id: u64, cols: u16, rows: u16) {
         if let Some(info) = self.metadata.get_mut(&id) {
