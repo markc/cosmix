@@ -605,7 +605,7 @@ fn write_tmp(path: &Path, physical: &[PhysicalBinding]) -> std::io::Result<PathB
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn doc(rows: &str) -> String {
@@ -754,7 +754,7 @@ mod tests {
 
     /// Like [`scratch`] but under `/tmp` (world-traversable), for tests whose
     /// check runs as uid 65534 — the harness temp dir may be root-only.
-    fn scratch_tmp(tag: &str) -> PathBuf {
+    pub(crate) fn scratch_tmp(tag: &str) -> PathBuf {
         let dir = PathBuf::from(format!("/tmp/inputd-open-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -946,7 +946,7 @@ mod tests {
         std::fs::rename(&tmp, path).unwrap();
     }
 
-    fn chmod(path: &Path, mode: u32) {
+    pub(crate) fn chmod(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
@@ -965,11 +965,17 @@ mod tests {
     /// cannot pass vacuously. Bounded by a 20 s deadline: past it the child
     /// is killed, reaped, and the test fails.
     fn run_perm_child(name: &str, dir: &Path) {
+        run_perm_child_in("keymap_file::tests", name, dir);
+    }
+
+    /// [`run_perm_child`] for a child test living in module `module` (e.g.
+    /// `service::tests`), so other test modules share the one harness.
+    pub(crate) fn run_perm_child_in(module: &str, name: &str, dir: &Path) {
         use std::io::Read;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                &format!("keymap_file::tests::{name}"),
+                &format!("{module}::{name}"),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -1001,7 +1007,7 @@ mod tests {
     /// In a child started by [`run_perm_child`] for `name`: drop to 65534 if
     /// root and return the scratch dir. Anywhere else (the normal test run):
     /// `None`, and the child test is a no-op pass.
-    fn perm_child(name: &str) -> Option<PathBuf> {
+    pub(crate) fn perm_child(name: &str) -> Option<PathBuf> {
         if std::env::var(PERM_CHILD_ENV).ok().as_deref() != Some(name) {
             return None;
         }

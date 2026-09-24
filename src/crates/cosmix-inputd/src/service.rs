@@ -374,20 +374,26 @@ fn reload(resolver: &Shared, store: &Store) -> (u8, String) {
         // in place and the live keymap is unchanged. The reply names the real
         // state: configured but unusable, plus why writing is off if it is.
         Err(load_error) => {
-            // An unusable document (bad JSON, a newer version, ...) now sits at
-            // the path. The next bind/unbind would rename our document over it
+            // A file sits at the path that is unusable (bad JSON, a newer
+            // version, ...) or unreadable (EACCES/EIO/EISDIR — it may well be
+            // valid). The next bind/unbind would rename our document over it
             // with no backup, so writing goes off until a good reload — the
             // startup rule, applied at runtime. An existing reason is kept.
-            if let keymap_file::LoadError::Invalid(reason, _) = &load_error {
+            // Absent is different: nothing of the user's is there, so writing
+            // stays on and the next bind creates the file.
+            let state = match &load_error {
+                keymap_file::LoadError::Invalid(reason, _) => Some(format!("unusable ({reason})")),
+                keymap_file::LoadError::Io(reason) => Some(format!("unreadable ({reason})")),
+                keymap_file::LoadError::Absent => None,
+            };
+            if let Some(state) = state {
                 store
                     .persist_disabled
                     .lock()
                     .expect("store poisoned")
                     .get_or_insert_with(|| {
-                        let why = format!(
-                            "{}: unusable ({reason}); left in place by input.reload",
-                            path.display()
-                        );
+                        let why =
+                            format!("{}: {state}; left in place by input.reload", path.display());
                         eprintln!("cosmix-inputd: keymap persistence disabled: {why}");
                         why
                     });
@@ -1029,6 +1035,80 @@ mod tests {
         assert!(reply.get("persisted").is_none(), "{reply}");
         let written = keymap_file::load(&path).expect("bind persisted a loadable file");
         assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reload_read_error_disables_writing_until_a_good_reload() {
+        // A VALID file the daemon cannot read (mode 0000, EACCES). The whole
+        // sequence runs in one child process (one Store), dropped to uid 65534
+        // when started as root, since root bypasses the mode bits. The file is
+        // owned by the child's uid so it can restore the mode itself, and the
+        // directory is world-writable so a wrong save WOULD succeed.
+        use crate::keymap_file::tests::{chmod, run_perm_child_in, scratch_tmp};
+        let dir = scratch_tmp("reload-eacces");
+        chmod(&dir, 0o777);
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, r#"{"version":1,"physical":[]}"#).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path and plain ids.
+            assert_eq!(unsafe { libc::chown(c_path.as_ptr(), 65534, 65534) }, 0);
+        }
+        chmod(&path, 0o000);
+        run_perm_child_in("service::tests", "perm_child_reload_eacces", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn perm_child_reload_eacces() {
+        let Some(dir) = crate::keymap_file::tests::perm_child("perm_child_reload_eacces") else {
+            return;
+        };
+        let path = dir.join("keymap.json");
+        let valid = r#"{"version":1,"physical":[]}"#;
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        let disabled = reply["persist_disabled"].as_str().expect("writing turned off");
+        assert!(disabled.starts_with(&path.display().to_string()), "{disabled}");
+        assert!(disabled.contains("unreadable (open failed"), "{disabled}");
+        assert!(disabled.ends_with("left in place by input.reload"), "{disabled}");
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], disabled);
+        // The operator restores the mode: the file was never touched.
+        crate::keymap_file::tests::chmod(&path, 0o644);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), valid);
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persist_reenabled"], disabled);
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        let written = keymap_file::load(&path).expect("bind persisted a loadable file");
+        assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
+    }
+
+    #[test]
+    fn a_reload_of_a_missing_file_leaves_writing_on() {
+        // Unchanged behaviour: rc 10 "could not be read: absent", no
+        // persist_disabled, and the next bind creates the file.
+        let (dir, path) = keymap_dir("reload-absent", "{}");
+        std::fs::remove_file(&path).unwrap();
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        assert!(reply["error"].as_str().unwrap().ends_with("could not be read: absent"), "{reply}");
+        assert!(reply.get("persist_disabled").is_none(), "{reply}");
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        assert!(keymap_file::load(&path).is_ok(), "bind created the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

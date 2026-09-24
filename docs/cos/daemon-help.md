@@ -215,9 +215,12 @@ and `persist_error` instead. A successful save leaves the reply unchanged.
 
 `input.reload` never moves or rewrites the file. On an unusable file, such as
 bad JSON or a newer version, it returns rc 10 with the reason, and the live
-keymap is unchanged. It also turns writing off if it was on, so the next
-`input.bind` or `input.unbind` cannot replace that file. The reply then
-carries `persist_disabled`. Once the file is fixed,
+keymap is unchanged. The same applies to a file it cannot read, such as one
+with a permission error. In both cases it also turns writing off if it was
+on, so the next `input.bind` or `input.unbind` cannot replace that file. The
+reply then carries `persist_disabled`, which names the path, the reason and
+`left in place by input.reload`. A reload of a missing file also returns rc
+10, but writing stays on, and the next rebind creates the file. Once the file is fixed,
 `input.reload` loads it and turns writing back on. Its reply then carries
 `persist_reenabled` with the reason that no longer applies.
 

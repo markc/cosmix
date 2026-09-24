@@ -619,9 +619,12 @@ reason. A save that fails while writing is enabled adds <code>"persisted":false<
 and <code>persist_error</code> instead. A successful save leaves the reply unchanged.</p>
 <p><code>input.reload</code> never moves or rewrites the file. On an unusable file, such as
 bad JSON or a newer version, it returns rc 10 with the reason, and the live
-keymap is unchanged. It also turns writing off if it was on, so the next
-<code>input.bind</code> or <code>input.unbind</code> cannot replace that file. The reply then
-carries <code>persist_disabled</code>. Once the file is fixed,
+keymap is unchanged. The same applies to a file it cannot read, such as one
+with a permission error. In both cases it also turns writing off if it was
+on, so the next <code>input.bind</code> or <code>input.unbind</code> cannot replace that file. The
+reply then carries <code>persist_disabled</code>, which names the path, the reason and
+<code>left in place by input.reload</code>. A reload of a missing file also returns rc
+10, but writing stays on, and the next rebind creates the file. Once the file is fixed,
 <code>input.reload</code> loads it and turns writing back on. Its reply then carries
 <code>persist_reenabled</code> with the reason that no longer applies.</p>
 <p>A host with a usable file keeps its rows, apart from the legacy clipboard
