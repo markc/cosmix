@@ -432,6 +432,13 @@ pub(crate) struct WindowFrame {
     hidden: bool,
 }
 
+impl WindowFrame {
+    /// The renderer showed new content of this window in this frame.
+    pub(crate) fn presented(&self) -> bool {
+        self.presented
+    }
+}
+
 /// Every stats table the protocol thread keeps.
 #[derive(Default)]
 pub(crate) struct StatsRegistry {

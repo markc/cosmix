@@ -1445,6 +1445,132 @@ fn presented_waits_for_a_frame_of_the_current_mapping() {
     assert_eq!(rc, 0, "a frame of this mapping: {body}");
 }
 
+/// Most clients never request `wp_presentation` feedback. `presented` must
+/// rest on what the renderer showed (the evidence `comp.window.stats`
+/// counts), so such a window, once shown, satisfies it; a window whose new
+/// content the renderer never showed still times out.
+#[test]
+fn presented_needs_no_presentation_feedback_but_needs_a_shown_frame() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    // Mapped and committed, but the renderer has not shown this content.
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(
+        surface_id,
+        monotonic_micros(),
+        content_seq(&harness, &alpha),
+        false,
+    );
+    harness.server.state.frame_presented(frame, content);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "mapped but never shown is not presented: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["until"], "presented");
+
+    // No feedback object was ever requested; the renderer shows a frame.
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
+        |harness| {
+            let (frame, content) = test_frame_report(
+                surface_id,
+                monotonic_micros(),
+                content_seq(harness, &alpha),
+                true,
+            );
+            harness.server.state.frame_presented(frame, content);
+        },
+    );
+    assert_eq!(rc, 0, "shown without feedback is presented: {body}");
+    assert_eq!(body["until"], "presented");
+    assert_eq!(body["window"]["id"], id);
+    assert_eq!(
+        harness.server.state.presentation.ledger.counters(surface_id).presented,
+        0,
+        "the feedback ledger never moved: the shown frame alone decided"
+    );
+}
+
+/// A static window hidden when it mapped (occluded, say) has its content
+/// resolved as not-shown; exposing it later shows the SAME sequence, which
+/// the stats fold does not count as new. `presented` still resolves: any
+/// shown frame of this mapping counts, not only new content.
+#[test]
+fn presented_resolves_when_static_content_hidden_at_map_is_exposed() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let seq = content_seq(&harness, &alpha);
+    let (frame, content) = test_frame_report(surface_id, monotonic_micros(), seq, false);
+    harness.server.state.frame_presented(frame, content);
+    let presented = wait_for(by_id(id, generation), WaitUntil::Presented, 30);
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented, |_| {});
+    assert_eq!(rc, 10, "hidden at map: {body}");
+
+    // No new commit: the exposed frame shows the same content sequence.
+    assert_eq!(content_seq(&harness, &alpha), seq);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
+        |harness| {
+            let (frame, content) = test_frame_report(surface_id, monotonic_micros(), seq, true);
+            harness.server.state.frame_presented(frame, content);
+        },
+    );
+    assert_eq!(rc, 0, "exposed static content is presented: {body}");
+}
+
+/// Shown evidence is retained, so the workspace gate is applied when the
+/// wait resolves: a window shown and then moved off the current workspace
+/// is not presented (as `wait_until_visible_times_out_off_workspace_…`
+/// pins for the feedback path).
+#[test]
+fn presented_shown_then_moved_off_workspace_times_out() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(
+        surface_id,
+        monotonic_micros(),
+        content_seq(&harness, &alpha),
+        true,
+    );
+    harness.server.state.frame_presented(frame, content);
+    let presented = wait_for(by_id(id, generation), WaitUntil::Presented, 30);
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented.clone(), |_| {});
+    assert_eq!(rc, 0, "shown on the current workspace: {body}");
+
+    assert_eq!(
+        harness
+            .server
+            .state
+            .move_window_to_workspace(&alpha, WorkspaceTarget::Index(2)),
+        Ok((1, 2))
+    );
+    let (rc, body) = long_window_op(&mut harness, &ingress, &runtime, presented, |_| {});
+    assert_eq!(rc, 10, "moved off the current workspace: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["until"], "presented");
+}
+
 /// Waits learn nothing under a session lock (a named id's `gone` still
 /// resolves), a kill never lands under it, and a never-issued id is
 /// refused.

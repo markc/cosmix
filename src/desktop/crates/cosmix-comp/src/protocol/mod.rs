@@ -17299,6 +17299,43 @@ fn send_frames_surface_tree_limited(
     batch
 }
 
+/// Complete the oldest queued frame callback of EVERY surface in the tree that
+/// has one, and return their ids. Per surface, not per tree: a callback
+/// releases only its own surface's present, so a root that re-requests every
+/// interval must not starve a FIFO-blocked subsurface (a GL or video
+/// subsurface on its own thread). Bounded by the tree's size.
+fn complete_oldest_frame_callback_per_surface(
+    surface: &WlSurface,
+    time: u32,
+    surfaces: &HashMap<ObjectId, SurfaceRecord>,
+) -> Vec<ObjectId> {
+    let mut completed = Vec::new();
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, states, &()| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let callbacks = &mut attributes.current().frame_callbacks;
+            if callbacks.is_empty() {
+                return;
+            }
+            let callback = callbacks.remove(0);
+            callback.done(time);
+            crate::frame_trace::event("comp_callback_done_queued", || {
+                (
+                    surfaces.get(&surface.id()).map_or(0, |record| record.id.0),
+                    u64::from(callback.id().protocol_id()),
+                    u64::from(surface.id().protocol_id()),
+                )
+            });
+            completed.push(callback.id());
+        },
+        |_, _, &()| true,
+    );
+    completed
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DamageCapAction {
     Accept,

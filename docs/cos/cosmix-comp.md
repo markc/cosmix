@@ -57,6 +57,18 @@ layer-shell backgrounds, ordinary toplevels and XWayland surface trees.
 Minimised/off-workspace and session-lock gates retain their existing precedence;
 callbacks before the first buffer are never withheld by occlusion.
 
+Withholding is a throttle, not a stop. A client on Mesa's default FIFO present
+mode blocks inside present until its frame callback completes, so a covered one
+could not even answer a configure. Once per second, every surface of an
+occluded tree that retains a callback has its oldest one completed. It is per
+surface because a callback releases only its own surface's present, so a root
+that requests again every second cannot starve a subsurface. This matches the ~1 Hz KWin and Mutter give
+hidden windows. The trickle is paced by the existing frame opportunities, with
+no timer of its own, and the window restarts whenever a root becomes occluded
+again. At most 64 callbacks are retained per surface of an occluded tree, so a
+root with one subsurface can hold 128. Excess older ones complete at once rather
+than being dropped.
+
 Coverage uses applied opaque-region transactions and renderer-confirmed installed
 content. A pending DMA-BUF replacement cannot lend its opaque region to an older
 texture. Candidate bounds round outwards and occluders round inwards in output
@@ -760,9 +772,14 @@ restores it. Two verbs drive the workspaces:
     are at most 4096 bytes. With `id`, the wait is about that window; an id
     comp never handed out is refused with `unknown_window`. Without it, the
     wait is about the lowest-id mapped window whose names match.
-  - `until` is `mapped`, `visible`, `presented` (a frame presented at or
-    after the current mapping began; a late report of an earlier frame does
-    not count), `size` (needs `width` and `height`, compared with the
+  - `until` is `mapped`, `visible`, `presented` (the renderer showed the
+    window in a frame at or after the current mapping began, judged from
+    the renderer's frame reports that `comp.window.stats` also reads, so no
+    `wp_presentation` feedback is needed. Static content that was hidden at
+    map time counts once exposed. Feedback presented in that span also
+    counts. A late report of an earlier frame does not. The window must
+    also be unminimised and on the current workspace when the wait
+    resolves), `size` (needs `width` and `height`, compared with the
     window-geometry size), `focused`, `unmapped` or `gone`. For a match
     without `id`, `unmapped` and `gone` mean no mapped window matches.
     `mapped` is workspace-blind; `visible` and `presented` need the
@@ -1415,7 +1432,15 @@ wake the publisher with an event notification, which drains the outbox to
 empty. There is no publisher polling timer or idle tick source. `topic.idle`
 drops the property baseline and a later `topic.active` seeds one at the next
 stable service point; both lifecycle directions coalesce latest-wins if the
-ingress is temporarily full.
+ingress is temporarily full. These notices, and the `noded.props.changed`
+registry diffs, are honoured only from the local broker: `from: noded` with
+`broker_origin` absent or `local`. Absent is the normal case, because noded
+does not stamp its topic notices. A message claiming `noded` with
+`broker_origin: mesh` is ignored and logged at warn level, at most once every
+10 seconds. This is defence in depth. Mesh ingress strips `from`, and responses
+never reach this dispatch. The one reachable forgery is a client connected
+over WireGuard to a pre-0.18 noded that let it register the name `noded`.
+noded 0.18.0 refuses that name.
 
 The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
 still serialise far beyond the wire allowance, so comp measures the cached
