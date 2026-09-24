@@ -45,9 +45,30 @@ pub fn default_path() -> Option<PathBuf> {
 /// make `main` reseed the defaults over the user's keymap).
 #[derive(Deserialize)]
 struct RawKeymap {
-    #[allow(dead_code)]
     version: u32,
     physical: Vec<serde_json::Value>,
+}
+
+/// The document-level reason a keymap of `found` version is unusable to this
+/// binary, or `None` when it is the version this inputd writes. A newer file
+/// must not load as ours: the next bind would persist it back as
+/// [`KEYMAP_SCHEMA_VERSION`], a silent downgrade. Being `Invalid` is only half
+/// of that guarantee — the file must also never be written over: startup
+/// moves it aside before seeding, and a failed `input.reload` turns
+/// persistence off until a good reload (service.rs). An older version is the hook
+/// for a future migration; none exists yet (version 1 is the first), so it
+/// takes the same unusable-document path.
+fn version_mismatch(found: u32) -> Option<String> {
+    use std::cmp::Ordering;
+    match found.cmp(&KEYMAP_SCHEMA_VERSION) {
+        Ordering::Equal => None,
+        Ordering::Greater => Some(format!(
+            "keymap version {found} is newer than this inputd's {KEYMAP_SCHEMA_VERSION}"
+        )),
+        Ordering::Less => Some(format!(
+            "keymap version {found} is older than this inputd's {KEYMAP_SCHEMA_VERSION} and no migration exists"
+        )),
+    }
 }
 
 /// A loaded keymap: the admitted rows plus a record of every row dropped at
@@ -74,7 +95,8 @@ pub enum LoadError {
     Absent,
     /// The bytes were read but the DOCUMENT is unusable (invalid UTF-8, not
     /// JSON, not an object, missing/non-array `physical`, missing/non-u32
-    /// `version`). Carries the reason and the identity of the bytes that were
+    /// `version`, or a `version` other than [`KEYMAP_SCHEMA_VERSION`]).
+    /// Carries the reason and the identity of the bytes that were
     /// read. This is the only class startup moves aside.
     Invalid(String, FileId),
     /// Opening or reading failed for any other reason (EACCES, EIO, EISDIR,
@@ -463,8 +485,20 @@ fn parse(text: &str, path: &Path) -> Result<Loaded, String> {
     if !value.is_object() {
         return Err("not a JSON object".to_string());
     }
+    // Version first: a future document may reshape the rest (drop or rename
+    // `physical`), and its version is the reason that matters. A missing or
+    // non-u32 version falls through and is reported by the deserialize below.
+    if let Some(found) = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        && let Some(reason) = version_mismatch(found)
+    {
+        return Err(reason);
+    }
     let parsed: RawKeymap =
         serde_json::from_value(value).map_err(|error| format!("bad document: {error}"))?;
+    debug_assert_eq!(parsed.version, KEYMAP_SCHEMA_VERSION);
     let mut dropped = Vec::new();
     let mut drop_row = |raw: &serde_json::Value, reason: String| {
         let record = dropped_record(raw, &reason);
@@ -571,7 +605,7 @@ fn write_tmp(path: &Path, physical: &[PhysicalBinding]) -> std::io::Result<PathB
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn doc(rows: &str) -> String {
@@ -720,7 +754,7 @@ mod tests {
 
     /// Like [`scratch`] but under `/tmp` (world-traversable), for tests whose
     /// check runs as uid 65534 — the harness temp dir may be root-only.
-    fn scratch_tmp(tag: &str) -> PathBuf {
+    pub(crate) fn scratch_tmp(tag: &str) -> PathBuf {
         let dir = PathBuf::from(format!("/tmp/inputd-open-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -773,6 +807,99 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_version_is_recovered_never_loaded_as_ours() {
+        // Before the check, a version-2 file loaded as version 1 and the next
+        // bind persisted it back as version 1 — a silent downgrade.
+        let newer = KEYMAP_SCHEMA_VERSION + 1;
+        let text = format!(r#"{{"version":{newer},"physical":[{NEXT_WITHOUT}]}}"#);
+        let expected = format!(
+            "keymap version {newer} is newer than this inputd's {KEYMAP_SCHEMA_VERSION}"
+        );
+        assert_eq!(parse(&text, Path::new("t")).err().as_deref(), Some(expected.as_str()));
+        let dir = scratch("newer-version");
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, &text).unwrap();
+        match load(&path) {
+            Err(LoadError::Invalid(reason, _)) => assert_eq!(reason, expected),
+            Err(other) => panic!("wrong error class: {other:?}"),
+            Ok(_) => panic!("a newer-version keymap loaded"),
+        }
+        let opened = open(&path, STAMP);
+        let backup = dir.join(format!("keymap.json.bad-{STAMP}"));
+        assert_eq!(opened.recovered_from.as_deref(), Some(backup.as_path()));
+        assert!(opened.persist_disabled.is_none());
+        let defaults = cosmix_input_core::default_keymap().physical;
+        assert_eq!(opened.rows, defaults, "defaults served");
+        // The newer document survives verbatim; the path holds our version.
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), text);
+        assert_eq!(load(&path).unwrap().rows, defaults);
+        let seeded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(seeded["version"], KEYMAP_SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reshaped_newer_document_reports_its_version_not_its_shape() {
+        let newer = KEYMAP_SCHEMA_VERSION + 1;
+        let expected = format!(
+            "keymap version {newer} is newer than this inputd's {KEYMAP_SCHEMA_VERSION}"
+        );
+        for text in [
+            format!(r#"{{"version":{newer}}}"#),
+            format!(r#"{{"version":{newer},"bindings":{{}}}}"#),
+            format!(r#"{{"version":{newer},"physical":{{}}}}"#),
+        ] {
+            assert_eq!(parse(&text, Path::new("t")).err().as_deref(), Some(expected.as_str()), "{text}");
+        }
+        // A version that is not a u32 still reports as a bad document.
+        for text in [r#"{"version":"2","physical":[]}"#, r#"{"version":4294967296,"physical":[]}"#] {
+            let reason = parse(text, Path::new("t")).err().expect("refused");
+            assert!(reason.starts_with("bad document"), "{text}: {reason}");
+        }
+    }
+
+    #[test]
+    fn an_older_version_takes_the_same_recovery_path() {
+        // No older version exists (1 is the first); 0 exercises the hook.
+        let text = format!(r#"{{"version":0,"physical":[{NEXT_WITHOUT}]}}"#);
+        let reason = parse(&text, Path::new("t")).err().expect("version 0 refused");
+        assert!(
+            reason.starts_with(&format!(
+                "keymap version 0 is older than this inputd's {KEYMAP_SCHEMA_VERSION}"
+            )),
+            "{reason}"
+        );
+        let dir = scratch("older-version");
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, &text).unwrap();
+        let opened = open(&path, STAMP);
+        let backup = dir.join(format!("keymap.json.bad-{STAMP}"));
+        assert_eq!(opened.recovered_from.as_deref(), Some(backup.as_path()));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_current_version_loads_unchanged() {
+        let text = format!(
+            r#"{{"version":{KEYMAP_SCHEMA_VERSION},"physical":[{NEXT_WITHOUT}]}}"#
+        );
+        let loaded = parse(&text, Path::new("t")).expect("current version loads");
+        assert_eq!(loaded.rows.len(), 1);
+        assert!(loaded.dropped.is_empty());
+        let dir = scratch("current-version");
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, &text).unwrap();
+        let opened = open(&path, STAMP);
+        assert!(opened.recovered_from.is_none());
+        assert_eq!(opened.rows[0].action.as_str(), "desktop.workspace.next");
+        assert_eq!(dir_names(&dir), vec!["keymap.json"], "no backup");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_second_recovery_in_the_same_second_keeps_the_first_backup() {
         let dir = scratch("twice");
         let path = dir.join("keymap.json");
@@ -819,7 +946,7 @@ mod tests {
         std::fs::rename(&tmp, path).unwrap();
     }
 
-    fn chmod(path: &Path, mode: u32) {
+    pub(crate) fn chmod(path: &Path, mode: u32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
@@ -838,11 +965,17 @@ mod tests {
     /// cannot pass vacuously. Bounded by a 20 s deadline: past it the child
     /// is killed, reaped, and the test fails.
     fn run_perm_child(name: &str, dir: &Path) {
+        run_perm_child_in("keymap_file::tests", name, dir);
+    }
+
+    /// [`run_perm_child`] for a child test living in module `module` (e.g.
+    /// `service::tests`), so other test modules share the one harness.
+    pub(crate) fn run_perm_child_in(module: &str, name: &str, dir: &Path) {
         use std::io::Read;
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                &format!("keymap_file::tests::{name}"),
+                &format!("{module}::{name}"),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -874,7 +1007,7 @@ mod tests {
     /// In a child started by [`run_perm_child`] for `name`: drop to 65534 if
     /// root and return the scratch dir. Anywhere else (the normal test run):
     /// `None`, and the child test is a no-op pass.
-    fn perm_child(name: &str) -> Option<PathBuf> {
+    pub(crate) fn perm_child(name: &str) -> Option<PathBuf> {
         if std::env::var(PERM_CHILD_ENV).ok().as_deref() != Some(name) {
             return None;
         }

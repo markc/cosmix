@@ -90,6 +90,17 @@ fn main() -> anyhow::Result<()> {
         }
         None => (default_keymap(), service::Store::default()),
     };
+    // Mesh posture, read ONCE: flipping COSMIX_MESH_OPEN needs a restart.
+    let mesh_open = service::mesh_open_from_env();
+    eprintln!(
+        "cosmix-inputd: mesh access {}",
+        if mesh_open {
+            "open (every verb reachable by mesh callers)"
+        } else {
+            "locked (COSMIX_MESH_OPEN=0: keymap mutations node-local only)"
+        }
+    );
+    let store = store.with_mesh_open(mesh_open);
     let resolver: Shared = Arc::new(Mutex::new(Resolver::new(keymap)));
 
     // Grab mode fires resolved verbs; the reader (blocking thread) sends them to
