@@ -257,7 +257,7 @@ async fn vhost_add(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, String)
             })
             .to_string(),
         ),
-        Err(e) => caller_error(&format!("vhost.add failed: {e}")),
+        Err(e) => write_error("vhost.add", &e),
     }
 }
 
@@ -321,7 +321,7 @@ async fn vhost_remove(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, Stri
             })
             .to_string(),
         ),
-        Err(e) => caller_error(&format!("vhost.remove failed: {e}")),
+        Err(e) => write_error("vhost.remove", &e),
     }
 }
 
@@ -658,6 +658,30 @@ pub(crate) fn caller_error(msg: &str) -> (u8, String) {
         })
         .to_string(),
     )
+}
+
+/// rc for a node-side fault the operator must fix on the node itself —
+/// today only an unreadable `node.conf.mix` reported by the
+/// `webd.vhosts` hooks (`HookError::Hook`), matching the rc 20 the raw
+/// `webd.props.*` surface returns for the same hook error.
+const RC_NODE_FAULT: u8 = 20;
+
+/// Project a namespace write error: a hook-reported node fault is rc 20
+/// (`kind: "server"`); everything else — validation refusals, OCC
+/// conflicts — stays the caller-side rc 10 this module has always used.
+fn write_error(verb: &str, e: &cosmix_props::RuntimeError) -> (u8, String) {
+    let msg = format!("{verb} failed: {e}");
+    match e {
+        cosmix_props::RuntimeError::Hook(cosmix_props::HookError::Hook { .. }) => (
+            RC_NODE_FAULT,
+            json!({
+                "error": msg,
+                "kind": "server",
+            })
+            .to_string(),
+        ),
+        _ => caller_error(&msg),
+    }
 }
 
 fn server_error(msg: &str) -> (u8, String) {
@@ -1929,6 +1953,35 @@ mod tests {
         let (rc, body) = vhost_add(&node, &add_cmd(host)).await;
         assert_eq!(rc, RC_CALLER_ERROR, "enable refused; body={body}");
         assert!(body.contains("not in any [[webd.listener]]"), "{body}");
+        clear_auth_policy_for_test();
+    }
+
+    /// An unreadable node.conf.mix is a node fault: rc 20 on both the
+    /// ergonomic verb and the raw props surface, not a caller error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreadable_node_config_is_rc_20_on_both_surfaces() {
+        let node = build_node_full(
+            &["props.write:webd.vhosts"],
+            &[],
+            ListenerConfigSource::Broken("parse error at line 3".to_string()),
+        )
+        .await;
+        let (rc, body) = vhost_add(&node, &add_cmd("any.example.org")).await;
+        assert_eq!(rc, 20, "verb: node fault; body={body}");
+        assert!(body.contains("could not be loaded"), "{body}");
+        assert!(body.contains("\"kind\":\"server\""), "{body}");
+
+        let set = props_cmd(
+            "webd.props.set",
+            &[("namespace", "vhosts"), ("key", "any.example.org"), ("if_version", "0")],
+            r#"{"fqdn":"any.example.org","www_dir":"/srv/x","enabled":true,
+                "acme_provider":"letsencrypt_staging","acme_challenge":"http01",
+                "acme_contact_email":"ops@example.com"}"#,
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "set", &set).await;
+        assert_eq!(rc, 20, "props.set: node fault; body={body}");
+        assert!(namespace_hosts(&node).await.is_empty());
         clear_auth_policy_for_test();
     }
 

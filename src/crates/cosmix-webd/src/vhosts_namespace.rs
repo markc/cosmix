@@ -748,6 +748,9 @@ pub enum ListenerConfigSource {
     /// implicit single `wg` listener that serves every host.
     #[cfg(test)]
     Fixed(Option<Arc<NodeConfig>>),
+    /// Test fixture: a config that fails to load with this error.
+    #[cfg(test)]
+    Broken(String),
 }
 
 impl ListenerConfigSource {
@@ -758,6 +761,8 @@ impl ListenerConfigSource {
                 .map_err(|e| format!("{e:#}")),
             #[cfg(test)]
             Self::Fixed(cfg) => Ok(cfg.clone()),
+            #[cfg(test)]
+            Self::Broken(e) => Err(e.clone()),
         }
     }
 }
