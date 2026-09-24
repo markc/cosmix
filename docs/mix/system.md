@@ -810,9 +810,14 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   example by calling `process_alive` after it has exited, Mix can no longer
   prove the group id is still that child's. The group is then skipped, so any
   survivors are not swept. PDEATHSIG is keyed to the thread that called
-  `spawn`. The `mix` binary evaluates on one thread that lives until exit. An
-  embedder evaluating on a short-lived thread must call
-  `builtins::owned_spawns::sweep()` itself. Off Linux the option raises
+  `spawn`, and the ownership registry is process-wide. So the option works
+  only on a thread whose host owns it. The `mix` binary evaluates on one
+  thread that lives until exit and sweeps before it ends. Elsewhere, for
+  example webd, cosmix-mcp or cosmix-claud evaluating on pooled `spawn_blocking`
+  threads, `die_with_parent` raises `OPTION_INVALID`. An embedder that does
+  own a long-lived evaluation thread opts in by calling
+  `builtins::owned_spawns::enable()` on it, and must call `sweep()` on that
+  same thread before it exits. Off Linux the option raises
   `OPTION_INVALID`. Default `false`: a plain spawn child is untouched by mix's
   exit.
 - `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)

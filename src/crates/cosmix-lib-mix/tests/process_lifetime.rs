@@ -183,10 +183,18 @@ async fn grace_option_is_validated() {
     assert_eq!(output, "OPTION_INVALID\nOPTION_INVALID\nOPTION_INVALID\ntrue\nx\n");
 }
 
-/// spawn's lifetime option: validated, contradictory with detach, and the
-/// child it starts leads its own process group (so its tree is addressable).
-#[tokio::test]
-async fn spawn_die_with_parent_leads_its_own_group_and_refuses_detach() {
+/// spawn's lifetime option: refused on a thread no host has enabled (the
+/// embedder case — a pooled evaluator thread), validated, contradictory with
+/// detach, and once enabled the child leads its own process group.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_die_with_parent_needs_a_host_leads_its_group_and_refuses_detach() {
+    let refused = run_ok(
+        "try\n  spawn([\"true\"], {die_with_parent: true})\ncatch $m, $e\n  print($e.code .. \" \" .. contains($m, \"owns the evaluator thread\"))\nend\n",
+    )
+    .await;
+    assert_eq!(refused, "OPTION_INVALID true\n", "un-hosted spawn must be refused");
+
+    cosmix_mix::builtins::owned_spawns::enable();
     let output = run_ok(
         "try\n  spawn([\"true\"], {die_with_parent: true, detach: true})\ncatch $m, $e\n  print($e.code)\nend\n\
          try\n  spawn([\"true\"], {die_with_parent: 1})\ncatch $m, $e\n  print($e.code)\nend\n\

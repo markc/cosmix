@@ -1809,6 +1809,10 @@ pub(crate) fn owned_spawns_sweep() {
 /// before it exits, because their PDEATHSIG is keyed to it and would otherwise
 /// SIGKILL them first with no chance to clean up (TODO-mix P2).
 fn eval_thread_main() -> i32 {
+    // This thread lives until exit and sweeps before it ends, so it is the
+    // one host allowed to create owned children.
+    #[cfg(target_os = "linux")]
+    cosmix_mix::builtins::owned_spawns::enable();
     let code = real_main();
     owned_spawns_sweep();
     code

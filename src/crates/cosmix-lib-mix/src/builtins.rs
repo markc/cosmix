@@ -4213,6 +4213,15 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]).stdin(std::process::Stdio::null());
     #[cfg(target_os = "linux")]
+    if die_with_parent && !owned_spawns::enabled_here() {
+        return Err(opt_invalid(
+            caller,
+            "die_with_parent needs a host that owns the evaluator thread (the mix \
+             binary does; an embedder must call builtins::owned_spawns::enable() on its \
+             long-lived evaluation thread and sweep on it before that thread exits)",
+        ));
+    }
+    #[cfg(target_os = "linux")]
     if die_with_parent {
         arm_die_with_parent(&mut command);
     }
@@ -4359,9 +4368,9 @@ fn arm_die_with_parent(command: &mut std::process::Command) {
 ///   every group to empty, then SIGKILL to the groups — so descendants go too.
 ///
 /// PDEATHSIG is keyed to the THREAD that called spawn. The `mix` binary
-/// evaluates on one long-lived thread and sweeps on that thread before it
-/// exits, so a graceful exit always reaches the sweep first. An embedder
-/// that evaluates on a short-lived thread must call [`sweep`] itself.
+/// evaluates on one long-lived thread, [`enable`]s it, and sweeps on it
+/// before it exits, so a graceful exit always reaches the sweep first. On any
+/// thread that was not enabled, `die_with_parent` raises OPTION_INVALID.
 #[cfg(target_os = "linux")]
 pub mod owned_spawns {
     use std::sync::Mutex;
@@ -4371,6 +4380,27 @@ pub mod owned_spawns {
     pub const SWEEP_GRACE: Duration = Duration::from_secs(2);
 
     static OWNED: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+    /// The one thread allowed to create owned children. PDEATHSIG is keyed to
+    /// the creating THREAD and the registry is process-wide, so the facility
+    /// is only sound when a host owns a long-lived evaluator thread and sweeps
+    /// on it. Embedders that evaluate on pooled threads (tokio
+    /// `spawn_blocking` in webd, cosmix-mcp, cosmix-claud) never call
+    /// [`enable`]; there a pool thread retiring would SIGKILL a helper while
+    /// the daemon lives, and one request's sweep would end another's helpers.
+    static HOST: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+    /// Opt this thread in as the host that owns `die_with_parent` children.
+    /// The first call wins; the host must sweep on this same thread before it
+    /// exits. The `mix` binary calls this on its evaluation thread.
+    pub fn enable() {
+        let _ = HOST.set(std::thread::current().id());
+    }
+
+    /// May the current thread create an owned child?
+    pub(crate) fn enabled_here() -> bool {
+        HOST.get() == Some(&std::thread::current().id())
+    }
 
     pub(crate) fn register(pid: libc::pid_t) {
         OWNED.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
