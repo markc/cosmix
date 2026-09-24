@@ -88,16 +88,91 @@ impl BuildInfo {
     /// sha can never satisfy an equality check). Keys match `mix --version
     /// --json`, plus `component`.
     pub fn json(&self) -> String {
-        format!(
-            "{{\"component\":{},\"version\":{},\"git_sha\":{},\"git_sha_full\":{},\"git_dirty\":{},\"build_time\":{}}}",
-            json_str(self.pkg),
-            json_str(self.version),
-            json_str(self.git_sha),
-            json_str(self.git_sha_full),
+        provenance_json(
+            self.pkg,
+            self.version,
+            self.git_sha,
+            self.git_sha_full,
             self.git_dirty,
-            json_str(self.build_time),
+            self.build_time,
         )
     }
+}
+
+/// The one renderer behind [`BuildInfo::json`] and the embedded marker, so
+/// the two can never disagree about a field or its encoding.
+fn provenance_json(
+    pkg: &str,
+    version: &str,
+    git_sha: &str,
+    git_sha_full: &str,
+    git_dirty: bool,
+    build_time: &str,
+) -> String {
+    format!(
+        "{{\"component\":{},\"version\":{},\"git_sha\":{},\"git_sha_full\":{},\"git_dirty\":{},\"build_time\":{}}}",
+        json_str(pkg),
+        json_str(version),
+        json_str(git_sha),
+        json_str(git_sha_full),
+        git_dirty,
+        json_str(build_time),
+    )
+}
+
+// ── the embedded provenance marker ───────────────────────────────────
+//
+// `--version --json` needs the binary to RUN. A fleet inventory must not run
+// anything it merely finds on disk (a build older than the contract might not
+// honour the flag), so every binary also CARRIES its provenance as bytes:
+//
+//     COSMIX-BUILDINFO:1:{"component":…,"version":…,"git_sha":…,
+//                         "git_sha_full":…,"git_dirty":…,"build_time":…}
+//
+// — the JSON `--version --json` prints for a `build_info!()` user, rendered
+// from the same build-script run. [`emit`] puts it in
+// `COSMIX_BUILDINFO_MARKER`; [`build_info!`] pins that string into the binary
+// through a `#[used]` static it also references, so neither dead-code
+// elimination, LTO nor `strip` (which drops symbols, not data) removes it. A
+// reader finds the prefix and takes the flat JSON object up to its first `}`
+// (no value can contain one). A library that itself calls [`emit`] and
+// expands [`build_info!`] contributes its OWN marker as well, so a binary may
+// carry several: pick the one whose `component` names the binary's crate.
+
+/// The marker prefix, version 1. Written as two halves for readability of
+/// intent only: rustc folds literal `format!` arguments, so a binary that
+/// links this function may still contain the whole prefix as a bare string.
+/// That is harmless — a reader counts a candidate only where the prefix is
+/// immediately followed by `{`, and keeps only JSON naming the right crate.
+pub fn marker_prefix() -> String {
+    format!("{}{}", "COSMIX-BUILD", "INFO:1:")
+}
+
+/// Every well-formed marker JSON object in `bytes` (a binary's contents), in
+/// file order, deduplicated. Malformed or truncated candidates are skipped.
+pub fn find_markers(bytes: &[u8]) -> Vec<String> {
+    let prefix = marker_prefix();
+    let p = prefix.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + p.len() <= bytes.len() {
+        if &bytes[i..i + p.len()] != p {
+            i += 1;
+            continue;
+        }
+        let start = i + p.len();
+        if bytes.get(start) == Some(&b'{') {
+            let window = &bytes[start..bytes.len().min(start + 4096)];
+            if let Some(e) = window.iter().position(|&b| b == b'}')
+                && let Ok(s) = std::str::from_utf8(&window[..=e])
+                && !out.iter().any(|o| o == s)
+            {
+                out.push(s.to_string());
+            }
+        }
+        i = start;
+    }
+    out
 }
 
 /// A JSON string literal. The fields are compile-time crate metadata, but the
@@ -127,7 +202,15 @@ fn json_str(s: &str) -> String {
 /// `false` (itself the "no build.rs wired" signal).
 #[macro_export]
 macro_rules! build_info {
-    () => {
+    () => {{
+        // The embedded provenance marker (see `find_markers`): `#[used]` keeps
+        // the static in the object file and the `black_box` reference keeps it
+        // past the linker's section GC, so the marker lands in every binary
+        // that expands this macro in a crate whose build.rs ran `emit()`.
+        #[used]
+        static COSMIX_BUILDINFO_MARKER: ::core::option::Option<&str> =
+            option_env!("COSMIX_BUILDINFO_MARKER");
+        let _ = ::core::hint::black_box(&COSMIX_BUILDINFO_MARKER);
         $crate::BuildInfo {
             pkg: env!("CARGO_PKG_NAME"),
             version: env!("CARGO_PKG_VERSION"),
@@ -136,7 +219,7 @@ macro_rules! build_info {
             git_dirty: matches!(option_env!("COSMIX_GIT_DIRTY"), Some("1") | Some("true")),
             build_time: option_env!("COSMIX_BUILD_TIME").unwrap_or("unknown"),
         }
-    };
+    }};
 }
 
 /// Current wall-clock time as RFC3339 UTC — a runtime helper for a
@@ -291,7 +374,17 @@ pub fn emit() {
         "cargo:rustc-env=COSMIX_GIT_DIRTY={}",
         if dirty { 1 } else { 0 }
     );
-    println!("cargo:rustc-env=COSMIX_BUILD_TIME={}", build_time());
+    let built = build_time();
+    println!("cargo:rustc-env=COSMIX_BUILD_TIME={built}");
+    // The embedded marker: the JSON `--version --json` prints, from the same
+    // values, for byte-level readers that must not execute the binary.
+    let pkg = std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".to_string());
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    println!(
+        "cargo:rustc-env=COSMIX_BUILDINFO_MARKER={}{}",
+        marker_prefix(),
+        provenance_json(&pkg, &version, &sha, &sha_full, dirty, &built)
+    );
 
     // Emitting ANY `rerun-if-changed` disables Cargo's default "rerun on
     // any package-file change" scan, so we must re-add the source watch
@@ -487,5 +580,49 @@ mod tests {
         let bi = build_info!();
         assert_eq!(bi.pkg, "cosmix-lib-buildinfo");
         assert!(!bi.version.is_empty());
+    }
+
+    fn sample() -> BuildInfo {
+        BuildInfo {
+            pkg: "cosmix-example",
+            version: "1.2.3",
+            git_sha: "0123456789ab",
+            git_sha_full: "0123456789abcdef0123456789abcdef01234567",
+            git_dirty: false,
+            build_time: "2026-09-25T00:00:00Z",
+        }
+    }
+
+    #[test]
+    fn marker_json_is_the_version_json() {
+        let bi = sample();
+        let marker = format!("{}{}", marker_prefix(), bi.json());
+        let mut bytes = b"\x00\x7fELF junk".to_vec();
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes.extend_from_slice(b"\x00more rodata");
+        assert_eq!(find_markers(&bytes), vec![bi.json()]);
+    }
+
+    #[test]
+    fn find_markers_skips_false_starts_and_dedupes() {
+        let json = sample().json();
+        let p = marker_prefix();
+        let mut bytes = Vec::new();
+        // A bare prefix with no object after it, and one never closed within
+        // the window, are both skipped rather than misread.
+        bytes.extend_from_slice(p.as_bytes());
+        bytes.extend_from_slice(b"not json");
+        bytes.extend_from_slice(format!("{p}{json}").as_bytes());
+        bytes.extend_from_slice(format!("{p}{json}").as_bytes());
+        let other = BuildInfo { pkg: "cosmix-lib-other", ..sample() }.json();
+        bytes.extend_from_slice(format!("{p}{other}").as_bytes());
+        bytes.extend_from_slice(p.as_bytes());
+        bytes.extend_from_slice(b"{\"unterminated\":");
+        assert_eq!(find_markers(&bytes), vec![json, other]);
+    }
+
+    #[test]
+    fn marker_prefix_is_versioned() {
+        assert_eq!(marker_prefix(), "COSMIX-BUILDINFO:1:");
     }
 }

@@ -522,7 +522,10 @@ so a value literally spelled <code>-V</code> or <code>--version</code> must foll
 <code>--flag=-V</code> form also works); binaries whose options take free strings
 with no <code>--</code> escape use <code>exit_on_version!(leading)</code>, which reads argv[1]
 for the flag and argv[2] for <code>--json</code>. The crate's <code>build.rs</code> calls <code>cosmix_buildinfo::emit()</code> so the sha
-is real. A new binary is covered by <code>src/tools/version_flag_gate.mix</code>
+is real. <code>emit()</code> + <code>build_info!()</code> also embed the same provenance in the
+file as bytes (<code>COSMIX-BUILDINFO:1:{json}</code>, component = the crate), so an
+inventory reads it with <code>cosmix_buildinfo::find_markers</code> instead of
+executing a binary; the gate asserts marker and answer agree. A new binary is covered by <code>src/tools/version_flag_gate.mix</code>
 automatically; it fails until the binary conforms.</li>
 <li>Public-safe architecture specifications belong in <code>docs/spec/</code>. Read their
 status and evidence labels: draft publication is not normative acceptance.

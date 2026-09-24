@@ -44,6 +44,34 @@ fn version_json_shape_and_full_sha() {
     }
 }
 
+/// The embedded provenance marker (cosmix-lib-buildinfo `find_markers`): the
+/// mix binary carries, as plain bytes, the same provenance its
+/// `--version --json` prints — readable without executing it. `component`
+/// is the one field that differs: the marker names the crate (`cosmix-mix`),
+/// the JSON answer names the binary (`mix`).
+#[test]
+fn embedded_marker_matches_version_json() {
+    let bin = env!("CARGO_BIN_EXE_mix");
+    let out = Command::new(bin)
+        .args(["--version", "--json"])
+        .env("MIX_STATS", "off")
+        .output()
+        .expect("run mix --version --json");
+    let answer: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("valid JSON");
+    let bytes = std::fs::read(bin).expect("read the mix binary");
+    let markers: Vec<serde_json::Value> = cosmix_buildinfo::find_markers(&bytes)
+        .iter()
+        .map(|m| serde_json::from_str(m).expect("marker is JSON"))
+        .filter(|m: &serde_json::Value| m["component"] == "cosmix-mix")
+        .collect();
+    assert_eq!(markers.len(), 1, "exactly one cosmix-mix marker in {bin}");
+    let marker = &markers[0];
+    for key in ["version", "git_sha", "git_sha_full", "git_dirty", "build_time"] {
+        assert_eq!(marker[key], answer[key], "marker {key} equals --version --json");
+    }
+}
+
 #[test]
 fn plain_version_line_unchanged() {
     let out = Command::new(env!("CARGO_BIN_EXE_mix"))
