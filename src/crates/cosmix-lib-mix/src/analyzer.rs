@@ -1282,9 +1282,19 @@ fn check_expr(
                     } else {
                         format!("undefined variable '${name}' (assigned nowhere in this file)")
                     },
-                    Some(format!(
-                        "assign it, use env(\"{name}\") for environment values, or pass --allow-global {name}"
-                    )),
+                    Some(if ctx.remote_body {
+                        // env() in a body reads the REMOTE environment, and
+                        // --allow-global only silences lint; neither ships
+                        // a local value.
+                        format!(
+                            "pass it in through the call: ssh_mix(host, body, {{bindings: {{{name}: …}}}}), \
+                             or assign it inside the body (env(\"{name}\") there reads the REMOTE environment)"
+                        )
+                    } else {
+                        format!(
+                            "assign it, use env(\"{name}\") for environment values, or pass --allow-global {name}"
+                        )
+                    }),
                 ));
             }
         }

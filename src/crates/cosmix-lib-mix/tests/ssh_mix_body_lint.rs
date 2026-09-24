@@ -289,6 +289,25 @@ fn w2402_is_silent_for_a_remote_functions_params_and_locals() {
 }
 
 #[test]
+fn a_body_e1101_hint_points_at_bindings_not_allow_global() {
+    // Inside a body, env() reads the REMOTE environment and --allow-global
+    // only silences lint; the fix that ships a value is `bindings`.
+    let src = "$z = 1\n$r = ssh_mix(\"a\", 'print($z)')\n";
+    let stmts = Parser::new(Lexer::new(src).tokenize().unwrap(), src)
+        .parse_program()
+        .unwrap();
+    let hint = analyze(&stmts, None, &AnalyzerConfig::default())
+        .diagnostics
+        .into_iter()
+        .find(|d| d.code == "MIX-E1101")
+        .and_then(|d| d.hint)
+        .expect("E1101 with a hint");
+    assert!(hint.contains("{bindings: {z: …}}"), "{hint}");
+    assert!(hint.contains("REMOTE environment"), "{hint}");
+    assert!(!hint.contains("--allow-global"), "{hint}");
+}
+
+#[test]
 fn env_keys_are_bound_inside_the_body_too() {
     // `env` ships as prepended `export KEY = "value"` lines.
     let src = "$r = ssh_mix(\"a\", '\nprint($FOO)\n', {env: {FOO: \"1\"}})\n";
