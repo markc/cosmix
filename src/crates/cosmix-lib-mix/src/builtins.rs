@@ -8787,6 +8787,15 @@ struct PipelineRawStageOutcome {
 fn signal_pipeline_groups_for_runtime(children: &mut [PipelineChildRuntime], signal: i32) {
     for child in children.iter_mut() {
         if child.status.is_none() {
+            // A stage that exited on its own inside the last poll window is
+            // not the runtime's kill (review MINOR-9): collect it first, so
+            // only stages that are STILL running when the signal goes out
+            // are reported timeout/interrupted.
+            if let Ok(Some(status)) = child.child.try_wait() {
+                child.status = Some(status);
+                child.duration_ms = child.started.elapsed().as_millis();
+                continue;
+            }
             child.runtime_signalled = true;
         }
     }
