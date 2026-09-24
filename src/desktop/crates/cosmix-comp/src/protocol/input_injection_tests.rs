@@ -49,6 +49,12 @@ fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {
 fn bare_modifier_without_focus_is_held_for_a_following_binding() {
     let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
     let runtime = control_reply_runtime();
+    // The harness maps a focused toplevel; this test wants no client focus.
+    harness.server.state.keyboard.clone().set_focus(
+        &mut harness.server.state,
+        None,
+        SERIAL_COUNTER.next_serial(),
+    );
     assert!(harness.server.state.keyboard.current_focus().is_none());
     assert_eq!(harness.server.state.workspace_current(), 1);
     let key = |name: &str, action| InputOp::Key {
