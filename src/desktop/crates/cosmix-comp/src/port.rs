@@ -1571,6 +1571,45 @@ fn handle_incoming(
     );
 }
 
+/// A `from: noded` message is the local broker only when noded did not stamp
+/// it as relayed from the mesh. Absent (a pre-0.18 broker, an in-process
+/// test) or `local` both mean this node's broker.
+fn from_local_broker(command: &cosmix_client::IncomingCommand) -> bool {
+    command
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
+        .is_none_or(|(_, origin)| origin.eq_ignore_ascii_case("local"))
+}
+
+const FOREIGN_BROKER_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// At most one warning per interval: a peer replaying these must not flood
+/// the journal, but the first one is always visible.
+fn warn_foreign_broker_claim(command: &cosmix_client::IncomingCommand) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|at| now.duration_since(at) < FOREIGN_BROKER_WARN_INTERVAL) {
+        return;
+    }
+    *last = Some(now);
+    let header = |key: &str| {
+        command
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map_or("", |(_, value)| value.as_str())
+    };
+    tracing::warn!(
+        broker_origin = header("broker_origin"),
+        source_peer = header("source_peer"),
+        command = %command.command,
+        topic = command.topic().unwrap_or(""),
+        "ignored a non-local message claiming to be the broker (from: noded)"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_incoming(
     ingress: &PortIngress,
@@ -1589,20 +1628,30 @@ fn dispatch_incoming(
     }
     let malformed =
         !command.body.is_empty() && serde_json::from_str::<Value>(&command.body).is_err();
-    if command.from == "noded"
+    let broker_lifecycle = command.from == "noded"
         && matches!(command.command.as_str(), "topic.active" | "topic.idle")
         && command.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("name")
                 && value
                     == &port_observation::topic_name(service, port_observation::PROPS_TOPIC_SUFFIX)
-        })
-    {
+        });
+    let broker_registry = command.from == "noded" && command.topic() == Some(REGISTRY_TOPIC);
+    // Only the LOCAL broker speaks as `noded`. noded 0.18.0 refuses clients
+    // registering that name and re-stamps local routed traffic, but a reply
+    // relayed from a mesh peer keeps the remote's `from` with only
+    // `broker_origin: mesh` added — so a mesh message claiming `from: noded`
+    // is not this compositor's broker and must not steer it.
+    if (broker_lifecycle || broker_registry) && !from_local_broker(&command) {
+        warn_foreign_broker_claim(&command);
+        return;
+    }
+    if broker_lifecycle {
         ingress.set_watch_state(command.command == "topic.active");
         return;
     }
     // The broker's registry (only noded may publish its props topic): a
     // holder service that left takes its panel holds with it.
-    if command.from == "noded" && command.topic() == Some(REGISTRY_TOPIC) {
+    if broker_registry {
         if let Ok(body) = serde_json::from_str::<Value>(&command.body)
             && body["path"] == "services.registered"
             && let Some(live) = body["new"].as_array().and_then(|names| {
@@ -5634,6 +5683,75 @@ mod tests {
             };
             assert_eq!(observed, active);
         }
+    }
+
+    /// A mesh peer's reply keeps its own `from`, so `from: noded` with
+    /// `broker_origin: mesh` is some other node's broker: it must not turn
+    /// this compositor's props publishing off, nor rewrite its live-service
+    /// set. A `local` stamp is still honoured.
+    #[tokio::test]
+    async fn mesh_origin_noded_claims_do_not_steer_the_broker_state() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(4);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let idle = |origin: &str| {
+            let mut idle = command("topic.idle", 1);
+            idle.from = "noded".into();
+            idle.id = None;
+            idle.headers
+                .insert("name".into(), "comp-nested.props.changed".into());
+            idle.headers.insert("broker_origin".into(), origin.into());
+            idle.headers
+                .insert("source_peer".into(), "beta.example".into());
+            idle
+        };
+        let body = json!({"path":"services.registered","old":["quoin"],"new":["noded"]});
+        let mut registry = command("props.changed", 2);
+        registry.from = "noded".into();
+        registry.id = None;
+        registry.body = body.to_string();
+        registry.args = body;
+        registry
+            .headers
+            .insert("topic".into(), REGISTRY_TOPIC.into());
+        registry
+            .headers
+            .insert("broker_origin".into(), "mesh".into());
+        for forged in [idle("mesh"), idle("MESH"), registry] {
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                forged,
+            );
+        }
+        assert!(
+            matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a mesh-origin noded claim reaches nothing"
+        );
+        assert!(replies.try_recv().is_err(), "and is never answered");
+
+        dispatch_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &long_permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            idle("local"),
+        );
+        let Ok(PortCommand::WatchState { active, .. }) = source.try_recv() else {
+            panic!("the local broker's idle notice still lands");
+        };
+        assert!(!active);
     }
 
     #[test]

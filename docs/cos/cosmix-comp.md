@@ -1415,7 +1415,11 @@ wake the publisher with an event notification, which drains the outbox to
 empty. There is no publisher polling timer or idle tick source. `topic.idle`
 drops the property baseline and a later `topic.active` seeds one at the next
 stable service point; both lifecycle directions coalesce latest-wins if the
-ingress is temporarily full.
+ingress is temporarily full. These notices, and the `noded.props.changed`
+registry diffs, are honoured only from the local broker: `from: noded` with
+`broker_origin` absent or `local`. A mesh-relayed message keeps the remote's
+`from`, so one claiming `noded` with `broker_origin: mesh` is ignored and logged
+at warn level, at most once every 10 seconds.
 
 The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
 still serialise far beyond the wire allowance, so comp measures the cached
