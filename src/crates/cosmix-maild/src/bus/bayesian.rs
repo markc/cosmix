@@ -442,7 +442,10 @@ async fn handle_untrain(
     args: &serde_json::Value,
 ) -> (u8, String) {
     if let Err(e) = reject_unknown_keys(args, UNTRAIN_KEYS) {
-        return (RC_ERROR, err_body(&format!("malformed untrain request: {e}")));
+        return (
+            RC_ERROR,
+            err_body(&format!("malformed untrain request: {e}")),
+        );
     }
     let req: UntrainRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,

@@ -961,7 +961,11 @@ mod tests {
         assert_eq!(stats.seeded_from, Some(seed.display().to_string()));
         assert!(!base.join("9").exists(), "peek_stats seeded a corpus");
         for s in &sidecars {
-            assert!(!s.exists(), "peek_stats created {} next to the seed", s.display());
+            assert!(
+                !s.exists(),
+                "peek_stats created {} next to the seed",
+                s.display()
+            );
         }
 
         // An existing corpus is read as it stands.
