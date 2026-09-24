@@ -4013,17 +4013,7 @@ mod tests {
             "exclusive_latch":null,"event_seq":1}))
     }
 
-    /// The activation's holds. Its reveal is also a `local` hold (chunk 15:
-    /// Quoin's own reveals are holds comp sees), which [`local_holds`] shows.
     fn holds(calls: &[ctk::bus::TestBusCall]) -> Vec<Value> {
-        all_holds(calls).into_iter().filter(|body| body["holder"] != "local").collect()
-    }
-
-    fn local_holds(calls: &[ctk::bus::TestBusCall]) -> Vec<Value> {
-        all_holds(calls).into_iter().filter(|body| body["holder"] == "local").collect()
-    }
-
-    fn all_holds(calls: &[ctk::bus::TestBusCall]) -> Vec<Value> {
         calls.iter().filter(|call| call.command == "comp.panel.hold")
             .map(|call| serde_json::from_str(&call.body).unwrap()).collect()
     }
@@ -4236,15 +4226,10 @@ mod tests {
         comp.refuse_holds.set(Some("unknown_panel_surface"));
         map_left_layer(&mut app, "panel-left");
         let calls = pump(&mut app, &peer, &comp);
-        let commands: Vec<_> = calls.iter()
-            .filter(|call| !call.body.contains(r#""holder":"local""#))
-            .map(|call| (call.to.as_str(), call.command.as_str())).collect();
+        let commands: Vec<_> = calls.iter().map(|call| (call.to.as_str(), call.command.as_str())).collect();
         assert_eq!(commands, [("comp-nested", "comp.panel.mode"), ("comp-nested", "comp.panel.hold")]);
         assert_eq!(holds(&calls), [json!({"output":"test","edge":"left","surface":"panel-left",
             "holder":"focus","acquire":true})]);
-        // The reveal the activation made is Quoin's own: a `local` hold too.
-        assert_eq!(local_holds(&calls), [json!({"output":"test","edge":"left","surface":"panel-left",
-            "holder":"local","acquire":true})]);
         assert_eq!(comp.published(), [false], "the re-stated conceal verdict");
         assert!(left(&app).transient_revealed, "a conceal before the hold leaves the reveal");
         // The layer maps: the refused hold is sent again and holds the edge.

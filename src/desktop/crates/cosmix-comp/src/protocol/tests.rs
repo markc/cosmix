@@ -35436,15 +35436,10 @@ fn release_after_departure_arms_the_conceal_and_the_timer_fires_it() {
     };
     cycle(&mut harness, (20.0, 12.0));
     cycle(&mut harness, away);
-    // Chunk 15: the one-shot now also serves the popup hold's lease, so the
-    // assertion is on the edge's own conceal deadline.
-    let key = (output.clone(), "left".to_owned());
-    let panel = &harness.server.state.observations.panel_holders[&key];
-    assert_eq!(panel.conceal_deadline(), None, "the popup still holds: no conceal deadline");
     assert_eq!(
         harness.server.state.observations.conceal_deadline,
-        panel.leases.get("popup").copied(),
-        "only the popup's lease is timed"
+        None,
+        "the popup still holds: no timer"
     );
     drain_observations(&observations);
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold(false)).0, 0);
@@ -35737,10 +35732,19 @@ fn enforcement_hides_and_excludes_only_the_stalled_panel_layers() {
     let panel_id = layer_by_namespace(&harness, "quoin.panel.15").id;
     assert_eq!(harness.server.state.surface_at(20.0, 12.0).map(|record| record.id), Some(panel_id));
     cycle(&mut harness, away);
-    // Quoin is stalled: the conceal fires and nothing applies it.
+    // Quoin is stalled: the conceal fires and nothing applies it. After the
+    // grace comp probes it; the probe goes unanswered.
+    pump_until(&mut harness, "comp probes the stalled owner", |harness| {
+        harness.server.state.observations.panel_holders[&key].probe.is_some()
+    });
+    assert!(
+        harness.server.state.observations.enforced_surfaces.is_empty(),
+        "nothing is hidden before the probe times out"
+    );
     pump_until(&mut harness, "comp enforces the unapplied conceal", |harness| {
         !harness.server.state.observations.enforced_surfaces.is_empty()
     });
+    assert!(harness.server.state.observations.panel_holders[&key].stalled);
     assert_eq!(panel_commands(&observations), [("quoin.panel.15".to_owned(), false)]);
     assert_eq!(
         harness.server.state.observations.enforced_surfaces,
@@ -35750,10 +35754,11 @@ fn enforcement_hides_and_excludes_only_the_stalled_panel_layers() {
     let record = layer_by_namespace(&harness, "quoin.panel.15");
     assert!(record.mapped, "the client never unmapped it");
     assert!(!record.layout.visible, "comp hides it itself");
-    assert_ne!(
-        harness.server.state.surface_at(20.0, 12.0).map(|record| record.id),
-        Some(panel_id),
-        "and its input is excluded"
+    let toplevel_id = test_toplevel_record(&harness).id;
+    let under = harness.server.state.surface_at(20.0, 12.0).expect("something is under the panel");
+    assert!(
+        under.id == toplevel_id || under.layout.parent == Some(toplevel_id),
+        "its input is excluded: the toplevel underneath is hit"
     );
     // Everything else on the output keeps its visibility and its input.
     let dock = layer_by_namespace(&harness, "foreign-dock");
@@ -35805,16 +35810,18 @@ fn enforcement_hides_and_excludes_only_the_stalled_panel_layers() {
         || harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap(),
     );
     assert_eq!((rc, body), (0, json!(1)));
-    // SIGCONT: a live Quoin's replayed report does not lift the exclusion —
-    // a Quoin that stalls again right after must stay bounded — ...
+    // SIGCONT: a live Quoin's replayed report lifts the exclusion, and the
+    // conceal it still owes is owed again with a fresh grace, so a Quoin
+    // that stalls again right after stays bounded ...
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
-    assert_eq!(
-        harness.server.state.observations.enforced_surfaces,
-        std::collections::BTreeSet::from([panel_id])
-    );
-    assert!(!layer_by_namespace(&harness, "quoin.panel.15").layout.visible);
-    // ... until comp sees the conceal applied: no holder and no enforcement
-    // are left.
+    assert!(harness.server.state.observations.enforced_surfaces.is_empty());
+    assert!(layer_by_namespace(&harness, "quoin.panel.15").layout.visible);
+    let panel = &harness.server.state.observations.panel_holders[&key];
+    assert!(!panel.stalled, "it reported: not stopped");
+    assert_eq!(panel.pending, std::collections::BTreeSet::from([panel_id]), "owed again");
+    assert!(panel.enforce_at.is_some());
+    // ... and it applies the conceal: that cancels what is owed, and no
+    // holder and no enforcement are left.
     swap_test_client(&mut harness, &mut quoin);
     destroy_test_layer(&mut harness, quoin_panel);
     swap_test_client(&mut harness, &mut quoin);
@@ -35967,12 +35974,14 @@ fn reconnect_mode_report_resets_holder_state() {
     stall(&mut harness);
     let a_owner = harness.server.state.observations.panel_holders[&key].owner.clone();
     assert!(a_owner.is_some());
-    // A resumes and replays its report: still excluded until the conceal lands.
+    // A resumes and replays its report: the exclusion lifts and the conceal
+    // is owed again with a fresh grace; applying it (the unmap) settles it.
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", report("quoin.panel.18a")).0, 0);
-    assert!(!harness.server.state.observations.enforced_surfaces.is_empty());
-    assert!(!layer_by_namespace(&harness, "quoin.panel.18a").layout.visible);
+    assert!(harness.server.state.observations.enforced_surfaces.is_empty());
+    assert!(harness.server.state.observations.panel_holders[&key].enforce_at.is_some(), "owed again");
     destroy_test_layer(&mut harness, a_panel);
-    assert!(harness.server.state.observations.enforced_surfaces.is_empty(), "the unmap lifts it");
+    let panel = &harness.server.state.observations.panel_holders[&key];
+    assert!(!panel.owed(), "the unmap settles it");
     // A reveals again on a new layer, then stalls again: bounded by the grace.
     let _ = map_named_test_layer_surface(&mut harness, 0, spec, "quoin.panel.18a2");
     let _ = harness.sync();
@@ -35996,13 +36005,13 @@ fn reconnect_mode_report_resets_holder_state() {
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", report("quoin.panel.18b")).0, 0);
     let b_id = layer_by_namespace(&harness, "quoin.panel.18b").id;
     let panel = &harness.server.state.observations.panel_holders[&key];
-    assert!(panel.held.is_empty() && panel.leases.is_empty(), "nothing of A's holds survives into B");
+    assert!(panel.held.is_empty(), "nothing of A's holds survives into B");
     assert!(panel.owner.is_some() && panel.owner != a_owner, "B's client owns the edge");
     assert_eq!(panel.id, Some(b_id));
     assert_eq!(panel.surface, "quoin.panel.18b");
     assert_eq!(panel.pointer, port_observation::PointerHold::Out);
     assert_eq!((panel.verdict, panel.enforce_at), (Some(false), None));
-    assert!(panel.enforced.is_empty() && panel.popups.is_empty() && !panel.lapsed);
+    assert!(panel.enforced.is_empty() && panel.popups.is_empty() && !panel.stalled);
     assert_eq!(harness.server.state.observations.conceal_deadline, None, "no timer left armed");
     assert!(harness.server.state.observations.enforced_surfaces.is_empty());
     assert_eq!(panel_commands(&observations), [("quoin.panel.18b".to_owned(), false)]);
@@ -36014,116 +36023,239 @@ fn reconnect_mode_report_resets_holder_state() {
     assert_eq!(harness.server.state.observations.panel_holders[&key].held.len(), 1);
 }
 
-/// A hold its holder stops renewing (a SIGSTOPped Quoin) lapses after the
-/// lease: the edge conceals, enforcement follows after the grace, and the
-/// stopped client's Exclusive menu loses the keyboard at once. A renewed
-/// hold survives.
+/// Answer a liveness probe as a live client does: acknowledge the newest
+/// configure each named layer received. Drives the harness's current client.
 #[cfg(feature = "bus")]
-#[test]
-fn unrenewed_hold_lapses_conceals_and_frees_the_keyboard() {
+fn ack_latest_configures(harness: &mut KeybindingHarness, layers: &[TestLayerSurface]) {
+    let traffic = harness.sync();
+    for layer in layers {
+        if traffic.iter().any(|(object, opcode, _)| *object == layer.layer_surface && *opcode == 0) {
+            let (serial, _, _) = configured_layer(&traffic, layer.layer_surface);
+            send_request(&mut harness.client, layer.layer_surface, 6, &words(&[serial]));
+        }
+    }
+    let _ = harness.sync();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+}
+
+/// Quoin (its own client) with a hidden left panel and an open Exclusive
+/// corner menu holding it: the menu has the keyboard. Returns the panel and
+/// menu layers.
+#[cfg(feature = "bus")]
+fn open_quoin_menu(
+    harness: &mut KeybindingHarness,
+    ingress: &crate::port::PortIngress,
+    quoin: &mut OtherTestClient,
+    token: &str,
+) -> (TestLayerSurface, TestLayerSurface) {
     const TOP_LEFT: u32 = 1 | 4;
     let exclusive = zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32;
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    swap_test_client(harness, quoin);
+    let (panel, _) = map_named_test_layer_surface(
+        harness,
+        0,
+        TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() },
+        &format!("quoin.panel.{token}"),
+    );
+    let (menu, _) = map_named_test_layer_surface(
+        harness,
+        0,
+        TestLayerSpec { keyboard_interactivity: exclusive, ..TestLayerSpec::default() },
+        &format!("quoin-menu.{token}"),
+    );
+    let _ = harness.sync();
+    swap_test_client(harness, quoin);
+    let mode = json!({"output":output,"edge":"left","surface":format!("quoin.panel.{token}"),
+        "mode":"hidden"});
+    assert_eq!(nested_panel_call(harness, ingress, "comp.panel.mode", mode).0, 0);
+    let hold = json!({"output":output,"edge":"left","surface":format!("quoin-menu.{token}"),
+        "holder":"popup","acquire":true});
+    assert_eq!(nested_panel_call(harness, ingress, "comp.panel.hold", hold).0, 0);
+    (panel, menu)
+}
+
+/// A stopped Quoin's Exclusive menu must not keep the keyboard or the
+/// panel: the user's click elsewhere triggers a liveness probe, the probe
+/// goes unanswered, and comp drops the popup hold, gives the keyboard back
+/// to the application, conceals, and hides and excludes panel and menu.
+#[cfg(feature = "bus")]
+#[test]
+fn stalled_owner_probe_frees_the_keyboard_and_enforces() {
     let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
     map_initial_test_toplevel(&mut harness);
     let toplevel = test_toplevel_record(&harness).role.wl_surface().clone();
+    let toplevel_id = test_toplevel_record(&harness).id;
     let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
     let output = harness.server.state.backend.default_output().unwrap().name();
     let (width, height) = harness.server.state.backend.seat_extent();
     // Away from the panel and from the menu, which centres on the output.
     route_pointer_to(&mut harness, f64::from(width) * 0.8, f64::from(height) * 0.8);
     let mut quoin = connect_other_layer_client(&mut harness);
-    swap_test_client(&mut harness, &mut quoin);
-    let _ = map_named_test_layer_surface(
-        &mut harness,
-        0,
-        TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() },
-        "quoin.panel.20",
-    );
-    let _ = map_named_test_layer_surface(
-        &mut harness,
-        0,
-        TestLayerSpec { keyboard_interactivity: exclusive, ..TestLayerSpec::default() },
-        "quoin-menu.20",
-    );
-    let _ = harness.sync();
-    swap_test_client(&mut harness, &mut quoin);
-    let menu = layer_by_namespace(&harness, "quoin-menu.20").role.wl_surface().clone();
-    assert_eq!(focus(&harness), Some(menu.clone()), "the Exclusive menu takes the keyboard");
+    let _ = open_quoin_menu(&mut harness, &ingress, &mut quoin, "30");
     let key = (output.clone(), "left".to_owned());
-    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.20","mode":"hidden"});
-    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
-    let hold = json!({"output":output,"edge":"left","surface":"quoin-menu.20",
-        "holder":"popup","acquire":true});
-    let (rc, body) = nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold.clone());
-    assert_eq!((rc, &body["lease_ms"]), (0, &json!(10_000)), "the acquisition states its lease");
-    let first = harness.server.state.observations.panel_holders[&key].leases["popup"];
-    // Renewal is a repeated acquisition: the lease moves, the hold stays.
-    std::thread::sleep(Duration::from_millis(5));
-    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold).0, 0);
-    let renewed = harness.server.state.observations.panel_holders[&key].leases["popup"];
-    assert!(renewed > first);
-    assert!(harness.server.state.observations.panel_holders[&key].held.contains_key("popup"));
+    let menu = layer_by_namespace(&harness, "quoin-menu.30").role.wl_surface().clone();
+    assert_eq!(focus(&harness), Some(menu.clone()), "the Exclusive menu has the keyboard");
+    assert_eq!(harness.server.state.observations.panel_holders[&key].verdict, Some(true));
     drain_observations(&observations);
-    // Quoin stops: nothing renews. Stand in for the lease running out.
-    harness.server.state.observations.panel_holders.get_mut(&key).unwrap().leases
-        .insert("popup".into(), Instant::now());
+    // Quoin stops. The user clicks elsewhere: comp probes the owner.
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
     harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let probe = harness.server.state.observations.panel_holders[&key].probe.clone();
+    assert_eq!(probe.map(|probe| probe.serials.len()), Some(2), "panel and menu are probed");
+    assert_eq!(focus(&harness), Some(menu.clone()), "nothing changes while the probe waits");
+    // Nobody answers.
+    pump_until(&mut harness, "the unanswered probe stalls the owner", |harness| {
+        harness.server.state.observations.panel_holders[&key].stalled
+    });
     let panel = &harness.server.state.observations.panel_holders[&key];
-    assert!(panel.held.is_empty() && panel.lapsed, "the unrenewed hold lapsed");
-    assert_eq!(panel_commands(&observations), [("quoin.panel.20".to_owned(), false)]);
+    assert!(!panel.held.contains_key("popup"), "the stopped menu's popup hold is dropped");
+    assert_eq!(panel.verdict, Some(false));
+    assert_eq!(panel_commands(&observations), [("quoin.panel.30".to_owned(), false)]);
     let after = focus(&harness);
-    assert_ne!(after, Some(menu.clone()), "a lapsed owner's Exclusive menu keeps no grab");
-    let application = after.and_then(|surface| harness.server.state.surfaces.get(&surface.id()))
+    assert_ne!(after, Some(menu), "a stopped owner's Exclusive menu keeps no grab");
+    let application = after
+        .and_then(|surface| harness.server.state.surfaces.get(&surface.id()))
         .map(|record| (record.id, record.layout.parent));
-    let toplevel_id = harness.server.state.surfaces[&toplevel.id()].id;
     assert!(
         application.is_some_and(|(id, parent)| id == toplevel_id || parent == Some(toplevel_id)),
-        "the application gets the keyboard back"
+        "the application gets the keyboard back ({toplevel:?})"
     );
-    // Past the grace, the panel and its menu are hidden and excluded.
-    pump_until(&mut harness, "comp enforces the lapsed conceal", |harness| {
-        harness.server.state.observations.enforced_surfaces.len() == 2
-    });
-    assert!(!layer_by_namespace(&harness, "quoin-menu.20").layout.visible);
-    assert!(!layer_by_namespace(&harness, "quoin.panel.20").layout.visible);
+    assert_eq!(harness.server.state.observations.enforced_surfaces.len(), 2);
+    assert!(!layer_by_namespace(&harness, "quoin-menu.30").layout.visible);
+    assert!(!layer_by_namespace(&harness, "quoin.panel.30").layout.visible);
 }
 
-/// Quoin's local reveals (startup intro, explicit show, resize) are `local`
-/// holds comp sees: a panel shown with one is not owed a conceal; its release
-/// with the panel still showing is.
+/// The same trigger on a live Quoin: it answers the probe, and nothing is
+/// dropped, stripped or hidden — and nothing is probed again until the next
+/// trigger.
 #[cfg(feature = "bus")]
 #[test]
-fn local_hold_keeps_a_shown_panel_and_its_release_arms_enforcement() {
-    const TOP_LEFT: u32 = 1 | 4;
-    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+fn healthy_owner_answers_the_probe_and_is_untouched() {
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
     let output = harness.server.state.backend.default_output().unwrap().name();
     let (width, height) = harness.server.state.backend.seat_extent();
-    route_pointer_to(&mut harness, f64::from(width) / 2.0, f64::from(height) / 2.0);
-    let _ = map_named_test_layer_surface(
+    route_pointer_to(&mut harness, f64::from(width) * 0.8, f64::from(height) * 0.8);
+    let mut quoin = connect_other_layer_client(&mut harness);
+    let (panel_layer, menu_layer) = open_quoin_menu(&mut harness, &ingress, &mut quoin, "31");
+    let key = (output.clone(), "left".to_owned());
+    let menu = layer_by_namespace(&harness, "quoin-menu.31").role.wl_surface().clone();
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    assert!(harness.server.state.observations.panel_holders[&key].probe.is_some());
+    // Quoin is alive: it acknowledges the unchanged configures.
+    swap_test_client(&mut harness, &mut quoin);
+    ack_latest_configures(&mut harness, &[panel_layer, menu_layer]);
+    swap_test_client(&mut harness, &mut quoin);
+    let panel = &harness.server.state.observations.panel_holders[&key];
+    assert!(panel.probe.is_none() && panel.quiet && !panel.stalled);
+    assert!(panel.held.contains_key("popup"), "the live menu keeps its hold");
+    // Past the timeout nothing happens.
+    let answered = Instant::now();
+    while answered.elapsed() < port_observation::PROBE_TIMEOUT + Duration::from_millis(200) {
+        harness.server.dispatch_cycle(Some(Duration::from_millis(100))).unwrap();
+    }
+    let panel = &harness.server.state.observations.panel_holders[&key];
+    assert!(panel.probe.is_none(), "nothing re-arms without a trigger");
+    assert!(!panel.stalled && panel.verdict == Some(true));
+    assert!(harness.server.state.observations.enforced_surfaces.is_empty());
+    assert_eq!(focus(&harness), Some(menu), "the live menu keeps the keyboard");
+}
+
+/// A pointer reveal during a live Quoin's startup intro, then the pointer
+/// leaving: comp conceals, Quoin keeps its intro showing, the grace ends in a
+/// probe, Quoin answers, and the intro is not cut short.
+#[cfg(feature = "bus")]
+#[test]
+fn intro_hover_and_leave_on_a_live_quoin_is_not_cut_short() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let away = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let (intro, _) = map_named_test_layer_surface(
         &mut harness,
         0,
         TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() },
-        "quoin.panel.21",
+        "quoin.panel.32",
     );
+    route_pointer_to(&mut harness, away.0, away.1);
     let _ = harness.sync();
     let key = (output.clone(), "left".to_owned());
-    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.21","mode":"hidden"});
-    let local = |acquire: bool| json!({"output":output,"edge":"left","surface":"quoin.panel.21",
-        "holder":"local","acquire":acquire});
+    let mode = json!({"output":output,"edge":"left","surface":"quoin.panel.32","mode":"hidden"});
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode).0, 0);
-    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", local(true)).0, 0);
-    assert_eq!(
-        panel_commands(&observations),
-        [("quoin.panel.21".to_owned(), false), ("quoin.panel.21".to_owned(), true)]
-    );
+    route_pointer_to(&mut harness, 20.0, 12.0);
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    route_pointer_to(&mut harness, away.0, away.1);
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    pump_until(&mut harness, "the grace ends in a probe", |harness| {
+        harness.server.state.observations.panel_holders[&key].probe.is_some()
+    });
+    ack_latest_configures(&mut harness, &[intro]);
+    let answered = Instant::now();
+    while answered.elapsed() < port_observation::PROBE_TIMEOUT + Duration::from_millis(200) {
+        harness.server.dispatch_cycle(Some(Duration::from_millis(100))).unwrap();
+    }
     let panel = &harness.server.state.observations.panel_holders[&key];
-    assert_eq!((panel.verdict, panel.enforce_at), (Some(true), None), "held: nothing owed");
-    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", local(false)).0, 0);
-    assert_eq!(panel_commands(&observations), [("quoin.panel.21".to_owned(), false)]);
-    assert!(
-        harness.server.state.observations.panel_holders[&key].enforce_at.is_some(),
-        "released with the panel still showing: the conceal is owed"
-    );
+    assert!(panel.probe.is_none() && !panel.stalled && panel.quiet, "answered; not probed again");
+    assert!(harness.server.state.observations.enforced_surfaces.is_empty());
+    assert!(layer_by_namespace(&harness, "quoin.panel.32").layout.visible, "the intro keeps showing");
+}
+
+/// Shell design §7 with the recorded set: comp conceals, Quoin slides the
+/// panel away and unmaps it (the conceal applied: nothing is owed), and the
+/// user presses the show key at once. The re-mapped panel is not hidden at
+/// the old deadline; being shown against comp's verdict, it is only probed,
+/// and a live Quoin answers.
+#[cfg(feature = "bus")]
+#[test]
+fn applied_conceal_cancels_and_a_prompt_reshow_is_not_hidden() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let (mut harness, ingress, _observations) = KeybindingHarness::new_with_port();
+    let output = harness.server.state.backend.default_output().unwrap().name();
+    let (width, height) = harness.server.state.backend.seat_extent();
+    let away = (f64::from(width) / 2.0, f64::from(height) / 2.0);
+    let spec = TestLayerSpec { anchor: TOP_LEFT, ..TestLayerSpec::default() };
+    let (first, _) = map_named_test_layer_surface(&mut harness, 0, spec, "quoin.panel.33a");
+    route_pointer_to(&mut harness, away.0, away.1);
+    let _ = harness.sync();
+    let key = (output.clone(), "left".to_owned());
+    let report = |token: &str| json!({"output":output,"edge":"left","surface":token,"mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", report("quoin.panel.33a")).0, 0);
+    route_pointer_to(&mut harness, 20.0, 12.0);
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    route_pointer_to(&mut harness, away.0, away.1);
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    pump_until(&mut harness, "comp conceals", |harness| {
+        !harness.server.state.observations.panel_holders[&key].pending.is_empty()
+    });
+    let concealed = Instant::now();
+    // Quoin applies it: the recorded layer goes. Nothing is owed.
+    destroy_test_layer(&mut harness, first);
+    assert!(!harness.server.state.observations.panel_holders[&key].owed());
+    // The show key: a new layer, reported.
+    let (second, _) = map_named_test_layer_surface(&mut harness, 0, spec, "quoin.panel.33b");
+    let _ = harness.sync();
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", report("quoin.panel.33b")).0, 0);
+    while concealed.elapsed() < port_observation::ENFORCE_GRACE + Duration::from_millis(200) {
+        harness.server.dispatch_cycle(Some(Duration::from_millis(100))).unwrap();
+    }
+    assert!(harness.server.state.observations.enforced_surfaces.is_empty(), "not hidden at the old deadline");
+    assert!(layer_by_namespace(&harness, "quoin.panel.33b").layout.visible);
+    pump_until(&mut harness, "shown against the verdict: probed", |harness| {
+        harness.server.state.observations.panel_holders[&key].probe.is_some()
+    });
+    ack_latest_configures(&mut harness, &[second]);
+    let answered = Instant::now();
+    while answered.elapsed() < port_observation::PROBE_TIMEOUT + Duration::from_millis(200) {
+        harness.server.dispatch_cycle(Some(Duration::from_millis(100))).unwrap();
+    }
+    assert!(harness.server.state.observations.enforced_surfaces.is_empty());
+    assert!(layer_by_namespace(&harness, "quoin.panel.33b").layout.visible, "a live Quoin's show stands");
 }
 
 /// The holder service leaving the Bus drops its explicit holds (comp's own

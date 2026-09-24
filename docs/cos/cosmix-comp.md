@@ -1134,18 +1134,13 @@ The panel holder plane is two verbs, sent like every comp verb as the literal
 command (`comp.panel.hold`, not `<service>.panel.hold`) addressed to the
 selected service. `comp.panel.hold` takes `output` (raw connector name), `edge`
 (`top`, `bottom`, `left`, `right`), `surface` (the layer-shell namespace token),
-`holder` (`pointer`, `focus`, `popup`, or `local` — a reveal the shell holds
-on its own: its startup intro, an explicit show, a resize) and boolean
-`acquire`. `comp.panel.mode` takes the same output/edge/surface address,
-`mode` (`hidden`, `pinned`, `docked`) and an optional `generation` (the
-reporter's Bus connection generation, a non-negative integer). Both run at
-the stable observation dispatch boundary and return
-`{"accepted":true,"surface":...}`; an acquisition's reply adds `lease_ms`
-(10000). Every explicit hold is leased: it lapses 10 s after its last
-acquisition unless the holder renews it by acquiring it again (Quoin does at
-half the lease), so a stopped holder's holds end on their own. Malformed
-arguments are refused as `invalid_args` naming the offending `field`, with the
-`allowed` list (a hold carrying `generation` is malformed).
+`holder` (`pointer`, `focus`, `popup`) and boolean `acquire`.
+`comp.panel.mode` takes the same output/edge/surface address, `mode`
+(`hidden`, `pinned`, `docked`) and an optional `generation` (the reporter's
+Bus connection generation, a non-negative integer). Both run at the stable
+observation dispatch boundary and return `{"accepted":true,"surface":...}`.
+Malformed arguments are refused as `invalid_args` naming the offending
+`field`, with the `allowed` list (a hold carrying `generation` is malformed).
 Acquisitions require a live layer on that output. Mode reports survive concealed
 panel-layer destruction; releases match their recorded token even if the layer
 has already gone, and a release for an edge comp holds no state for is a no-op.
@@ -1215,50 +1210,71 @@ Comp also subscribes to noded's registry (`noded.props.changed`,
 the Bus, its explicit holds go, while the owner and any enforcement — which
 belong to the Wayland client — stay. A report with a different `generation`
 (or from a different service) is a new Bus incarnation of the holder, and the
-previous one's holds end there. Leases bound anything a missed registry event
-could leave behind.
+previous one's holds end there. The liveness probe below bounds anything a
+missed registry event could leave behind.
 
-Comp enforces its conceals (shell design §7: a slow or crashed shell must not
-keep a panel shown or take input). Whenever a hidden panel's verdict is
-conceal and its owner still shows a mapped layer for the edge, Quoin has 1 s
-(its slide takes 200 ms) to apply it — however the panel came to be shown,
-since the shell's own reveals are `local` holds comp sees. Past that grace comp
-hides the owner's layers it recorded for that edge — the panel layer and any
-popup layer acquired for it — and excludes them from input. It does so
-through the same effective-visibility funnel as minimising, so the layers stop
-rendering, stop being hit-tested, lose keyboard and pointer focus and can no
-longer hold an exclusive keyboard grab; their subsurfaces and popups go with
-them. Exclusion acts only on those surface ids, never on a namespace or prefix
-match, so no other client's surface — a foreign layer or toplevel on the same
-output — is touched. Enforcement ends when comp reveals the edge again, when
-the client unmaps or destroys the layer itself, on a persistent mode, and with
-the owner's disconnect. A hidden mode report does not end it: a Quoin
-resuming from a stall applies the conceal it was sent (the unmap ends the
-exclusion), and one that stalls again stays bounded. When an explicit hold
-lapses unrenewed, its owner is marked stopped: its Exclusive layers lose their
-keyboard grab at once (arbitration treats them as on-demand) and applications
-get the keyboard back, until the owner is heard from again. Lease expiry and
-the grace share the single one-shot timer with the conceal delay.
+Comp enforces its conceals (shell design §7: a slow or stopped shell must not
+keep a panel shown or hold the input). When a conceal ends a reveal comp
+itself commanded, comp records the owner's layers showing for that edge — the
+panel layer and any popup layer acquired for it. If any of them unmaps or goes,
+the shell has applied the conceal and nothing is owed, so a panel the user
+shows again at once is never hidden. If they are still mapped 1 s later (the
+shell's slide takes 200 ms), comp asks whether the shell is alive: it re-sends
+each layer its current configure, unchanged, and waits up to 1 s for the
+`ack_configure` a live client sends and a stopped one cannot. The same probe
+runs when an owner layer stays shown for 1 s while the verdict is conceal for
+another reason (a shell that stopped during its startup intro or an explicit
+show), and at once when the user clicks or types somewhere the shell does not
+own while only a popup or focus hold keeps the edge revealed (a stopped menu
+or launcher). An answered probe owes nothing and is not repeated until the
+next trigger. An unanswered one marks the owner stalled: its popup and focus
+holds drop, its keyboard focus stops counting as a holder, its Exclusive
+layers lose their keyboard grab (arbitration treats them as on-demand, so the
+application gets the keyboard back), the edge conceals, and the showing layers
+are hidden and excluded from input at once. Any later acknowledgement or Bus
+request from the owner clears the stalled mark.
 
-Not covered yet: a docked panel's reservation from a stalled shell stays in
-place (shell design §7, "stale reservations"); tracked in TODO-cos.
+Hiding goes through the same effective-visibility funnel as minimising, so
+the layers stop rendering, stop being hit-tested, lose keyboard and pointer
+focus and can no longer hold an exclusive keyboard grab; their subsurfaces and
+popups go with them. It acts only on the recorded surface ids, never on a
+namespace or prefix match, so no other client's surface — a foreign layer or
+toplevel on the same output — is touched. Enforcement ends when comp reveals
+the edge again, when the client unmaps or destroys the layer itself, on any
+mode report for the edge, and with the owner's disconnect. A hidden report
+that finds a conceal still owed lifts the exclusion but owes it again with a
+fresh grace, so a shell that resumes and stalls again stays bounded. The
+grace and the probe share the single one-shot timer with the conceal delay;
+nothing polls and nothing is sent to a shell that is not being checked.
+
+What remains open to a Bus peer: the verbs are mesh-open, so any caller can
+send a `comp.panel.mode` for an edge. An anonymous caller binds nothing; a
+registered service's report is accepted like the holder's own, and the
+ownership check applies to the layer it names (whose Wayland client comp
+attests), not to the caller. Such a report can re-state or change an edge's
+mode and lift an exclusion (owing it again), but cannot make another client's
+layer the panel or select it for hiding.
+
+Not covered: a docked panel's reservation from a stalled shell stays in place
+(shell design §7, "stale reservations"); tracked in TODO-cos.
 
 The read-only `input.corners.holders` leaf is the switch clients gate on. It
-reads `true`: the verbs, holder tracking, leases, the conceal timer,
-enforcement on a stalled client, disconnect cleanup and resynchronisation are
-all live, and Quoin hands reveal/conceal over to comp when it reads it. Two
-families of
+reads `true`: the verbs, holder tracking, the conceal timer, the liveness
+probe and enforcement on a stalled client, disconnect cleanup and
+resynchronisation are all live, and Quoin hands reveal/conceal over to comp
+when it reads it. Two families of
 read-only, volatile leaves (served by `comp.props.get`/`list`/`describe`,
 never in `props.changed`) report the plane per edge, summed over outputs:
 `input.corners.enforced.{top,bottom,left,right}` counts the layers comp is
 hiding and excluding right now, and `input.corners.held.{top,bottom,left,right}`
 the explicit holds it records. A stalled-shell check reads them: with the
 shell stopped (`SIGSTOP`) after a pointer reveal, the pointer's departure
-conceals after 800 ms and `enforced.<edge>` reads 1 about a second later;
-with a menu open instead, its popup hold lapses after 10 s, the keyboard
-returns to the application at once and the panel and menu are enforced a
-second later. After `SIGCONT` the shell's own conceal returns `enforced` to
-0, and `held.<edge>` returns to 0 once its menus have closed.
+conceals after 800 ms, comp probes a second later, and `enforced.<edge>` reads
+1 about a second after that; with a menu open instead, a click on an
+application probes at once, and a second later the keyboard returns to the
+application and the panel and menu are enforced. After `SIGCONT` the shell's
+own conceal returns `enforced` to 0, and `held.<edge>` returns to 0 once its
+menus have closed.
 
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry

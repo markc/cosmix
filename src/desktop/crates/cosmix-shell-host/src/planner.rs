@@ -344,7 +344,6 @@ mod tests {
             },
             keyboard_requested: false,
             keyboard_focused: false,
-            local_hold: false,
             page_ids: Arc::default(),
             active_page_id: None,
             page_change: Default::default(),

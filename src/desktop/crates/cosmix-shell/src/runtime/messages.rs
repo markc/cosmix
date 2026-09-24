@@ -198,8 +198,6 @@ pub struct PanelPresentation {
     pub keyboard_requested: bool,
     /// The host reports this panel's surface holds the keyboard.
     pub keyboard_focused: bool,
-    /// The panel holds its own reveal (see `PanelSnapshot::local_hold`).
-    pub local_hold: bool,
     pub page_ids: Arc<[String]>,
     pub active_page_id: Option<String>,
     /// Marker for the change that produced `active_page_id` this update, if
@@ -258,7 +256,6 @@ impl ShellFrame {
                 },
                 keyboard_requested: model.focus_directive() == FocusDirective::Panel(edge),
                 keyboard_focused: model.keyboard_focus() == Some(edge),
-                local_hold: panel.local_hold,
                 page_ids: model.carousel(edge).shared_page_ids(),
                 active_page_id: model.carousel(edge).active_id().map(str::to_owned),
                 page_change: PageChange::None,

@@ -774,7 +774,7 @@ impl PortIngress {
     }
 
     /// Best effort: a full queue drops the set, and the next registry diff or
-    /// the holds' leases repair it.
+    /// the liveness probe on the holder's layers repair it.
     pub(crate) fn services_live(&self, live: std::collections::BTreeSet<String>) {
         if self.sender.try_send(PortCommand::ServicesLive(live)).is_err() {
             tracing::debug!("registry update dropped: compositor port queue full");
@@ -1420,13 +1420,13 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&publish_timeouts),
         shutdown.clone(),
     ));
-    // Holder cleanup on Bus departure. Best effort: the holds' leases bound
+    // Holder cleanup on Bus departure. Best effort: the liveness probe bounds
     // what a missed departure can leave behind.
     let registry_task = tokio::spawn({
         let client = Arc::clone(&client);
         async move {
             if let Err(error) = client.subscribe_topic(REGISTRY_TOPIC).await {
-                tracing::warn!(%error, "registry subscription failed; panel holds rely on their leases");
+                tracing::warn!(%error, "registry subscription failed; panel holds rely on the liveness probe");
             }
         }
     });

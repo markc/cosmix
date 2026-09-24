@@ -990,22 +990,22 @@ or leave holds behind; stale docked reservations are the part of shell design
 never by a namespace token (Quoin adds 128 random bits to each token so it
 cannot be guessed), and an edge is adopted only for a token Quoin itself
 reported; another live client's layer under a copied token is refused
-(<code>panel_owner_mismatch</code>). Every hold Quoin acquires is leased by comp for
-10 s and renewed by re-sending it every 5 s — a one-shot host deadline that
-exists only while something is held — so a stopped Quoin's holds lapse, its
-Exclusive menu loses the keyboard at once, and the edge conceals. Quoin's own
-reveals — the startup intro, an explicit show until the pointer or the
-keyboard takes it over, a resize, a named activation's reveal — are reported
-as <code>local</code> holds, so comp knows a shown panel is meant to be shown. A panel
-still showing 1 s after comp's conceal (Quoin stopped or wedged) is hidden and
-excluded from input by comp itself, and nothing of any other client is
-touched. When Quoin's Wayland connection dies comp drops everything it held;
-when its Bus connection goes (comp watches noded's registry), or a report
-arrives from a new Bus generation (mode reports carry <code>generation</code>), its holds
-end there. A Quoin resuming from a stall applies the conceal it was sent, and
-that unmap ends comp's exclusion. Comp's read-only
-<code>input.corners.enforced.&lt;edge&gt;</code> and <code>input.corners.held.&lt;edge&gt;</code> counts show
-the state.</p>
+(<code>panel_owner_mismatch</code>, which Quoin retries on the next layer mapping or
+registry receipt). Quoin sends nothing extra to stay alive: comp checks it
+only when it has reason to — a panel still showing 1 s after comp's conceal,
+or a click or key elsewhere while only Quoin's menu or launcher holds a
+panel — by re-sending an unchanged layer configure that a live Quoin
+acknowledges within a second, as SCTK does on its own. A Quoin that does not
+answer is taken to be stopped: its menu and focus holds drop, its Exclusive
+menu loses the keyboard, and its panel and menu are hidden and excluded from
+input; nothing of any other client is touched. A conceal Quoin applies (the
+layer unmapped) owes nothing, so a panel shown again at once stays. When
+Quoin's Wayland connection dies comp drops everything it held; when its Bus
+connection goes (comp watches noded's registry), or a report arrives from a
+new Bus generation (mode reports carry <code>generation</code>), its holds end there. A
+report lifts comp's exclusion, and a conceal still owed is owed again with a
+fresh grace. Comp's read-only <code>input.corners.enforced.&lt;edge&gt;</code> and
+<code>input.corners.held.&lt;edge&gt;</code> counts show the state.</p>
 <h3 id="corner-input">Corner input</h3>
 <p>Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. <code>--comp-service NAME</code> selects the

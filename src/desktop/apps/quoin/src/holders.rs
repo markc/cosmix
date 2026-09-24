@@ -35,11 +35,6 @@ const HOLDERS_PATH: &str = "input.corners.holders";
 const TOPIC_SUFFIXES: [&str; 3] = ["props.changed", "panel.command", "surface.mapped"];
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_CAP: Duration = Duration::from_secs(8);
-/// Comp expires an explicit hold 10 s after its last acquisition, so that a
-/// stopped Quoin cannot keep a panel shown or the keyboard grabbed; a live
-/// one re-sends every held acquisition at half that. A one-shot deadline
-/// that exists only while something is held — not a poll.
-const HOLD_RENEW: Duration = Duration::from_secs(5);
 
 /// `(layer token, verb)`: one desired request per layer and verb.
 type Key = (String, String);
@@ -127,9 +122,6 @@ pub(crate) struct HolderClient {
     /// which comp's ordinary holders decide. Derived from Quoin's own frame,
     /// never from comp's focus events, so no event ordering can end it early.
     focus: BTreeSet<(String, Edge)>,
-    /// When the held acquisitions are next re-sent to renew comp's lease;
-    /// `None` while nothing is held.
-    renew_at: Option<Duration>,
 }
 
 pub(crate) fn install(app: &mut App, bus: &mut BusBridgeConfig, service: String) {
@@ -158,7 +150,11 @@ fn wait_for(code: Option<&str>) -> Wait {
     match code {
         Some(
             "unknown_panel_surface" | "unknown_output" | "panel_output_mismatch"
-            | "ambiguous_panel_surface",
+            | "ambiguous_panel_surface"
+            // Another client's layer holds the edge (a dead incarnation's
+            // squatter, a copied token): retry when layers change, and on
+            // every registry receipt, which clears all refusals.
+            | "panel_owner_mismatch",
         ) => Wait::Mapping,
         Some("locked") => Wait::Unlock,
         None | Some("busy") => Wait::Retry,
@@ -176,7 +172,7 @@ impl HolderClient {
             maybe_held: BTreeMap::new(), pending: None, pending_superseded: false,
             retry_wanted: false, retry_read: false,
             retry_at: None, backoff: RETRY_FIRST, popup: BTreeMap::new(),
-            popup_surfaces: BTreeMap::new(), focus: BTreeSet::new(), renew_at: None,
+            popup_surfaces: BTreeMap::new(), focus: BTreeSet::new(),
         }
     }
 
@@ -392,33 +388,9 @@ impl HolderClient {
     /// One host update: fire a due retry, send, then arm a deadline for any
     /// send that just failed, so the next unrelated update cannot resend early.
     fn update(&mut self, bridge: &BusBridge, now: Duration, deadline: &mut LayerHostDeadline) {
-        self.renew(now, deadline);
         self.tick(now, deadline);
         self.flush(bridge);
         self.tick(now, deadline);
-    }
-
-    /// Lease renewal: while any acquisition is wanted, every [`HOLD_RENEW`]
-    /// the acknowledged acquisitions are forgotten so the next flush re-sends
-    /// them (comp treats a repeated acquisition as a renewal). Published as a
-    /// host wake deadline; nothing is armed while nothing is held.
-    fn renew(&mut self, now: Duration, deadline: &mut LayerHostDeadline) {
-        let acquired = |key: &Key, body: &Value| key.1 == "panel.hold" && body["acquire"] == true;
-        if !self.capable || !self.desired.iter().any(|(key, body)| acquired(key, body)) {
-            self.renew_at = None;
-            return;
-        }
-        match self.renew_at {
-            Some(at) if at <= now => {
-                self.acknowledged.retain(|key, body| !acquired(key, body));
-                self.renew_at = Some(now + HOLD_RENEW);
-            }
-            None => self.renew_at = Some(now + HOLD_RENEW),
-            Some(_) => {}
-        }
-        if let Some(at) = self.renew_at {
-            deadline.0 = Some(deadline.0.map_or(at, |current| current.min(at)));
-        }
     }
 
     /// Fires the one-shot retry, then arms the next one if a transient failure
@@ -565,15 +537,6 @@ pub(crate) fn report_holders(
                 report["generation"] = json!(generation);
             }
             client.desired.insert((surface.into(), "panel.mode".into()), report);
-            // Quoin's own reveals (the intro, an explicit show, a resize) are
-            // a `local` hold on the panel's layer, so comp never takes a
-            // panel Quoin keeps on screen for a stalled one.
-            if frame.0.panel(edge).local_hold {
-                client.desired.insert((format!("{surface}#local"), "panel.hold".into()), json!({
-                    "output":output.as_str(),"edge":edge_name(edge),"surface":surface,
-                    "holder":"local","acquire":true,
-                }));
-            }
             // The activation's focus hold names the panel's own layer, which
             // maps with the reveal: an acquisition that overtakes the mapping
             // is refused and resent on the next `surface.mapped`.
@@ -726,39 +689,21 @@ mod tests {
         assert!(client.message(&command("token", 2)).is_none());
     }
 
-    /// Comp leases every hold: while one is wanted, the acknowledged
-    /// acquisition is re-sent at half the lease, on a one-shot host deadline
-    /// that is gone once nothing is held.
+    /// A report refused because another client's layer holds the edge is
+    /// retried when layers change, not left until the intent changes.
     #[test]
-    fn held_acquisitions_renew_at_half_the_lease() {
+    fn owner_mismatch_retries_on_the_next_mapping() {
+        assert_eq!(wait_for(Some("panel_owner_mismatch")), Wait::Mapping);
         let (mut client, bridge, peer) = capable_client();
-        acknowledge_mode(&mut client, &bridge, &peer, "panel-1");
-        let key: Key = ("panel-1#local".into(), "panel.hold".into());
-        let hold = json!({"output":"test","edge":"left","surface":"panel-1",
-            "holder":"local","acquire":true});
-        client.desired.insert(key.clone(), hold.clone());
-        let mut deadline = LayerHostDeadline::default();
-        client.renew(Duration::ZERO, &mut deadline);
-        assert_eq!(deadline.0, Some(HOLD_RENEW), "armed while something is held");
+        client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
         client.flush(&bridge);
-        let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1);
-        client.event(&reply(calls[0].request_id, 0, r#"{"accepted":true,"lease_ms":10000}"#));
+        let call = peer.drain_calls().remove(0);
+        client.event(&reply(call.request_id, 10, r#"{"error":"panel_owner_mismatch"}"#));
         client.flush(&bridge);
-        assert!(peer.drain_calls().is_empty(), "acknowledged: quiet until the renewal");
-        client.renew(HOLD_RENEW - Duration::from_millis(1), &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "waits for a mapping");
+        assert!(client.message(&frame("surface.mapped", json!({"id":4,"event_seq":8}))).is_none());
         client.flush(&bridge);
-        assert!(peer.drain_calls().is_empty());
-        client.renew(HOLD_RENEW, &mut deadline);
-        client.flush(&bridge);
-        let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1, "the renewal re-sends the acquisition");
-        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold);
-        // Nothing held: no deadline.
-        client.desired.remove(&key);
-        let mut deadline = LayerHostDeadline::default();
-        client.renew(HOLD_RENEW * 2, &mut deadline);
-        assert_eq!(deadline.0, None);
+        assert_eq!(peer.drain_calls()[0].command, "comp.panel.mode", "resent after the mapping");
     }
 
     #[test]
