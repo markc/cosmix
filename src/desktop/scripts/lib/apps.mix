@@ -414,6 +414,49 @@ fn expand_exec($exec, $entry, $uris)
   return $argv
 end
 
+-- ── launch environment (XWayland DISPLAY) ───────────────────────────────
+-- comp never sets DISPLAY globally. Once its XWM is ready it publishes
+-- $XDG_RUNTIME_DIR/cosmix-comp/<WAYLAND_DISPLAY>.xwayland.env holding
+-- "DISPLAY=:N\nGENERATION=G\n", and removes it when XWayland dies. The
+-- launcher reads it at EVERY launch (never cached): a restarted XWayland may
+-- take a different display number.
+
+fn xwayland_descriptor_path($runtime_dir, $wayland_display)
+  -- "" when the session cannot name comp's descriptor: no runtime dir, no
+  -- WAYLAND_DISPLAY, or an absolute/relative socket path rather than a name.
+  if $runtime_dir == "" or $wayland_display == "" or contains($wayland_display, "/") then
+    return ""
+  end
+  return $runtime_dir .. "/cosmix-comp/" .. $wayland_display .. ".xwayland.env"
+end
+
+fn parse_xwayland_descriptor($text)
+  -- The DISPLAY value (":N") from descriptor text, or nil when it has none
+  -- or it is malformed -- a garbage value must never reach an X client.
+  for each $line in lines($text)
+    $kv = split_once(trim($line), "=")
+    if $kv != nil and $kv[0] == "DISPLAY" and re_match($kv[1], "^:[0-9]+$") then
+      return $kv[1]
+    end
+  end
+  return nil
+end
+
+fn launch_env($runtime_dir, $wayland_display)
+  -- Environment additions for one launch: {DISPLAY: ":N"} while comp's
+  -- XWayland is serving, else {} (the inherited environment is left alone).
+  $path = xwayland_descriptor_path($runtime_dir, $wayland_display)
+  if $path == "" or not is_file($path) then return {} end
+  try
+    $display = parse_xwayland_descriptor(read_file($path))
+  catch $err
+    -- Removed between the check and the read: XWayland just died.
+    return {}
+  end
+  if $display == nil then return {} end
+  return {DISPLAY: $display}
+end
+
 -- ── icon-theme lookup ───────────────────────────────────────────────────
 
 fn icon_kind($path)

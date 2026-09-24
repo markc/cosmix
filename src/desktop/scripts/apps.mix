@@ -107,6 +107,10 @@ on "apps.launch" desc "launch an application by id, detached (uris optional)"
       if $e.terminal then $argv = concat($a.parse_exec($terminal_cmd), $argv) end
       $opts = {detach: true}
       if $e.workdir != "" and is_dir($e.workdir) then $opts.cwd = $e.workdir end
+      -- DISPLAY for X11 apps, read from comp's live XWayland descriptor at
+      -- each launch (TODO-comp C8); merged over the inherited environment.
+      $extra_env = $a.launch_env(env("XDG_RUNTIME_DIR"), env("WAYLAND_DISPLAY"))
+      if len(keys($extra_env)) > 0 then $opts.env = $extra_env end
       try
         $pid = spawn($argv, $opts)
         reply(0, json_encode({id: $id, pid: $pid, argv: $argv}))

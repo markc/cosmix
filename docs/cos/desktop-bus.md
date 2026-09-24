@@ -131,6 +131,14 @@ It is event-driven: the tree is scanned once at start and again only on
 intended rescan trigger. `src/desktop/scripts/cosmix-desk-apps.service` is
 an example user unit bound to `graphical-session.target`.
 
+`apps.launch` gives X11 applications the right `DISPLAY` without any static
+environment. At every launch it reads comp's XWayland descriptor,
+`$XDG_RUNTIME_DIR/cosmix-comp/$WAYLAND_DISPLAY.xwayland.env`, and passes its
+`DISPLAY=:N` to the child on top of the inherited environment. Because it
+is read per launch, an XWayland restart on another display number is seen
+by the next launch. With no descriptor (XWayland not running) nothing is
+added.
+
 | Verb | JSON request | Successful response |
 |---|---|---|
 | `apps.list` | `{category?, query?}` | array of `{id,name,generic_name,comment,icon,categories,exec,terminal,path}` sorted by name |

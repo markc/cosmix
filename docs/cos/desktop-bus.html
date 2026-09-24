@@ -542,6 +542,13 @@ Start it like the session provider:</p>
 <code>apps.reload</code>. There is no timer or poll loop; a future inotify wake is the
 intended rescan trigger. <code>src/desktop/scripts/cosmix-desk-apps.service</code> is
 an example user unit bound to <code>graphical-session.target</code>.</p>
+<p><code>apps.launch</code> gives X11 applications the right <code>DISPLAY</code> without any static
+environment. At every launch it reads comp's XWayland descriptor,
+<code>$XDG_RUNTIME_DIR/cosmix-comp/$WAYLAND_DISPLAY.xwayland.env</code>, and passes its
+<code>DISPLAY=:N</code> to the child on top of the inherited environment. Because it
+is read per launch, an XWayland restart on another display number is seen
+by the next launch. With no descriptor (XWayland not running) nothing is
+added.</p>
 <table><thead><tr><th>Verb</th><th>JSON request</th><th>Successful response</th></tr></thead><tbody>
 <tr><td><code>apps.list</code></td><td><code>{category?, query?}</code></td><td>array of <code>{id,name,generic_name,comment,icon,categories,exec,terminal,path}</code> sorted by name</td></tr>
 <tr><td><code>apps.get</code></td><td><code>{id}</code></td><td>the entry with all parsed fields (adds <code>keywords</code>, <code>try_exec</code>, <code>no_display</code>, <code>workdir</code>, <code>only_show_in</code>, <code>not_show_in</code>)</td></tr>

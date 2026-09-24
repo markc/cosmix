@@ -22,7 +22,10 @@ $citizen_env = {
   COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
   HOME: $tmp,
   XDG_DATA_HOME: $tmp .. "/data",
-  XDG_DATA_DIRS: $tmp .. "/sys"
+  XDG_DATA_DIRS: $tmp .. "/sys",
+  -- comp's XWayland descriptor lives under the fixture runtime dir.
+  XDG_RUNTIME_DIR: $tmp .. "/run",
+  WAYLAND_DISPLAY: "wayland-apps-test"
 }
 -- Pre-bound so the finally block can run even when a setup step fails
 -- before the two daemons are spawned (an unbound read would raise there
@@ -43,6 +46,9 @@ fn write_recorder()
   mkdir($tmp .. "/bin")
   write_file($tmp .. "/bin/recorder", "#!/opt/cosmix/bin/mix\n" ..
     "write_file(env(\"HOME\") .. \"/launched-\" .. basename($0), join(args(), \"\\n\") .. \"\\n\")\n")
+  -- Records the DISPLAY the launched app actually inherited.
+  write_file($tmp .. "/bin/display-recorder", "#!/opt/cosmix/bin/mix\n" ..
+    "write_file(env(\"HOME\") .. \"/launched-display\", env(\"DISPLAY\") .. \"\\n\")\n")
 end
 fn check($condition, $message)
   if not $condition then raise("APPS_BUS_TEST", $message) end
@@ -98,7 +104,10 @@ try
   fixture("data/icons/hicolor/index.theme", "[Icon Theme]\n" ..
     "Name=Hicolor\nDirectories=22x22\n\n[22x22]\nSize=22\nType=Fixed\n")
   fixture("data/icons/hicolor/22x22/apps-bus-test-icon.png", "")
-  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/recorder"])
+  fixture("data/applications/xapp.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=X App\nExec=" .. $tmp .. "/bin/display-recorder\n")
+  fixture("run/cosmix-comp/wayland-apps-test.xwayland.env", "DISPLAY=:7\nGENERATION=1\n")
+  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/recorder", $tmp .. "/bin/display-recorder"])
 
   $noded_pid = spawn(["/opt/cosmix/bin/cosmix-noded", "serve", "--listen", "127.0.0.1:" .. to_string($port),
     "--node", "apps-bus-test-" .. $tag, "--no-monitor", "--no-log"],
@@ -125,6 +134,15 @@ try
   check($launch.rc == 0 and type($launch.result.pid) == "number", "apps.launch failed")
   check(wait_file($tmp .. "/launched-recorder") == "plain-arg\n", "launched argv wrong")
 
+  -- An X11 app inherits DISPLAY from comp's XWayland descriptor, read at
+  -- launch time: a restarted XWayland on another number is seen at once.
+  check(call("apps", "apps.launch", json_encode({id: "xapp"})).rc == 0, "xapp apps.launch failed")
+  check(wait_file($tmp .. "/launched-display") == ":7\n", "launched app did not get the descriptor DISPLAY")
+  $_rm = run_argv_must(["rm", "-f", "--", $tmp .. "/launched-display"])
+  fixture("run/cosmix-comp/wayland-apps-test.xwayland.env", "DISPLAY=:9\nGENERATION=2\n")
+  check(call("apps", "apps.launch", json_encode({id: "xapp"})).rc == 0, "second xapp apps.launch failed")
+  check(wait_file($tmp .. "/launched-display") == ":9\n", "launch reused a stale DISPLAY after an XWayland restart")
+
   -- apps.terminal may carry arguments: parsed with the Exec rules and
   -- prefixed as terminal argv + app argv (B7 over the Bus).
   $set = call("apps", "apps.props.set", json_encode({path: "apps.terminal", value: $tmp .. "/bin/recorder -e"}))
@@ -139,7 +157,7 @@ try
   fixture("data/applications/late.desktop", "[Desktop Entry]\n" ..
     "Type=Application\nName=Late App\nExec=" .. $tmp .. "/bin/recorder late-arg\n")
   $reload = call("apps", "apps.reload", "{}")
-  check($reload.rc == 0 and $reload.result.count == 4, "apps.reload count wrong (expected 4 index entries)")
+  check($reload.rc == 0 and $reload.result.count == 5, "apps.reload count wrong (expected 5 index entries)")
   check(call("apps", "apps.get", json_encode({id: "late"})).rc == 0, "apps.reload did not rebind the index")
 
   -- Icon resolution through the citizen (theme chain, fixture hicolor).

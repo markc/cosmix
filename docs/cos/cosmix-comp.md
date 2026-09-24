@@ -1669,8 +1669,12 @@ band are supported.
 `DISPLAY` is never set globally. After the XWM owns `WM_S0`, the compositor
 atomically publishes a mode-0600 per-socket descriptor at
 `$XDG_RUNTIME_DIR/cosmix-comp/<WAYLAND_DISPLAY>.xwayland.env` containing
-`DISPLAY=:N` and the XWayland generation; launchers read it once and pass
-`DISPLAY` explicitly to each X client. A missing `Xwayland` binary or a
+`DISPLAY=:N` and the XWayland generation; launchers read it at each launch
+(the number can change when XWayland restarts) and pass `DISPLAY`
+explicitly to each X client. The desktop's `apps.launch` does exactly that
+(see the apps citizen in [desktop-bus](desktop-bus.md)). comp itself spawns
+no desktop applications, so setting `DISPLAY` in its own process would
+reach nothing but Xwayland. A missing `Xwayland` binary or a
 failed start degrades to a fully working native-Wayland compositor with a
 warning. An unexpected XWayland death destroys that generation's windows,
 removes the descriptor and arms a single 60-second one-shot restart backstop;

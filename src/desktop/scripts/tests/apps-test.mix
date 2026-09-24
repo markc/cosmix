@@ -192,7 +192,24 @@ try
   check($hit.hit != nil and $hit.hit.theme == "hicolor", "absent theme did not fall through to hicolor")
   $ctx = $hit.ctx
 
-  print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache")
+  -- ── XWayland DISPLAY for launches (TODO-comp C8) ─────────────────────
+  check($a.xwayland_descriptor_path("/run/user/1", "wayland-1") == "/run/user/1/cosmix-comp/wayland-1.xwayland.env",
+    "descriptor path wrong")
+  check($a.xwayland_descriptor_path("", "wayland-1") == "", "descriptor path invented without a runtime dir")
+  check($a.xwayland_descriptor_path("/run/user/1", "/run/user/1/wayland-1") == "", "descriptor path from a socket path")
+  check($a.parse_xwayland_descriptor("DISPLAY=:3\nGENERATION=2\n") == ":3", "descriptor DISPLAY not parsed")
+  check($a.parse_xwayland_descriptor("GENERATION=2\nDISPLAY=:12\n") == ":12", "DISPLAY not found after another key")
+  check($a.parse_xwayland_descriptor("DISPLAY=:0; rm -rf /\n") == nil, "malformed DISPLAY accepted")
+  check($a.parse_xwayland_descriptor("") == nil, "empty descriptor produced a DISPLAY")
+  -- No descriptor (XWayland not up, or died): nothing is added.
+  check(len(keys($a.launch_env($tmp, "wayland-9"))) == 0, "launch_env invented a DISPLAY with no descriptor")
+  fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=:1\nGENERATION=1\n")
+  check($a.launch_env($tmp, "wayland-9").DISPLAY == ":1", "launch_env did not read the descriptor")
+  -- A restarted XWayland on a different number is seen on the next launch.
+  fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=:4\nGENERATION=2\n")
+  check($a.launch_env($tmp, "wayland-9").DISPLAY == ":4", "launch_env cached a stale DISPLAY")
+
+  print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache, XWayland launch DISPLAY")
 finally
   if starts_with($tmp, "/tmp/cosmix-apps-lib-test.") then
     $_remove = run_argv_must(["rm", "-rf", "--", $tmp])
