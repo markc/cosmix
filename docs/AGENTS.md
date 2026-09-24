@@ -91,9 +91,11 @@ and `--` lines, first 32 lines), in exactly this form:
 ```
 
 - Every runnable script this repo ships carries the header: `setup.mix`,
-  `docs/build/`, `src/desktop/scripts/`, toolsd, the `check-*`/export scripts,
+  `docs/build/`, `src/desktop/scripts/` (not its `tests/`), toolsd, the `check-*`/export scripts,
   and the starter `ctl/_bin/` and `ctl/_share/`. Libraries, handlers and data
-  files that are loaded rather than run do not. A new script gets one;
+  files that are loaded rather than run do not, and neither do test scripts:
+  a header would make the test the entry script whose version
+  `script_version()` reports. A new script gets one;
   `mix docs/build/add-version-headers.mix` adds any that are missing.
 - Bump the header when the script's observable behaviour changes. That is the
   same test as a crate bump.

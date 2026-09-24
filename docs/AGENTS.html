@@ -521,9 +521,11 @@ and <code>--</code> lines, first 32 lines), in exactly this form:</p>
 </code></pre>
 <ul>
 <li>Every runnable script this repo ships carries the header: <code>setup.mix</code>,
-<code>docs/build/</code>, <code>src/desktop/scripts/</code>, toolsd, the <code>check-*</code>/export scripts,
+<code>docs/build/</code>, <code>src/desktop/scripts/</code> (not its <code>tests/</code>), toolsd, the <code>check-*</code>/export scripts,
 and the starter <code>ctl/_bin/</code> and <code>ctl/_share/</code>. Libraries, handlers and data
-files that are loaded rather than run do not. A new script gets one;
+files that are loaded rather than run do not, and neither do test scripts:
+a header would make the test the entry script whose version
+<code>script_version()</code> reports. A new script gets one;
 <code>mix docs/build/add-version-headers.mix</code> adds any that are missing.</li>
 <li>Bump the header when the script's observable behaviour changes. That is the
 same test as a crate bump.</li>

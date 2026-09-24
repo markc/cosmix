@@ -168,7 +168,9 @@ The contract:
   proves two nodes run the same bytes; the header is what a human bumps.
 - **`--json`** straight after the flag prints the same facts as one JSON
   object, the same map `script_version()` returns (`version` and `modified`
-  are `null` when absent), matching `mix --version --json`.
+  are `null` when absent), matching `mix --version --json`. Its keys come
+  out in a different order from the in-script map; JSON objects are
+  unordered, so read them by name.
 - **Read, never parsed.** The answer comes from the same cold position as
   `mix --version` — no session lane, no Bus, no prelude, no rc — and the file
   is only read, so a script with a syntax error still reports its version. An
@@ -177,7 +179,8 @@ The contract:
   same inode.
 - **Symlinks.** The name is the basename of the path as given (the link's
   own name, so `~/.local/bin/zcode` reports `zcode`); the hash and the mtime
-  are the target's.
+  are the target's. The same rule holds for a running `--serve` citizen's
+  `script_version()`, although serve reads the script by its canonical path.
 - **The header form is exactly `-- version: X.Y.Z`** (optional `-pre` /
   `+build` suffix), and it must sit in the **leading comment region**: an
   optional `#!` shebang on line 1, then only blank lines and `--` comment
@@ -203,7 +206,10 @@ The contract:
   the same leading comment region. `mix` then does not take position 1: the
   script runs with `--version` in `args()` and is expected to answer the flag
   itself. Only the exact value `script` counts. `--serve` still answers for an
-  opted-out script, because a daemon has no argv to hand the flag to.
+  opted-out script, because a daemon has no argv to hand the flag to, so
+  `mix --serve SCRIPT --version` is the cold provenance route for an
+  opted-out script: it only reads the file, whether or not the script is a
+  citizen, and never starts it.
 - **`mix --serve script.mix --version`** answers the same way and exits before
   any broker connect. **`mix - --version`** reads the script from stdin and
   names it `-`, with no `modified` field:

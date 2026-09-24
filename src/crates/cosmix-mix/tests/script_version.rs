@@ -423,7 +423,12 @@ fn lint_gates_serve_citizens_and_script_directories() {
     }
     let library = write(d.path(), "scripts/lib/util.mix", "fn f()\n  return 1\nend\n");
     let plain = write(d.path(), "flat/util.mix", "fn f()\n  return 1\nend\n");
-    for p in [&library, &plain] {
+    // Z2: a test script under scripts/tests/ (or test/) must stay header-less
+    // (a header would make it the entry script whose record the code under
+    // test reads), so lint never asks it for one.
+    let under_tests = write(d.path(), "scripts/tests/desktop-test.mix", "print(1)\n");
+    let under_test = write(d.path(), "bin/test/check.mix", "print(1)\n");
+    for p in [&library, &plain, &under_tests, &under_test] {
         let (_, out) = lint(&[p.to_str().unwrap()]);
         assert!(!out.contains("MIX-D3016"), "{}: {out}", p.display());
     }

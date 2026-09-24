@@ -1201,12 +1201,15 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
     // relative path would then resolve against the changed directory and
     // reload a different file (or none). Fall back to the given path if the
     // file does not exist yet (the read below reports it).
+    // The record names the script by the path it was invoked with (a
+    // symlink keeps its own name), exactly as the cold `--version` query does.
+    let invoked_path = script_path.to_string();
     let script_path_abs = std::fs::canonicalize(script_path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| script_path.to_string());
     let script_path = script_path_abs.as_str();
 
-    let (source, initial_provenance) = match script_meta::read_script_text(script_path) {
+    let (source, initial_provenance) = match script_meta::read_script_text_as(script_path, &invoked_path) {
         Ok((s, p)) => (s, script_meta::shared(p)),
         Err(e) => {
             tracing::error!(
@@ -1457,7 +1460,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             // (file changed since) or a runtime failure in the new init
             // body reverts to the old evaluator — loudly, never silently.
             tracing::info!(service = %service_name, "serve: RELOAD accepted; building replacement evaluator");
-            let (new_source, new_provenance) = match script_meta::read_script_text(script_path) {
+            let (new_source, new_provenance) = match script_meta::read_script_text_as(script_path, &invoked_path) {
                 Ok((s, p)) => (s, script_meta::shared(p)),
                 Err(e) => {
                     tracing::error!(service = %service_name, error = %e,

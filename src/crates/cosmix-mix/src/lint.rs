@@ -260,14 +260,19 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
 /// a module loaded by `require`/`include`? A deliberately simple heuristic,
 /// documented in lint.md, decided in this order over the path AS GIVEN:
 /// 1. a `#!` shebang on line 1 — a script;
-/// 2. a `lib` or `_lib` directory component — a library, never reported;
+/// 2. a `lib`, `_lib`, `tests` or `test` directory component — never
+///    reported: a library is loaded, not run, and a test script must NOT
+///    carry a header (it would become the entry script whose record
+///    `script_version()` returns, masking the code under test's own);
 /// 3. a `bin`, `_bin`, `scripts` or `build` directory component — a script;
 /// 4. a serve citizen: a top-level `on <verb>` handler (column 0), or a
 ///    `--serve` mention in the leading comment region — a script.
 ///
 /// Stdin (`-`) has no path, so only rules 1 and 4 apply. Known false
 /// positive, Wontfix: a library under an absolute `/…/bin/…` path with no
-/// `lib` component is reported; lint it by a relative path.
+/// `lib` component is reported; lint it by a relative path. The mirror also
+/// holds: ANY `lib`/`tests` ancestor in an absolute path (`/…/lib/…`)
+/// exempts a script beneath it.
 fn runs_as_script(source: &str, file: &str) -> bool {
     if source.starts_with("#!") {
         return true;
@@ -281,7 +286,10 @@ fn runs_as_script(source: &str, file: &str) -> bool {
                     .collect()
             })
             .unwrap_or_default();
-        if dirs.iter().any(|d| d == "lib" || d == "_lib") {
+        if dirs
+            .iter()
+            .any(|d| matches!(d.as_str(), "lib" | "_lib" | "tests" | "test"))
+        {
             return false;
         }
         if dirs

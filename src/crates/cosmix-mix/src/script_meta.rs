@@ -86,8 +86,20 @@ pub(crate) fn read_script(path: &str) -> std::io::Result<(Vec<u8>, Option<System
 /// [`read_script`] as UTF-8 text plus its provenance — the script-run path.
 /// Errors carry `read_to_string`'s wording for invalid UTF-8.
 pub(crate) fn read_script_text(path: &str) -> std::io::Result<(String, ScriptProvenance)> {
-    let (bytes, mtime) = read_script(path)?;
-    let provenance = provenance(Some(path), &bytes, mtime);
+    read_script_text_as(path, path)
+}
+
+/// [`read_script_text`] reading `read_path` but naming the record after
+/// `invoked_path`. `--serve` reads (and RELOAD re-reads) a canonicalised
+/// path, but the record must carry the name the script was INVOKED by, so
+/// one rule holds everywhere: name = basename of the path as given (a
+/// symlink's own name), bytes and mtime = the file actually read.
+pub(crate) fn read_script_text_as(
+    read_path: &str,
+    invoked_path: &str,
+) -> std::io::Result<(String, ScriptProvenance)> {
+    let (bytes, mtime) = read_script(read_path)?;
+    let provenance = provenance(Some(invoked_path), &bytes, mtime);
     let text = String::from_utf8(bytes).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -232,6 +244,26 @@ mod tests {
         assert_eq!(cls(&["mix", "-", "--version"]).as_deref(), Some("Stdin"));
         assert_eq!(cls(&["mix", "a.mix", "--version", "--json"]).as_deref(), Some("File(\"a.mix\")+json"));
         assert_eq!(cls(&["mix", "-", "-V", "--json"]).as_deref(), Some("Stdin+json"));
+    }
+
+    /// Z1: `--serve` reads the canonicalised target but names the record
+    /// after the invoked path, so a symlinked citizen's `script_version()`
+    /// name matches the cold `mix --serve LINK --version` answer.
+    #[test]
+    fn serve_record_is_named_after_the_invoked_link() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("citizen.mix");
+        std::fs::write(&target, "-- version: 1.0.0\nprint(1)\n").unwrap();
+        let link = d.path().join("alias.mix");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let canonical = std::fs::canonicalize(&link).unwrap();
+        let (_, p) = read_script_text_as(canonical.to_str().unwrap(), link.to_str().unwrap()).unwrap();
+        assert_eq!(p.name, "alias.mix");
+        assert_eq!(p.version.as_deref(), Some("1.0.0"));
+        // Control: naming by the canonical path would have said citizen.mix.
+        let (_, c) = read_script_text(canonical.to_str().unwrap()).unwrap();
+        assert_eq!(c.name, "citizen.mix");
+        assert_eq!(c.sha256, p.sha256);
     }
 
     #[test]
