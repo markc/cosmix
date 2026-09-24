@@ -3583,7 +3583,10 @@ fn track_panel_holders(state: &mut WaylandState, now: Instant) -> bool {
             panel.quiet = false;
         }
         if !owes {
-            panel.settle_owed();
+            // Nothing to conceal; a probe of a revealed edge (a menu or
+            // launcher the user clicked away from) stands.
+            panel.pending.clear();
+            panel.enforce_at = None;
         } else if panel.stalled && panel.enforced.is_empty() && !showing.is_empty() {
             // A stopped owner's conceal is enforced without another grace.
             panel.settle_owed();
