@@ -16766,16 +16766,16 @@ fn grid_origin_candidates(
         .map(|x| x + offset.0);
     let ys = crate::compositor_scene::physical_grid_neighbours(anchor.1 - offset.1, scale120)
         .map(|y| y + offset.1);
-    let mut candidates = Vec::with_capacity(4);
-    for x in xs {
-        for y in ys {
-            candidates.push((x, y));
-        }
-    }
-    let distance = |(x, y): (f32, f32)| (x - anchor.0).powi(2) + (y - anchor.1).powi(2);
-    // Stable: equal distances keep the nearest-per-axis order.
-    candidates.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
-    candidates
+    // Ordered by per-axis rank, not by measured distance: at a half-pixel tie
+    // the two neighbours are equally far and f32 noise would pick either, while
+    // the renderer's projection (and so a neighbour's shared edge) resolves the
+    // tie deterministically. Its choice is `neighbours[0]`; keep it first.
+    vec![
+        (xs[0], ys[0]),
+        (xs[1], ys[0]),
+        (xs[0], ys[1]),
+        (xs[1], ys[1]),
+    ]
 }
 
 /// The nearest whole-pixel origin around `anchor` that `accept` admits, or
