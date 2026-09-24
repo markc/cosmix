@@ -158,6 +158,19 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// Test-only record of claimed rowids the drain skipped as superseded.
+#[cfg(test)]
+thread_local! {
+    static SKIPPED_SUPERSEDED: std::cell::RefCell<Vec<i64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain this thread's record of superseded skips (test only).
+#[cfg(test)]
+pub(crate) fn take_skipped_superseded() -> Vec<i64> {
+    SKIPPED_SUPERSEDED.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
 /// Drain this thread's record of `retrain_logged` calls (test only).
 #[cfg(test)]
 pub(crate) fn take_trained_via() -> Vec<TrainVia> {
@@ -471,7 +484,13 @@ impl RetrainOutboxWorker {
             let mds = Arc::clone(&self.mds);
             tokio::task::spawn_blocking(move || mds.with_set_tx(&set, claim_batch)).await??
         };
+        self.apply_claimed(set, rows).await
+    }
 
+    /// Apply one claimed batch in rowid order. Split from [`Self::drain_set`]
+    /// so a white-box test can supersede a row between the claim and the
+    /// apply, which is the window the existence re-check guards.
+    pub(crate) async fn apply_claimed(&self, set: SetId, rows: Vec<ClaimedRow>) -> Result<u64> {
         let mut applied = 0u64;
         // Strictly sequential: `record_label` is latest-wins per
         // stamp, so the rows that *do* get applied for a stamp must
@@ -508,6 +527,8 @@ impl RetrainOutboxWorker {
                     row.rowid,
                     row.stamp_id,
                 );
+                #[cfg(test)]
+                SKIPPED_SUPERSEDED.with(|v| v.borrow_mut().push(row.rowid));
                 continue;
             }
             let outcome = self.process_row(&set, &row).await;
