@@ -712,18 +712,12 @@ impl State {
                 let _ = notify.send(note);
             }
         }
-        let (shape, terminals) = {
+        let shape = {
             let tabs = self.tabs.lock().expect("tabs");
             if tabs.is_empty() {
                 return iced::exit();
             }
-            let shape = Shape::of(&tabs);
-            let terminals: Vec<_> = shape
-                .visible()
-                .into_iter()
-                .filter_map(|id| tabs.pane_by_id(id).map(|terminal| (id, terminal)))
-                .collect();
-            (shape, terminals)
+            Shape::of(&tabs)
         };
         let visible = shape.visible();
         self.painter.retain(&visible);
@@ -732,6 +726,21 @@ impl State {
         self.cached.retain(|id, _| visible.contains(id));
         self.shape = shape;
         self.relayout();
+        self.repaint();
+        Task::none()
+    }
+
+    /// Rasterise every visible pane by its damaged rows (all rows, for a
+    /// frame that was invalidated or is new).
+    fn repaint(&mut self) {
+        let terminals: Vec<_> = {
+            let tabs = self.tabs.lock().expect("tabs");
+            self.shape
+                .visible()
+                .into_iter()
+                .filter_map(|id| tabs.pane_by_id(id).map(|terminal| (id, terminal)))
+                .collect()
+        };
         for (id, terminal) in terminals {
             let snapshot = terminal.lock().expect("terminal").grid_snapshot();
             #[allow(unused_variables)]
@@ -746,7 +755,6 @@ impl State {
                 }
             }
         }
-        Task::none()
     }
 
     fn act(&mut self, action: Action) -> Task<Message> {
@@ -804,13 +812,15 @@ impl State {
     }
 
     /// The cell size changed under the same window: forget every pane's
-    /// grid so `relayout` resizes them all, and ask for a repaint — the
-    /// frames were invalidated, and a PTY told the size it already had need
-    /// not fire a wake of its own.
+    /// grid so `relayout` resizes them all, then repaint NOW. The PTY resize
+    /// is synchronous, so the snapshots already have the new size; waiting
+    /// for the next wake instead would let `view` lay out the new grid size
+    /// over the old surface, which keeps its dimensions through `invalidate`
+    /// — one stretched frame per zoom step (review finding).
     fn reflow(&mut self) {
         self.grids.clear();
         self.relayout();
-        self.waker.fd.waker()();
+        self.repaint();
     }
 
     /// Size every visible pane from the window and tell each PTY that moved.
@@ -996,6 +1006,69 @@ mod tests {
         };
         assert_eq!(frame_colour(&split, 7, tokens), tokens.ring);
         assert_eq!(frame_colour(&split, 8, tokens), tokens.border);
+    }
+
+    /// A real `State` with a PTY-backed tab set, no window and no Bus.
+    fn test_state() -> (State, std::thread::JoinHandle<()>) {
+        let (cleanup, reaper) = tabs::Cleanup::start().expect("cleanup worker");
+        let waker = Arc::new(Waker {
+            fd: WakeFd::new().expect("eventfd"),
+            pending: AtomicBool::new(false),
+            sender: Mutex::new(None),
+            polling: AtomicBool::new(false),
+        });
+        let tabs = Arc::new(Mutex::new(layout::test_tabs()));
+        tabs.lock().unwrap().set_wake(waker.fd.waker());
+        let state = State {
+            painter: Painter::new(1.0, FontSize::new(13.0), config::Cursor::Underline)
+                .expect("a monospace font"),
+            tabs,
+            cleanup,
+            notify: None,
+            tokens: theme::tokens(),
+            waker,
+            window: Size::new(900.0, 560.0),
+            shape: Shape::default(),
+            grids: HashMap::new(),
+            modifiers: iced::keyboard::Modifiers::empty(),
+            wheel: 0.0,
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            cached: HashMap::new(),
+        };
+        (state, reaper)
+    }
+
+    /// Review finding: a zoom used to relayout and then only WAKE, so the
+    /// next `view` laid the new grid size over the old surface — one
+    /// stretched frame per step. After the zoom returns, every visible frame
+    /// must already be exactly its grid in the new cell size.
+    #[test]
+    fn a_zoom_repaints_before_the_next_view() {
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
+        assert_eq!(state.shape.visible().len(), 2);
+
+        let before = state.painter.cell();
+        state.zoom(|font| font.step_by(6));
+        let cell = state.painter.cell();
+        assert_ne!(cell, before, "six steps must change the cell");
+        for id in state.shape.visible() {
+            let (cols, rows) = state.grids[&id];
+            let frame = state.painter.existing(id).expect("a visible pane has a frame");
+            let frame = frame.lock().unwrap();
+            assert_eq!(
+                (frame.surface().width(), frame.surface().height()),
+                (u32::from(cols) * cell.0, u32::from(rows) * cell.1),
+                "pane {id} still holds the pre-zoom surface"
+            );
+        }
+
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
     }
 
     fn active_pane(tabs: &TabSet) -> u64 {
