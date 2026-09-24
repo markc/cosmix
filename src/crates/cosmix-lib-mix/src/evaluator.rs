@@ -1385,8 +1385,9 @@ pub const HANDLER_FAULT_BODY: &str =
 /// SPEC 18 Phase 2 WS3-C.7f — `rc` value for synth'd shutdown replies.
 ///
 /// Application-error band (`>= 10`), like [`HANDLER_FAULT_RC`]: a
-/// request whose handler was cancelled by a shutdown/reload never did
-/// its work, and the previous `rc=2` read as delivered-with-warning
+/// request whose handler was cancelled by a shutdown/reload was never
+/// answered by it (any side effects before the cancellation point
+/// stand), and the previous `rc=2` read as delivered-with-warning
 /// success to a `$rc >= 10` caller. Distinct from the fault rc so the
 /// two causes are separable by rc as well as by `error_code`.
 #[cfg(feature = "tokio-sleep")]
@@ -4588,7 +4589,8 @@ impl Evaluator {
     ///    [`InvocationReplyHandle::is_pending_request`], and for each
     ///    surviving pending request fire
     ///    [`InvocationReplyHandle::synthesize_unanswered`] with
-    ///    `rc=2` and a SPEC 18 §3.4 shutdown body — UNLESS
+    ///    `SHUTDOWN_SYNTH_RC` (16) and the `HANDLER_CANCELLED` shutdown
+    ///    body — UNLESS
     ///    `allow_synth_replies` is false (transport-drop path: the
     ///    socket is already gone, so there is no caller channel
     ///    left to reply on).
@@ -5539,13 +5541,12 @@ impl Evaluator {
         // SPEC 18 §3.4 — if any body faulted (panic or error) and the
         // requester has NOT been answered by a `reply()` from some body,
         // synthesize an rc >= 10 HANDLER_FAULT reply so a request-class
-        // caller is
-        // not left blocked. Gated exactly like `reply()`: only a
-        // request (`type=request`) can be answered — a topic delivery
+        // caller is not left blocked. Gated exactly like `reply()`: only
+        // a request (`type=request`) can be answered — a topic delivery
         // has no caller; `from` may be empty (noded-anonymized caller)
         // and is not a gate, the response correlates by `id`. The wire
-        // body is a
-        // fixed, non-sensitive string — the panic/error detail stays in
+        // body is a fixed, non-sensitive JSON object
+        // (`HANDLER_FAULT_BODY`) — the panic/error detail stays in
         // the server-side log and never crosses the Bus boundary (it can
         // carry request data or Trojan-Source bytes; the WG trust domain
         // does not make peers non-adversarial).

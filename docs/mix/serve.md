@@ -234,7 +234,10 @@ deploy the runtime before the scripts.
 (`0..=255`) is an **application error** carried to the caller's `$rc`/`$result` —
 distinct from a transport failure. `reply` is only valid inside a handler
 servicing a request; calling it for a topic delivery (which has no caller) is a
-hard error.
+hard error. `rc` 15 and 16 are the runtime's own (`HANDLER_FAULT` and
+`HANDLER_CANCELLED`, see [handler fault isolation](#handler-fault-isolation-the-per-request-boundary));
+pick another `rc >= 10` for your own refusals, and treat `error_code` as the
+authoritative signal.
 
 ```mix
 on do.validate
@@ -345,7 +348,7 @@ end
 the application-error band, so the usual `$rc >= 10` check catches it; on an
 ordinary send `$result` is `internal handler error`, and on every route
 `$reply.error_code == "HANDLER_FAULT"` (see [Reading `$rc`](bus.md#reading-rc-ok-vs-application-error-vs-transport-failure)).
-Up to mix 0.93.0 this reply was `rc=1`, which the Bus contract reads as
+Before mix 0.94.0 this reply was `rc=1`, which the Bus contract reads as
 delivered-with-warning *success*: a caller testing `$rc >= 10` took a crashed
 handler for a working one.
 
@@ -535,8 +538,10 @@ bad edit can do is a logged revert. Things to know:
 - **A request in flight across the swap gets a terminal reply, not
   silence.** When the old generation is retired its pending requests are
   answered with `rc=16` and `error_code` `HANDLER_CANCELLED` (the connection
-  is live, so the caller is never left hanging to its own timeout; up to mix
-  0.93.0 this reply was `rc=2`, which read as success). SIGTERM/Ctrl-C during a
+  is live, so the caller is never left hanging to its own timeout; before mix
+  0.94.0 this reply was `rc=2`, which read as success). The reply says the
+  handler was cancelled before replying, not that it did nothing: any side
+  effects it made before that point stand. SIGTERM/Ctrl-C during a
   reload's init still shuts the citizen down cleanly, and a new init body
   that fails after admitting traffic has its spawned handlers cancelled
   before the old generation resumes.

@@ -607,13 +607,15 @@ against any service should test <code>$rc &gt;= 10</code> and read the code from
 rather than match one spelling.</p>
 <p><strong>A Mix citizen's runtime refusals are all in the error band.</strong> Besides
 <code>UNKNOWN_COMMAND</code>, the serve runtime answers a request itself in two more
-cases, each with an <code>error</code> message and an <code>error_code</code>:</p>
+cases, each with an <code>error</code> message and an <code>error_code</code>. <code>rc</code> 15 and 16 are
+the runtime's; pick another <code>rc &gt;= 10</code> for a handler's own <code>reply()</code> refusals,
+and treat <code>error_code</code> as the authoritative signal:</p>
 <table><thead><tr><th><code>$rc</code></th><th><code>$reply.error_code</code></th><th>When</th></tr></thead><tbody>
 <tr><td>10</td><td><code>UNKNOWN_COMMAND</code></td><td>no <code>on</code> handler for the verb</td></tr>
 <tr><td>15</td><td><code>HANDLER_FAULT</code></td><td>the handler raised, <code>die</code>d or panicked before replying; the real error is in the citizen's log, never on the wire</td></tr>
 <tr><td>16</td><td><code>HANDLER_CANCELLED</code></td><td>the citizen shut down or reloaded while the handler was still running</td></tr>
 </tbody></table>
-<p>Up to mix 0.93.0 the last two answered <code>rc 1</code> and <code>rc 2</code>, which this section
+<p>Before mix 0.94.0 the last two answered <code>rc 1</code> and <code>rc 2</code>, which this section
 defines as delivered-with-warning success, so a <code>$rc &gt;= 10</code> check missed them.
 See <a href="/mix/serve#handler-fault-isolation-the-per-request-boundary">handler fault isolation</a>.</p>
 <h2 id="send-and-the-verified-session-lane"><code>send</code> and the verified session lane</h2>

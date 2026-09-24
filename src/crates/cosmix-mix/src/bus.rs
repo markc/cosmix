@@ -1938,14 +1938,19 @@ mod tests {
             ),
         ] {
             assert!(rc >= 10, "{code}: rc {rc} would read as success to a `$rc >= 10` caller");
-            let (trc, tresult) = typed_reply_to_result(rc, body.into(), None);
-            assert_eq!(trc, i32::from(rc));
+            // JSON-body route: $rc preserved, $result the message, $reply the object.
+            let (trc, tresult, treply) = typed_reply(rc, body.into(), None);
+            assert_eq!(trc, i32::from(rc), "{code}: JSON-body $rc");
             assert_eq!(tresult, Value::String(msg.into()), "{code}: JSON-body $result");
-            let (_, hresult) = headers_reply_to_result(rc, body.into(), None);
+            assert_eq!(field(&treply, "error_code"), Value::String(code.into()), "{code}: JSON-body $reply");
+            assert_eq!(field(&treply, "error"), Value::String(msg.into()), "{code}: JSON-body $reply.error");
+            // Header route: $rc preserved, $result AND $reply the object.
+            let (hrc, hresult, hreply) = headers_reply(rc, body.into(), None);
+            assert_eq!(hrc, i32::from(rc), "{code}: header $rc");
             assert_eq!(field(&hresult, "error_code"), Value::String(code.into()), "{code}: header $result");
-            let reply = parse_reply_body(body);
-            assert_eq!(field(&reply, "error_code"), Value::String(code.into()), "{code}: $reply");
-            assert_eq!(field(&reply, "error"), Value::String(msg.into()));
+            assert_eq!(field(&hresult, "error"), Value::String(msg.into()), "{code}: header $result.error");
+            assert_eq!(field(&hreply, "error_code"), Value::String(code.into()), "{code}: header $reply");
+            assert_eq!(field(&hreply, "error"), Value::String(msg.into()), "{code}: header $reply.error");
         }
     }
 

@@ -622,7 +622,10 @@ deploy the runtime before the scripts.</p>
 (<code>0..=255</code>) is an <strong>application error</strong> carried to the caller's <code>$rc</code>/<code>$result</code> —
 distinct from a transport failure. <code>reply</code> is only valid inside a handler
 servicing a request; calling it for a topic delivery (which has no caller) is a
-hard error.</p>
+hard error. <code>rc</code> 15 and 16 are the runtime's own (<code>HANDLER_FAULT</code> and
+<code>HANDLER_CANCELLED</code>, see <a href="/mix/serve#handler-fault-isolation-the-per-request-boundary">handler fault isolation</a>);
+pick another <code>rc &gt;= 10</code> for your own refusals, and treat <code>error_code</code> as the
+authoritative signal.</p>
 <pre><code class="language-mix">on do.validate
   if is_empty($event.body) then
     reply(10, "missing input")   -- caller sees $rc = 10
@@ -712,7 +715,7 @@ end
 the application-error band, so the usual <code>$rc &gt;= 10</code> check catches it; on an
 ordinary send <code>$result</code> is <code>internal handler error</code>, and on every route
 <code>$reply.error_code == "HANDLER_FAULT"</code> (see <a href="/mix/bus#reading-rc-ok-vs-application-error-vs-transport-failure">Reading <code>$rc</code></a>).
-Up to mix 0.93.0 this reply was <code>rc=1</code>, which the Bus contract reads as
+Before mix 0.94.0 this reply was <code>rc=1</code>, which the Bus contract reads as
 delivered-with-warning <em>success</em>: a caller testing <code>$rc &gt;= 10</code> took a crashed
 handler for a working one.</p>
 <pre><code class="language-mix">send risky risky.op body="not a number"
@@ -854,8 +857,10 @@ memory.</li>
 <li><strong>A request in flight across the swap gets a terminal reply, not
 silence.</strong> When the old generation is retired its pending requests are
 answered with <code>rc=16</code> and <code>error_code</code> <code>HANDLER_CANCELLED</code> (the connection
-is live, so the caller is never left hanging to its own timeout; up to mix
-0.93.0 this reply was <code>rc=2</code>, which read as success). SIGTERM/Ctrl-C during a
+is live, so the caller is never left hanging to its own timeout; before mix
+0.94.0 this reply was <code>rc=2</code>, which read as success). The reply says the
+handler was cancelled before replying, not that it did nothing: any side
+effects it made before that point stand. SIGTERM/Ctrl-C during a
 reload's init still shuts the citizen down cleanly, and a new init body
 that fails after admitting traffic has its spawned handlers cancelled
 before the old generation resumes.</li>
