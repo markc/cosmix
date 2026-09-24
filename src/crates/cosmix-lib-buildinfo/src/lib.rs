@@ -161,12 +161,11 @@ pub fn find_markers(bytes: &[u8]) -> Vec<String> {
         let start = i + p.len();
         if bytes.get(start) == Some(&b'{') {
             let window = &bytes[start..bytes.len().min(start + 4096)];
-            if let Some(e) = window.iter().position(|&b| b == b'}') {
-                if let Ok(s) = std::str::from_utf8(&window[..=e]) {
-                    if !out.iter().any(|o| o == s) {
-                        out.push(s.to_string());
-                    }
-                }
+            if let Some(e) = window.iter().position(|&b| b == b'}')
+                && let Ok(s) = std::str::from_utf8(&window[..=e])
+                && !out.iter().any(|o| o == s)
+            {
+                out.push(s.to_string());
             }
         }
         i = start;
