@@ -238,6 +238,7 @@ impl CompositorHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: false,
                     committed_input_region: None,
@@ -643,17 +644,11 @@ impl CompositorHandler for WaylandState {
                                 // A new geometry inset moves the buffer under a
                                 // fixed window origin; keep the buffer on the
                                 // physical pixel grid while it does.
-                                let offset = (window_geometry.x, window_geometry.y);
-                                if record.role.managed_toplevel() {
-                                    record.window_origin = physical_grid_window_origin(
-                                        record,
-                                        record.window_origin,
-                                        offset,
-                                        scale120,
-                                    );
-                                }
-                                record.layout.x = record.window_origin.0 - offset.0;
-                                record.layout.y = record.window_origin.1 - offset.1;
+                                settle_buffer_under_inset(
+                                    record,
+                                    (window_geometry.x, window_geometry.y),
+                                    scale120,
+                                );
                                 record.committed_window_geometry = Some(window_geometry);
                             }
                             record.layout.width = presentation.size.0;
@@ -917,6 +912,7 @@ impl WlrLayerShellHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -1146,6 +1142,7 @@ impl XdgShellHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -1371,6 +1368,7 @@ impl XdgShellHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -1885,6 +1883,7 @@ impl SessionLockHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -2410,6 +2409,7 @@ impl InputMethodHandler for WaylandState {
                 chrome_pointer: ChromePointerSceneState::default(),
                 committed_window_geometry: None,
                 committed_window_geometry_explicit: false,
+                grid_placement: None,
                 pending_popup_reposition: None,
                 parent_association_committed: true,
                 committed_input_region: None,

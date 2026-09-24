@@ -2657,3 +2657,265 @@ fn restore_by_id_switches_to_the_windows_workspace() {
     assert!(!state.surfaces[&beta].layout.visible);
     assert!(state.minimized_toplevels.is_empty());
 }
+
+// ---- whole-pixel placement: anchors, commit paths and constraints ----
+
+fn toplevel_surface(harness: &KeybindingHarness) -> WlSurface {
+    test_toplevel_record(harness).role.wl_surface().clone()
+}
+
+fn set_test_window_geometry(harness: &mut KeybindingHarness, geometry: [u32; 4]) {
+    send_request(&mut harness.client, TEST_XDG_SURFACE_ID, 3, &words(&geometry));
+}
+
+fn commit_test_toplevel(harness: &mut KeybindingHarness, buffer: Option<u32>) {
+    if let Some(buffer) = buffer {
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_SURFACE_ID,
+            1,
+            &words(&[buffer, 0, 0]),
+        );
+    }
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+}
+
+/// A GTK window changes its shadow inset on every focus change. Re-snapping
+/// the already-snapped origin broke the 2.5x half-pixel tie the same way each
+/// time and walked the window one physical pixel per change; a scale round
+/// trip drifted the same way.
+#[test]
+fn inset_toggles_and_scale_round_trips_do_not_walk_a_whole_pixel_window() {
+    let mut harness = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.change_output_scale(2.5);
+    let surface = toplevel_surface(&harness);
+    harness
+        .server
+        .state
+        .move_window_to(&surface, (101.0, 41.0), "comp.window");
+    let buffer = harness.create_dmabuf_buffer_sized(120, 80);
+    set_test_window_geometry(&mut harness, [24, 24, 60, 40]);
+    commit_test_toplevel(&mut harness, Some(buffer));
+    let settled = test_toplevel_record(&harness).window_origin;
+    assert_on_physical_grid(test_toplevel_record(&harness), 2.5, "inset 24");
+
+    for round in 0..10 {
+        // Alternate the DMA-BUF and the bufferless commit paths.
+        let buffer = (round % 2 == 0).then(|| harness.create_dmabuf_buffer_sized(120, 80));
+        set_test_window_geometry(&mut harness, [23, 23, 60, 40]);
+        commit_test_toplevel(&mut harness, buffer);
+        let record = test_toplevel_record(&harness);
+        assert_on_physical_grid(record, 2.5, &format!("round {round} inset 23"));
+        let shifted = record.window_origin;
+        assert!(
+            (shifted.0 - 101.0).abs() <= 0.2 + 1e-4 && (shifted.1 - 41.0).abs() <= 0.2 + 1e-4,
+            "round {round}: the inset keeps the window within half a pixel of its anchor"
+        );
+        set_test_window_geometry(&mut harness, [24, 24, 60, 40]);
+        commit_test_toplevel(&mut harness, None);
+        assert_eq!(
+            test_toplevel_record(&harness).window_origin,
+            settled,
+            "round {round}: back at inset 24 the window is where it started"
+        );
+    }
+
+    harness.server.state.change_output_scale(1.25);
+    assert_on_physical_grid(test_toplevel_record(&harness), 1.25, "at 1.25");
+    harness.server.state.change_output_scale(2.5);
+    assert_eq!(
+        test_toplevel_record(&harness).window_origin,
+        settled,
+        "2.5 -> 1.25 -> 2.5 round-trips the origin"
+    );
+}
+
+/// The SHM commit path settles the buffer on the grid under an inset too.
+#[test]
+fn shm_commit_with_an_inset_stands_the_buffer_on_a_whole_pixel() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    map_initial_test_toplevel(&mut wire.harness);
+    wire.harness.server.state.change_output_scale(2.5);
+    let surface = toplevel_surface(&wire.harness);
+    wire.harness
+        .server
+        .state
+        .move_window_to(&surface, (100.0, 40.0), "comp.window");
+    let (_file, buffer) = wire.shm_buffer(65, 33, 260);
+    set_test_window_geometry(&mut wire.harness, [1, 1, 63, 31]);
+    commit_test_toplevel(&mut wire.harness, Some(buffer));
+    let record = test_toplevel_record(&wire.harness);
+    assert_eq!(
+        record.committed_window_geometry.map(|g| (g.x, g.y)),
+        Some((1.0, 1.0))
+    );
+    assert_on_physical_grid(record, 2.5, "SHM commit with inset 1");
+    let (left, top, right, bottom) = physical_edges(record, 300);
+    assert_eq!((right - left, bottom - top), (163, 83), "sampled 1:1");
+}
+
+/// `x = 319.9` on a 320-wide output is visible, but its nearest whole pixel
+/// (320) is not: place must validate the origin the window will really have.
+#[test]
+fn place_validates_the_snapped_origin_and_keeps_the_window_on_its_output() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let width = harness.server.state.logical_output_rect().width;
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Place(PlaceSpec {
+            x: Some(f64::from(width) - 0.1),
+            y: Some(10.0),
+            ..place(id, generation)
+        }),
+    );
+    assert_eq!(rc, 0, "{body}");
+    let record = &harness.server.state.surfaces[&alpha];
+    assert_eq!(record.window_origin.0, width - 1.0);
+    assert!(record.window_origin.0 < width, "a sliver stays on the output");
+}
+
+/// Dragging the LEFT edge must not move the right edge at all.
+#[test]
+fn left_edge_drag_keeps_the_stationary_right_edge_on_its_pixel() {
+    let mut harness = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.change_output_scale(2.5);
+    let surface = toplevel_surface(&harness);
+    harness
+        .server
+        .state
+        .move_window_to(&surface, (100.0, 40.0), "comp.window");
+    let start_origin = test_toplevel_record(&harness).window_origin;
+    let start_size = (200, 150);
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .expect("toplevel record")
+        .configured_size = start_size;
+    let edge = |value: f32| crate::compositor_scene::physical_edge(value, 300);
+    let right = edge(start_origin.0 + start_size.0 as f32);
+    for dx in [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, -1.0, -2.0, -3.0] {
+        harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
+            surface: surface.clone(),
+            edges: xdg_toplevel::ResizeEdge::Left,
+            start_pointer: (50.0, 50.0),
+            start_origin,
+            start_size,
+        });
+        harness.server.state.update_interactive_pointer(50.0 + dx, 50.0);
+        let record = test_toplevel_record(&harness);
+        assert_eq!(record.configured_size.0, start_size.0 - dx as i32);
+        assert_eq!(
+            edge(record.window_origin.0 + record.configured_size.0 as f32),
+            right,
+            "dx {dx}: the right edge stays on its pixel"
+        );
+        assert_on_physical_grid(record, 2.5, &format!("dx {dx}"));
+    }
+}
+
+/// A left panel one logical pixel wide puts the work area at x = 1, which is
+/// 1.25 physical at 1.25x. The clamp's nearest grid point (0.8) would slide the
+/// window under the panel; the next one (1.6) is inside the clamp.
+#[test]
+fn shrink_clamp_snaps_inside_the_work_area_not_under_a_panel() {
+    const TOP_BOTTOM_LEFT: u32 = 1 | 2 | 4;
+    let mut harness = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.change_output_scale(1.25);
+    map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (1, 0),
+            anchor: TOP_BOTTOM_LEFT,
+            exclusive_zone: 1,
+            ..TestLayerSpec::default()
+        },
+    );
+    assert_eq!(harness.server.state.usable_output_rect().x, 1.0);
+    let surface = toplevel_surface(&harness);
+    harness
+        .server
+        .state
+        .move_window_to(&surface, (-20.0, 40.0), "comp.window");
+    let output = harness.server.state.backend.output_size();
+    harness.server.state.resize_output(output.0, output.1 - 1);
+    let record = test_toplevel_record(&harness);
+    assert!(
+        record.layout.x >= 1.0,
+        "the snapped buffer stays inside the work area: {}",
+        record.layout.x
+    );
+    assert_on_physical_grid(record, 1.25, "clamped against the panel");
+}
+
+/// Output 500 wide, window 265, margin 24: the clamp lands at 211, whose
+/// nearest 1.25x grid point (211.2) leaves 264.8 of room and would force a
+/// resize to 264. The grid point inside the clamp (210.4) keeps 265.
+#[test]
+fn shrink_clamp_snaps_without_forcing_a_resize() {
+    let mut harness = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.change_output_scale(1.25);
+    let buffer = harness.create_dmabuf_buffer_sized(265, 100);
+    commit_test_toplevel(&mut harness, Some(buffer));
+    let surface = toplevel_surface(&harness);
+    assert_ne!(
+        test_toplevel_record(&harness).committed_decoration,
+        SceneDecorationMode::ServerSide,
+        "the arithmetic below is the client-side-decorated clamp"
+    );
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .expect("toplevel record")
+        .configured_size = (265, 100);
+    harness
+        .server
+        .state
+        .move_window_to(&surface, (300.0, 40.0), "comp.window");
+    harness.server.state.resize_output(500, 400);
+    let record = test_toplevel_record(&harness);
+    assert_eq!(record.layout.width, 265.0);
+    assert!(
+        record.layout.x <= 211.0 + 1e-4,
+        "inside the clamp: {}",
+        record.layout.x
+    );
+    assert_on_physical_grid(record, 1.25, "clamped at the right");
+    assert_eq!(record.configured_size, (265, 100), "no forced resize");
+}
+
+/// A new window's cascade slot is on the grid even when the work area starts
+/// at an odd logical x (a one-pixel left panel at 2.5x puts slot 0 at 37).
+#[test]
+fn cascade_slot_opens_on_a_whole_physical_pixel() {
+    const TOP_BOTTOM_LEFT: u32 = 1 | 2 | 4;
+    let mut harness = KeybindingHarness::new(false);
+    map_initial_test_toplevel(&mut harness);
+    harness.server.state.change_output_scale(2.5);
+    map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            size: (1, 0),
+            anchor: TOP_BOTTOM_LEFT,
+            exclusive_zone: 1,
+            ..TestLayerSpec::default()
+        },
+    );
+    let (_, _, _, object) = map_named_test_toplevel(&mut harness, "Gamma", "dev.cosmix.Gamma");
+    let record = &harness.server.state.surfaces[&object];
+    assert!(record.layout.x > 1.0);
+    assert_on_physical_grid(record, 2.5, "cascade slot");
+}

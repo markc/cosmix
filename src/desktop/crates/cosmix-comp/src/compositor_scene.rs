@@ -154,6 +154,29 @@ pub(crate) fn snap_logical_to_physical_grid(value: f32, scale120: u32) -> f32 {
     (project_logical_edge(value, scale120) as f64 * 120.0 / f64::from(scale120)) as f32
 }
 
+/// The two physical-grid points nearest `value`, in logical units, nearest
+/// first. A caller with a constraint the nearest point breaks (stay inside a
+/// clamp, keep a far edge fixed, stay on an output) takes the other one, which
+/// is on the far side of `value` and so still less than one physical pixel
+/// away.
+pub(crate) fn physical_grid_neighbours(value: f32, scale120: u32) -> [f32; 2] {
+    let scale120 = scale120.max(1);
+    let physical = f64::from(value) * f64::from(scale120) / 120.0;
+    let nearest = project_logical_edge(value, scale120);
+    let other = if physical >= nearest as f64 {
+        nearest + 1
+    } else {
+        nearest - 1
+    };
+    let logical = |edge: i64| (edge as f64 * 120.0 / f64::from(scale120)) as f32;
+    [logical(nearest), logical(other)]
+}
+
+/// The physical pixel edge a logical edge projects to (the renderer's rule).
+pub(crate) fn physical_edge(edge: f32, scale120: u32) -> i64 {
+    project_logical_edge(edge, scale120.max(1))
+}
+
 /// Exact 120ths for an output scale, as the renderer's projection reads them.
 pub(crate) fn output_scale120(scale: f64) -> u32 {
     if scale.is_finite() && scale > 0.0 {

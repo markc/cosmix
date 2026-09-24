@@ -827,14 +827,30 @@ impl WaylandState {
         // A window placed wholly off every output could never be seen or
         // clicked again by a caller that trusted the reply.
         let size = requested.unwrap_or(current);
-        let on_output = port_snapshot::project_outputs(self).is_some_and(|projection| {
-            projection.rows.values().any(|output| {
-                target.0 < (output.x as f32 + output.width as f32)
-                    && target.0 + size.0 as f32 > output.x as f32
-                    && target.1 < (output.y as f32 + output.height as f32)
-                    && target.1 + size.1 as f32 > output.y as f32
+        let projection = port_snapshot::project_outputs(self);
+        let visible_at = |target: (f32, f32)| {
+            projection.as_ref().is_some_and(|projection| {
+                projection.rows.values().any(|output| {
+                    target.0 < (output.x as f32 + output.width as f32)
+                        && target.0 + size.0 as f32 > output.x as f32
+                        && target.1 < (output.y as f32 + output.height as f32)
+                        && target.1 + size.1 as f32 > output.y as f32
+                })
             })
-        });
+        };
+        // Validate where the window will actually stand: the whole-pixel
+        // origin, preferring the grid point on the output side when the
+        // nearest one would push a sliver of window off it.
+        let target = {
+            let record = &self.surfaces[&object];
+            let offset = record
+                .committed_window_geometry
+                .map(|geometry| (geometry.x, geometry.y))
+                .unwrap_or_default();
+            let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+            choose_grid_origin(record, target, offset, scale120, visible_at)
+        };
+        let on_output = visible_at(target);
         if !on_output {
             return ControlReply::refused(
                 "off_output",

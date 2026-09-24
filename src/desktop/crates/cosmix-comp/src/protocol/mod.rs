@@ -5144,6 +5144,12 @@ struct SurfaceRecord {
     chrome_pointer: ChromePointerSceneState,
     committed_window_geometry: Option<SceneWindowGeometry>,
     committed_window_geometry_explicit: bool,
+    /// The unsnapped origin comp last placed this window at, and the
+    /// whole-pixel origin it produced. Later re-snaps (a new geometry inset, a
+    /// scale change) start from the anchor, never from a snapped value, so a
+    /// half-pixel tie cannot walk the window one pixel per change. Stale, and
+    /// ignored, once `window_origin` no longer equals `placed`.
+    grid_placement: Option<GridPlacement>,
     pending_popup_reposition: Option<PendingPopupReposition>,
     /// Adding a subsurface is double-buffered on its parent.
     parent_association_committed: bool,
@@ -14374,7 +14380,7 @@ impl WaylandState {
                 continue;
             }
             let server_side = record.committed_decoration == SceneDecorationMode::ServerSide;
-            let delta = if server_side {
+            let (delta, bounds) = if server_side {
                 let extents = DecoExtents::of(&decoration_theme);
                 let content_size = record.committed_window_geometry.map_or(
                     vec2(
@@ -14399,7 +14405,11 @@ impl WaylandState {
                 record.layout.y += delta.1;
                 record.window_origin.0 += delta.0;
                 record.window_origin.1 += delta.1;
-                delta
+                let bounds = (
+                    (usable.x + extents.left, max_x + extents.left),
+                    (usable.y + extents.top, max_y + extents.top),
+                );
+                (delta, bounds)
             } else {
                 let previous_origin = (record.layout.x, record.layout.y);
                 let max_x =
@@ -14410,26 +14420,52 @@ impl WaylandState {
                 record.layout.y = record.layout.y.clamp(usable.y, max_y);
                 record.window_origin.0 += record.layout.x - previous_origin.0;
                 record.window_origin.1 += record.layout.y - previous_origin.1;
+                let inset = (
+                    record.window_origin.0 - record.layout.x,
+                    record.window_origin.1 - record.layout.y,
+                );
                 (
-                    record.layout.x - previous_origin.0,
-                    record.layout.y - previous_origin.1,
+                    (
+                        record.layout.x - previous_origin.0,
+                        record.layout.y - previous_origin.1,
+                    ),
+                    (
+                        (usable.x + inset.0, max_x + inset.0),
+                        (usable.y + inset.1, max_y + inset.1),
+                    ),
                 )
             };
             // A clamp lands on the work-area edge minus the window's logical
             // size, which is off the physical grid whenever that size is odd
-            // at 2.5x; settle the buffer back onto a whole pixel.
+            // at 2.5x; settle the buffer back onto the nearest whole pixel
+            // that is still inside the clamp, so the snap neither slides the
+            // window under a panel nor shrinks the room it was clamped to fit.
             let delta = if delta != (0.0, 0.0) {
                 let offset = (
                     record.window_origin.0 - record.layout.x,
                     record.window_origin.1 - record.layout.y,
                 );
+                const SLACK: f32 = 1e-3;
+                let inside = |(x, y): (f32, f32)| {
+                    x >= bounds.0.0 - SLACK
+                        && x <= bounds.0.1 + SLACK
+                        && y >= bounds.1.0 - SLACK
+                        && y <= bounds.1.1 + SLACK
+                };
                 let snapped =
-                    physical_grid_window_origin(record, record.window_origin, offset, scale120);
+                    choose_grid_origin(record, record.window_origin, offset, scale120, inside);
+                let snapped = if inside(snapped) {
+                    snapped
+                } else {
+                    // The clamp interval is narrower than a pixel: keep the
+                    // clamped origin rather than leave the work area.
+                    record.window_origin
+                };
                 let extra = (
                     snapped.0 - record.window_origin.0,
                     snapped.1 - record.window_origin.1,
                 );
-                record.window_origin = snapped;
+                set_grid_origin(record, snapped, snapped);
                 record.layout.x += extra.0;
                 record.layout.y += extra.1;
                 (delta.0 + extra.0, delta.1 + extra.1)
@@ -14543,10 +14579,12 @@ impl WaylandState {
                     .committed_window_geometry
                     .map(|geometry| (geometry.x, geometry.y))
                     .unwrap_or_default();
-                physical_grid_window_origin(record, record.window_origin, offset, scale120)
+                physical_grid_window_origin(record, placement_anchor(record), offset, scale120)
                     != record.window_origin
             })
-            .map(|record| (record.role.wl_surface().clone(), record.window_origin))
+            // From the anchor: re-snapping a snapped origin would drift across
+            // repeated scale changes (2.5 -> 1.25 -> 2.5 must round-trip).
+            .map(|record| (record.role.wl_surface().clone(), placement_anchor(record)))
             .collect::<Vec<_>>();
         for (surface, origin) in targets {
             self.move_window_to(&surface, origin, "output.geometry");
@@ -14649,6 +14687,13 @@ impl WaylandState {
                         start_origin.1
                     },
                 );
+                let origin = self.anchored_resize_origin(
+                    &surface,
+                    origin,
+                    (start_origin, start_size),
+                    new_size,
+                    (left, top),
+                );
                 self.resize_window_to(&surface, origin, new_size, "wayland.map")
                     .unwrap_or_else(|| {
                         self.interactive_pointer = None;
@@ -14656,6 +14701,40 @@ impl WaylandState {
                     })
             }
         }
+    }
+
+    /// The whole-pixel origin for a left or top edge drag that keeps the
+    /// STATIONARY far edge on the physical pixel it started on. Snapping the
+    /// raw origin alone rounds origin and width separately, so the edge under
+    /// no one's hand would wobble a pixel as the drag crosses odd sizes.
+    fn anchored_resize_origin(
+        &self,
+        surface: &WlSurface,
+        raw: (f32, f32),
+        (start_origin, start_size): ((f32, f32), (i32, i32)),
+        new_size: (i32, i32),
+        (left, top): (bool, bool),
+    ) -> (f32, f32) {
+        if !left && !top {
+            return raw;
+        }
+        let Some(record) = self.surfaces.get(&surface.id()) else {
+            return raw;
+        };
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        let edge = |value: f32| crate::compositor_scene::physical_edge(value, scale120);
+        let far = (
+            edge(start_origin.0 + start_size.0 as f32),
+            edge(start_origin.1 + start_size.1 as f32),
+        );
+        choose_grid_origin(record, raw, offset, scale120, |candidate| {
+            (!left || edge(candidate.0 + new_size.0 as f32) == far.0)
+                && (!top || edge(candidate.1 + new_size.1 as f32) == far.1)
+        })
     }
 
     /// A window size inside the client's (clamped) min/max constraints.
@@ -14684,7 +14763,8 @@ impl WaylandState {
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
-        record.window_origin = physical_grid_window_origin(record, origin, offset, scale120);
+        let placed = physical_grid_window_origin(record, origin, offset, scale120);
+        set_grid_origin(record, origin, placed);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         let delta = (
@@ -14742,7 +14822,8 @@ impl WaylandState {
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
-        record.window_origin = physical_grid_window_origin(record, origin, offset, scale120);
+        let placed = physical_grid_window_origin(record, origin, offset, scale120);
+        set_grid_origin(record, origin, placed);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         record.configured_size = size;
@@ -15062,12 +15143,11 @@ impl WaylandState {
     }
 
     fn refresh_toplevel_window_geometry(&mut self, root: &WlSurface) {
-        let Some((size, old_layout, window_origin, mapped, id, explicit)) =
+        let Some((size, old_layout, mapped, id, explicit)) =
             self.surfaces.get(&root.id()).map(|record| {
                 (
                     (record.layout.width, record.layout.height),
                     (record.layout.x, record.layout.y),
-                    record.window_origin,
                     record.mapped,
                     record.id,
                     record.committed_window_geometry_explicit,
@@ -15080,15 +15160,17 @@ impl WaylandState {
             return;
         }
         let geometry = self.effective_window_geometry(root, size);
-        let new_layout = (window_origin.0 - geometry.x, window_origin.1 - geometry.y);
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let Some(record) = self.surfaces.get_mut(&root.id()) else {
             return;
         };
+        let previous = (record.window_origin, record.grid_placement);
+        settle_buffer_under_inset(record, (geometry.x, geometry.y), scale120);
+        let new_layout = (record.layout.x, record.layout.y);
         if record.committed_window_geometry == Some(geometry) && old_layout == new_layout {
+            (record.window_origin, record.grid_placement) = previous;
             return;
         }
-        record.layout.x = new_layout.0;
-        record.layout.y = new_layout.1;
         record.committed_window_geometry = Some(geometry);
         sync_toplevel_scene_state(record);
         let scene = record.scene_snapshot();
@@ -15115,6 +15197,7 @@ impl WaylandState {
             .get(&surface.id())
             .is_some_and(|r| r.committed_fullscreen);
         let extents = DecoExtents::of(&self.decoration.theme);
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let (shifted, clear_chrome_pointer, chrome_scene_changed) = {
             let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                 return;
@@ -15177,8 +15260,7 @@ impl WaylandState {
                 .committed_window_geometry
                 .map(|geometry| (geometry.x, geometry.y))
                 .unwrap_or_default();
-            record.layout.x = record.window_origin.0 - geometry_offset.0;
-            record.layout.y = record.window_origin.1 - geometry_offset.1;
+            settle_buffer_under_inset(record, geometry_offset, scale120);
             sync_toplevel_scene_state(record);
             let layout_delta = (
                 record.layout.x - old_layout.0,
@@ -15822,6 +15904,8 @@ impl WaylandState {
                     #[cfg(feature = "bus")]
                     self.mark_surface_mapped(surface);
                     let current_workspace = self.workspace_current();
+                    let scale120 =
+                        crate::compositor_scene::output_scale120(self.backend.output_scale());
                     let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                         #[cfg(test)]
                         {
@@ -15837,8 +15921,11 @@ impl WaylandState {
                     workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                     let old_origin = (record.layout.x, record.layout.y);
                     if let Some(window_geometry) = window_geometry {
-                        record.layout.x = record.window_origin.0 - window_geometry.x;
-                        record.layout.y = record.window_origin.1 - window_geometry.y;
+                        settle_buffer_under_inset(
+                            record,
+                            (window_geometry.x, window_geometry.y),
+                            scale120,
+                        );
                         record.committed_window_geometry = Some(window_geometry);
                     }
                     record.layout.width = presentation.size.0;
@@ -15997,6 +16084,7 @@ impl WaylandState {
                 #[cfg(feature = "bus")]
                 self.mark_surface_mapped(surface);
                 let current_workspace = self.workspace_current();
+                let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
                 let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                     return;
                 };
@@ -16005,8 +16093,11 @@ impl WaylandState {
                 workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                 let old_origin = (record.layout.x, record.layout.y);
                 if let Some(window_geometry) = window_geometry {
-                    record.layout.x = record.window_origin.0 - window_geometry.x;
-                    record.layout.y = record.window_origin.1 - window_geometry.y;
+                    settle_buffer_under_inset(
+                        record,
+                        (window_geometry.x, window_geometry.y),
+                        scale120,
+                    );
                     record.committed_window_geometry = Some(window_geometry);
                 }
                 record.layout.width = presentation.size.0;
@@ -16634,31 +16725,104 @@ fn validate_surface_buffer_size(
 /// one. X11 windows keep their origin: X positions are integers in the X
 /// coordinate space, and Xwayland buffers are not fractional-scale anyway.
 /// Maximised and fullscreen windows keep theirs too: they are sized to the
-/// work area or output and must start exactly where it does.
+/// work area or output and must start exactly where it does. Only xdg
+/// toplevels are snapped; every other role keeps `origin`.
 fn physical_grid_window_origin(
     record: &SurfaceRecord,
     origin: (f32, f32),
     offset: (f32, f32),
     scale120: u32,
 ) -> (f32, f32) {
-    if record.committed_maximized
+    grid_origin_candidates(record, origin, offset, scale120)[0]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridPlacement {
+    anchor: (f32, f32),
+    placed: (f32, f32),
+}
+
+fn grid_exempt(record: &SurfaceRecord) -> bool {
+    !matches!(record.role, SurfaceRole::Toplevel(_))
+        || record.committed_maximized
         || record.requested_maximized
         || record.committed_fullscreen
         || record.requested_fullscreen
-    {
-        return origin;
+}
+
+/// Whole-pixel window origins around `anchor`, nearest first: per axis the
+/// grid point nearest the anchor and the one on its other side, combined.
+/// An exempt window has exactly one candidate, `anchor` itself.
+fn grid_origin_candidates(
+    record: &SurfaceRecord,
+    anchor: (f32, f32),
+    offset: (f32, f32),
+    scale120: u32,
+) -> Vec<(f32, f32)> {
+    if grid_exempt(record) {
+        return vec![anchor];
     }
-    #[cfg(feature = "xwayland")]
-    if record.role.x11().is_some() {
-        return origin;
+    let xs = crate::compositor_scene::physical_grid_neighbours(anchor.0 - offset.0, scale120)
+        .map(|x| x + offset.0);
+    let ys = crate::compositor_scene::physical_grid_neighbours(anchor.1 - offset.1, scale120)
+        .map(|y| y + offset.1);
+    let mut candidates = Vec::with_capacity(4);
+    for x in xs {
+        for y in ys {
+            candidates.push((x, y));
+        }
     }
-    #[cfg(not(feature = "xwayland"))]
-    let _ = record;
-    let snap = |value: f32| crate::compositor_scene::snap_logical_to_physical_grid(value, scale120);
-    (
-        snap(origin.0 - offset.0) + offset.0,
-        snap(origin.1 - offset.1) + offset.1,
-    )
+    let distance = |(x, y): (f32, f32)| (x - anchor.0).powi(2) + (y - anchor.1).powi(2);
+    // Stable: equal distances keep the nearest-per-axis order.
+    candidates.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
+    candidates
+}
+
+/// The nearest whole-pixel origin around `anchor` that `accept` admits, or
+/// the nearest one when none does.
+fn choose_grid_origin(
+    record: &SurfaceRecord,
+    anchor: (f32, f32),
+    offset: (f32, f32),
+    scale120: u32,
+    accept: impl Fn((f32, f32)) -> bool,
+) -> (f32, f32) {
+    let candidates = grid_origin_candidates(record, anchor, offset, scale120);
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| accept(*candidate))
+        .unwrap_or(candidates[0])
+}
+
+/// Where comp last meant this window to be: the recorded anchor while the
+/// window still stands where that placement put it, else its origin now
+/// (something other than a grid placement moved it since).
+fn placement_anchor(record: &SurfaceRecord) -> (f32, f32) {
+    match record.grid_placement {
+        Some(placement) if placement.placed == record.window_origin => placement.anchor,
+        _ => record.window_origin,
+    }
+}
+
+/// Stand the window at `placed`, remembering `anchor` for later re-snaps.
+fn set_grid_origin(record: &mut SurfaceRecord, anchor: (f32, f32), placed: (f32, f32)) {
+    record.grid_placement = Some(GridPlacement { anchor, placed });
+    record.window_origin = placed;
+}
+
+/// The one rule every commit path uses when a window-geometry inset lands:
+/// the geometry origin stays where comp placed it and the buffer goes under
+/// it, re-derived from the placement anchor so repeated inset changes (GTK
+/// shadows change on focus) cannot accumulate a half-pixel tie.
+fn settle_buffer_under_inset(record: &mut SurfaceRecord, offset: (f32, f32), scale120: u32) {
+    if !grid_exempt(record) {
+        let anchor = placement_anchor(record);
+        let placed = physical_grid_window_origin(record, anchor, offset, scale120);
+        set_grid_origin(record, anchor, placed);
+    }
+    record.layout.x = record.window_origin.0 - offset.0;
+    record.layout.y = record.window_origin.1 - offset.1;
 }
 
 fn logical_surface_size(width: u32, height: u32, buffer_scale: i32) -> Result<(f32, f32), String> {
