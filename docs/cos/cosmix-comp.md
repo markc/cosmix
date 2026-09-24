@@ -557,7 +557,12 @@ new role, so an id alone can name a different window than the one a script
 read. Every role assignment (including the role ending) takes a new,
 never-reused `generation`. Unmapping and remapping the same role (a null
 buffer, then a new one) keeps it; an X11 window that is associated again
-counts as a new role.
+counts as a new role. A client may also destroy its `xdg_toplevel` and
+`xdg_surface` and later wrap the same `wl_surface` in a fresh `xdg_surface`
+(Qt's hide→show does this); comp accepts it, and the new toplevel is a new
+role. A second `xdg_surface` is refused with `xdg_wm_base.role` only while an
+earlier one for that `wl_surface` is still alive, or when the surface carries
+a non-xdg role.
 Every surface row publishes it as `surfaces.s<id>.generation`, and window rows
 repeat it. X11 windows have no `windows.*` row yet, so read their generation
 from `surfaces.s<id>`. Treat `{id, generation}` as the window's identity:

@@ -26712,10 +26712,11 @@ fn a_rejected_upsert_for_a_role_destroyed_surface_converges_on_membership() {
 /// and the live role's configure serials consumed out from under it.
 ///
 /// So the sequence is refused at its first illegal request, before
-/// `data_init.init` gives the client an object at all. That the surface's role
-/// is *permanent* is what makes `get_role` the right predicate rather than a
-/// scan for a live role object; re-taking the same role through the **existing**
-/// `xdg_surface` stays legal and is covered separately.
+/// `data_init.init` gives the client an object at all. For an xdg role the
+/// predicate is "a live `xdg_surface` still wraps this `wl_surface`" — here
+/// the original wrapper is alive. Re-taking the same role through the
+/// **existing** `xdg_surface`, and through a fresh one once the old wrapper is
+/// destroyed, both stay legal and are covered separately.
 ///
 /// This fixture deliberately never sends `get_toplevel`. If it did, it could
 /// not tell an early refusal from a late one.
@@ -27313,13 +27314,16 @@ fn a_second_toplevel_on_one_xdg_surface_is_a_fatal_protocol_error() {
 }
 
 /// Destroying an `xdg_toplevel` frees the wrapper to take the role again, and
-/// does *not* free the `wl_surface` to be wrapped again.
+/// does *not* free the `wl_surface` to be wrapped again while that wrapper is
+/// still alive.
 ///
 /// Both halves matter and they pull in opposite directions, which is why they
-/// share a fixture. `get_xdg_surface` tests `get_role`, and a core role is
-/// permanent — `set_role` never clears `public_data.role` — so no scan for a
-/// *live* role object would refuse the second half here, and none should:
-/// re-wrapping a surface whose role is stamped forever is the violation.
+/// share a fixture. No live *role object* exists at the second half, so a scan
+/// for one would wave the fresh wrapper through; the guard instead asks
+/// whether a live `xdg_surface` still wraps the `wl_surface`, and wrapper 7
+/// does. (Once wrapper 7 is destroyed too, a fresh wrapper is legal — that is
+/// Qt's hide→show, pinned by
+/// [`destroying_the_xdg_surface_releases_the_wl_surface_for_a_fresh_wrapper`].)
 /// `has_active_role` is per-wrapper and *is* cleared by the role object's
 /// destructor, which is what keeps the first half legal.
 ///
@@ -27370,9 +27374,146 @@ fn destroying_a_role_object_frees_the_wrapper_but_never_the_surface() {
     assert_eq!(
         code,
         xdg_wm_base::Error::Role as u32,
-        "the wl_surface's role outlives its role object, so a fresh wrapper for \
-         it is still xdg_wm_base.role: {message}"
+        "wrapper 7 is still alive, so a second wrapper for the same wl_surface \
+         is xdg_wm_base.role: {message}"
     );
+
+    drop(client);
+    drop(runtime);
+}
+
+/// Destroying the `xdg_toplevel` AND its `xdg_surface` releases the
+/// `wl_surface`: a fresh `get_xdg_surface` on it is accepted, takes the
+/// toplevel role again, and maps.
+///
+/// This is Qt's hide→show (`FloatingWindow.visible = false` then `true`): it
+/// destroys both role objects, keeps the `wl_surface`, and later wraps it
+/// again. comp used to refuse the fresh wrapper with `xdg_wm_base.role`
+/// because the role stamp on the surface is permanent, which killed the client
+/// (TODO-cos, found 2026-09-16 on the QML clip panel). xdg_shell releases the
+/// surface for the same role once the role objects are gone, and wlroots,
+/// Mutter and KWin all accept the sequence.
+///
+/// The second map is asserted through the renderer channel, not just the
+/// absence of an error: an accepted-but-dead role would pass the first half.
+#[test]
+fn destroying_the_xdg_surface_releases_the_wl_surface_for_a_fresh_wrapper() {
+    const STRIDE: u32 = 16 * 4;
+    const HEIGHT: u32 = 16;
+    const POOL_BYTES: u32 = STRIDE * HEIGHT;
+
+    let runtime_dir =
+        env::var_os("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR is required for the re-wrap oracle");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_nanos();
+    let socket_name = format!("cosmix-rewrap-{}-{unique}", std::process::id());
+    let runtime = WaylandRuntime::new(
+        &socket_name,
+        BackendKind::Winit,
+        (320, 240),
+        Some(DmabufCapabilities {
+            main_device: 0,
+            formats: Vec::new(),
+            adapter_name: "rewrap-test".into(),
+            drm_adapter: synthetic_drm_adapter("rewrap-test"),
+        }),
+        None,
+        test_retirement_adapter(),
+        Default::default(),
+        WaylandRuntimePolicy {
+            keybindings_enabled: false,
+            f9_bus: None,
+            explicit_sync_exposure_mode: ExplicitSyncExposureMode::Disabled,
+            decoration: DecorationStartup::default(),
+        },
+    )
+    .expect("protocol thread starts");
+    let mut client = UnixStream::connect(std::path::Path::new(&runtime_dir).join(&socket_name))
+        .expect("connect to compositor socket");
+    // wl_surface 7, xdg_surface 8, xdg_toplevel 9, shm pool 11; configured.
+    let _pool = bring_up_shm_toplevel(&mut client, POOL_BYTES, "cosmix-rewrap-test");
+
+    let wait_for_map = |runtime: &WaylandRuntime, what: &str| {
+        let deadline = Instant::now() + PROTOCOL_ACK_DEADLINE;
+        loop {
+            let mapped = runtime
+                .drain_events()
+                .expect("protocol thread is alive")
+                .into_iter()
+                .any(|event| matches!(event, ProtocolEvent::SurfaceUpserted { .. }));
+            if mapped {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{what} must reach the renderer");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[12, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[12, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the first map
+    wait_for_map(&runtime, "the first map");
+
+    // Hide, the way Qt does it: unmap, then destroy the role object and the
+    // wrapper, keeping the wl_surface.
+    send_request(&mut client, 7, 1, &words(&[0, 0, 0])); // wl_surface.attach(NULL)
+    send_request(&mut client, 7, 6, &[]); // commit: unmapped
+    send_request(&mut client, 9, 0, &[]); // xdg_toplevel.destroy
+    send_request(&mut client, 8, 0, &[]); // xdg_surface.destroy
+    send_display_request(&mut client, 0, 13);
+    let events = events_until_callback(&mut client, 13);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the hide half is plain legal teardown: {events:?}"
+    );
+    // Anything the hide produced is not the second map.
+    let _ = runtime.drain_events().expect("protocol thread is alive");
+
+    // Show: a fresh wrapper on the SAME wl_surface, the toplevel role again.
+    send_request(&mut client, 5, 2, &words(&[14, 7])); // xdg_wm_base.get_xdg_surface
+    send_request(&mut client, 14, 1, &words(&[15])); // xdg_surface.get_toplevel
+    send_request(&mut client, 7, 6, &[]); // initial empty commit
+    send_display_request(&mut client, 0, 16);
+    let events = events_until_callback(&mut client, 16);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "a fresh xdg_surface on a wl_surface whose previous wrapper is destroyed \
+         must be accepted, not refused as xdg_wm_base.role: {events:?}"
+    );
+    let serial = events
+        .iter()
+        .find_map(|(object, opcode, body)| (*object == 14 && *opcode == 0).then(|| word(body, 0)))
+        .expect("the fresh wrapper is configured after its initial commit");
+    send_request(&mut client, 14, 4, &words(&[serial])); // xdg_surface.ack_configure
+
+    send_request(
+        &mut client,
+        11,
+        0,
+        &words(&[17, 0, 16, HEIGHT, STRIDE, wl_shm::Format::Argb8888 as u32]),
+    ); // wl_shm_pool.create_buffer
+    send_request(&mut client, 7, 1, &words(&[17, 0, 0])); // wl_surface.attach
+    send_request(&mut client, 7, 6, &[]); // commit: the second map
+    send_display_request(&mut client, 0, 18);
+    let events = events_until_callback(&mut client, 18);
+    assert!(
+        events
+            .iter()
+            .all(|(object, opcode, _)| !(*object == 1 && *opcode == 0)),
+        "the second map must be accepted: {events:?}"
+    );
+    wait_for_map(&runtime, "the second map, through the fresh wrapper");
 
     drop(client);
     drop(runtime);

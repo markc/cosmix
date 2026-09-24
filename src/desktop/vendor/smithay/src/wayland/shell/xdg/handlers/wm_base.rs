@@ -4,8 +4,10 @@ use indexmap::IndexSet;
 
 use crate::{
     utils::{alive_tracker::AliveTracker, IsAlive, Serial},
-    wayland::shell::xdg::XdgShellState,
+    wayland::shell::xdg::{XdgShellState, XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE},
 };
+
+use wayland_server::protocol::wl_surface::WlSurface;
 
 use wayland_protocols::xdg::shell::server::{
     xdg_positioner::XdgPositioner, xdg_surface, xdg_surface::XdgSurface, xdg_wm_base, xdg_wm_base::XdgWmBase,
@@ -69,19 +71,36 @@ where
                 // as errors." -- and a wl_surface that already carries a role
                 // must be refused here with `xdg_wm_base.role`.
                 //
-                // This is deliberately `get_role`, not a scan for a *live* role
-                // object. A core role is permanent for the surface's lifetime,
-                // so a destroyed `xdg_toplevel` leaves the role stamped and a
-                // fresh wrapper for it is still a violation. Re-taking the same
-                // role through the *existing* `xdg_surface` stays legal, which
-                // is the sequence a client that recreates a window uses.
+                // Two cases, and they are not the same rule.
                 //
-                // Refusing before `data_init.init` is the point: an initialised
-                // duplicate wrapper can call `set_window_geometry` and
-                // `ack_configure`, both of which reach the *shared*
-                // per-`wl_surface` state and would corrupt the live role's
-                // geometry and configure serials.
-                if crate::wayland::compositor::get_role(&surface).is_some() {
+                // A role from any *other* protocol (subsurface, layer, cursor,
+                // drag icon, session lock, …) is always refused: an
+                // `xdg_surface` can never legitimately wrap it.
+                //
+                // An xdg role (`xdg_toplevel` / `xdg_popup`) is refused only
+                // while a LIVE `xdg_surface` for this `wl_surface` still
+                // exists. The stamp itself is permanent (`set_role` never
+                // clears it), but xdg_shell releases the surface for the same
+                // role once its role object and `xdg_surface` are destroyed,
+                // and Qt's hide→show does exactly that: it destroys both and
+                // later asks `get_xdg_surface` for the same `wl_surface`.
+                // wlroots, Mutter and KWin accept it; refusing it killed every
+                // Qt client that toggled `visible` (TODO-cos, 2026-09-16).
+                // `give_role` with the same role stays a no-op, so the fresh
+                // wrapper can take the role back.
+                //
+                // Refusing before `data_init.init` while a wrapper is live is
+                // still the point: an initialised duplicate wrapper next to a
+                // live one is the shape that once reached the shared
+                // per-`wl_surface` geometry and configure serials.
+                let refuse = match crate::wayland::compositor::get_role(&surface) {
+                    None => false,
+                    Some(role) if role == XDG_TOPLEVEL_ROLE || role == XDG_POPUP_ROLE => {
+                        XdgSurfaceWrappers::any_live(&surface)
+                    }
+                    Some(_) => true,
+                };
+                if refuse {
                     wm_base.post_error(
                         xdg_wm_base::Error::Role,
                         "wl_surface already has an assigned role",
@@ -95,11 +114,12 @@ where
                     id,
                     XdgSurfaceUserData {
                         known_surfaces: data.known_surfaces.clone(),
-                        wl_surface: surface,
+                        wl_surface: surface.clone(),
                         wm_base: wm_base.clone(),
                         has_active_role: AtomicBool::new(false),
                     },
                 );
+                XdgSurfaceWrappers::register(&surface, &xdg_surface);
                 data.known_surfaces
                     .lock()
                     .unwrap()
@@ -143,6 +163,52 @@ impl IsAlive for XdgWmBase {
     fn alive(&self) -> bool {
         let data: &XdgWmBaseUserData = self.data().unwrap();
         data.alive_tracker.alive()
+    }
+}
+
+/// The `xdg_surface` wrappers created for one `wl_surface`, held weakly in the
+/// surface's own data map.
+///
+/// Per-surface rather than the per-`xdg_wm_base` `known_surfaces`, so a client
+/// that binds `xdg_wm_base` twice cannot slip a second live wrapper past the
+/// `get_xdg_surface` guard through the other binding.
+#[derive(Debug, Default)]
+pub(crate) struct XdgSurfaceWrappers(Mutex<Vec<Weak<XdgSurface>>>);
+
+impl XdgSurfaceWrappers {
+    fn register(surface: &WlSurface, xdg_surface: &XdgSurface) {
+        crate::wayland::compositor::with_states(surface, |states| {
+            states.data_map.insert_if_missing_threadsafe(Self::default);
+            let wrappers = states.data_map.get::<Self>().unwrap();
+            let mut guard = wrappers.0.lock().unwrap();
+            guard.retain(|weak| weak.upgrade().is_ok());
+            guard.push(xdg_surface.downgrade());
+        });
+    }
+
+    /// Drop one wrapper from the registry. Called from `xdg_surface.destroy`
+    /// so the answer does not depend on when the backend marks the object dead.
+    pub(crate) fn unregister(surface: &WlSurface, xdg_surface: &XdgSurface) {
+        crate::wayland::compositor::with_states(surface, |states| {
+            if let Some(wrappers) = states.data_map.get::<Self>() {
+                let gone = xdg_surface.downgrade();
+                wrappers
+                    .0
+                    .lock()
+                    .unwrap()
+                    .retain(|weak| weak != &gone && weak.upgrade().is_ok());
+            }
+        });
+    }
+
+    fn any_live(surface: &WlSurface) -> bool {
+        crate::wayland::compositor::with_states(surface, |states| {
+            states.data_map.get::<Self>().is_some_and(|wrappers| {
+                let mut guard = wrappers.0.lock().unwrap();
+                guard.retain(|weak| weak.upgrade().is_ok());
+                !guard.is_empty()
+            })
+        })
     }
 }
 
