@@ -19844,7 +19844,10 @@ fn fractional_kms_configures_popups_and_interactive_deltas_stay_logical() {
         .state
         .update_interactive_pointer(117.25, 89.5);
     let moved_origin = harness.server.state.surfaces[&surface.id()].window_origin;
-    assert_eq!(moved_origin, (217.25, 169.5));
+    // The logical delta lands at (217.25, 169.5) = physical (543.125, 423.75);
+    // whole-pixel placement settles the buffer on (543, 424) = (217.2, 169.6).
+    // A 2.5x-converted delta would be tens of logical pixels away instead.
+    assert_eq!(moved_origin, (217.2, 169.6));
 
     harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
         surface: surface.clone(),
@@ -41793,6 +41796,85 @@ fn screencopy_s1a_02_exact_whole_output_shm_advertisement() {
     );
 }
 
+/// The nested output is 320x240 logical. At 2.5 its screencopy frame is the
+/// 800x600 physical buffer, never the logical size, and a logical region is
+/// projected to physical pixels. A client that composes the result at
+/// `wl_output.scale` (nested advertises 1, as grim reads it) downsamples it
+/// again on its own side; that is why a pixel gate must ask for the scale.
+#[test]
+fn screencopy_nested_frame_is_physical_pixels_at_two_point_five() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 320, 240, 1280]
+    );
+    assert!(
+        wire.harness
+            .server
+            .state
+            .backend
+            .change_host_output_scale(2.5)
+    );
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 800, 600, 3200]
+    );
+    let (region, events) = wire.capture_region(10, 20, 30, 40);
+    assert_eq!(
+        screencopy_buffer_words(&events, region),
+        vec![wl_shm::Format::Xrgb8888 as u32, 75, 100, 300]
+    );
+}
+
+/// A host swapchain of 2762x1555 at 2.5 is 1104.8x622 logical, which the host
+/// reports truncated to 1104x622. Projecting that back gives 2760x1555, two
+/// pixels short of the swapchain, and the renderer refuses a copy whose
+/// advertised extent differs from its target, so every capture failed. The
+/// host's own physical size is what is advertised once it is known.
+#[test]
+fn screencopy_nested_advertises_the_host_swapchain_at_a_non_integral_host_size() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let state = &mut wire.harness.server.state;
+    state.resize_output(1104, 622);
+    state.change_output_scale(2.5);
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 2760, 1555, 11040],
+        "without the host size, the truncated projection misses the swapchain"
+    );
+
+    wire.harness
+        .server
+        .state
+        .handle_host_input(HostInput::OutputPhysicalResized {
+            width: 2762,
+            height: 1555,
+        });
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 2762, 1555, 11048]
+    );
+    // A region reaching the output's right edge reaches the swapchain's.
+    let (region, events) = wire.capture_region(1000, 0, 104, 10);
+    assert_eq!(
+        screencopy_buffer_words(&events, region),
+        vec![wl_shm::Format::Xrgb8888 as u32, 262, 25, 1048]
+    );
+    // Reporting the same size again is not a change.
+    assert!(
+        !wire
+            .harness
+            .server
+            .state
+            .backend
+            .set_host_physical_size((2762, 1555))
+    );
+}
+
 #[test]
 fn first_light_wire_copy_then_copy_with_damage_complete_across_animation_frames() {
     let started = Instant::now();
@@ -41913,6 +41995,52 @@ fn screencopy_s1a_03_logical_region_clipping_and_invalid_regions() {
     assert!(
         capture_reservation_bytes((3840, 2160), tiny_region).unwrap() > 3840 * 2160 * 3,
         "a tiny crop is charged for the full source texture, mapped image and staging"
+    );
+}
+
+/// A 1367-wide KMS mode at 1.25 is 1093.6 logical, rounded to 1094. Projected
+/// back that is 1367.5 -> 1368, one pixel past the mode, so a whole-output
+/// capture used to be refused. Output-edge sides map to the mode edge.
+/// Coverage for the edge mapping of 6293586c; the whole-pixel fix pass did
+/// not change it.
+#[test]
+fn kms_whole_output_capture_at_a_rounded_up_logical_size_is_the_whole_mode() {
+    let key = OutputKey {
+        device: 17,
+        connector_name: "DP-1".into(),
+    };
+    let source = crate::backend::CaptureSourceSnapshot {
+        source_id: crate::backend::CaptureSourceId::Kms {
+            key,
+            generation: 3,
+        },
+        output_name: "DP-1".into(),
+        logical_rect: (0, 0, 1094, 800),
+        source_storage_extent: (1367, 1000),
+        displayed_physical_extent: (1367, 1000),
+        scale120: 150,
+        transform: smithay::utils::Transform::Normal,
+        generation: 3,
+        dmabuf: None,
+    };
+    assert_eq!(
+        capture_physical_region(&source, None),
+        Some(CaptureRegion {
+            x: 0,
+            y: 0,
+            width: 1367,
+            height: 1000
+        })
+    );
+    assert_eq!(
+        capture_physical_region(&source, Some((1000, 0, 94, 10))),
+        Some(CaptureRegion {
+            x: 1250,
+            y: 0,
+            width: 117,
+            height: 13
+        }),
+        "a region reaching the right edge ends at the mode edge"
     );
 }
 

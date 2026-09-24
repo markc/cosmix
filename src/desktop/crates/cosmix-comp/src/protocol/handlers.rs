@@ -238,6 +238,7 @@ impl CompositorHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: false,
                     committed_input_region: None,
@@ -624,6 +625,9 @@ impl CompositorHandler for WaylandState {
                                 presentation.size,
                                 scene_commit.window_geometry_changed,
                             );
+                            let scale120 = crate::compositor_scene::output_scale120(
+                                self.backend.output_scale(),
+                            );
                             let record = self
                                 .surfaces
                                 .get_mut(&surface.id())
@@ -637,8 +641,14 @@ impl CompositorHandler for WaylandState {
                                 record.layout.height,
                             );
                             if let Some(window_geometry) = window_geometry {
-                                record.layout.x = record.window_origin.0 - window_geometry.x;
-                                record.layout.y = record.window_origin.1 - window_geometry.y;
+                                // A new geometry inset moves the buffer under a
+                                // fixed window origin; keep the buffer on the
+                                // physical pixel grid while it does.
+                                settle_buffer_under_inset(
+                                    record,
+                                    (window_geometry.x, window_geometry.y),
+                                    scale120,
+                                );
                                 record.committed_window_geometry = Some(window_geometry);
                             }
                             record.layout.width = presentation.size.0;
@@ -902,6 +912,7 @@ impl WlrLayerShellHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -1039,8 +1050,12 @@ impl XdgShellHandler for WaylandState {
         self.next_layout_index = self.next_layout_index.saturating_add(1);
         let z = self.allocate_stack_key(StackBand::Normal);
         let usable = self.usable_output_rect();
-        let x = usable.x + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
-        let y = usable.y + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP;
+        // Cascade slots start on whole physical pixels; a later geometry
+        // commit re-snaps the buffer under its inset.
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+        let snap = |value: f32| crate::compositor_scene::snap_logical_to_physical_grid(value, scale120);
+        let x = snap(usable.x + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP);
+        let y = snap(usable.y + CASCADE_ORIGIN + cascade as f32 * CASCADE_STEP);
         let configured_size = sensible_toplevel_size(usable, x, y);
         let layout = SurfaceLayout {
             x,
@@ -1127,6 +1142,7 @@ impl XdgShellHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -1352,6 +1368,7 @@ impl XdgShellHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -1866,6 +1883,7 @@ impl SessionLockHandler for WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,
@@ -2391,6 +2409,7 @@ impl InputMethodHandler for WaylandState {
                 chrome_pointer: ChromePointerSceneState::default(),
                 committed_window_geometry: None,
                 committed_window_geometry_explicit: false,
+                grid_placement: None,
                 pending_popup_reposition: None,
                 parent_association_committed: true,
                 committed_input_region: None,

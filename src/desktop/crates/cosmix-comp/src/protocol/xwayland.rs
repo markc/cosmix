@@ -2095,6 +2095,7 @@ impl WaylandState {
                     chrome_pointer: ChromePointerSceneState::default(),
                     committed_window_geometry: None,
                     committed_window_geometry_explicit: false,
+                    grid_placement: None,
                     pending_popup_reposition: None,
                     parent_association_committed: true,
                     committed_input_region: None,

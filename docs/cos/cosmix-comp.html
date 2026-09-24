@@ -926,7 +926,10 @@ sequence watermark across every topic, and <code>port.lost_count</code> is cumul
 separate bounded lanes; both abandon a sink wait after two seconds.</p>
 <p>Window rows add seven read-only leaves. <code>generation</code> is the window's role
 generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin and
-<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. Use all four
+<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. The origin
+stands its buffer on a whole physical pixel, so <code>window_x</code>/<code>window_y</code> can be
+fractional at a fractional scale and are integers at scale 1 (see
+<a href="/cos/cosmix-comp#whole-pixel-placement">Whole-pixel placement</a>). Use all four
 for window screenshots that exclude client-side shadow margins. <code>x</code>/<code>y</code> remain
 the buffer origin and <code>width</code>/<code>height</code> the buffer extent, including those margins.
 Without explicit client geometry, all four <code>window_*</code> fields use the effective
@@ -1048,7 +1051,8 @@ window is not a valid X11 activation target
 (<code>window_switch_candidate</code>), un-minimising is the separate request that
 restores it. Two verbs drive the workspaces:</p>
 <ul>
-<li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
+<li>
+<p><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
 current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
 the current one, which wrap at the ends unless <code>wrap:false</code>, when they are
 refused with <code>{"error":"at_end",output,from,count}</code> (<code>output</code> there is the
@@ -1061,8 +1065,10 @@ is <code>invalid_value</code> naming <code>index</code> with the range. The repl
 <code>from == to</code> and does nothing. Minimise state is untouched: a minimised
 window on the arriving workspace stays minimised. The verb names no
 window but changes what is on screen, so a session lock refuses it
-(<code>locked</code>).</li>
-<li><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
+(<code>locked</code>).</p>
+</li>
+<li>
+<p><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
 window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</code> relative to the
 window's own workspace, always wrapping) without switching; the window
 becomes <code>visible:false, minimized:false</code> if it leaves the current
@@ -1085,8 +1091,10 @@ and <code>current</code> reads 1, so a send to workspace 1 answers <code>followe
 The move has happened either way. The reply is <code>{id,generation,index}</code>
 (plus <code>followed</code> with <code>follow:true</code>). A move never changes the window's
 <code>generation</code>. Out-of-range indices are <code>invalid_value</code> and change
-nothing; the usual <code>{id,generation}</code> fence applies.</li>
-<li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
+nothing; the usual <code>{id,generation}</code> fence applies.</p>
+</li>
+<li>
+<p><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
 <code>focused</code> is false, <code>reason</code> says why, the first that holds in this
@@ -1095,15 +1103,19 @@ order: <code>exclusive_layer</code> (an exclusive layer surface holds the keyboa
 or <code>refused</code>. The first three are what keep an off-workspace window's
 switch from running, so such a window names the gate that held it, not
 the visibility the switch would have given it; a refusal changes nothing
-and attributes nothing to the window.</li>
-<li><code>comp.window.raise {id,generation}</code> raises the window within its band
+and attributes nothing to the window.</p>
+</li>
+<li>
+<p><code>comp.window.raise {id,generation}</code> raises the window within its band
 without focusing it. The reply is <code>{id,generation,raised}</code>. Raise is
 stacking only: it never switches workspace and never un-minimises. An
 off-workspace or minimised window is restacked in place and stays where it
 is; <code>raised</code> reports the stacking change alone. <code>comp.window.focus</code> and
-<code>comp.window.restore</code> are the verbs that bring a window into view.</li>
-<li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
-or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
+<code>comp.window.restore</code> are the verbs that bring a window into view.</p>
+</li>
+<li>
+<p><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
+or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.</p>
 <ul>
 <li>With <code>force:true</code> (and optional <code>timeout_ms</code>, default 3000, at most
 60000) the reply waits. The deadline runs from when the port admitted
@@ -1123,8 +1135,9 @@ and the verb replies at once with
 <code>{"error":"still_open","reason":"x11_kill_unsupported",polite_close_sent:true}</code>.</li>
 </ul>
 </li>
-<li><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
-and/or resizes the window, with at least one field given.
+<li>
+<p><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
+and/or resizes the window, with at least one field given.</p>
 <ul>
 <li><code>x</code>/<code>y</code> are output-local logical coordinates of the window-geometry
 origin (<code>window_x</code>/<code>window_y</code>). <code>output</code> is an <code>outputs</code> key or output
@@ -1138,14 +1151,21 @@ size for the other axis in the configure. For an xdg window this is a configure,
 changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
 <li>The reply is
 <code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
+<li>The window lands on whole physical pixels, so <code>window_x</code>/<code>window_y</code> can
+differ from the request by up to half a physical pixel and need not be
+integers: at scale 2.5, <code>x: 1</code> answers <code>window_x: 1.2</code>. See
+<a href="/cos/cosmix-comp#whole-pixel-placement">Whole-pixel placement</a>. To put a neighbour flush
+against this window, place it at the REPLIED origin plus the window's
+logical size, not the requested one.</li>
 <li>A maximised or fullscreen window is refused with
 <code>{"error":"invalid_state",maximized,fullscreen}</code>. An unknown output is
 <code>unknown_output</code>. A place that would leave the window wholly outside
 every output is refused with <code>{"error":"off_output",x,y,width,height}</code>.</li>
 </ul>
 </li>
-<li><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
-window reaches a state.
+<li>
+<p><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
+window reaches a state.</p>
 <ul>
 <li><code>match</code> is either <code>{id,generation?}</code> or
 <code>{app_id?,title?,title_contains?}</code> with at least one field. Name filters
@@ -1182,16 +1202,98 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 <code>comp.input.sequence</code>.</li>
 </ul>
 </li>
-<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
+<li>
+<p><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
 returns <code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field
 (text filters at most 4096 bytes; <code>workspace</code> is an index in <code>1..=count</code>
 — above the count is <code>invalid_value</code>, not an empty list — <code>"current"</code> for
 the current workspace, or <code>"all"</code>, the default). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
-windows and is empty while a session lock is active.</li>
+windows and is empty while a session lock is active.</p>
+</li>
 </ul>
 <p>Every argument object is checked for unknown fields
 (<code>{"error":"invalid_args",field,allowed}</code>).</p>
+<h4 id="whole-pixel-placement">Whole-pixel placement</h4>
+<p>At a fractional output scale a logical origin can fall between physical
+pixels: x = 1 at 2.5 is physical 2.5. The KMS renderer projects each window
+edge to a whole pixel on its own, so a 795-wide window there spans 1987
+pixels while its fractional-scale client drew <code>round(795 x 2.5)</code> = 1988, and
+the content is resampled and blurs. comp therefore stands every xdg
+toplevel's BUFFER origin on a whole physical pixel. The snap moves the buffer
+by at most half a physical pixel. It applies in these places:</p>
+<ul>
+<li>the cascade slot a new window opens in;</li>
+<li><code>comp.window.place</code>;</li>
+<li>interactive move and resize;</li>
+<li>the clamp after the output shrinks;</li>
+<li>every commit that changes the client's window-geometry inset, whichever
+buffer path it arrives on (none, SHM or DMA-BUF), and the inset comp derives
+from subsurface bounds;</li>
+<li>a return from maximised or fullscreen;</li>
+<li>a nested host scale change.</li>
+</ul>
+<p>The reported <code>window_x</code>/<code>window_y</code> and the <code>windows.s&lt;id&gt;</code> position leaves are
+the snapped values. They can be fractional in logical units at a fractional
+scale, and they are integers at scale 1, where the same rule rounds a
+fractional pointer-driven origin to a whole pixel.</p>
+<p><strong>Re-snaps start from where comp meant the window to be.</strong> comp remembers the
+unsnapped origin it last placed a window at. A later inset change or scale
+change derives the new whole-pixel origin from that anchor, never from an
+already snapped value. So a GTK window whose shadow inset changes on every
+focus change stays put, and a scale change from 2.5 to 1.25 and back returns
+the window to the same pixel.</p>
+<p>Which requests set the anchor:</p>
+<ul>
+<li>A move, <code>comp.window.place</code>, an interactive resize and the output-shrink
+clamp each REPLACE the anchor, per axis, with the origin they asked for.</li>
+<li>An axis such a request leaves where the window already stands keeps its
+recorded anchor. Examples are a size-only place, a right or bottom edge
+drag, and the unmoved axis of a left drag. So interleaving resizes with
+inset changes cannot walk the window either.</li>
+<li>Anything else that moves the window, such as a return from maximised or a
+decoration-mode switch, makes its new origin the anchor.</li>
+</ul>
+<p><strong>Constraints choose between the two nearest grid points.</strong></p>
+<ul>
+<li><code>comp.window.place</code> validates the snapped origin, not the requested one.
+When the nearest grid point would put the window wholly off every output,
+it takes the grid point on the other side.</li>
+<li>The output-shrink clamp takes the nearest grid point that is still inside
+the clamp. The window does not slide under a panel or lose the room it was
+clamped to fit. When the window is wider than the work area, the clamp
+interval is narrower than a pixel. Then the origin takes the nearest grid
+point at or past the work area's near edge, and the size clamp that follows
+shrinks the window. That grid point becomes the anchor, so the next commit
+keeps it.</li>
+<li>A left or top edge drag whose stationary edge sits exactly on the output's
+left or top edge may have no grid point that keeps it on its pixel. It then
+moves one pixel toward the visible side, never behind the output edge.</li>
+<li>A left or top edge drag keeps the STATIONARY edge on the physical pixel it
+started on. The moving origin takes whichever grid point preserves it, so
+the far edge does not wobble as the drag crosses odd sizes.</li>
+</ul>
+<p><strong>What 1:1 means, and where.</strong> On the grid, both edges of the buffer project
+exactly. On KMS the drawn width is then the client's <code>round(width x scale)</code>
+buffer, sampled 1:1. The nested compositor renders through the host camera's
+scale without this edge projection, so it still resamples a window whose
+logical width is odd at 2.5. Nested pixel gates cannot prove sharpness at a
+fractional scale. A neighbour placed at the REPLIED origin plus the window's
+logical size projects its left edge to this window's right edge, with no seam
+and no overlap. Placing it at the REQUESTED origin plus the width can overlap
+by one pixel. With a client-side-decorated window only the buffer is on the
+grid; its visible window-geometry edges sit at the client's integer logical
+inset from it and can fall between pixels.</p>
+<p>Three kinds of surface are left alone:</p>
+<ul>
+<li>X11 windows keep integer X coordinates.</li>
+<li>Maximised and fullscreen windows start exactly at the work area or output
+origin.</li>
+<li>Popups and subsurfaces keep their client-chosen offsets from the parent.</li>
+</ul>
+<p>A window whose right or bottom edge falls on a negative half pixel, straddling
+the left or top output edge, can still project one pixel short. The renderer
+rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
 <p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply
@@ -2253,7 +2355,28 @@ capture feed and completion path while ignoring client scene content; every
 changed animation frame marks full-output damage, so <code>copy_with_damage</code> wakes.
 The wlr protocol is a compatibility surface; the planned
 <code>ext-image-copy-capture-v1</code> implementation will become another consumer of the
-same capture service. The automated nested acceptance gate uses <code>grim</code>; the
+same capture service.</p>
+<p><strong>Frames are physical pixels, on nested too.</strong> A whole-output screencopy frame
+is the output's physical buffer: at scale 2.5 a 320x240 logical output
+advertises and delivers 800x600, and a logical region is projected to
+physical pixels. On nested, the extent is the host window's own swapchain
+size, not the truncated logical size times the scale (a 2762-pixel-wide host
+at 2.5 is 1104.8 logical, reported as 1104). The nested scene itself is laid
+out on that truncated 1104-wide canvas, so the last physical pixel or two at
+the right or bottom of such a frame are background that no client can draw
+into. The strip is cosmetic and is not a capture error. What a client does with the frame
+is its own business. grim composes its image at the output's integer
+<code>wl_output.scale</code>, which is 1 on nested and <code>ceil(scale)</code> on KMS, so by
+default it downsamples a nested frame to the logical size and upsamples a KMS
+one. A pixel gate that must see what the panel shows runs
+<code>grim -s &lt;exact scale&gt;</code>, for example <code>grim -s 2.5</code>, which composes at 1:1.</p>
+<p>An earlier note held that nested screencopy returned a LOGICAL-size frame and
+that nested pixel gates were therefore vacuous. That premise was wrong. The
+1105x622 images it cited were grim's default composition. comp itself has no
+Bus capture verb: <code>capture.screenshot</code> belongs to the separate
+<code>cosmix-capture</code> screencopy client, and a native <code>comp.capture.frame</code> is
+still a proposal.</p>
+<p>The automated nested acceptance gate uses <code>grim</code>; the
 <code>cosmix-screencopy-probe</code> binary is a deadline-bounded manual diagnostic for the
 advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
 <code>--dmabuf --drm-node PATH</code> mode waits for <code>buffer_done</code>, allocates an advertised

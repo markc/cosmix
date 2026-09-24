@@ -121,12 +121,69 @@ fn round_half_away(value: f64) -> i64 {
     }
 }
 
+/// Sub-pixel resolution at which a projected edge is read before rounding.
+///
+/// A logical origin on the physical grid (1.2 at 2.5x) is not exact in f32, so
+/// an edge meant to sit on an exact half pixel (an odd logical width at 2.5x)
+/// lands a few millionths either side of it and the tie would be decided by
+/// representation noise: the same window would project one pixel narrower or
+/// wider than its `round(width x scale)` buffer depending on where it stands.
+/// Reading the edge at 1/64 px first makes such a tie a tie again, so it
+/// resolves the way exact arithmetic would. Only edges within 1/128 px of a
+/// half are affected; no real layout depends on that distinction.
+const PHYSICAL_EDGE_QUANTUM: f64 = 64.0;
+
 /// Project one logical edge to its sole physical pixel edge.
 ///
 /// Edges, rather than origins and sizes, are projected so adjacent rectangles
 /// calculate their shared boundary from the same input and cannot open a seam.
 fn project_logical_edge(edge: f32, scale120: u32) -> i64 {
-    round_half_away(f64::from(edge) * f64::from(scale120) / 120.0)
+    let physical = f64::from(edge) * f64::from(scale120) / 120.0;
+    round_half_away((physical * PHYSICAL_EDGE_QUANTUM).round() / PHYSICAL_EDGE_QUANTUM)
+}
+
+/// The logical coordinate of the physical pixel edge `value` projects to.
+///
+/// A window whose surface origin passes through this lands on a whole physical
+/// pixel, so its projected width is exactly `round(width x scale)`, the buffer a
+/// fractional-scale client draws, and the renderer samples it 1:1. Applied at
+/// every scale: at 1.0 it rounds a fractional origin (a pointer-driven move) to
+/// the whole pixel the renderer's identity projection would otherwise straddle.
+pub(crate) fn snap_logical_to_physical_grid(value: f32, scale120: u32) -> f32 {
+    let scale120 = scale120.max(1);
+    (project_logical_edge(value, scale120) as f64 * 120.0 / f64::from(scale120)) as f32
+}
+
+/// The two physical-grid points nearest `value`, in logical units, nearest
+/// first. A caller with a constraint the nearest point breaks (stay inside a
+/// clamp, keep a far edge fixed, stay on an output) takes the other one, which
+/// is on the far side of `value` and so still less than one physical pixel
+/// away.
+pub(crate) fn physical_grid_neighbours(value: f32, scale120: u32) -> [f32; 2] {
+    let scale120 = scale120.max(1);
+    let physical = f64::from(value) * f64::from(scale120) / 120.0;
+    let nearest = project_logical_edge(value, scale120);
+    let other = if physical >= nearest as f64 {
+        nearest + 1
+    } else {
+        nearest - 1
+    };
+    let logical = |edge: i64| (edge as f64 * 120.0 / f64::from(scale120)) as f32;
+    [logical(nearest), logical(other)]
+}
+
+/// The physical pixel edge a logical edge projects to (the renderer's rule).
+pub(crate) fn physical_edge(edge: f32, scale120: u32) -> i64 {
+    project_logical_edge(edge, scale120.max(1))
+}
+
+/// Exact 120ths for an output scale, as the renderer's projection reads them.
+pub(crate) fn output_scale120(scale: f64) -> u32 {
+    if scale.is_finite() && scale > 0.0 {
+        ((scale * 120.0).round() as u32).max(1)
+    } else {
+        crate::backend::kms::OutputScale120::ONE.get()
+    }
 }
 
 pub(crate) fn projected_renderer_physical_edges(
@@ -4786,6 +4843,45 @@ mod tests {
             right - left,
             "independently projected widths cover the span without a gap or overlap"
         );
+    }
+
+    #[test]
+    fn snapped_origins_project_every_width_to_its_rounded_buffer_at_fractional_scales() {
+        // At 2.5 the raw odd origin is one pixel narrow: the defect.
+        let raw = projected_renderer_physical_edges(1.0, 0.0, 795.0, 1.0, 300);
+        assert_eq!(raw.2 - raw.0, 1987, "x = 1 resamples a 1988-pixel buffer");
+
+        for scale120 in [150_u32, 180, 210, 300] {
+            let scale = f64::from(scale120) / 120.0;
+            for width in [795.0_f32, 101.0, 64.0, 1.0] {
+                let buffer = (f64::from(width) * scale).round() as i64;
+                // Non-negative origins only: symmetric half-away rounding
+                // makes a right edge that falls on a NEGATIVE half pixel round
+                // down, so a window straddling the left output edge can still
+                // project one pixel short (the symmetry is pinned above).
+                for step in 0..400 {
+                    let origin = step as f32 * 0.7;
+                    let snapped = snap_logical_to_physical_grid(origin, scale120);
+                    assert!(
+                        (snapped - origin).abs() <= (0.5 + 1.0 / 64.0) * 120.0 / scale120 as f32,
+                        "the snap moves by at most half a physical pixel"
+                    );
+                    let (left, _, right, _) =
+                        projected_renderer_physical_edges(snapped, 0.0, width, 1.0, scale120);
+                    assert_eq!(
+                        right - left,
+                        buffer,
+                        "origin {origin} (snapped {snapped}) width {width} at {scale}"
+                    );
+                    // A neighbour at the snapped origin plus the width shares
+                    // this window's right edge exactly.
+                    let neighbour = snap_logical_to_physical_grid(snapped + width, scale120);
+                    assert_eq!(project_logical_edge(neighbour, scale120), right);
+                }
+            }
+        }
+        assert_eq!(snap_logical_to_physical_grid(1.0, 300), 1.2);
+        assert_eq!(snap_logical_to_physical_grid(17.4, 120), 17.0);
     }
 
     #[test]
