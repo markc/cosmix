@@ -96,8 +96,6 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
 /// was moved to.
 pub struct Opened {
     pub rows: Vec<PhysicalBinding>,
-    /// Rows dropped at per-row admission (already logged).
-    pub dropped: usize,
     /// The backup the unusable document was renamed to, if that happened.
     pub recovered_from: Option<PathBuf>,
     /// False only when an unusable document could NOT be moved aside: the
@@ -121,7 +119,6 @@ pub fn open(path: &Path, stamp: &str) -> Opened {
             );
             return Opened {
                 rows: loaded.rows,
-                dropped: loaded.dropped.len(),
                 recovered_from: None,
                 persist: true,
             };
@@ -149,7 +146,6 @@ pub fn open(path: &Path, stamp: &str) -> Opened {
                 );
                 return Opened {
                     rows,
-                    dropped: 0,
                     recovered_from: None,
                     persist: false,
                 };
@@ -162,7 +158,6 @@ pub fn open(path: &Path, stamp: &str) -> Opened {
     }
     Opened {
         rows,
-        dropped: 0,
         recovered_from,
         persist: true,
     }
