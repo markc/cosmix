@@ -13656,7 +13656,10 @@ impl WaylandState {
                 // itself to OnDemand keeps it: the grab ends, the focus it
                 // was granted does not. (Quoin's panels ask for the grab only
                 // until it lands, so a later click elsewhere can move focus.)
+                // A layer with an active popup keyboard grab keeps the
+                // documented dismissal instead.
                 let demoted_keeps_focus = !fallback
+                    && !self.keyboard.is_grabbed()
                     && previous_exclusive.is_some()
                     && current_focus_surface.as_ref().is_some_and(|focus| {
                         previous_exclusive.as_ref() == Some(&focus.id())
