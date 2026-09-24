@@ -256,7 +256,10 @@ Other rules:
 - **max_bytes** bounds the write. If the data is larger, the call raises
   `WRITE_TOO_LARGE` before anything touches the disk.
 - **Refusals.** A target that exists but is not a regular file, such as a
-  directory, raises. Bad options raise `OPTION_INVALID`. A wrong argument type
+  directory, raises, and so does a path ending in `/`. A target that is a
+  mount point, such as a bind-mounted file, cannot be replaced by `rename`,
+  so it raises `WRITE_NOT_ATOMIC` and writes nothing. Use `write_file` there,
+  which rewrites in place, non-atomically. Bad options raise `OPTION_INVALID`. A wrong argument type
   raises `TYPE_MISMATCH`.
 
 ```mix

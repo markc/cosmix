@@ -214,3 +214,17 @@ async fn spawn_die_with_parent_needs_a_host_leads_its_group_and_refuses_detach()
     }
     assert_eq!(pgid, pid, "die_with_parent child must lead its own process group");
 }
+
+/// A top-level run_parallel timeout replaces each job's own, so a job's
+/// `{timeout: 0, grace: 1}` is a job WITH a deadline there, not a refused
+/// grace-without-deadline; without the override it is still refused.
+#[tokio::test]
+async fn run_parallel_timeout_override_applies_before_grace_validation() {
+    let output = run_ok(
+        "$r = run_parallel([{argv: [\"true\"], timeout: 0, grace: 1}], {timeout: 5})\n\
+         print($r[0].ok)\n\
+         try\n  run_parallel([{argv: [\"true\"], timeout: 0, grace: 1}])\ncatch $m, $e\n  print($e.code)\nend\n",
+    )
+    .await;
+    assert_eq!(output, "true\nOPTION_INVALID\n");
+}

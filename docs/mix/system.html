@@ -543,7 +543,10 @@ there is no string form either: <code>stdin: "inherit"</code> is ordinary stdin 
 the seven bytes <code>inherit</code>. Use <code>run_stream</code> when a child must own the
 terminal and its stdin. The same rule applies to stage 0 of <code>run_pipeline</code>
 and to <code>run_parallel</code> jobs. At most one <code>run_parallel</code> job may inherit
-stdin. Two or more raise <code>OPTION_INVALID</code> before any job runs, because
+stdin. Inheriting stdin makes sense for a script run as <code>mix script.mix</code>
+or <code>mix -</code>, where stdin is data. A bare REPL fed through a pipe reads its
+own input lines from that same stdin, so an inheriting child there would
+compete with the REPL for the lines of the script. Two or more raise <code>OPTION_INVALID</code> before any job runs, because
 concurrent readers of one pipe would race for its bytes. With
 <code>timeout: 0</code>, Mix also waits for a stdin-data writer to finish after the
 direct child exits. A descendant which retains the read end without consuming

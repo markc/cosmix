@@ -113,7 +113,10 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
   the seven bytes `inherit`. Use `run_stream` when a child must own the
   terminal and its stdin. The same rule applies to stage 0 of `run_pipeline`
   and to `run_parallel` jobs. At most one `run_parallel` job may inherit
-  stdin. Two or more raise `OPTION_INVALID` before any job runs, because
+  stdin. Inheriting stdin makes sense for a script run as `mix script.mix`
+  or `mix -`, where stdin is data. A bare REPL fed through a pipe reads its
+  own input lines from that same stdin, so an inheriting child there would
+  compete with the REPL for the lines of the script. Two or more raise `OPTION_INVALID` before any job runs, because
   concurrent readers of one pipe would race for its bytes. With
   `timeout: 0`, Mix also waits for a stdin-data writer to finish after the
   direct child exits. A descendant which retains the read end without consuming

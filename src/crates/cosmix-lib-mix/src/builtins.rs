@@ -6635,7 +6635,11 @@ struct ParsedJob {
 
 /// Parse one `run_parallel` job — an argv list, or a `{argv, …}` map mirroring
 /// run_argv's options — into owned config.
-fn parse_run_parallel_job(caller: &str, job: &Value) -> MixResult<ParsedJob> {
+fn parse_run_parallel_job(
+    caller: &str,
+    job: &Value,
+    timeout_overridden: bool,
+) -> MixResult<ParsedJob> {
     match job {
         Value::List(_) => Ok(ParsedJob {
             argv: parse_run_argv_argv(caller, job)?,
@@ -6659,6 +6663,12 @@ fn parse_run_parallel_job(caller: &str, job: &Value) -> MixResult<ParsedJob> {
             let mut cleaned = (**m).clone();
             cleaned.shift_remove("argv");
             cleaned.shift_remove("stream");
+            // A top-level timeout replaces this job's own, so the job's value
+            // must not take part in validation either: `{timeout: 0, grace: 1}`
+            // under a top-level timeout is a job WITH a deadline (review NIT).
+            if timeout_overridden {
+                cleaned.shift_remove("timeout");
+            }
             let opts = parse_run_argv_opts(caller, Some(&Value::map(cleaned)))?;
             Ok(ParsedJob { argv, opts })
         }
@@ -6698,7 +6708,7 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     // exactly like run_argv validates before spawning.
     let mut parsed: Vec<ParsedJob> = Vec::with_capacity(jobs.len());
     for job in jobs.iter() {
-        let mut p = parse_run_parallel_job(caller, job)?;
+        let mut p = parse_run_parallel_job(caller, job, popts.timeout_ms.is_some())?;
         if let Some(t) = popts.timeout_ms {
             p.opts.timeout_ms = t;
         }
@@ -13603,6 +13613,22 @@ fn write_atomic_impl(
         // SAFETY: removing our own temp name inside the pinned directory.
         unsafe {
             libc::unlinkat(dirfd, tmp_c.as_ptr(), 0);
+        }
+        // The temp is always beside the target, so EXDEV/EBUSY at the rename
+        // means the target is itself a mount point — a bind-mounted file
+        // (review NIT). That can never be replaced atomically; say so with a
+        // code, not a bare errno.
+        if what == "renaming over target"
+            && matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::EBUSY))
+        {
+            return Err(MixError::structured(
+                "WRITE_NOT_ATOMIC",
+                format!(
+                    "write_atomic '{path}': the target is a mount point (a bind-mounted \
+                     file?), which rename cannot replace; nothing was written — write_file \
+                     rewrites it in place, non-atomically ({e})"
+                ),
+            ));
         }
         return Err(write_atomic_error(path, what, &e));
     }

@@ -659,7 +659,10 @@ through the link.</li>
 <li><strong>max_bytes</strong> bounds the write. If the data is larger, the call raises
 <code>WRITE_TOO_LARGE</code> before anything touches the disk.</li>
 <li><strong>Refusals.</strong> A target that exists but is not a regular file, such as a
-directory, raises. Bad options raise <code>OPTION_INVALID</code>. A wrong argument type
+directory, raises, and so does a path ending in <code>/</code>. A target that is a
+mount point, such as a bind-mounted file, cannot be replaced by <code>rename</code>,
+so it raises <code>WRITE_NOT_ATOMIC</code> and writes nothing. Use <code>write_file</code> there,
+which rewrites in place, non-atomically. Bad options raise <code>OPTION_INVALID</code>. A wrong argument type
 raises <code>TYPE_MISMATCH</code>.</li>
 </ul>
 <pre><code class="language-mix">write_atomic("/tmp/io/state", "v1\n")
