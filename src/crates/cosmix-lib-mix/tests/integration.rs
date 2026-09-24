@@ -2345,6 +2345,50 @@ async fn reply_in_handler_without_bus_errors() {
 
 // ── SPEC 18 §3.4: handler fault isolation (WS6) ──
 
+/// The wire body of the §3.4 synthetic fault reply, spelled out as a
+/// literal (not the `HANDLER_FAULT_BODY` constant) so a change to the
+/// constant is a test failure, not a silent pass.
+const FAULT_BODY: &str = r#"{"error":"internal handler error","error_code":"HANDLER_FAULT"}"#;
+
+/// A handler that RAISES (a Mix-level fault, not a Rust panic) answers
+/// its caller in the application-error band: rc 15 with a HANDLER_FAULT
+/// body. Before this the reply was rc 1, which the Bus contract reads as
+/// delivered-with-warning SUCCESS, so a `$rc >= 10` caller took a crashed
+/// handler for a working one. The raise message stays off the wire, and
+/// the citizen answers the next request normally.
+#[tokio::test]
+async fn raising_handler_replies_handler_fault_in_error_band_and_keeps_serving() {
+    use cosmix_mix::evaluator::{HANDLER_FAULT_BODY, HANDLER_FAULT_RC};
+    let replies = dispatch_with_boom(
+        "on q\n    raise(\"E_TEST\", \"secret detail\")\ndone\non ok\n    reply(\"fine\")\ndone\n",
+        &[
+            mk_event("q", "", &[("from", "c1"), ("id", "1"), ("type", "request")]),
+            mk_event("ok", "", &[("from", "c2"), ("id", "2"), ("type", "request")]),
+        ],
+    )
+    .await;
+    assert_eq!(replies.len(), 2, "one reply per request, got {replies:?}");
+    let (to, cmd, id, rc, body) = &replies[0];
+    assert_eq!((to.as_str(), cmd.as_str(), id.as_deref()), ("c1", "q", Some("1")));
+    assert!(*rc >= 10, "a fault must be in the application-error band, got rc {rc}");
+    assert_eq!(*rc, 15);
+    assert_eq!(*rc, HANDLER_FAULT_RC);
+    assert_eq!(body, FAULT_BODY);
+    assert_eq!(body, HANDLER_FAULT_BODY);
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("fault body is JSON");
+    assert_eq!(parsed["error_code"], "HANDLER_FAULT");
+    assert_eq!(parsed["error"], "internal handler error");
+    assert!(
+        !body.contains("secret detail") && !body.contains("E_TEST"),
+        "the raise detail must never cross the wire, got {body}"
+    );
+    assert_eq!(
+        replies[1],
+        ("c2".to_string(), "ok".to_string(), Some("2".to_string()), 0u8, "fine".to_string()),
+        "the citizen must keep serving after a fault"
+    );
+}
+
 /// Build an evaluator wired to a `ReplyRecorder`, register a `boom()`
 /// extension that triggers a real Rust panic (the deterministic stand-in
 /// for "an `unwrap` on a `nil` field / a builtin that panics"), run the
@@ -2375,7 +2419,7 @@ async fn dispatch_with_boom(source: &str, events: &[IncomingEvent]) -> Vec<Reply
 }
 
 /// A Rust panic inside a request handler is caught, the daemon survives,
-/// and the requester gets a synthetic non-zero error reply (rc=1, fixed
+/// and the requester gets a synthetic HANDLER_FAULT reply (rc=15, fixed
 /// non-sensitive body) so it is not left blocked forever. The panic
 /// detail never crosses the wire.
 #[tokio::test]
@@ -2395,10 +2439,10 @@ async fn panic_in_request_handler_is_isolated_and_synthesizes_error_reply() {
             "caller".to_string(),
             "q".to_string(),
             Some("7".to_string()),
-            1u8,
-            "internal handler error".to_string(),
+            15u8,
+            FAULT_BODY.to_string(),
         )],
-        "a panicking request handler must yield exactly one rc=1 \
+        "a panicking request handler must yield exactly one rc=15 \
          synthetic reply with a non-sensitive body"
     );
 }
@@ -2407,7 +2451,7 @@ async fn panic_in_request_handler_is_isolated_and_synthesizes_error_reply() {
 /// the synthetic error-reply for a panicking handler must also fire when
 /// noded anonymized the caller (no `from`). Before the fix the synthetic
 /// reply was gated on `!from.is_empty()`, so an anonymous requester whose
-/// handler panicked blocked forever instead of getting rc=1.
+/// handler panicked blocked forever instead of getting the fault reply.
 #[tokio::test]
 async fn panic_synthesizes_error_reply_even_when_noded_stripped_from() {
     let replies = dispatch_with_boom(
@@ -2421,11 +2465,11 @@ async fn panic_synthesizes_error_reply_even_when_noded_stripped_from() {
             String::new(),
             "q".to_string(),
             Some("7".to_string()),
-            1u8,
-            "internal handler error".to_string(),
+            15u8,
+            FAULT_BODY.to_string(),
         )],
         "an anonymized (no-`from`) request whose handler panics must \
-         still get the rc=1 synthetic reply, correlated by `id`"
+         still get the rc=15 synthetic reply, correlated by `id`"
     );
 }
 
@@ -2455,8 +2499,8 @@ async fn panic_does_not_deny_service_to_subsequent_events() {
                 "c1".to_string(),
                 "q".to_string(),
                 Some("1".to_string()),
-                1u8,
-                "internal handler error".to_string(),
+                15u8,
+                FAULT_BODY.to_string(),
             ),
             (
                 "c2".to_string(),
@@ -2610,8 +2654,8 @@ async fn panic_inside_address_block_does_not_leak_address_target() {
                 "c1".to_string(),
                 "q".to_string(),
                 Some("1".to_string()),
-                1u8,
-                "internal handler error".to_string(),
+                15u8,
+                FAULT_BODY.to_string(),
             ),
             (
                 "c2".to_string(),
@@ -2646,8 +2690,8 @@ async fn die_in_request_handler_synthesizes_error_reply() {
             "caller".to_string(),
             "q".to_string(),
             Some("3".to_string()),
-            1u8,
-            "internal handler error".to_string(),
+            15u8,
+            FAULT_BODY.to_string(),
         )],
         "an uncaught die on a request must surface an error reply"
     );
@@ -4049,8 +4093,16 @@ end
             assert_eq!(
                 entries[0].3, SHUTDOWN_SYNTH_RC,
                 "synth rc MUST be the module constant SHUTDOWN_SYNTH_RC \
-                 (=2, the §3.4 fault-domain code) — a different rc \
-                 means a fork in the synth path or a stale local"
+                 — a different rc means a fork in the synth path or a \
+                 stale local"
+            );
+            // Pinned as literals too: the synth must be in the
+            // application-error band (a `$rc >= 10` caller must not read
+            // a cancelled handler as success) and carry its error_code.
+            assert_eq!(entries[0].3, 16u8, "shutdown synth rc is 16");
+            assert_eq!(
+                entries[0].4,
+                r#"{"error":"service shutting down; handler cancelled before replying","error_code":"HANDLER_CANCELLED"}"#
             );
             assert_eq!(
                 entries[0].4, SHUTDOWN_SYNTH_BODY,

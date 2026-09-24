@@ -1359,24 +1359,49 @@ impl ClassCTaskRegistry {
 #[cfg(feature = "tokio-sleep")]
 pub const CLASSC_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// SPEC 18 §3.4 — `rc` of the synthetic reply a request gets when its
+/// handler faults (uncaught error, `die`, or a Rust panic) before
+/// replying.
+///
+/// In the application-error band (`>= 10`) on purpose. Until this
+/// constant existed the fault reply was `rc=1`, and the Bus contract
+/// (`bus.md`, "Reading `$rc`") defines `1..9` as delivered-with-warning
+/// SUCCESS — so every caller using the manual's `$rc >= 10` idiom read a
+/// crashed handler as a success. 15 rather than 10 so a fault is
+/// distinguishable from an author's own `reply(10, …)` refusal by rc
+/// alone; the `error_code` in the body is the authoritative signal.
+pub const HANDLER_FAULT_RC: u8 = 15;
+
+/// SPEC 18 §3.4 — body of the synthetic handler-fault reply.
+///
+/// A JSON object with an `error` (so a JSON-body `send` reduces it to a
+/// readable `$result`) and an `error_code` (so `$reply.error_code` is
+/// field-accessible on every route). Fixed and non-sensitive: the real
+/// error/panic detail stays in the server-side log and never crosses
+/// the Bus (it can carry request data or Trojan-Source bytes).
+pub const HANDLER_FAULT_BODY: &str =
+    r#"{"error":"internal handler error","error_code":"HANDLER_FAULT"}"#;
+
 /// SPEC 18 Phase 2 WS3-C.7f — `rc` value for synth'd shutdown replies.
 ///
-/// Uses the existing §3.4 fault-domain `rc=2` rather than minting a
-/// new value. Callers distinguish "handler crashed" (§3.4 fault arm)
-/// from "service shutting down mid-handler" (C.7f drain synth) by the
-/// reply body, not the rc — minting a new rc here would be a SPEC 18
-/// §3.4 amendment, which Phase 2 deliberately does not perform.
+/// Application-error band (`>= 10`), like [`HANDLER_FAULT_RC`]: a
+/// request whose handler was cancelled by a shutdown/reload was never
+/// answered by it (any side effects before the cancellation point
+/// stand), and the previous `rc=2` read as delivered-with-warning
+/// success to a `$rc >= 10` caller. Distinct from the fault rc so the
+/// two causes are separable by rc as well as by `error_code`.
 #[cfg(feature = "tokio-sleep")]
-pub const SHUTDOWN_SYNTH_RC: u8 = 2;
+pub const SHUTDOWN_SYNTH_RC: u8 = 16;
 
 /// SPEC 18 Phase 2 WS3-C.7f — body for synth'd shutdown replies.
 ///
-/// Stable, non-sensitive, identifies the cause unambiguously. Does
-/// not embed the service name — the caller's correlation already
-/// resolves the address (the broker route returned this reply on the
-/// `&lt;svc&gt;.&lt;cmd&gt;` namespace it dispatched against).
+/// Stable, non-sensitive, identifies the cause unambiguously
+/// (`error_code` `HANDLER_CANCELLED`). Does not embed the service name
+/// — the caller's correlation already resolves the address (the broker
+/// route returned this reply on the `<svc>.<cmd>` namespace it
+/// dispatched against).
 #[cfg(feature = "tokio-sleep")]
-pub const SHUTDOWN_SYNTH_BODY: &str = "service shutting down; handler cancelled before replying";
+pub const SHUTDOWN_SYNTH_BODY: &str = r#"{"error":"service shutting down; handler cancelled before replying","error_code":"HANDLER_CANCELLED"}"#;
 
 /// SPEC 18 Phase 2 WS3-C.7f — accounting for one drain pass.
 ///
@@ -4564,7 +4589,8 @@ impl Evaluator {
     ///    [`InvocationReplyHandle::is_pending_request`], and for each
     ///    surviving pending request fire
     ///    [`InvocationReplyHandle::synthesize_unanswered`] with
-    ///    `rc=2` and a SPEC 18 §3.4 shutdown body — UNLESS
+    ///    `SHUTDOWN_SYNTH_RC` (16) and the `HANDLER_CANCELLED` shutdown
+    ///    body — UNLESS
     ///    `allow_synth_replies` is false (transport-drop path: the
     ///    socket is already gone, so there is no caller channel
     ///    left to reply on).
@@ -5514,13 +5540,13 @@ impl Evaluator {
 
         // SPEC 18 §3.4 — if any body faulted (panic or error) and the
         // requester has NOT been answered by a `reply()` from some body,
-        // synthesize a non-zero error reply so a request-class caller is
-        // not left blocked. Gated exactly like `reply()`: only a
-        // request (`type=request`) can be answered — a topic delivery
+        // synthesize an rc >= 10 HANDLER_FAULT reply so a request-class
+        // caller is not left blocked. Gated exactly like `reply()`: only
+        // a request (`type=request`) can be answered — a topic delivery
         // has no caller; `from` may be empty (noded-anonymized caller)
         // and is not a gate, the response correlates by `id`. The wire
-        // body is a
-        // fixed, non-sensitive string — the panic/error detail stays in
+        // body is a fixed, non-sensitive JSON object
+        // (`HANDLER_FAULT_BODY`) — the panic/error detail stays in
         // the server-side log and never crosses the Bus boundary (it can
         // carry request data or Trojan-Source bytes; the WG trust domain
         // does not make peers non-adversarial).
@@ -5532,7 +5558,7 @@ impl Evaluator {
             // fault edge. `reply_once` itself releases its
             // `RefCell`-free `Rc<dyn BusHandler>` clone across the
             // `.await` — no globals borrow survives.
-            match handle.reply_once(1, "internal handler error").await {
+            match handle.reply_once(HANDLER_FAULT_RC, HANDLER_FAULT_BODY).await {
                 Ok(_) => {}
                 Err(e) => tracing::error!(
                     command = %event.command,

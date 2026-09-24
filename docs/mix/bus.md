@@ -205,6 +205,22 @@ citizen's: other daemons name the same refusal differently — comp answers
 against any service should test `$rc >= 10` and read the code from `$reply`
 rather than match one spelling.
 
+**A Mix citizen's runtime refusals are all in the error band.** Besides
+`UNKNOWN_COMMAND`, the serve runtime answers a request itself in two more
+cases, each with an `error` message and an `error_code`. `rc` 15 and 16 are
+the runtime's; pick another `rc >= 10` for a handler's own `reply()` refusals,
+and treat `error_code` as the authoritative signal:
+
+| `$rc` | `$reply.error_code` | When |
+|---|---|---|
+| 10 | `UNKNOWN_COMMAND` | no `on` handler for the verb |
+| 15 | `HANDLER_FAULT` | the handler raised, `die`d or panicked before replying; the real error is in the citizen's log, never on the wire |
+| 16 | `HANDLER_CANCELLED` | the citizen shut down or reloaded while the handler was still running |
+
+Before mix 0.94.0 the last two answered `rc 1` and `rc 2`, which this section
+defines as delivered-with-warning success, so a `$rc >= 10` check missed them.
+See [handler fault isolation](serve.md#handler-fault-isolation-the-per-request-boundary).
+
 ## `send` and the verified session lane
 
 A locally registered service can be addressed two ways, and only one of them

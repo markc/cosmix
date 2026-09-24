@@ -1916,6 +1916,44 @@ mod tests {
         assert_eq!(field(&reply, "command"), Value::String("x.y".into()));
     }
 
+    /// The serve runtime's own synthetic refusals — a faulting handler
+    /// (HANDLER_FAULT, rc 15) and a handler cancelled by shutdown/reload
+    /// (HANDLER_CANCELLED, rc 16) — reach a sender in the application-error
+    /// band with the message in `$result` on the JSON-body route, the whole
+    /// object in `$result` on the header route, and `error_code` readable in
+    /// `$reply` on both. Built from the evaluator's wire constants so the
+    /// caller side is tested against exactly what the citizen sends.
+    #[test]
+    fn serve_synthetic_refusals_read_as_errors_with_error_code() {
+        use cosmix_mix::evaluator::{
+            HANDLER_FAULT_BODY, HANDLER_FAULT_RC, SHUTDOWN_SYNTH_BODY, SHUTDOWN_SYNTH_RC,
+        };
+        for (rc, body, code, msg) in [
+            (HANDLER_FAULT_RC, HANDLER_FAULT_BODY, "HANDLER_FAULT", "internal handler error"),
+            (
+                SHUTDOWN_SYNTH_RC,
+                SHUTDOWN_SYNTH_BODY,
+                "HANDLER_CANCELLED",
+                "service shutting down; handler cancelled before replying",
+            ),
+        ] {
+            assert!(rc >= 10, "{code}: rc {rc} would read as success to a `$rc >= 10` caller");
+            // JSON-body route: $rc preserved, $result the message, $reply the object.
+            let (trc, tresult, treply) = typed_reply(rc, body.into(), None);
+            assert_eq!(trc, i32::from(rc), "{code}: JSON-body $rc");
+            assert_eq!(tresult, Value::String(msg.into()), "{code}: JSON-body $result");
+            assert_eq!(field(&treply, "error_code"), Value::String(code.into()), "{code}: JSON-body $reply");
+            assert_eq!(field(&treply, "error"), Value::String(msg.into()), "{code}: JSON-body $reply.error");
+            // Header route: $rc preserved, $result AND $reply the object.
+            let (hrc, hresult, hreply) = headers_reply(rc, body.into(), None);
+            assert_eq!(hrc, i32::from(rc), "{code}: header $rc");
+            assert_eq!(field(&hresult, "error_code"), Value::String(code.into()), "{code}: header $result");
+            assert_eq!(field(&hresult, "error"), Value::String(msg.into()), "{code}: header $result.error");
+            assert_eq!(field(&hreply, "error_code"), Value::String(code.into()), "{code}: header $reply");
+            assert_eq!(field(&hreply, "error"), Value::String(msg.into()), "{code}: header $reply.error");
+        }
+    }
+
     /// One parse, one conversion: a success body's `$result` and `$reply` are
     /// the SAME map allocation (an Rc clone), on both routes, and so is a
     /// header-route `error_code` refusal's.

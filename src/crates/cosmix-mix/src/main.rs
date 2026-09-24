@@ -1133,7 +1133,7 @@ fn init_serve_tracing() -> cosmix_log::LogHandle {
     // socket is present (true on any systemd box) so a supervised citizen
     // doesn't double-log. That is right under systemd, but it means an
     // INTERACTIVE `mix --serve foo.mix` in a terminal shows NOTHING — a
-    // handler fault answers the caller the fixed `internal handler error`
+    // handler fault answers the caller the fixed rc 15 HANDLER_FAULT reply
     // (the §3.4 wire-masking is deliberate; the real error is a
     // `tracing::error!`) and the developer never sees the real error. So
     // when stderr is a TTY (a foreground dev run, never a systemd unit),

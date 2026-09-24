@@ -234,7 +234,10 @@ deploy the runtime before the scripts.
 (`0..=255`) is an **application error** carried to the caller's `$rc`/`$result` —
 distinct from a transport failure. `reply` is only valid inside a handler
 servicing a request; calling it for a topic delivery (which has no caller) is a
-hard error.
+hard error. `rc` 15 and 16 are the runtime's own (`HANDLER_FAULT` and
+`HANDLER_CANCELLED`, see [handler fault isolation](#handler-fault-isolation-the-per-request-boundary));
+pick another `rc >= 10` for your own refusals, and treat `error_code` as the
+authoritative signal.
 
 ```mix
 on do.validate
@@ -340,11 +343,26 @@ end
 ```
 
 **What the caller sees vs. what you debug with.** The caller's reply is a
-**fixed** `rc=1`, `internal handler error` — the real error message is
-deliberately **not** put on the wire (it can carry request data or
-Trojan-Source bytes, and a peer in the mesh is not automatically trusted). The
-real error — with the command, handler index, and the failing line — is
-**logged instead**, and that's where you debug:
+**fixed** `rc=15` with the body
+`{"error": "internal handler error", "error_code": "HANDLER_FAULT"}`. That is in
+the application-error band, so the usual `$rc >= 10` check catches it; on an
+ordinary send `$result` is `internal handler error`, and on every route
+`$reply.error_code == "HANDLER_FAULT"` (see [Reading `$rc`](bus.md#reading-rc-ok-vs-application-error-vs-transport-failure)).
+Before mix 0.94.0 this reply was `rc=1`, which the Bus contract reads as
+delivered-with-warning *success*: a caller testing `$rc >= 10` took a crashed
+handler for a working one.
+
+```mix
+send risky risky.op body="not a number"
+if $rc >= 10 and $reply.error_code == "HANDLER_FAULT" then
+  print("the citizen's handler crashed; its log has the real error")
+end
+```
+
+The real error message is deliberately **not** put on the wire (it can carry
+request data or Trojan-Source bytes, and a peer in the mesh is not
+automatically trusted). The real error — with the command, handler index, and
+the failing line — is **logged instead**, and that's where you debug:
 
 - **Interactive** (`mix --serve foo.mix` in a terminal): faults print straight
   to the terminal, e.g. `ERROR … Handler body errored … command=risky.op
@@ -519,8 +537,11 @@ bad edit can do is a logged revert. Things to know:
   memory.
 - **A request in flight across the swap gets a terminal reply, not
   silence.** When the old generation is retired its pending requests are
-  answered with a shutdown-flavoured reply (the connection is live, so the
-  caller is never left hanging to its own timeout). SIGTERM/Ctrl-C during a
+  answered with `rc=16` and `error_code` `HANDLER_CANCELLED` (the connection
+  is live, so the caller is never left hanging to its own timeout; before mix
+  0.94.0 this reply was `rc=2`, which read as success). The reply says the
+  handler was cancelled before replying, not that it did nothing: any side
+  effects it made before that point stand. SIGTERM/Ctrl-C during a
   reload's init still shuts the citizen down cleanly, and a new init body
   that fails after admitting traffic has its spawned handlers cancelled
   before the old generation resumes.
@@ -669,7 +690,7 @@ resident `--serve` daemon is what requires the broker to be up.
 | Init | top-level body runs **once**, then the pump runs forever |
 | Reserved (injected) | `HELP`, `INFO`, `QUIT`, `<svc>.props.{get,list,describe}` |
 | Author can override reserved? | **No** — runtime wins (pre-dispatch intercept) |
-| Handler fault | caught per-request, logged, error reply, pump continues |
+| Handler fault | caught per-request, logged, `rc=15` `HANDLER_FAULT` reply, pump continues |
 | Slow downstream + concurrent callers | mark the handler `async` (Class C) |
 | Sync cycle A→B→A | prohibited — deadlocks; break with `emit` + topic reply |
 | Shutdown | `SIGTERM` / Ctrl-C / `QUIT` → deregister → exit 0 |
