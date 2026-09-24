@@ -574,6 +574,15 @@ for a success (the same value as <code>$result</code>) or a refusal of either di
 One limit: a target reached over its <strong>local Unix port</strong> (a sibling
 user-service, not the broker) reports a refusal as a message only, so there
 <code>$reply</code> is <code>nil</code> for a refusal. (0.92.0)</p>
+<p><strong><code>$rc</code>, <code>$result</code> and <code>$reply</code> are shared, not per-call.</strong> A <code>send</code> updates the
+existing variable of that name — and once a top-level <code>send</code> has created them,
+that is the script's global, so a <code>send</code> inside a function or an <code>on</code> handler
+overwrites it too. In a <code>mix --serve</code> citizen whose async handlers interleave,
+handler A can <code>send</code>, yield, and read back the <code>$rc</code>/<code>$result</code>/<code>$reply</code> of
+handler B's send. (<code>$event</code> does NOT have this problem: each handler invocation
+gets its own.) Until these get per-invocation binding, read them immediately
+after the <code>send</code>, or capture the reply with the expression form —
+<code>$r = send svc cmd</code> — and copy <code>$rc</code> into a local before the next await.</p>
 <p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
 with <code>on</code> handlers) that receives a request for a command it has no handler
 for refuses it immediately with <code>rc 10</code> and a structured body —

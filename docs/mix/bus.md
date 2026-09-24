@@ -172,6 +172,16 @@ One limit: a target reached over its **local Unix port** (a sibling
 user-service, not the broker) reports a refusal as a message only, so there
 `$reply` is `nil` for a refusal. (0.92.0)
 
+**`$rc`, `$result` and `$reply` are shared, not per-call.** A `send` updates the
+existing variable of that name — and once a top-level `send` has created them,
+that is the script's global, so a `send` inside a function or an `on` handler
+overwrites it too. In a `mix --serve` citizen whose async handlers interleave,
+handler A can `send`, yield, and read back the `$rc`/`$result`/`$reply` of
+handler B's send. (`$event` does NOT have this problem: each handler invocation
+gets its own.) Until these get per-invocation binding, read them immediately
+after the `send`, or capture the reply with the expression form —
+`$r = send svc cmd` — and copy `$rc` into a local before the next await.
+
 **A wrong verb name answers at once.** A `mix --serve` citizen (or any script
 with `on` handlers) that receives a request for a command it has no handler
 for refuses it immediately with `rc 10` and a structured body —

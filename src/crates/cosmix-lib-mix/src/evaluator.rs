@@ -14835,7 +14835,8 @@ impl Evaluator {
             Self::rewrap_functions(&mut ret, &env);
             return ret;
         }
-        const EXCLUDED_VARS: &[&str] = &["rc", "result", "status", "event"];
+        // `reply` joins `rc`/`result`: `send` binds all three (0.92.0).
+        const EXCLUDED_VARS: &[&str] = &["rc", "result", "reply", "status", "event"];
         let mut exports = IndexMap::new();
         for (name, f) in wrapped {
             if !name.starts_with('_') {
