@@ -14,13 +14,16 @@ the shell-first classifier is in `cosmix-mix/src/shell.rs`.
 
 ```text
 $ mix --version
-mix 0.89.1 (f886d310df76)
+mix 0.89.1 (f886d310df76, built 2026-09-21T03:14:00Z)
 ```
 
 The line carries the short git sha of the build, suffixed `-dirty` when the
-tree was modified at compile time — a semver alone cannot tell a stale binary
-from a fresh one. `mix --version --json` gives the same provenance
-machine-readably, including the full 40-hex `git_sha_full`.
+tree was modified at compile time, and the build time — a semver alone cannot
+tell a stale binary from a fresh one. It is the shape every cosmix binary
+answers with, except that mix names itself `mix` rather than its crate
+`cosmix-mix`. `mix --version --json` gives the same provenance
+machine-readably (`component`, `version`, `git_sha`, `git_sha_full`,
+`git_dirty`, `build_time`).
 
 **A version query does nothing else.** It is answered before the base-env
 capture, the native-session lane, Bus dispatch and the evaluation thread, so it

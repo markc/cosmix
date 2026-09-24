@@ -12,7 +12,8 @@ cosmix-wgd [--iface NAME] [--self NAME] [--interval SECONDS]
 
 The parser accepts no positional arguments. An unknown argument or a missing flag value prints an error and returns status 2.
 
-`--version` and `-V` print the package version and exit successfully.
+`--version` and `-V` print the package version, git revision and build time,
+and exit successfully.
 
 The binary does not implement a help flag.
 

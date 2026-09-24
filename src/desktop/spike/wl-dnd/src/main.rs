@@ -50,6 +50,8 @@ const PAYLOAD_PATH: &str = "/tmp/wl-dnd-spike-payload.txt";
 const PAYLOAD_TEXT: &str = "wl-dnd-spike test payload\n";
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let reactive_ms = env::var("WLDND_REACTIVE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())

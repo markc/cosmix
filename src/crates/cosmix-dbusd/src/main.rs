@@ -25,6 +25,8 @@ enum Command {
 const RUNTIME_STOP: Duration = Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let command = Cli::parse().command;
     // Tokio's default worker count follows the cgroup CPU quota, so a
     // 1-CPU quota yields ONE worker — and a single never-yielding

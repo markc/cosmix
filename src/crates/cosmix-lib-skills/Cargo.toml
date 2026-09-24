@@ -15,6 +15,8 @@ name = "cosmix-skills-cli"
 path = "src/cli.rs"
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config" }
 cosmix_llm = { package = "cosmix-lib-llm", path = "../cosmix-lib-llm" }
 anyhow.workspace = true
@@ -26,3 +28,6 @@ chrono.workspace = true
 clap.workspace = true
 tracing-subscriber.workspace = true
 directories.workspace = true
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

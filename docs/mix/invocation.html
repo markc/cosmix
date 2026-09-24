@@ -453,12 +453,15 @@ line runs as Mix code or dispatches a shell command.</p>
 lives in <a href="https://github.com/markc/cosmix/blob/main/src/crates/cosmix-mix/src/main.rs"><code>cosmix-mix/src/main.rs</code></a>;
 the shell-first classifier is in <code>cosmix-mix/src/shell.rs</code>.</p>
 <pre><code class="language-text">$ mix --version
-mix 0.89.1 (f886d310df76)
+mix 0.89.1 (f886d310df76, built 2026-09-21T03:14:00Z)
 </code></pre>
 <p>The line carries the short git sha of the build, suffixed <code>-dirty</code> when the
-tree was modified at compile time — a semver alone cannot tell a stale binary
-from a fresh one. <code>mix --version --json</code> gives the same provenance
-machine-readably, including the full 40-hex <code>git_sha_full</code>.</p>
+tree was modified at compile time, and the build time — a semver alone cannot
+tell a stale binary from a fresh one. It is the shape every cosmix binary
+answers with, except that mix names itself <code>mix</code> rather than its crate
+<code>cosmix-mix</code>. <code>mix --version --json</code> gives the same provenance
+machine-readably (<code>component</code>, <code>version</code>, <code>git_sha</code>, <code>git_sha_full</code>,
+<code>git_dirty</code>, <code>build_time</code>).</p>
 <p><strong>A version query does nothing else.</strong> It is answered before the base-env
 capture, the native-session lane, Bus dispatch and the evaluation thread, so it
 neither starts a session nor disturbs one: <code>mix --version</code> is truthful and

@@ -478,8 +478,11 @@ pub fn version_line(version: &str) -> String {
     format!("mix {version}")
 }
 
-/// The version line plus this build's provenance: `mix 0.89.0 (a1b2c3d)`,
-/// suffixed `-dirty` when the tree was modified at compile time.
+/// The version line plus this build's provenance:
+/// `mix 0.89.0 (a1b2c3d4e5f6, built 2026-09-25T00:00:00Z)`, the sha suffixed
+/// `-dirty` when the tree was modified at compile time — the same shape as
+/// every other cosmix binary (`cosmix_buildinfo::BuildInfo::line`), except
+/// that it names the binary `mix` rather than the crate.
 ///
 /// A semver alone is too weak a "what build is this?" signal — a forgotten
 /// bump hides a real change (the 2026-06-01 stale-binary incident, which is
@@ -491,7 +494,10 @@ pub fn version_line(version: &str) -> String {
 pub fn version_line_build(version: &str) -> String {
     let bi = cosmix_buildinfo::build_info!();
     let dirty = if bi.git_dirty { "-dirty" } else { "" };
-    format!("mix {version} ({}{dirty})", bi.git_sha)
+    format!(
+        "mix {version} ({}{dirty}, built {})",
+        bi.git_sha, bi.build_time
+    )
 }
 
 /// Answer a version query, or `None` when argv is not one.
@@ -517,6 +523,11 @@ pub fn version_request(args: &[String], version: &str) -> Option<String> {
         let bi = cosmix_buildinfo::build_info!();
         return Some(
             serde_json::json!({
+                // The binary's name, matching the text line's first field
+                // (the substrate-wide shape names the component; mix is the
+                // one binary that answers with its binary name, not its
+                // crate name `cosmix-mix`).
+                "component": "mix",
                 "version": version,
                 "git_sha": bi.git_sha,
                 "git_sha_full": bi.git_sha_full,
@@ -3496,11 +3507,14 @@ mod version_line_tests {
         let out = version_request(&argv(&["--version"]), "9.9.9").expect("a version request");
         assert!(out.starts_with("mix 9.9.9 ("), "got {out:?}");
         assert!(out.ends_with(')'), "got {out:?}");
-        let sha = out
+        let (sha, built) = out
             .trim_start_matches("mix 9.9.9 (")
             .trim_end_matches(')')
-            .trim_end_matches("-dirty");
+            .split_once(", built ")
+            .unwrap_or_else(|| panic!("no `, built <time>` in {out:?}"));
+        let sha = sha.trim_end_matches("-dirty");
         assert!(!sha.is_empty(), "build hash must not be blank: {out:?}");
+        assert!(!built.is_empty(), "build time must not be blank: {out:?}");
         assert_eq!(version_request(&argv(&["-V"]), "9.9.9"), Some(out));
     }
 
@@ -3512,6 +3526,7 @@ mod version_line_tests {
             version_request(&argv(&["--version", "--json"]), "9.9.9").expect("a version request");
         let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(v["version"], "9.9.9");
+        assert_eq!(v["component"], "mix");
         for key in ["git_sha", "git_sha_full", "git_dirty", "build_time"] {
             assert!(!v[key].is_null(), "missing {key} in {out}");
         }

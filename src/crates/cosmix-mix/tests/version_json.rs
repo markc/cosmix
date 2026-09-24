@@ -21,6 +21,9 @@ fn version_json_shape_and_full_sha() {
         keys,
         [
             "build_time",
+            // Added with the substrate-wide --version contract: the JSON
+            // names its component like every other cosmix binary's.
+            "component",
             "git_dirty",
             "git_sha",
             "git_sha_full",

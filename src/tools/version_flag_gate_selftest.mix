@@ -1,0 +1,181 @@
+# version_flag_gate_selftest.mix — prove version_flag_gate.mix still fails.
+#
+# A gate nobody has watched fail is not yet a gate. This builds a fake pair of
+# workspaces in a temp dir whose "binaries" are shell scripts, one per branch
+# of the gate, runs the gate over them, and asserts every binary's verdict,
+# the reason each FAIL names, the summary counts, and exit 1. No cargo build:
+# the gate only needs `cargo metadata` and the files in target/release.
+#
+#   okbin        PASS  conforming, -dirty sha
+#   badsemver    FAIL  semver differs from Cargo.toml
+#   stale        FAIL  sha differs from the expected HEAD
+#   unknownsha   FAIL  "unknown" sha (no build.rs emit)
+#   noclose      FAIL  no closing paren
+#   nobuilt      FAIL  no ", built <rfc3339>"
+#   wsstderr     FAIL  whitespace-only stderr
+#   hang         FAIL  exceeds the 5 s deadline
+#   extra        FAIL  an extra line that is not key: value
+#   wrongname    FAIL  names neither its crate nor an allowlisted alias
+#   jsonbad      FAIL  --json disagrees with the text line
+#   jsonmissing  FAIL  --json lacks a required key
+#   forker       FAIL  forks, so fails under the thread-starvation probe
+#                      (PASS when the gate reports the probe as skipped)
+#   mix          PASS  the allowlisted alias mix -> cosmix-mix
+#   optional     SKIP  required-features outside default, not built
+#   comp4        PASS  comp's four-line shape (desktop workspace)
+#   cosmix-foreman SKIP decommissioned, not a member
+#
+# Usage (from $COSMIX/src): mix tools/version_flag_gate_selftest.mix [--gate PATH]
+# Exit 0 = the gate behaved exactly as expected; 1 = it did not.
+
+$argv = args()
+$gate = "tools/version_flag_gate.mix"
+if len($argv) == 2 and $argv[0] == "--gate" then
+    $gate = $argv[1]
+elif len($argv) != 0 then
+    print("usage: mix tools/version_flag_gate_selftest.mix [--gate PATH]")
+    exit(2)
+end
+if !exists($gate) and env("COSMIX") != nil then
+    $gate = env("COSMIX") + "/src/tools/version_flag_gate.mix"
+end
+if !exists($gate) then
+    print("selftest: gate not found; run from \$COSMIX/src or pass --gate PATH")
+    exit(2)
+end
+$mix = which("mix") ?? "/opt/cosmix/bin/mix"
+
+$tmp = env("TMPDIR") ?? ""
+if $tmp == "" then
+    $tmp = "/tmp"
+end
+$root = $tmp + "/vfg-selftest-" + to_string(pid())
+remove_dir($root)
+$SHA = "abcdef012345"
+$T = "2026-01-01T00:00:00Z"
+
+fn manifest($dir, $name, $extra)
+    mkdir($dir + "/" + $name + "/src")
+    write_file($dir + "/" + $name + "/Cargo.toml", "[package]\nname = \"" + $name + "\"\nversion = \"1.2.3\"\nedition = \"2021\"\n" + $extra)
+    write_file($dir + "/" + $name + "/src/main.rs", "fn main() {}\n")
+end
+
+fn script($path, $body)
+    write_file($path, "#!/bin/sh\n" + $body)
+    chmod($path, 493)
+end
+
+# A binary that prints $line for --version/-V and $json for --version --json,
+# after running $prelude.
+fn standard($path, $prelude, $line, $json)
+    script($path, $prelude + "\ncase \"$*\" in\n  *--json*) printf '%s\\n' '" + $json + "' ;;\n  *) printf '%s\\n' '" + $line + "' ;;\nesac\n")
+end
+
+fn obj($name, $version, $sha, $dirty, $built)
+    return "{\"component\":\"" + $name + "\",\"version\":\"" + $version + "\",\"git_sha\":\"" + $sha + "\",\"git_dirty\":" + $dirty + ",\"build_time\":\"" + $built + "\"}"
+end
+
+$members = ["okbin", "badsemver", "stale", "unknownsha", "noclose", "nobuilt", "wsstderr", "hang", "extra", "wrongname", "jsonbad", "jsonmissing", "forker", "cosmix-mix", "optional"]
+for $m in $members
+    manifest($root, $m, "")
+end
+manifest($root, "cosmix-mix", "[[bin]]\nname = \"mix\"\npath = \"src/main.rs\"\n")
+manifest($root, "optional", "[features]\nopt = []\n[[bin]]\nname = \"optional\"\npath = \"src/main.rs\"\nrequired-features = [\"opt\"]\n")
+$quoted = []
+for $m in $members
+    push($quoted, "\"" + $m + "\"")
+end
+write_file($root + "/Cargo.toml", "[workspace]\nmembers = [" + join($quoted, ", ") + "]\nresolver = \"2\"\n")
+manifest($root + "/desktop", "comp4", "")
+write_file($root + "/desktop/Cargo.toml", "[workspace]\nmembers = [\"comp4\"]\nresolver = \"2\"\n")
+mkdir($root + "/crates/cosmix-foreman")
+
+$R = $root + "/target/release/"
+mkdir($R)
+mkdir($root + "/desktop/target/release")
+standard($R + "okbin", "", "okbin 1.2.3 (" + $SHA + "-dirty, built " + $T + ")", obj("okbin", "1.2.3", $SHA, "true", $T))
+standard($R + "badsemver", "", "badsemver 1.2.2 (" + $SHA + ", built " + $T + ")", obj("badsemver", "1.2.2", $SHA, "false", $T))
+standard($R + "stale", "", "stale 1.2.3 (0000000000aa, built " + $T + ")", obj("stale", "1.2.3", "0000000000aa", "false", $T))
+standard($R + "unknownsha", "", "unknownsha 1.2.3 (unknown, built unknown)", "{}")
+standard($R + "noclose", "", "noclose 1.2.3 (" + $SHA + ",garbage", "{}")
+standard($R + "nobuilt", "", "nobuilt 1.2.3 (" + $SHA + ")", "{}")
+standard($R + "wsstderr", "printf ' ' >&2", "wsstderr 1.2.3 (" + $SHA + ", built " + $T + ")", obj("wsstderr", "1.2.3", $SHA, "false", $T))
+script($R + "hang", "sleep 30\n")
+script($R + "extra", "printf '%s\\n' 'extra 1.2.3 (" + $SHA + ", built " + $T + ")' 'Not a key line'\n")
+standard($R + "wrongname", "", "other 1.2.3 (" + $SHA + ", built " + $T + ")", obj("other", "1.2.3", $SHA, "false", $T))
+standard($R + "jsonbad", "", "jsonbad 1.2.3 (" + $SHA + ", built " + $T + ")", obj("jsonbad", "9.9.9", $SHA, "false", $T))
+standard($R + "jsonmissing", "", "jsonmissing 1.2.3 (" + $SHA + ", built " + $T + ")", "{\"component\":\"jsonmissing\"}")
+standard($R + "forker", "/bin/true & wait", "forker 1.2.3 (" + $SHA + ", built " + $T + ")", obj("forker", "1.2.3", $SHA, "false", $T))
+standard($R + "mix", "", "mix 1.2.3 (" + $SHA + ", built " + $T + ")", obj("mix", "1.2.3", $SHA, "false", $T))
+script($root + "/desktop/target/release/comp4", "case \"$*\" in\n  *--json*) printf '%s\\n' '" + obj("comp4", "1.2.3", $SHA, "false", $T) + "' ;;\n  *) printf '%s\\n' 'comp4 1.2.3 (" + $SHA + ", built " + $T + ")' 'commit: x' 'features: bus' 'profile: release' ;;\nesac\n")
+
+$r = run_argv([$mix, $gate, "--src", $root, "--expect-sha", $SHA], {timeout: 180})
+$out = $r.stdout
+print(rtrim($out))
+
+$probe_ran = contains($out, "\nPROBE thread-starvation arm: ") or starts_with($out, "PROBE thread-starvation arm: ")
+$forker_want = "FAIL|under "
+$want_pass = 3
+$want_fail = 12
+if !$probe_ran then
+    $forker_want = "PASS|"
+    $want_pass = 4
+    $want_fail = 11
+    print("selftest: the gate reported the starvation probe as skipped, so forker is expected to PASS")
+end
+
+# label -> "VERDICT|reason substring"
+$expect = {
+    "okbin (okbin)": "PASS|",
+    "badsemver (badsemver)": "FAIL|semver 1.2.2 != Cargo.toml 1.2.3",
+    "stale (stale)": "FAIL|sha 0000000000aa != expected " + $SHA,
+    "unknownsha (unknownsha)": "FAIL|first line does not match",
+    "noclose (noclose)": "FAIL|first line does not match",
+    "nobuilt (nobuilt)": "FAIL|first line does not match",
+    "wsstderr (wsstderr)": "FAIL|wrote to stderr",
+    "hang (hang)": "FAIL|timed out after 5 s",
+    "extra (extra)": "FAIL|extra stdout line is not 'key: value'",
+    "wrongname (wrongname)": "FAIL|name 'other' is not crate 'wrongname'",
+    "jsonbad (jsonbad)": "FAIL|--version --json disagrees with the text line",
+    "jsonmissing (jsonmissing)": "FAIL|--version --json lacks 'version'",
+    "forker (forker)": $forker_want,
+    "mix (cosmix-mix)": "PASS|",
+    "optional (optional)": "SKIP|required-features outside default",
+    "comp4 (comp4)": "PASS|",
+    "cosmix-foreman": "SKIP|decommissioned"
+}
+
+$bad = []
+$lines = split($out, "\n")
+for $label in keys($expect)
+    $spec = split($expect[$label], "|")
+    $verdict = $spec[0]
+    $reason = $spec[1]
+    $found = nil
+    for $l in $lines
+        if starts_with($l, $verdict + " " + $label + ":") then
+            $found = $l
+        end
+    end
+    if $found == nil then
+        push($bad, "no '" + $verdict + " " + $label + "' line")
+    elif $reason != "" and !contains($found, $reason) then
+        push($bad, $label + " failed for the wrong reason: " + $found)
+    end
+end
+$summary = "version_flag_gate: ${want_pass} pass, ${want_fail} fail, 2 skipped"
+if !contains($out, $summary) then
+    push($bad, "summary is not '" + $summary + "'")
+end
+if $r.exit_code != 1 then
+    push($bad, "gate exit ${r.exit_code}, want 1")
+end
+
+remove_dir($root)
+if len($bad) > 0 then
+    for $b in $bad
+        print("SELFTEST FAIL: " + $b)
+    end
+    exit(1)
+end
+print("version_flag_gate_selftest: OK — every branch fired as expected (${want_pass} pass, ${want_fail} fail, 2 skipped, exit 1)")

@@ -19,7 +19,7 @@ cosmix-dnsd --zones <zones.mix> --state <state-file> \
 | `--listen <ip:port>` | yes | UDP and TCP listen address. Repeat for multiple addresses. |
 | `--allow-non-loopback-listen` | no | Allows a non-loopback address in standalone mode or when trusted node configuration is unavailable. |
 | `-h`, `--help` | no | Prints the usage string and exits with status `2`. |
-| `-V`, `--version` | no | Prints the package name and version, then exits successfully. |
+| `-V`, `--version` | no | Prints the package name, version, git revision and build time, then exits successfully. |
 
 Hostnames are not accepted by `--listen`; the value parses as a socket address.
 Use brackets around IPv6 addresses, for example `[::1]:5353`.

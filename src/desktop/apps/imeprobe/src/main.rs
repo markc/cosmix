@@ -431,6 +431,10 @@ impl Dispatch<XdgActivationTokenV1, ()> for App {
 delegate_noop!(App: ignore ZwpInputPopupSurfaceV2);
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect. `leading`
+    // (argv[1] only): --commit TEXT take free strings with no `--` escape,
+    // so a value spelled --version must reach the parser, not this check.
+    cosmix_buildinfo::exit_on_version!(leading);
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {

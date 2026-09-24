@@ -1525,6 +1525,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-config",
  "cosmix-lib-llm",
  "directories",
@@ -1637,6 +1638,7 @@ version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-maild-rules",
@@ -1654,6 +1656,7 @@ name = "cosmix-maild-rules"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "cosmix-lib-mix",
@@ -1699,6 +1702,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
  "cosmix-lib-client",
  "humantime",
@@ -1725,6 +1729,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-config",
  "cosmix-lib-mesh-trust",
  "cosmix-lib-wg",
@@ -1741,6 +1746,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cosmix-lib-buildinfo",
  "midly",
 ]
 
@@ -4512,6 +4518,7 @@ dependencies = [
 name = "mix-bench"
 version = "0.1.0"
 dependencies = [
+ "cosmix-lib-buildinfo",
  "cosmix-lib-mix",
  "tokio",
 ]

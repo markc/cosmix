@@ -366,8 +366,18 @@ const BENCH_REPLAY_SCRIPTS: &[&str] = &[
 
 const BENCH_REPLAY_ITERATIONS: u32 = 50;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
+    // --version/-V first, before the tokio runtime exists: a thread- or
+    // fd-starved host must still get an answer, not a runtime-build panic.
+    cosmix_buildinfo::exit_on_version!();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() {
     // `--json` is accepted for compatibility with program.md's invocation
     // shape; we don't actually emit JSON, but the loop driver may pass it.
     let _args: Vec<String> = env::args().skip(1).collect();

@@ -18,11 +18,16 @@ required-features = ["cli"]
 [features]
 # The CLI binary; library consumers take `default-features = false` and skip clap.
 default = ["cli"]
-cli = ["dep:clap"]
+cli = ["dep:clap", "dep:cosmix_buildinfo"]
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo", optional = true }
 # SMF (Standard MIDI File) read/write. The encode/decode cores are built on
 # this rather than a hand-rolled binary codec.
 midly = "0.5"
 clap = { workspace = true, optional = true }   # CLI flags (derive) — `cli` feature only
 anyhow.workspace = true
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

@@ -40,6 +40,10 @@ fn required_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
 struct OpenPending(bool);
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect. `leading`
+    // (argv[1] only): FILE/--directory/--service take free strings with no `--` escape,
+    // so a value spelled --version must reach the parser, not this check.
+    cosmix_buildinfo::exit_on_version!(leading);
     let mut options = Options {
         directory: std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -51,10 +55,6 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--version" => {
-                println!("cosmix-media {}", env!("CARGO_PKG_VERSION"));
-                return;
-            }
             "--help" => {
                 println!(
                     "cosmix-media [FILE] [--directory DIR] [--service NAME]\nNative Wayland/CTK MP3/MP4 player. Ctrl+O: open; Space: pause; arrows: seek 10s; M: mute; F: fullscreen; Escape: exit fullscreen.\nBus: media.open/play/pause/toggle/stop/seek/volume/mute/fullscreen/fullscreen.toggle/status/props.get/quit.\nRequires GStreamer playbin, appsink, pulsesink and file codecs. Video currently uses CPU RGBA upload."

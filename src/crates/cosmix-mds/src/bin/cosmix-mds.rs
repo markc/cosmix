@@ -278,6 +278,8 @@ struct VerifyResponse {
 }
 
 fn main() -> ExitCode {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let cli = Cli::parse();
     match run(cli, &mut std::io::stdout()) {
         Ok(()) => ExitCode::from(EXIT_OK),

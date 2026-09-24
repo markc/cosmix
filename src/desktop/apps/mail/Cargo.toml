@@ -27,6 +27,8 @@ name = "cosmix-mail"
 path = "src/main.rs"
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 bevy = { version = "=0.19.0", default-features = false, features = [
     "ui",
     "bevy_feathers",
@@ -43,3 +45,6 @@ ctk = { path = "../../ctk", features = ["body-view", "virtual-list"] }
 # against a hand-set flag. Cheaper than an errno literal that has to be right on
 # every target this app is ever built for.
 libc = "0.2"
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

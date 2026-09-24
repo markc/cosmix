@@ -25,6 +25,8 @@ use ctk::prelude::*;
 use identity::IDENTITY;
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let noded_url: Option<String> = app_port::parse_noded_url(&args)
         .unwrap_or_else(|error| {

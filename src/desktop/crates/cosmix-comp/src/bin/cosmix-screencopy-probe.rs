@@ -439,6 +439,10 @@ fn dispatch_until(
 }
 
 fn main() -> ExitCode {
+    // --version/-V: answer and exit 0 before any other side effect. `leading`
+    // (argv[1] only): --output/--drm-node take free strings with no `--` escape,
+    // so a value spelled --version must reach the parser, not this check.
+    cosmix_buildinfo::exit_on_version!(leading);
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

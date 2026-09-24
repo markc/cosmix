@@ -17,7 +17,9 @@ build provenance (the package line, full commit, enabled behaviour features,
 and the cargo profile) and exits successfully before opening any device,
 session, socket or Bus connection. It is recognised anywhere in the argument
 vector, including after the `kms-live` subcommand, and wins when combined with
-other options.
+other options. `--version --json` prints the same provenance as one JSON object
+(`component`, `version`, `git_sha`, `git_sha_full`, `git_dirty`, `build_time`,
+`features`, `profile`).
 
 ## KMS target-device changes (0.62.1)
 

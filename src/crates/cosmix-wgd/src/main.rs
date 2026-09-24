@@ -120,13 +120,19 @@ fn validate_iface(name: String) -> Result<String, String> {
     Ok(name)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // --version/-V first, before the tokio runtime exists: a thread- or
+    // fd-starved host must still get an answer, not a runtime-build panic.
+    cosmix_buildinfo::exit_on_version!();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!(concat!("cosmix-wgd ", env!("CARGO_PKG_VERSION")));
-        return ExitCode::SUCCESS;
-    }
     let opts = match parse_args(&args[1..]) {
         Ok(o) => o,
         Err(e) => {

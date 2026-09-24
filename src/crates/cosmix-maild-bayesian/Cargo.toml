@@ -19,6 +19,8 @@ core = []
 cosmix = ["dep:cosmix-lib-bus", "dep:cosmix-lib-client"]
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
 cosmix-maild-rules = { path = "../cosmix-maild-rules" }
 spamlite = { git = "https://github.com/markc/spamlite", rev = "98f91a9d8142f92ae89ba4f070a165ce86fa5e8d", default-features = false }
 rusqlite = { workspace = true }
@@ -32,3 +34,6 @@ chrono = { workspace = true }
 
 cosmix-lib-bus = { path = "../cosmix-lib-bus", optional = true }
 cosmix-lib-client = { path = "../cosmix-lib-client", features = ["native"], optional = true }
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

@@ -20,6 +20,8 @@ pub(crate) const IDENTITY: AppIdentity = AppIdentity {
 pub(crate) const BUS_SERVICE_NAME: &str = "interact-gui";
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {

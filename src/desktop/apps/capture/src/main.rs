@@ -96,10 +96,6 @@ fn options() -> Result<Option<Options>, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--version" => {
-                println!("cosmix-capture {}", env!("CARGO_PKG_VERSION"));
-                return Ok(None);
-            }
             "--help" => {
                 println!(
                     "cosmix-capture [--output NAME] [--directory /absolute/path] [--vaapi-device /dev/dri/renderD128]\nNative Bus service capture: capture.screenshot, capture.start {{fps:30}}, capture.stop, capture.status.\nRecordings automatically stop at 300 seconds. Files default to ~/Videos/Cosmix.\nEncoding defaults to software libx264. An explicit VAAPI device requires hardware H.264; failures never fall back."
@@ -389,8 +385,20 @@ fn request(command: &str, body: &str) -> Result<Option<JobRequest>, String> {
         _ => Err("unknown capture command".into()),
     }
 }
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), String> {
+fn main() -> Result<(), String> {
+    // --version/-V first, before the tokio runtime exists: a thread- or
+    // fd-starved host must still get an answer, not a runtime-build panic.
+    // `leading`: capture's option values are free strings with no `--`
+    // escape (`--output --version` names an output), so only argv[1] asks.
+    cosmix_buildinfo::exit_on_version!(leading);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), String> {
     let Some(options) = options()? else {
         return Ok(());
     };

@@ -99,6 +99,8 @@ fn load_config_file(
 }
 
 fn main() -> anyhow::Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     match Cli::parse().cmd {
         Cmd::Reconcile {
             config,

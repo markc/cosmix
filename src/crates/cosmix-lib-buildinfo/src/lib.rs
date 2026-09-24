@@ -31,7 +31,14 @@
 //! ```ignore
 //! fn main() { cosmix_lib_buildinfo::emit(); }
 //! ```
-//! In the crate:
+//! As `main`'s first statement in every binary (the `--version` contract):
+//! ```ignore
+//! fn main() {
+//!     cosmix_lib_buildinfo::exit_on_version!();
+//!     // ...
+//! }
+//! ```
+//! Elsewhere in the crate:
 //! ```ignore
 //! let bi = cosmix_lib_buildinfo::build_info!();
 //! println!("{} {} ({}{}, built {})", bi.pkg, bi.version, bi.git_sha,
@@ -75,6 +82,39 @@ impl BuildInfo {
             self.build_time,
         )
     }
+
+    /// Machine form of [`line`](Self::line): one JSON object carrying the
+    /// FULL sha, for gates that compare a recorded 40-hex commit (the short
+    /// sha can never satisfy an equality check). Keys match `mix --version
+    /// --json`, plus `component`.
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"component\":{},\"version\":{},\"git_sha\":{},\"git_sha_full\":{},\"git_dirty\":{},\"build_time\":{}}}",
+            json_str(self.pkg),
+            json_str(self.version),
+            json_str(self.git_sha),
+            json_str(self.git_sha_full),
+            self.git_dirty,
+            json_str(self.build_time),
+        )
+    }
+}
+
+/// A JSON string literal. The fields are compile-time crate metadata, but the
+/// encoder still escapes everything JSON requires, so it stays dep-free.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Construct a [`BuildInfo`] for the **calling** crate.
@@ -109,6 +149,111 @@ pub fn now_rfc3339() -> String {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     rfc3339_utc(secs)
+}
+
+// ── the `--version` contract ─────────────────────────────────────────
+
+/// Where in argv a version flag is honoured.
+///
+/// Every cosmix binary answers `--version`/`-V`; the only difference is how
+/// far into argv it looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionScope {
+    /// Anywhere before a bare `--`. The default: a daemon's exact systemd
+    /// unit argv (`cosmix-noded serve …`) can be reused with the flag
+    /// appended, which is how `cosmix-comp` has always parsed it.
+    Anywhere,
+    /// `argv[1]` only, for binaries that forward the rest of their argv to
+    /// something else — a terminal's `-e cmd --version` must run `cmd`.
+    Leading,
+}
+
+/// Answer a version query, or `None` when `args` (the whole argv, program
+/// name first) is not one. Scans with [`VersionScope::Anywhere`].
+///
+/// The answer is one line, `<pkg> <semver> (<sha12>[-dirty], built
+/// <rfc3339>)` — [`BuildInfo::line`]. With `--json` also present, it is one
+/// JSON object carrying the full sha instead.
+///
+/// `info` must come from [`build_info!`] expanded in the **binary's** crate,
+/// or the sha describes this library rather than the program.
+pub fn version_request(args: &[String], info: BuildInfo) -> Option<String> {
+    version_request_scoped(args, info, VersionScope::Anywhere)
+}
+
+/// [`version_request`] with an explicit [`VersionScope`].
+pub fn version_request_scoped(
+    args: &[String],
+    info: BuildInfo,
+    scope: VersionScope,
+) -> Option<String> {
+    let rest = args.get(1..).unwrap_or(&[]);
+    let (asked, json) = match scope {
+        VersionScope::Leading => (
+            matches!(rest.first().map(String::as_str), Some("--version" | "-V")),
+            rest.get(1).map(String::as_str) == Some("--json"),
+        ),
+        VersionScope::Anywhere => {
+            let before_dashdash = rest.iter().take_while(|a| a.as_str() != "--");
+            let mut asked = false;
+            let mut json = false;
+            for arg in before_dashdash {
+                match arg.as_str() {
+                    "--version" | "-V" => asked = true,
+                    "--json" => json = true,
+                    _ => {}
+                }
+            }
+            (asked, json)
+        }
+    };
+    if !asked {
+        return None;
+    }
+    Some(if json { info.json() } else { info.line() })
+}
+
+/// Handle `--version` for the running process: when argv asks for it, print
+/// the answer to stdout and exit 0; otherwise return and let `main` carry on.
+///
+/// Call it as `main`'s FIRST statement — before the async runtime (so never
+/// under `#[tokio::main]`, which builds the runtime before the body runs and
+/// panics on a thread-starved host), config reads, logging, fd quarantine,
+/// display checks, Bus connections or windows — so the answer can
+/// never depend on startup succeeding and a second copy of a running program
+/// answers truthfully. Prefer the [`exit_on_version!`] macro, which expands
+/// [`build_info!`] in the caller for you. Non-UTF-8 arguments are compared
+/// lossily; they can never spell a version flag, so nothing is lost.
+pub fn exit_on_version(info: BuildInfo, scope: VersionScope) {
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Some(text) = version_request_scoped(&args, info, scope) {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        // A closed stdout (`bin --version | head -0`) is not a reason to
+        // panic; the exit status is still the contract.
+        let _ = writeln!(out, "{text}");
+        let _ = out.flush();
+        std::process::exit(0);
+    }
+}
+
+/// `main`'s first line in every cosmix binary: answer `--version`/`-V` and
+/// exit 0, or fall through. Expands [`build_info!`] HERE, in the binary's
+/// crate, so the reported sha is the binary's.
+///
+/// `exit_on_version!()` scans the whole argv ([`VersionScope::Anywhere`]);
+/// `exit_on_version!(leading)` looks at `argv[1]` only, for programs that
+/// forward their argv.
+#[macro_export]
+macro_rules! exit_on_version {
+    () => {
+        $crate::exit_on_version($crate::build_info!(), $crate::VersionScope::Anywhere)
+    };
+    (leading) => {
+        $crate::exit_on_version($crate::build_info!(), $crate::VersionScope::Leading)
+    };
 }
 
 // ── build.rs helper ──────────────────────────────────────────────────
@@ -270,6 +415,69 @@ mod tests {
             bi.line(),
             "cosmix-demo 1.2.3 (abc123def456-dirty, built 2026-06-01T00:00:00Z)"
         );
+    }
+
+    fn demo() -> BuildInfo {
+        BuildInfo {
+            pkg: "cosmix-demo",
+            version: "1.2.3",
+            git_sha: "abc123def456",
+            git_sha_full: "abc123def456abc123def456abc123def456abc1",
+            git_dirty: false,
+            build_time: "2026-06-01T00:00:00Z",
+        }
+    }
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("demo")
+            .chain(rest.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn version_request_answers_both_spellings_with_one_line() {
+        let want = "cosmix-demo 1.2.3 (abc123def456, built 2026-06-01T00:00:00Z)";
+        for flag in ["--version", "-V"] {
+            let out = version_request(&argv(&[flag]), demo()).expect("a version request");
+            assert_eq!(out, want);
+            assert_eq!(out.lines().count(), 1);
+        }
+    }
+
+    #[test]
+    fn anywhere_scope_honours_the_flag_after_a_unit_argv_but_not_after_dashdash() {
+        assert!(version_request(&argv(&["serve", "--config", "x", "--version"]), demo()).is_some());
+        assert!(version_request(&argv(&["run", "--", "cmd", "--version"]), demo()).is_none());
+        assert!(version_request(&argv(&[]), demo()).is_none());
+        assert!(version_request(&argv(&["--versionx"]), demo()).is_none());
+        // argv[0] is the program, never a flag.
+        assert!(version_request(&["--version".to_string()], demo()).is_none());
+    }
+
+    #[test]
+    fn leading_scope_only_reads_argv1() {
+        let s = VersionScope::Leading;
+        assert!(version_request_scoped(&argv(&["-V"]), demo(), s).is_some());
+        assert!(version_request_scoped(&argv(&["-e", "cmd", "--version"]), demo(), s).is_none());
+    }
+
+    #[test]
+    fn json_form_carries_the_full_sha_and_escapes() {
+        let out = version_request(&argv(&["--version", "--json"]), demo()).expect("json");
+        assert_eq!(
+            out,
+            "{\"component\":\"cosmix-demo\",\"version\":\"1.2.3\",\"git_sha\":\"abc123def456\",\
+             \"git_sha_full\":\"abc123def456abc123def456abc123def456abc1\",\"git_dirty\":false,\
+             \"build_time\":\"2026-06-01T00:00:00Z\"}"
+        );
+        assert_eq!(json_str("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
+        // Leading scope reads --json only from argv[2].
+        let s = VersionScope::Leading;
+        let leading = version_request_scoped(&argv(&["--version", "--json"]), demo(), s);
+        assert!(leading.expect("json").starts_with('{'));
+        let not_json = version_request_scoped(&argv(&["--version", "x", "--json"]), demo(), s);
+        assert!(!not_json.expect("line").starts_with('{'));
     }
 
     #[test]

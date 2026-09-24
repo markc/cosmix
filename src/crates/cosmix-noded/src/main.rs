@@ -81,8 +81,18 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // --version/-V first, before the tokio runtime exists: a thread- or
+    // fd-starved host must still get an answer, not a runtime-build panic.
+    cosmix_buildinfo::exit_on_version!();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _log = cosmix_log::init(
         &cosmix_log::LogOpts::default(),
         &cosmix_log::StatsOpts::default(),

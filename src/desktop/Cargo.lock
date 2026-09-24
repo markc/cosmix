@@ -3026,6 +3026,7 @@ name = "cosmix-busviewer"
 version = "0.1.1"
 dependencies = [
  "bevy",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-client",
  "ctk",
  "flume",
@@ -3132,6 +3133,7 @@ dependencies = [
 name = "cosmix-imeprobe"
 version = "0.2.0"
 dependencies = [
+ "cosmix-lib-buildinfo",
  "rustix 1.1.4",
  "wayland-client",
  "wayland-protocols",
@@ -3295,6 +3297,7 @@ name = "cosmix-mail"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "cosmix-lib-buildinfo",
  "ctk",
  "libc",
 ]
@@ -3304,6 +3307,7 @@ name = "cosmix-media"
 version = "0.1.2"
 dependencies = [
  "bevy",
+ "cosmix-lib-buildinfo",
  "cosmix-lib-client",
  "cosmix-lib-config",
  "ctk",
@@ -3320,6 +3324,7 @@ name = "cosmix-midicomp"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "cosmix-lib-buildinfo",
  "midly",
 ]
 
@@ -3517,6 +3522,7 @@ name = "cosmix-tray"
 version = "0.3.1"
 dependencies = [
  "cosmix-app-identity",
+ "cosmix-lib-buildinfo",
  "ksni",
  "libc",
  "zbus",
@@ -9291,6 +9297,7 @@ name = "spike-wl-dnd"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "cosmix-lib-buildinfo",
  "raw-window-handle",
  "smithay-client-toolkit 0.19.2",
  "wayland-backend",

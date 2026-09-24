@@ -6958,8 +6958,18 @@ async fn run_readonly_verb_cli(verb: &'static str) -> Result<()> {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // --version/-V first, before the tokio runtime exists: a thread- or
+    // fd-starved host must still get an answer, not a runtime-build panic.
+    cosmix_buildinfo::exit_on_version!();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // Held for the whole of `main` — must outlive the process (drop
     // flushes). Renamed from `_log` because the Serve branch reads it
     // to attach the live `webd.log` watcher.
