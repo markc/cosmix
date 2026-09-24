@@ -67,9 +67,11 @@ pub(crate) struct WallpaperState {
     next_id: u64,
     pending: Option<(u64, RequestKind, Duration)>,
     queued: Option<(&'static str, Value)>,
-    /// When the next read is due. `None` after an authoritative read: the
-    /// snapshot stays current until a `props.changed` notification, a
-    /// dropped-message gap or a reconnect invalidates it (never a poll).
+    /// When the next read is due. After an authoritative read it is set to
+    /// now + `VISIBLE_RECONCILE` (the visible-only backstop for a
+    /// broker-side dropped notice); a `props.changed` notification, a
+    /// dropped-message gap or a reconnect pulls it forward to "now". A
+    /// hidden page never sends on it.
     refresh: Option<Duration>,
     /// Delay applied after the next failed read.
     backoff: Duration,
