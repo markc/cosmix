@@ -486,12 +486,13 @@ fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
         iced::keyboard::Event::KeyPressed {
             key,
             modified_key,
+            physical_key,
             text,
             modifiers,
             repeat,
             ..
         } => {
-            if let Some(action) = input::action_for(key, modified_key, *modifiers) {
+            if let Some(action) = input::action_for(key, modified_key, *physical_key, *modifiers) {
                 // A repeat of a non-repeating chord is swallowed, not passed
                 // through: it must not turn into a control code either.
                 return (!*repeat || action.repeats()).then_some(Message::Action(action));
