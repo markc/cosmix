@@ -64,7 +64,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-interaction-schema` | 0.6.0 |
 | `cosmix-lib-agent` | 0.1.0 |
 | `cosmix-lib-config` | 0.8.5 |
-| `cosmix-lib-daemon` | 0.7.0 |
+| `cosmix-lib-daemon` | 0.7.1 |
 | `cosmix-lib-davproto` | 0.1.2 |
 | `cosmix-lib-dns` | 0.3.0 |
 | `cosmix-lib-files` | 0.7.0 |
@@ -91,7 +91,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-nspawnd` | 0.2.1 |
 | `cosmix-powerd` | 0.1.0 |
 | `cosmix-song` | 0.2.0 |
-| `cosmix-webd` | 0.10.2 |
+| `cosmix-webd` | 0.11.0 |
 | `cosmix-wgd` | 0.4.1 |
 
 ## desktop
