@@ -102,7 +102,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-bterm` | 0.9.1 |
 | `cosmix-busviewer` | 0.1.1 |
 | `cosmix-capture` | 0.2.0 |
-| `cosmix-comp` | 0.63.4 |
+| `cosmix-comp` | 0.68.0 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
 | `cosmix-filemgr` | 0.9.7 |
@@ -112,11 +112,11 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-interactgui` | 0.1.2 |
 | `cosmix-mail` | 0.1.0 |
 | `cosmix-media` | 0.1.2 |
-| `cosmix-quoin` | 0.13.2 |
+| `cosmix-quoin` | 0.14.1 |
 | `cosmix-scene` | 0.4.0 |
-| `cosmix-scene-bevy` | 0.4.1 |
-| `cosmix-shell` | 0.13.2 |
-| `cosmix-shell-host` | 0.7.2 |
+| `cosmix-scene-bevy` | 0.4.2 |
+| `cosmix-shell` | 0.15.0 |
+| `cosmix-shell-host` | 0.9.0 |
 | `cosmix-studio` | 0.4.7 |
 | `cosmix-term` | 0.2.0 |
 | `cosmix-term-core` | 0.4.1 |
