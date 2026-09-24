@@ -200,6 +200,60 @@ Properties publish through `apps.props.watch` (snapshot read; optionally
 `apps.props.{get,list,describe}` for the runtime-owned lifecycle tree, so
 the author properties ride the SPEC-12 fall-through verbs instead.
 
+## Workspace citizen (`desktop`)
+
+`src/desktop/scripts/desktop-workspace.mix` registers the Bus service
+`desktop` and switches cosmix-comp's workspaces. inputd's default keymap fires
+two of its verbs with an empty body: RightCtrl+Left (code 105) sends
+`desktop.workspace.prev` and RightCtrl+Right (code 106) sends
+`desktop.workspace.next`. Both rows route by first segment, so they reach this
+citizen with no `service` field (see
+[Inputd keymap rows](daemon-help.md#inputd-keymap-rows-and-their-target-service)).
+Start it under that name:
+
+```text
+mix --serve /path/to/cosmix/src/desktop/scripts/desktop-workspace.mix --name desktop
+```
+
+Each verb makes exactly one call to comp. `COSMIX_DESKTOP_COMP_SERVICE` names
+comp's Bus service and defaults to `comp`.
+
+| Verb | JSON request | Forwards to comp |
+|---|---|---|
+| `desktop.workspace.next` | empty or `{}` | `comp.workspace.switch {"index":"next","wrap":true}` |
+| `desktop.workspace.prev` | empty or `{}` | `comp.workspace.switch {"index":"prev","wrap":true}` |
+| `desktop.workspace.set` | `{"n":N}`, N an integer 1–64 | `comp.workspace.switch {"index":N,"wrap":true}` |
+| `desktop.workspace.current` | empty or `{}` | `comp.props.get {"path":"workspaces.current"}` |
+
+comp does the wrap: `next` on the last workspace lands on the first, and
+`prev` on the first lands on the last. The citizen sends `wrap` explicitly, so
+it does not depend on comp's default. comp still range-checks `set`, so an `N`
+above the live workspace count is comp's `invalid_value`.
+
+A successful reply is rc 0 with the workspace comp reports: the switch
+reply's `to`, or the `workspaces.current` value.
+
+```json
+{"ok":true,"backend":"comp","desktop":2}
+```
+
+A malformed request is refused with rc 10 and never reaches comp. That covers
+a body that is not a JSON object, any field on `next`, `prev` or `current`,
+and a `set` without exactly an integer `n` in range. A comp refusal, such as
+`locked` under a session lock, keeps comp's rc and carries its text in
+`{"ok":false,"backend":"comp","error":...}`. An unreachable broker becomes
+rc 1 with the same shape. There is no retry and no second backend. Mesh
+callers reach every verb with no authorization gate, and only well-formedness
+is checked.
+
+`src/desktop/scripts/cosmix-desktop-workspace.service` is an example user
+unit. Validation and reply shaping live in `src/desktop/scripts/lib/workspace.mix`.
+
+Earlier deployments ran a private copy of this citizen with a KWin fallback
+over the session D-Bus. This script replaces that copy. The KWin path is not
+carried over, because cosmix components reach D-Bus only through
+cosmix-dbusd adapters.
+
 ## Verification
 
 `tests/desktop-test.mix` exercises production request validation and result
@@ -232,3 +286,10 @@ private verified-lane unix socket, so it needs no user systemd manager and
 cannot reach the host Bus) and covers list/get/launch/reload/props over the
 real Bus with recorder-script fixture "applications" — no real application
 is ever launched.
+
+`tests/workspace-test.mix` exercises the workspace citizen's request
+validation and reply shaping with no Bus and no compositor:
+
+```text
+mix src/desktop/scripts/tests/workspace-test.mix
+```

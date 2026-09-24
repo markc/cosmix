@@ -137,6 +137,10 @@ The shipped default keymap binds these right-Ctrl rows:
 | RightCtrl+Down | 108 | `desktop.clipboard.menu` | `desktop-vt1` | ignore |
 | RightCtrl+Up | 103 | `desktop.clipboard.rotate` | `desktop-vt1` | ignore |
 
+The two workspace rows are answered by the workspace citizen registered as
+`desktop`, which forwards them to comp's `comp.workspace.switch`. Its verbs are
+documented in [Desktop Bus capabilities](desktop-bus.md#workspace-citizen-desktop).
+
 The default keymap only seeds a missing keymap file, or one whose whole
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a `physical` list, or lack an unsigned

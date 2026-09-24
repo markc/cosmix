@@ -1,0 +1,53 @@
+-- desktop-workspace -- the workspace-switching citizen. Registers Bus service
+-- `desktop` and answers desktop.workspace.*, which inputd's default
+-- RightCtrl+Left / RightCtrl+Right rows fire, by forwarding to cosmix-comp:
+--
+--   desktop.workspace.next     {}      -> comp.workspace.switch {index:"next", wrap:true}
+--   desktop.workspace.prev     {}      -> comp.workspace.switch {index:"prev", wrap:true}
+--   desktop.workspace.set      {n}     -> comp.workspace.switch {index:n, wrap:true}
+--   desktop.workspace.current  {}      -> comp.props.get {path:"workspaces.current"}
+--
+-- Every reply is {ok, backend:"comp", desktop} or {ok:false, backend, error}.
+--
+-- Run: mix --serve desktop-workspace.mix --name desktop
+-- COSMIX_DESKTOP_COMP_SERVICE names the comp service (default `comp`).
+-- Validation and reply shaping live in lib/workspace.mix (pure, unit-tested);
+-- this file is only the Bus surface. Mesh callers reach every verb with no
+-- authorization gate; only well-formedness is checked.
+$w = require("lib/workspace.mix")
+
+fn respond($event)
+  $plan = $w.prepare($event.command, $event.body)
+  if $plan.send == nil then
+    return $plan
+  end
+  try
+    $s = $plan.send
+    $b = json_encode($s.body)
+    send $s.service $s.verb body=$b
+    return $w.finish($plan, $rc, $result)
+  catch $e
+    return {rc: 1, body: {ok: false, backend: "comp", error: to_string($e)}}
+  end
+end
+
+-- Multi-segment verbs are quoted in `on` (a bare handler verb takes one dot).
+on "desktop.workspace.next" desc "Switch to the next workspace, wrapping at the end"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
+
+on "desktop.workspace.prev" desc "Switch to the previous workspace, wrapping at the start"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
+
+on "desktop.workspace.set" desc "Switch to workspace N: {n: N} (1-based integer)"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end
+
+on "desktop.workspace.current" desc "Reply with the current workspace number"
+  $r = respond($event)
+  reply($r.rc, json_encode($r.body))
+end

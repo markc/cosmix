@@ -1,0 +1,34 @@
+# Example user unit for the workspace-switching citizen (Bus service
+# `desktop`), which inputd's default RightCtrl+Left / RightCtrl+Right rows
+# fire. Not installed by default. Copy to ~/.config/systemd/user/ and enable
+# with
+#   systemctl --user enable --now cosmix-desktop-workspace.service
+#
+# The citizen only forwards Bus verbs to cosmix-comp; it opens no display, so
+# it needs no WAYLAND_DISPLAY / DISPLAY. It needs the local broker:
+# COSMIX_NODE_CONFIG names the node configuration and COSMIX_RUN the runtime
+# root holding noded's socket, as for the clipboard citizen.
+# COSMIX_DESKTOP_COMP_SERVICE names comp's Bus service (default `comp`).
+#
+# Paths show an installed tree (/opt/cosmix); from a checkout point
+# ExecStart at $COSMIX/src/desktop/scripts/desktop-workspace.mix instead
+# (lib/workspace.mix must sit beside it in lib/).
+[Unit]
+Description=CosMix workspace citizen (desktop.workspace.* -> comp.workspace.switch)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/desktop/desktop-workspace.mix --name desktop
+Environment=COSMIX_NODE_CONFIG=/etc/cosmix/node.conf.mix
+Environment=COSMIX_RUN=/run/cosmix
+Environment=COSMIX_DESKTOP_COMP_SERVICE=comp
+Environment=MIX_STATS=off
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical-session.target

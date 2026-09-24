@@ -555,6 +555,9 @@ After rolling forward again, those rows must be rebound with <code>service</code
 <tr><td>RightCtrl+Down</td><td>108</td><td><code>desktop.clipboard.menu</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 <tr><td>RightCtrl+Up</td><td>103</td><td><code>desktop.clipboard.rotate</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 </tbody></table>
+<p>The two workspace rows are answered by the workspace citizen registered as
+<code>desktop</code>, which forwards them to comp's <code>comp.workspace.switch</code>. Its verbs are
+documented in <a href="/cos/desktop-bus#workspace-citizen-desktop">Desktop Bus capabilities</a>.</p>
 <p>The default keymap only seeds a missing keymap file, or one whose whole
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a <code>physical</code> list, or lack an unsigned

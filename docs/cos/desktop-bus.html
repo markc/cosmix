@@ -606,6 +606,47 @@ malformed requests rc 10.</p>
 <code>apps.terminal</code> (default <code>foot</code>). Mix 0.89.0 reserves
 <code>apps.props.{get,list,describe}</code> for the runtime-owned lifecycle tree, so
 the author properties ride the SPEC-12 fall-through verbs instead.</p>
+<h2 id="workspace-citizen-desktop">Workspace citizen (<code>desktop</code>)</h2>
+<p><code>src/desktop/scripts/desktop-workspace.mix</code> registers the Bus service
+<code>desktop</code> and switches cosmix-comp's workspaces. inputd's default keymap fires
+two of its verbs with an empty body: RightCtrl+Left (code 105) sends
+<code>desktop.workspace.prev</code> and RightCtrl+Right (code 106) sends
+<code>desktop.workspace.next</code>. Both rows route by first segment, so they reach this
+citizen with no <code>service</code> field (see
+<a href="/cos/daemon-help#inputd-keymap-rows-and-their-target-service">Inputd keymap rows</a>).
+Start it under that name:</p>
+<pre><code class="language-text">mix --serve /path/to/cosmix/src/desktop/scripts/desktop-workspace.mix --name desktop
+</code></pre>
+<p>Each verb makes exactly one call to comp. <code>COSMIX_DESKTOP_COMP_SERVICE</code> names
+comp's Bus service and defaults to <code>comp</code>.</p>
+<table><thead><tr><th>Verb</th><th>JSON request</th><th>Forwards to comp</th></tr></thead><tbody>
+<tr><td><code>desktop.workspace.next</code></td><td>empty or <code>{}</code></td><td><code>comp.workspace.switch {"index":"next","wrap":true}</code></td></tr>
+<tr><td><code>desktop.workspace.prev</code></td><td>empty or <code>{}</code></td><td><code>comp.workspace.switch {"index":"prev","wrap":true}</code></td></tr>
+<tr><td><code>desktop.workspace.set</code></td><td><code>{"n":N}</code>, N an integer 1–64</td><td><code>comp.workspace.switch {"index":N,"wrap":true}</code></td></tr>
+<tr><td><code>desktop.workspace.current</code></td><td>empty or <code>{}</code></td><td><code>comp.props.get {"path":"workspaces.current"}</code></td></tr>
+</tbody></table>
+<p>comp does the wrap: <code>next</code> on the last workspace lands on the first, and
+<code>prev</code> on the first lands on the last. The citizen sends <code>wrap</code> explicitly, so
+it does not depend on comp's default. comp still range-checks <code>set</code>, so an <code>N</code>
+above the live workspace count is comp's <code>invalid_value</code>.</p>
+<p>A successful reply is rc 0 with the workspace comp reports: the switch
+reply's <code>to</code>, or the <code>workspaces.current</code> value.</p>
+<pre><code class="language-json">{"ok":true,"backend":"comp","desktop":2}
+</code></pre>
+<p>A malformed request is refused with rc 10 and never reaches comp. That covers
+a body that is not a JSON object, any field on <code>next</code>, <code>prev</code> or <code>current</code>,
+and a <code>set</code> without exactly an integer <code>n</code> in range. A comp refusal, such as
+<code>locked</code> under a session lock, keeps comp's rc and carries its text in
+<code>{"ok":false,"backend":"comp","error":...}</code>. An unreachable broker becomes
+rc 1 with the same shape. There is no retry and no second backend. Mesh
+callers reach every verb with no authorization gate, and only well-formedness
+is checked.</p>
+<p><code>src/desktop/scripts/cosmix-desktop-workspace.service</code> is an example user
+unit. Validation and reply shaping live in <code>src/desktop/scripts/lib/workspace.mix</code>.</p>
+<p>Earlier deployments ran a private copy of this citizen with a KWin fallback
+over the session D-Bus. This script replaces that copy. The KWin path is not
+carried over, because cosmix components reach D-Bus only through
+cosmix-dbusd adapters.</p>
 <h2 id="verification">Verification</h2>
 <p><code>tests/desktop-test.mix</code> exercises production request validation and result
 handling without desktop effects. Run it with <code>COSMIX_MESH_OPEN=0</code> in the
@@ -632,7 +673,11 @@ production apps citizen against an isolated noded (private TCP port plus
 private verified-lane unix socket, so it needs no user systemd manager and
 cannot reach the host Bus) and covers list/get/launch/reload/props over the
 real Bus with recorder-script fixture "applications" — no real application
-is ever launched.</p></div></div>
+is ever launched.</p>
+<p><code>tests/workspace-test.mix</code> exercises the workspace citizen's request
+validation and reply shaping with no Bus and no compositor:</p>
+<pre><code class="language-text">mix src/desktop/scripts/tests/workspace-test.mix
+</code></pre></div></div>
     </div>
 
 </main>

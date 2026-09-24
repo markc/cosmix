@@ -1,0 +1,93 @@
+-- Deterministic tests for the workspace citizen's request validation and
+-- reply shaping (lib/workspace.mix); no Bus, no compositor, nothing switches.
+-- Run from the repo root: mix src/desktop/scripts/tests/workspace-test.mix
+$w = require("../lib/workspace.mix")
+fn check($condition, $message)
+  if not $condition then raise("WORKSPACE_TEST", $message) end
+end
+$prev_service = env("COSMIX_DESKTOP_COMP_SERVICE", "")
+export COSMIX_DESKTOP_COMP_SERVICE = ""
+try
+  -- ── next / prev: one comp.workspace.switch, relative, wrap explicit ──
+  for each $dir in ["next", "prev"]
+    $verb = "desktop.workspace." .. $dir
+    for each $empty in ["", "   ", "{}", nil]
+      $p = $w.prepare($verb, $empty)
+      check($p.rc == nil and $p.kind == "switch", $verb .. " with an empty body was refused: " .. json_encode($p))
+      check($p.send.service == "comp", $verb .. " went to " .. $p.send.service)
+      check($p.send.verb == "comp.workspace.switch", $verb .. " sent " .. $p.send.verb)
+      $body = json_parse(json_encode($p.send.body))
+      check(length(keys($body)) == 2 and $body["index"] == $dir and $body["wrap"] == true, $verb .. " body wrong: " .. json_encode($body))
+    end
+  end
+
+  -- ── wrap: comp does the arithmetic; its {from,to} reply is relayed ──
+  -- next from the last of 4 lands on 1, prev from 1 lands on 4.
+  $next = $w.prepare("desktop.workspace.next", "")
+  $prev = $w.prepare("desktop.workspace.prev", "")
+  for each $case in [[$next, {output: "o_a", from: 4, to: 1}, 1], [$prev, {output: "o_a", from: 1, to: 4}, 4],
+      [$next, {output: "o_a", from: 2, to: 3}, 3], [$prev, "{\"output\":\"o_a\",\"from\":3,\"to\":2}", 2]]
+    $r = $w.finish($case[0], 0, $case[1])
+    check($r.rc == 0 and $r.body.ok == true and $r.body.backend == "comp" and $r.body.desktop == $case[2], "switch reply not relayed: " .. json_encode($r))
+    check(length(keys($r.body)) == 3, "switch reply carries extra fields: " .. json_encode($r.body))
+  end
+  -- A single workspace: next/prev is from == to, still ok.
+  $r = $w.finish($next, 0, {output: "o_a", from: 1, to: 1})
+  check($r.rc == 0 and $r.body.desktop == 1, "single-workspace switch not ok: " .. json_encode($r))
+  -- comp's refusal keeps its rc and text; a transport failure (negative rc) becomes 1.
+  $r = $w.finish($next, 10, "{\"error\":\"locked\"}")
+  check($r.rc == 10 and $r.body.ok == false and $r.body.backend == "comp" and contains($r.body.error, "locked"), "comp refusal not carried: " .. json_encode($r))
+  $r = $w.finish($next, -3, "Bus unavailable")
+  check($r.rc == 1 and $r.body.ok == false and contains($r.body.error, "Bus unavailable"), "transport failure not carried: " .. json_encode($r))
+  -- A switch reply without a numeric `to` is an error, never ok with a nil desktop.
+  for each $bad in [{output: "o_a"}, {to: "two"}, "ok", 3, nil]
+    $r = $w.finish($next, 0, $bad)
+    check($r.rc == 1 and $r.body.ok == false, "malformed comp switch reply accepted: " .. json_encode($bad))
+  end
+
+  -- ── set {n}: absolute index, validated before it reaches comp ──
+  for each $n in [1, 2, 64]
+    $p = $w.prepare("desktop.workspace.set", json_encode({n: $n}))
+    check($p.kind == "switch" and $p.send.verb == "comp.workspace.switch" and $p.send.body.index == $n and $p.send.body.wrap == true, "set " .. to_string($n) .. " wrong: " .. json_encode($p))
+  end
+
+  -- ── current: comp.props.get of workspaces.current, reply shape ──
+  $cur = $w.prepare("desktop.workspace.current", "")
+  check($cur.kind == "current" and $cur.send.service == "comp" and $cur.send.verb == "comp.props.get", "current plan wrong: " .. json_encode($cur))
+  check(json_encode($cur.send.body) == "{\"path\":\"workspaces.current\"}", "current body wrong: " .. json_encode($cur.send.body))
+  $r = $w.finish($cur, 0, 3)
+  check($r.rc == 0 and json_encode($r.body) == json_encode({ok: true, backend: "comp", desktop: 3}), "current reply shape wrong: " .. json_encode($r))
+  $r = $w.finish($cur, 0, "2")
+  check($r.rc == 1 and $r.body.ok == false, "non-numeric current accepted: " .. json_encode($r))
+  $r = $w.finish($cur, 14, "no such path")
+  check($r.rc == 14 and $r.body.ok == false and $r.body.backend == "comp", "current refusal not carried: " .. json_encode($r))
+
+  -- ── malformed bodies are refused with rc 10 and never reach comp ──
+  $bad_cases = [
+    ["desktop.workspace.next", "not json"],
+    ["desktop.workspace.next", "[1,2]"],
+    ["desktop.workspace.next", "\"next\""],
+    ["desktop.workspace.prev", "{\"index\":3}"],
+    ["desktop.workspace.current", "{\"path\":\"x\"}"],
+    ["desktop.workspace.set", ""],
+    ["desktop.workspace.set", "{}"],
+    ["desktop.workspace.set", "{\"n\":0}"],
+    ["desktop.workspace.set", "{\"n\":-1}"],
+    ["desktop.workspace.set", "{\"n\":1.5}"],
+    ["desktop.workspace.set", "{\"n\":65}"],
+    ["desktop.workspace.set", "{\"n\":\"2\"}"],
+    ["desktop.workspace.set", "{\"n\":2,\"wrap\":false}"],
+    ["desktop.workspace.jump", ""]]
+  for each $case in $bad_cases
+    $p = $w.prepare($case[0], $case[1])
+    check($p.rc == 10 and $p.send == nil and $p.body.ok == false and type($p.body.error) == "string", "malformed request accepted: " .. json_encode($case))
+  end
+
+  -- ── the comp service name is configurable (a nested comp) ──
+  export COSMIX_DESKTOP_COMP_SERVICE = "comp-nested"
+  check($w.prepare("desktop.workspace.next", "").send.service == "comp-nested", "COSMIX_DESKTOP_COMP_SERVICE ignored")
+
+  print("PASS workspace next/prev/set plans (comp.workspace.switch, wrap:true), wrap replies relayed, comp refusals carried, current reply shape, malformed bodies refused")
+finally
+  export COSMIX_DESKTOP_COMP_SERVICE = $prev_service
+end
