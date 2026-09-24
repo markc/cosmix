@@ -2151,6 +2151,13 @@ The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.
 
+Smithay's `xdg_wm_base.get_xdg_surface` guard is narrowed. It still refuses
+a `wl_surface` with any non-xdg role, and one that a live `xdg_surface`
+still wraps. Once the previous `xdg_surface` is destroyed, a fresh one for
+the same `wl_surface` is accepted and may take the same xdg role again.
+Live wrappers are tracked per `wl_surface`, so a second `xdg_wm_base`
+binding cannot bypass the guard.
+
 Smithay's `X11Surface` has one additive test-support setter
 (`set_wl_surface_offline`) that assigns the associated `wl_surface` directly.
 The xwayland-shell serial handshake owns the real association; the setter

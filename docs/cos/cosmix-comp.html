@@ -2423,6 +2423,12 @@ attach/commit ledger enforce <code>AlreadyConstructed</code>.
 The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.</p>
+<p>Smithay's <code>xdg_wm_base.get_xdg_surface</code> guard is narrowed. It still refuses
+a <code>wl_surface</code> with any non-xdg role, and one that a live <code>xdg_surface</code>
+still wraps. Once the previous <code>xdg_surface</code> is destroyed, a fresh one for
+the same <code>wl_surface</code> is accepted and may take the same xdg role again.
+Live wrappers are tracked per <code>wl_surface</code>, so a second <code>xdg_wm_base</code>
+binding cannot bypass the guard.</p>
 <p>Smithay's <code>X11Surface</code> has one additive test-support setter
 (<code>set_wl_surface_offline</code>) that assigns the associated <code>wl_surface</code> directly.
 The xwayland-shell serial handshake owns the real association; the setter
