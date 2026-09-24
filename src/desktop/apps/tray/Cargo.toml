@@ -3,7 +3,7 @@
 # would pull a rendering engine into this engine-free tray process.
 [package]
 name = "cosmix-tray"
-version = "0.3.1"
+version = "0.3.2"
 description = "CosMix Tray — thin StatusNotifierItem skin for cosmix-trayd"
 edition = "2021"
 rust-version = "1.95"

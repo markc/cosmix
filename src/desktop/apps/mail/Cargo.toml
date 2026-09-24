@@ -10,7 +10,7 @@
 # so the widget composition can be exercised before the transport exists.
 [package]
 name = "cosmix-mail"
-version = "0.1.0"
+version = "0.1.1"
 description = "CosMix Mail — a native CTK mail reader and composer"
 edition = "2021"
 rust-version = "1.95"

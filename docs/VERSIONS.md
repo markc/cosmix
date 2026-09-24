@@ -26,7 +26,7 @@ CosMix Agent Bus — protocol family
 
 | crate | version |
 |---|---|
-| `cosmix-lib-buildinfo` | 0.2.0 |
+| `cosmix-lib-buildinfo` | 0.3.0 |
 | `cosmix-lib-bus` | 0.3.6 |
 | `cosmix-lib-client` | 0.7.0 |
 | `cosmix-lib-log` | 0.3.0 |
@@ -38,9 +38,9 @@ Mix — the language and shell
 
 | crate | version |
 |---|---|
-| `cosmix-lib-mix` | 0.94.0 |
-| `cosmix-mix` | 0.94.0 |
-| `mix-bench` | 0.1.0 |
+| `cosmix-lib-mix` | 0.95.0 |
+| `cosmix-mix` | 0.95.0 |
+| `mix-bench` | 0.1.1 |
 
 ## cos
 
@@ -50,14 +50,14 @@ CoS — substrate libraries and daemon family
 |---|---|
 | `cosmix-actions` | 0.4.0 |
 | `cosmix-app-identity` | 0.2.0 |
-| `cosmix-dbusd` | 0.3.0 |
-| `cosmix-dnsd` | 0.3.2 |
-| `cosmix-filesd` | 0.8.1 |
-| `cosmix-indexd` | 0.9.1 |
+| `cosmix-dbusd` | 0.3.1 |
+| `cosmix-dnsd` | 0.3.3 |
+| `cosmix-filesd` | 0.8.2 |
+| `cosmix-indexd` | 0.9.2 |
 | `cosmix-input-core` | 0.1.3 |
 | `cosmix-input-schema` | 0.1.4 |
-| `cosmix-inputd` | 0.4.3 |
-| `cosmix-interactd` | 0.5.1 |
+| `cosmix-inputd` | 0.4.4 |
+| `cosmix-interactd` | 0.5.2 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
 | `cosmix-lib-config` | 0.8.5 |
@@ -71,25 +71,25 @@ CoS — substrate libraries and daemon family
 | `cosmix-lib-mesh-trust` | 0.10.0 |
 | `cosmix-lib-node-id` | 0.2.0 |
 | `cosmix-lib-props-store` | 0.4.0 |
-| `cosmix-lib-skills` | 0.1.0 |
+| `cosmix-lib-skills` | 0.1.1 |
 | `cosmix-lib-wg` | 0.2.0 |
-| `cosmix-maild` | 0.9.0 |
+| `cosmix-maild` | 0.9.1 |
 | `cosmix-maild-auth` | 0.2.0 |
-| `cosmix-maild-bayesian` | 0.7.0 |
-| `cosmix-maild-rules` | 0.3.0 |
-| `cosmix-mcp` | 0.5.2 |
-| `cosmix-mds` | 0.3.0 |
-| `cosmix-mesh-sign` | 0.8.0 |
-| `cosmix-midicomp` | 0.3.0 |
+| `cosmix-maild-bayesian` | 0.7.1 |
+| `cosmix-maild-rules` | 0.3.1 |
+| `cosmix-mcp` | 0.5.3 |
+| `cosmix-mds` | 0.3.1 |
+| `cosmix-mesh-sign` | 0.8.1 |
+| `cosmix-midicomp` | 0.3.1 |
 | `cosmix-mixer-schema` | 0.5.0 |
-| `cosmix-mprisd` | 0.1.1 |
-| `cosmix-musicd` | 0.25.0 |
-| `cosmix-noded` | 0.18.0 |
-| `cosmix-nspawnd` | 0.2.1 |
-| `cosmix-powerd` | 0.1.0 |
+| `cosmix-mprisd` | 0.1.2 |
+| `cosmix-musicd` | 0.25.1 |
+| `cosmix-noded` | 0.18.1 |
+| `cosmix-nspawnd` | 0.2.2 |
+| `cosmix-powerd` | 0.1.1 |
 | `cosmix-song` | 0.2.0 |
-| `cosmix-webd` | 0.11.0 |
-| `cosmix-wgd` | 0.4.1 |
+| `cosmix-webd` | 0.11.1 |
+| `cosmix-wgd` | 0.4.2 |
 
 ## desktop
 
@@ -98,36 +98,36 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | crate | version |
 |---|---|
 | `cosmix-bg-boing` | 0.1.0 |
-| `cosmix-bg-showcase` | 0.2.5 |
-| `cosmix-bterm` | 0.9.1 |
-| `cosmix-busviewer` | 0.1.1 |
-| `cosmix-capture` | 0.2.0 |
-| `cosmix-comp` | 0.68.0 |
+| `cosmix-bg-showcase` | 0.2.6 |
+| `cosmix-bterm` | 0.9.2 |
+| `cosmix-busviewer` | 0.1.2 |
+| `cosmix-capture` | 0.2.1 |
+| `cosmix-comp` | 0.69.1 |
 | `cosmix-deco` | 0.4.0 |
 | `cosmix-design` | 0.14.0 |
-| `cosmix-filemgr` | 0.9.7 |
+| `cosmix-filemgr` | 0.9.8 |
 | `cosmix-flock` | 0.1.0 |
 | `cosmix-iced-widgets` | 0.1.1 |
-| `cosmix-imeprobe` | 0.2.0 |
-| `cosmix-interactgui` | 0.1.2 |
-| `cosmix-mail` | 0.1.0 |
-| `cosmix-media` | 0.1.2 |
-| `cosmix-quoin` | 0.14.1 |
+| `cosmix-imeprobe` | 0.2.1 |
+| `cosmix-interactgui` | 0.1.3 |
+| `cosmix-mail` | 0.1.1 |
+| `cosmix-media` | 0.1.3 |
+| `cosmix-quoin` | 0.14.3 |
 | `cosmix-scene` | 0.4.0 |
 | `cosmix-scene-bevy` | 0.4.2 |
 | `cosmix-shell` | 0.15.0 |
-| `cosmix-shell-host` | 0.9.0 |
-| `cosmix-studio` | 0.4.7 |
-| `cosmix-term` | 0.2.0 |
-| `cosmix-term-core` | 0.4.1 |
-| `cosmix-tower` | 0.5.4 |
-| `cosmix-tray` | 0.3.1 |
-| `cosmix-trayd` | 0.6.2 |
-| `cosmix-wallpaper` | 0.2.0 |
+| `cosmix-shell-host` | 0.9.1 |
+| `cosmix-studio` | 0.4.8 |
+| `cosmix-term` | 0.2.1 |
+| `cosmix-term-core` | 0.5.0 |
+| `cosmix-tower` | 0.5.5 |
+| `cosmix-tray` | 0.3.2 |
+| `cosmix-trayd` | 0.6.3 |
+| `cosmix-wallpaper` | 0.2.1 |
 | `cosmix-wgpu-dmabuf` | 0.16.2 |
 | `cosmix-wl-dnd` | 0.4.2 |
 | `ctk` | 0.57.0 |
-| `spike-wl-dnd` | 0.1.0 |
+| `spike-wl-dnd` | 0.1.1 |
 | `term-native-test-broker` | 0.0.0 |
 
 ---
