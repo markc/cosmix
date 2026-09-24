@@ -2169,6 +2169,9 @@ async fn unknown_command_request_is_refused_immediately() {
     let (to, cmd, id, rc, body) = &calls[0];
     assert_eq!((to.as_str(), cmd.as_str(), id.as_deref(), *rc), ("c", "nosuch.verb", Some("5"), 10));
     assert!(body.contains("\"error_code\":\"UNKNOWN_COMMAND\""), "body: {body}");
+    // `error` is what a JSON-body send reduces an rc>=10 reply to for
+    // `$result`; without it the caller got the raw JSON text.
+    assert!(body.contains("\"error\":\"unknown command 'nosuch.verb'"), "body: {body}");
     assert!(body.contains("\"command\":\"nosuch.verb\""), "body: {body}");
     assert!(body.contains("\"available\":[\"b.verb\",\"q\"]"), "body: {body}");
 }

@@ -143,14 +143,16 @@ connection), `-2` a per-send `timeout=` budget exceeded, `-3` Bus unavailable (n
 broker was ever present, a bare host). See [timeout](#per-send-timeout) and
 [no broker](#no-broker-graceful-degradation).
 
-**A structured refusal keeps its body.** When a peer answers `rc >= 10` with a
-JSON object naming an `error_code`, `$result` is that object — field-accessible,
-so `$result.error_code` and whatever else it carries (`reason`,
-`retry_requires`) are readable. Branching on those is the whole point of a
-refusal; flattened to prose it leaves a script parsing English to decide whether
-to retry. This is narrow on purpose: a peer that answers an error as plain text,
-or as JSON of some other shape, still produces exactly the string it always did.
-Only a body naming `error_code` takes the structured path. (0.87.0)
+**A structured refusal keeps its body — on the header route.** When a
+header-routed send (one with a `body=` arg, or a SPEC-12 `*.props.*` call with
+`namespace=`) gets `rc >= 10` with a JSON object naming an `error_code`,
+`$result` is that object — field-accessible, so `$result.error_code` and
+whatever else it carries (`reason`, `retry_requires`) are readable. (0.87.0)
+The ordinary JSON-body send never did this: there `$result` is the `error`
+header, else the body's `error` string, else the body text verbatim — so an
+`error_code` body with no `error` field arrives as raw JSON TEXT in `$result`.
+On either route, read the structure from `$reply` (below), which is the parsed
+body whatever its shape; `$result` is for the message.
 
 **`$reply` keeps every field of every reply.** Most daemons refuse in the other
 dialect — `{"error": "occluded", "under": {…}}` — and `$result` reduces that to
@@ -184,9 +186,10 @@ after the `send`, or capture the reply with the expression form —
 
 **A wrong verb name answers at once.** A `mix --serve` citizen (or any script
 with `on` handlers) that receives a request for a command it has no handler
-for refuses it immediately with `rc 10` and a structured body —
-`$result.error_code == "UNKNOWN_COMMAND"`, `$result.command` the verb you sent,
-`$result.available` the citizen's declared handlers. (Before 0.92.0 the request
+for refuses it immediately with `rc 10`: `$result` is the message ("unknown
+command 'x' (this citizen handles: …)"), and the structure is in `$reply` —
+`$reply.error_code == "UNKNOWN_COMMAND"`, `$reply.command` the verb you sent,
+`$reply.available` the citizen's declared handlers. (Before 0.92.0 the request
 was dropped: the caller waited out its full timeout and got `-2`, which read as
 a mesh problem.) So a `-2` from a citizen that answers its other verbs is no
 longer a typo symptom — look at the citizen's handler instead. Props paths such

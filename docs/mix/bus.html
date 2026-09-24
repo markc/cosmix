@@ -550,14 +550,16 @@ transport failure (a broker was there but the send failed — lost or broken
 connection), <code>-2</code> a per-send <code>timeout=</code> budget exceeded, <code>-3</code> Bus unavailable (no
 broker was ever present, a bare host). See <a href="/mix/bus#per-send-timeout">timeout</a> and
 <a href="/mix/bus#no-broker-graceful-degradation">no broker</a>.</p>
-<p><strong>A structured refusal keeps its body.</strong> When a peer answers <code>rc &gt;= 10</code> with a
-JSON object naming an <code>error_code</code>, <code>$result</code> is that object — field-accessible,
-so <code>$result.error_code</code> and whatever else it carries (<code>reason</code>,
-<code>retry_requires</code>) are readable. Branching on those is the whole point of a
-refusal; flattened to prose it leaves a script parsing English to decide whether
-to retry. This is narrow on purpose: a peer that answers an error as plain text,
-or as JSON of some other shape, still produces exactly the string it always did.
-Only a body naming <code>error_code</code> takes the structured path. (0.87.0)</p>
+<p><strong>A structured refusal keeps its body — on the header route.</strong> When a
+header-routed send (one with a <code>body=</code> arg, or a SPEC-12 <code>*.props.*</code> call with
+<code>namespace=</code>) gets <code>rc &gt;= 10</code> with a JSON object naming an <code>error_code</code>,
+<code>$result</code> is that object — field-accessible, so <code>$result.error_code</code> and
+whatever else it carries (<code>reason</code>, <code>retry_requires</code>) are readable. (0.87.0)
+The ordinary JSON-body send never did this: there <code>$result</code> is the <code>error</code>
+header, else the body's <code>error</code> string, else the body text verbatim — so an
+<code>error_code</code> body with no <code>error</code> field arrives as raw JSON TEXT in <code>$result</code>.
+On either route, read the structure from <code>$reply</code> (below), which is the parsed
+body whatever its shape; <code>$result</code> is for the message.</p>
 <p><strong><code>$reply</code> keeps every field of every reply.</strong> Most daemons refuse in the other
 dialect — <code>{"error": "occluded", "under": {…}}</code> — and <code>$result</code> reduces that to
 its message string on purpose, so existing scripts keep working. The detail
@@ -585,9 +587,10 @@ after the <code>send</code>, or capture the reply with the expression form —
 <code>$r = send svc cmd</code> — and copy <code>$rc</code> into a local before the next await.</p>
 <p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
 with <code>on</code> handlers) that receives a request for a command it has no handler
-for refuses it immediately with <code>rc 10</code> and a structured body —
-<code>$result.error_code == "UNKNOWN_COMMAND"</code>, <code>$result.command</code> the verb you sent,
-<code>$result.available</code> the citizen's declared handlers. (Before 0.92.0 the request
+for refuses it immediately with <code>rc 10</code>: <code>$result</code> is the message ("unknown
+command 'x' (this citizen handles: …)"), and the structure is in <code>$reply</code> —
+<code>$reply.error_code == "UNKNOWN_COMMAND"</code>, <code>$reply.command</code> the verb you sent,
+<code>$reply.available</code> the citizen's declared handlers. (Before 0.92.0 the request
 was dropped: the caller waited out its full timeout and got <code>-2</code>, which read as
 a mesh problem.) So a <code>-2</code> from a citizen that answers its other verbs is no
 longer a typo symptom — look at the citizen's handler instead. Props paths such

@@ -1890,6 +1890,20 @@ mod tests {
         assert_eq!(typed_reply_to_result(0, "# markdown".into(), None).1, s("# markdown"));
     }
 
+    /// A Mix citizen's UNKNOWN_COMMAND refusal (evaluator.rs
+    /// `refuse_unknown_command`) carries `error`, so a JSON-body send reads a
+    /// message in `$result` and the structure in `$reply`.
+    #[test]
+    fn unknown_command_refusal_reads_as_message_and_structured_reply() {
+        let body = r#"{"error_code":"UNKNOWN_COMMAND","error":"unknown command 'x.y' (this citizen handles: ping; HELP lists them)","message":"unknown command 'x.y' (this citizen handles: ping; HELP lists them)","command":"x.y","available":["ping"]}"#;
+        let (rc, result) = typed_reply_to_result(10, body.into(), None);
+        assert_eq!(rc, 10);
+        assert!(matches!(&result, Value::String(s) if s.starts_with("unknown command 'x.y'")), "{result:?}");
+        let reply = parse_reply_body(body);
+        assert_eq!(field(&reply, "error_code"), Value::String("UNKNOWN_COMMAND".into()));
+        assert_eq!(field(&reply, "command"), Value::String("x.y".into()));
+    }
+
     /// A success body is identical in `$result` and `$reply`; a non-JSON or
     /// empty body is nil in `$reply`.
     #[test]

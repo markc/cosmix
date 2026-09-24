@@ -4765,13 +4765,17 @@ impl Evaluator {
             return;
         };
         available.sort();
+        // `error` carries the message too: a JSON-body `send` reduces an
+        // rc >= 10 body to its `error` string for `$result` (a body with no
+        // `error` would reach the caller as raw JSON text), so the caller
+        // gets a readable `$result` and the structure in `$reply`.
+        let message = json_quote(&format!(
+            "unknown command '{}' (this citizen handles: {}; HELP lists them)",
+            event.command,
+            if available.is_empty() { "none".to_string() } else { available.join(", ") }
+        ));
         let body = format!(
-            "{{\"error_code\":\"UNKNOWN_COMMAND\",\"message\":{},\"command\":{},\"available\":[{}]}}",
-            json_quote(&format!(
-                "unknown command '{}' (this citizen handles: {}; HELP lists them)",
-                event.command,
-                if available.is_empty() { "none".to_string() } else { available.join(", ") }
-            )),
+            "{{\"error_code\":\"UNKNOWN_COMMAND\",\"error\":{message},\"message\":{message},\"command\":{},\"available\":[{}]}}",
             json_quote(&event.command),
             available.iter().map(|c| json_quote(c)).collect::<Vec<_>>().join(","),
         );
