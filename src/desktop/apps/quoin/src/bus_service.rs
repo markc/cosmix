@@ -487,6 +487,8 @@ fn service_bus(
                 )
             };
             (rc, body, None)
+        } else if request.command == "shell.scenes.list" {
+            (0, content.scenes.list(&content.registry.0).to_string(), None)
         } else if matches!(
             request.command.as_str(),
             "shell.sub.register" | "shell.sub.remove"
@@ -965,7 +967,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.state","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch","scenes.list"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -992,6 +994,21 @@ fn dispatch_shell_request(
             response.body,
             None,
         );
+    }
+    if request.command == "shell.panel.state" {
+        let Some(edge) = argument(request, "edge").and_then(parse_edge) else {
+            return (
+                10,
+                json!({"error":"edge must be left, bottom, right or top"}).to_string(),
+                None,
+            );
+        };
+        let snapshot = Value::from(&ShellProps(frame).snapshot());
+        let mut state = snapshot["panels"][edge_name(edge)].clone();
+        let panel = frame.panel(edge);
+        state["keyboard_focused"] = json!(panel.keyboard_focused);
+        state["keyboard_requested"] = json!(panel.keyboard_requested);
+        return (0, state.to_string(), None);
     }
     if request.command == "shell.quit" {
         if let Err(error) = verify_caller_provenance(request) {
@@ -1603,6 +1620,149 @@ mod tests {
             .headers
             .insert("broker_origin".to_owned(), "local".to_owned());
         request
+    }
+
+    #[test]
+    fn panel_state_matches_props_and_host_keyboard_flags_without_mutation() {
+        let mut frame = test_frame();
+        for (index, panel) in frame.panels.iter_mut().enumerate() {
+            panel.keyboard_focused = index % 2 == 0;
+            panel.keyboard_requested = index % 2 != 0;
+        }
+        let before = frame.clone();
+        for edge in Edge::ALL {
+            for header_argument in [false, true] {
+                // No provenance stamp: these reads must not require one.
+                let mut req = request("shell.panel.state");
+                req.body = json!({"edge":edge_name(edge)}).to_string();
+                if header_argument {
+                    req.body = "{}".into();
+                    req.headers.insert("edge".into(), edge_name(edge).into());
+                }
+                let (rc, body, command) =
+                    dispatch_shell_request(&req, &frame, Default::default());
+                assert_eq!(rc, 0, "{body}");
+                assert!(command.is_none());
+                let mut actual: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(actual.as_object().unwrap().len(), 9);
+                assert_eq!(actual["keyboard_focused"], frame.panel(edge).keyboard_focused);
+                assert_eq!(
+                    actual["keyboard_requested"],
+                    frame.panel(edge).keyboard_requested
+                );
+                actual.as_object_mut().unwrap().remove("keyboard_focused");
+                actual.as_object_mut().unwrap().remove("keyboard_requested");
+                let mut props = request("shell.props.get");
+                props.body = json!({"path":format!("panels.{}", edge_name(edge))}).to_string();
+                let (rc, body, _) =
+                    dispatch_shell_request(&props, &frame, Default::default());
+                assert_eq!(rc, 0);
+                assert_eq!(actual, serde_json::from_str::<Value>(&body).unwrap());
+            }
+        }
+        assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn panel_state_rejects_unknown_missing_and_non_string_edges_like_show() {
+        let frame = test_frame();
+        for args in [json!({"edge":"diagonal"}), json!({}), json!({"edge":42})] {
+            let mut state = request("shell.panel.state");
+            state.body = args.to_string();
+            let mut show = local("shell.panel.show");
+            show.body = state.body.clone();
+            let (rc, body, command) = dispatch_shell_request(&state, &frame, Default::default());
+            let expected = dispatch_shell_request(&show, &frame, Default::default());
+            assert_eq!(rc, 10);
+            assert_eq!((rc, body), (expected.0, expected.1));
+            assert!(command.is_none());
+        }
+    }
+
+    #[test]
+    fn scenes_list_empty_store_and_discovery() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut req = request("shell.scenes.list");
+        req.body = "{}".into();
+        peer.send(req);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replies[0].body).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            app.world().resource::<ShellBusState>().diagnostics.accepted_mutations,
+            0
+        );
+        let (rc, body, _) = dispatch_shell_request(
+            &request("shell.info"),
+            &test_frame(),
+            Default::default(),
+        );
+        assert_eq!(rc, 0);
+        let info: Value = serde_json::from_str(&body).unwrap();
+        for verb in ["scenes.list", "panel.state"] {
+            assert!(info["verbs"].as_array().unwrap().contains(&json!(verb)));
+        }
+    }
+
+    #[test]
+    fn scenes_list_is_sorted_reports_seats_and_matches_watch() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut app = bus_app(bridge);
+        for (name, edge) in [("zeta", "left"), ("alpha", "right")] {
+            peer.send(scene_load(name, "loader", edge));
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        }
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .forget("scene-zeta");
+        let before = app.world().resource::<ShellFrameState>().0.clone();
+        let mut req = request("shell.scenes.list");
+        req.body = "{}".into();
+        peer.send(req);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0);
+        let rows: Value = serde_json::from_str(&replies[0].body).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        for (index, name, edge, registered) in [
+            (0, "alpha", json!("right"), true),
+            (1, "zeta", Value::Null, false),
+        ] {
+            let mut watch = local("shell.scene.watch");
+            watch.body = json!({"scene":name}).to_string();
+            peer.send(watch);
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].rc, 0);
+            let watched: Value = serde_json::from_str(&replies[0].body).unwrap();
+            assert_eq!(rows[index], json!({
+                "name":name, "page":format!("scene-{name}"), "edge":edge,
+                "owner":"authored-metadata", "revision":watched["revision"],
+                "digest":watched["digest"], "registered":registered,
+            }));
+        }
+        assert_eq!(app.world().resource::<ShellFrameState>().0, before);
+        assert!(
+            app.world().resource::<SubPanelRegistryState>().0.seat("scene-zeta").is_none()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("loader"),
+            ["alpha", "zeta"]
+        );
     }
 
     #[test]

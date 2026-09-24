@@ -66,6 +66,29 @@ pub struct SceneStore {
 }
 
 impl SceneStore {
+    /// Read-only inventory in scene-name order. Ownership here is authored
+    /// metadata, not the broker identity used for lifetime management.
+    pub fn list(&self, registry: &SubPanelRegistry) -> Value {
+        Value::Array(
+            self.scenes
+                .iter()
+                .map(|(name, entry)| {
+                    let page = render::page_id(&entry.tree);
+                    let seat = registry.seat(&page);
+                    json!({
+                        "name": name,
+                        "page": page,
+                        "edge": seat.map(|seat| format!("{:?}", seat.edge).to_lowercase()),
+                        "owner": entry.document.citizen,
+                        "revision": entry.revision,
+                        "digest": digest(&entry.tree),
+                        "registered": seat.is_some(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
     /// Transactional Bus ingress: a rejected candidate never replaces last-good.
     pub fn dispatch(
         &mut self,
