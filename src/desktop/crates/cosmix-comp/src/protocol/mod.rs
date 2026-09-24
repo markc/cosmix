@@ -13652,8 +13652,27 @@ impl WaylandState {
                     Some(surface) => self.interaction_focus_root(&surface),
                     None => None,
                 };
+                // An Exclusive layer that holds the keyboard and demotes
+                // itself to OnDemand keeps it: the grab ends, the focus it
+                // was granted does not. (Quoin's panels ask for the grab only
+                // until it lands, so a later click elsewhere can move focus.)
+                // A layer with an active popup keyboard grab keeps the
+                // documented dismissal instead.
+                let demoted_keeps_focus = !fallback
+                    && !self.keyboard.is_grabbed()
+                    && previous_exclusive.is_some()
+                    && current_focus_surface.as_ref().is_some_and(|focus| {
+                        previous_exclusive.as_ref() == Some(&focus.id())
+                            && self.surfaces.get(&focus.id()).is_some_and(|record| {
+                                record.mapped && record.layout.visible
+                            })
+                            && self.layer_keyboard_interactivity_for_surface(focus)
+                                == Some(KeyboardInteractivity::OnDemand)
+                    });
                 if requested.is_some() {
                     requested
+                } else if demoted_keeps_focus {
+                    break 'focus_policy;
                 } else if fallback || current_layer_became_none || previous_exclusive.is_some() {
                     self.highest_visible_toplevel_surface()
                 } else if clear_if_unrequested {

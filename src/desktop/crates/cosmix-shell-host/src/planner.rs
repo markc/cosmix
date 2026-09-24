@@ -342,6 +342,8 @@ mod tests {
             } else {
                 KeyboardInteractivity::None
             },
+            keyboard_requested: false,
+            keyboard_focused: false,
             page_ids: Arc::default(),
             active_page_id: None,
             page_change: Default::default(),

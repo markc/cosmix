@@ -186,10 +186,82 @@ fn an_ungranted_cycle_request_expires() {
     assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::OnDemand);
     assert_eq!(model.next_deadline(), None);
 
-    // A granted request keeps its grab past the deadline.
+    // A granted request outlives the deadline, but its grab does not: once
+    // the panel holds the keyboard it is on-demand again (changed with named
+    // activation, chunk 16), so a click elsewhere can take focus away.
     model.cycle_keyboard_focus(ms(1_000));
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::Exclusive);
     model.keyboard_focus_observed(Some(Edge::Left));
     model.tick(ms(5_000)).unwrap();
     assert_eq!(model.focus_directive(), FocusDirective::Panel(Edge::Left));
-    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::Exclusive);
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::OnDemand);
+}
+
+/// Click-away after the grant, for both callers of the one focus request:
+/// the focus cycle and named activation. Focus landing drops the grab to
+/// on-demand; the host then reporting focus gone (a click elsewhere) ends
+/// the request, and nothing re-grabs.
+#[test]
+fn a_granted_focus_request_can_be_clicked_away() {
+    for activation in [false, true] {
+        let mut model = model();
+        model.set_mode(Edge::Left, ms(0), PanelMode::Pinned).unwrap();
+        model.tick(ms(300)).unwrap();
+        if activation {
+            model.request_keyboard_focus(Edge::Left, ms(300));
+        } else {
+            assert_eq!(model.cycle_keyboard_focus(ms(300)), FocusStop::Panel(Edge::Left));
+        }
+        let frame = ShellFrame::from_model(&model);
+        assert_eq!(frame.panel(Edge::Left).keyboard_interactivity, KeyboardInteractivity::Exclusive);
+        assert!(frame.panel(Edge::Left).keyboard_requested && !frame.panel(Edge::Left).keyboard_focused);
+        model.keyboard_focus_observed(Some(Edge::Left));
+        let frame = ShellFrame::from_model(&model);
+        assert_eq!(frame.panel(Edge::Left).keyboard_interactivity, KeyboardInteractivity::OnDemand,
+            "activation={activation}: granted, so no longer exclusive");
+        assert!(frame.panel(Edge::Left).keyboard_focused);
+        model.keyboard_focus_observed(None);
+        assert_eq!(model.focus_directive(), FocusDirective::Follow, "activation={activation}");
+        let frame = ShellFrame::from_model(&model);
+        assert_eq!(frame.panel(Edge::Left).keyboard_interactivity, KeyboardInteractivity::OnDemand);
+        assert!(!frame.panel(Edge::Left).keyboard_requested);
+        assert_eq!(model.panel(Edge::Left).mode, PanelMode::Pinned);
+    }
+}
+
+/// An activation that revealed a hidden edge and never got the keyboard (a
+/// lock, a higher exclusive layer) ends its reveal when the request lapses:
+/// Escape would go to the application, so nothing else could close it. A
+/// focus-cycle request, an activation of an edge that was already showing,
+/// and a granted request never hide anything at the deadline.
+#[test]
+fn an_ungranted_activation_ends_its_reveal_at_the_grant_timeout() {
+    for (activation, already_shown, granted, hides) in [
+        (true, false, false, true),
+        (true, true, false, false),
+        (true, false, true, false),
+        (false, false, false, false),
+    ] {
+        let case = format!("activation={activation} shown={already_shown} granted={granted}");
+        let mut model = model();
+        if already_shown || !activation {
+            model.panel_input(Edge::Left, ms(0), PanelInput::Reveal).unwrap();
+        }
+        model.tick(ms(300)).unwrap();
+        if activation {
+            model.panel_input(Edge::Left, ms(300), PanelInput::Reveal).unwrap();
+            model.request_activation_focus(Edge::Left, ms(300), !already_shown);
+        } else {
+            model.request_keyboard_focus(Edge::Left, ms(300));
+        }
+        if granted {
+            model.keyboard_focus_observed(Some(Edge::Left));
+        }
+        model.tick(ms(300) + FOCUS_GRANT_TIMEOUT).unwrap();
+        assert_eq!(model.panel(Edge::Left).transient_revealed, !hides, "{case}");
+        assert_eq!(model.panel(Edge::Left).mode, PanelMode::Hidden, "{case}");
+        if !granted {
+            assert_eq!(model.focus_directive(), FocusDirective::Follow, "{case}");
+        }
+    }
 }
