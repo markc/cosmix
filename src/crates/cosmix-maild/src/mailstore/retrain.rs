@@ -149,9 +149,10 @@ impl TrainEvent {
     }
 }
 
-/// Apply one retrain through the classifier and log it. Every training
-/// surface (the IMAP outbox drain, JMAP moves, `maild.bayesian.train`)
-/// goes through here, so the log is a complete record of what was learned.
+/// Apply one retrain through the classifier and log it. Every
+/// single-message training surface (the IMAP outbox drain, JMAP moves,
+/// `maild.bayesian.train`) goes through here. `maild.bayesian.rebuild` does
+/// not: it trains a shadow corpus in bulk and reports counts in its job body.
 pub async fn retrain_logged(
     classifier: &DefaultClassifier,
     req: &RetrainRequest<'_>,
