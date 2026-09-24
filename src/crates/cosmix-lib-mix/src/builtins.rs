@@ -305,12 +305,12 @@ builtin_table! {
     ("run", CapabilityClass::Process,             "system",  "Run shell command via sh, return trimmed stdout as string. run(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; a timed-out child is PG-killed and run dies (catchable)", contract!((cmd: string, opts?: map) -> string; effects[blocking, shell]; failure[raises])),
     ("run_rc", CapabilityClass::Process,          "system",  "Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true", contract!((cmd: string, opts?: map) -> map("run_rc_result", {rc: number, stdout: string, stderr: string, timed_out: bool, interrupted: bool}); effects[must_use, blocking, shell]; failure[returns_result])),
     ("run_stream", CapabilityClass::Process,      "system",  "Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an `env` prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing", contract!((argv: list(string), opts?: map("run_stream_options", {env: map, clear_env: bool, cwd: any_of(string, nil)})) -> number; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
-    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
+    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; grace (seconds: at the deadline SIGTERM the process group, wait up to grace for it, then SIGKILL — default 0 = SIGKILL at once; refused with timeout:0); stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout, grace} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
+    ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
     ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
-    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
+    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, die_with_parent, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); die_with_parent:true (Linux) is the opposite slot — the child leads its own process group, is SIGKILLed by the kernel if this process dies (PR_SET_PDEATHSIG), and on a graceful mix exit (script end, --serve QUIT/SIGTERM, restart) its whole group gets SIGTERM, 2 s grace, then SIGKILL, so a helper server never outlives its citizen (refused together with detach); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
     ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
@@ -4045,6 +4045,7 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
 
     // Options.
     let mut detach = false;
+    let mut die_with_parent = false;
     let mut cwd: Option<String> = None;
     let mut env: Vec<(String, String)> = Vec::new();
     let mut clear_env = false;
@@ -4066,6 +4067,17 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
                             return Err(opt_invalid(
                                 caller,
                                 format!("detach must be a bool, got {}", other.type_name()),
+                            ));
+                        }
+                    };
+                }
+                "die_with_parent" => {
+                    die_with_parent = match val {
+                        Value::Bool(b) => *b,
+                        other => {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("die_with_parent must be a bool, got {}", other.type_name()),
                             ));
                         }
                     };
@@ -4172,7 +4184,7 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
                     return Err(opt_invalid(
                         caller,
                         format!(
-                            "unknown option '{}' (supported: detach, cwd, env, clear_env, stdout, stderr)",
+                            "unknown option '{}' (supported: detach, die_with_parent, cwd, env, clear_env, stdout, stderr)",
                             sanitize_for_diag(other)
                         ),
                     ));
@@ -4181,8 +4193,27 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         }
     }
 
+    if detach && die_with_parent {
+        return Err(opt_invalid(
+            caller,
+            "detach and die_with_parent contradict each other: detach severs the child from \
+             this process, die_with_parent ties its lifetime to it",
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if die_with_parent {
+        return Err(opt_invalid(
+            caller,
+            "die_with_parent needs Linux (PR_SET_PDEATHSIG)",
+        ));
+    }
+
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]).stdin(std::process::Stdio::null());
+    #[cfg(target_os = "linux")]
+    if die_with_parent {
+        arm_die_with_parent(&mut command);
+    }
     if let Some(dir) = &cwd {
         command.current_dir(dir);
     }
@@ -4268,7 +4299,136 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         span: None,
         msg: format!("spawn failed: {e}"),
     })?;
+    #[cfg(target_os = "linux")]
+    if die_with_parent {
+        owned_spawns::register(child.id() as libc::pid_t);
+    }
     Ok(Some(Value::Number(child.id() as f64)))
+}
+
+/// `spawn(argv, {die_with_parent: true})`: the child leads a fresh process
+/// group (so its whole tree is addressable as `-pid`) and carries
+/// `PR_SET_PDEATHSIG(SIGKILL)`, so the kernel kills it if this process dies
+/// without running the graceful sweep (crash, SIGKILL, OOM). A failed
+/// `prctl` fails the spawn rather than returning a child that does not
+/// honour the option. The `getppid` check closes the fork→prctl race: a
+/// parent that died in between would never deliver the signal.
+#[cfg(target_os = "linux")]
+fn arm_die_with_parent(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let parent_pid = std::process::id() as libc::pid_t;
+    // SAFETY: setpgid, prctl, getppid and _exit are raw syscalls, safe in the
+    // post-fork pre-exec window: no locks, no allocation.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Children started with `spawn(argv, {die_with_parent: true})`, ended with
+/// this process (TODO-mix P2).
+///
+/// Two layers, because neither alone is enough:
+///
+/// * `PR_SET_PDEATHSIG(SIGKILL)` (armed at spawn) is the crash path: the
+///   kernel kills the direct child when its creating thread dies, however it
+///   dies. It reaches the child only — not the child's own children — and it
+///   is SIGKILL, so the child gets no chance to clean up.
+/// * [`sweep`] is the graceful path, run by the interpreter on its way out
+///   (end of script, `mix --serve` QUIT/SIGTERM drain, REPL restart): SIGTERM
+///   to every owned child's whole process group, up to [`SWEEP_GRACE`] for the
+///   leaders to exit, then SIGKILL to the groups — so descendants go too.
+///
+/// PDEATHSIG is keyed to the THREAD that called spawn. The `mix` binary
+/// evaluates on one long-lived thread and sweeps on that thread before it
+/// exits, so a graceful exit always reaches the sweep first. An embedder
+/// that evaluates on a short-lived thread must call [`sweep`] itself.
+#[cfg(target_os = "linux")]
+pub mod owned_spawns {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// How long the graceful sweep waits between SIGTERM and SIGKILL.
+    pub const SWEEP_GRACE: Duration = Duration::from_secs(2);
+
+    static OWNED: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+    pub(crate) fn register(pid: libc::pid_t) {
+        OWNED.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+    }
+
+    /// Leader state without reaping it: `Some(false)` running, `Some(true)`
+    /// exited but unreaped (a zombie — its pid, and so its pgid, is still
+    /// reserved), `None` no longer our unreaped child (someone reaped it —
+    /// `process_alive` does — so the pid may already belong to a stranger and
+    /// must not be signalled).
+    fn leader_state(pid: libc::pid_t) -> Option<bool> {
+        // SAFETY: waitid writes only into the zeroed local `info`.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == -1
+            {
+                return None;
+            }
+            Some(info.si_pid() != 0)
+        }
+    }
+
+    /// End every owned child and its process group; returns how many groups
+    /// were signalled. Idempotent: the registry is drained, so a second call
+    /// signals nothing. A group whose leader was already reaped elsewhere is
+    /// skipped — its pgid can no longer be proven ours.
+    pub fn sweep() -> usize {
+        let pids = std::mem::take(&mut *OWNED.lock().unwrap_or_else(|e| e.into_inner()));
+        let live: Vec<libc::pid_t> = pids
+            .into_iter()
+            .filter(|pid| leader_state(*pid).is_some())
+            .collect();
+        for pid in &live {
+            // SAFETY: the leader is unreaped, so -pid names its own group.
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+            }
+        }
+        let deadline = Instant::now() + SWEEP_GRACE;
+        while Instant::now() < deadline
+            && live.iter().any(|pid| leader_state(*pid) == Some(false))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for pid in &live {
+            // SAFETY: still unreaped (only this function reaps it, below),
+            // so the pgid is still reserved for this group.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(*pid, &mut status, 0);
+            }
+        }
+        live.len()
+    }
 }
 
 /// A `fork` inside a forked child: the second fork must not be `libc::fork`,
@@ -5532,6 +5692,9 @@ fn builtin_run_rc(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// as `TYPE_MISMATCH`, option problems as `OPTION_INVALID`.
 struct RunArgvOpts {
     timeout_ms: u64,
+    /// Deadline escalation window: 0 = SIGKILL the group at the deadline
+    /// (the historical hard kill); N = SIGTERM, wait up to N ms, then SIGKILL.
+    grace_ms: u64,
     stdin: RunArgvStdin,
     cwd: Option<String>,
     env: Vec<(String, String)>,
@@ -5572,6 +5735,7 @@ enum RunArgvStderr {
 
 const RUN_ARGV_OPT_KEYS: &[&str] = &[
     "timeout",
+    "grace",
     "stdin",
     "cwd",
     "env",
@@ -5814,6 +5978,7 @@ fn parse_stderr_route(caller: &str, value: &Value) -> MixResult<RunArgvStderr> {
 fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts> {
     let mut opts = RunArgvOpts {
         timeout_ms: 30_000,
+        grace_ms: 0,
         stdin: RunArgvStdin::Null,
         cwd: None,
         env: Vec::new(),
@@ -5944,6 +6109,35 @@ fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts
                     }
                 };
             }
+            "grace" => {
+                let t = match extract_number(val, InputPolicy::NumberOnly) {
+                    Some(n) => n,
+                    None => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!("grace must be a number of seconds, got {}", val.type_name()),
+                        ));
+                    }
+                };
+                as_duration(&format!("{caller}: grace"), t).map_err(|_| {
+                    opt_invalid(
+                        caller,
+                        format!("grace must be a finite non-negative number, got {t}"),
+                    )
+                })?;
+                opts.grace_ms = if t > 0.0 {
+                    (as_count(
+                        &format!("{caller}: grace milliseconds"),
+                        (t * 1000.0).round(),
+                        usize::MAX,
+                    )
+                    .map_err(|_| opt_invalid(caller, format!("grace {t}s is out of range")))?
+                        as u64)
+                        .max(1)
+                } else {
+                    0
+                };
+            }
             "max_output" => {
                 let n = match extract_number(val, InputPolicy::NumberOnly) {
                     Some(n) => n,
@@ -5998,6 +6192,14 @@ fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts
         return Err(opt_invalid(
             caller,
             "stream:true cannot be combined with stdout:\"inherit\"",
+        ));
+    }
+    // grace only shapes what happens AT a deadline; with the deadline
+    // disabled it would silently do nothing, so refuse the combination.
+    if opts.grace_ms > 0 && opts.timeout_ms == 0 {
+        return Err(opt_invalid(
+            caller,
+            "grace needs a deadline: it cannot be combined with timeout: 0",
         ));
     }
     Ok(opts)
@@ -6236,6 +6438,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
             RunArgvStderr::File(file) => ProcStderr::File(file),
         },
         timeout_ms: opts.timeout_ms,
+        grace_ms: opts.grace_ms,
         caller,
         cwd: opts.cwd.as_deref(),
         env: &opts.env,
@@ -7807,6 +8010,9 @@ struct ProcSpec<'a> {
     stderr: ProcStderr<'a>,
     /// Wall-clock deadline in milliseconds; 0 disables.
     timeout_ms: u64,
+    /// At the deadline: 0 = SIGKILL the group at once; N = SIGTERM, wait up
+    /// to N ms for the leader, then SIGKILL the group.
+    grace_ms: u64,
     /// Builtin name for diagnostics (`run`, `ssh_run`, `run_argv`, ...).
     caller: &'a str,
     /// Working directory for the child; `None` inherits.
@@ -9483,6 +9689,30 @@ fn pipeline_result_map(
     Value::map(map)
 }
 
+/// Has direct child `pid` exited? Answers without reaping it (`WNOWAIT`), so
+/// the zombie keeps its pid — and therefore its process-group id — reserved
+/// while the caller signals the group. `Ok(false)` while it runs.
+#[cfg(target_os = "linux")]
+fn leader_exited_unreaped(pid: i32) -> std::io::Result<bool> {
+    // SAFETY: waitid writes only into `info`, which is a zeroed plain-data
+    // siginfo_t owned by this frame; si_pid() reads a field of that struct.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // WNOHANG with no state change leaves si_pid zero (POSIX; the
+        // struct was zeroed above for exactly this test).
+        Ok(info.si_pid() != 0)
+    }
+}
+
 fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -9494,6 +9724,7 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         stdout,
         stderr,
         timeout_ms,
+        grace_ms,
         caller,
         cwd,
         env,
@@ -9501,8 +9732,8 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         max_output,
         stream,
     } = spec;
-    let (stdin, stdout, stderr, timeout_ms, caller, stream) =
-        (*stdin, *stdout, *stderr, *timeout_ms, *caller, *stream);
+    let (stdin, stdout, stderr, timeout_ms, grace_ms, caller, stream) =
+        (*stdin, *stdout, *stderr, *timeout_ms, *grace_ms, *caller, *stream);
     let start = Instant::now();
     let timeout = (timeout_ms != 0).then(|| Duration::from_millis(timeout_ms));
     let deadline = timeout.map(|timeout| start + timeout);
@@ -9832,8 +10063,9 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
             // stale pgid is not catastrophic (kernel returns ESRCH
             // which we ignore).
             let pgid = -child_pid;
-            if timed_out {
-                // Hard local deadline — no grace, no cooperation.
+            if timed_out && grace_ms == 0 {
+                // Hard local deadline — no grace, no cooperation (the
+                // default; `grace` opts into the escalation below).
                 unsafe {
                     libc::kill(pgid, libc::SIGKILL);
                 }
@@ -9843,19 +10075,49 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
                     libc::kill(pgid, libc::SIGKILL);
                 }
             } else {
-                // Interrupt path — cooperative SIGTERM, then SIGKILL
-                // if the group hasn't exited within the grace window.
+                // Interrupt path, or a deadline with `grace` — cooperative
+                // SIGTERM, then SIGKILL if the group leader hasn't exited
+                // within the grace window. The group SIGKILL below the loop
+                // runs either way, so a descendant that outlives a leader
+                // which honoured SIGTERM is still reached.
                 unsafe {
                     libc::kill(pgid, libc::SIGTERM);
                 }
-                let term_deadline = Instant::now() + Duration::from_secs(2);
+                let grace = if timed_out {
+                    Duration::from_millis(grace_ms)
+                } else {
+                    Duration::from_secs(2)
+                };
+                let term_deadline = Instant::now() + grace;
                 let mut term_grace_failed = false;
                 loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            natural_exit = Some(status);
-                            break;
+                    // Linux: observe the leader's exit WITHOUT reaping it. A
+                    // zombie leader still pins its pid, so the pgid cannot be
+                    // recycled, and the group SIGKILL below reaches exactly
+                    // the descendants that ignored SIGTERM and would otherwise
+                    // be left running as orphans once the leader honoured it.
+                    // The blocking wait after this block then reaps the
+                    // leader. Elsewhere: the historical reaping try_wait,
+                    // with no descendant sweep (a reaped pgid may recycle).
+                    #[cfg(target_os = "linux")]
+                    let polled = leader_exited_unreaped(child_pid).map(|exited| {
+                        if exited {
+                            unsafe {
+                                libc::kill(pgid, libc::SIGKILL);
+                            }
+                            Some(())
+                        } else {
+                            None
                         }
+                    });
+                    #[cfg(not(target_os = "linux"))]
+                    let polled = child.try_wait().map(|status| {
+                        status.map(|status| {
+                            natural_exit = Some(status);
+                        })
+                    });
+                    match polled {
+                        Ok(Some(())) => break,
                         Ok(None) => {}
                         // EINTR: another SIGINT arrived during the wait —
                         // retry the poll, don't give up on the grace period.
@@ -10047,6 +10309,7 @@ fn run_with_timeout(
         stdout: ProcOutput::Capture,
         stderr: ProcStderr::Capture,
         timeout_ms: timeout_s.saturating_mul(1000),
+        grace_ms: 0,
         caller,
         cwd: None,
         env: &[],

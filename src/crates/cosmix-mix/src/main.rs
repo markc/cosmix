@@ -1784,14 +1784,32 @@ fn main() {
     let handle = std::thread::Builder::new()
         .name("mix-eval".into())
         .stack_size(MAIN_STACK_SIZE)
-        .spawn(real_main)
+        .spawn(|| {
+            let code = real_main();
+            // spawn(argv, {die_with_parent: true}) children: SIGTERM their
+            // groups, grace, SIGKILL — on THIS thread, before it exits,
+            // because their PDEATHSIG is keyed to it and would otherwise
+            // SIGKILL them first with no chance to clean up (TODO-mix P2).
+            owned_spawns_sweep();
+            code
+        })
         .expect("spawn mix evaluation thread");
     let code = handle.join().unwrap_or(101);
+    // A panicked evaluation thread never reached its sweep; PDEATHSIG has
+    // already killed the direct children, this reaches their groups.
+    owned_spawns_sweep();
     // Kill-on-drop: pdeathsig reaches each task LEADER when its supervisor
     // thread goes, but nothing would reach the leader's own children. This is
     // the only point every invocation mode passes through on the way out.
     session_task::sweep();
     std::process::exit(code);
+}
+
+/// End `spawn(argv, {die_with_parent: true})` children with this process.
+/// Idempotent — the registry drains on the first call.
+pub(crate) fn owned_spawns_sweep() {
+    #[cfg(target_os = "linux")]
+    cosmix_mix::builtins::owned_spawns::sweep();
 }
 
 fn real_main() -> i32 {

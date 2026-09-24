@@ -73,6 +73,23 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
   and capture drains. With `timeout: 0`, Mix waits for every captured stream to
   reach EOF; it does not abandon a reader merely because the direct child has
   exited. Note `run`/`run_rc` default to no deadline.
+- `grace`: seconds, default **0**, fractional ok — what happens AT the
+  deadline. `0` SIGKILLs the child's process group at once (the historic hard
+  kill). A positive grace sends SIGTERM to the group, waits up to `grace` for
+  the child to exit, then SIGKILLs the group. The group is SIGKILLed even when
+  the child honours SIGTERM, so a descendant that ignores it is not left
+  running. The call can therefore take up to `timeout + grace`. The result still
+  reports `timed_out: true`, and `signal` says how it ended: `15` if the child
+  obeyed SIGTERM, `9` if it had to be killed. `grace` with `timeout: 0` raises
+  `OPTION_INVALID`, because without a deadline it would do nothing.
+
+  ```mix
+  $r = run_argv(["pg_dump", "app"], {timeout: 600, grace: 10,
+                                     stdout: {file: "/srv/app.sql"}})
+  if $r.timed_out then
+    eprint("dump cut off at the deadline (signal " .. $r.signal .. ")")
+  end
+  ```
 - `stdin`: `nil` or `{null: true}` closes stdin; string/bytes/buffer supplies
   those bytes; `{file: path}` opens a local file for the child to read. There is
   deliberately no `stdin: "inherit"` route: run_argv puts its child in a new
@@ -459,8 +476,12 @@ The full status contract:
 Kill mechanics (the same machinery as [`ssh_run`](remote.md)): the child is
 spawned in its **own process group**, so the kill reaches every descendant — an
 `ssh` helper or forked worker can't keep the pipes open past the deadline. A
-timeout SIGKILLs the group immediately; a Ctrl-C sends SIGTERM, waits a 2-second
-grace, then SIGKILLs. An interrupt that lands on the same poll as the deadline
+timeout SIGKILLs the group immediately (`run_argv` can opt into SIGTERM first
+with `grace`); a Ctrl-C sends SIGTERM, waits a 2-second grace, then SIGKILLs.
+On Linux the group is SIGKILLed even when the child obeys the SIGTERM, before
+the child is reaped. The zombie still holds the group id, so the kill reaches
+exactly the descendants that ignored the SIGTERM and would otherwise be left
+running as orphans. An interrupt that lands on the same poll as the deadline
 wins the tie — it's reported as the cause.
 
 The opts map is validated **loudly** — a mistake can't silently leave a call
@@ -712,7 +733,7 @@ raises `TYPE_MISMATCH` at argument validation, before any stdio file is opened
 (so a NUL in `stderr_path` can no longer truncate the `stdout_path` file on the
 way to failing).
 
-**Argv form — `spawn(argv[, {detach, cwd, env, clear_env, stdout, stderr}])`**
+**Argv form — `spawn(argv[, {detach, die_with_parent, cwd, env, clear_env, stdout, stderr}])`**
 (v0.89.0), a **list** of strings run **directly, with no shell** — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force `run("setsid app &")` through `sh`.
@@ -742,6 +763,34 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   daemon later, have it write its own pidfile together with its start time (a pidfile alone does not establish process identity once the pid can be recycled) or answer a Bus verb rather than
   trusting a pid remembered from long ago. Default `false` (a plain child
   in the caller's session, which stays the caller's to reap).
+- `die_with_parent: true` (Linux) → the opposite slot. The child **ends with
+  this mix process**, for a helper that must not outlive the script or
+  `--serve` citizen that started it:
+
+  ```mix
+  $pid = spawn(["goose", "serve", "--port", "7070"], {die_with_parent: true})
+  ```
+
+  The child leads its own process group. Two mechanisms end it:
+  - **Graceful exit.** This covers the script ending, `exit()`, a `--serve`
+    citizen's QUIT or SIGTERM drain, and a REPL restart. Mix sends SIGTERM to
+    the child's whole process group, waits up to 2 s for the child to exit,
+    then SIGKILLs the group. The child gets its chance to clean up, and its own
+    children go too.
+  - **Crash.** If mix is SIGKILLed, panics or is OOM-killed, the kernel
+    SIGKILLs the child (`PR_SET_PDEATHSIG`). That reaches the child only, not
+    its descendants, and gives it no chance to clean up.
+
+  `detach` together with `die_with_parent` raises `OPTION_INVALID`, because
+  they contradict each other. If the script reaps the child itself, for
+  example by calling `process_alive` after it has exited, Mix can no longer
+  prove the group id is still that child's. The group is then skipped, so any
+  survivors are not swept. PDEATHSIG is keyed to the thread that called
+  `spawn`. The `mix` binary evaluates on one thread that lives until exit. An
+  embedder evaluating on a short-lived thread must call
+  `builtins::owned_spawns::sweep()` itself. Off Linux the option raises
+  `OPTION_INVALID`. Default `false`: a plain spawn child is untouched by mix's
+  exit.
 - `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)
   (clear-then-layer: `{clear_env: true, env: {…}}` starts from empty).
 - `stdout` / `stderr` reuse `run_argv`'s routing, minus capture: `"null"`
