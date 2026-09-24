@@ -4297,8 +4297,11 @@ unsafe fn raw_fork() -> libc::pid_t {
     unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) as libc::pid_t }
 }
 
-/// Elsewhere (other unix, other Linux arches): fall back to fork; the
-/// atfork caveat above applies there.
+/// Elsewhere (other unix, other Linux arches): fall back to `libc::fork`.
+/// The atfork hazard described above REMAINS on these targets — a prepare
+/// handler that waits on another thread can deadlock the intermediate, and
+/// fork is not async-signal-safe here. Cosmix targets Linux on the three
+/// arches above; this arm is documented exposure, not a fix.
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")
@@ -4353,8 +4356,10 @@ fn spawn_detached(mut command: std::process::Command) -> MixResult<Option<Value>
     // SAFETY: wfd was just created by fcntl and is owned only here.
     let write_end = unsafe { OwnedFd::from_raw_fd(wfd) };
 
-    // SAFETY: only raw syscalls (clone/fork, write, _exit, setsid) run in the
-    // post-fork pre-exec window — no allocation, no locks, no atfork handlers.
+    // SAFETY: only write, _exit, setsid and `raw_fork` run in the post-fork
+    // pre-exec window — no allocation, no locks. On Linux x86_64/aarch64/
+    // riscv64 `raw_fork` is the raw clone syscall (no atfork handlers);
+    // elsewhere it is libc::fork and the atfork hazard remains (see there).
     unsafe {
         command.pre_exec(move || {
             match raw_fork() {
