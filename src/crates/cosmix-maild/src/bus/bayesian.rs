@@ -295,7 +295,11 @@ async fn resolve_message(
             .map_err(|e| format!("message lookup task: {e}"))?
             .map_err(|e| format!("message lookup failed: {e}"))?;
             match found.as_slice() {
-                [] => return Err(format!("no message with Message-ID {mid:?} in this account")),
+                [] => {
+                    return Err(format!(
+                        "no message with Message-ID {mid:?} in this account"
+                    ));
+                }
                 [one] => *one,
                 many => {
                     let ids: Vec<String> = many.iter().map(|i| i.0.to_string()).collect();
@@ -397,7 +401,12 @@ async fn handle_untrain(
 ) -> (u8, String) {
     let req: UntrainRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
-        Err(e) => return (RC_ERROR, err_body(&format!("malformed untrain request: {e}"))),
+        Err(e) => {
+            return (
+                RC_ERROR,
+                err_body(&format!("malformed untrain request: {e}")),
+            );
+        }
     };
     let row = match resolve_account(database, &req.account).await {
         Ok(row) => row,
@@ -413,7 +422,10 @@ async fn handle_untrain(
         Ok(c) => c,
         Err(e) => return (RC_ERROR, err_body(&format!("open corpus failed: {e}"))),
     };
-    match classifier.forget_from(conn.as_ref(), &stamp, &message).await {
+    match classifier
+        .forget_from(conn.as_ref(), &stamp, &message)
+        .await
+    {
         Ok(removed) => {
             let removed = removed.map(|l| match l {
                 Label::Spam => "spam",
@@ -1887,7 +1899,8 @@ mod tests {
         let foreign = add_message(&mds, &set4, inbox4, b"Subject: other\r\n\r\nbody\r\n");
         let database = database_with_accounts(&[3, 4]);
 
-        let args = serde_json::json!({"account_id": 3, "email_id": a.0.to_string(), "class": "junk"});
+        let args =
+            serde_json::json!({"account_id": 3, "email_id": a.0.to_string(), "class": "junk"});
         let (rc, body) = handle_train(&cls, &database, &store, &args).await;
         assert_eq!(rc, RC_ERROR);
         assert!(body.contains("class must be"), "{body}");
@@ -1907,7 +1920,8 @@ mod tests {
         assert!(body.contains("names 2 messages"), "{body}");
         assert!(body.contains(&a.0.to_string()), "{body}");
 
-        let args = serde_json::json!({"account_id": 9, "email_id": a.0.to_string(), "class": "spam"});
+        let args =
+            serde_json::json!({"account_id": 9, "email_id": a.0.to_string(), "class": "spam"});
         let (rc, body) = handle_train(&cls, &database, &store, &args).await;
         assert_eq!(rc, RC_ERROR);
         assert!(body.contains("account not found"), "{body}");

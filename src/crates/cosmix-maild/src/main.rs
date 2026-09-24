@@ -2333,47 +2333,44 @@ async fn main() -> Result<()> {
             }
         },
 
-        Command::Bayesian { action } => {
-            match action {
-                BayesianAction::Stats { account } => {
-                    let body = account_selector(&account).to_string();
-                    run_inspection_verb_cli("bayesian stats", "maild.bayesian.stats", &body)
-                        .await?;
-                }
-                BayesianAction::Train {
-                    account,
-                    email_id,
-                    message_id,
-                    class,
-                } => {
-                    let mut body = account_selector(&account);
-                    body["email_id"] = serde_json::json!(email_id);
-                    body["message_id"] = serde_json::json!(message_id);
-                    body["class"] = serde_json::json!(class);
-                    run_inspection_verb_cli(
-                        "bayesian train",
-                        "maild.bayesian.train",
-                        &body.to_string(),
-                    )
-                    .await?;
-                }
-                BayesianAction::Untrain {
-                    account,
-                    email_id,
-                    message_id,
-                } => {
-                    let mut body = account_selector(&account);
-                    body["email_id"] = serde_json::json!(email_id);
-                    body["message_id"] = serde_json::json!(message_id);
-                    run_inspection_verb_cli(
-                        "bayesian untrain",
-                        "maild.bayesian.untrain",
-                        &body.to_string(),
-                    )
-                    .await?;
-                }
+        Command::Bayesian { action } => match action {
+            BayesianAction::Stats { account } => {
+                let body = account_selector(&account).to_string();
+                run_inspection_verb_cli("bayesian stats", "maild.bayesian.stats", &body).await?;
             }
-        }
+            BayesianAction::Train {
+                account,
+                email_id,
+                message_id,
+                class,
+            } => {
+                let mut body = account_selector(&account);
+                body["email_id"] = serde_json::json!(email_id);
+                body["message_id"] = serde_json::json!(message_id);
+                body["class"] = serde_json::json!(class);
+                run_inspection_verb_cli(
+                    "bayesian train",
+                    "maild.bayesian.train",
+                    &body.to_string(),
+                )
+                .await?;
+            }
+            BayesianAction::Untrain {
+                account,
+                email_id,
+                message_id,
+            } => {
+                let mut body = account_selector(&account);
+                body["email_id"] = serde_json::json!(email_id);
+                body["message_id"] = serde_json::json!(message_id);
+                run_inspection_verb_cli(
+                    "bayesian untrain",
+                    "maild.bayesian.untrain",
+                    &body.to_string(),
+                )
+                .await?;
+            }
+        },
 
         Command::Tls { action } => {
             let TlsAction::Reload = action;
@@ -2858,7 +2855,17 @@ mod cli_parser_tests {
             .is_err()
         );
         // Untrain needs a target but no class.
-        assert!(parse(&["cosmix-maild", "bayesian", "untrain", "3", "--email-id", "x"]).is_ok());
+        assert!(
+            parse(&[
+                "cosmix-maild",
+                "bayesian",
+                "untrain",
+                "3",
+                "--email-id",
+                "x"
+            ])
+            .is_ok()
+        );
         assert!(parse(&["cosmix-maild", "bayesian", "untrain", "3"]).is_err());
     }
 
