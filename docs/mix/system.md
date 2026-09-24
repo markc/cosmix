@@ -806,9 +806,19 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
     helper again therefore never races a leftover one for the same port. If
     the reload then reverts, because the new init failed, the old script
     resumes without those children.
-  - **Crash.** If mix is SIGKILLed, panics or is OOM-killed, the kernel
-    SIGKILLs the child (`PR_SET_PDEATHSIG`). That reaches the child only, not
-    its descendants, and gives it no chance to clean up.
+  - **Hangup of the interactive shell.** When the terminal goes away, the
+    job-control shutdown sweeps owned children the same graceful way before
+    it exits.
+  - **Crash, or a signal mix does not handle.** If mix is SIGKILLed, panics
+    or is OOM-killed, the kernel SIGKILLs the child (`PR_SET_PDEATHSIG`). The
+    same happens when a plain `mix script.mix` or a non-interactive mix
+    receives SIGTERM, SIGHUP or SIGQUIT, because those still end mix at once
+    by default. That path reaches the child only, not its descendants, and
+    gives it no chance to clean up. A `--serve` citizen is different: its
+    SIGTERM is a graceful drain, so the sweep runs. A script that must clean
+    up its helper's own children on SIGTERM should run as a `--serve`
+    citizen or be stopped with Ctrl-C, which ends the evaluation normally and
+    so reaches the sweep.
 
   `detach` together with `die_with_parent` raises `OPTION_INVALID`, because
   they contradict each other. Mix itself is the only thing that reaps an
