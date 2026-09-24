@@ -270,7 +270,9 @@ pub async fn untrain_inline(
     let cancelled = cancel_pending_rows(mds, set, stamp).await?;
     log_superseded(account.as_str(), stamp, cancelled, TrainVia::Bus);
     let conn = classifier.open_account_connection(account).await?;
-    Ok(classifier.forget_from(conn.as_ref(), stamp, message).await?)
+    Ok(classifier
+        .forget_from(conn.as_ref(), stamp, message)
+        .await?)
 }
 
 /// One row claimed from `mail_retrain_outbox`, carrying the exact

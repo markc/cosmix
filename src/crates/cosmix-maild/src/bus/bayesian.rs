@@ -1919,11 +1919,16 @@ mod tests {
         let account = AccountId::new("3");
 
         enqueue_outbox_row(&mds, &set, 3, item, "junk");
-        let args = serde_json::json!({"account_id": 3, "email_id": item.0.to_string(), "class": "ham"});
+        let args =
+            serde_json::json!({"account_id": 3, "email_id": item.0.to_string(), "class": "ham"});
         let (rc, body) = handle_train(&cls, &database, &store, &args).await;
         assert_eq!(rc, 0, "body was: {body}");
         let worker = RetrainOutboxWorker::new(Arc::clone(&mds), Arc::clone(&cls));
-        assert_eq!(worker.drain_once().await.unwrap(), 0, "stale row was applied");
+        assert_eq!(
+            worker.drain_once().await.unwrap(),
+            0,
+            "stale row was applied"
+        );
         let stats = cls.peek_stats(&account).await.unwrap();
         assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 1));
 
@@ -1931,7 +1936,11 @@ mod tests {
         let args = serde_json::json!({"account_id": 3, "email_id": item.0.to_string()});
         let (rc, body) = handle_untrain(&cls, &database, &store, &args).await;
         assert_eq!(rc, 0, "body was: {body}");
-        assert_eq!(worker.drain_once().await.unwrap(), 0, "stale row was applied");
+        assert_eq!(
+            worker.drain_once().await.unwrap(),
+            0,
+            "stale row was applied"
+        );
         let stats = cls.peek_stats(&account).await.unwrap();
         assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 0));
 
