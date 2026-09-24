@@ -683,7 +683,12 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   subreaper), which reaps it — so a long-lived caller such as a `mix --serve`
   launcher citizen is never left holding zombies, and "owns nothing after it
   returns" is literally true. The returned PID is the real (grandchild)
-  process, and it still leads its own session. Default `false` (a plain child
+  process, and it still leads its own session. Because init reaps it, the pid
+  is FREE as soon as the child exits and the kernel may hand it to an unrelated
+  process: a later `kill($pid)` or `process_alive($pid)` can hit a stranger.
+  A live pid only says SOME process holds that number; to stop a detached
+  daemon later, have it write its own pidfile or answer a Bus verb rather than
+  trusting a pid remembered from long ago. Default `false` (a plain child
   in the caller's session, which stays the caller's to reap).
 - `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)
   (clear-then-layer: `{clear_env: true, env: {…}}` starts from empty).
