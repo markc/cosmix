@@ -4,7 +4,7 @@
 //! screen. The VT loop rasterises into it in place and appends the damaged
 //! bands; the renderer consumes them. The wgpu arm keeps one Vec-backed
 //! surface; tiny-skia shares its Bytes-backed surface with its image handle,
-//! reclaiming it for painting or copying if a widget still holds it. Reusing
+//! reclaiming it for painting or copying if iced still holds it. Reusing
 //! storage matters: the Bevy terminal's `Image::new`-per-damaged-frame
 //! is where 320 MB of its 344 MB of mapped GEM went
 //! (`_journal/2026-09-20-term-vs-foot-memory-anatomy.md`).
@@ -240,6 +240,14 @@ impl Painter {
                 frame.generation += 1;
                 frame.damage.clear();
                 return true;
+            }
+            // paint may have released the CPU handle before finding no
+            // damage. The caller skips refresh on false, so restore it here
+            // at the unchanged generation rather than showing a placeholder.
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            {
+                let generation = frame.generation;
+                frame.surface.cache_handle(generation);
             }
             return false;
         }

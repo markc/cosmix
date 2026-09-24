@@ -4,10 +4,13 @@
 //!
 //! Each pane paints into the same allocation its image handle shares. Before
 //! painting we drop our cached handle and reclaim the `Bytes` with
-//! `try_into_mut`. A widget still holding the previous handle forces one copy
-//! and a full repaint; otherwise dirty rows are painted in place. At rest
-//! only this allocation and iced's premultiplied cache remain. The handle is
-//! keyed on `Frame::generation`, so an idle terminal rebuilds nothing.
+//! `try_into_mut`. iced's renderer layers and compositor history retain old
+//! handles, normally forcing one memcpy plus incremental dirty-row painting.
+//! Reclaim remains zero-copy when no other owner remains. At rest each pane
+//! has one app-side buffer (the separate Frame Vec is gone), plus iced's
+//! premultiplied cache and up to max_age retained older buffers after a burst,
+//! until later redraws release them. The handle is keyed on
+//! `Frame::generation`, so an idle terminal rebuilds nothing.
 
 use crate::frame::Frame;
 use bytes::{Bytes, BytesMut};
@@ -87,10 +90,12 @@ impl Surface {
         let mut pixels = match std::mem::take(&mut self.rgba).try_into_mut() {
             Ok(pixels) => pixels,
             Err(shared) => {
-                // A widget may still draw the old handle. Never mutate its
-                // bytes, and never let damage skip rows of a fresh buffer.
-                self.state.invalidate();
-                BytesMut::from(shared.as_ref())
+                // iced may still draw the old handle. Copy every byte and
+                // preserve damage state: unchanged rows already contain the
+                // right pixels, even though their address has changed.
+                let pixels = BytesMut::from(shared.as_ref());
+                self.state.rebind(&pixels);
+                pixels
             }
         };
         let len = width as usize * height as usize * 4;
@@ -112,6 +117,17 @@ impl Surface {
         self.cursor = cursor && screen.cursor.0 < screen.cols;
         &self.bands
     }
+
+    pub fn cache_handle(&mut self, generation: u64) {
+        if self.is_empty() {
+            self.cached = None;
+        } else if self.cached.as_ref().map(|(current, _)| *current) != Some(generation) {
+            self.cached = Some((
+                generation,
+                Handle::from_rgba(self.width, self.height, self.rgba.clone()),
+            ));
+        }
+    }
 }
 
 /// Rebuild the cached handle if the frame moved on; otherwise keep it.
@@ -125,20 +141,7 @@ pub fn refresh(frame: &Arc<Mutex<Frame>>) {
     // handle even if the generation happened to match, or the widget keeps
     // presenting pixels whose source no longer exists.
     let generation = frame.generation();
-    let surface = frame.cpu_surface_mut();
-    if surface.width() == 0 || surface.height() == 0 {
-        surface.cached = None;
-        return;
-    }
-    if let Some((cached_generation, _)) = &surface.cached
-        && *cached_generation == generation
-    {
-        return;
-    }
-    surface.cached = Some((
-        generation,
-        Handle::from_rgba(surface.width(), surface.height(), surface.rgba.clone()),
-    ));
+    frame.cpu_surface_mut().cache_handle(generation);
 }
 
 pub fn view(frame: &Arc<Mutex<Frame>>) -> image::Image<Handle> {
@@ -249,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn outstanding_handle_gets_a_fresh_buffer_and_full_repaint() {
+    fn outstanding_handle_gets_a_fresh_buffer_and_incremental_repaint() {
         let mut painter = painter();
         let frame = painter.frame(PANE);
         let mut grid = screen();
@@ -257,16 +260,16 @@ mod tests {
         refresh(&frame);
         let old = handle(&frame);
         let before = pixels(&old).to_vec();
-        for cell in &mut grid.cells {
+        for cell in &mut grid.cells[8..16] {
             cell.bg = [70, 80, 90];
         }
         assert!(painter.repaint(PANE, &grid, &[false, true, false, false]));
-        // Inspect bands before refresh consumes them: fallback owes every row.
+        // Inspect bands before refresh consumes them: only row 1 is owed.
         assert_eq!(
             frame.lock().unwrap().take_damage(),
             vec![DamageBand {
-                y: 0,
-                height: painter.cell().1 * grid.rows as u32,
+                y: painter.cell().1,
+                height: painter.cell().1,
             }]
         );
         refresh(&frame);
@@ -283,6 +286,91 @@ mod tests {
         let mut raster = Raster::new(1.0, 13.0, Cursor::Underline).expect("a monospace font");
         raster.render_into(&grid, &[], &mut reference);
         assert_eq!(pixels(&next).as_ref(), reference.rgba());
+    }
+
+    #[test]
+    fn retained_layers_keep_incremental_paint_without_app_buffer_history() {
+        let mut painter = painter();
+        let frame = painter.frame(PANE);
+        let mut grid = screen();
+        assert!(painter.repaint(PANE, &grid, &[]));
+        refresh(&frame);
+        let mut history = Vec::new();
+        let mut raster = Raster::new(1.0, 13.0, Cursor::Underline).expect("a monospace font");
+
+        for generation in 2..=9 {
+            // Keep each presented handle, including the first, across later
+            // generations as iced's layers/compositor history do.
+            let old = handle(&frame);
+            let before = pixels(&old).to_vec();
+            history.push((old, before));
+            let row = generation as usize % grid.rows;
+            for cell in &mut grid.cells[row * grid.cols..(row + 1) * grid.cols] {
+                cell.bg = [generation as u8 * 20, 80, 90];
+            }
+            let mut dirty = [false; 4];
+            dirty[row] = true;
+            assert!(painter.repaint(PANE, &grid, &dirty));
+            assert_eq!(
+                frame.lock().unwrap().take_damage(),
+                vec![DamageBand {
+                    y: row as u32 * painter.cell().1,
+                    height: painter.cell().1,
+                }]
+            );
+            refresh(&frame);
+            let current = handle(&frame);
+            let mut reference = cosmix_term_core::raster::Surface::default();
+            raster.render_into(&grid, &[], &mut reference);
+            assert_eq!(pixels(&current).as_ref(), reference.rgba());
+            let locked = frame.lock().unwrap();
+            assert_eq!(locked.generation(), generation);
+            assert_eq!(locked.surface().rgba.as_ptr(), pixels(&current).as_ptr());
+            assert_eq!(locked.surface().rgba.len(), pixels(&current).len());
+            for (retained, expected) in &history {
+                assert_eq!(pixels(retained).as_ref(), expected.as_slice());
+                assert_ne!(pixels(retained).as_ptr(), pixels(&current).as_ptr());
+            }
+        }
+
+        // With the app and its current cache still alive, releasing simulated
+        // renderer history leaves each older buffer uniquely owned. The app
+        // has retained no previous-generation buffers of its own.
+        for (retained, _) in history {
+            let Handle::Rgba { pixels, .. } = retained else {
+                panic!("expected an RGBA handle");
+            };
+            assert!(pixels.try_into_mut().is_ok(), "app retained an old buffer");
+        }
+    }
+
+    #[test]
+    fn no_damage_after_cache_release_restores_current_generation_without_refresh() {
+        let mut painter = painter();
+        let frame = painter.frame(PANE);
+        let grid = screen();
+        assert!(painter.repaint(PANE, &grid, &[]));
+        refresh(&frame);
+        let old = handle(&frame);
+        let generation = frame.lock().unwrap().generation();
+        // Force the conservative frontend guard to fall through while core
+        // state correctly reports no cursor and no dirty rows. This models
+        // divergence between the guard and core's damage rules.
+        frame.lock().unwrap().cpu_surface_mut().cursor = true;
+        assert!(!painter.repaint(PANE, &grid, &[false; 4]));
+        // Deliberately do not refresh: main skips it for a false repaint.
+        let current = handle(&frame);
+        assert_eq!(pixels(&current).as_ref(), pixels(&old).as_ref());
+        let locked = frame.lock().unwrap();
+        let surface = locked.surface();
+        assert_eq!(locked.generation(), generation);
+        assert_eq!(surface.cached.as_ref().unwrap().0, generation);
+        assert_eq!(surface.rgba.as_ptr(), pixels(&current).as_ptr());
+        let Handle::Rgba { width, height, .. } = current else {
+            panic!("expected an RGBA handle");
+        };
+        assert_eq!((width, height), (surface.width(), surface.height()));
+        assert!(width > 1 && height > 1);
     }
 
     #[test]
