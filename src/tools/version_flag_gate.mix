@@ -25,10 +25,11 @@
 #   * `-V` prints exactly what `--version` printed;
 #   * `--version --json` parses, and its component/version/git_sha/
 #     build_time/git_dirty equal the text line's;
-#   * under `prlimit --nproc=1` (no thread or process can be created) the
-#     answer is unchanged: proof that it precedes runtime construction.
-#     RLIMIT_NPROC does not bind root, so as root this probe is reported as
-#     skipped rather than passed.
+#   * with no thread or process creatable, the answer is unchanged: proof that
+#     it precedes runtime construction. Non-root runs under
+#     `prlimit --nproc=1`; root (RLIMIT_NPROC does not bind it) runs in a
+#     transient `systemd-run --scope -p TasksMax=1`. With neither tool the
+#     probe is reported as skipped, never as passed.
 #
 # A binary whose `required-features` are not in its crate's default features
 # is SKIPPED when absent (a default workspace build never produces it) and
@@ -105,14 +106,22 @@ if !re_match($expect, "^[0-9a-f]{12,40}$") then
 end
 $expect = slice($expect, 0, 12)
 
-$nproc_probe = true
+# The thread-starvation wrapper. RLIMIT_NPROC does not bind root, so root
+# uses a transient systemd scope whose cgroup pids.max is 1 instead: the
+# process itself is the one task, and any thread or child it tries to create
+# fails with EAGAIN either way.
+$starve = nil
+$starve_label = ""
 $prlimit = which("prlimit")
-if uid() == 0 then
-    print("NOTE thread-starvation probe skipped: RLIMIT_NPROC does not bind root")
-    $nproc_probe = false
-elif $prlimit == nil then
-    print("NOTE thread-starvation probe skipped: prlimit (util-linux) not found")
-    $nproc_probe = false
+$systemd_run = which("systemd-run")
+if uid() != 0 and $prlimit != nil then
+    $starve = [$prlimit, "--nproc=1:1", "--"]
+    $starve_label = "--version under nproc=1"
+elif uid() == 0 and $systemd_run != nil then
+    $starve = [$systemd_run, "--scope", "--quiet", "--collect", "-p", "TasksMax=1", "--"]
+    $starve_label = "--version under TasksMax=1"
+else
+    print("NOTE thread-starvation probe skipped: need prlimit (non-root) or systemd-run (root)")
 end
 
 $workspaces = [$src + "/Cargo.toml", $src + "/desktop/Cargo.toml"]
@@ -258,6 +267,23 @@ for $ws in $workspaces
                 end
             end
 
+            # Starved of threads and processes, the answer must not change.
+            # Before the JSON check, so a binary whose text line conforms but
+            # which builds its runtime first fails HERE, by name.
+            if $why == nil and $starve != nil then
+                $cmd = []
+                for $w in $starve
+                    push($cmd, $w)
+                end
+                push($cmd, $path)
+                push($cmd, "--version")
+                $starved = run_once($cmd, $starve_label)
+                $why = $starved.why
+                if $why == nil and $starved.out != $long.out then
+                    $why = $starve_label + " printed something else"
+                end
+            end
+
             # The JSON form must agree with the text form.
             if $why == nil then
                 $js = run_once([$path, "--version", "--json"], "--version --json")
@@ -289,15 +315,6 @@ for $ws in $workspaces
                             $why = "--version --json disagrees with the text line: " + trim($js.out)
                         end
                     end
-                end
-            end
-
-            # Starved of threads and processes, the answer must not change.
-            if $why == nil and $nproc_probe then
-                $starved = run_once([$prlimit, "--nproc=1:1", "--", $path, "--version"], "--version under nproc=1")
-                $why = $starved.why
-                if $why == nil and $starved.out != $long.out then
-                    $why = "--version under nproc=1 printed something else"
                 end
             end
 
