@@ -3393,6 +3393,18 @@ impl WaylandState {
         let Some(record) = self.surfaces.get_mut(&object) else {
             return;
         };
+        if record.committed_fullscreen {
+            // Fullscreen owns geometry; maximize changes only the state we
+            // reveal on exit. Never replace or consume the normal restore.
+            record.requested_maximized = maximized;
+            record.committed_maximized = maximized;
+            sync_toplevel_scene_state(record);
+            if let Err(error) = window.set_maximized(maximized) {
+                tracing::warn!(xid, %error, "failed to set X11 EWMH maximized state");
+            }
+            self.publish_x11_state_relayout(xid);
+            return;
+        }
         let server_side = record.committed_decoration == SceneDecorationMode::ServerSide;
         let target = if maximized {
             if record.committed_maximized {

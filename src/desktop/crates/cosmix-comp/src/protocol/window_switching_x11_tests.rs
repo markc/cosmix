@@ -2,6 +2,49 @@ use super::*;
 
 #[cfg(feature = "bus")]
 #[test]
+fn fullscreen_maximize_in_either_order_preserves_x11_geometry_and_restore() {
+    for toggle_while_fullscreen in [false, true] {
+        let mut harness = KeybindingHarness::new(true);
+        let (sid, _, _, object) = associate_normal_window(&mut harness, 921);
+        commit_dmabuf(&mut harness, sid, 32, 24);
+        let record = &harness.server.state.surfaces[&object];
+        let (id, generation) = (record.id.0, record.generation);
+        let original = (record.window_origin, record.configured_size);
+        let mut verbs = vec!["comp.window.fullscreen", "comp.window.maximize"];
+        if toggle_while_fullscreen {
+            verbs.extend(["comp.window.unmaximize", "comp.window.maximize"]);
+        }
+        verbs.extend(["comp.window.unfullscreen", "comp.window.unmaximize"]);
+        let mut fullscreen_rect = None;
+        for verb in verbs {
+            let crate::port::WindowVerb::Op(op) =
+                crate::port::parse_window_verb(verb, &json!({"id":id,"generation":generation}))
+                    .unwrap()
+            else {
+                panic!("one-pass verb")
+            };
+            let (rc, body) = harness.server.state.service_window_op(&op).into_wire();
+            assert_eq!(rc, 0, "{verb}: {body}");
+            let record = &harness.server.state.surfaces[&object];
+            let rect = (record.window_origin, record.configured_size);
+            if record.committed_fullscreen {
+                assert_eq!(*fullscreen_rect.get_or_insert(rect), rect, "{verb}");
+                let restore = record.normal_restore.as_ref().unwrap();
+                assert_eq!(
+                    (restore.window_origin, restore.client_size),
+                    original,
+                    "{verb}"
+                );
+            }
+        }
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!((record.window_origin, record.configured_size), original);
+        assert!(record.normal_restore.is_none());
+    }
+}
+
+#[cfg(feature = "bus")]
+#[test]
 fn bus_state_verbs_use_x11_state_and_geometry_paths() {
     let mut harness = KeybindingHarness::new(true);
     let (sid, _, _, object) = associate_normal_window(&mut harness, 920);

@@ -4302,6 +4302,9 @@ fn service_set_window_state(
     window: u64,
     leaf: &str,
 ) {
+    crate::frame_trace::event("comp_window_control", || {
+        (window, 11, request.generation.unwrap_or(0))
+    });
     let result = if let Some(enabled) = request.value.as_bool() {
         if state.session_lock_active() {
             ControlReply::Locked

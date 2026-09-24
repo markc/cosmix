@@ -73,6 +73,10 @@ fn refused(error: &'static str) -> ControlReply {
 }
 
 impl WaylandState {
+    pub(super) fn region_selection_active(&self) -> bool {
+        self.region.run.is_some()
+    }
+
     pub(super) fn start_region_selection(
         &mut self,
         output: Option<String>,

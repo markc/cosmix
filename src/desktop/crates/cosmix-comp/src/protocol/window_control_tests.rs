@@ -1,9 +1,155 @@
 // `comp.window.*` and `comp.windows.list` (included from tests.rs).
 
-use crate::port::{
-    LongOp, PlaceSpec, WaitSpec, WaitUntil, WindowMatch, WindowOp, WorkspaceIndex,
-};
+use crate::port::{LongOp, PlaceSpec, WaitSpec, WaitUntil, WindowMatch, WindowOp, WorkspaceIndex};
 use workspaces::WorkspaceTarget;
+
+#[test]
+fn unsupported_state_does_not_install_a_fullscreen_output_selection() {
+    let mut harness = KeybindingHarness::new(true);
+    let (layer, _) = map_test_layer_surface(&mut harness, 0, TestLayerSpec::default());
+    let object = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .id();
+    let output = harness
+        .server
+        .state
+        .backend
+        .default_output()
+        .unwrap()
+        .name();
+    let reply = harness
+        .server
+        .state
+        .set_window_state(
+            &object,
+            crate::port::WindowState::Fullscreen,
+            true,
+            Some(&output),
+            "test",
+        )
+        .unwrap_err();
+    assert_eq!(reply.wire_json()["error"], "unsupported_state");
+    assert!(
+        harness.server.state.surfaces[&object]
+            .fullscreen_output
+            .is_none()
+    );
+}
+
+#[test]
+fn explicit_fullscreen_reflows_when_secondary_changes_or_disappears() {
+    let (mut harness, _, _) = KeybindingHarness::new_with_port_backend(BackendKind::Kms, "kms");
+    let first = kms_security_test_key(226, "Test-A");
+    let second = kms_security_test_key(226, "Test-B");
+    let mut topology = kms_security_test_snapshot(&first, 41);
+    let secondary = kms_security_test_snapshot(&second, 42);
+    topology.connectors.extend(secondary.connectors);
+    topology.selections.extend(secondary.selections);
+    submit_kms_security_lifecycle(&mut harness, KmsTopologyLifecycleEvent::Initial(topology));
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let output = port_snapshot::project_outputs(&harness.server.state)
+        .unwrap()
+        .keys
+        .into_iter()
+        .find(|(output, _)| output.name() == "Test-B")
+        .unwrap()
+        .0;
+    harness
+        .server
+        .state
+        .set_window_state(
+            &object,
+            crate::port::WindowState::Fullscreen,
+            true,
+            Some("Test-B"),
+            "test",
+        )
+        .unwrap();
+    let traffic = harness.sync();
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+    let previous_output = harness.server.state.logical_output_rect();
+    let previous_usable = harness.server.state.usable_output_rect();
+    output.change_current_state(
+        Some(smithay::output::Mode {
+            size: (640, 480).into(),
+            refresh: 60_000,
+        }),
+        None,
+        None,
+        Some((320, 0).into()),
+    );
+    assert_eq!(harness.server.state.logical_output_rect(), previous_output);
+    harness
+        .server
+        .state
+        .reconcile_output_after_topology_change_if_needed(previous_output, previous_usable);
+    let traffic = harness.sync();
+    assert_eq!(configured_toplevel_size(&traffic), (640, 480));
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+    assert_eq!(test_toplevel_record(&harness).window_origin, (320.0, 0.0));
+
+    submit_kms_security_lifecycle(
+        &mut harness,
+        KmsTopologyLifecycleEvent::Initial(kms_security_test_snapshot(&first, 41)),
+    );
+    let traffic = harness.sync();
+    assert_eq!(harness.server.state.logical_output_rect(), previous_output);
+    assert_eq!(harness.server.state.usable_output_rect(), previous_usable);
+    assert!(test_toplevel_record(&harness).fullscreen_output.is_none());
+    assert_eq!(configured_toplevel_size(&traffic), (320, 240));
+    commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+    assert!(test_toplevel_record(&harness).committed_fullscreen);
+    assert_eq!(
+        test_toplevel_record(&harness).window_origin,
+        (previous_output.x, previous_output.y)
+    );
+}
+
+#[test]
+fn state_wait_does_not_complete_while_opposite_configures_are_pending() {
+    for (state, until) in [
+        (crate::port::WindowState::Maximized, WaitUntil::Unmaximized),
+        (
+            crate::port::WindowState::Fullscreen,
+            WaitUntil::Unfullscreen,
+        ),
+    ] {
+        let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
+        map_initial_test_toplevel(&mut harness);
+        let object = test_toplevel_record(&harness).role.wl_surface().id();
+        let (id, generation) = window_id_and_generation(&harness, &object);
+        let runtime = control_reply_runtime();
+        harness
+            .server
+            .state
+            .set_window_state(&object, state, true, None, "test")
+            .unwrap();
+        let old = configured_toplevel_serial(&harness.sync());
+        harness
+            .server
+            .state
+            .set_window_state(&object, state, false, None, "test")
+            .unwrap();
+        let new = configured_toplevel_serial(&harness.sync());
+        let admission = ingress
+            .request_long(wait_for(by_id(id, generation), until, 1000))
+            .unwrap();
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+        assert_eq!(harness.server.state.window_waiters.waiters.len(), 1);
+        commit_test_toplevel_state(&mut harness, old);
+        harness.server.state.service_window_waiters();
+        assert_eq!(harness.server.state.window_waiters.waiters.len(), 1);
+        commit_test_toplevel_state(&mut harness, new);
+        harness.server.state.service_window_waiters();
+        assert!(harness.server.state.window_waiters.waiters.is_empty());
+        assert_eq!(
+            runtime.block_on(admission.receive()).unwrap().wire_json()["until"],
+            until.name()
+        );
+    }
+}
 
 #[test]
 fn state_verbs_configure_then_publish_and_satisfy_committed_waits() {

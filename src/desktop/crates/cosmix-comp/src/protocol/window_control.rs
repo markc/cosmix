@@ -151,6 +151,16 @@ impl WaylandState {
                 .ok_or_else(|| ControlReply::refused("unknown_output", json!({"output": name})))?;
             Some(selected)
         } else { None };
+        if !matches!(&record.role, SurfaceRole::Toplevel(_)) {
+            #[cfg(feature = "xwayland")]
+            let supported = matches!(&record.role, SurfaceRole::X11(_));
+            #[cfg(not(feature = "xwayland"))]
+            let supported = false;
+            if !supported {
+                return Err(ControlReply::refused("unsupported_state", json!({"id": id.0})));
+            }
+        }
+        let previous_selection = record.fullscreen_output.clone();
         self.mark_surface_dirty(id, cause);
         if state == WindowState::Fullscreen && (output.is_some() || !enabled) {
             self.surfaces.get_mut(object).expect("resolved window").fullscreen_output = selected;
@@ -176,6 +186,7 @@ impl WaylandState {
             WindowState::Fullscreen => record.requested_fullscreen,
         };
         if after != enabled {
+            self.surfaces.get_mut(object).expect("resolved window").fullscreen_output = previous_selection;
             return Err(ControlReply::refused("unsupported_state", json!({"id": id.0, "reason": "configure_refused"})));
         }
         Ok((before, after))
@@ -1325,10 +1336,10 @@ impl WaylandState {
             }
             WaitUntil::Size { width, height } => geometry_size(record) == (width, height),
             WaitUntil::Focused => record.focused,
-            WaitUntil::Maximized => record.committed_maximized,
-            WaitUntil::Unmaximized => !record.committed_maximized,
-            WaitUntil::Fullscreen => record.committed_fullscreen,
-            WaitUntil::Unfullscreen => !record.committed_fullscreen,
+            WaitUntil::Maximized => record.pending_window_state.is_none() && record.committed_maximized,
+            WaitUntil::Unmaximized => record.pending_window_state.is_none() && !record.committed_maximized,
+            WaitUntil::Fullscreen => record.pending_window_state.is_none() && record.committed_fullscreen,
+            WaitUntil::Unfullscreen => record.pending_window_state.is_none() && !record.committed_fullscreen,
             WaitUntil::Unmapped | WaitUntil::Gone => false,
         };
         let live = |record: &SurfaceRecord| {

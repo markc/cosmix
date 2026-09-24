@@ -11908,6 +11908,13 @@ impl WaylandState {
             self.titlebar_click_candidate = None;
             return;
         }
+        #[cfg(feature = "bus")]
+        if let Some((id, generation)) = self.injection.targeted_button {
+            // All modal, quarantine and delivery gates have already run in
+            // handle_host_input. Only device hit-testing/raising is replaced.
+            self.targeted_pointer_button(id, generation, button, state, time);
+            return;
+        }
         #[cfg(feature = "embedded-quoin")]
         if let Some(bridge) = &self.embedded_shell
             && bridge.button(
@@ -12358,6 +12365,18 @@ impl WaylandState {
                     } else {
                         state.bindings.dispatch(keycode, pressed, keysym, modifiers)
                     };
+                    #[cfg(feature = "bus")]
+                    {
+                        let forwarded = matches!(&disposition, KeyDisposition::Forward);
+                        state.injection.key_handled = !forwarded
+                            || state.keyboard.current_focus().is_some()
+                            || state.corner_engaged();
+                        state.injection.key_delivery = if forwarded {
+                            state.delivery_target(true)
+                        } else {
+                            None
+                        };
+                    }
                     binding_filter_result(disposition)
                 },
             )
@@ -14324,6 +14343,18 @@ impl WaylandState {
     }
 
     fn reconfigure_window_states_for_output(&mut self) {
+        // A retired Output clone must not keep a fullscreen selection alive.
+        // Reconcile before both protocol families calculate their next rect.
+        #[cfg(feature = "bus")]
+        for record in self.surfaces.values_mut() {
+            if record
+                .fullscreen_output
+                .as_ref()
+                .is_some_and(|output| self.backend.port_output(output).is_none())
+            {
+                record.fullscreen_output = None;
+            }
+        }
         #[cfg(feature = "xwayland")]
         self.reconfigure_x11_for_output();
         let window_states = self
@@ -14352,6 +14383,10 @@ impl WaylandState {
     ) {
         if self.logical_output_rect() != previous_output
             || self.usable_output_rect() != previous_usable
+            || self
+                .surfaces
+                .values()
+                .any(|record| record.fullscreen_output.is_some())
         {
             self.reconcile_output_geometry_after_topology_change();
         }
