@@ -287,6 +287,10 @@ pub fn default_keymap() -> InputKeymap {
     }
     physical.push(right_ctrl_arrow(KEY_LEFT, "desktop.workspace.prev"));
     physical.push(right_ctrl_arrow(KEY_RIGHT, "desktop.workspace.next"));
+    // "desktop-vt1" is right on the first host (its user unit runs the citizen
+    // `--name desktop-vt1`) and wrong on hosts whose citizen has another name
+    // (e.g. one running `desktop-vt5`); it only matters on a freshly seeded file.
+    // Deferred: the per-host target is decision 6 in the TODO sweep plan.
     physical.push(clipboard_row(KEY_DOWN, "desktop.clipboard.menu"));
     physical.push(clipboard_row(KEY_UP, "desktop.clipboard.rotate"));
     for code in [KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN] {

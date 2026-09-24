@@ -88,9 +88,40 @@ citizen receives the whole string as the command and has no such verb.
 `service` must match the broker's registered-name grammar
 `^[a-z][a-z0-9-]{1,30}$`, so a mesh-qualified target is not accepted. An
 `input.bind` with a malformed `service` returns rc 10 with
-`rebind refused: InvalidService`. A keymap file row with a malformed `service`
-is dropped at load with a log line; the other rows still load. Rows without the
-field serialize without it, so older files and callers are unaffected.
+`rebind refused: InvalidService`. Rows without the field serialize without it,
+so older files and callers are unaffected.
+
+The keymap file is admitted row by row. A row that does not parse, such as one
+whose `service` is not a string, is dropped. So is a row whose `service` fails
+the grammar. The other rows still load, and the file is not reseeded. Each
+dropped row is logged with its code, modifiers, action, service and reason.
+`input.reload` also returns them in a `dropped` list in its reply:
+
+```json
+{"ok":true,"generation":7,"dropped":[{"code":108,"modifiers":{"right_ctrl":true},
+  "action":"desktop.clipboard.menu","service":7,"reason":"malformed row: ..."}]}
+```
+
+The file on disk is left as written until the next `input.bind` or
+`input.unbind`, which rewrites it from the live rows without the dropped ones.
+
+One legacy shape is migrated at load. A row with no `service` whose action
+starts with `desktop-vt1.desktop.clipboard.` is rewritten to service
+`desktop-vt1` with the rest of the action, for example
+`desktop.clipboard.menu`. inputd logs each migration with the row's code,
+modifiers, old action and new target. No other action is rewritten, so a row
+such as `foo-bar.baz.qux` keeps first-segment routing.
+
+The clipboard rows work with no `args` because the clipboard citizen accepts an
+empty body for `desktop.clipboard.menu` and `desktop.clipboard.rotate` from a
+local caller. Since citizen 0.3.5, `instance` is optional on those two verbs.
+When a caller sends it, a stale value is still refused with rc 12.
+
+Rolling back to an inputd without this field is lossy. The older binary ignores
+`service` and routes by first segment, so the clipboard rows go to `desktop`,
+which has no such verb, and nothing is logged. The next `input.bind` or
+`input.unbind` under the older binary also rewrites the file without the field.
+After rolling forward again, those rows must be rebound with `service`.
 
 The shipped default keymap binds these right-Ctrl rows:
 
@@ -102,5 +133,8 @@ The shipped default keymap binds these right-Ctrl rows:
 | RightCtrl+Up | 103 | `desktop.clipboard.rotate` | `desktop-vt1` | ignore |
 
 The default keymap only seeds a missing keymap file. A host with an existing
-file keeps its rows until they are rebound with `input.bind` or the file is
-edited and `input.reload` is sent.
+file keeps its rows, apart from the legacy clipboard migration above. Other
+rows change only when they are rebound with `input.bind`, or when the file is
+edited and `input.reload` is sent. The `desktop-vt1` target suits a host whose
+clipboard citizen runs under that name. On a host whose citizen has another
+name, rebind these two rows with that host's name.

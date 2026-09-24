@@ -72,12 +72,17 @@ fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(keymap_file::default_path);
     let keymap = match keymap_path.as_deref().and_then(keymap_file::load) {
-        Some(physical) => {
-            eprintln!("cosmix-inputd: loaded keymap ({} rows) from file", physical.len());
+        Some(loaded) => {
+            // Dropped rows were already logged one by one during the load.
+            eprintln!(
+                "cosmix-inputd: loaded keymap ({} rows, {} dropped) from file",
+                loaded.rows.len(),
+                loaded.dropped.len()
+            );
             InputKeymap {
                 version: KEYMAP_SCHEMA_VERSION,
                 semantic: cosmix_input_schema::Keymap::default(),
-                physical,
+                physical: loaded.rows,
             }
         }
         None => {

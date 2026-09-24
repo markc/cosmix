@@ -265,14 +265,15 @@ fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
         );
     };
     match keymap_file::load(path) {
-        Some(rows) => {
+        Some(loaded) => {
             let generation = resolver
                 .lock()
                 .expect("resolver poisoned")
-                .replace_physical(rows);
+                .replace_physical(loaded.rows);
             (
                 0,
-                json!({ "ok": true, "generation": generation }).to_string(),
+                json!({ "ok": true, "generation": generation, "dropped": loaded.dropped })
+                    .to_string(),
             )
         }
         None => error(&format!("keymap file {} could not be read", path.display())),
@@ -546,6 +547,39 @@ mod tests {
             .find(|r| r["action"] == "desktop.workspace.next")
             .unwrap();
         assert!(next.get("service").is_none(), "{next}");
+    }
+
+    #[test]
+    fn reload_reports_dropped_rows_and_keeps_the_good_ones() {
+        let dir =
+            std::env::temp_dir().join(format!("inputd-reload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keymap.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"physical":[
+                {"stroke":{"code":108,"modifiers":{"right_ctrl":true}},
+                 "action":"desktop.clipboard.menu","service":7},
+                {"stroke":{"code":106,"modifiers":{"right_ctrl":true}},
+                 "action":"desktop.workspace.next"}]}"#,
+        )
+        .unwrap();
+        let mut injector = PointerInjector::default();
+        let resolver = resolver();
+        let cmd = command(verbs::RELOAD, json!({}), Some("local"));
+        let (rc, reply) = dispatch(&resolver, Some(&path), &mut injector, &cmd);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc, 0, "{reply}");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        let dropped = reply["dropped"].as_array().expect("dropped list");
+        assert_eq!(dropped.len(), 1, "{reply}");
+        assert_eq!(dropped[0]["code"], 108);
+        assert_eq!(dropped[0]["action"], "desktop.clipboard.menu");
+        assert_eq!(dropped[0]["service"], 7);
+        assert_eq!(dropped[0]["modifiers"]["right_ctrl"], true);
+        let rows = resolver.lock().unwrap().physical_rows().to_vec();
+        assert_eq!(rows.len(), 1, "only the good row is live");
+        assert_eq!(rows[0].action.as_str(), "desktop.workspace.next");
     }
 
     #[test]

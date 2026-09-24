@@ -516,9 +516,33 @@ citizen receives the whole string as the command and has no such verb.</p>
 <p><code>service</code> must match the broker's registered-name grammar
 <code>^[a-z][a-z0-9-]{1,30}$</code>, so a mesh-qualified target is not accepted. An
 <code>input.bind</code> with a malformed <code>service</code> returns rc 10 with
-<code>rebind refused: InvalidService</code>. A keymap file row with a malformed <code>service</code>
-is dropped at load with a log line; the other rows still load. Rows without the
-field serialize without it, so older files and callers are unaffected.</p>
+<code>rebind refused: InvalidService</code>. Rows without the field serialize without it,
+so older files and callers are unaffected.</p>
+<p>The keymap file is admitted row by row. A row that does not parse, such as one
+whose <code>service</code> is not a string, is dropped. So is a row whose <code>service</code> fails
+the grammar. The other rows still load, and the file is not reseeded. Each
+dropped row is logged with its code, modifiers, action, service and reason.
+<code>input.reload</code> also returns them in a <code>dropped</code> list in its reply:</p>
+<pre><code class="language-json">{"ok":true,"generation":7,"dropped":[{"code":108,"modifiers":{"right_ctrl":true},
+  "action":"desktop.clipboard.menu","service":7,"reason":"malformed row: ..."}]}
+</code></pre>
+<p>The file on disk is left as written until the next <code>input.bind</code> or
+<code>input.unbind</code>, which rewrites it from the live rows without the dropped ones.</p>
+<p>One legacy shape is migrated at load. A row with no <code>service</code> whose action
+starts with <code>desktop-vt1.desktop.clipboard.</code> is rewritten to service
+<code>desktop-vt1</code> with the rest of the action, for example
+<code>desktop.clipboard.menu</code>. inputd logs each migration with the row's code,
+modifiers, old action and new target. No other action is rewritten, so a row
+such as <code>foo-bar.baz.qux</code> keeps first-segment routing.</p>
+<p>The clipboard rows work with no <code>args</code> because the clipboard citizen accepts an
+empty body for <code>desktop.clipboard.menu</code> and <code>desktop.clipboard.rotate</code> from a
+local caller. Since citizen 0.3.5, <code>instance</code> is optional on those two verbs.
+When a caller sends it, a stale value is still refused with rc 12.</p>
+<p>Rolling back to an inputd without this field is lossy. The older binary ignores
+<code>service</code> and routes by first segment, so the clipboard rows go to <code>desktop</code>,
+which has no such verb, and nothing is logged. The next <code>input.bind</code> or
+<code>input.unbind</code> under the older binary also rewrites the file without the field.
+After rolling forward again, those rows must be rebound with <code>service</code>.</p>
 <p>The shipped default keymap binds these right-Ctrl rows:</p>
 <table><thead><tr><th>Chord</th><th>Code</th><th>Action</th><th>Service</th><th>Repeat</th></tr></thead><tbody>
 <tr><td>RightCtrl+Left</td><td>105</td><td><code>desktop.workspace.prev</code></td><td>first segment</td><td>allow</td></tr>
@@ -527,8 +551,11 @@ field serialize without it, so older files and callers are unaffected.</p>
 <tr><td>RightCtrl+Up</td><td>103</td><td><code>desktop.clipboard.rotate</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 </tbody></table>
 <p>The default keymap only seeds a missing keymap file. A host with an existing
-file keeps its rows until they are rebound with <code>input.bind</code> or the file is
-edited and <code>input.reload</code> is sent.</p></div></div>
+file keeps its rows, apart from the legacy clipboard migration above. Other
+rows change only when they are rebound with <code>input.bind</code>, or when the file is
+edited and <code>input.reload</code> is sent. The <code>desktop-vt1</code> target suits a host whose
+clipboard citizen runs under that name. On a host whose citizen has another
+name, rebind these two rows with that host's name.</p></div></div>
     </div>
 
 </main>

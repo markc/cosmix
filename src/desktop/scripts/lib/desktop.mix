@@ -1,4 +1,4 @@
--- Desktop Bus capability provider v0.3.4. Trusted session configuration only.
+-- Desktop Bus capability provider v0.3.5. Trusted session configuration only.
 -- Requests never select executable paths, environment, display or session bus.
 $_nul = json_parse("\"\\u0000\"")
 
@@ -460,7 +460,7 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.4", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:"0.3.5", session:$ctx.session,
       instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
@@ -491,17 +491,27 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   elif $verb == "desktop.clipboard.entry" then $expected = ["instance","id"]
   elif $verb == "desktop.clipboard.pick" then $expected = ["instance","id"]
   elif $verb == "desktop.clipboard.pause" then $expected = ["instance","on"]
-  elif $verb == "desktop.clipboard.rotate" then $expected = ["instance"]
-  elif $verb == "desktop.clipboard.menu" then $expected = ["instance"]
+  elif $verb == "desktop.clipboard.rotate" or $verb == "desktop.clipboard.menu" then
+    -- Keybind surfaces: inputd fires these from a static keymap row with an
+    -- empty body, and a static row cannot carry the uuid minted at citizen
+    -- start. So `instance` is OPTIONAL here — same reasoning as capture: the
+    -- fence is a staleness guard for caller-held handles, not a trust
+    -- boundary (both verbs are local-only in caller_allowed, and any local
+    -- caller can read the live instance from desktop.capabilities). When a
+    -- caller does send `instance`, it is still checked and a stale one is
+    -- refused exactly as before.
+    if not keys_subset($body, [], ["instance"]) then return error("INVALID_REQUEST", 10) end
+    if $body.instance != nil and $body.instance != $ctx.instance then return error("STALE_SESSION", 12) end
   elif $verb != "desktop.clipboard.read" and $verb != "desktop.clipboard.history" and $verb != "desktop.clipboard.clear" then
     return error("UNKNOWN_COMMAND", 10)
   end
-  if $verb != "desktop.clipboard.history" and $verb != "desktop.clipboard.clear" and not keys_are($body, $expected) then
+  $fence_optional = $verb == "desktop.clipboard.rotate" or $verb == "desktop.clipboard.menu"
+  if not $fence_optional and $verb != "desktop.clipboard.history" and $verb != "desktop.clipboard.clear" and not keys_are($body, $expected) then
     return error("INVALID_REQUEST", 10)
   end
   if $verb == "desktop.clipboard.history" and not keys_subset($body, ["instance"], ["q","offset","limit"]) then return error("INVALID_REQUEST", 10) end
   if $verb == "desktop.clipboard.clear" and not keys_subset($body, ["instance"], ["id"]) then return error("INVALID_REQUEST", 10) end
-  if $body.instance != $ctx.instance then return error("STALE_SESSION", 12) end
+  if not $fence_optional and $body.instance != $ctx.instance then return error("STALE_SESSION", 12) end
   if $verb == "desktop.clipboard.history" then
     $q = $body.q == nil ? "" : $body.q
     $offset = $body.offset == nil ? 0 : $body.offset
