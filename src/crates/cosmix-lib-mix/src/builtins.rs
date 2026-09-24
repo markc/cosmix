@@ -320,6 +320,7 @@ builtin_table! {
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
     ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers). Every host is validated before any ssh spawns, so a bad option or host raises locally with nothing run. One host's failure is DATA in its own map, never a raise: unreachable, nonzero exit and timeout arrive as ok:false. decode is per host too: where ssh_mix raises (truncated stdout, unparseable stdout), that host alone gets ok:false, decode_error and no value. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch)", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
+    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id. Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client. to is a string or list of strings; the envelope sender is from's address (the part in <…> when it has a display name). A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL anywhere in a header raises (no header injection). headers adds headers or replaces the generated Date/Message-ID/MIME-Version/Content-Type/Content-Transfer-Encoding; From/To/Subject there raise (set them in msg). sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host instead, via ssh_exec (remote default /usr/sbin/sendmail; the result carries host). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); a bad msg or option raises OPTION_INVALID before anything runs", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: map("send_mail_options", {host: string, sendmail: string, timeout: number})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
@@ -545,6 +546,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "ssh_must" => builtin_ssh_must(args),
         "ssh_mix" => builtin_ssh_mix(args),
         "ssh_mix_many" => builtin_ssh_mix_many(args),
+        "send_mail" => builtin_send_mail(args),
         "ssh_exec" => builtin_ssh_exec(args),
         "run_rc" => builtin_run_rc(args),
         "run_stream" => builtin_run_stream(args),
@@ -1150,13 +1152,13 @@ pub fn conditional_cap_engaged(name: &str, args: &[Value], option: &str) -> bool
             _ => {}
         }
     }
-    // `name` selects a per-builtin resolver, and only http builtins have
-    // one today — without the http feature the selector is legitimately
-    // unread (the signature stays feature-stable for callers).
-    #[cfg(not(feature = "http"))]
-    let _ = name;
-    // No option-carrying builtin outside http today; conservative
-    // fallback (any map arg) for a future one added without a resolver.
+    // send_mail's `host` lives in the OPTS map only; its first argument is
+    // the message map, whose keys are never options.
+    if name == "send_mail" {
+        return map_has(args.get(1));
+    }
+    // Conservative fallback (any map arg) for an option-carrying builtin
+    // added without a resolver.
     args.iter().any(|v| map_has(Some(v)))
 }
 
@@ -10929,6 +10931,379 @@ fn plan_ssh_mix(args: Vec<Value>) -> MixResult<(SshCall, Option<String>)> {
         Value::map(opts_map),
     ])?;
     Ok((call, decode_mode))
+}
+
+// ── send_mail ──────────────────────────────────────────────────────────
+
+const SEND_MAIL_MSG_KEYS: &[&str] = &["to", "from", "subject", "body", "headers"];
+const SEND_MAIL_OPT_KEYS: &[&str] = &["host", "sendmail", "timeout"];
+/// Headers `send_mail` writes itself from the msg fields. A `headers`
+/// entry naming one is refused — there must be exactly one source for
+/// each, or a report could go out with two `To:` lines.
+const SEND_MAIL_OWNED_HEADERS: &[&str] = &["from", "to", "subject"];
+/// Where a local sendmail is looked for when `sendmail` is not given and
+/// none is on PATH (non-root PATHs usually lack /usr/sbin).
+const SEND_MAIL_LOCAL_FALLBACKS: &[&str] = &["/usr/sbin/sendmail", "/usr/lib/sendmail"];
+/// The remote default for a `host` hop — the fleet convention; the remote
+/// run_argv resolves nothing else.
+const SEND_MAIL_REMOTE_DEFAULT: &str = "/usr/sbin/sendmail";
+
+fn send_mail_invalid(msg: impl std::fmt::Display) -> MixError {
+    opt_invalid("send_mail", msg)
+}
+
+/// A header value: a string, single line, no NUL, ASCII (anything else
+/// would need RFC 2047 or SMTPUTF8 and must not be guessed at).
+fn send_mail_header_value(field: &str, v: &Value) -> MixResult<String> {
+    let Value::String(s) = v else {
+        return Err(send_mail_invalid(format!(
+            "{field} must be a string, got {}",
+            v.type_name()
+        )));
+    };
+    if s.contains(['\r', '\n', '\0']) {
+        return Err(send_mail_invalid(format!(
+            "{field} contains a CR, LF or NUL — refused (header injection)"
+        )));
+    }
+    if !s.is_ascii() {
+        return Err(send_mail_invalid(format!(
+            "{field} must be ASCII (only the subject is RFC 2047-encoded for you)"
+        )));
+    }
+    Ok(s.clone())
+}
+
+/// The envelope sender for `sendmail -f`: the address inside `<…>` when
+/// the From value has a display name, else the whole value.
+fn send_mail_envelope(from: &str) -> MixResult<String> {
+    let addr = match (from.rfind('<'), from.rfind('>')) {
+        (Some(l), Some(r)) if l < r => from[l + 1..r].trim(),
+        _ => from.trim(),
+    };
+    if addr.is_empty() || addr.starts_with('-') || addr.contains(char::is_whitespace) {
+        return Err(send_mail_invalid(format!(
+            "from must hold one address (\"a@example.com\" or \"Name <a@example.com>\"), got {from:?}"
+        )));
+    }
+    Ok(addr.to_string())
+}
+
+/// RFC 5322 §3.3 date-time in UTC, e.g. `Thu, 24 Sep 2026 12:00:00 +0000`.
+fn send_mail_date(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} +0000",
+        WD[days.rem_euclid(7) as usize],
+        day,
+        MO[(month - 1) as usize],
+        year,
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+/// Encode a subject: unchanged when plain ASCII, else RFC 2047 words
+/// folded one per line (each continuation starts with a space — valid
+/// folding whitespace, and it keeps every line short).
+fn send_mail_subject(subject: &str) -> MixResult<String> {
+    if subject.is_ascii() && !subject.contains("=?") {
+        return Ok(subject.to_string());
+    }
+    send_mail_rfc2047(subject)
+}
+
+#[cfg(feature = "crypto")]
+fn send_mail_rfc2047(subject: &str) -> MixResult<String> {
+    match builtin_rfc2047_encode(vec![Value::String(subject.to_string())])? {
+        Some(Value::String(s)) => Ok(s.replace(" =?", "\n =?")),
+        _ => Err(MixError::RuntimeError {
+            span: None,
+            msg: "send_mail: rfc2047_encode returned a non-string".into(),
+        }),
+    }
+}
+
+#[cfg(not(feature = "crypto"))]
+fn send_mail_rfc2047(_subject: &str) -> MixResult<String> {
+    Err(MixError::RuntimeError {
+        span: None,
+        msg: "send_mail: a non-ASCII subject requires the `crypto` feature (RFC 2047 B encoding is base64)".into(),
+    })
+}
+
+/// A rendered message: the RFC 5322 text, its envelope sender and its
+/// Message-ID.
+struct RenderedMail {
+    text: String,
+    envelope_from: String,
+    message_id: String,
+}
+
+fn send_mail_render(msg: &Value) -> MixResult<RenderedMail> {
+    let Value::Map(m) = msg else {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!("send_mail: msg must be a map, got {}", msg.type_name()),
+        ));
+    };
+    for k in m.keys() {
+        if !SEND_MAIL_MSG_KEYS.contains(&k.as_str()) {
+            return Err(send_mail_invalid(format!(
+                "unknown msg key '{}' (allowed: {})",
+                sanitize_for_diag(k),
+                SEND_MAIL_MSG_KEYS.join(", ")
+            )));
+        }
+    }
+    let required = |key: &str| {
+        m.get(key)
+            .filter(|v| !matches!(v, Value::Nil))
+            .ok_or_else(|| send_mail_invalid(format!("msg.{key} is required")))
+    };
+    let to: Vec<String> = match required("to")? {
+        Value::List(l) if l.is_empty() => {
+            return Err(send_mail_invalid("msg.to must name at least one recipient"));
+        }
+        Value::List(l) => l
+            .iter()
+            .enumerate()
+            .map(|(i, v)| send_mail_header_value(&format!("msg.to[{i}]"), v))
+            .collect::<MixResult<_>>()?,
+        other => vec![send_mail_header_value("msg.to", other)?],
+    };
+    if to.iter().any(|t| t.trim().is_empty()) {
+        return Err(send_mail_invalid("msg.to must not contain an empty recipient"));
+    }
+    let from = send_mail_header_value("msg.from", required("from")?)?;
+    let envelope_from = send_mail_envelope(&from)?;
+    let subject = match required("subject")? {
+        Value::String(s) if !s.contains(['\r', '\n', '\0']) => s.clone(),
+        Value::String(_) => {
+            return Err(send_mail_invalid(
+                "msg.subject contains a CR, LF or NUL — refused (header injection)",
+            ));
+        }
+        other => {
+            return Err(send_mail_invalid(format!(
+                "msg.subject must be a string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let body = match required("body")? {
+        Value::String(s) => s.clone(),
+        other => {
+            return Err(send_mail_invalid(format!(
+                "msg.body must be a string, got {}",
+                other.type_name()
+            )));
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let domain = envelope_from
+        .rsplit_once('@')
+        .map_or("localhost", |(_, d)| d);
+    // Generated headers, in order; a caller header of the same name
+    // replaces the generated value in place.
+    let mut headers: Vec<(String, String)> = vec![
+        ("From".into(), from),
+        ("To".into(), to.join(", ")),
+        ("Subject".into(), send_mail_subject(&subject)?),
+        ("Date".into(), send_mail_date(now.as_secs() as i64)),
+        (
+            "Message-ID".into(),
+            format!(
+                "<{}.{}.{:016x}@{}>",
+                now.as_millis(),
+                std::process::id(),
+                rand::random::<u64>(),
+                domain
+            ),
+        ),
+        ("MIME-Version".into(), "1.0".into()),
+        ("Content-Type".into(), "text/plain; charset=utf-8".into()),
+        (
+            "Content-Transfer-Encoding".into(),
+            if body.is_ascii() { "7bit" } else { "8bit" }.into(),
+        ),
+    ];
+    match m.get("headers") {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(extra)) => {
+            for (name, v) in extra.iter() {
+                let valid_name = !name.is_empty()
+                    && name.bytes().all(|b| (33..=126).contains(&b) && b != b':');
+                if !valid_name {
+                    return Err(send_mail_invalid(format!(
+                        "invalid header name {:?} (printable ASCII, no ':')",
+                        sanitize_for_diag(name)
+                    )));
+                }
+                let lower = name.to_ascii_lowercase();
+                if SEND_MAIL_OWNED_HEADERS.contains(&lower.as_str()) {
+                    return Err(send_mail_invalid(format!(
+                        "header '{name}' comes from msg.{lower} — set it there"
+                    )));
+                }
+                let value = send_mail_header_value(&format!("msg.headers.{name}"), v)?;
+                match headers
+                    .iter_mut()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    Some(slot) => *slot = (name.clone(), value),
+                    None => headers.push((name.clone(), value)),
+                }
+            }
+        }
+        Some(other) => {
+            return Err(send_mail_invalid(format!(
+                "msg.headers must be a map, got {}",
+                other.type_name()
+            )));
+        }
+    }
+    let message_id = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("message-id"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    let mut text = String::with_capacity(body.len() + 512);
+    for (n, v) in &headers {
+        text.push_str(n);
+        text.push_str(": ");
+        text.push_str(v);
+        text.push('\n');
+    }
+    text.push('\n');
+    // sendmail reads local line endings; a CRLF body would gain stray CRs.
+    text.push_str(&body.replace("\r\n", "\n"));
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(RenderedMail {
+        text,
+        envelope_from,
+        message_id,
+    })
+}
+
+/// First `sendmail` on PATH, else the conventional install paths, else the
+/// bare name (run_argv then reports the spawn failure as DATA).
+fn send_mail_local_binary() -> String {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let cand = dir.join("sendmail");
+            if let Ok(meta) = std::fs::metadata(&cand) {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                    return cand.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    SEND_MAIL_LOCAL_FALLBACKS
+        .iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .map_or_else(|| "sendmail".to_string(), |p| (*p).to_string())
+}
+
+/// `send_mail(msg[, opts])` — render a plain-text message and hand it to
+/// the local MTA's `sendmail -t -i -f <envelope>` over stdin (never a
+/// network SMTP client). `host` does the same on a remote host through
+/// `ssh_exec`. Returns the `process_result` of that sendmail run (plus
+/// `host` for a hop) with `message_id` added; an MTA failure is DATA.
+fn builtin_send_mail(args: Vec<Value>) -> MixResult<Option<Value>> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!("send_mail: expected 1 or 2 args (msg, [opts]), got {}", args.len()),
+        ));
+    }
+    let mut host: Option<String> = None;
+    let mut binary: Option<String> = None;
+    let mut timeout: Option<Value> = None;
+    match args.get(1) {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(o)) => {
+            for (k, v) in o.iter() {
+                match (k.as_str(), v) {
+                    ("host", Value::String(s)) if !s.is_empty() => host = Some(s.clone()),
+                    ("sendmail", Value::String(s)) if !s.is_empty() => binary = Some(s.clone()),
+                    ("timeout", Value::Number(_)) => timeout = Some(v.clone()),
+                    ("host" | "sendmail", _) => {
+                        return Err(send_mail_invalid(format!("{k} must be a non-empty string")));
+                    }
+                    ("timeout", other) => {
+                        return Err(send_mail_invalid(format!(
+                            "timeout must be a number of seconds, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    (other, _) => {
+                        return Err(send_mail_invalid(format!(
+                            "unknown option '{}' (allowed: {})",
+                            sanitize_for_diag(other),
+                            SEND_MAIL_OPT_KEYS.join(", ")
+                        )));
+                    }
+                }
+            }
+        }
+        Some(other) => {
+            return Err(send_mail_invalid(format!(
+                "options must be a map, got {}",
+                other.type_name()
+            )));
+        }
+    }
+    let mail = send_mail_render(&args[0])?;
+
+    let mut run_opts = indexmap::IndexMap::new();
+    run_opts.insert("stdin".to_string(), Value::String(mail.text));
+    if let Some(t) = timeout {
+        run_opts.insert("timeout".to_string(), t);
+    }
+    let bin = match (&host, binary) {
+        (_, Some(b)) => b,
+        (Some(_), None) => SEND_MAIL_REMOTE_DEFAULT.to_string(),
+        (None, None) => send_mail_local_binary(),
+    };
+    let argv = Value::list(
+        [bin.as_str(), "-t", "-i", "-f", mail.envelope_from.as_str()]
+            .into_iter()
+            .map(|s| Value::String(s.to_string()))
+            .collect(),
+    );
+    let mut result = match host {
+        Some(h) => builtin_ssh_exec(vec![Value::String(h), argv, Value::map(run_opts)])?
+            .unwrap_or(Value::Nil),
+        None => builtin_run_argv_impl("send_mail", &[argv, Value::map(run_opts)])?,
+    };
+    if let Value::Map(m) = &mut result {
+        Rc::make_mut(m).insert("message_id".into(), Value::String(mail.message_id));
+    }
+    Ok(Some(result))
 }
 
 /// An error's message without the `Runtime error:` rendering prefix, for
@@ -22578,8 +22953,9 @@ mod ssh_helpers_tests {
 
     // ---- ssh_run helpers --------------------------------------------------
     use super::{
-        SshOpts, build_remote_command, build_ssh_argv, builtin_ssh_mix, builtin_ssh_mix_many,
-        builtin_ssh_run, is_valid_env_key, parse_env_opt, parse_ssh_opts,
+        SshOpts, build_remote_command, build_ssh_argv, builtin_send_mail, builtin_ssh_mix,
+        builtin_ssh_mix_many, builtin_ssh_run, conditional_cap_engaged, is_valid_env_key,
+        parse_env_opt, parse_ssh_opts, send_mail_date, send_mail_render,
     };
     use crate::error::MixError;
     use indexmap::IndexMap;
@@ -22860,6 +23236,168 @@ mod ssh_helpers_tests {
             ])
             .contains("opts must be a map")
         );
+    }
+
+    fn mail_msg(extra: &[(&str, Value)]) -> Value {
+        let mut m = IndexMap::new();
+        m.insert("to".to_string(), Value::String("ops@example.com".into()));
+        m.insert("from".to_string(), Value::String("Reports <reports@example.com>".into()));
+        m.insert("subject".to_string(), Value::String("weekly".into()));
+        m.insert("body".to_string(), Value::String("line one\r\nline two".into()));
+        for (k, v) in extra {
+            if matches!(v, Value::Nil) {
+                m.shift_remove(*k);
+            } else {
+                m.insert((*k).to_string(), v.clone());
+            }
+        }
+        Value::map(m)
+    }
+
+    fn send_mail_code(args: Vec<Value>) -> (Option<String>, String) {
+        let e = builtin_send_mail(args).expect_err("must raise before any sendmail runs");
+        (e.info().map(|i| i.code.clone()), e.to_string())
+    }
+
+    #[test]
+    fn send_mail_date_is_rfc5322_utc() {
+        assert_eq!(send_mail_date(0), "Thu, 01 Jan 1970 00:00:00 +0000");
+        assert_eq!(send_mail_date(951_868_799), "Tue, 29 Feb 2000 23:59:59 +0000");
+        assert_eq!(send_mail_date(1_790_253_296), "Thu, 24 Sep 2026 12:34:56 +0000");
+    }
+
+    #[test]
+    fn send_mail_renders_headers_envelope_and_body() {
+        let r = send_mail_render(&mail_msg(&[(
+            "to",
+            Value::list(vec![
+                Value::String("a@example.com".into()),
+                Value::String("B <b@example.com>".into()),
+            ]),
+        )]))
+        .expect("render");
+        assert_eq!(r.envelope_from, "reports@example.com");
+        let (head, body) = r.text.split_once("\n\n").expect("blank line ends the headers");
+        let lines: Vec<&str> = head.lines().collect();
+        assert_eq!(lines[0], "From: Reports <reports@example.com>");
+        assert_eq!(lines[1], "To: a@example.com, B <b@example.com>");
+        assert_eq!(lines[2], "Subject: weekly");
+        assert!(lines[3].starts_with("Date: ") && lines[3].ends_with(" +0000"), "{head}");
+        assert_eq!(lines[4], format!("Message-ID: {}", r.message_id));
+        assert!(
+            r.message_id.starts_with('<') && r.message_id.ends_with("@example.com>"),
+            "{}",
+            r.message_id
+        );
+        assert!(head.contains("Content-Type: text/plain; charset=utf-8"), "{head}");
+        assert!(head.contains("Content-Transfer-Encoding: 7bit"), "{head}");
+        // CRLF normalised, trailing newline added.
+        assert_eq!(body, "line one\nline two\n");
+    }
+
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn send_mail_encodes_a_non_ascii_subject_and_marks_8bit_bodies() {
+        let r = send_mail_render(&mail_msg(&[
+            ("subject", Value::String("Wöchentlicher Bericht über alle Benutzer auf dem Cluster".into())),
+            ("body", Value::String("grüße\n".into())),
+        ]))
+        .expect("render");
+        let subject: String = r
+            .text
+            .lines()
+            .skip_while(|l| !l.starts_with("Subject: "))
+            .take_while(|l| l.starts_with("Subject: ") || l.starts_with(' '))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(subject.starts_with("Subject: =?UTF-8?B?"), "{subject}");
+        assert!(subject.is_ascii(), "{subject}");
+        assert!(r.text.contains("Content-Transfer-Encoding: 8bit"), "{}", r.text);
+    }
+
+    #[test]
+    fn send_mail_headers_replace_generated_ones_and_refuse_owned_ones() {
+        let r = send_mail_render(&mail_msg(&[(
+            "headers",
+            map_of(&[
+                ("Content-Type", Value::String("text/html; charset=utf-8".into())),
+                ("Message-ID", Value::String("<fixed@example.com>".into())),
+                ("X-Report", Value::String("weekly".into())),
+            ]),
+        )]))
+        .expect("render");
+        assert_eq!(r.message_id, "<fixed@example.com>");
+        assert_eq!(r.text.matches("Content-Type:").count(), 1, "{}", r.text);
+        assert!(r.text.contains("Content-Type: text/html; charset=utf-8\n"));
+        assert!(r.text.contains("X-Report: weekly\n"));
+
+        let e = send_mail_render(&mail_msg(&[(
+            "headers",
+            map_of(&[("subject", Value::String("second".into()))]),
+        )]))
+        .err()
+        .expect("an owned header in headers must raise");
+        assert!(e.to_string().contains("msg.subject"), "{e}");
+    }
+
+    #[test]
+    fn send_mail_refuses_bad_messages_before_running_anything() {
+        let cases: Vec<(Value, &str)> = vec![
+            (mail_msg(&[("to", Value::Nil)]), "msg.to is required"),
+            (mail_msg(&[("from", Value::Nil)]), "msg.from is required"),
+            (mail_msg(&[("to", Value::list(vec![]))]), "at least one recipient"),
+            (
+                mail_msg(&[("to", Value::String("a@example.com\nBcc: x@example.com".into()))]),
+                "header injection",
+            ),
+            (
+                mail_msg(&[("subject", Value::String("hi\r\nBcc: x@example.com".into()))]),
+                "header injection",
+            ),
+            (
+                mail_msg(&[("from", Value::String("-oQ/tmp x@example.com".into()))]),
+                "one address",
+            ),
+            (mail_msg(&[("from", Value::String("-x@example.com".into()))]), "one address"),
+            (mail_msg(&[("cc", Value::String("x@example.com".into()))]), "unknown msg key"),
+            (
+                mail_msg(&[("headers", map_of(&[("Bad Name", Value::String("v".into()))]))]),
+                "invalid header name",
+            ),
+            (
+                mail_msg(&[("to", Value::String("Jürgen <j@example.com>".into()))]),
+                "must be ASCII",
+            ),
+        ];
+        for (msg, want) in cases {
+            let (code, text) = send_mail_code(vec![msg]);
+            assert_eq!(code.as_deref(), Some("OPTION_INVALID"), "{text}");
+            assert!(text.contains(want), "want {want:?}, got {text}");
+        }
+        let (code, text) = send_mail_code(vec![Value::String("x".into())]);
+        assert_eq!(code.as_deref(), Some("TYPE_MISMATCH"), "{text}");
+        let (code, text) = send_mail_code(vec![
+            mail_msg(&[]),
+            map_of(&[("via", Value::String("sendmail".into()))]),
+        ]);
+        assert_eq!(code.as_deref(), Some("OPTION_INVALID"), "{text}");
+        assert!(text.contains("unknown option 'via'"), "{text}");
+    }
+
+    #[test]
+    fn send_mail_host_engages_the_network_capability_only_from_opts() {
+        let msg = mail_msg(&[]);
+        assert!(!conditional_cap_engaged("send_mail", &[msg.clone()], "host"));
+        assert!(!conditional_cap_engaged(
+            "send_mail",
+            &[msg.clone(), map_of(&[("timeout", Value::Number(5.0))])],
+            "host"
+        ));
+        assert!(conditional_cap_engaged(
+            "send_mail",
+            &[msg, map_of(&[("host", Value::String("alpha".into()))])],
+            "host"
+        ));
     }
 
     fn ssh_mix_many_err(args: Vec<Value>) -> MixError {
