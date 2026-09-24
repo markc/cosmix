@@ -745,7 +745,6 @@ mod tests {
             handler_ast_cache: crate::mix_handler::new_ast_cache(),
             // These sync-dispatch tests never reach `tls.reload`.
             tls_reload: None,
-            listener_config: crate::bus::vhost_verbs::ListenerConfigSource::Fixed(None),
         })
     }
 

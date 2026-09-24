@@ -65,7 +65,6 @@
 use std::sync::Arc;
 
 use cosmix_client::IncomingCommand;
-use cosmix_config::node::{NodeConfig, WebdListenerConfig};
 use cosmix_props::{
     Actor, Capability, CapabilitySet, DeleteOpts, MergeMode, PeerIdentity, PropValue, RecordKey,
     SetOpts, StoreError, Version, WriteOrigin,
@@ -92,115 +91,6 @@ const RC_CALLER_ERROR: u8 = 10;
 /// drift between the two stamps surfaces immediately as a namespace
 /// hook rejection rather than a silent half-state.
 const SOURCE_BUS_RUNTIME: &str = "bus_runtime";
-
-/// Where `vhost.add` / `vhost.remove` read the `node.conf.mix` that the
-/// NEXT webd restart will enforce.
-///
-/// The restart — not the live daemon — is what a runtime row can break:
-/// `synthesize_listeners` runs over every namespace host at startup, and
-/// on a node with an explicit `[[webd.listener]]` array a host that no
-/// enabled listener names (or a listener naming a host that no longer
-/// exists) aborts the boot, taking every vhost on the node down. The
-/// verbs therefore re-read the on-disk config at call time and refuse a
-/// change that restart would reject, instead of letting it detonate later.
-#[derive(Clone)]
-pub(crate) enum ListenerConfigSource {
-    /// Re-read `node.conf.mix` through the same resolution startup uses
-    /// ([`cosmix_config::node::load_node_config`]). Production.
-    Disk,
-    /// A fixed config: test fixtures, the bootstrap `:80` node and the
-    /// dev static server. `None` = no node config, i.e. the implicit
-    /// single `wg` listener that serves every host.
-    Fixed(Option<Arc<NodeConfig>>),
-}
-
-impl ListenerConfigSource {
-    fn load(&self) -> Result<Option<Arc<NodeConfig>>, String> {
-        match self {
-            Self::Disk => cosmix_config::node::load_node_config()
-                .map(|c| c.map(Arc::new))
-                .map_err(|e| format!("{e:#}")),
-            Self::Fixed(cfg) => Ok(cfg.clone()),
-        }
-    }
-}
-
-/// Listeners in `cfg` whose `vhosts` allowlist names `fqdn` (exact
-/// match — the startup check compares the namespace key byte-for-byte).
-fn listeners_naming<'a>(cfg: &'a NodeConfig, fqdn: &str) -> Vec<&'a WebdListenerConfig> {
-    cfg.webd
-        .listener
-        .iter()
-        .filter(|l| l.vhosts.iter().any(|h| h == fqdn))
-        .collect()
-}
-
-/// Would the next restart serve a newly added `fqdn`? Mirrors the
-/// per-host half of `NodeConfig::synthesize_listeners`: with an explicit
-/// listener array the host must be named by exactly one listener, and
-/// that listener must be enabled. `None` = admissible (including the
-/// implicit single-listener node, which serves every host).
-pub(crate) fn listener_add_error(cfg: Option<&NodeConfig>, fqdn: &str) -> Option<String> {
-    let cfg = cfg?;
-    if cfg.webd.listener.is_empty() {
-        return None;
-    }
-    match listeners_naming(cfg, fqdn).as_slice() {
-        [] => Some(format!(
-            "vhost {fqdn:?} is not in any [[webd.listener]] `vhosts` allowlist in \
-             node.conf.mix; the next webd restart would refuse to start and take \
-             every vhost on this node down. Add it to exactly one enabled \
-             listener's `vhosts` first, then retry",
-        )),
-        [l] if !l.enabled => Some(format!(
-            "vhost {fqdn:?} is named only by the disabled listener {:?} in \
-             node.conf.mix; the next webd restart would refuse to start. Move it \
-             to an enabled listener first, then retry",
-            l.id,
-        )),
-        [_] => None,
-        [a, b, ..] => Some(format!(
-            "vhost {fqdn:?} is named by two listeners ({:?} and {:?}) in \
-             node.conf.mix; the next webd restart would refuse to start. A host \
-             belongs to exactly one listener",
-            a.id, b.id,
-        )),
-    }
-}
-
-/// Would the next restart survive removing `fqdn`? A listener that still
-/// names a host no longer defined anywhere is a hard "unknown vhost"
-/// startup error. The host stays defined when a `[[webd.vhost]]` block
-/// still declares it (host or alias): bootstrap re-materialises that row.
-pub(crate) fn listener_remove_error(cfg: Option<&NodeConfig>, fqdn: &str) -> Option<String> {
-    let cfg = cfg?;
-    let naming = listeners_naming(cfg, fqdn);
-    let first = naming.first()?;
-    let still_defined = cfg.webd.vhost.iter().any(|v| {
-        v.host.eq_ignore_ascii_case(fqdn) || v.aliases.iter().any(|a| a.eq_ignore_ascii_case(fqdn))
-    });
-    if still_defined {
-        return None;
-    }
-    Some(format!(
-        "listener {:?} in node.conf.mix still names vhost {fqdn:?}; removing the \
-         row would make the next webd restart refuse to start (unknown vhost). \
-         Drop it from that listener's `vhosts` first, then retry",
-        first.id,
-    ))
-}
-
-/// Load the restart-time config, mapping a read/parse failure to the
-/// caller-facing refusal (a config that does not load means the next
-/// restart fails whatever this verb does, so the verb cannot vouch for it).
-fn load_listener_config(node: &NodeState) -> Result<Option<Arc<NodeConfig>>, (u8, String)> {
-    node.listener_config.load().map_err(|e| {
-        caller_error(&format!(
-            "node.conf.mix could not be loaded ({e}); cannot tell whether the next \
-             webd restart would serve this change. Fix the config first",
-        ))
-    })
-}
 
 /// Dispatch entry from [`crate::bus::mod`] — `suffix` is the verb name
 /// after stripping the `webd.` namespace prefix (e.g. `vhost.add`).
@@ -276,18 +166,6 @@ async fn vhost_add(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, String)
     let Some(locks) = node.vhost_key_locks.as_ref() else {
         return server_error("vhost_key_locks not attached — bootstrap node or wiring bug");
     };
-
-    // Refuse at add time what the next restart would refuse at boot:
-    // a host no enabled listener serves crash-loops webd on the next
-    // restart. Checked before any write, so a refusal leaves the
-    // namespace untouched.
-    let restart_cfg = match load_listener_config(node) {
-        Ok(cfg) => cfg,
-        Err(rsp) => return rsp,
-    };
-    if let Some(msg) = listener_add_error(restart_cfg.as_deref(), &fqdn) {
-        return caller_error(&format!("vhost.add refused: {msg}"));
-    }
 
     // Acquire the per-FQDN lock identity the provisioner's
     // VhostRemoved arm also acquires. Same lock pattern as
@@ -398,16 +276,6 @@ async fn vhost_remove(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, Stri
     let Some(runtime) = node.vhosts_runtime.as_ref() else {
         return server_error("webd.vhosts runtime not attached — bootstrap node or wiring bug");
     };
-
-    // The remove-side mirror of vhost.add's listener check: a listener
-    // still naming a host that no longer exists aborts the next boot.
-    let restart_cfg = match load_listener_config(node) {
-        Ok(cfg) => cfg,
-        Err(rsp) => return rsp,
-    };
-    if let Some(msg) = listener_remove_error(restart_cfg.as_deref(), &fqdn) {
-        return caller_error(&format!("vhost.remove refused: {msg}"));
-    }
 
     let ns = namespace_name();
     let key = RecordKey::collection(ns.clone(), fqdn.clone());
@@ -893,6 +761,11 @@ fn project_row(row: &VhostRow, acme_status: &str, with_secrets: bool) -> JsonVal
 mod tests {
     use super::*;
     use crate::acme_provisioner::FqdnLockMap;
+    use crate::vhosts_namespace::{
+        ListenerConfigSource, listener_add_error, listener_remove_error,
+        register_vhosts_namespace_with_listener_config,
+    };
+    use cosmix_config::node::{NodeConfig, WebdListenerConfig};
     use crate::tls_status::{AcmeStatusSnapshot, AcmeVhostStateSnapshot, TlsStatusSnapshot};
     use crate::vhosts_namespace::register_vhosts_namespace;
     use arc_swap::ArcSwap;
@@ -969,7 +842,8 @@ mod tests {
         let store = Arc::new(SqliteStore::new("webd", conn).expect("store"));
         let mut router = PropsRouter::new("webd");
         let (runtime, _events_rx) =
-            register_vhosts_namespace(&mut router, &store).expect("register");
+            register_vhosts_namespace_with_listener_config(&mut router, &store, listener_config)
+                .expect("register");
         // Override the spec's AuthPolicy after registration so the test
         // cap set is what verb dispatch sees. We can't replace the
         // `NamespaceSpec` already wired into the runtime, but the
@@ -1027,7 +901,6 @@ mod tests {
             ))),
             handler_ast_cache: crate::mix_handler::new_ast_cache(),
             tls_reload: None,
-            listener_config,
         })
     }
 
@@ -1741,7 +1614,6 @@ mod tests {
                 ))),
                 handler_ast_cache: crate::mix_handler::new_ast_cache(),
                 tls_reload: None,
-                listener_config: node.listener_config.clone(),
             })
         };
         let _tx = tx; // keep sender alive for the rx to remain live
@@ -1908,7 +1780,7 @@ mod tests {
         let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg).await;
         let (rc, body) = vhost_add(&node, &add_cmd("new.example.org")).await;
         assert_eq!(rc, RC_CALLER_ERROR, "refused as caller error; body={body}");
-        assert!(body.contains("vhost.add refused"), "{body}");
+        assert!(body.contains("vhost.add failed"), "{body}");
         assert!(body.contains("not in any [[webd.listener]]"), "{body}");
 
         let runtime = node.vhosts_runtime.as_ref().unwrap();
@@ -1991,13 +1863,133 @@ mod tests {
         let rm = cmd_with_headers("webd.vhost.remove", &[("fqdn", host)]);
         let (rc, body) = vhost_remove(&node, &rm).await;
         assert_eq!(rc, RC_CALLER_ERROR, "refused; body={body}");
-        assert!(body.contains("vhost.remove refused"), "{body}");
+        assert!(body.contains("still names vhost"), "{body}");
         assert_eq!(
             namespace_hosts(&node).await,
             vec![host.to_string()],
             "a refused remove must leave the row in place",
         );
         clear_auth_policy_for_test();
+    }
+
+    fn props_cmd(verb: &str, headers: &[(&str, &str)], body: &str) -> IncomingCommand {
+        let mut cmd = cmd_with_headers(verb, headers);
+        cmd.body = body.to_string();
+        cmd
+    }
+
+    /// The check lives in the namespace hooks, so the raw SPEC-12 surface
+    /// (`webd.props.set` / `webd.props.delete`) is guarded exactly like
+    /// the ergonomic verbs — no writer can bypass it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_props_set_and_delete_hit_the_same_listener_check() {
+        let named = "named.example.org";
+        let unnamed = "unnamed.example.org";
+        let cfg = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[named])], &[]);
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg).await;
+        let row = |fqdn: &str| format!(r#"{{"fqdn":"{fqdn}","www_dir":"/srv/x","enabled":true}}"#);
+
+        // Unnamed host through props.set: refused, nothing written.
+        let set = props_cmd(
+            "webd.props.set",
+            &[("namespace", "vhosts"), ("key", unnamed), ("if_version", "0")],
+            &row(unnamed),
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "set", &set).await;
+        assert_eq!(rc, 10, "validation refusal; body={body}");
+        assert!(body.contains("not in any [[webd.listener]]"), "{body}");
+        assert!(namespace_hosts(&node).await.is_empty(), "nothing persisted");
+
+        // Named host through props.set: admitted.
+        let set = props_cmd(
+            "webd.props.set",
+            &[("namespace", "vhosts"), ("key", named), ("if_version", "0")],
+            &row(named),
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "set", &set).await;
+        assert_eq!(rc, 0, "admitted; body={body}");
+
+        // props.delete of the named host would orphan the listener entry.
+        let del = cmd_with_headers(
+            "webd.props.delete",
+            &[("namespace", "vhosts"), ("key", named), ("if_version", "1")],
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "delete", &del).await;
+        assert_eq!(rc, 10, "delete refused; body={body}");
+        assert!(body.contains("still names vhost"), "{body}");
+        assert_eq!(namespace_hosts(&node).await, vec![named.to_string()]);
+        clear_auth_policy_for_test();
+    }
+
+    /// Writes to an already-enabled row are not re-checked: config that
+    /// drifted after the row was admitted must never block a
+    /// provisioner cert writeback or an ordinary field update.
+    #[tokio::test(flavor = "current_thread")]
+    async fn writes_to_an_already_enabled_row_are_not_rechecked() {
+        let host = "drift.example.org";
+        // Seed under a permissive (no node config) namespace, then
+        // re-register the SAME store under a config that no longer names
+        // the host — i.e. the operator edited node.conf.mix afterwards.
+        let conn = Connection::open_in_memory().expect("sqlite");
+        let store = Arc::new(SqliteStore::new("webd", conn).expect("store"));
+        let mut r1 = PropsRouter::new("webd");
+        let (rt1, _rx1) = register_vhosts_namespace_with_listener_config(
+            &mut r1,
+            &store,
+            ListenerConfigSource::Fixed(None),
+        )
+        .expect("register");
+        let key = RecordKey::collection(namespace_name(), host.to_string());
+        let mut body = BTreeMap::new();
+        body.insert("fqdn".to_string(), PropValue::String(host.into()));
+        body.insert("www_dir".to_string(), PropValue::String("/srv/x".into()));
+        body.insert("enabled".to_string(), PropValue::Bool(true));
+        body.insert("source".to_string(), PropValue::String("bus_runtime".into()));
+        rt1.set_with_origin(
+            key.clone(),
+            PropValue::Object(body),
+            SetOpts {
+                expected_version: Some(Version::zero()),
+                merge: MergeMode::Patch,
+                actor: Actor::service("webd").expect("actor"),
+                cause: None,
+                ts_ms: 0,
+            },
+            WriteOrigin::backend(),
+        )
+        .await
+        .expect("seed");
+
+        let drifted = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[])], &[]);
+        let mut r2 = PropsRouter::new("webd");
+        let (rt2, _rx2) = register_vhosts_namespace_with_listener_config(
+            &mut r2,
+            &store,
+            ListenerConfigSource::Fixed(Some(Arc::new(drifted))),
+        )
+        .expect("re-register");
+        let mut patch = BTreeMap::new();
+        patch.insert(
+            "not_after".to_string(),
+            PropValue::String("2100-01-01T00:00:00Z".into()),
+        );
+        rt2.set_with_origin(
+            key,
+            PropValue::Object(patch),
+            SetOpts {
+                expected_version: Some(Version(1)),
+                merge: MergeMode::Patch,
+                actor: Actor::service("webd").expect("actor"),
+                cause: None,
+                ts_ms: 0,
+            },
+            WriteOrigin::backend(),
+        )
+        .await
+        .expect("writeback to an admitted row must not be refused");
     }
 
     /// Remove is allowed while a listener names the host when a
