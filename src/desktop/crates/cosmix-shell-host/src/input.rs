@@ -19,8 +19,8 @@ use bevy::picking::pointer::{
     PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
 };
 use bevy::prelude::{
-    App, ChildOf, Entity, Has, IntoScheduleConfigs, Name, On, Query, Res, ResMut, Resource,
-    Time, Vec2, Window, With, World,
+    App, ChildOf, DetectChanges, Entity, Has, IntoScheduleConfigs, Name, On, Query, Res, ResMut,
+    Resource, Time, Vec2, Window, With, World,
 };
 use bevy::time::Real;
 use bevy::ui::UiTargetCamera;
