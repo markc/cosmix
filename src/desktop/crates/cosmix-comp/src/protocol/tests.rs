@@ -19844,7 +19844,10 @@ fn fractional_kms_configures_popups_and_interactive_deltas_stay_logical() {
         .state
         .update_interactive_pointer(117.25, 89.5);
     let moved_origin = harness.server.state.surfaces[&surface.id()].window_origin;
-    assert_eq!(moved_origin, (217.25, 169.5));
+    // The logical delta lands at (217.25, 169.5) = physical (543.125, 423.75);
+    // whole-pixel placement settles the buffer on (543, 424) = (217.2, 169.6).
+    // A 2.5x-converted delta would be tens of logical pixels away instead.
+    assert_eq!(moved_origin, (217.2, 169.6));
 
     harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
         surface: surface.clone(),
