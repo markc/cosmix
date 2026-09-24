@@ -604,7 +604,11 @@ failed directory sync raises even though the new file is already in place.
 It is the one failure that happens <em>after</em> the replace, so it has its own
 code, <code>WRITE_NOT_DURABLE</code>, with <code>$err.details.replaced == true</code>. Every other
 failure leaves the target untouched. A gate must never "roll back" on
-<code>WRITE_NOT_DURABLE</code>, because the new content is already the file.</p>
+<code>WRITE_NOT_DURABLE</code>, because the new content is already the file. The
+details also carry <code>directory</code>. The same error covers a directory you may
+write and search but not read, mode <code>0300</code>: <code>write_atomic</code> works there at any
+level, but such a directory cannot be fsynced, so <code>"full"</code> reports that
+instead of claiming durability.</p>
 <p>Other rules:</p>
 <ul>
 <li><strong>data</strong> must be a string, bytes or a buffer. Nothing else is coerced. A

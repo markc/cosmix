@@ -203,7 +203,11 @@ failed directory sync raises even though the new file is already in place.
 It is the one failure that happens *after* the replace, so it has its own
 code, `WRITE_NOT_DURABLE`, with `$err.details.replaced == true`. Every other
 failure leaves the target untouched. A gate must never "roll back" on
-`WRITE_NOT_DURABLE`, because the new content is already the file.
+`WRITE_NOT_DURABLE`, because the new content is already the file. The
+details also carry `directory`. The same error covers a directory you may
+write and search but not read, mode `0300`: `write_atomic` works there at any
+level, but such a directory cannot be fsynced, so `"full"` reports that
+instead of claiming durability.
 
 Other rules:
 

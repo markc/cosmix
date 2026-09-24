@@ -13369,10 +13369,18 @@ fn set_access_acl(file: &std::fs::File, acl: Option<&[u8]>) -> std::io::Result<(
 /// `details.replaced: true` lets a gate tell it from every other failure —
 /// which all leave the target untouched — so it never "rolls back" a file
 /// that was in fact replaced.
-fn write_atomic_not_durable(path: &str, error: &std::io::Error) -> MixError {
+fn write_atomic_not_durable(
+    path: &str,
+    dir: &std::path::Path,
+    error: &std::io::Error,
+) -> MixError {
     let mut details = indexmap::IndexMap::new();
     details.insert("replaced".to_string(), Value::Bool(true));
     details.insert("path".to_string(), Value::String(path.to_string()));
+    details.insert(
+        "directory".to_string(),
+        Value::String(dir.to_string_lossy().into_owned()),
+    );
     MixError::Structured(Box::new(
         crate::error::ErrorInfo::new(
             "WRITE_NOT_DURABLE",
@@ -13452,9 +13460,12 @@ fn write_atomic_impl(
     // target, creating the temp, the rename, cleanup, the directory fsync —
     // is relative to THIS open directory, so renaming or replacing it (or
     // any parent) mid-call cannot redirect the write somewhere else.
+    // O_PATH (review R3): pinning needs no READ permission on the directory,
+    // so a write+search-only directory (0300) works exactly as the path-based
+    // code did. Only the directory fsync needs a readable fd; see below.
     let dir_fd = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(&dir)
         .map_err(|e| write_atomic_error(path, "opening the target's directory", &e))?;
     let dirfd = dir_fd.as_raw_fd();
@@ -13718,10 +13729,24 @@ fn write_atomic_impl(
         return Err(write_atomic_error(path, what, &e));
     }
 
-    if opts.durability == WriteDurability::Full
-        && let Err(e) = dir_fd.sync_all()
-    {
-        return Err(write_atomic_not_durable(path, &e));
+    if opts.durability == WriteDurability::Full {
+        // fsync needs a real (readable) fd; the pin is O_PATH. Reopen the SAME
+        // directory through it — openat(dirfd, ".") needs no /proc. A
+        // directory this process cannot read cannot be fsynced: that is
+        // WRITE_NOT_DURABLE, never a silent claim of durability.
+        // SAFETY: openat with a valid dirfd and a static NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(dirfd, c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        let synced = if fd == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a fresh descriptor we now own.
+            unsafe { std::fs::File::from_raw_fd(fd) }.sync_all()
+        };
+        if let Err(e) = synced {
+            return Err(write_atomic_not_durable(path, &dir, &e));
+        }
     }
     Ok(())
 }
@@ -24670,7 +24695,11 @@ mod write_atomic_tests {
     /// pinned at its single construction site.)
     #[test]
     fn a_post_rename_sync_failure_says_the_file_was_replaced() {
-        let e = super::write_atomic_not_durable("/x/y", &std::io::Error::from_raw_os_error(libc::EIO));
+        let e = super::write_atomic_not_durable(
+            "/x/y",
+            std::path::Path::new("/x"),
+            &std::io::Error::from_raw_os_error(libc::EIO),
+        );
         match e {
             MixError::Structured(info) => {
                 assert_eq!(info.code, "WRITE_NOT_DURABLE");
@@ -24678,6 +24707,7 @@ mod write_atomic_tests {
                     panic!("details must be a map: {:?}", info.details);
                 };
                 assert!(matches!(details.get("replaced"), Some(Value::Bool(true))));
+                assert!(matches!(details.get("directory"), Some(Value::String(d)) if d == "/x"));
                 assert!(info.message.contains("in place"), "{}", info.message);
             }
             other => panic!("expected a structured error, got {other:?}"),
