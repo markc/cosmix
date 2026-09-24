@@ -5728,9 +5728,10 @@ mod tests {
             crate::listeners_needing_runtime_tls(&rows, &dir.by_host, &listeners, &HashMap::new());
         assert_eq!(needing, vec!["rt".to_string()]);
         let handle = crate::empty_listener_tls(true).expect("empty handle");
+        let (_, mode, pending) = crate::listener_bind_tls(Some(&handle));
         assert!(
-            matches!(crate::listener_bind_tls(Some(&handle)).1, TlsMode::Plain),
-            "before adoption the empty handle would bind plain"
+            matches!(mode, TlsMode::Terminate) && pending,
+            "before adoption the empty handle binds as PENDING TLS, never plain"
         );
 
         let mut tls = HashMap::new();
@@ -5747,8 +5748,9 @@ mod tests {
             .await;
         assert_eq!(adopted.adopted, 1);
 
-        let (bind_tls, mode) = crate::listener_bind_tls(Some(&handle));
+        let (bind_tls, mode, pending) = crate::listener_bind_tls(Some(&handle));
         assert!(matches!(mode, TlsMode::Terminate), "binds TLS after adoption");
+        assert!(!pending, "adopted: serving, no longer pending");
         assert!(bind_tls.is_some());
         let (resolver, _cfg) = handle.current().expect("usable resolver");
         assert!(resolver.strict_sni(), "strict SNI preserved through republish");

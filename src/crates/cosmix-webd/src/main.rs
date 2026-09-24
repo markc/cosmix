@@ -792,14 +792,22 @@ pub(crate) fn empty_listener_tls(strict_sni: bool) -> Result<ListenerTls> {
     Ok(ListenerTls::new(Some(Arc::new(resolver))))
 }
 
-/// Bind-time TLS decision, taken AFTER runtime-cert adoption: a listener
-/// terminates TLS iff its handle now holds a usable (non-empty) resolver.
-/// An empty handle binds plain, exactly as a listener with no certs did
-/// before (a `Terminate` listener with an empty resolver refuses to bind).
-pub(crate) fn listener_bind_tls(tls: Option<&ListenerTls>) -> (Option<ListenerTls>, TlsMode) {
+/// Bind-time TLS decision, taken AFTER runtime-cert adoption. Returns
+/// `(handle, mode, pending)`:
+/// * usable resolver → `Terminate`, serving certs;
+/// * a handle that is still EMPTY (runtime certs pending issuance) →
+///   `Terminate` with `pending = true`: the listener binds as a TLS port,
+///   refuses every handshake with a TLS alert, and upgrades in place when
+///   the provisioner publishes the cert into this same handle. Never
+///   plaintext on a TLS port;
+/// * no handle → `Plain` (a listener with no TLS vhosts at all).
+pub(crate) fn listener_bind_tls(
+    tls: Option<&ListenerTls>,
+) -> (Option<ListenerTls>, TlsMode, bool) {
     match tls {
-        Some(t) if t.is_enabled() => (Some(t.clone()), TlsMode::Terminate),
-        _ => (None, TlsMode::Plain),
+        Some(t) if t.is_enabled() => (Some(t.clone()), TlsMode::Terminate, false),
+        Some(t) if t.is_pending() => (Some(t.clone()), TlsMode::Terminate, true),
+        _ => (None, TlsMode::Plain, false),
     }
 }
 
@@ -7805,7 +7813,10 @@ async fn main() -> Result<()> {
             // strict_sni) so the provisioner's pre-bind adoption can
             // publish the on-disk certs into it; the bind decision below
             // is taken after adoption.
-            {
+            // Only with a provisioner: without one nothing could ever fill
+            // the handle, and a TLS port pending forever would be a dead
+            // port (such a node keeps the old plain bind; see the manual).
+            if acme_provisioner_opt.is_some() {
                 let routed = vhost_directory_handle.load();
                 for lid in listeners_needing_runtime_tls(
                     &vhosts_namespace_rows,
@@ -8122,8 +8133,23 @@ async fn main() -> Result<()> {
                 });
                 // Decided after runtime-cert adoption: a runtime-only
                 // listener whose certs were adopted terminates TLS; one
-                // whose handle is still empty binds plain as before.
-                let (tls, tls_mode) = listener_bind_tls(tls_listeners.get(&l.id));
+                // whose handle is still empty binds as pending TLS
+                // (handshakes refused until issuance fills the handle).
+                let (tls, tls_mode, tls_pending) = listener_bind_tls(tls_listeners.get(&l.id));
+                if tls_pending {
+                    let hosts: Vec<&String> = l
+                        .hosts
+                        .iter()
+                        .filter(|h| vhost_directory_handle.load().by_host.contains_key(*h))
+                        .collect();
+                    tracing::warn!(
+                        listener = %l.id,
+                        tls = "pending",
+                        ?hosts,
+                        "tls pending for runtime-added vhosts: bound as TLS, handshakes \
+                         refused until their certificates are issued"
+                    );
+                }
                 // L1-authoritative: `enabled` + the guard policy come
                 // from the `webd.listeners` row (config-seeded, then
                 // operator-owned), NOT raw config — so a listener an
@@ -8140,6 +8166,7 @@ async fn main() -> Result<()> {
                     .with_external(l.external)
                     .with_enabled(enabled)
                     .with_tls_mode(tls_mode)
+                    .with_tls_pending_ok(tls_pending)
                     .with_guard(guard);
                 listener_builder.add(spec, handler, tls);
             }
@@ -8155,6 +8182,17 @@ async fn main() -> Result<()> {
             // waiting.
             if acme_pending_after_bind && let Some(n) = node.acme_notify.as_ref() {
                 n.notify_one();
+            }
+            // One line per listener with its TLS state, so a pending TLS
+            // port reads `tls=pending`, never as plain.
+            for s in listener_set.control().status() {
+                tracing::info!(
+                    listener = %s.id,
+                    running = s.running,
+                    tls = s.tls,
+                    binds = ?s.binds,
+                    "listener state"
+                );
             }
 
             // `start_all` is best-effort (it only errors when *every*

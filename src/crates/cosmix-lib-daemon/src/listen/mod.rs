@@ -62,6 +62,19 @@ struct Entry {
     tls: Option<ListenerTls>,
 }
 
+/// The [`ListenerStatus::tls`] word for an entry.
+fn tls_state(e: &Entry) -> &'static str {
+    match e.spec.tls_mode {
+        TlsMode::Plain => "plain",
+        #[cfg(feature = "tls")]
+        TlsMode::Terminate if e.tls.as_ref().is_some_and(|t| t.is_pending()) => "pending",
+        #[cfg(feature = "tls")]
+        TlsMode::Terminate => "terminate",
+        #[cfg(feature = "tls")]
+        TlsMode::StartTlsPassthrough => "starttls",
+    }
+}
+
 /// The live state of a started listener: a cancellation sender, the
 /// accept-loop task handles (one per bound address), and the actual
 /// kernel-assigned bind addresses (port 0 resolves to a real port).
@@ -201,6 +214,10 @@ pub struct ListenerStatus {
     pub binds: Vec<SocketAddr>,
     pub external: bool,
     pub active_conns: u32,
+    /// `"plain"`, `"terminate"` (serving certs), or `"pending"` (a TLS
+    /// port bound with no certificate yet — handshakes refused until
+    /// one is published; never plaintext).
+    pub tls: &'static str,
 }
 
 /// Cheap, cloneable control surface for a [`ListenerSet`]. Shares the
@@ -231,12 +248,25 @@ impl ListenerSetControl {
         }
 
         // A Terminate listener with no usable resolver would accept TCP
-        // then fail every handshake — refuse to bind instead.
+        // then fail every handshake — refuse to bind instead, unless the
+        // spec opted into pending TLS AND has a handle a later cert can
+        // be swapped into (then: bind, refuse handshakes with a TLS
+        // alert, upgrade in place — never plaintext).
         #[cfg(feature = "tls")]
         if entry.spec.tls_mode == TlsMode::Terminate {
             let usable = entry.tls.as_ref().is_some_and(|t| t.is_enabled());
             if !usable {
-                anyhow::bail!("listener {id:?}: Terminate mode requires a non-empty TLS resolver");
+                if !(entry.spec.tls_pending_ok && entry.tls.is_some()) {
+                    anyhow::bail!(
+                        "listener {id:?}: Terminate mode requires a non-empty TLS resolver"
+                    );
+                }
+                tracing::warn!(
+                    listener = %id,
+                    tls = "pending",
+                    "listener binding with TLS pending: no certificate yet — every \
+                     handshake is refused until one is published into this listener"
+                );
             }
         }
 
@@ -410,6 +440,7 @@ impl ListenerSetControl {
                     binds,
                     external: e.spec.external,
                     active_conns: e.guards.active(),
+                    tls: tls_state(e),
                 }
             })
             .collect();
@@ -497,9 +528,21 @@ async fn handle_conn(
                 tracing::error!(listener = %args.listener_id, "Terminate listener missing TLS handle");
                 return;
             };
-            let Some((_resolver, cfg)) = tls.current() else {
-                tracing::warn!(listener = %args.listener_id, "Terminate listener TLS disabled mid-run");
-                return;
+            let cfg = match tls.current() {
+                Some((_resolver, cfg)) => cfg,
+                None => match tls.pending_config() {
+                    // TLS pending (empty resolver): run the handshake so
+                    // the client gets a proper TLS alert — the resolver
+                    // resolves no cert, rustls refuses. No plaintext.
+                    Some(cfg) => cfg,
+                    None => {
+                        tracing::warn!(
+                            listener = %args.listener_id,
+                            "Terminate listener TLS disabled mid-run"
+                        );
+                        return;
+                    }
+                },
             };
             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
             match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
@@ -663,5 +706,186 @@ mod tests {
             tokio::net::TcpListener::bind(addr).await.is_ok(),
             "disabled listener must release its port"
         );
+    }
+
+    #[cfg(feature = "tls")]
+    mod pending_tls {
+        use super::*;
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{DigitallySignedStruct, SignatureScheme};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Test client verifier: the server cert is self-signed; what is
+        /// under test is whether a handshake completes at all.
+        #[derive(Debug)]
+        struct AcceptAny;
+        impl ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &ServerName<'_>,
+                _: &[u8],
+                _: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        /// Says HELLO over TLS; counts any plaintext stream it is handed.
+        struct HelloHandler {
+            plaintext: Arc<AtomicU32>,
+        }
+        #[async_trait::async_trait]
+        impl ConnHandler for HelloHandler {
+            async fn handle(&self, stream: AcceptedStream, _ctx: ConnCtx) {
+                match stream {
+                    AcceptedStream::Tls(mut s) => {
+                        let _ = s.write_all(b"HELLO").await;
+                        let _ = s.shutdown().await;
+                    }
+                    AcceptedStream::Tcp(_) => {
+                        self.plaintext.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            }
+        }
+
+        async fn tls_hello(addr: SocketAddr, name: &str) -> Result<Vec<u8>, String> {
+            let cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAny))
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(cfg));
+            let tcp = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| e.to_string())?;
+            let server_name = ServerName::try_from(name.to_string()).map_err(|e| e.to_string())?;
+            let mut tls = connector
+                .connect(server_name, tcp)
+                .await
+                .map_err(|e| format!("handshake: {e}"))?;
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf).await;
+            Ok(buf)
+        }
+
+        fn identity_for(dir: &std::path::Path, name: &str) -> cosmix_config::node::TlsIdentityConfig {
+            let key = rcgen::KeyPair::generate().expect("keypair");
+            let cert = rcgen::CertificateParams::new(vec![name.to_string()])
+                .expect("params")
+                .self_signed(&key)
+                .expect("self-sign");
+            let cert_path = dir.join("fullchain.pem");
+            let key_path = dir.join("privkey.pem");
+            std::fs::write(&cert_path, cert.pem()).unwrap();
+            std::fs::write(&key_path, key.serialize_pem()).unwrap();
+            cosmix_config::node::TlsIdentityConfig {
+                server_name: name.to_string(),
+                cert: cert_path.to_string_lossy().into_owned(),
+                key: key_path.to_string_lossy().into_owned(),
+                default: false,
+                no_sni_fallback: false,
+            }
+        }
+
+        /// A Terminate listener opted into pending TLS binds with an
+        /// empty resolver, refuses every handshake, never answers
+        /// plaintext, and upgrades IN PLACE when a cert is swapped into
+        /// the same handle — no rebind, no restart.
+        #[tokio::test]
+        async fn pending_tls_listener_refuses_then_upgrades_in_place() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let empty = crate::tls::sni::SniCertResolver::from_config(&[], true).unwrap();
+            let handle = ListenerTls::new(Some(Arc::new(empty)));
+            let plaintext = Arc::new(AtomicU32::new(0));
+            let spec = plain_spec("pub")
+                .with_tls_mode(TlsMode::Terminate)
+                .with_tls_pending_ok(true);
+            let mut b = ListenerSet::builder();
+            b.add(
+                spec,
+                Arc::new(HelloHandler {
+                    plaintext: plaintext.clone(),
+                }),
+                Some(handle.clone()),
+            );
+            let set = b.build();
+            set.start_all().await.expect("pending listener binds");
+            let st = set.control().status();
+            assert_eq!(st[0].tls, "pending");
+            assert!(st[0].running);
+            let addr = st[0].binds[0];
+
+            // Pending: the TLS handshake is refused.
+            let err = tls_hello(addr, "pend.example").await.expect_err("refused");
+            assert!(err.contains("handshake"), "{err}");
+
+            // A plaintext client gets no HTTP-ish answer and the handler
+            // is never handed a plaintext stream.
+            let mut raw = tokio::net::TcpStream::connect(addr).await.unwrap();
+            raw.write_all(b"GET / HTTP/1.0\r\nHost: pend.example\r\n\r\n")
+                .await
+                .unwrap();
+            let mut reply = Vec::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                raw.read_to_end(&mut reply),
+            )
+            .await;
+            assert!(!reply.starts_with(b"HTTP"), "no plaintext answer: {reply:?}");
+
+            // Issue: swap a real identity into the SAME handle.
+            let tmp = tempfile::tempdir().unwrap();
+            let ident = identity_for(tmp.path(), "pend.example");
+            let filled = crate::tls::sni::SniCertResolver::from_config(&[ident], true).unwrap();
+            handle.swap(Some(Arc::new(filled)));
+            assert_eq!(set.control().status()[0].tls, "terminate");
+            let body = tls_hello(addr, "pend.example")
+                .await
+                .expect("the same listener now completes the handshake");
+            assert_eq!(body, b"HELLO");
+            assert_eq!(plaintext.load(Ordering::Acquire), 0, "never plaintext");
+        }
+
+        /// Without the opt-in, an empty resolver still refuses to bind.
+        #[tokio::test]
+        async fn empty_resolver_without_opt_in_still_refuses_to_bind() {
+            let empty = crate::tls::sni::SniCertResolver::from_config(&[], false).unwrap();
+            let mut b = ListenerSet::builder();
+            b.add(
+                plain_spec("pub").with_tls_mode(TlsMode::Terminate),
+                Arc::new(HelloHandler {
+                    plaintext: Arc::new(AtomicU32::new(0)),
+                }),
+                Some(ListenerTls::new(Some(Arc::new(empty)))),
+            );
+            let set = b.build();
+            assert!(set.control().enable("pub").await.is_err());
+        }
     }
 }

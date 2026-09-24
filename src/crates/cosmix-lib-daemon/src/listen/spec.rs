@@ -87,6 +87,13 @@ pub struct ListenerSpec {
     pub guard: GuardPolicy,
     /// What to do on a partial multi-bind failure.
     pub bind_policy: BindPolicy,
+    /// Opt-in: a `Terminate` listener may bind while its TLS handle is
+    /// still EMPTY (certs pending issuance). It stays a TLS port — every
+    /// handshake is refused with a TLS alert until a resolver with
+    /// identities is swapped into the same handle, after which it serves
+    /// TLS with no rebind. Never plaintext. Default `false`: an empty
+    /// resolver refuses to bind, as before.
+    pub tls_pending_ok: bool,
 }
 
 impl ListenerSpec {
@@ -101,7 +108,14 @@ impl ListenerSpec {
             tls_mode: TlsMode::default(),
             guard: GuardPolicy::default(),
             bind_policy: BindPolicy::default(),
+            tls_pending_ok: false,
         }
+    }
+
+    /// See [`ListenerSpec::tls_pending_ok`].
+    pub fn with_tls_pending_ok(mut self, ok: bool) -> Self {
+        self.tls_pending_ok = ok;
+        self
     }
 
     /// Set the TLS termination mode.
