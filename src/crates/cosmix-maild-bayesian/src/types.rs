@@ -90,8 +90,10 @@ pub struct AccountStats {
     pub model_version: u32,
     /// Messages currently carrying a Spam / Ham training label — user
     /// corrections, operator `train`, and rebuilds. Unlike
-    /// `spam_messages`/`ham_messages` these exclude seeded and imported
-    /// corpus totals, so they move exactly when training happens.
+    /// `spam_messages`/`ham_messages` these exclude corpus totals imported
+    /// without label rows. A seed is copied byte-for-byte on first open and
+    /// label rows record no origin, so any label rows the seed carried DO
+    /// count here.
     pub labelled_spam: u64,
     pub labelled_ham: u64,
     /// Unix seconds of the most recent label write, `None` if never trained.
