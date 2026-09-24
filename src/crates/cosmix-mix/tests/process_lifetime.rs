@@ -299,3 +299,19 @@ fn stdin_inherit_refuses_a_terminal_stdin() {
     assert!(ok, "script failed: {out}");
     assert_eq!(out, "STDIN_TERMINAL true\nSTDIN_TERMINAL\ntrue\n");
 }
+
+/// run_parallel: one job may inherit stdin; two would race for the same
+/// bytes and are refused before anything runs.
+#[test]
+fn run_parallel_allows_one_stdin_inheriting_job_not_two() {
+    let (ok, out) = run_with_stdin(
+        "stdin-parallel",
+        "try\n  run_parallel([{argv: [\"cat\"], stdin: {inherit: true}}, {argv: [\"cat\"], stdin: {inherit: true}}])\ncatch $m, $e\n  print($e.code .. \" \" .. contains($m, \"at most one job\"))\nend\n\
+         $r = run_parallel([{argv: [\"cat\"], stdin: {inherit: true}}, [\"printf\", \"b\"]])\n\
+         print($r[0].stdout .. \" \" .. $r[1].stdout)\n",
+        Stdio::piped(),
+        Some(b"a"),
+    );
+    assert!(ok, "script failed: {out}");
+    assert_eq!(out, "OPTION_INVALID true\na b\n");
+}

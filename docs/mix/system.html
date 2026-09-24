@@ -542,8 +542,9 @@ with <code>SIGTTIN</code>. The call would then hang until its deadline. That is 
 there is no string form either: <code>stdin: "inherit"</code> is ordinary stdin data,
 the seven bytes <code>inherit</code>. Use <code>run_stream</code> when a child must own the
 terminal and its stdin. The same rule applies to stage 0 of <code>run_pipeline</code>
-and to <code>run_parallel</code> jobs. Parallel jobs that inherit one pipe share it,
-and each reads whatever bytes it gets first. With
+and to <code>run_parallel</code> jobs. At most one <code>run_parallel</code> job may inherit
+stdin. Two or more raise <code>OPTION_INVALID</code> before any job runs, because
+concurrent readers of one pipe would race for its bytes. With
 <code>timeout: 0</code>, Mix also waits for a stdin-data writer to finish after the
 direct child exits. A descendant which retains the read end without consuming
 the data can therefore make the call wait indefinitely; that is the explicit

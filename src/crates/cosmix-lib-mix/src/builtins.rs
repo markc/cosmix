@@ -6718,6 +6718,20 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
         p.opts.stream = false;
         parsed.push(p);
     }
+    // One shared stdin read by several concurrent jobs is a silent byte race
+    // (review MINOR-10): each would get an arbitrary interleaving of it. One
+    // inheriting job is well defined; more than one is refused.
+    if parsed
+        .iter()
+        .filter(|p| matches!(p.opts.stdin, RunArgvStdin::Inherit))
+        .count()
+        > 1
+    {
+        return Err(opt_invalid(
+            caller,
+            "at most one job may use stdin {inherit: true} — concurrent jobs would race for the same bytes",
+        ));
+    }
 
     let n = parsed.len();
     if n == 0 {
