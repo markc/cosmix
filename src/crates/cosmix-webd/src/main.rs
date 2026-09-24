@@ -7629,11 +7629,28 @@ async fn main() -> Result<()> {
                 .keys()
                 .cloned()
                 .collect();
+            // Fail-soft for namespace rows the directory did not route
+            // (disabled, or a runtime row whose www_dir is missing): a
+            // listener naming one is skipped, not an "unknown vhost"
+            // abort — the same B1 treatment config hosts get.
+            let routing_dropped = vhost_directory::routing_dropped_hosts(
+                &vhosts_namespace_rows,
+                &vhost_directory_handle.load(),
+            );
+            if !routing_dropped.is_empty() {
+                tracing::warn!(
+                    hosts = ?routing_dropped,
+                    "webd.vhosts rows not routed this run (disabled or www_dir \
+                     missing) — skipped in listener resolution"
+                );
+            }
+            let listener_skip_hosts: HashSet<String> =
+                disabled_hosts.union(&routing_dropped).cloned().collect();
             let resolved_listeners: Vec<ResolvedWebdListener> = if has_explicit_listeners {
                 node_cfg
                     .as_ref()
                     .expect("has_explicit_listeners implies node_cfg is Some")
-                    .synthesize_listeners(&all_hosts, &disabled_hosts)
+                    .synthesize_listeners(&all_hosts, &listener_skip_hosts)
                     .context("resolving [[webd.listener]] array")?
             } else {
                 vec![ResolvedWebdListener {

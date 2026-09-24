@@ -1684,11 +1684,15 @@ mod tests {
     }
 
     fn add_cmd(fqdn: &str) -> IncomingCommand {
+        add_cmd_in(fqdn, "/srv/new")
+    }
+
+    fn add_cmd_in(fqdn: &str, www_dir: &str) -> IncomingCommand {
         cmd_with_headers(
             "webd.vhost.add",
             &[
                 ("fqdn", fqdn),
-                ("www_dir", "/srv/new"),
+                ("www_dir", www_dir),
                 ("acme.provider", "letsencrypt_staging"),
                 ("acme.challenge", "http01"),
                 ("acme.contact_email", "ops@example.com"),
@@ -1815,17 +1819,28 @@ mod tests {
             &[],
         );
         let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg.clone()).await;
-        let (rc, body) = vhost_add(&node, &add_cmd(host)).await;
+        let www = tempfile::tempdir().unwrap();
+        let www_dir = www.path().to_string_lossy().into_owned();
+        let (rc, body) = vhost_add(&node, &add_cmd_in(host, &www_dir)).await;
         assert_eq!(rc, 0, "admitted add rc=0; body={body}");
 
-        // Surface: namespace row (what the restarted directory builds from).
-        let hosts = namespace_hosts(&node).await;
-        assert_eq!(hosts, vec![host.to_string()]);
+        // Surface: routing directory — rebuilt exactly as the next boot
+        // does (namespace snapshot → from_namespace_rows), so the host
+        // is actually routed, not merely stored.
+        let rows = crate::vhosts_namespace::snapshot_rows(node.vhosts_runtime.as_ref().unwrap())
+            .await
+            .expect("snapshot");
+        let dir = crate::vhost_directory::from_namespace_rows(&rows, &HashMap::new(), &HashSet::new())
+            .expect("directory");
+        assert!(dir.by_host.contains_key(host), "host routed after restart");
+        let all_hosts: Vec<String> = dir.by_host.keys().cloned().collect();
+        let dropped = crate::vhost_directory::routing_dropped_hosts(&rows, &dir);
+        assert!(dropped.is_empty());
 
-        // Surface: listener allowlist — the startup check over exactly
-        // the namespace hosts must pass and put the host on `pub`.
+        // Surface: listener allowlist — the startup check over the
+        // routed hosts must pass and put the host on `pub`.
         let resolved = cfg
-            .synthesize_listeners(&hosts, &HashSet::new())
+            .synthesize_listeners(&all_hosts, &dropped)
             .expect("the next boot's listener resolution accepts the added host");
         let owner = resolved
             .iter()
@@ -1868,6 +1883,37 @@ mod tests {
             vec![host.to_string()],
             "a refused remove must leave the row in place",
         );
+        clear_auth_policy_for_test();
+    }
+
+    /// A disabled row is not routed, so it needs no listener: the add is
+    /// admitted even though no listener names it, and startup's
+    /// fail-soft keeps the node booting. Flipping it to enabled later is
+    /// the transition the hook checks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabled_add_needs_no_listener_but_enabling_it_does() {
+        let host = "staged.example.org";
+        let cfg = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[])], &[]);
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg.clone()).await;
+        let mut add = add_cmd(host);
+        add.headers.insert("enabled".to_string(), "false".to_string());
+        let (rc, body) = vhost_add(&node, &add).await;
+        assert_eq!(rc, 0, "disabled add admitted; body={body}");
+
+        let rows = crate::vhosts_namespace::snapshot_rows(node.vhosts_runtime.as_ref().unwrap())
+            .await
+            .expect("snapshot");
+        let dir = crate::vhost_directory::from_namespace_rows(&rows, &HashMap::new(), &HashSet::new())
+            .expect("directory");
+        let all_hosts: Vec<String> = dir.by_host.keys().cloned().collect();
+        let dropped = crate::vhost_directory::routing_dropped_hosts(&rows, &dir);
+        cfg.synthesize_listeners(&all_hosts, &dropped)
+            .expect("next boot survives the disabled row");
+
+        // Enabling it (vhost.add Patch with enabled=true) is refused.
+        let (rc, body) = vhost_add(&node, &add_cmd(host)).await;
+        assert_eq!(rc, RC_CALLER_ERROR, "enable refused; body={body}");
+        assert!(body.contains("not in any [[webd.listener]]"), "{body}");
         clear_auth_policy_for_test();
     }
 
