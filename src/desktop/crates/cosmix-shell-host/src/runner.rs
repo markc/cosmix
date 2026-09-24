@@ -1331,6 +1331,7 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
                 ..default()
             }),
     );
+    crate::input::install_focus_dispatch(app);
     app.insert_resource(CornerMenuHook(corner_menu::open));
     app.insert_resource(LayerHostWake(external_wake))
         .init_resource::<crate::file_watch::LayerHostFileWatches>()

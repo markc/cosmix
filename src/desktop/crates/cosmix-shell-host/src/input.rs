@@ -5,19 +5,24 @@ use std::time::Duration;
 
 use bevy::app::{PreUpdate, Update};
 use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::input::gamepad::GamepadButtonChangedEvent;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput, NativeKey};
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::input::touch::{TouchInput, TouchPhase};
 use bevy::input::{ButtonState, InputSystems};
+use bevy::input_focus::{InputDispatchPlugin, InputFocus};
 use bevy::picking::events::PointerState;
 use bevy::picking::pointer::{
     PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
 };
 use bevy::prelude::{
-    App, Entity, IntoScheduleConfigs, Res, ResMut, Resource, Time, Vec2, Window, World,
+    App, Entity, IntoScheduleConfigs, Name, Res, ResMut, Resource, Time, Vec2, Window, With,
+    World,
 };
 use bevy::time::Real;
-use bevy::window::{CursorEntered, CursorLeft, CursorMoved, WindowEvent, WindowFocused};
+use bevy::window::{
+    CursorEntered, CursorLeft, CursorMoved, PrimaryWindow, WindowEvent, WindowFocused,
+};
 use bevy_winit::converters::{convert_logical_key, convert_physical_key_code};
 use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
 use cosmix_shell::runtime::{
@@ -564,6 +569,46 @@ struct Focus {
 /// mode change.
 #[derive(Resource, Default)]
 pub(crate) struct StagedShellCommands(Vec<(OutputKey, ShellCommandKind)>);
+
+/// Route Bevy input messages to the `InputFocus` entity.
+///
+/// Every ctk text field, button and menu listens on
+/// `On<FocusedInput<KeyboardInput>>`, which only Bevy's `InputDispatchPlugin`
+/// raises. Its `dispatch_focused_input` system (bevy_input_focus 0.19) does
+/// nothing unless exactly one `PrimaryWindow` entity exists — and the layer
+/// host has none: every panel is its own `Window` entity behind a layer
+/// surface, and `WindowPlugin::primary_window` is `None`. So keys arrived
+/// from the keyboard bridge as `KeyboardInput` messages and stopped there;
+/// the launcher search box took focus and typed nothing (2026-09-24).
+///
+/// The anchor spawned here is a bare entity carrying only the marker. It has
+/// no `Window`, so everything else keyed on `With<PrimaryWindow>` — the UI
+/// default camera, render-target normalisation, picking pointer locations,
+/// the render surface probe — finds no window behind it and behaves exactly
+/// as it does with none. It is where `FocusedInput` bubbling ends and the
+/// fallback target when nothing is focused; nothing observes it.
+///
+/// Call after `DefaultPlugins`: the dispatcher orders itself after
+/// `InputSystems`. Idempotent for the plugin; the anchor is spawned only when
+/// no `PrimaryWindow` exists, because two would silence the dispatcher again.
+pub(crate) fn install_focus_dispatch(app: &mut App) {
+    app.init_resource::<InputFocus>()
+        .add_message::<KeyboardInput>()
+        .add_message::<MouseWheel>()
+        .add_message::<GamepadButtonChangedEvent>();
+    if !app.is_plugin_added::<InputDispatchPlugin>() {
+        app.add_plugins(InputDispatchPlugin);
+    }
+    let world = app.world_mut();
+    let has_primary = world
+        .query_filtered::<Entity, With<PrimaryWindow>>()
+        .iter(world)
+        .next()
+        .is_some();
+    if !has_primary {
+        world.spawn((PrimaryWindow, Name::new("focus-dispatch-anchor")));
+    }
+}
 
 pub(crate) fn configure_ingress(app: &mut App) {
     app.add_message::<KeyboardFocusLost>()
@@ -1348,6 +1393,60 @@ mod tests {
     };
     use cosmix_shell::runtime::{ShellFrameState, ShellRuntimePlugin, WakePolicy};
     use std::time::Duration;
+
+    #[derive(Resource, Default)]
+    struct FocusedKeys(Vec<String>);
+
+    fn record_focused_key(
+        event: bevy::ecs::observer::On<bevy::input_focus::FocusedInput<KeyboardInput>>,
+        mut keys: ResMut<FocusedKeys>,
+    ) {
+        keys.0.push(
+            event
+                .input
+                .text
+                .as_ref()
+                .map_or_else(String::new, ToString::to_string),
+        );
+    }
+
+    /// The launcher search box regression (2026-09-24): a key pressed on a
+    /// panel window must reach the `InputFocus` entity as `FocusedInput`
+    /// although the layer host has no primary window.
+    #[test]
+    fn keys_reach_the_input_focus_entity_without_a_primary_window() {
+        let (mut app, window) = keyboard_app();
+        app.init_resource::<FocusedKeys>();
+        install_focus_dispatch(&mut app);
+        let mut real_primary = app
+            .world_mut()
+            .query_filtered::<Entity, (With<PrimaryWindow>, With<Window>)>();
+        assert_eq!(real_primary.iter(app.world()).count(), 0);
+
+        let field = app.world_mut().spawn_empty().id();
+        app.world_mut().entity_mut(field).observe(record_focused_key);
+        app.insert_resource(InputFocus::from_entity(field));
+        app.finish();
+        app.cleanup();
+
+        emit_keyboard(
+            &mut app,
+            window,
+            &map_key(30, Keysym::a, Some("a".to_owned())),
+            ButtonState::Pressed,
+            false,
+        );
+        app.update();
+        assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
+
+        // A second install must not add a second anchor: two primary windows
+        // silence Bevy's dispatcher exactly as none does.
+        install_focus_dispatch(&mut app);
+        let mut anchors = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>();
+        assert_eq!(anchors.iter(app.world()).count(), 1);
+    }
 
     fn pointer_app() -> (App, Entity, OutputKey) {
         let mut app = App::new();
