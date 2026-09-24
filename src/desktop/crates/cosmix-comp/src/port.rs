@@ -1576,13 +1576,14 @@ fn handle_incoming(
 /// `build_topic_notice` never stamps `broker_origin`, on any broker version,
 /// so every real `topic.active`/`topic.idle` arrives without it. Requiring
 /// `local` here would silently break the props publishing lifecycle. Accept
-/// absent or `local`; refuse anything else.
+/// absent or `local`; refuse anything else. Every case-variant spelling of
+/// the header must say `local`, independent of noded's own stripping.
 fn from_local_broker(command: &cosmix_client::IncomingCommand) -> bool {
     command
         .headers
         .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
-        .is_none_or(|(_, origin)| origin.eq_ignore_ascii_case("local"))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
+        .all(|(_, origin)| origin.eq_ignore_ascii_case("local"))
 }
 
 const FOREIGN_BROKER_WARN_INTERVAL: Duration = Duration::from_secs(10);
@@ -5725,7 +5726,10 @@ mod tests {
         registry
             .headers
             .insert("broker_origin".into(), "mesh".into());
-        for forged in [idle("mesh"), idle("MESH"), registry] {
+        // A `local` spelling beside a non-local one is still refused.
+        let mut mixed = idle("local");
+        mixed.headers.insert("Broker_Origin".into(), "mesh".into());
+        for forged in [idle("mesh"), idle("MESH"), mixed, registry] {
             dispatch_incoming(
                 &ingress,
                 &mut responders,
