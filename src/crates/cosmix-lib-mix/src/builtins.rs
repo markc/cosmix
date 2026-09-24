@@ -23538,11 +23538,13 @@ mod ssh_helpers_tests {
         let subject: String = r
             .text
             .lines()
-            .skip_while(|l| !l.starts_with("Subject: "))
-            .take_while(|l| l.starts_with("Subject: ") || l.starts_with(' '))
+            .skip_while(|l| !l.starts_with("Subject:"))
+            .take_while(|l| l.starts_with("Subject:") || l.starts_with(' '))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(subject.starts_with("Subject: =?UTF-8?B?"), "{subject}");
+        // The first word may fold onto its own line (X2); compare unfolded.
+        assert!(unfold(&subject).starts_with("Subject: =?UTF-8?B?"), "{subject}");
+        assert!(subject.lines().all(|l| l.len() <= 78), "{subject}");
         assert!(subject.is_ascii(), "{subject}");
         assert!(
             r.text.contains("Content-Transfer-Encoding: quoted-printable"),
