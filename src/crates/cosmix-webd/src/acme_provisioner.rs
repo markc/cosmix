@@ -409,6 +409,12 @@ pub struct AcmeProvisioner {
     /// rebuilt resolver. Built once from the resolved listener set and
     /// attached alongside [`Self::tls_listeners`].
     fqdn_to_listener: HashMap<String, String>,
+    /// Per-listener `strict_sni` as the startup resolvers were built with
+    /// (the L1 `webd.listeners` value at boot). Every republish rebuilds
+    /// each listener's resolver with ITS policy — before this, republish
+    /// hard-coded `false`, so the first renewal or runtime-cert adoption
+    /// silently turned a strict listener lenient.
+    listener_strict_sni: HashMap<String, bool>,
 
     /// Interval between [`AcmeProvisioner::run_forever`] sweeps.
     /// Production callers pass [`DEFAULT_RENEWAL_TICK`]; tests pass
@@ -736,6 +742,7 @@ impl AcmeProvisioner {
             acme_identities: HashMap::new(),
             tls_listeners: HashMap::new(),
             fqdn_to_listener: HashMap::new(),
+            listener_strict_sni: HashMap::new(),
             renewal_tick,
             notify: Arc::new(Notify::new()),
             staging_client: None,
@@ -827,6 +834,14 @@ impl AcmeProvisioner {
     ) {
         self.tls_listeners = listeners;
         self.fqdn_to_listener = fqdn_to_listener;
+    }
+
+    /// Attach each listener's startup `strict_sni` so republishes keep
+    /// it (see [`Self::listener_strict_sni`]). A listener absent from
+    /// the map keeps whatever policy its live resolver carries, else
+    /// lenient.
+    pub fn attach_listener_strict_sni(&mut self, strict_by_listener: HashMap<String, bool>) {
+        self.listener_strict_sni = strict_by_listener;
     }
 
     /// Attach the `webd.vhosts` namespace event receiver + runtime
@@ -2831,8 +2846,14 @@ impl AcmeProvisioner {
             Vec::with_capacity(self.tls_listeners.len());
         for (lid, handle) in &self.tls_listeners {
             let bucket = by_listener.get(lid.as_str()).cloned().unwrap_or_default();
+            let strict_sni = self
+                .listener_strict_sni
+                .get(lid.as_str())
+                .copied()
+                .or_else(|| handle.current().map(|(r, _)| r.strict_sni()))
+                .unwrap_or(false);
             let resolver =
-                SniCertResolver::from_config(&bucket, /* strict_sni */ false).map_err(|e| {
+                SniCertResolver::from_config(&bucket, strict_sni).map_err(|e| {
                     warn!(
                         listener = %lid,
                         error = %e,
@@ -3874,6 +3895,7 @@ pub fn archive_orphan_acme_dirs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmix_daemon::listen::TlsMode;
 
     /// Origin used as the `now` argument across the backoff tests so
     /// the asserted timestamps are stable regardless of wall-clock
@@ -5596,6 +5618,140 @@ mod tests {
                 "startup adopt must never attempt issuance ({fqdn})"
             );
         }
+    }
+
+    fn _install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// Stage a live dir whose PEMs are a REAL self-signed pair for
+    /// `fqdn`, so `SniCertResolver::from_config` can load it (the chain
+    /// validator is swapped for these tests; the resolver is not).
+    fn _stage_real_live(acme_dir: &Path, fqdn: &str) {
+        _stage_fake_live(acme_dir, fqdn);
+        let key = rcgen::KeyPair::generate().expect("rcgen keypair");
+        let params = rcgen::CertificateParams::new(vec![fqdn.to_string()]).expect("rcgen params");
+        let cert = params.self_signed(&key).expect("rcgen self-sign");
+        let live = acme_dir.join(fqdn).join(LIVE_DIR);
+        std::fs::write(live.join(FULLCHAIN_FILE), cert.pem()).unwrap();
+        std::fs::write(live.join(PRIVKEY_FILE), key.serialize_pem()).unwrap();
+    }
+
+    fn _listener(id: &str, hosts: &[&str]) -> cosmix_config::node::ResolvedWebdListener {
+        cosmix_config::node::ResolvedWebdListener {
+            id: id.to_string(),
+            bind: "192.0.2.1:443".to_string(),
+            external: true,
+            enabled: true,
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+        }
+    }
+
+    /// Review MAJOR-3 + MAJOR-4 + MINOR-8, end to end through the real
+    /// resolver: a listener whose only host is a runtime-added vhost gets
+    /// a handle before adoption, adoption publishes the on-disk cert into
+    /// it, the bind decision taken afterwards is TLS, the handshake
+    /// resolver picks the vhost's own cert, and the listener's strict
+    /// SNI survives the republish.
+    #[tokio::test]
+    async fn startup_adopt_serves_runtime_only_listener_over_strict_tls() {
+        _install_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let www = tempfile::tempdir().unwrap();
+        let (mut p, runtime, _rx) = _new_acme_provisioner_with_runtime(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        let mut row = _runtime_row_claiming_cert("rt.example");
+        row.www_dir = www.path().to_string_lossy().into_owned();
+        _write_row(&runtime, &row).await;
+        _stage_real_live(tmp.path(), "rt.example");
+
+        // Startup: the config-derived partition gave "rt" no handle.
+        let rows = crate::vhosts_namespace::snapshot_rows(&runtime).await.unwrap();
+        let dir = from_namespace_rows(&rows, &HashMap::new(), &HashSet::new()).unwrap();
+        let listeners = vec![_listener("rt", &["rt.example"])];
+        let needing =
+            crate::listeners_needing_runtime_tls(&rows, &dir.by_host, &listeners, &HashMap::new());
+        assert_eq!(needing, vec!["rt".to_string()]);
+        let handle = crate::empty_listener_tls(true).expect("empty handle");
+        assert!(
+            matches!(crate::listener_bind_tls(Some(&handle)).1, TlsMode::Plain),
+            "before adoption the empty handle would bind plain"
+        );
+
+        let mut tls = HashMap::new();
+        tls.insert("rt".to_string(), handle.clone());
+        let mut map = HashMap::new();
+        map.insert("rt.example".to_string(), "rt".to_string());
+        p.attach_tls_listeners(tls, map);
+        let mut strict = HashMap::new();
+        strict.insert("rt".to_string(), true);
+        p.attach_listener_strict_sni(strict);
+
+        let adopted = p
+            .adopt_namespace_rows_at_startup(OffsetDateTime::now_utc(), Duration::from_secs(3600))
+            .await;
+        assert_eq!(adopted, 1);
+
+        let (bind_tls, mode) = crate::listener_bind_tls(Some(&handle));
+        assert!(matches!(mode, TlsMode::Terminate), "binds TLS after adoption");
+        assert!(bind_tls.is_some());
+        let (resolver, _cfg) = handle.current().expect("usable resolver");
+        assert!(resolver.strict_sni(), "strict SNI preserved through republish");
+        assert_eq!(
+            resolver.pick_for_sni(Some("rt.example")).map(|i| i.name.as_str()),
+            Some("rt.example"),
+            "the handshake for the runtime vhost gets its own cert"
+        );
+        assert!(resolver.pick_for_sni(Some("other.example")).is_none());
+        assert!(resolver.pick_for_sni(None).is_none());
+    }
+
+    /// MAJOR-4 for a listener built from config identities: republish
+    /// (here via a runtime adoption onto the same listener) keeps the
+    /// strict policy it booted with; a lenient listener stays lenient.
+    #[tokio::test]
+    async fn republish_keeps_each_listeners_strict_sni() {
+        _install_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = _new_acme_provisioner(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        // Config identity on "strict", nothing on "lenient".
+        _stage_real_live(tmp.path(), "cfg.example");
+        let live = tmp.path().join("cfg.example").join(LIVE_DIR);
+        let cfg_ident = TlsIdentityConfig {
+            server_name: "cfg.example".to_string(),
+            cert: live.join(FULLCHAIN_FILE).to_string_lossy().into_owned(),
+            key: live.join(PRIVKEY_FILE).to_string_lossy().into_owned(),
+            default: false,
+            no_sni_fallback: false,
+        };
+        p.base_identities = vec![cfg_ident.clone()];
+        let strict_handle = ListenerTls::new(Some(Arc::new(
+            SniCertResolver::from_config(&[cfg_ident], true).unwrap(),
+        )));
+        let lenient_handle = crate::empty_listener_tls(false).unwrap();
+        let mut tls = HashMap::new();
+        tls.insert("strict".to_string(), strict_handle.clone());
+        tls.insert("lenient".to_string(), lenient_handle.clone());
+        let mut map = HashMap::new();
+        map.insert("cfg.example".to_string(), "strict".to_string());
+        map.insert("run.example".to_string(), "lenient".to_string());
+        p.attach_tls_listeners(tls, map);
+        let mut strict = HashMap::new();
+        strict.insert("strict".to_string(), true);
+        strict.insert("lenient".to_string(), false);
+        p.attach_listener_strict_sni(strict);
+
+        _stage_real_live(tmp.path(), "run.example");
+        p.apply_vhost_row("run.example", _runtime_row_claiming_cert("run.example"))
+            .await
+            .unwrap();
+        let (s, _) = strict_handle.current().expect("strict listener still serving");
+        assert!(s.strict_sni(), "strict listener must stay strict");
+        assert!(s.pick_for_sni(Some("cfg.example")).is_some());
+        let (l, _) = lenient_handle.current().expect("lenient listener now serving");
+        assert!(!l.strict_sni());
+        assert!(l.pick_for_sni(Some("run.example")).is_some());
     }
 
     #[tokio::test]
