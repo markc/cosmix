@@ -944,14 +944,36 @@ mod tests {
         let set = Mutex::new(TabSet::new().unwrap());
         let (cleanup, worker) = Cleanup::start().unwrap();
         let revision = || set.lock().unwrap().revision;
+        // Every structural verb must bump the revision by exactly one: the
+        // expected values come from `before`, not a read after the call, so a
+        // verb that stopped bumping fails here.
+        let before = revision();
         assert_eq!(
             handle(&set, &cleanup, "term.tab.new", "").unwrap(),
-            format!("opened id=2 tab=2 pane=2 revision={} binding=unavailable", revision())
+            format!("opened id=2 tab=2 pane=2 revision={} binding=unavailable", before + 1)
         );
+        assert_eq!(revision(), before + 1);
         let tabs = handle(&set, &cleanup, "term.tabs", "").unwrap();
-        assert_eq!(tabs.lines().count(), 2);
-        for line in tabs.lines() {
-            assert!(line.ends_with(&format!(" revision={}", revision())), "{line}");
+        let lines: Vec<Vec<(&str, &str)>> = tabs
+            .lines()
+            .map(|line| {
+                line.split(' ')
+                    .map(|pair| pair.split_once('=').expect("key=value token"))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for (line, (id, active)) in lines.iter().zip([("1", "false"), ("2", "true")]) {
+            let keys: Vec<_> = line.iter().map(|(key, _)| *key).collect();
+            assert_eq!(
+                keys,
+                ["id", "active", "title", "cols", "rows", "child_pid", "revision"],
+                "{tabs}"
+            );
+            assert_eq!(line[0], ("id", id));
+            assert_eq!(line[1], ("active", active));
+            assert_eq!(line[2], ("title", "mix"));
+            assert_eq!(line[6], ("revision", (before + 1).to_string().as_str()));
         }
         // Selecting does not bump the revision: drift from a select shows in
         // tab=/pane=, never in revision=.
@@ -963,12 +985,15 @@ mod tests {
         assert_eq!(revision(), before);
         assert_eq!(
             handle(&set, &cleanup, "term.tab.close", r#"{"id":2}"#).unwrap(),
-            format!("closed id=2 remaining=1 revision={}", revision())
+            format!("closed id=2 remaining=1 revision={}", before + 1)
         );
+        assert_eq!(revision(), before + 1);
+        let before = revision();
         assert_eq!(
             handle(&set, &cleanup, "term.tab.close", r#"{"id":1}"#).unwrap(),
-            format!("closed id=1 last revision={}", revision())
+            format!("closed id=1 last revision={}", before + 1)
         );
+        assert_eq!(revision(), before + 1);
         // The last close latches: no verb can reopen a closing terminal.
         assert_eq!(
             handle(&set, &cleanup, "term.tab.new", "").unwrap_err(),
