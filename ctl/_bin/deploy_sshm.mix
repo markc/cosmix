@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_sshm.mix — install the sshm wake citizen, drain worker, and
 -- missed-wake backstop on the hub-configured SSH-manager node.
 --

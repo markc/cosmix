@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- version-flag: script
 -- zcode.mix — headless ZCode launcher with a --model passthrough.
 --

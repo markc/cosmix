@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_maild.mix — install the freshly-built cosmix-maild binary and
 -- refreshed systemd unit on the hub-configured mail nodes.
 --

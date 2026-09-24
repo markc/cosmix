@@ -544,7 +544,12 @@ and <code>--</code> lines, first 32 lines), in exactly this form:</p>
 <ul>
 <li>Every runnable script this repo ships carries the header: <code>setup.mix</code>,
 <code>docs/build/</code>, <code>src/desktop/scripts/</code> (not its <code>tests/</code>), toolsd, the <code>check-*</code>/export scripts,
-and the starter <code>ctl/_bin/</code> and <code>ctl/_share/</code>. Libraries, handlers and data
+and <code>ctl/_share/</code>. The starter <code>ctl/_bin/</code> scripts do not: they are copied
+out to become an operator's private hub, where a header only helps if
+someone bumps it, so they answer <code>unversioned</code> plus their content sha
+(the truthful part) until their owner chooses to version one. Wrappers
+there that must forward <code>--version</code> still declare the opt-out line below.
+Libraries, handlers and data
 files that are loaded rather than run do not, and neither do test scripts:
 a header would make the test the entry script whose version
 <code>script_version()</code> reports. A new script gets one;

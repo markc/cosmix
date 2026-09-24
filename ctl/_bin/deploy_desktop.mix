@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_desktop.mix — build + install the CosMix Desktop apps on one configured workstation.
 --
 -- Scheme: $COSMIX/src/desktop/APPS.md (slug-spine identity canon).

@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- smoke_chrome_shaders.mix — prove the compositor's chrome shaders on a GPU.
 --
 -- This workstation-only gate starts cage with a headless backend, launches a

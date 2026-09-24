@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- ct_reconcile.mix — resolve ambiguous provision_ct and provision_dns jobs.
 --
 -- A reconcile job has an uncertain external outcome, so its lane remains

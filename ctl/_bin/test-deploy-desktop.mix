@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- test-deploy-desktop.mix — the regression suite for deploy_desktop.mix's
 -- manifest and ledger functions.
 --

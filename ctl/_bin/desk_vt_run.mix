@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- desk_vt_run.mix — run one checkpoint-bracketed kms-live test locally.
 --
 -- WARNING: this switches the physical display to the configured VT. A

@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- check-web-palette.mix — gate every site.css clone against ctk's web_roles.
 --
 --   check-web-palette.mix                 check every clone, human output

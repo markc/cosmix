@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- cbc-run.mix — detached, reattachable execution on a build worker.
 --
 --   mix _bin/cbc-run.mix start  --worker alpha --job 70 -- cargo test --workspace

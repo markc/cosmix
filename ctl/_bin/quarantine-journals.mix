@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- quarantine-journals.mix — move a named journal series out of journalctl's
 -- merge directory without deleting it.
 --

@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- desk_atomic_gate.mix — unattended local atomic-presentation gate.
 --
 -- Runs the freshly built desktop compositor inside a configured local

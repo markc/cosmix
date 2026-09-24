@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_wg.mix — apply inventory-derived WireGuard state to a mesh.
 --
 --   mix _bin/deploy_wg.mix --dry-run       -- show and verify the plan

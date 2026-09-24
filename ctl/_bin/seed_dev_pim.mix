@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- seed_dev_pim.mix — seed one configured development mail account with
 -- contacts, calendar events and inbox messages for PIM presentation work.
 --

@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- mesh_push.mix — select, verify, and install a signed inventory locally.
 --
 -- The order is load-bearing: select or sign -> verify -> push -> restart ->

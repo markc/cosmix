@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- ct_provision_worker.mix — claim one container job, provision it on a
 -- configured Proxmox host, commit its DNS identity, verify it through a
 -- reboot, then report the fenced terminal result.

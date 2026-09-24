@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_filesd_fs.mix — install the file-manager fs-mode filesd citizen on
 -- configured fleet nodes, with its filesystem sandbox generated from the same
 -- private places data the daemon receives.

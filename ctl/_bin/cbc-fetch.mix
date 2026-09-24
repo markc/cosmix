@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- cbc-fetch.mix — copy a built artefact back from a build-cluster worker.
 --
 --   mix _bin/cbc-fetch.mix --worker alpha --task 1000 \

@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- foundation_check.mix — Foundations conformance probe.
 --
 -- Walk the resource registry (the source of truth, not filesystem grep) and

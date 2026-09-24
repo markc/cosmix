@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- build_deploy.mix — build the monorepo, compare semantic versions, and invoke
 -- the existing deploy scripts only for configured nodes whose version differs.
 --

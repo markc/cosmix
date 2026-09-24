@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_loki.mix — install the Loki config and Cosmix-managed systemd unit
 -- on the configured observability node, then prove the restarted service is
 -- healthy.

@@ -115,7 +115,12 @@ and `--` lines, first 32 lines), in exactly this form:
 
 - Every runnable script this repo ships carries the header: `setup.mix`,
   `docs/build/`, `src/desktop/scripts/` (not its `tests/`), toolsd, the `check-*`/export scripts,
-  and the starter `ctl/_bin/` and `ctl/_share/`. Libraries, handlers and data
+  and `ctl/_share/`. The starter `ctl/_bin/` scripts do not: they are copied
+  out to become an operator's private hub, where a header only helps if
+  someone bumps it, so they answer `unversioned` plus their content sha
+  (the truthful part) until their owner chooses to version one. Wrappers
+  there that must forward `--version` still declare the opt-out line below.
+  Libraries, handlers and data
   files that are loaded rather than run do not, and neither do test scripts:
   a header would make the test the entry script whose version
   `script_version()` reports. A new script gets one;

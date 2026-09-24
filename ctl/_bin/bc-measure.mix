@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- bc-measure.mix — measure cross-worktree sccache reuse.
 --
 --   mix _bin/bc-measure.mix <label> <worktree-1> <worktree-2>

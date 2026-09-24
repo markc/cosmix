@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- cbc-task.mix — prepare and control one task on a configured build worker.
 --
 --   mix _bin/cbc-task.mix prepare --worker alpha --task 70 --commit <sha>

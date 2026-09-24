@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- provision_mix.mix — bootstrap the freshly-built release `mix` onto roster
 -- nodes which do not have /opt/cosmix/bin/mix yet.
 --

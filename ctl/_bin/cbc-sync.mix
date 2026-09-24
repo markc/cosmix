@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- Pin the public CosMix monorepo checkout on named build workers.
 --
 --   mix _bin/cbc-sync.mix <worker> [<worker>...]

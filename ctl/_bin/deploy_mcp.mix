@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_mcp.mix — install cosmix-mcp on the configured workstation nodes,
 -- or a named configured subset.
 --

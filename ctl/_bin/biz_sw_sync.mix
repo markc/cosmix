@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- biz_sw_sync.mix — run one Synergy Wholesale renewal/expiry update batch on
 -- a configured webd site.
 --

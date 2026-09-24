@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- webd_listener.mix <node> <id> <on|off|status> — operate webd's
 -- per-interface listener kill switch.
 --

@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- bc-scratch.mix — create scratch worktrees for build-cache measurements.
 --
 --   mix _bin/bc-scratch.mix make

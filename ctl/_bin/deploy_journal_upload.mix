@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_journal_upload.mix — configure systemd-journal-upload on the
 -- configured leaf nodes, or a named configured subset.
 --

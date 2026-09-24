@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- dnd-rig.mix — live acceptance rig for file-manager drag-and-drop.
 --
 -- Builds a deterministic two-directory tree, points both file-manager panes

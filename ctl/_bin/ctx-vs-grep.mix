@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- ctx-vs-grep.mix — time a simple lexical search over a configured corpus.
 --
 --   mix _bin/ctx-vs-grep.mix "<query>"        -- search one query

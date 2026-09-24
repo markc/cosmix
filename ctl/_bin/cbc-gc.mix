@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- cbc-gc.mix — reclaim build scratch on configured build-cluster workers.
 --
 --   mix _bin/cbc-gc.mix --dry-run alpha

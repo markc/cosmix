@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- normalize_maild_configs.mix [node...] — idempotently rewrite maild configs
 -- from brace/JSON form to native conf.mix `key: value` form.
 --

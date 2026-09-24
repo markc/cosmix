@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- test-web-palette.mix — falsify check-web-palette.mix before trusting green.
 --
 -- Every mutation is made in /tmp. Helpers return verdicts; only top-level code

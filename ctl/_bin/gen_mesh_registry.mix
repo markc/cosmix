@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- gen_mesh_registry.mix — generate the flat mesh-locator registry in a
 -- private namespace repository.
 --

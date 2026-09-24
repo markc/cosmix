@@ -1,5 +1,5 @@
 #!/usr/bin/env mix
--- version: 0.1.0
+-- version: 0.1.1
 -- add-version-headers.mix — give every shipped Mix script a `-- version:`
 -- header, so `mix SCRIPT --version` never answers "unversioned" for code
 -- this repo ships (docs/mix/invocation.md, "--version for scripts").
@@ -7,9 +7,10 @@
 --   mix docs/build/add-version-headers.mix [--dry-run] [PATH...]
 --
 -- With no PATH it sweeps the scripts the public repo ships: setup.mix,
--- docs/build/, src/desktop/scripts/, src/_etc/cosmix/toolsd/, ctl/_bin/,
+-- docs/build/, src/desktop/scripts/, src/_etc/cosmix/toolsd/,
 -- ctl/_share/cosmix/, and the check/export scripts in src/crates/cosmix-mix/,
 -- src/desktop/apps/bterm/ and src/desktop/apps/bg-showcase/assets-src/.
+-- Not ctl/_bin/: the starter hub scripts stay header-less (AGENTS.md).
 -- Not swept, because they are loaded rather than run: the std prelude,
 -- webd vhost handlers, keymap and settings data. Library modules (a `_lib/` or `lib/` directory) and
 -- strict-data files (`*.conf.mix` and the other data suffixes) are skipped:
@@ -79,7 +80,7 @@ end
 $repo = trim(run_argv_must(["git", "rev-parse", "--show-toplevel"]))
 if length($targets) == 0 then
   $targets = [$repo .. "/setup.mix"]
-  for each $dir in ["docs/build", "src/desktop/scripts", "src/_etc/cosmix/toolsd", "ctl/_bin", "ctl/_share/cosmix", "src/crates/cosmix-mix", "src/desktop/apps/bterm", "src/desktop/apps/bg-showcase/assets-src"]
+  for each $dir in ["docs/build", "src/desktop/scripts", "src/_etc/cosmix/toolsd", "ctl/_share/cosmix", "src/crates/cosmix-mix", "src/desktop/apps/bterm", "src/desktop/apps/bg-showcase/assets-src"]
     for each $f in glob($repo .. "/" .. $dir .. "/*.mix")
       push($targets, $f)
     end

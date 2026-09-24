@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_spamlite.mix — build and install the external spamlite engine on
 -- hub-configured mail nodes, then carry engine changes into cosmix-maild.
 --

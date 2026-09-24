@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_mix.mix — install the freshly-built release `mix` to every node in
 -- the hub's fleet roster (or a named subset).
 --

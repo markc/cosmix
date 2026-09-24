@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_maild_filter.mix — install the private hub's inbound mail routing
 -- filter on the hub-configured mail nodes and ensure maild points at it.
 --

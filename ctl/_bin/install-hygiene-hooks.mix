@@ -1,5 +1,4 @@
 #!/opt/cosmix/bin/mix
--- version: 0.1.0
 -- install-hygiene-hooks.mix — wire the public-repo hygiene gate into git.
 --
 -- Installs `pre-commit`, `commit-msg` and `pre-push` into every repo listed in

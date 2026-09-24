@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- ensure_maild_filter_cfg.mix — idempotently point maild at its canonical
 -- inbound filter on the hub-configured mail nodes.
 --

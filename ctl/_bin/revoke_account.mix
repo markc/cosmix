@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- revoke_account.mix — revoke both authorities that can keep an account's
 -- sessions alive on every selected mail node.
 --

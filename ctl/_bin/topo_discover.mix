@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- topo_discover.mix — build a network topology graph from authenticated mesh
 -- state, the hub's SSH host fragments, and the hub's live WireGuard peer dump.
 --

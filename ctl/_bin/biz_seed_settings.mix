@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- biz_seed_settings.mix — seed one configured webd site's provisioning
 -- settings without replacing later administrator choices.
 --

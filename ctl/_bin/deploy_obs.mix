@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- deploy_obs.mix — deploy Prometheus and Grafana configuration to the
 -- hub-configured observation nodes.
 --

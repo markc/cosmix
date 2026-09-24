@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- mesh_d2_seed.mix — stage each selected node's SPEC 13 §9a D2 private seed.
 --
 -- The signed inventory is verified before its current D2 public keys are used.

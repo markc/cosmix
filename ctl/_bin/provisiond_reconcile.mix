@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- provisiond_reconcile.mix — credentialed, operation-locked reconcile launcher.
 --
 -- Run this as root. The reconciler itself runs as the dedicated provisiond

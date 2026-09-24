@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- Manage one canonical CSS base and its shared browser engine files across
 -- configured webd vhost source trees. This only edits the local checkout; it
 -- never deploys files or contacts a node.

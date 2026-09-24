@@ -1,5 +1,4 @@
 #!/usr/bin/env mix
--- version: 0.1.0
 -- cbc-provision.mix — provision configured CosMix Build Cluster workers.
 --
 --   mix _bin/cbc-provision.mix <worker> [<worker>...]

@@ -1,5 +1,4 @@
 #!/opt/cosmix/bin/mix
--- version: 0.1.0
 -- check-public-hygiene.mix — refuse to publish mesh-private identity.
 --
 -- Enforces the "no hardwired mesh values in a public repo" mandate

@@ -1,5 +1,4 @@
 #!/opt/cosmix/bin/mix
--- version: 0.1.0
 -- test-public-hygiene.mix — the test suite for the public-repo hygiene gate.
 --
 --   mix _bin/test-public-hygiene.mix        (exit 0 = every probe passed)
