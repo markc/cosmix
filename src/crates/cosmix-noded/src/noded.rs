@@ -7638,7 +7638,7 @@ mod tests {
 
     #[test]
     fn reserved_broker_name_covers_the_broker_namespace_only() {
-        for name in ["noded", "noded-1", "noded-x"] {
+        for name in ["noded", "noded-", "noded-1", "noded-x"] {
             assert!(super::reserved_broker_name(name), "{name}");
         }
         for name in ["noded2", "nodedx", "my-noded", "mix-noded-1", "node"] {
