@@ -700,6 +700,99 @@ mod tests {
     }
 
     #[test]
+    fn arm_keeps_the_earliest_of_the_shared_deadline() {
+        let mut deadline = LayerHostDeadline(Some(Duration::from_secs(1)));
+        arm(&mut deadline, Duration::from_secs(5));
+        assert_eq!(deadline.0, Some(Duration::from_secs(1)), "later loses");
+        arm(&mut deadline, Duration::from_millis(500));
+        assert_eq!(deadline.0, Some(Duration::from_millis(500)), "earlier wins");
+    }
+
+    #[test]
+    fn another_projections_deadline_survives_hidden_and_disconnected_ticks() {
+        let holders = Some(Duration::from_secs(7));
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), Duration::ZERO);
+        // Hidden, reconcile past due: arms nothing, clears nothing.
+        let mut deadline = LayerHostDeadline(holders);
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert_eq!(deadline.0, holders);
+        // Disconnected (the old code set the shared deadline to None).
+        state.event(
+            &BusBridgeEvent::Connection {
+                state: BusConnectionState::Disconnected,
+                generation: 1,
+            },
+            Duration::ZERO,
+        );
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert_eq!(deadline.0, holders);
+        drop(peer);
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
+        assert_eq!(deadline.0, holders, "a gone worker clears nothing either");
+    }
+
+    #[test]
+    fn the_real_present_wiring_opens_the_page_and_reads_once() {
+        use bevy::ecs::message::Messages;
+        use cosmix_shell::{
+            core::{LogicalSize, OutputKey, ShellModel},
+            runtime::ShellFrame,
+        };
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1536.0, 864.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), Duration::ZERO);
+        let mut app = App::new();
+        app.insert_resource(state)
+            .insert_resource(ShellFrameState(ShellFrame::from_model(&model)))
+            .init_resource::<InputFocus>()
+            .add_message::<bevy::window::RequestRedraw>()
+            .add_plugins(WallpaperPlugin);
+        let redraws = |app: &mut App| {
+            app.world_mut()
+                .resource_mut::<Messages<bevy::window::RequestRedraw>>()
+                .drain()
+                .count()
+        };
+        app.update();
+        assert_eq!(redraws(&mut app), 0, "hidden: no redraw");
+        {
+            let mut frame = app.world_mut().resource_mut::<ShellFrameState>();
+            let panel = &mut frame.0.panels[Edge::Right.index()];
+            panel.mapped = true;
+            panel.active_page_id = Some("monitor".into());
+        }
+        app.update();
+        assert_eq!(redraws(&mut app), 1, "opening the page requests an update");
+        let now = Duration::from_secs(1);
+        let mut deadline = LayerHostDeadline::default();
+        {
+            let mut state = app.world_mut().resource_mut::<WallpaperState>();
+            state.tick(&bridge, now, &mut deadline);
+            assert_eq!(peer.drain_calls().len(), 1, "the open reads once");
+            state.tick(&bridge, now, &mut deadline);
+            assert!(peer.drain_calls().is_empty());
+        }
+        app.update();
+        assert_eq!(redraws(&mut app), 0, "staying open requests nothing more");
+    }
+
+    #[test]
     fn a_change_during_an_in_flight_read_survives_its_reply() {
         let (bridge, peer) = test_bridge("shell");
         // Visible: the notice lands while the read is pending; the reply

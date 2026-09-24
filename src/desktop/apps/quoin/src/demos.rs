@@ -718,6 +718,39 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_action_is_still_read_back_and_other_deadlines_survive() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = DemoState::default();
+        state.event(
+            &BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation: 1,
+            },
+            Duration::ZERO,
+        );
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        for call in peer.drain_calls() {
+            state.event(&ok(call.request_id, json!({"scene":"boing"})), Duration::ZERO);
+        }
+        // Another projection's wake survives a hidden tick with reads due.
+        let holders = Some(Duration::from_secs(7));
+        let mut deadline = LayerHostDeadline(holders);
+        state.tick(&bridge, VISIBLE_REFRESH * 4, &mut deadline);
+        assert!(peer.drain_calls().is_empty());
+        assert_eq!(deadline.0, holders);
+        // The page is hidden right after the click: the ack still owes a
+        // status readback, sent without the page.
+        state.background.queue("boing.kick", json!({}));
+        let now = VISIBLE_REFRESH * 4;
+        state.tick(&bridge, now, &mut LayerHostDeadline::default());
+        let kick = peer.drain_calls().remove(0);
+        assert_eq!(kick.command, "boing.kick");
+        state.event(&ok(kick.request_id, json!({"accepted":true})), now);
+        state.tick(&bridge, now, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls()[0].command, "background.status");
+    }
+
+    #[test]
     fn a_timed_out_status_backs_off_and_a_hidden_one_is_not_retried() {
         let (bridge, peer) = test_bridge("shell");
         let mut id = 0;
