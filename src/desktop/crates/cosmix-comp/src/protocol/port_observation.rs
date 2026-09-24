@@ -4048,6 +4048,7 @@ fn service_set(
         match leaf {
             "band" => service_set_window_band(state, request, window),
             "minimized" => service_set_window_minimized(state, request, window),
+            "maximized" | "fullscreen" => service_set_window_state(state, request, window, leaf),
             "workspace" => service_set_window_workspace(state, request, window),
             _ => {
                 if let Some(reply) = request.reply.take() {
@@ -4292,6 +4293,45 @@ fn service_set_window_minimized(
     };
     if let Some(reply) = request.reply.take() {
         let _ = reply.send(reply_value);
+    }
+}
+
+fn service_set_window_state(
+    state: &mut WaylandState,
+    request: &mut PortSetRequest,
+    window: u64,
+    leaf: &str,
+) {
+    let result = if let Some(enabled) = request.value.as_bool() {
+        if state.session_lock_active() {
+            ControlReply::Locked
+        } else {
+            match state.resolve_window_target(window, request.generation) {
+                Ok(object) => {
+                    let kind = if leaf == "maximized" {
+                        crate::port::WindowState::Maximized
+                    } else {
+                        crate::port::WindowState::Fullscreen
+                    };
+                    match state.set_window_state(&object, kind, enabled, None, "props.set") {
+                        Ok((old, new)) => ControlReply::Set {
+                            path: request.path.clone(),
+                            old: PropValue::Bool(old),
+                            new: PropValue::Bool(new),
+                            persisted: None,
+                        },
+                        Err(reply) => reply,
+                    }
+                }
+                Err(error @ WindowTargetError::StaleTarget { .. }) => ControlReply::WindowTarget { id: window, error },
+                Err(_) => missing_window(&request.path),
+            }
+        }
+    } else {
+        ControlReply::Validation(invalid_value(&request.path, "bool", "true|false"))
+    };
+    if let Some(reply) = request.reply.take() {
+        let _ = reply.send(result);
     }
 }
 
@@ -4614,7 +4654,7 @@ pub(crate) fn validate_set_request(path: &str, value: &Value) -> Result<(), SetV
             Err(invalid_value(path, "bool", "true|false"))
         };
     }
-    if parse_window_leaf_path(path).is_some_and(|(_, leaf)| leaf == "minimized") {
+    if parse_window_leaf_path(path).is_some_and(|(_, leaf)| matches!(leaf, "minimized" | "maximized" | "fullscreen")) {
         return if value.is_boolean() {
             Ok(())
         } else {
@@ -5184,6 +5224,15 @@ mod tests {
 
         #[test]
         fn ingress_gate_admits_every_writable_leaf_family() {
+            for leaf in ["minimized", "maximized", "fullscreen"] {
+                let path = format!("windows.s7.{leaf}");
+                for value in [json!(true), json!(false)] {
+                    assert!(validate_set_request(&path, &value).is_ok());
+                }
+                for value in [json!(0), json!("true"), Value::Null] {
+                    assert!(matches!(validate_set_request(&path, &value), Err(SetValidationError::InvalidValue { .. })));
+                }
+            }
             assert!(validate_set_request("input.corners.enabled", &json!(true)).is_ok());
             assert!(validate_set_request("windows.s7.band", &json!("bottom")).is_ok());
             // Other window leaves stay read-only, unknown stays unknown.

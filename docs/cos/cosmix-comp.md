@@ -385,6 +385,7 @@ The control plane exposes these verbs:
   remains subscribed.
 - `comp.props.set {path,value,generation?}` mutates the six corner
   properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
+  `windows.s<id>.maximized`, `windows.s<id>.fullscreen`,
   `windows.s<id>.workspace`, `workspaces.count`, `workspaces.current`,
   `workspaces.o_<slug>.current`, `input.host.passthrough`, or
   `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
@@ -401,6 +402,9 @@ The control plane exposes these verbs:
   compositor furniture. See Region selection below.
 - `comp.window.minimize {id,generation}` minimises one window, like its
   title-bar button. Both fields are required.
+- `comp.window.maximize {id,generation}`, `comp.window.unmaximize {id,generation}`,
+  `comp.window.fullscreen {id,generation,output?}` and
+  `comp.window.unfullscreen {id,generation}` request window state (below).
 - `comp.window.restore {id?,generation?}` with no arguments restores the most
   recently minimised window, exactly like the `Super+Shift+M` binding; with
   `{id,generation}` (both required together) it restores that window. If the
@@ -650,12 +654,37 @@ pointer motion out of the corner.
 
 ### Window control
 
+`comp.window.maximize {id,generation}` and
+`comp.window.unmaximize {id,generation}` use the compositor's native maximize
+configure path, including XWayland. `comp.window.fullscreen {id,generation,output?}`
+and `comp.window.unfullscreen {id,generation}` use its fullscreen path.
+`output` accepts an output key or name; an unknown name is `unknown_output`.
+Without it, fullscreen retains an existing explicit selection or uses the default
+output. The selection survives later configures and output reflows; leaving
+fullscreen clears it. Fixed size constraints on either axis refuse entry with
+rc 10 `unsupported_state`, `reason:"fixed_size"`. Target failures use the existing
+`unknown_window`, `not_managed`, `not_mapped` and `stale_target` replies.
+
+Success is rc 0 `{id,generation,title,app_id,minimized,changed,maximized,fullscreen,configure_pending}`.
+`changed` reports a change in requested state or fullscreen output selection.
+`maximized` and `fullscreen` report committed state. Wayland clients must ack
+and commit the configure before those fields change; `configure_pending` reports
+that outstanding configure. Use `comp.window.wait` with `until:maximized`,
+`unmaximized`, `fullscreen` or `unfullscreen` to wait for the committed state.
+The same transitions publish `props.changed` through the normal window-row diff.
+
+`windows.s<id>.maximized` and `windows.s<id>.fullscreen` are writable booleans
+through `comp.props.set {path,value,generation?}`, fenced like `.minimized`.
+Their `{path,old,new}` reply describes requested state; reads and changed events
+describe committed state. These writes use the same refusal and configure paths
+as the verbs. All four verbs and both properties are available to mesh callers.
+
 Every verb here names its window with `{id, generation}`, refuses a stale or
 missing target as described under Window identity, and replies
 `{"error":"locked"}` while a session lock is active. Each is recorded in the
 frame trace as `comp_window_control` (subject the id; detail 1 minimize,
 2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close,
-9 workspace switch, 10 send to workspace; `comp.window.stats` and
+9 workspace switch, 10 send to workspace, 11 window state; `comp.window.stats` and
 `.stats.reset` reuse 7 and 8, a collision kept until 0.60 renumbers them).
 
 Every mapped window is on one workspace and each output has a current one;
@@ -795,7 +824,9 @@ restores it. Two verbs drive the workspaces:
     counts. A late report of an earlier frame does not. The window must
     also be unminimised and on the current workspace when the wait
     resolves), `size` (needs `width` and `height`, compared with the
-    window-geometry size), `focused`, `unmapped` or `gone`. For a match
+    window-geometry size), `focused`, `maximized`, `unmaximized`,
+    `fullscreen`, `unfullscreen`, `unmapped` or `gone`. State waits require
+    a mapped window and test committed state. For a match
     without `id`, `unmapped` and `gone` mean no mapped window matches.
     `mapped` is workspace-blind; `visible` and `presented` need the
     window's workspace to be the current one, so a wait on a window that
@@ -909,6 +940,29 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
+`comp.input.key` (including its `{text}` form) and `comp.input.pointer.button`
+accept `window:{id,generation}` and `raise?:bool` (default true). Both identity
+fields are required; `raise` requires `window`. The compositor focuses the window
+using the focus verb's path, applies the requested raise policy, then injects
+within the same compositor-thread operation. The usual input reply
+`{input_seq,injected_at_us,pointer,target}` names that window in
+`target:{id,generation}`. Sequence steps accept exactly the same arguments.
+
+Targeted buttons direct the seat pointer to the named window at the current
+cursor position, expressed relative to its buffer origin; they do not warp the
+cursor. The ordinary device-click focus/raise policy is skipped because the
+targeted operation has already applied it, including `raise:false`.
+An unmapped, minimised, off-workspace or non-presentable window, a session lock,
+an exclusive layer, or an interfering grab returns rc 10
+`target_unfocusable` with `reason`, `id` and `generation`, and injects no key or
+button. Unlike the standalone focus verb, targeted input never switches workspace
+or restores a window. Unknown or stale identities retain the existing target errors.
+
+Without `window`, a key or text request with no keyboard focus returns rc 10
+`no_keyboard_target` and injects nothing. Untargeted buttons retain their existing
+behaviour: a null pointer delivery target can also mean chrome, a panel or a hot
+corner, so it is not a reliable empty-space refusal.
+
 The `comp.input.*` verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply
 unchanged: bindings (an injected `Super+Shift+M` restores a window, and the
@@ -973,8 +1027,8 @@ Every refusal is decided before anything is sent:
 - `unknown_output`;
 - `out_of_bounds`, with the output size, for a point outside the output.
 
-The verbs are not refused while the session is locked; the seat decides where
-the input goes.
+Untargeted input is not refused while the session is locked; the seat decides
+where it goes. Targeted input refuses the locked window as described above.
 
 `release_all` releases the keys and buttons that injection pressed and has not
 released. It never releases anything a physical device holds. Taps and clicks
@@ -1466,7 +1520,8 @@ mixed-scale, multi-output correctness depends on the renderer's multi-output
 camera model, not on the affordance.
 
 The mutable leaves are the six corner leaves, `windows.s<id>.band`,
-`windows.s<id>.minimized`, `windows.s<id>.workspace`, `workspaces.count`,
+`windows.s<id>.minimized`, `windows.s<id>.maximized`, `windows.s<id>.fullscreen`,
+`windows.s<id>.workspace`, `workspaces.count`,
 `workspaces.current`, `workspaces.o_<slug>.current`, `input.host.passthrough`
 (nested only) and `xwayland.enabled`. The corner, window and workspace
 descriptors say `mutable:true` and

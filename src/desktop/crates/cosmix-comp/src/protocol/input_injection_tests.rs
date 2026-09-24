@@ -12,6 +12,85 @@ const KEY_M: u32 = 50;
 const KEY_O: u32 = 24;
 const KEY_LEFTSHIFT: u32 = 42;
 
+#[test]
+fn keyboard_without_a_surface_refuses_before_injecting() {
+    let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
+    let runtime = control_reply_runtime();
+    harness.server.state.keyboard.clone().set_focus(&mut harness.server.state, None, SERIAL_COUNTER.next_serial());
+    let before = harness.server.state.injection.events;
+    for op in [InputOp::Text("a".into()), InputOp::Key {
+        key: KeySpec::Evdev(KEY_A), action: PressAction::Both,
+        modifiers: vec![KeySpec::Name("Shift_L".into())],
+    }] {
+        let (rc, body) = inject(&mut harness, &ingress, &runtime, op);
+        assert_eq!(rc, 10);
+        assert_eq!(body["error"], "no_keyboard_target");
+        assert_eq!(harness.server.state.injection.events, before);
+        assert!(harness.server.state.injection.held.is_empty());
+    }
+}
+
+#[test]
+fn targeted_key_and_button_focus_without_raising_when_requested() {
+    let (mut harness, ingress, runtime, pointer, alpha, beta) = two_windows();
+    raise(&mut harness, &beta);
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let z = harness.server.state.surfaces[&alpha].layout.z;
+    // The cursor is outside Alpha: a targeted button must not click Beta.
+    let _ = inject(&mut harness, &ingress, &runtime, move_op(PointerMoveTarget::Output {
+        output:None, x:320.0, y:20.0,
+    }));
+    let _ = harness.sync();
+    for op in [InputOp::Key {
+        key:KeySpec::Evdev(KEY_A), action:PressAction::Both, modifiers:vec![],
+    }, InputOp::PointerButton { button:BTN_LEFT, action:PressAction::Both }] {
+        let (rc, body) = inject(&mut harness, &ingress, &runtime, InputOp::Targeted {
+            id, generation, raise:false, op:Box::new(op),
+        });
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["target"], json!({"id":id,"generation":generation}));
+        assert_eq!(focused_object(&harness), Some(alpha.clone()));
+        assert_eq!(harness.server.state.surfaces[&alpha].layout.z, z);
+    }
+    let traffic = harness.sync();
+    assert_eq!(pointer_bodies(&traffic, pointer, 3).len(), 2);
+    assert_eq!(keyboard_key_events(&traffic), vec![(KEY_A, 1), (KEY_A, 0)]);
+    assert!(harness.server.state.pointer.current_pressed().is_empty());
+    let op = crate::port::parse_input_op("comp.input.key", &json!({
+        "key":"a", "window":{"id":id,"generation":generation},
+    })).unwrap();
+    let (rc, body) = inject(&mut harness, &ingress, &runtime, op);
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.surfaces[&alpha].layout.z > harness.server.state.surfaces[&beta].layout.z);
+}
+
+#[test]
+fn targeted_input_refusals_inject_nothing_and_do_not_switch_workspaces() {
+    let (mut harness, ingress, runtime, _, alpha, _) = two_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let targeted = |generation| InputOp::Targeted {
+        id, generation, raise:true, op:Box::new(InputOp::Text("a".into())),
+    };
+    let before = harness.server.state.injection.events;
+    let (rc, body) = inject(&mut harness, &ingress, &runtime, targeted(generation + 1));
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "stale_target");
+    for (field, reason) in [("minimized", "minimized"), ("mapped", "unmapped"), ("workspace", "other_workspace")] {
+        {
+            let record = harness.server.state.surfaces.get_mut(&alpha).unwrap();
+            record.minimized = field == "minimized";
+            record.mapped = field != "mapped";
+            record.workspace = if field == "workspace" { 2 } else { 1 };
+        }
+        let (rc, body) = inject(&mut harness, &ingress, &runtime, targeted(generation));
+        assert_eq!(rc, 10, "{body}");
+        assert_eq!(body["error"], "target_unfocusable");
+        assert_eq!(body["reason"], reason);
+        assert_eq!(harness.server.state.workspace_current(), 1);
+        assert_eq!(harness.server.state.injection.events, before);
+    }
+}
+
 fn move_op(target: PointerMoveTarget) -> InputOp {
     InputOp::PointerMove {
         target,
@@ -397,8 +476,9 @@ fn injected_workspace_chord_is_consumed() {
             modifiers: vec![KeySpec::Name("Super_L".into())],
         },
     );
-    assert_eq!(rc, 0, "{body}");
-    assert_eq!(harness.server.state.workspace_current(), 3);
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "no_keyboard_target");
+    assert_eq!(harness.server.state.workspace_current(), 2);
     let keys = keyboard_key_events(&harness.sync());
     assert!(
         keys.iter().all(|(key, _)| *key != KEY_RIGHTBRACE),
@@ -407,7 +487,7 @@ fn injected_workspace_chord_is_consumed() {
 
     // The move chord through the injected keymap's Shift level. Both
     // windows are hidden on 1, so there is no keyboard focus: the chord is
-    // a whole no-op, it does not even switch.
+    // refused before injecting any part of the chord.
     let move_chord = |harness: &mut KeybindingHarness| {
         inject(
             harness,
@@ -424,23 +504,15 @@ fn injected_workspace_chord_is_consumed() {
         )
     };
     let (rc, body) = move_chord(&mut harness);
-    assert_eq!(rc, 0, "{body}");
-    assert_eq!(harness.server.state.workspace_current(), 3);
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "no_keyboard_target");
+    assert_eq!(harness.server.state.workspace_current(), 2);
     assert_eq!(harness.server.state.surfaces[&alpha].workspace, 1);
 
     // Back on 1 with alpha focused, the same chord moves alpha to 2 and
     // follows it; the level-0 digit is still swallowed under Shift.
-    let (rc, body) = inject(
-        &mut harness,
-        &ingress,
-        &runtime,
-        InputOp::Key {
-            key: KeySpec::Name("1".into()),
-            action: PressAction::Both,
-            modifiers: vec![KeySpec::Name("Super_L".into())],
-        },
-    );
-    assert_eq!(rc, 0, "{body}");
+    harness.server.state.switch_workspace(None, workspaces::WorkspaceTarget::Index(1), true)
+        .expect("switch back without keyboard focus");
     assert_eq!(harness.server.state.workspace_current(), 1);
     harness.server.state.activate_managed_window(&surface);
     let _ = harness.sync();
@@ -641,6 +713,17 @@ fn injection_while_locked_reaches_only_the_lock_surface() {
     let _ = harness.sync();
     let lock_record = test_lock_record(&harness, lock.surface);
     let lock_target = json!({"id": lock_record.id.0, "generation": lock_record.generation});
+    let window = test_toplevel_record(&harness);
+    let targeted = InputOp::Targeted {
+        id:window.id.0, generation:window.generation, raise:true,
+        op:Box::new(InputOp::Text("a".into())),
+    };
+    let before = harness.server.state.injection.events;
+    let (rc, body) = inject(&mut harness, &ingress, &runtime, targeted);
+    assert_eq!(rc, 10);
+    assert_eq!(body["error"], "target_unfocusable");
+    assert_eq!(body["reason"], "session_lock");
+    assert_eq!(harness.server.state.injection.events, before);
 
     let (rc, moved) = inject(
         &mut harness,

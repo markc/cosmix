@@ -5,6 +5,125 @@ use crate::port::{
 };
 use workspaces::WorkspaceTarget;
 
+#[test]
+fn state_verbs_configure_then_publish_and_satisfy_committed_waits() {
+    let (mut harness, ingress, observations) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let runtime = control_reply_runtime();
+    let watch = ingress.request_watch().unwrap();
+    let _ = serviced_control_reply(&mut harness, &runtime, watch);
+    port_observation::service_observations(&mut harness.server.state);
+    drain_observations(&observations);
+    for (state, enabled, until, leaf) in [
+        (crate::port::WindowState::Maximized, true, WaitUntil::Maximized, "maximized"),
+        (crate::port::WindowState::Maximized, false, WaitUntil::Unmaximized, "maximized"),
+        (crate::port::WindowState::Fullscreen, true, WaitUntil::Fullscreen, "fullscreen"),
+        (crate::port::WindowState::Fullscreen, false, WaitUntil::Unfullscreen, "fullscreen"),
+    ] {
+        let (rc, body) = window_op(&mut harness, &ingress, &runtime, WindowOp::State {
+            id, generation, state, enabled, output: None,
+        });
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["id"], id);
+        assert_eq!(body["generation"], generation);
+        assert_eq!(body["changed"], true);
+        assert_eq!(body[leaf], !enabled, "reply reports committed state");
+        assert_eq!(body["configure_pending"], true);
+        let traffic = harness.sync();
+        let serial = configured_toplevel_serial(&traffic);
+        // Registration before the ack must remain pending.
+        let admission = ingress.request_long(wait_for(by_id(id, generation), until, 1000)).unwrap();
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+        assert_eq!(harness.server.state.window_waiters.waiters.len(), 1);
+        commit_test_toplevel_state(&mut harness, serial);
+        port_observation::service_observations(&mut harness.server.state);
+        harness.server.state.service_window_waiters();
+        assert!(harness.server.state.window_waiters.waiters.is_empty());
+        let reply = runtime.block_on(admission.receive()).unwrap().wire_json();
+        assert_eq!(reply["until"], until.name());
+        assert_eq!(reply["window"][leaf], enabled);
+        let path = format!("windows.s{id}.{leaf}");
+        let changed = drain_observations(&observations);
+        assert!(changed.iter().any(|record| matches!(record,
+            port_observation::ObservationRecord::PropsChanged { path: actual, new, .. }
+                if *actual == path && new.wire_value() == json!(enabled)
+        )), "missing {path} edge: {changed:?}");
+    }
+}
+
+#[test]
+fn state_props_fence_at_service_and_reject_fixed_size_windows() {
+    let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let runtime = control_reply_runtime();
+    for leaf in ["maximized", "fullscreen"] {
+        let path = format!("windows.s{id}.{leaf}");
+        let admission = ingress.request_set_fenced(path.clone(), json!(true), Some(generation + 1)).unwrap();
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 10);
+        assert_eq!(body["error"], "stale_target");
+        let admission = ingress.request_set_fenced(path.clone(), json!(true), Some(generation)).unwrap();
+        let (rc, body) = serviced_control_reply(&mut harness, &runtime, admission);
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body, json!({"path":path,"old":false,"new":true}));
+        let traffic = harness.sync();
+        commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+    }
+    // xdg set_max_size / set_min_size are double buffered.
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 7, &words(&[100, 100]));
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 8, &words(&[100, 100]));
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    let _ = harness.sync();
+    for state in [crate::port::WindowState::Maximized, crate::port::WindowState::Fullscreen] {
+        let (rc, body) = window_op(&mut harness, &ingress, &runtime, WindowOp::State {
+            id, generation, state, enabled:true, output:None,
+        });
+        assert_eq!(rc, 10);
+        assert_eq!(body["error"], "unsupported_state");
+        assert_eq!(body["reason"], "fixed_size");
+    }
+}
+
+#[test]
+fn fullscreen_output_is_resolved_before_mutation_and_retained_for_reconfigure() {
+    let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
+    map_initial_test_toplevel(&mut harness);
+    let object = test_toplevel_record(&harness).role.wl_surface().id();
+    let (id, generation) = window_id_and_generation(&harness, &object);
+    let runtime = control_reply_runtime();
+    let state_op = |generation, output| WindowOp::State {
+        id, generation, state:crate::port::WindowState::Fullscreen, enabled:true, output:Some(output),
+    };
+    for (op, error) in [
+        (state_op(generation + 1, "missing".into()), "stale_target"),
+        (state_op(generation, "missing".into()), "unknown_output"),
+        (WindowOp::State { id:u64::MAX, generation, state:crate::port::WindowState::Fullscreen, enabled:true, output:None }, "unknown_window"),
+    ] {
+        let (rc, body) = window_op(&mut harness, &ingress, &runtime, op);
+        assert_eq!(rc, 10);
+        assert_eq!(body["error"], error);
+        assert!(!harness.server.state.surfaces[&object].requested_fullscreen);
+    }
+    let output = harness.server.state.backend.default_output().unwrap();
+    let (key, row) = port_snapshot::project_output(&harness.server.state, &output).unwrap();
+    for name in [row.name, key] {
+        let (rc, body) = window_op(&mut harness, &ingress, &runtime, state_op(generation, name));
+        assert_eq!(rc, 0, "{body}");
+        let traffic = harness.sync();
+        assert_eq!(configured_toplevel_size(&traffic), (row.width as i32, row.height as i32));
+        commit_test_toplevel_state(&mut harness, configured_toplevel_serial(&traffic));
+        assert_eq!(harness.server.state.surfaces[&object].fullscreen_output.as_ref(), Some(&output));
+    }
+    harness.server.state.reconfigure_window_states_for_output();
+    let traffic = harness.sync();
+    assert_eq!(configured_toplevel_size(&traffic), (row.width as i32, row.height as i32));
+    assert_eq!(harness.server.state.surfaces[&object].fullscreen_output.as_ref(), Some(&output));
+}
+
 fn window_op(
     harness: &mut KeybindingHarness,
     ingress: &crate::port::PortIngress,

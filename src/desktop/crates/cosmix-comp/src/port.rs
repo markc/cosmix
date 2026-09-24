@@ -131,6 +131,13 @@ pub(crate) enum StatsTarget {
 /// window is named; only `restore` may name none (most recently minimised).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WindowOp {
+    State {
+        id: u64,
+        generation: u64,
+        state: WindowState,
+        enabled: bool,
+        output: Option<String>,
+    },
     Minimize {
         id: u64,
         generation: u64,
@@ -205,9 +212,19 @@ pub(crate) struct PlaceSpec {
     pub(crate) height: Option<i32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowState {
+    Maximized,
+    Fullscreen,
+}
+
 /// What `comp.window.wait` waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitUntil {
+    Maximized,
+    Unmaximized,
+    Fullscreen,
+    Unfullscreen,
     Mapped,
     Visible,
     Presented,
@@ -220,6 +237,10 @@ pub(crate) enum WaitUntil {
 impl WaitUntil {
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::Maximized => "maximized",
+            Self::Unmaximized => "unmaximized",
+            Self::Fullscreen => "fullscreen",
+            Self::Unfullscreen => "unfullscreen",
             Self::Mapped => "mapped",
             Self::Visible => "visible",
             Self::Presented => "presented",
@@ -310,6 +331,13 @@ pub(crate) enum KeySpec {
 /// One `comp.input.*` operation, parsed and bounded on the worker.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InputOp {
+    /// Focus and inject in one compositor-thread dispatch.
+    Targeted {
+        id: u64,
+        generation: u64,
+        raise: bool,
+        op: Box<InputOp>,
+    },
     /// `corners: false` keeps the move from arming a hot corner.
     PointerMove {
         target: PointerMoveTarget,
@@ -340,6 +368,7 @@ impl InputOp {
     /// is held, which earlier (capped) verbs bounded.
     pub(crate) fn event_bound(&self) -> usize {
         match self {
+            Self::Targeted { op, .. } => op.event_bound() + usize::from(matches!(op.as_ref(), Self::PointerButton { .. })),
             Self::PointerMove { .. } | Self::PointerScroll { .. } | Self::ReleaseAll => 1,
             Self::PointerButton { .. } => 2,
             Self::Key { modifiers, .. } => 2 * (modifiers.len() + 2),
@@ -2194,6 +2223,10 @@ fn parse_window_op(verb: &str, args: &Value) -> Result<WindowOp, ControlReply> {
 }
 
 const WINDOW_VERBS: &[&str] = &[
+    "comp.window.maximize",
+    "comp.window.unmaximize",
+    "comp.window.fullscreen",
+    "comp.window.unfullscreen",
     "comp.window.minimize",
     "comp.window.restore",
     "comp.window.focus",
@@ -2324,6 +2357,23 @@ fn timeout_arg(
 pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, ControlReply> {
     let empty = serde_json::Map::new();
     match verb {
+        "comp.window.maximize" | "comp.window.unmaximize"
+        | "comp.window.fullscreen" | "comp.window.unfullscreen" => {
+            let allowed: &'static [&'static str] = if verb == "comp.window.fullscreen" {
+                &["id", "generation", "output"]
+            } else {
+                &["id", "generation"]
+            };
+            let object = args_object(args, &empty, allowed)?;
+            let (id, generation) = required_target(object)?;
+            Ok(WindowVerb::Op(WindowOp::State {
+                id,
+                generation,
+                state: if verb.ends_with("maximize") { WindowState::Maximized } else { WindowState::Fullscreen },
+                enabled: matches!(verb, "comp.window.maximize" | "comp.window.fullscreen"),
+                output: output_arg(object)?,
+            }))
+        }
         "comp.window.minimize" | "comp.window.restore" => {
             parse_window_op(verb, args).map(WindowVerb::Op)
         }
@@ -2486,13 +2536,17 @@ pub(crate) fn parse_window_verb(verb: &str, args: &Value) -> Result<WindowVerb, 
                     }
                 },
                 Some("focused") => WaitUntil::Focused,
+                Some("maximized") => WaitUntil::Maximized,
+                Some("unmaximized") => WaitUntil::Unmaximized,
+                Some("fullscreen") => WaitUntil::Fullscreen,
+                Some("unfullscreen") => WaitUntil::Unfullscreen,
                 Some("unmapped") => WaitUntil::Unmapped,
                 Some("gone") => WaitUntil::Gone,
                 _ => {
                     return Err(invalid_argument(
                         "until",
                         "string",
-                        "mapped|visible|presented|size|focused|unmapped|gone",
+                        "mapped|visible|presented|size|focused|maximized|unmaximized|fullscreen|unfullscreen|unmapped|gone",
                     ));
                 }
             };
@@ -2642,6 +2696,41 @@ fn modifier_spec(value: &Value) -> Result<KeySpec, ControlReply> {
 /// Parse one `comp.input.*` verb's arguments. Shared by the direct verbs
 /// and `comp.input.sequence` steps, so a step is exactly the verb.
 pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
+    let op = parse_input_payload(verb, args)?;
+    if !matches!(verb, "comp.input.key" | "comp.input.pointer.button") {
+        return Ok(op);
+    }
+    let empty = serde_json::Map::new();
+    let object = args.as_object().unwrap_or(&empty);
+    let Some(window) = present(object, "window") else {
+        if present(object, "raise").is_some() {
+            return Err(invalid_argument("raise", "absent", "requires window"));
+        }
+        return Ok(op);
+    };
+    const WINDOW: &[&str] = &["id", "generation"];
+    let Value::Object(window) = window else {
+        return Err(invalid_argument("window", "object", "{id, generation}"));
+    };
+    if let Some(field) = window.keys().find(|field| !WINDOW.contains(&field.as_str())) {
+        return Err(ControlReply::InvalidArgs {
+            field: format!("window.{field}"),
+            allowed: WINDOW,
+        });
+    }
+    let id = window_arg(window, "id")?
+        .ok_or_else(|| invalid_argument("window.id", "unsigned integer", "required"))?;
+    let generation = window_arg(window, "generation")?
+        .ok_or_else(|| invalid_argument("window.generation", "unsigned integer", "required"))?;
+    Ok(InputOp::Targeted {
+        id,
+        generation,
+        raise: bool_arg(object, "raise", true)?,
+        op: Box::new(op),
+    })
+}
+
+fn parse_input_payload(verb: &str, args: &Value) -> Result<InputOp, ControlReply> {
     let empty = serde_json::Map::new();
     match verb {
         "comp.input.pointer.move" => {
@@ -2744,7 +2833,7 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
             })
         }
         "comp.input.pointer.button" => {
-            const ALLOWED: &[&str] = &["button", "action"];
+            const ALLOWED: &[&str] = &["button", "action", "window", "raise"];
             let object = args_object(args, &empty, ALLOWED)?;
             let button = match present(object, "button") {
                 None => BTN_LEFT,
@@ -2851,7 +2940,7 @@ pub(crate) fn parse_input_op(verb: &str, args: &Value) -> Result<InputOp, Contro
             })
         }
         "comp.input.key" => {
-            const ALLOWED: &[&str] = &["key", "action", "modifiers", "text"];
+            const ALLOWED: &[&str] = &["key", "action", "modifiers", "text", "window", "raise"];
             let object = args_object(args, &empty, ALLOWED)?;
             if let Some(text) = present(object, "text") {
                 if ["key", "action", "modifiers"]
@@ -2947,6 +3036,64 @@ mod region_argument_tests {
         assert!(
             matches!(parse_region_select(&json!({})).unwrap(),LongOp::RegionSelect {output:None,timeout} if timeout==Duration::from_secs(30))
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_control_argument_tests {
+    use super::*;
+
+    #[test]
+    fn state_verbs_are_registered_fenced_and_strict() {
+        for (verb, state, enabled) in [
+            ("comp.window.maximize", WindowState::Maximized, true),
+            ("comp.window.unmaximize", WindowState::Maximized, false),
+            ("comp.window.fullscreen", WindowState::Fullscreen, true),
+            ("comp.window.unfullscreen", WindowState::Fullscreen, false),
+        ] {
+            assert_eq!(window_verb(verb), Some(verb));
+            assert_eq!(parse_window_verb(verb, &json!({"id":7,"generation":3})),
+                Ok(WindowVerb::Op(WindowOp::State { id:7, generation:3, state, enabled, output:None })));
+            for args in [json!({}), json!({"id":7}), json!({"id":7,"generation":null}),
+                json!({"id":7,"generation":3,"typo":true})] {
+                assert!(parse_window_verb(verb, &args).is_err(), "{verb}: {args}");
+            }
+            let output = json!({"id":7,"generation":3,"output":"Output-1"});
+            assert_eq!(parse_window_verb(verb, &output).is_ok(), verb == "comp.window.fullscreen");
+        }
+        assert!(parse_window_verb("comp.window.fullscreen", &json!({"id":7,"generation":3,"output":""})).is_err());
+    }
+
+    #[test]
+    fn state_waits_parse_and_name_the_committed_condition() {
+        for until in [WaitUntil::Maximized, WaitUntil::Unmaximized, WaitUntil::Fullscreen, WaitUntil::Unfullscreen] {
+            assert!(matches!(parse_window_verb("comp.window.wait", &json!({
+                "match":{"id":7,"generation":3}, "until":until.name(),
+            })), Ok(WindowVerb::Long(LongOp::Wait(spec))) if spec.until == until));
+        }
+    }
+
+    #[test]
+    fn targeted_input_is_strict_and_sequences_share_the_parser() {
+        for (verb, mut args) in [
+            ("comp.input.key", json!({"key":"a"})),
+            ("comp.input.key", json!({"text":"hello"})),
+            ("comp.input.pointer.button", json!({"button":"left"})),
+        ] {
+            args["window"] = json!({"id":7,"generation":3});
+            assert!(matches!(parse_input_op(verb, &args), Ok(InputOp::Targeted {
+                id:7, generation:3, raise:true, ..
+            })));
+            args["raise"] = json!(false);
+            assert!(matches!(parse_input_op(verb, &args), Ok(InputOp::Targeted { raise:false, .. })));
+            assert!(parse_sequence(&json!({"steps":[{"verb":verb,"args":args}]})).is_ok());
+            for window in [json!({"id":7}), json!({"generation":3}), json!({"id":7,"generation":3,"raise":true}), json!(7)] {
+                args["window"] = window;
+                assert!(parse_input_op(verb, &args).is_err(), "{verb}: {args}");
+            }
+            args.as_object_mut().unwrap().remove("window");
+            assert!(parse_input_op(verb, &args).is_err(), "raise needs window");
+        }
     }
 }
 

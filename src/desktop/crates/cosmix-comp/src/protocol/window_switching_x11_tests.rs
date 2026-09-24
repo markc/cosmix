@@ -1,5 +1,32 @@
 use super::*;
 
+#[cfg(feature = "bus")]
+#[test]
+fn bus_state_verbs_use_x11_state_and_geometry_paths() {
+    let mut harness = KeybindingHarness::new(true);
+    let (sid, _, _, object) = associate_normal_window(&mut harness, 920);
+    commit_dmabuf(&mut harness, sid, 32, 24);
+    let record = &harness.server.state.surfaces[&object];
+    let (id, generation) = (record.id.0, record.generation);
+    for (verb, maximized, fullscreen) in [
+        ("comp.window.maximize", true, false),
+        ("comp.window.fullscreen", true, true),
+        ("comp.window.unfullscreen", true, false),
+        ("comp.window.unmaximize", false, false),
+    ] {
+        let crate::port::WindowVerb::Op(op) = crate::port::parse_window_verb(
+            verb, &json!({"id":id,"generation":generation}),
+        ).unwrap() else { panic!("one-pass verb") };
+        let (rc, body) = harness.server.state.service_window_op(&op).into_wire();
+        assert_eq!(rc, 0, "{verb}: {body}");
+        let record = &harness.server.state.surfaces[&object];
+        assert_eq!(record.committed_maximized, maximized);
+        assert_eq!(record.requested_maximized, maximized);
+        assert_eq!(record.committed_fullscreen, fullscreen);
+        assert_eq!(record.requested_fullscreen, fullscreen);
+    }
+}
+
 #[test]
 fn active_window_tracks_managed_transfer_and_native_or_none_clears() {
     let mut harness = KeybindingHarness::new(true);

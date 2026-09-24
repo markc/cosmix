@@ -5129,6 +5129,8 @@ struct SurfaceRecord {
     committed_decoration: SceneDecorationMode,
     requested_maximized: bool,
     requested_fullscreen: bool,
+    /// Explicit fullscreen output, retained across subsequent configures.
+    fullscreen_output: Option<Output>,
     fullscreen_restore_band: Option<StackBand>,
     committed_maximized: bool,
     pub(crate) committed_fullscreen: bool,
@@ -14152,6 +14154,27 @@ impl WaylandState {
         )
     }
 
+    fn fullscreen_rect_for(&self, surface: &WlSurface) -> LogicalOutputRect {
+        let selected = self.surfaces.get(&surface.id())
+            .and_then(|record| record.fullscreen_output.as_ref());
+        #[cfg(feature = "bus")]
+        let selected = selected.filter(|output| self.backend.port_output(output).is_some());
+        if let Some(output) = selected && let Some(mode) = output.current_mode() {
+            let size = mode.size.to_f64()
+                .to_logical(output.current_scale().fractional_scale())
+                .to_i32_round::<i32>();
+            let size = output.current_transform().transform_size(size);
+            let origin = output.current_location();
+            return LogicalOutputRect {
+                x: origin.x as f32,
+                y: origin.y as f32,
+                width: size.w.max(1) as f32,
+                height: size.h.max(1) as f32,
+            };
+        }
+        self.logical_output_rect()
+    }
+
     fn request_maximized_state(&mut self, surface: &WlSurface, maximized: bool) {
         let fullscreen = self
             .surfaces
@@ -14161,6 +14184,9 @@ impl WaylandState {
     }
 
     fn request_fullscreen_state(&mut self, surface: &WlSurface, fullscreen: bool) {
+        if !fullscreen && let Some(record) = self.surfaces.get_mut(&surface.id()) {
+            record.fullscreen_output = None;
+        }
         let maximized = self
             .surfaces
             .get(&surface.id())
@@ -14177,7 +14203,7 @@ impl WaylandState {
         }
         self.titlebar_click_candidate = None;
         let output = self.usable_output_rect();
-        let full_output = self.logical_output_rect();
+        let full_output = self.fullscreen_rect_for(surface);
         let extents = DecoExtents::of(&self.decoration.theme);
         let theme = self.decoration.theme.clone();
         let configured_server_side = compositor::with_states(surface, |states| {

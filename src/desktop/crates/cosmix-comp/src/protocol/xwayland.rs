@@ -1467,7 +1467,6 @@ impl WaylandState {
     /// preserving restore memory and leaving override-redirect menus alone.
     pub(super) fn reconfigure_x11_for_output(&mut self) {
         let usable = self.usable_output_rect();
-        let output = self.logical_output_rect();
         let extents = DecoExtents::of(&self.decoration.theme);
         let targets = self
             .surfaces
@@ -1479,6 +1478,7 @@ impl WaylandState {
                 }
                 let server_side = record.committed_decoration == SceneDecorationMode::ServerSide;
                 let target = if role.fullscreen {
+                    let output = self.fullscreen_rect_for(record.role.wl_surface());
                     Rectangle::new(
                         (output.x as i32, output.y as i32).into(),
                         (output.width.max(1.0) as i32, output.height.max(1.0) as i32).into(),
@@ -2043,6 +2043,7 @@ impl WaylandState {
             record.committed_decoration = decoration;
             record.requested_maximized = false;
             record.requested_fullscreen = false;
+            record.fullscreen_output = None;
             record.committed_fullscreen = false;
             record.fullscreen_restore_band = None;
             record.committed_maximized = false;
@@ -2082,6 +2083,7 @@ impl WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: decoration,
                     requested_maximized: false,
+                    fullscreen_output: None,
                     requested_fullscreen: false,
                     fullscreen_restore_band: None,
                     committed_maximized: false,
@@ -3473,7 +3475,10 @@ impl WaylandState {
         if self.managed_x11_record_mut(xid).is_none() {
             return;
         }
-        let output = self.logical_output_rect();
+        let output = self.xwayland.surfaces_by_xid.get(&xid)
+            .and_then(|object| self.surfaces.get(object))
+            .map(|record| self.fullscreen_rect_for(record.role.wl_surface()))
+            .unwrap_or_else(|| self.logical_output_rect());
         let usable = self.usable_output_rect();
         let extents = DecoExtents::of(&self.decoration.theme);
         let restore_ssd =
@@ -3487,10 +3492,15 @@ impl WaylandState {
         let SurfaceRole::X11(role) = &mut record.role else {
             return;
         };
-        if role.fullscreen == fullscreen {
+        if role.fullscreen == fullscreen && record.fullscreen_output.is_none() {
             return;
         }
+        if !fullscreen {
+            record.fullscreen_output = None;
+        }
         role.fullscreen = fullscreen;
+        record.requested_fullscreen = fullscreen;
+        record.committed_fullscreen = fullscreen;
         let target = if fullscreen {
             record.normal_restore = record.normal_restore.or(Some(NormalRestore {
                 window_origin: record.window_origin,
