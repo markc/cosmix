@@ -2048,6 +2048,26 @@ impl AcmeProvisioner {
         // case; the `cert_blob_id` branch is the post-restart
         // already-covered case (no retry needed, the daemon
         // writeback already landed in a prior run).
+        // An in-memory identity whose PEM files have since vanished
+        // (operator wiped state, disk failure) must not count as covered:
+        // the live resolver still holds the key in memory, but the next
+        // restart, renewal or republish reloads from disk and would lose
+        // it, and `tick_once` skips a plan with missing meta. Drop it so
+        // the 4c classification below treats the absence like NotFound
+        // and re-issues under the normal cooldown. The live resolver is
+        // left alone until a new cert is published.
+        if let Some(ident) = self.acme_identities.get(fqdn)
+            && !(Path::new(&ident.cert).is_file() && Path::new(&ident.key).is_file())
+        {
+            warn!(
+                fqdn = %fqdn,
+                cert = %ident.cert,
+                key = %ident.key,
+                "ACME apply_vhost_row: live PEM files are gone — treating as \
+                 uncovered (re-issue under cooldown)"
+            );
+            self.acme_identities.remove(fqdn);
+        }
         if self.acme_identities.contains_key(fqdn) {
             // Two writeback-retry triggers:
             // 4a. `cert_blob_id` absent — first writeback never landed.
@@ -5672,6 +5692,37 @@ mod tests {
                 .map(|s| s.last_error_count),
             Some(1),
             "the reconcile attempts issuance (fails hermetically: no ToS)"
+        );
+    }
+
+    /// Round-2 R2: an in-memory identity whose PEMs were deleted after
+    /// adoption must not short-circuit recovery — the timer's reconcile
+    /// treats the absence like NotFound and attempts issuance.
+    #[tokio::test]
+    async fn reconcile_reissues_when_adopted_pems_are_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut p, runtime, _rx) = _new_acme_provisioner_with_runtime(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        let row = _runtime_row_claiming_cert("wiped.example");
+        _write_row(&runtime, &row).await;
+        _stage_fake_live(tmp.path(), "wiped.example");
+        let adoption = p
+            .adopt_namespace_rows_at_startup(OffsetDateTime::now_utc(), Duration::from_secs(3600))
+            .await;
+        assert_eq!(adoption.adopted, 1);
+
+        let live = tmp.path().join("wiped.example").join(LIVE_DIR);
+        std::fs::remove_file(live.join(FULLCHAIN_FILE)).unwrap();
+        std::fs::remove_file(live.join(PRIVKEY_FILE)).unwrap();
+
+        // What every timer tick after the first runs.
+        p.snapshot_reconcile_additive().await;
+        p.tick_once().await;
+        assert!(!p.acme_identities.contains_key("wiped.example"));
+        assert_eq!(
+            p.vhost_state.get("wiped.example").map(|s| s.last_error_count),
+            Some(1),
+            "issuance attempted (fails hermetically: no ToS)"
         );
     }
 
