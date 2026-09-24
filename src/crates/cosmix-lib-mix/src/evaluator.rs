@@ -12645,7 +12645,12 @@ impl Evaluator {
         {
             return Ok(None);
         }
+        // EVAL_SPECIAL_BUILTINS (printf, write_stdout, serve_name, …) are
+        // outside `is_builtin` by design, so they need their own guard here:
+        // without it `printf() + 1` called a user `fn printf` while a plain
+        // `printf()` called the builtin.
         if crate::builtins::is_builtin(name)
+            || crate::builtins::EVAL_SPECIAL_BUILTINS.contains(&name.as_str())
             || crate::builtins_hof::lookup(name).is_some()
             || self.globals.borrow().extensions.contains_key(name)
             || matches!(
