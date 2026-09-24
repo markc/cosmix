@@ -933,6 +933,78 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Exact replies for the tab verbs' identity echo, the no-bump rule for
+    /// select, both tab.close forms, and the closing latch after the last tab.
+    #[test]
+    fn tab_verbs_echo_exact_identity_and_the_last_close_latches() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP tab identity test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let revision = || set.lock().unwrap().revision;
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.new", "").unwrap(),
+            format!("opened id=2 tab=2 pane=2 revision={} binding=unavailable", revision())
+        );
+        let tabs = handle(&set, &cleanup, "term.tabs", "").unwrap();
+        assert_eq!(tabs.lines().count(), 2);
+        for line in tabs.lines() {
+            assert!(line.ends_with(&format!(" revision={}", revision())), "{line}");
+        }
+        // Selecting does not bump the revision: drift from a select shows in
+        // tab=/pane=, never in revision=.
+        let before = revision();
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.select", r#"{"id":1}"#).unwrap(),
+            format!("selected id=1 tab=1 pane=1 revision={before}")
+        );
+        assert_eq!(revision(), before);
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.close", r#"{"id":2}"#).unwrap(),
+            format!("closed id=2 remaining=1 revision={}", revision())
+        );
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.close", r#"{"id":1}"#).unwrap(),
+            format!("closed id=1 last revision={}", revision())
+        );
+        // The last close latches: no verb can reopen a closing terminal.
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.new", "").unwrap_err(),
+            "application closing"
+        );
+        assert!(set.lock().unwrap().is_empty());
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    /// The property serve() relies on to close the check-then-wait window:
+    /// a last-tab close with nobody waiting leaves a permit, so a wait that
+    /// starts afterwards completes at once instead of sleeping forever.
+    #[test]
+    fn a_close_before_the_wait_is_not_lost() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP emptied permit test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let emptied = set.lock().unwrap().emptied();
+        cleanup.submit(set.lock().unwrap().shutdown());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(100), emptied.notified())
+                    .await
+                    .expect("the close's permit was lost");
+            });
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
     struct Recorder(std::sync::mpsc::Sender<(String, u8, String)>);
     impl Peer for Recorder {
         async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
