@@ -79,6 +79,10 @@ pub(crate) struct WallpaperState {
     owed: bool,
     /// Last page visibility seen by `present` (post-model, same update).
     visible: bool,
+    /// An invalidation arrived while a read was in flight. Notices and
+    /// replies travel different noded paths with no mutual ordering, so that
+    /// read's reply may predate the change and must not clear it.
+    stale_since_send: bool,
     settings: Option<Value>,
     feedback: String,
 }
@@ -94,6 +98,7 @@ impl Default for WallpaperState {
             backoff: RETRY_INITIAL,
             owed: true,
             visible: false,
+            stale_since_send: false,
             settings: None,
             feedback: String::new(),
         }
@@ -141,6 +146,16 @@ impl WallpaperState {
         self.refresh = Some(Duration::ZERO);
         self.backoff = RETRY_INITIAL;
         self.owed = true;
+        self.stale_since_send = false;
+    }
+
+    /// Mark the snapshot stale: re-read when allowed, and remember the
+    /// change if a read is already in flight.
+    fn invalidate(&mut self, now: Duration) {
+        self.refresh = Some(now);
+        if matches!(self.pending, Some((_, RequestKind::Get, _))) {
+            self.stale_since_send = true;
+        }
     }
 
     fn failed(&mut self, now: Duration) {
@@ -165,7 +180,7 @@ impl WallpaperState {
             BusBridgeEvent::DroppedMessages(_) => {
                 // A gap may have swallowed a change notification.
                 self.settings = None;
-                self.refresh = Some(now);
+                self.invalidate(now);
             }
             BusBridgeEvent::Reply { request_id, result } => {
                 let Some((id, kind, _)) = self.pending else {
@@ -189,8 +204,14 @@ impl WallpaperState {
                                         self.feedback.clear();
                                     }
                                     // Authoritative: re-read on invalidation, or
-                                    // the visible-only backstop.
-                                    self.refresh = Some(now + VISIBLE_RECONCILE);
+                                    // the visible-only backstop — unless a
+                                    // change landed while this read was in
+                                    // flight, which the reply may predate.
+                                    self.refresh = Some(if self.stale_since_send {
+                                        now
+                                    } else {
+                                        now + VISIBLE_RECONCILE
+                                    });
                                     self.backoff = RETRY_INITIAL;
                                 }
                             }
@@ -232,7 +253,7 @@ impl WallpaperState {
                 Some("wallpaper.props.changed" | "bg-showcase.props.changed")
             )
         {
-            self.refresh = Some(now);
+            self.invalidate(now);
         }
     }
 
@@ -306,6 +327,7 @@ impl WallpaperState {
                 if matches!(kind, RequestKind::Get) {
                     self.refresh = None;
                     self.owed = false;
+                    self.stale_since_send = false;
                 }
                 self.queued = None;
                 self.pending = Some((self.next_id, kind, now + Duration::from_secs(3)));
@@ -657,6 +679,41 @@ mod tests {
         state.message(&changed_notice(1), later);
         state.tick(&bridge, later, &mut deadline);
         assert_eq!(peer.drain_calls().len(), 1);
+    }
+
+    #[test]
+    fn a_change_during_an_in_flight_read_survives_its_reply() {
+        let (bridge, peer) = test_bridge("shell");
+        // Visible: the notice lands while the read is pending; the reply
+        // may predate it, so the next tick reads again.
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.visible = true;
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.message(&changed_notice(1), Duration::from_millis(5));
+        state.event(&reply(get.request_id, settings()), Duration::from_millis(10));
+        assert_eq!(state.refresh, Some(Duration::from_millis(10)));
+        state.tick(&bridge, Duration::from_millis(10), &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        // That read carries no stale mark: its reply arms only the backstop.
+        state.event(&reply(get.request_id, settings()), Duration::from_millis(20));
+        assert_eq!(
+            state.refresh,
+            Some(Duration::from_millis(20) + VISIBLE_RECONCILE)
+        );
+
+        // Hidden variant: the owed bootstrap is pending, a change lands, the
+        // page opens (no open-read: one is in flight), then the reply.
+        let mut state = WallpaperState::default();
+        connected(&mut state, 2);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        let get = peer.drain_calls().remove(0);
+        state.message(&changed_notice(2), Duration::from_millis(5));
+        state.visible = true;
+        state.event(&reply(get.request_id, settings()), Duration::from_millis(10));
+        state.tick(&bridge, Duration::from_millis(10), &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls().len(), 1, "the change is read, not lost");
     }
 
     #[test]
