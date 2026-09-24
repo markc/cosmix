@@ -266,8 +266,9 @@ fn targeted_buttons_obey_kms_delivery_and_quarantine_gates() {
         if blocked {
             // Deferred unlock keeps session_lock_active() true; targeted
             // input rejects that before the surface-presentability check.
-            assert_eq!(reply.wire_json()["error"], "target_unfocusable");
-            assert_eq!(reply.wire_json()["reason"], "session_lock");
+            let wire = reply.wire_json();
+            assert_eq!(wire["error"], "target_unfocusable");
+            assert_eq!(wire["reason"], "session_lock");
             assert_eq!(harness.server.state.injection.events, before);
         } else {
             assert!(matches!(&reply, ControlReply::Body(_)), "{reply:?}");
