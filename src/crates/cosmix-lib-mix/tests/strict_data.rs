@@ -557,7 +557,8 @@ fn trailing_commas_still_accepted() {
 // --- Escapes: literal `${`, `~`, and JSON `\uXXXX` ------------------------------
 
 fn text(src: &str) -> String {
-    match p(src) {
+    let v = p(src);
+    match &v {
         Value::Map(m) => match m.get("t") {
             Some(Value::String(s)) => s.clone(),
             other => panic!("expected string t, got {other:?}"),
