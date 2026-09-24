@@ -1572,8 +1572,11 @@ fn handle_incoming(
 }
 
 /// A `from: noded` message is the local broker only when noded did not stamp
-/// it as relayed from the mesh. Absent (a pre-0.18 broker, an in-process
-/// test) or `local` both mean this node's broker.
+/// it as relayed from the mesh. ABSENT IS THE NORMAL PRODUCTION CASE: noded's
+/// `build_topic_notice` never stamps `broker_origin`, on any broker version,
+/// so every real `topic.active`/`topic.idle` arrives without it. Requiring
+/// `local` here would silently break the props publishing lifecycle. Accept
+/// absent or `local`; refuse anything else.
 fn from_local_broker(command: &cosmix_client::IncomingCommand) -> bool {
     command
         .headers
