@@ -447,6 +447,17 @@ Literal heredocs are accepted as strings, including their normal trailing-newlin
 semantics. A heredoc containing `${...}` interpolation or `$(...)` command
 substitution is rejected like every other executable strict-data construct.
 
+**Escapes in strict-data strings.** A literal `${` is written `\${` (the same
+`\$` escape as program source) and a leading `~` is written `\~` — which is
+exactly what `data_encode` emits, so its output always reads back unchanged.
+From 0.92.0 strict data also decodes JSON's `\uXXXX` form (exactly four hex
+digits; a surrogate pair is joined, a lone surrogate is a parse error) as well
+as the braced `\u{…}`, so JSON-encoded text — which escapes control characters
+that way — reads back as the original string. Program source is unchanged: a
+bare `\u` not followed by `{` stays literal there. JSON text is still not
+strict data in general: `json_encode` leaves `$` bare, so text carrying `${`
+must be escaped (`replace($json, '${', '\${')`) or produced by `data_encode`.
+
 ```mix
 $cfg = { name: "alpha", port: 25, tags: ["a", "b"] }
 print(data_encode($cfg))

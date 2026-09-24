@@ -105,11 +105,12 @@ check($data.root.widget == "row", "fence parses as strict data")
 check(index_of($data.a.text, "`") < 0, "a backtick cannot close the fence")
 check(index_of($data.a.text, "\"x\"") >= 0, "quotes survive")
 
--- Strict data reads "${" as interpolation with no escape: user text that
--- carries one (a window title, a notification) must still parse.
+-- Strict data reads "${" as interpolation: user text that carries one (a
+-- window title, a notification) must still parse, and come back unaltered.
 for each $hostile in ['title ${name} here', 'dangling ${', 'x ${a ?? b}', '~/Downloads/shot.png saved', '~', 'tab	and "quotes" ~ mid']
   $parsed = data_parse($p.node_line("root", {widget: "text", text: $hostile}))
   check(type($parsed.root.text) == "string", "hostile text parses: " .. $hostile)
+  check($parsed.root.text == $hostile, "hostile text round-trips exactly: " .. $hostile)
 end
 
 check($p.short_title("abcdef", 4) == "abc…", "long titles are cut with an ellipsis")

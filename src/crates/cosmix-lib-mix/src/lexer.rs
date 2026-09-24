@@ -36,6 +36,10 @@ pub struct Lexer {
     continuation_sites: Vec<ContinuationSite>,
     continuation_error: Option<MixError>,
     string_notes: Vec<StringNote>,
+    /// Strict-data source (`parse_data`): double-quoted strings also
+    /// decode the JSON-style `\uXXXX` escape, so JSON-encoded text reads
+    /// back unchanged. Program source keeps a bare `\u` literal.
+    data_mode: bool,
 }
 
 impl Lexer {
@@ -56,6 +60,15 @@ impl Lexer {
             continuation_sites,
             continuation_error,
             string_notes: Vec::new(),
+            data_mode: false,
+        }
+    }
+
+    /// A lexer for strict-data source — see `data_mode`.
+    pub fn for_data(source: &str) -> Self {
+        Lexer {
+            data_mode: true,
+            ..Lexer::new(source)
         }
     }
 
@@ -691,6 +704,13 @@ impl Lexer {
                         Some('u') if self.peek() == Some('{') => {
                             self.lex_unicode_escape(line, col, &mut current)?
                         }
+                        // Strict data only: the JSON `\uXXXX` form (exactly
+                        // four hex digits, surrogate pairs joined), so text
+                        // produced by json_encode — which escapes control
+                        // characters that way — reads back unchanged.
+                        Some('u') if self.data_mode && self.hex4_at(0).is_some() => {
+                            self.lex_json_unicode_escape(line, col, &mut current)?
+                        }
                         // The C/Rust/JS control escapes (0.90.0). Every
                         // other language has these, so the "unrecognised
                         // escape keeps the backslash" rule turned a habit
@@ -927,6 +947,63 @@ impl Lexer {
         let ch = char::from_u32(cp)
             .ok_or_else(|| err(format!("\\u{{{hex}}} is not a valid unicode codepoint")))?;
         out.push(ch);
+        Ok(())
+    }
+
+    /// The value of the four hex digits starting `offset` chars ahead, if
+    /// all four are hex.
+    fn hex4_at(&self, offset: usize) -> Option<u32> {
+        let mut v = 0u32;
+        for k in 0..4 {
+            v = v * 16 + self.peek_ahead(offset + k)?.to_digit(16)?;
+        }
+        Some(v)
+    }
+
+    /// Decode a JSON-style `\uXXXX` (strict data only; the `\u` is already
+    /// consumed and four hex digits are known to follow). A high surrogate
+    /// must be followed by `\u` + a low one and the pair is joined, exactly
+    /// as JSON defines; a lone surrogate is an error, never a silent U+FFFD.
+    fn lex_json_unicode_escape(&mut self, line: usize, col: usize, out: &mut String) -> MixResult<()> {
+        let err = |msg: String| MixError::LexerError {
+            msg,
+            span: Span {
+                line,
+                column: col,
+                file: None,
+            },
+        };
+        let hi = self.hex4_at(0).expect("caller checked four hex digits");
+        for _ in 0..4 {
+            self.advance();
+        }
+        let cp = match hi {
+            0xD800..=0xDBFF => {
+                let lo = if self.peek() == Some('\\') && self.peek_ahead(1) == Some('u') {
+                    self.hex4_at(2)
+                } else {
+                    None
+                };
+                match lo {
+                    Some(lo @ 0xDC00..=0xDFFF) => {
+                        for _ in 0..6 {
+                            self.advance();
+                        }
+                        0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                    }
+                    _ => {
+                        return Err(err(format!(
+                            "\\u{hi:04x} is a high surrogate with no \\uDC00-\\uDFFF low surrogate after it"
+                        )));
+                    }
+                }
+            }
+            0xDC00..=0xDFFF => {
+                return Err(err(format!("\\u{hi:04x} is a lone low surrogate")));
+            }
+            cp => cp,
+        };
+        out.push(char::from_u32(cp).expect("non-surrogate BMP or joined pair is a char"));
         Ok(())
     }
 
