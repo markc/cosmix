@@ -215,14 +215,23 @@ struct Torn;
 /// Bus thread silently (the frontend discards its join result) while every
 /// other verb went unanswered.
 ///
-/// The TabSet lock is what decides the outcome, because it is the only state
-/// a handler shares with the frontend. `handle()` takes every Terminal lock
-/// under it, so a panic that leaves the set unpoisoned happened outside any
-/// shared critical section — nothing is torn, the caller gets an ordinary
-/// error, and the lane keeps serving. A poisoned set may be half-mutated;
-/// that is [`Torn`], and the caller must not carry on. The reply cache is
-/// only written after `handle()` returns, so a panic leaves it untouched and
-/// a retry re-executes.
+/// The TabSet lock decides the outcome. Terminal, native-session and control
+/// state have locks of their own, but every one a handler takes is taken
+/// while it holds the TabSet lock, so a panic escaping any of them unwinds
+/// through the set lock and poisons it too. A poisoned set may be
+/// half-mutated: that is [`Torn`], and the caller must not carry on (serve()
+/// aborts before replying, so the in-flight caller gets no reply). An
+/// unpoisoned set means the panic happened outside those nested critical
+/// sections; the caller gets an ordinary error and the lane keeps serving.
+///
+/// Two limits. The boundary covers this one verb on this thread: panics on
+/// other threads, or at serve()'s own unguarded `is_empty()` lock, are
+/// outside it. And "unpoisoned" is not quite "nothing changed": `tab.close`
+/// and `pane.close` release the set lock before `cleanup.submit`, so a panic
+/// there would follow a completed close — and since the reply cache is only
+/// written after `handle()` returns, a retried targetless `pane.close` would
+/// close a DIFFERENT pane. Theoretical today (`submit` is a `let _ = send`),
+/// but anything added after those `drop(tabs)` calls inherits it.
 fn guard<T>(
     set: &Mutex<T>,
     run: impl FnOnce() -> Result<String, String> + std::panic::UnwindSafe,

@@ -487,7 +487,8 @@ A verb whose
 handler panics answers <code>internal error: verb handler panicked</code> (rc 10) and
 the lane keeps serving; a panic that unwinds while the tab set is locked may
 have left it half-changed, so the terminal logs the verb and aborts rather
-than serve over torn state. With
+than serve over torn state — before replying, so that caller gets no reply
+at all and sees only the terminal vanish from the Bus. With
 <code>COSMIX_MESH_OPEN=0</code> the strict diagnostic-only lane returns: <code>INFO</code>/<code>HELP</code>
 only, everything else refused with <code>FORBIDDEN</code>, including when
 native-session bootstrap fails. The posture is reported, not left to
