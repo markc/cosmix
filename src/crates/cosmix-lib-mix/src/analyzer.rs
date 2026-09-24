@@ -1286,10 +1286,7 @@ fn check_expr(
             {
                 // The runtime's own suggester, so lint — where an agent
                 // looks first — gives the answer the failing run would.
-                // Sorted so the lexical tie-break is deterministic.
-                let mut user_fns: Vec<&str> =
-                    ctx.known_callables.iter().map(String::as_str).collect();
-                user_fns.sort_unstable();
+                let user_fns = ctx.known_callables.iter().map(String::as_str);
                 let fallback =
                     format!("define it, or pass --allow-function {name} if an embedder provides it");
                 let hint = match function_suggestion(name, user_fns) {
@@ -3098,6 +3095,13 @@ pub(crate) fn function_suggestion<'a>(
     }
     let threshold = if name.chars().count() <= 4 { 1 } else { 2 };
     let mut best: Option<(usize, String)> = None;
+    // Sorted HERE, in the one place both callers share: the runtime hands
+    // over a HashSet, whose iteration order changes per process, so an
+    // equal-distance tie between two user functions used to flip between
+    // runs while lint (which sorted) always said the same thing.
+    let mut user_fns: Vec<&str> = user_fns.into_iter().collect();
+    user_fns.sort_unstable();
+    user_fns.dedup();
     // Candidates: leaf builtins, the HOF registry (map/filter/sort_by/… live in
     // a separate table, not BUILTIN_NAMES — a `mapp` typo must still resolve),
     // and in-scope user functions.
@@ -3112,9 +3116,7 @@ pub(crate) fn function_suggestion<'a>(
             continue;
         }
         // Strictly-better only, so ties keep the FIRST candidate — builtins
-        // before user functions, and the builtin table's own order. A
-        // HashSet of user names iterates in arbitrary order, which is why
-        // they come last.
+        // in table order, then user functions in sorted order.
         if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, cand.to_string()));
         }
@@ -3567,6 +3569,21 @@ mod instructional_error_tests {
             undefined_function_hint("json_decode", &fns(&["json_decodr"])),
             Some(" — did you mean 'json_parse'?".to_string())
         );
+    }
+
+    #[test]
+    fn an_equal_distance_tie_between_user_fns_is_deterministic() {
+        // `greet` and `greed` are both one edit from `greex`. The runtime
+        // passes a HashSet, and every new set iterates in its own order —
+        // before the sort, repeated runs answered greed ×5 / greet ×1.
+        for _ in 0..64 {
+            assert_eq!(
+                undefined_function_hint("greex", &fns(&["greet", "greed"])),
+                Some(" — did you mean 'greed'?".to_string())
+            );
+        }
+        let src = "fn greet()\n  return 1\nend\nfn greed()\n  return 2\nend\nprint(greex())\n";
+        assert!(e1102_hint(src).unwrap().starts_with("did you mean 'greed'?"));
     }
 
     fn e1102_hint(src: &str) -> Option<String> {
