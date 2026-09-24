@@ -3,25 +3,30 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use bevy::app::{PreUpdate, Update};
-use bevy::ecs::message::{MessageReader, MessageWriter};
+use bevy::app::{First, PreUpdate, Update};
+use bevy::camera::RenderTarget;
+use bevy::ecs::message::{Message, MessageReader, MessageWriter};
 use bevy::input::gamepad::GamepadButtonChangedEvent;
 use bevy::input::keyboard::{Key, KeyCode, KeyboardFocusLost, KeyboardInput, NativeKey};
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::input::touch::{TouchInput, TouchPhase};
 use bevy::input::{ButtonState, InputSystems};
-use bevy::input_focus::{InputDispatchPlugin, InputFocus};
+use bevy::input_focus::{
+    AcquireFocus, FocusedInput, InputDispatchPlugin, InputFocus, InputFocusSystems,
+};
 use bevy::picking::events::PointerState;
 use bevy::picking::pointer::{
     PointerAction, PointerId, PointerInput, PointerLocation, PointerPress,
 };
 use bevy::prelude::{
-    App, Entity, IntoScheduleConfigs, Name, Res, ResMut, Resource, Time, Vec2, Window, With,
-    World,
+    App, ChildOf, Entity, Has, IntoScheduleConfigs, Name, On, Query, Res, ResMut, Resource,
+    Time, Vec2, Window, With, World,
 };
 use bevy::time::Real;
+use bevy::ui::UiTargetCamera;
 use bevy::window::{
     CursorEntered, CursorLeft, CursorMoved, PrimaryWindow, WindowEvent, WindowFocused,
+    WindowRef,
 };
 use bevy_winit::converters::{convert_logical_key, convert_physical_key_code};
 use cosmix_shell::core::{CornerEvent, Edge, OutputKey, PanelInput};
@@ -169,6 +174,9 @@ impl KeyboardBridge {
         }
         let window = focus.window;
         self.focus = Some(focus);
+        if let Some(mut keyboard) = app.world_mut().get_resource_mut::<KeyboardWindow>() {
+            keyboard.0 = Some(window);
+        }
         stage_keyboard_focus(app, Some(edge));
         set_window_focused(app, window, true);
         emit_window(
@@ -351,6 +359,9 @@ impl KeyboardBridge {
             emit_keyboard(app, focus.window, &mapped, ButtonState::Released, false);
         }
         self.cancel_repeat();
+        if let Some(mut keyboard) = app.world_mut().get_resource_mut::<KeyboardWindow>() {
+            keyboard.0 = None;
+        }
         stage_keyboard_focus(app, None);
         set_window_focused(app, focus.window, false);
         emit_window(
@@ -570,35 +581,73 @@ struct Focus {
 #[derive(Resource, Default)]
 pub(crate) struct StagedShellCommands(Vec<(OutputKey, ShellCommandKind)>);
 
-/// Route Bevy input messages to the `InputFocus` entity.
+/// The panel window whose surface holds the Wayland keyboard, as the bridge
+/// last saw it; `None` while no panel surface has it. Read by
+/// [`confine_input_focus_to_keyboard_window`].
+#[derive(Resource, Default)]
+pub(crate) struct KeyboardWindow(pub(crate) Option<Entity>);
+
+/// Marker for the bare `PrimaryWindow` entity [`install_focus_dispatch`]
+/// spawns.
+#[derive(bevy::prelude::Component)]
+struct FocusDispatchAnchor;
+
+#[derive(Resource, Default)]
+struct FocusAnchorInvariantWarned(bool);
+
+/// Make Bevy's focused-input dispatch work in a host with no primary window.
 ///
 /// Every ctk text field, button and menu listens on
-/// `On<FocusedInput<KeyboardInput>>`, which only Bevy's `InputDispatchPlugin`
-/// raises. Its `dispatch_focused_input` system (bevy_input_focus 0.19) does
-/// nothing unless exactly one `PrimaryWindow` entity exists — and the layer
-/// host has none: every panel is its own `Window` entity behind a layer
-/// surface, and `WindowPlugin::primary_window` is `None`. So keys arrived
-/// from the keyboard bridge as `KeyboardInput` messages and stopped there;
-/// the launcher search box took focus and typed nothing (2026-09-24).
+/// `On<FocusedInput<KeyboardInput>>`, raised by `InputDispatchPlugin` (part of
+/// `DefaultPlugins`, so already present here). Its `dispatch_focused_input`
+/// system (bevy_input_focus 0.19) does nothing unless exactly one
+/// `PrimaryWindow` entity exists — and the layer host has none: every panel
+/// is its own `Window` entity behind a layer surface, and
+/// `WindowPlugin::primary_window` is `None`. So keys arrived from the
+/// keyboard bridge as `KeyboardInput` messages and stopped there; the
+/// launcher search box took focus and typed nothing (2026-09-24).
 ///
-/// The anchor spawned here is a bare entity carrying only the marker. It has
-/// no `Window`, so everything else keyed on `With<PrimaryWindow>` — the UI
-/// default camera, render-target normalisation, picking pointer locations,
-/// the render surface probe — finds no window behind it and behaves exactly
-/// as it does with none. It is where `FocusedInput` bubbling ends and the
-/// fallback target when nothing is focused; nothing observes it.
+/// The anchor spawned here carries the marker and no `Window`. Bevy's
+/// consumers of `With<PrimaryWindow>` that look up the window behind it
+/// (default UI camera, render-target normalisation, the screenshot and
+/// surface probes) find none and skip, as they do today; quoin targets every
+/// camera and UI root at an explicit window so none of them asks. Picking's
+/// pointer-location normalisation no longer returns early, which is
+/// harmless for explicit window targets. Two things the anchor must do
+/// itself, because it is not a `Window`:
 ///
-/// Call after `DefaultPlugins`: the dispatcher orders itself after
-/// `InputSystems`. Idempotent for the plugin; the anchor is spawned only when
-/// no `PrimaryWindow` exists, because two would silence the dispatcher again.
+/// - **End bubbling.** `WindowTraversal` sends a `FocusedInput` or
+///   `AcquireFocus` that reaches an entity with neither `ChildOf` nor
+///   `Window` on to `event.window` — the anchor — and Bevy's propagation loop
+///   has no cycle check, so without the observers below the first unhandled
+///   key spins the main thread forever (reproduced live, nested quoin at
+///   99.9 % CPU, 2026-09-25). The observers stop propagation at the anchor.
+/// - **Honour window boundaries.** `InputFocus` is one world-wide resource
+///   and the dispatcher never checks which window a key came from, so a field
+///   focused in one panel would receive keys typed into another.
+///   [`confine_input_focus_to_keyboard_window`] clears the focus before
+///   dispatch whenever the focused widget's window is not the one holding
+///   the keyboard.
+///
+/// Call after `DefaultPlugins`. Idempotent for the plugin and the systems'
+/// resources; the anchor is spawned only when no `PrimaryWindow` exists,
+/// because two would silence the dispatcher again — `First` checks that
+/// invariant every frame and warns once if it breaks.
 pub(crate) fn install_focus_dispatch(app: &mut App) {
     app.init_resource::<InputFocus>()
+        .init_resource::<KeyboardWindow>()
+        .init_resource::<FocusAnchorInvariantWarned>()
         .add_message::<KeyboardInput>()
         .add_message::<MouseWheel>()
         .add_message::<GamepadButtonChangedEvent>();
     if !app.is_plugin_added::<InputDispatchPlugin>() {
         app.add_plugins(InputDispatchPlugin);
     }
+    app.add_systems(
+        PreUpdate,
+        confine_input_focus_to_keyboard_window.before(InputFocusSystems::Dispatch),
+    )
+    .add_systems(First, check_focus_anchor_invariant);
     let world = app.world_mut();
     let has_primary = world
         .query_filtered::<Entity, With<PrimaryWindow>>()
@@ -606,7 +655,86 @@ pub(crate) fn install_focus_dispatch(app: &mut App) {
         .next()
         .is_some();
     if !has_primary {
-        world.spawn((PrimaryWindow, Name::new("focus-dispatch-anchor")));
+        world
+            .spawn((
+                PrimaryWindow,
+                FocusDispatchAnchor,
+                Name::new("focus-dispatch-anchor"),
+            ))
+            .observe(stop_at_anchor::<KeyboardInput>)
+            .observe(stop_at_anchor::<MouseWheel>)
+            .observe(stop_at_anchor::<GamepadButtonChangedEvent>)
+            .observe(stop_acquire_at_anchor);
+    }
+}
+
+fn stop_at_anchor<M: Message + Clone>(mut event: On<FocusedInput<M>>) {
+    event.propagate(false);
+}
+
+/// Bevy's own `acquire_focus` clears the focus when a click reaches a
+/// `Window`; the anchor is not one, so a click on non-focusable panel space
+/// leaves the focus as it is — the behaviour the host had before dispatch
+/// worked at all. Only the bubbling ends here.
+fn stop_acquire_at_anchor(mut event: On<AcquireFocus>) {
+    event.propagate(false);
+}
+
+/// Clear `InputFocus` when the focused widget lives in a panel window other
+/// than the one holding the keyboard, so a key typed into one panel never
+/// lands in a field of another. Widgets are located through their UI root's
+/// `UiTargetCamera` (quoin sets one on every root) and that camera's window
+/// target; an entity with no such root — the anchor, a bare test entity — is
+/// left alone.
+fn confine_input_focus_to_keyboard_window(
+    keyboard: Res<KeyboardWindow>,
+    mut focus: ResMut<InputFocus>,
+    parents: Query<&ChildOf>,
+    targets: Query<&UiTargetCamera>,
+    cameras: Query<&RenderTarget>,
+) {
+    let (Some(keyboard_window), Some(focused)) = (keyboard.0, focus.get()) else {
+        return;
+    };
+    let mut root = focused;
+    while let Ok(child_of) = parents.get(root) {
+        root = child_of.parent();
+    }
+    let Ok(target) = targets.get(root) else {
+        return;
+    };
+    let Ok(RenderTarget::Window(WindowRef::Entity(window))) = cameras.get(target.0) else {
+        return;
+    };
+    if *window != keyboard_window {
+        tracing::debug!(
+            event = "quoin_input_focus_confined",
+            ?focused,
+            focused_window = ?window,
+            keyboard_window = ?keyboard_window,
+        );
+        focus.clear();
+    }
+}
+
+fn check_focus_anchor_invariant(
+    mut warned: ResMut<FocusAnchorInvariantWarned>,
+    primaries: Query<Has<Window>, With<PrimaryWindow>>,
+) {
+    if warned.0 {
+        return;
+    }
+    let count = primaries.iter().count();
+    let with_window = primaries.iter().filter(|has_window| *has_window).count();
+    if count != 1 || with_window != 0 {
+        warned.0 = true;
+        tracing::warn!(
+            event = "quoin_focus_anchor_invariant_broken",
+            primary_windows = count,
+            with_window,
+            "focused-input dispatch needs exactly one PrimaryWindow, the bare anchor; \
+             keys will no longer reach panel widgets"
+        );
     }
 }
 
@@ -1410,22 +1538,58 @@ mod tests {
         );
     }
 
-    /// The launcher search box regression (2026-09-24): a key pressed on a
-    /// panel window must reach the `InputFocus` entity as `FocusedInput`
-    /// although the layer host has no primary window.
-    #[test]
-    fn keys_reach_the_input_focus_entity_without_a_primary_window() {
+    /// Run one frame on a helper thread. A `FocusedInput` or `AcquireFocus`
+    /// that bubbles into an entity `WindowTraversal` cannot leave spins
+    /// Bevy's propagation loop forever (no cycle check); a frame that does
+    /// not return in time is that defect, not a slow machine.
+    fn update_within(app: App, limit: Duration) -> App {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut app = app;
+            app.update();
+            let _ = tx.send(app);
+        });
+        match rx.recv_timeout(limit) {
+            Ok(app) => app,
+            Err(_) => panic!("app.update() did not return within {limit:?}: focused-input propagation is looping"),
+        }
+    }
+
+    /// A field under a UI root that targets `window`: the shape quoin's
+    /// scene pages have, which is what locates the field's window.
+    fn field_in_window(app: &mut App, window: Entity) -> Entity {
+        let camera = app
+            .world_mut()
+            .spawn(RenderTarget::Window(WindowRef::Entity(window)))
+            .id();
+        let root = app.world_mut().spawn(UiTargetCamera(camera)).id();
+        let field = app.world_mut().spawn(ChildOf(root)).id();
+        app.world_mut().entity_mut(field).observe(record_focused_key);
+        field
+    }
+
+    fn dispatch_app() -> (App, Entity) {
         let (mut app, window) = keyboard_app();
         app.init_resource::<FocusedKeys>();
         install_focus_dispatch(&mut app);
+        (app, window)
+    }
+
+    /// The launcher search box regression (2026-09-24): a key pressed on a
+    /// panel window must reach the `InputFocus` entity as `FocusedInput`
+    /// although the layer host has no primary window — and the frame must
+    /// end, which means the bubble that follows stops at the anchor.
+    #[test]
+    fn keys_reach_the_input_focus_entity_without_a_primary_window() {
+        let (mut app, window) = dispatch_app();
         let mut real_primary = app
             .world_mut()
             .query_filtered::<Entity, (With<PrimaryWindow>, With<Window>)>();
         assert_eq!(real_primary.iter(app.world()).count(), 0);
 
-        let field = app.world_mut().spawn_empty().id();
-        app.world_mut().entity_mut(field).observe(record_focused_key);
+        let field = field_in_window(&mut app, window);
         app.insert_resource(InputFocus::from_entity(field));
+        app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(window);
         app.finish();
         app.cleanup();
 
@@ -1436,8 +1600,9 @@ mod tests {
             ButtonState::Pressed,
             false,
         );
-        app.update();
+        let mut app = update_within(app, Duration::from_secs(5));
         assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
 
         // A second install must not add a second anchor: two primary windows
         // silence Bevy's dispatcher exactly as none does.
@@ -1446,6 +1611,74 @@ mod tests {
             .world_mut()
             .query_filtered::<Entity, With<PrimaryWindow>>();
         assert_eq!(anchors.iter(app.world()).count(), 1);
+    }
+
+    /// With nothing focused the dispatcher falls back to the anchor, and a
+    /// click on non-focusable space sends `AcquireFocus` there too. Both must
+    /// end at the anchor rather than loop, and neither may move the focus.
+    #[test]
+    fn unfocused_key_and_acquire_focus_end_at_the_anchor() {
+        let (mut app, window) = dispatch_app();
+        let loose = app.world_mut().spawn_empty().id();
+        app.finish();
+        app.cleanup();
+        let mut anchors = app
+            .world_mut()
+            .query_filtered::<Entity, With<PrimaryWindow>>();
+        let anchor = anchors.single(app.world()).unwrap();
+
+        emit_keyboard(
+            &mut app,
+            window,
+            &map_key(30, Keysym::a, Some("a".to_owned())),
+            ButtonState::Pressed,
+            false,
+        );
+        app.world_mut().trigger(AcquireFocus {
+            focused_entity: loose,
+            window: anchor,
+        });
+        let app = update_within(app, Duration::from_secs(5));
+        assert!(app.world().resource::<FocusedKeys>().0.is_empty());
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+    }
+
+    /// A field focused in one panel window must not receive keys typed into
+    /// another: the focus is cleared before dispatch when the keyboard sits
+    /// on a different window, and kept when it sits on the field's own.
+    #[test]
+    fn focus_in_another_window_is_cleared_before_keys_dispatch() {
+        let (mut app, window) = dispatch_app();
+        let other = app.world_mut().spawn(Window::default()).id();
+        let field = field_in_window(&mut app, window);
+        app.insert_resource(InputFocus::from_entity(field));
+        app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(other);
+        app.finish();
+        app.cleanup();
+
+        emit_keyboard(
+            &mut app,
+            other,
+            &map_key(30, Keysym::a, Some("a".to_owned())),
+            ButtonState::Pressed,
+            false,
+        );
+        let mut app = update_within(app, Duration::from_secs(5));
+        assert!(app.world().resource::<FocusedKeys>().0.is_empty());
+        assert_eq!(app.world().resource::<InputFocus>().get(), None);
+
+        app.insert_resource(InputFocus::from_entity(field));
+        app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(window);
+        emit_keyboard(
+            &mut app,
+            window,
+            &map_key(30, Keysym::a, Some("a".to_owned())),
+            ButtonState::Pressed,
+            false,
+        );
+        let app = update_within(app, Duration::from_secs(5));
+        assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
+        assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
     }
 
     fn pointer_app() -> (App, Entity, OutputKey) {
