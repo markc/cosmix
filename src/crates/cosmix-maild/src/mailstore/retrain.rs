@@ -188,6 +188,91 @@ pub async fn retrain_logged(
     result
 }
 
+/// Orders inline training (JMAP moves, `maild.bayesian.train`/`untrain`)
+/// against the outbox drain. An inline label is the newest event for its
+/// stamp, so it first cancels the stamp's pending outbox rows (older IMAP
+/// events). The drain re-checks that its row still exists before applying
+/// it. Both steps run under this lock, so a stale row can never be applied
+/// after the label that superseded it. Training is rare; one process-wide
+/// lock is cheaper than any finer scheme.
+fn train_order_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Delete every pending (undrained or dead-lettered) outbox row for
+/// `stamp` in `set`. Returns how many were cancelled.
+async fn cancel_pending_rows(mds: &Arc<SqliteCasMds>, set: SetId, stamp: &str) -> Result<usize> {
+    let mds = Arc::clone(mds);
+    let stamp = stamp.to_string();
+    let n = tokio::task::spawn_blocking(move || {
+        mds.with_set_tx(&set, |tx| {
+            tx.tx()
+                .execute(
+                    "DELETE FROM mail_retrain_outbox WHERE stamp_id = ?1",
+                    params![stamp],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(format!("cancel outbox rows: {e}")))
+        })
+    })
+    .await?;
+    match n {
+        Ok(n) => Ok(n),
+        // No MDS state for the account means nothing can be pending.
+        Err(cosmix_mds::Error::SetNotFound(_)) => Ok(0),
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
+fn log_superseded(account: &str, stamp: &str, cancelled: usize, via: TrainVia) {
+    if cancelled > 0 {
+        info!(
+            target: "maild::bayesian::train",
+            account = %account,
+            stamp = %stamp,
+            result = "superseded",
+            cancelled,
+            via = via.as_str(),
+            "cancelled {cancelled} pending outbox row(s) for {stamp}: superseded by a newer {} label",
+            via.as_str(),
+        );
+    }
+}
+
+/// Train one message inline — the JMAP move and `maild.bayesian.train`
+/// path. Supersedes the stamp's pending outbox rows first (see
+/// [`train_order_lock`]), then applies through [`retrain_logged`].
+pub async fn train_inline(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    classifier: &DefaultClassifier,
+    req: &RetrainRequest<'_>,
+    via: TrainVia,
+) -> anyhow::Result<RetrainOutcome> {
+    let _order = train_order_lock().lock().await;
+    let cancelled = cancel_pending_rows(mds, set, req.stamp_id).await?;
+    log_superseded(req.account.as_str(), req.stamp_id, cancelled, via);
+    Ok(retrain_logged(classifier, req, via).await?)
+}
+
+/// Remove one message's label inline (`maild.bayesian.untrain`), cancelling
+/// its pending outbox rows first so a queued move cannot resurrect it.
+/// Returns the label that was reversed, if any.
+pub async fn untrain_inline(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    classifier: &DefaultClassifier,
+    account: &AccountId,
+    stamp: &str,
+    message: &[u8],
+) -> anyhow::Result<Option<Label>> {
+    let _order = train_order_lock().lock().await;
+    let cancelled = cancel_pending_rows(mds, set, stamp).await?;
+    log_superseded(account.as_str(), stamp, cancelled, TrainVia::Bus);
+    let conn = classifier.open_account_connection(account).await?;
+    Ok(classifier.forget_from(conn.as_ref(), stamp, message).await?)
+}
+
 /// One row claimed from `mail_retrain_outbox`, carrying the exact
 /// `rowid` so finalise can target it precisely (the re-drag guard).
 ///
@@ -322,6 +407,24 @@ impl RetrainOutboxWorker {
         // whole set for a tick — but transient failures are rare and
         // correctness outranks per-tick throughput here.)
         for row in rows {
+            // Hold the train-order lock from the existence check through
+            // finalise. An inline label (JMAP move, Bus train/untrain) may
+            // have cancelled this row since the claim; applying it anyway
+            // would overwrite the newer label with this older event.
+            let _order = train_order_lock().lock().await;
+            if !self.row_still_pending(set, row.rowid).await? {
+                info!(
+                    target: "maild::bayesian::train",
+                    account = row.account_id,
+                    stamp = %row.stamp_id,
+                    result = "superseded",
+                    via = TrainVia::Imap.as_str(),
+                    "skipped outbox row {} for {}: superseded before drain",
+                    row.rowid,
+                    row.stamp_id,
+                );
+                continue;
+            }
             let outcome = self.process_row(&set, &row).await;
             let success = matches!(outcome, Finalise::Done);
             let halt = matches!(outcome, Finalise::Retry(_));
@@ -341,6 +444,25 @@ impl RetrainOutboxWorker {
             }
         }
         Ok(applied)
+    }
+
+    /// Is the claimed row still in the outbox? A row can vanish after the
+    /// claim when an inline label cancels it or a re-drag replaces it.
+    async fn row_still_pending(&self, set: SetId, rowid: i64) -> Result<bool> {
+        let mds = Arc::clone(&self.mds);
+        let present = tokio::task::spawn_blocking(move || {
+            mds.with_set_tx(&set, |tx| {
+                tx.tx()
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM mail_retrain_outbox WHERE rowid = ?1)",
+                        params![rowid],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(|e| cosmix_mds::Error::Other(format!("outbox row check: {e}")))
+            })
+        })
+        .await??;
+        Ok(present)
     }
 
     /// Resolve the message bytes for one claimed row and apply the

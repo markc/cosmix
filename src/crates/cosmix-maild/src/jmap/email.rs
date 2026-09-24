@@ -2186,7 +2186,9 @@ async fn retrain_for_move(
         message: &blob_data,
         label,
     };
-    crate::mailstore::retrain::retrain_logged(
+    crate::mailstore::retrain::train_inline(
+        mailstore.mds(),
+        crate::mailstore::account_id_to_setid(account_id),
         classifier,
         &req,
         crate::mailstore::retrain::TrainVia::Jmap,

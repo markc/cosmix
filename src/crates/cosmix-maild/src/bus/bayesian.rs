@@ -12,9 +12,11 @@
 //!   no matched rules, and `trusted = false`. Read-only: never calls
 //!   `record_label`.
 //! - `maild.bayesian.train` — label one stored message (`email_id` or
-//!   `message_id`) as `spam` or `ham` through `retrain_logged`, the path an
-//!   IMAP/JMAP move across Junk takes, keyed on the same item-id stamp.
-//! - `maild.bayesian.untrain` — remove that label and reverse its counts.
+//!   `message_id`) as `spam` or `ham` through `train_inline`, the path a
+//!   JMAP move across Junk takes, keyed on the same item-id stamp. It first
+//!   cancels the stamp's pending IMAP outbox rows, which are older events.
+//! - `maild.bayesian.untrain` — remove that label and reverse its counts,
+//!   cancelling pending outbox rows the same way.
 //! - `maild.bayesian.rebuild` — build a shadow corpus from current folder
 //!   state, replay corrections made during the walk, then atomically replace
 //!   the live corpus. `\\Junk` is Spam; `\\Trash`, `\\Drafts`, `\\Sent`, and
@@ -69,7 +71,7 @@ use crate::{
     db,
     mailstore::{
         ListOpts, MailStore, SqliteMailStore, account_id_to_setid,
-        retrain::{TrainVia, retrain_logged},
+        retrain::{TrainVia, train_inline, untrain_inline},
     },
 };
 
@@ -330,9 +332,11 @@ async fn resolve_message(
 }
 
 /// `maild.bayesian.train` — label one stored message as spam or ham through
-/// the exact path a user's move across Junk takes
-/// (`mailstore::retrain::retrain_logged`, stamp = item id), so a later user
-/// move of the same message flips this label rather than double-counting.
+/// the exact path a JMAP move across Junk takes
+/// (`mailstore::retrain::train_inline`, stamp = item id), so a later user
+/// move of the same message flips this label rather than double-counting,
+/// and an earlier move still queued in the IMAP outbox is cancelled rather
+/// than replayed over it.
 async fn handle_train(
     classifier: &DefaultClassifier,
     database: &db::Db,
@@ -369,7 +373,8 @@ async fn handle_train(
         message: &message,
         label,
     };
-    match retrain_logged(classifier, &retrain, TrainVia::Bus).await {
+    let set = account_id_to_setid(row.id);
+    match train_inline(mailstore.mds(), set, classifier, &retrain, TrainVia::Bus).await {
         Ok(outcome) => {
             let result = match outcome {
                 RetrainOutcome::Applied => "applied",
@@ -418,14 +423,8 @@ async fn handle_untrain(
     };
     let account = AccountId::new(row.id.to_string());
     let stamp = item.0.to_string();
-    let conn = match classifier.open_account_connection(&account).await {
-        Ok(c) => c,
-        Err(e) => return (RC_ERROR, err_body(&format!("open corpus failed: {e}"))),
-    };
-    match classifier
-        .forget_from(conn.as_ref(), &stamp, &message)
-        .await
-    {
+    let set = account_id_to_setid(row.id);
+    match untrain_inline(mailstore.mds(), set, classifier, &account, &stamp, &message).await {
         Ok(removed) => {
             let removed = removed.map(|l| match l {
                 Label::Spam => "spam",
@@ -1881,6 +1880,67 @@ mod tests {
         assert_eq!(v["removed"], "spam");
         let stats = cls.peek_stats(&AccountId::new("3")).await.unwrap();
         assert_eq!((stats.spam_messages, stats.labelled_spam), (0, 0));
+    }
+
+    fn enqueue_outbox_row(
+        mds: &SqliteCasMds,
+        set: &cosmix_mds::SetId,
+        account: i32,
+        item: ItemId,
+        label: &str,
+    ) {
+        mds.with_set_tx(set, |tx| {
+            tx.tx()
+                .execute(
+                    "INSERT OR REPLACE INTO mail_retrain_outbox \
+                     (stamp_id, account_id, item_id, label, attempts, last_error, created_at) \
+                     VALUES (?1, ?2, ?1, ?3, 0, NULL, 0)",
+                    rusqlite::params![item.0.to_string(), account, label],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Review MAJOR-2: a user's IMAP move to Junk still queued in the outbox
+    /// must not be replayed over a later operator `train ham`, nor resurrect
+    /// a label the operator removed with `untrain`.
+    #[tokio::test]
+    async fn inline_train_and_untrain_supersede_queued_outbox_rows() {
+        use crate::mailstore::retrain::RetrainOutboxWorker;
+        let dir = TempDir::new().unwrap();
+        let cls = disk_classifier(dir.path());
+        let (_mdir, mds, store) = temp_mailstore();
+        let set = store.ensure_account_set(3).unwrap();
+        let inbox = create_mailbox(&mds, &set, "Inbox", Some("\\Inbox"));
+        let item = add_message(&mds, &set, inbox, b"Subject: invoice\r\n\r\nbody\r\n");
+        let database = database_with_accounts(&[3]);
+        let account = AccountId::new("3");
+
+        enqueue_outbox_row(&mds, &set, 3, item, "junk");
+        let args = serde_json::json!({"account_id": 3, "email_id": item.0.to_string(), "class": "ham"});
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        let worker = RetrainOutboxWorker::new(Arc::clone(&mds), Arc::clone(&cls));
+        assert_eq!(worker.drain_once().await.unwrap(), 0, "stale row was applied");
+        let stats = cls.peek_stats(&account).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 1));
+
+        enqueue_outbox_row(&mds, &set, 3, item, "junk");
+        let args = serde_json::json!({"account_id": 3, "email_id": item.0.to_string()});
+        let (rc, body) = handle_untrain(&cls, &database, &store, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        assert_eq!(worker.drain_once().await.unwrap(), 0, "stale row was applied");
+        let stats = cls.peek_stats(&account).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 0));
+
+        // A row enqueued AFTER the operator's label is a newer event and
+        // still applies.
+        enqueue_outbox_row(&mds, &set, 3, item, "junk");
+        assert_eq!(worker.drain_once().await.unwrap(), 1);
+        let stats = cls.peek_stats(&account).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (1, 0));
     }
 
     #[tokio::test]
