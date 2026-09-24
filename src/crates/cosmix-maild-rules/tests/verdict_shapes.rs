@@ -290,6 +290,15 @@ async fn scam_account_reference_subject_spares_ordinary_account_mail() {
         "Your account statement for September",
         "Account Status-Q3",
         "Re: Account Status-Q3 review",
+        // Billing/ticket references that an earlier, broader pattern junked.
+        "Account Status-INV2024",
+        "Account Settlement-2024Q3",
+        "Account Status-FY2026",
+        "Account Follow-Up-TKT99812",
+        "Account Status-Win10",
+        "account status-covid19",
+        "Account status-Level5",
+        "Your account status-Update2",
     ] {
         let msg = with_subject(subject);
         let exp = engine
@@ -303,4 +312,29 @@ async fn scam_account_reference_subject_spares_ordinary_account_mail() {
             .expect("rule evaluated");
         assert!(!hit.matched, "{subject:?} must not match");
     }
+}
+
+/// The rule is meant to junk on its own. Pin its weight to the default
+/// hard_junk_threshold so raising the threshold cannot silently turn it into
+/// a Continue score, which routes nothing while rules_score_bias_k is 0.
+#[tokio::test]
+async fn scam_account_reference_subject_weight_equals_hard_junk_threshold() {
+    let config = EngineConfig::default();
+    let engine = engine_with_config(config.clone());
+    let auth = pass_verify_result();
+    let account = AccountId::new("test");
+    let rcpts: Vec<String> = vec!["y@example.invalid".into()];
+    let ov = AccountOverrides::default();
+    let msg = with_subject("Pending Account Matter-7G4K2Q");
+    let exp = engine
+        .explain(&ctx(&msg, &auth, &account, &rcpts, &ov))
+        .await
+        .unwrap();
+    let hit = exp
+        .rules
+        .iter()
+        .find(|r| r.id == "scam_account_reference_subject")
+        .expect("rule evaluated");
+    assert!(hit.matched);
+    assert_eq!(hit.configured_weight as f32, config.hard_junk_threshold);
 }

@@ -564,13 +564,17 @@ its data, but classification never matches it.</p>
 covers missing and patterned headers, body patterns, URL and recipient counts,
 executable attachments, message structure, and soft SPF and DKIM failures.</p>
 <p>One rule is a campaign fingerprint rather than a soft signal.
-<code>scam_account_reference_subject</code> matches a subject that names an account
-matter, settlement, status or follow-up and joins it with a bare hyphen to a
-random reference of letters and digits, as in <code>Pending Account Matter-7G4K2Q</code>.
-It has weight 15, which equals the default <code>hard_junk_threshold</code>, so it junks on
-its own. A legitimate notice is usually spaced (<code>Account status - ref 12345</code>) or
-uses a digits-only reference, and neither form matches. To turn the rule off for
-one account, add it to that account's <code>disabled_rules</code>.</p>
+<code>scam_account_reference_subject</code> matches only the three subjects of the
+pending-account scam campaign: <code>Pending Account Matter-</code>,
+<code>Account Settlement Follow-Up-</code> and <code>Follow-Up on Account Status-</code>. Each must
+start the subject and be glued with a bare hyphen to a random reference of five
+or more characters that mixes letters and digits, as in
+<code>Pending Account Matter-7G4K2Q</code>. The rule has weight 15, equal to the default
+<code>hard_junk_threshold</code>, so it junks on its own. A rules verdict short-circuits
+Bayes, so moving a match back to Inbox never trains the rule away. The only
+escapes are the sender allowlist and the account's <code>disabled_rules</code>. That is
+why the rule matches the campaign phrases exactly and does not match
+<code>account</code> subjects in general.</p>
 <p>The default engine thresholds are calibrated separately in <code>EngineConfig</code>.
 Callers can load the embedded text without locating a file:</p>
 <pre><code class="language-rust">let pack = cosmix_maild_rules::default_pack_str();
