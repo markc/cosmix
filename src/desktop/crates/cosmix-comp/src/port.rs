@@ -1636,11 +1636,12 @@ fn dispatch_incoming(
                     == &port_observation::topic_name(service, port_observation::PROPS_TOPIC_SUFFIX)
         });
     let broker_registry = command.from == "noded" && command.topic() == Some(REGISTRY_TOPIC);
-    // Only the LOCAL broker speaks as `noded`. noded 0.18.0 refuses clients
-    // registering that name and re-stamps local routed traffic, but a reply
-    // relayed from a mesh peer keeps the remote's `from` with only
-    // `broker_origin: mesh` added — so a mesh message claiming `from: noded`
-    // is not this compositor's broker and must not steer it.
+    // Only the LOCAL broker speaks as `noded`. Defence in depth: mesh ingress
+    // strips `from` (noded.rs mesh handler) and responses never reach this
+    // dispatch, so the one reachable forgery is a client connected over
+    // WireGuard to a PRE-0.18 noded that let it register the name `noded` —
+    // its routed messages arrive as `from: noded` + `broker_origin: mesh`.
+    // noded 0.18.0 refuses that name; this check does not rely on it.
     if (broker_lifecycle || broker_registry) && !from_local_broker(&command) {
         warn_foreign_broker_claim(&command);
         return;
@@ -5685,8 +5686,9 @@ mod tests {
         }
     }
 
-    /// A mesh peer's reply keeps its own `from`, so `from: noded` with
-    /// `broker_origin: mesh` is some other node's broker: it must not turn
+    /// `from: noded` with `broker_origin: mesh` is what a WireGuard client of
+    /// a pre-0.18 noded that registered the name `noded` looks like; it is
+    /// not this node's broker (defence in depth): it must not turn
     /// this compositor's props publishing off, nor rewrite its live-service
     /// set. A `local` stamp is still honoured.
     #[tokio::test]

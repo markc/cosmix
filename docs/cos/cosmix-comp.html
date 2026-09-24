@@ -1757,9 +1757,13 @@ drops the property baseline and a later <code>topic.active</code> seeds one at t
 stable service point; both lifecycle directions coalesce latest-wins if the
 ingress is temporarily full. These notices, and the <code>noded.props.changed</code>
 registry diffs, are honoured only from the local broker: <code>from: noded</code> with
-<code>broker_origin</code> absent or <code>local</code>. A mesh-relayed message keeps the remote's
-<code>from</code>, so one claiming <code>noded</code> with <code>broker_origin: mesh</code> is ignored and logged
-at warn level, at most once every 10 seconds.</p>
+<code>broker_origin</code> absent or <code>local</code>. Absent is the normal case, because noded
+does not stamp its topic notices. A message claiming <code>noded</code> with
+<code>broker_origin: mesh</code> is ignored and logged at warn level, at most once every
+10 seconds. This is defence in depth. Mesh ingress strips <code>from</code>, and responses
+never reach this dispatch. The one reachable forgery is a client connected
+over WireGuard to a pre-0.18 noded that let it register the name <code>noded</code>.
+noded 0.18.0 refuses that name.</p>
 <p>The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
 still serialise far beyond the wire allowance, so comp measures the cached
 full-tree bytes once and returns <code>too_large</code>; callers can read a leaf or subtree
