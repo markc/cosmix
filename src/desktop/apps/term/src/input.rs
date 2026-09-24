@@ -135,8 +135,10 @@ fn chord_letter(key: &Key, physical: Physical) -> Option<char> {
 /// A notched wheel reports whole lines and steps once per notch.
 pub const PIXELS_PER_STEP: f32 = 40.0;
 
-/// Ctrl+wheel -> font steps: positive grows (wheel forward, away from the
-/// user, as in foot's `Control+BTN_WHEEL_FORWARD`), negative shrinks.
+/// Ctrl+wheel -> font steps: positive grows, negative shrinks. Positive is
+/// iced's scroll-up, the direction foot calls `BTN_WHEEL_BACK` (its
+/// scrollback-up button), and foot binds `font-increase=Control+BTN_WHEEL_BACK`
+/// (`/etc/xdg/foot/foot.ini`), so the two agree.
 ///
 /// Fractions accumulate in `pending` so a touchpad's stream of small deltas
 /// adds up to steps instead of rounding every one of them to zero; turning

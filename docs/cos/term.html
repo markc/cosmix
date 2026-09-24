@@ -449,7 +449,7 @@ the PTY, the VT grid, the tab and pane model, the glyph raster and the Bus
 handlers. Only the window differs.</p>
 <p>It registers the Bus name <code>term</code> and serves the <code>term.*</code> verbs. bterm
 registers <code>bterm</code> and serves <code>bterm.*</code>, so both can run at once. <code>mix --gui</code>
-still prefers bterm until term reaches full verb parity (TODO-term D6 and
+still prefers bterm until term reaches full verb parity (decisions D6 and
 D10). Set <code>COSMIX_TERM_BIN</code> to the <code>term</code> binary to launch this one.</p>
 <h2 id="tabs-and-panes">Tabs and panes</h2>
 <p>The tab strip across the top shows one button per tab and a <code>+</code> that opens a
@@ -458,6 +458,10 @@ clicking a pane focuses it. When a tab has more than one pane, the focused
 pane's border takes the design's focus-ring colour. Every other border,
 including a tab's only pane, takes the plain border colour.
 All strip and border colours come from the <code>cosmix-design</code> tokens.</p>
+<p>Every tab is labelled <code>mix</code> for now, since the core does not yet take a title
+from the shell. The strip does not scroll or wrap. At the default window width, past about 17 tabs the <code>+</code>
+and the later tabs run off the right edge, although up to 32 terminals can be
+open. Ctrl+PageUp and Ctrl+PageDown still reach every tab.</p>
 <p>Every pane keeps a border of the same width whether or not it is focused, so
 moving focus never resizes a PTY. Split edges are placed on whole physical
 pixels, so a pane's grid is never drawn half a pixel off the display.</p>
@@ -493,7 +497,7 @@ size.</p>
 <tr><td>Ctrl+plus, Ctrl+equal, Ctrl+keypad plus</td><td>one step larger</td></tr>
 <tr><td>Ctrl+minus, Ctrl+keypad minus</td><td>one step smaller</td></tr>
 <tr><td>Ctrl+0, Ctrl+keypad 0</td><td>back to the configured size</td></tr>
-<tr><td>Ctrl+wheel forward / back</td><td>one step larger / smaller per notch</td></tr>
+<tr><td>Ctrl+wheel up / down</td><td>one step larger / smaller per notch</td></tr>
 </tbody></table>
 <p>A step is foot's half point, which is two thirds of a logical pixel. The
 size stays within the 6 to 48 pixel range that <code>font_px</code> accepts, and
@@ -512,12 +516,22 @@ and <code>TERM_SPIKE_FONT</code> names a monospace font file.</p>
 <li><code>term --version</code> prints the version and build hash and does nothing else.</li>
 </ul>
 <h2 id="bus">Bus</h2>
-<p>term serves the core's <code>term.*</code> surface under the mesh-open law, like bterm:
-<code>term.tabs</code>, <code>term.tab.new</code>, <code>term.tab.select</code>, <code>term.tab.close</code>,
-<code>term.panes</code>, <code>term.pane.split</code>, <code>term.pane.select</code>, <code>term.pane.close</code>,
-<code>term.snapshot</code> and <code>term.type</code>. <code>send term HELP</code> lists the full surface.
-A verb and the matching chord make the same change, and the window follows a
-verb straight away.</p>
+<p>term serves the core's <code>term.*</code> surface under the mesh-open law, like
+bterm. <code>send term HELP</code> lists the full surface. A verb and the matching chord
+make the same change, and the window follows a verb straight away. Every body
+is a JSON object, and <code>{}</code> means no arguments.</p>
+<table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
+<tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid</td></tr>
+<tr><td><code>term.tab.new</code></td><td><code>{}</code></td><td>open a tab and select it</td></tr>
+<tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
+<tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
+<tr><td><code>term.panes</code></td><td><code>{}</code></td><td>list the active tab's panes: id, focus, cols, rows, child pid, geometry</td></tr>
+<tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
+<tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
+<tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>
+<tr><td><code>term.snapshot</code></td><td><code>{}</code></td><td>read the focused pane's screen, size and cursor</td></tr>
+<tr><td><code>term.type</code></td><td><code>{"text":"..."}</code></td><td>type ASCII into the focused pane, as keys</td></tr>
+</tbody></table>
 <pre><code class="language-mix">send term term.tab.new
 send term term.pane.split dir=v
 send term term.panes
@@ -530,7 +544,8 @@ plain terminal.</p>
 <ul>
 <li>Mouse reporting, wheel scrollback and selection. bterm has them, see
 <a href="/cos/term-mouse">term-mouse</a>.</li>
-<li>The menu bar and the About dialog.</li>
+<li>The app-control port: <code>app.describe</code>, <code>app.quit</code> and <code>app.controls.*</code> are
+not served yet.</li>
 <li>The native-session lane, see <a href="/cos/term-native-session">term-native-session</a>.
 bterm is still its only client.</li>
 <li>A verb for the font size. Until one exists, font size is set from the
