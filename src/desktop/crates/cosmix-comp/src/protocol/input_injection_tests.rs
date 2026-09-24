@@ -1,6 +1,6 @@
 // `comp.input.*` through the real seat path (included from tests.rs).
 
-use crate::port::{BTN_LEFT, InputOp, KeySpec, PointerMoveTarget, PressAction, ScrollSource};
+use crate::port::{BTN_LEFT, ControlReply, InputOp, KeySpec, PointerMoveTarget, PressAction, ScrollSource};
 
 const KEY_2: u32 = 3;
 const KEY_RIGHTBRACE: u32 = 27;
