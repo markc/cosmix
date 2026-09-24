@@ -145,10 +145,13 @@ disabled, and a nested comp without it. An X11 app then fails at once
 instead of drawing on another X server. The citizen writes one stderr line
 per such launch naming the reason, including an unreadable descriptor. The
 file is mode 0600, so the citizen must run as comp's uid. The unset goes
-through `env -u DISPLAY`, because Mix's spawn `env` option cannot remove a
-variable. The program is resolved first, on the same `PATH` the child
-gets. A missing or non-executable program is still refused with rc 11
-`spawn_failed`, never answered with the wrapper's pid.
+through `/usr/bin/env -u DISPLAY`, because Mix's spawn `env` option cannot
+remove a variable. The program is resolved first, on the same `PATH` the
+child gets, and env is handed the absolute path. A path containing `=` goes
+through `/bin/sh -c 'exec "$@"'`, because GNU env reads any such operand
+as an assignment. On this path the app's `argv[0]` is therefore its
+absolute path. A missing or non-executable program is still refused with
+rc 11 `spawn_failed`, never answered with the wrapper's pid.
 
 A descriptor left behind by a comp killed with SIGKILL is not checked
 against its `GENERATION` or against a live XWayland. It is trusted until
