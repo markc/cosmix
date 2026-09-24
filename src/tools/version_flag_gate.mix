@@ -1,0 +1,191 @@
+# version_flag_gate.mix — every cosmix Rust binary answers `--version`.
+#
+# Contract (AGENTS.md "Conventions"): `<bin> --version` and `<bin> -V` print
+# `<crate> <semver> (<sha12>[-dirty], built <rfc3339>)` on stdout and exit 0
+# before any other side effect. This gate proves it by RUNNING each built
+# binary, never by grepping source:
+#
+#   * every `bin` target of both workspaces (src/ and src/desktop/), read from
+#     `cargo metadata`, so a new binary is covered without editing this file;
+#   * a scrubbed environment (PATH only: no WAYLAND_DISPLAY, DISPLAY,
+#     XDG_RUNTIME_DIR, COSMIX_RUN, HOME), stdin closed, 5 s deadline;
+#   * exit 0, empty stderr, first stdout line `<name> <semver> (<sha12>`, where
+#     name is the crate (or the binary's own name, for `mix`), semver EQUALS
+#     the crate's Cargo.toml version (a stale binary fails here), and the sha
+#     is real hex (a crate with no build.rs `emit()` reports "unknown" and
+#     fails);
+#   * any further stdout line must be a `key: value` provenance line
+#     (cosmix-comp adds commit/features/profile);
+#   * `-V` must print exactly what `--version` printed.
+#
+# A binary whose `required-features` are not in its crate's default features
+# is SKIPPED when absent (a default workspace build never produces it) and
+# checked when present. Build with the flags below to cover all of them.
+#
+# Usage (from $COSMIX/src, after the release builds):
+#   cargo build --release --workspace
+#   cargo build --release -p cosmix-mds --features _stress-helper
+#   (cd desktop && cargo build --release --workspace \
+#       && cargo build --release -p cosmix-comp --features kms-live \
+#       && cargo build --release -p cosmix-quoin --features demo)
+#   mix tools/version_flag_gate.mix [--src DIR] [--profile release]
+#
+# Exit 0 = every built binary conforms; 1 = at least one FAIL; 2 = usage.
+
+$argv = args()
+$src = nil
+$profile = "release"
+$i = 0
+while $i < len($argv)
+    $a = $argv[$i]
+    if $a == "--src" and $i + 1 < len($argv) then
+        $src = $argv[$i + 1]
+        $i = $i + 2
+    elif $a == "--profile" and $i + 1 < len($argv) then
+        $profile = $argv[$i + 1]
+        $i = $i + 2
+    else
+        print("usage: mix tools/version_flag_gate.mix [--src DIR] [--profile release]")
+        exit(2)
+    end
+end
+if $src == nil then
+    if exists("Cargo.toml") and exists("desktop/Cargo.toml") then
+        $src = cwd()
+    elif env("COSMIX") != nil then
+        $src = env("COSMIX") + "/src"
+    else
+        print("version_flag_gate: run from \$COSMIX/src, set COSMIX, or pass --src DIR")
+        exit(2)
+    end
+end
+$workspaces = [$src + "/Cargo.toml", $src + "/desktop/Cargo.toml"]
+
+# Transitive closure of a package's default features (feature names only;
+# `dep:x` and `crate/feature` entries cannot enable a required-feature).
+fn default_features($features)
+    $seen = {}
+    $todo = []
+    if has_key($features, "default") then
+        $todo = $features["default"]
+    end
+    $k = 0
+    while $k < len($todo)
+        $f = $todo[$k]
+        $k = $k + 1
+        if !has_key($seen, $f) and has_key($features, $f) then
+            $seen[$f] = true
+            for $g in $features[$f]
+                push($todo, $g)
+            end
+        end
+    end
+    return $seen
+end
+
+$pass = 0
+$fail = 0
+$skip = 0
+$failures = []
+$scrubbed = {PATH: "/usr/bin:/bin"}
+$line_re = "^(\\S+) (\\d+\\.\\d+\\.\\d+\\S*) \\(([0-9a-f]{12})(-dirty)?[,)]"
+$kv_re = "^[a-z][a-z_-]*: \\S"
+
+for $ws in $workspaces
+    $meta = run_argv(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1", "--manifest-path", $ws], {timeout: 120})
+    if !$meta.ok then
+        print("FAIL cargo metadata ${ws}: ${trim($meta.stderr)}")
+        exit(1)
+    end
+    $m = json_parse($meta.stdout)
+    $bindir = $m.target_directory + "/" + $profile
+    for $p in $m.packages
+        if $p.name == "cosmix-foreman" then
+            continue
+        end
+        $defaults = default_features($p.features)
+        for $t in $p.targets
+            if !contains($t.kind, "bin") then
+                continue
+            end
+            $bin = $t.name
+            $label = "${bin} (${p.name})"
+            $path = $bindir + "/" + $bin
+            if !exists($path) then
+                $optional = false
+                if has_key($t, "required-features") then
+                    for $rf in $t["required-features"]
+                        if !has_key($defaults, $rf) then
+                            $optional = true
+                        end
+                    end
+                end
+                if $optional then
+                    print("SKIP ${label}: not built (required-features outside default)")
+                    $skip = $skip + 1
+                else
+                    print("FAIL ${label}: ${path} missing — build the workspace first")
+                    push($failures, $label)
+                    $fail = $fail + 1
+                end
+                continue
+            end
+            $why = nil
+            $outs = []
+            for $flag in ["--version", "-V"]
+                $r = run_argv([$path, $flag], {timeout: 5, clear_env: true, env: $scrubbed, stdin: {null: true}})
+                if $r.timed_out then
+                    $why = "${flag} timed out after 5 s"
+                elif $r.exit_code != 0 then
+                    $why = "${flag} exit ${r.exit_code}, stderr: ${trim($r.stderr)}"
+                elif trim($r.stderr) != "" then
+                    $why = "${flag} wrote to stderr: ${trim($r.stderr)}"
+                end
+                if $why != nil then
+                    break
+                end
+                push($outs, $r.stdout)
+            end
+            if $why == nil and $outs[0] != $outs[1] then
+                $why = "-V output differs from --version"
+            end
+            $first = ""
+            if $why == nil then
+                $lines = split(rtrim($outs[0]), "\n")
+                $first = $lines[0]
+                $hit = re_find($first, $line_re)
+                if len($hit) == 0 then
+                    $why = "first line not '<name> <semver> (<sha12>': ${first}"
+                else
+                    $g = $hit[0].groups
+                    if $g[0] != $p.name and $g[0] != $bin then
+                        $why = "name '${g[0]}' is neither crate '${p.name}' nor binary '${bin}'"
+                    elif $g[1] != $p.version then
+                        $why = "semver ${g[1]} != Cargo.toml ${p.version} (stale binary?)"
+                    end
+                end
+                $n = 1
+                while $why == nil and $n < len($lines)
+                    if !re_match($lines[$n], $kv_re) then
+                        $why = "extra stdout line is not 'key: value': ${lines[$n]}"
+                    end
+                    $n = $n + 1
+                end
+            end
+            if $why == nil then
+                print("PASS ${label}: ${first}")
+                $pass = $pass + 1
+            else
+                print("FAIL ${label}: ${why}")
+                push($failures, $label)
+                $fail = $fail + 1
+            end
+        end
+    end
+end
+
+print("version_flag_gate: ${pass} pass, ${fail} fail, ${skip} skipped")
+if $fail > 0 then
+    print("offenders: " + join($failures, ", "))
+    exit(1)
+end

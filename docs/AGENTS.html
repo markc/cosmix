@@ -475,6 +475,7 @@ cd $COSMIX/src/desktop &amp;&amp; cargo test -p ctk --lib --features bus,theme a
 cd $COSMIX/src &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cd $COSMIX/src/desktop &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p &lt;crate&gt;          # never a repo-wide fmt from a task
+cd $COSMIX/src &amp;&amp; mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 </code></pre>
 <p>On a machine without a real GPU the desktop run fails exactly two llvmpipe
 pixel tests in <code>cosmix-comp</code> (<code>client_surface_material::…_on_a_real_gpu</code> and
@@ -501,6 +502,16 @@ CTK menus and purpose-specific controls with compositor-managed window chrome;
 do not add Quoin-like panel furniture to individual apps. See
 <code>src/desktop/APPS.md</code> for the layout policy and legacy migration scope.</li>
 <li>Version-bump a crate when a consumer would observe the change.</li>
+<li>Every binary answers <code>--version</code> and <code>-V</code> with one stdout line,
+<code>&lt;crate&gt; &lt;semver&gt; (&lt;sha12&gt;[-dirty], built &lt;rfc3339&gt;)</code>, and exits 0 before
+any other side effect: no config read, logging, display check, Bus connect,
+fd quarantine or window, with or without a display or broker. <code>main</code>'s first
+statement is <code>cosmix_buildinfo::exit_on_version!();</code> (whole argv up to <code>--</code>;
+<code>exit_on_version!(leading)</code> reads only argv[1], for programs that forward
+their argv), and the crate's <code>build.rs</code> calls <code>cosmix_buildinfo::emit()</code> so
+the sha is real. <code>--version --json</code> gives the full sha. A new binary is
+covered by <code>src/tools/version_flag_gate.mix</code> automatically; it fails until
+the binary conforms.</li>
 <li>Public-safe architecture specifications belong in <code>docs/spec/</code>. Read their
 status and evidence labels: draft publication is not normative acceptance.
 Chapter ordering does not reassign legacy runtime specification IDs.</li>

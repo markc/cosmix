@@ -37,6 +37,7 @@ cd $COSMIX/src/desktop && cargo test -p ctk --lib --features bus,theme app_contr
 cd $COSMIX/src && cargo clippy --workspace --all-targets -- -D warnings
 cd $COSMIX/src/desktop && cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p <crate>          # never a repo-wide fmt from a task
+cd $COSMIX/src && mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 ```
 
 On a machine without a real GPU the desktop run fails exactly two llvmpipe
@@ -68,6 +69,16 @@ defaults. Never hardcode an install path.
   do not add Quoin-like panel furniture to individual apps. See
   `src/desktop/APPS.md` for the layout policy and legacy migration scope.
 - Version-bump a crate when a consumer would observe the change.
+- Every binary answers `--version` and `-V` with one stdout line,
+  `<crate> <semver> (<sha12>[-dirty], built <rfc3339>)`, and exits 0 before
+  any other side effect: no config read, logging, display check, Bus connect,
+  fd quarantine or window, with or without a display or broker. `main`'s first
+  statement is `cosmix_buildinfo::exit_on_version!();` (whole argv up to `--`;
+  `exit_on_version!(leading)` reads only argv[1], for programs that forward
+  their argv), and the crate's `build.rs` calls `cosmix_buildinfo::emit()` so
+  the sha is real. `--version --json` gives the full sha. A new binary is
+  covered by `src/tools/version_flag_gate.mix` automatically; it fails until
+  the binary conforms.
 - Public-safe architecture specifications belong in `docs/spec/`. Read their
   status and evidence labels: draft publication is not normative acceptance.
   Chapter ordering does not reassign legacy runtime specification IDs.

@@ -33,32 +33,12 @@ use cosmix_buildinfo::BuildInfo;
 /// Unlike `--help` and `--print-config`, which scan the whole argv, a version
 /// query is `argv[1]` only: a terminal forwards the rest of its argv to the
 /// program it runs, and `bterm -e mycmd --version` must run `mycmd`.
+///
+/// The line and JSON shapes are the substrate-wide ones from
+/// `cosmix_buildinfo::version_request_scoped` (2026-09-25: every cosmix
+/// binary answers the same way); only the argv[1] reach is terminal-specific.
 pub fn version_request(args: &[String], bi: BuildInfo) -> Option<String> {
-    if !matches!(args.get(1).map(String::as_str), Some("--version" | "-V")) {
-        return None;
-    }
-    if args.get(2).map(String::as_str) == Some("--json") {
-        return Some(
-            serde_json::json!({
-                "component": bi.pkg,
-                "version": bi.version,
-                "git_sha": bi.git_sha,
-                "git_sha_full": bi.git_sha_full,
-                "git_dirty": bi.git_dirty,
-                "build_time": bi.build_time,
-            })
-            .to_string(),
-        );
-    }
-    Some(version_line(bi))
-}
-
-/// `<component> <version> (<sha>)`, with `-dirty` when the tree was modified
-/// at compile time. Mirrors `mix --version` so an operator reads one shape
-/// across the substrate.
-pub fn version_line(bi: BuildInfo) -> String {
-    let dirty = if bi.git_dirty { "-dirty" } else { "" };
-    format!("{} {} ({}{dirty})", bi.pkg, bi.version, bi.git_sha)
+    cosmix_buildinfo::version_request_scoped(args, bi, cosmix_buildinfo::VersionScope::Leading)
 }
 
 #[cfg(test)]
@@ -87,11 +67,11 @@ mod tests {
     fn reports_version_and_build_hash() {
         assert_eq!(
             version_request(&argv(&["--version"]), info()).as_deref(),
-            Some("cosmix-bterm 9.9.9 (abc1234)")
+            Some("cosmix-bterm 9.9.9 (abc1234, built 2026-09-21T00:00:00Z)")
         );
         assert_eq!(
             version_request(&argv(&["-V"]), info()).as_deref(),
-            Some("cosmix-bterm 9.9.9 (abc1234)")
+            Some("cosmix-bterm 9.9.9 (abc1234, built 2026-09-21T00:00:00Z)")
         );
     }
 
@@ -99,7 +79,8 @@ mod tests {
     fn a_dirty_build_says_so() {
         let mut bi = info();
         bi.git_dirty = true;
-        assert!(version_line(bi).ends_with("(abc1234-dirty)"));
+        let line = version_request(&argv(&["--version"]), bi).expect("a request");
+        assert!(line.contains("(abc1234-dirty, built "));
     }
 
     #[test]

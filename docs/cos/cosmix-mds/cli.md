@@ -19,7 +19,7 @@ The storage root is mandatory. Pass `--root <PATH>` or set `COSMIX_MDS_ROOT`. Th
 | `-q`, `--quiet` | Accepted global flag; current handlers do not consult it |
 | `-v`, `--verbose` | Accepted global flag; current handlers do not consult it |
 | `--help` | Show help |
-| `--version` | Show the package version |
+| `--version`, `-V` | Show the package version, git revision and build time |
 
 Reports go to standard output. Command failures print `cosmix-mds: <error>` to standard error.
 ## Exit status

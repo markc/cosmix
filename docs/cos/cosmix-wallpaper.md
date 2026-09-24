@@ -163,7 +163,8 @@ reconciled from authoritative snapshots, not inferred from application titles.
 
 `--capture /absolute/path.png` explicitly captures this application's own
 first output after 20 rendered frames. It does not capture other applications.
-`--version` prints the app version.
+`--version` or `-V` prints the crate version, git revision and build time,
+then exits before touching the display.
 
 Live Quoin control verification, daily session installation and broader desktop
 acceptance testing are still being completed. This manual describes the implemented
