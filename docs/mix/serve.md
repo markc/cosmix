@@ -717,7 +717,7 @@ fn kwin(m)
   return trim(run("qdbus6 org.kde.KWin /KWin org.kde.KWin." .. m))
 end
 
--- Multi-segment verbs must be QUOTED in `on` (a bare handler verb takes one dot).
+-- Multi-segment verbs need no quotes; segments after a dot may be Mix keywords too.
 on desktop.workspace.next
   kwin("nextDesktop")
   reply(json_encode({ok: true, desktop: kwin("currentDesktop")}))
