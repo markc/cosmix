@@ -2,7 +2,7 @@
 Type=Application
 Name=Term
 GenericName=Terminal
-Comment=CosMix Term — lightweight iced + wgpu terminal, Bus service `term`
+Comment=CosMix Term — lightweight iced terminal, Bus service `term`
 Exec=term
 Icon=utilities-terminal
 Terminal=false

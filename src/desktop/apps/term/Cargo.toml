@@ -1,10 +1,10 @@
 [package]
 name = "cosmix-term"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "CosMix Wayland terminal on iced + wgpu (lightweight frontend)"
+description = "CosMix Wayland terminal on iced + tiny-skia (lightweight frontend; wgpu behind a feature)"
 
 [[bin]]
 name = "term"
@@ -21,18 +21,23 @@ display = "CosMix Term"
 engine = "iced"
 
 [features]
-default = ["wgpu"]
-# The shader-widget path: one persistent wgpu texture, damage-band uploads.
-# `naga27-termcolor` rides along: see that dependency for why iced-on-wgpu
-# cannot share a build with Bevy without it.
+# Default renderer: tiny-skia (Mark, 2026-09-25, sweep decision 28). The
+# 2026-09-24 T5 retake measured it at ~57-63 MB PSS and 0 GEM against wgpu's
+# ~43 MB PSS + 113-121 MB GEM (iGPU GEM is system RAM), and wgpu's GEM is its
+# own swapchain, so it cannot get under the 80 MB gate at desktop sizes.
+default = ["tiny-skia"]
+# iced's CPU rasteriser into `wl_shm`: no DRM fd at all, like foot.
+tiny-skia = ["iced/tiny-skia", "iced/image"]
+# The shader-widget path, kept buildable: one persistent wgpu texture,
+# damage-band uploads. `--features wgpu` on top of the default selects it —
+# when both are compiled in, main.rs takes the wgpu grid and iced_renderer
+# puts wgpu first. `--no-default-features --features wgpu` is the clean arm
+# for measurement. `naga27-termcolor` rides along: see that dependency for
+# why iced-on-wgpu cannot share a build with Bevy without it.
 wgpu = ["iced/wgpu", "naga27-termcolor"]
 # Not meant to be selected on its own; `wgpu` pulls it in. It exists as a
 # feature so the compatibility dependency stays optional.
 naga27-termcolor = ["dep:naga27"]
-# D7's booked second arm: iced's CPU rasteriser into `wl_shm`, no DRM fd at
-# all. Build it ALONE (`--no-default-features --features tiny-skia`) — with
-# both compiled in, iced_renderer picks wgpu and the arm measures nothing.
-tiny-skia = ["iced/tiny-skia", "iced/image"]
 
 [build-dependencies]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

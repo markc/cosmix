@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cosmix-design",
  "cosmix-iced-widgets",
