@@ -569,7 +569,12 @@ pub(crate) struct WindowWaiters {
     /// Per window root: its generation and the newest frame time at which
     /// the renderer showed new content of it — the evidence
     /// `comp.window.stats` counts. Needs no `wp_presentation` feedback, which
-    /// most clients never request.
+    /// most clients never request. Sized like `presented_base`: at
+    /// `MAX_PRESENTED_BASES` a new entry prunes DEAD surfaces only, so the
+    /// table holds max(1024, live window roots) — a pruning threshold, not a
+    /// hard cap. Live roots are never evicted: dropping one's evidence would
+    /// turn a shown window back into a false `presented` timeout. Past 1024
+    /// live roots each first-time insert rescans (O(live roots)).
     shown: HashMap<SurfaceId, (u64, u64)>,
 }
 
