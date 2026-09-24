@@ -944,6 +944,12 @@ impl WlrLayerShellHandler for WaylandState {
         } else {
             None
         };
+        // A panel owner's liveness probe is answered by any acknowledgement.
+        #[cfg(feature = "bus")]
+        if let Some((surface_id, _)) = gate {
+            let client = surface.client().map(|client| client.id());
+            super::port_observation::note_layer_ack(self, surface_id, client, configure.serial);
+        }
         let smithay_state = compositor::with_states(&surface, |states| {
             let attributes = states
                 .data_map

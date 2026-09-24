@@ -150,7 +150,11 @@ fn wait_for(code: Option<&str>) -> Wait {
     match code {
         Some(
             "unknown_panel_surface" | "unknown_output" | "panel_output_mismatch"
-            | "ambiguous_panel_surface",
+            | "ambiguous_panel_surface"
+            // Another client's layer holds the edge (a dead incarnation's
+            // squatter, a copied token): retry when layers change, and on
+            // every registry receipt, which clears all refusals.
+            | "panel_owner_mismatch",
         ) => Wait::Mapping,
         Some("locked") => Wait::Unlock,
         None | Some("busy") => Wait::Retry,
@@ -524,9 +528,19 @@ pub(crate) fn report_holders(
         for edge in Edge::ALL {
             let Some(surface) = identities.get(output, edge) else { continue; };
             let mode = frame.0.panel(edge).mode;
-            client.desired.insert((surface.into(), "panel.mode".into()), json!({
+            let mut report = json!({
                 "output":output.as_str(),"edge":edge_name(edge),"surface":surface,"mode":mode.as_str(),
-            }));
+            });
+            // Comp fences holds by the reporting Bus connection: a new
+            // generation's report supersedes the old one's holds. Only a comp
+            // whose leaf reads true (the build with the full plane) knows the
+            // field; one without it would refuse the whole report.
+            if client.capable
+                && let Some(generation) = client.generation
+            {
+                report["generation"] = json!(generation);
+            }
+            client.desired.insert((surface.into(), "panel.mode".into()), report);
             // The activation's focus hold names the panel's own layer, which
             // maps with the reveal: an acquisition that overtakes the mapping
             // is refused and resent on the next `surface.mapped`.
@@ -677,6 +691,23 @@ mod tests {
         client.event(&reply(id, 0, "true"));
         assert!(!client.capable, "old lifetime's reply cannot enable the gate");
         assert!(client.message(&command("token", 2)).is_none());
+    }
+
+    /// A report refused because another client's layer holds the edge is
+    /// retried when layers change, not left until the intent changes.
+    #[test]
+    fn owner_mismatch_retries_on_the_next_mapping() {
+        assert_eq!(wait_for(Some("panel_owner_mismatch")), Wait::Mapping);
+        let (mut client, bridge, peer) = capable_client();
+        client.desired.insert(mode_key("panel-1"), mode_body("panel-1"));
+        client.flush(&bridge);
+        let call = peer.drain_calls().remove(0);
+        client.event(&reply(call.request_id, 10, r#"{"error":"panel_owner_mismatch"}"#));
+        client.flush(&bridge);
+        assert!(peer.drain_calls().is_empty(), "waits for a mapping");
+        assert!(client.message(&frame("surface.mapped", json!({"id":4,"event_seq":8}))).is_none());
+        client.flush(&bridge);
+        assert_eq!(peer.drain_calls()[0].command, "comp.panel.mode", "resent after the mapping");
     }
 
     #[test]

@@ -307,7 +307,7 @@ const CAPTURE_SHM_BYTES_PER_TURN: usize = 256 * 1024;
 /// reservation remains charged until Bevy reports completion.
 pub(crate) const CAPTURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SurfaceId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -3500,6 +3500,9 @@ impl ProtocolServer {
                         if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_controls.push(PortControl::Panel(request));
                         }
+                    }
+                    ChannelEvent::Msg(PortCommand::ServicesLive(live)) => {
+                        port_observation::panel_services_live(state, &live);
                     }
                     ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
                         if state.pending_port_requests.len() < PORT_QUEUE_CAPACITY {
@@ -8611,6 +8614,9 @@ impl WaylandState {
 
     fn handle_client_disconnect(&mut self, client_id: &ClientId) {
         self.destroy_client_acquire_gates(client_id);
+        // A Quoin that crashed or exited takes its panel holds with it.
+        #[cfg(feature = "bus")]
+        port_observation::panel_owner_disconnected(self, client_id);
         let frames = self
             .capture_frames
             .iter()
@@ -10573,6 +10579,12 @@ impl WaylandState {
         let mut observed = Vec::new();
         // Read once: the loop holds `surfaces` mutably.
         let current_workspace = self.workspace_current();
+        // Panel layers comp hides for a stalled shell (holder-plane
+        // enforcement): exactly the surface ids it recorded, and through this
+        // one funnel, so rendering, hit-testing and focus all agree. A field
+        // borrow, disjoint from `surfaces` and `events` below.
+        #[cfg(feature = "bus")]
+        let enforced_layers = &self.observations.enforced_surfaces;
         while let Some((id, ancestor_visible)) = stack.pop() {
             let Some(object) = self.surface_objects.get(&id).cloned() else {
                 continue;
@@ -10595,12 +10607,17 @@ impl WaylandState {
             };
             // The own-buffer term: hidden = minimised OR off the current
             // workspace (managed toplevels only; bands, layers, popups and
-            // locks are on every workspace). Both hide through this one
-            // funnel, so `visible:false, minimized:false` needs no reader
-            // change.
+            // locks are on every workspace) OR an enforced panel layer. All
+            // hide through this one funnel, so `visible:false,
+            // minimized:false` needs no reader change.
+            #[cfg(feature = "bus")]
+            let enforced = enforced_layers.contains(&record.id);
+            #[cfg(not(feature = "bus"))]
+            let enforced = false;
             let visible = effectively_visible(
                 record.mapped
                     && !record.minimized
+                    && !enforced
                     && workspaces::on_workspace(record, current_workspace),
                 ancestor_visible,
                 association_visible,
@@ -11793,6 +11810,18 @@ impl WaylandState {
     }
 
     fn pointer_button(&mut self, button: u32, state: HostButtonState, time: u32) {
+        // A press lands on some client: a trigger for the panel holders'
+        // liveness check (a stopped shell menu must not keep the input).
+        #[cfg(feature = "bus")]
+        if state == HostButtonState::Pressed {
+            let client = self
+                .pointer
+                .current_focus()
+                .and_then(|target| target.owned_surface())
+                .and_then(|surface| surface.client())
+                .map(|client| client.id());
+            port_observation::note_user_input(self, client);
+        }
         #[cfg(feature = "bus")]
         if (state == HostButtonState::Pressed && self.consume_corner_press(button))
             || (state == HostButtonState::Released && self.consume_corner_release(button))
@@ -12221,6 +12250,16 @@ impl WaylandState {
     /// [`HostInput::key_from_evdev`] for why the evdev offset is applied by
     /// exactly one transport and never here.
     fn keyboard_keycode(&mut self, keycode: Keycode, state: HostButtonState, time: u32) {
+        #[cfg(feature = "bus")]
+        if state == HostButtonState::Pressed {
+            let client = self
+                .keyboard
+                .current_focus()
+                .and_then(|target| target.owned_surface())
+                .and_then(|surface| surface.client())
+                .map(|client| client.id());
+            port_observation::note_user_input(self, client);
+        }
         let keyboard = self.keyboard.clone();
         let serial = SERIAL_COUNTER.next_serial();
         let pressed = state == HostButtonState::Pressed;
@@ -13520,8 +13559,18 @@ impl WaylandState {
                 let SurfaceRole::Layer(role) = &record.role else {
                     return None;
                 };
+                // A shell that left a liveness probe unanswered (stopped)
+                // keeps no keyboard grab: its layer counts as on-demand.
+                #[cfg(feature = "bus")]
+                let stalled = port_observation::layer_owner_stalled(
+                    self,
+                    role.surface.wl_surface().client().map(|client| client.id()),
+                );
+                #[cfg(not(feature = "bus"))]
+                let stalled = false;
                 (record.mapped
                     && record.layout.visible
+                    && !stalled
                     && role.surface.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::Exclusive)
                     .then_some((object.clone(), role.surface.wl_surface().clone(), record))

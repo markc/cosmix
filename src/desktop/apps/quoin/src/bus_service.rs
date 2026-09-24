@@ -1402,7 +1402,9 @@ mod tests {
                     input: cosmix_shell::core::PanelInput::MenuHold(open) },
             });
         };
-        let mode = json!({"output":"test","edge":"left","surface":"panel-token","mode":"hidden"});
+        // Chunk 15: mode reports carry the Bus connection generation.
+        let mode = json!({"output":"test","edge":"left","surface":"panel-token","mode":"hidden",
+            "generation":1});
         let hold = |acquire: bool| json!({"output":"test","edge":"left","surface":"menu-token",
             "holder":"popup","acquire":acquire});
         peer.deliver_event(BusBridgeEvent::Connection {

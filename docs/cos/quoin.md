@@ -532,9 +532,14 @@ The standalone host reads the selected comp's read-only
 `input.corners.holders` capability (`comp.props.get`) before sending
 `comp.panel.mode` or `comp.panel.hold`; like every comp verb these are literal
 commands addressed to the `--comp-service` instance. Missing, false or failed
-reads leave the plane inactive, and comp currently reports `false` until it
-also enforces concealment on a stalled Quoin, so today the plane stays
-inactive and the model keeps its local rules.
+reads leave the plane inactive and the model keeps its local rules. A comp
+that reports `true` also enforces concealment on a stalled Quoin (below), so
+the plane goes live with that comp build. Mode reports carry the Bus
+connection `generation` only once the leaf has read `true`: that comp is the
+one that knows the field. The deploy order is Quoin first (restart B), then
+comp (restart C); a comp with the holder verbs but without enforcement (the
+chunk 13/14 builds) was never shipped, and an older comp answers the leaf
+read with an unknown path, which keeps the plane off.
 Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
 client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present
@@ -608,6 +613,29 @@ requests in the same cycle, so a release never waits for an unrelated event.
 Nothing polls. Pinned and
 docked panels have no holders. The embedded host has no Wayland panel layers
 and does not install this standalone transport adapter.
+
+A slow, stopped or crashed Quoin cannot keep a panel shown, hold the keyboard
+or leave holds behind; stale docked reservations are the part of shell design
+§7 not yet covered. Comp identifies Quoin by the Wayland client of its layers,
+never by a namespace token (Quoin adds 128 random bits to each token so it
+cannot be guessed), and an edge is adopted only for a token Quoin itself
+reported; another live client's layer under a copied token is refused
+(`panel_owner_mismatch`, which Quoin retries on the next layer mapping or
+registry receipt). Quoin sends nothing extra to stay alive: comp checks it
+only when it has reason to — a panel still showing 1 s after comp's conceal,
+or a click or key elsewhere while only Quoin's menu or launcher holds a
+panel — by re-sending an unchanged layer configure that a live Quoin
+acknowledges within a second, as SCTK does on its own. A Quoin that does not
+answer is taken to be stopped: its menu and focus holds drop, its Exclusive
+menu loses the keyboard, and its panel and menu are hidden and excluded from
+input; nothing of any other client is touched. A conceal Quoin applies (the
+layer unmapped) owes nothing, so a panel shown again at once stays. When
+Quoin's Wayland connection dies comp drops everything it held; when its Bus
+connection goes (comp watches noded's registry), or a report arrives from a
+new Bus generation (mode reports carry `generation`), its holds end there. A
+report lifts comp's exclusion, and a conceal still owed is owed again with a
+fresh grace. Comp's read-only `input.corners.enforced.<edge>` and
+`input.corners.held.<edge>` counts show the state.
 
 ### Corner input
 

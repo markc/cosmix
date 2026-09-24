@@ -513,7 +513,9 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery}
+input.corners.{holders,enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery,
+               enforced.{top,bottom,left,right},
+               held.{top,bottom,left,right}}     (enforced, held: volatile)
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -1132,30 +1134,41 @@ The panel holder plane is two verbs, sent like every comp verb as the literal
 command (`comp.panel.hold`, not `<service>.panel.hold`) addressed to the
 selected service. `comp.panel.hold` takes `output` (raw connector name), `edge`
 (`top`, `bottom`, `left`, `right`), `surface` (the layer-shell namespace token),
-`holder` (`pointer`, `focus`, `popup`) and boolean `acquire`. `comp.panel.mode`
-takes the same output/edge/surface address and `mode` (`hidden`, `pinned`,
-`docked`). Both run at the stable observation dispatch boundary and return
-`{"accepted":true,"surface":...}`. Malformed arguments are refused as
-`invalid_args` naming the offending `field`, with the `allowed` list.
+`holder` (`pointer`, `focus`, `popup`) and boolean `acquire`.
+`comp.panel.mode` takes the same output/edge/surface address, `mode`
+(`hidden`, `pinned`, `docked`) and an optional `generation` (the reporter's
+Bus connection generation, a non-negative integer). Both run at the stable
+observation dispatch boundary and return `{"accepted":true,"surface":...}`.
+Malformed arguments are refused as `invalid_args` naming the offending
+`field`, with the `allowed` list (a hold carrying `generation` is malformed).
 Acquisitions require a live layer on that output. Mode reports survive concealed
 panel-layer destruction; releases match their recorded token even if the layer
 has already gone, and a release for an edge comp holds no state for is a no-op.
-Refusals are `unknown_output`, `unknown_panel_surface` (acquire with no layer),
+Refusals are `unknown_output`, `unknown_panel_surface` (acquire with no layer,
+or with a layer on an edge no registered holder service has reported yet),
 `panel_output_mismatch` (the token's one layer is on another output),
 `ambiguous_panel_surface` (the token names more than one layer, whatever their
-order) and `locked` (session lock). Explicit requests are idempotent; persistent
-modes clear holders and ignore acquisitions.
+order), `panel_owner_mismatch` (the token's layer belongs to a different live
+Wayland client than the one that owns the edge), `stale_generation` (a holder
+report whose `generation` is lower than the edge's current one: a delayed
+report from an older Bus connection, which changes nothing) and `locked`
+(session lock).
+Explicit requests are idempotent; persistent modes clear holders and ignore
+acquisitions.
 
 The namespace token is created by Quoin for each layer lifetime. It resolves
 to comp's own surface identity without relying on client-local Wayland object
 numbers or choosing the topmost layer. Popup holds name the menu's own layer
 because the panel can be hidden. The association is re-resolved whenever a layer
 maps or unmaps, so a mode report that overtakes its layer binds when the layer
-maps; tokens are never reused. Namespaces are not authenticated: a client that
-copies a token makes it ambiguous, which refuses rather than misdirects. For
-the same reason, any enforcement that hides a panel or excludes its input must
-act on the surface identity comp resolved from the token, never on a namespace
-prefix match. Output
+maps; tokens are never reused, and Quoin's carry 128 random bits, so another
+client cannot guess one. Namespaces are not authenticated: a client that
+copies a token makes it ambiguous, which refuses rather than misdirects. A Bus
+peer that can read the panel topics can copy a token and report it; that is
+the mesh trust boundary (every mesh caller reaches every verb), not a hole
+this plane closes. For the same reason, enforcement that hides a panel or
+excludes its input acts on the surface identity comp resolved from the token,
+never on a namespace prefix match. Output
 removal drops that output's state without a signal; Quoin rebuilds its panels
 with fresh tokens when an output goes, so nothing stale is suppressed.
 Besides the explicit holds, comp tracks two holders per reported panel itself
@@ -1182,11 +1195,103 @@ has just started following the commands learns it. Commands go out on
 its gap reporting; the version-1 body contains `output`, `edge`, `surface` (the
 panel's token when comp has one), `action` and `event_seq`.
 
-The read-only `input.corners.holders` leaf is the switch clients gate on, and it
-currently reads `false`: the verbs, holder tracking and the conceal timer are
-live, but comp does not yet enforce a conceal on a client that has stalled.
-The leaf turns `true` only in the build that does, because Quoin hands
-reveal/conceal over to comp when it does.
+Each edge belongs to one Quoin incarnation, identified by the Wayland client
+of its panel layer — an identity comp attests itself, unlike the token. An
+unowned edge is adopted only for a layer whose token a registered holder
+service (the broker-stamped sender, never an anonymous caller) named: in a
+`comp.panel.mode` report, or in a hold once that service has reported the
+edge (a corner menu can open while its panel has no layer). The first such
+service to report an edge is its holder service; a mode report from anyone
+else — an anonymous caller or another service — is recorded (its mode applies)
+but never replaces the token the holder named and binds nothing, so a foreign
+token can never become the one a later mapping adopts. A layer from a
+different client that is still connected is refused as `panel_owner_mismatch`
+and never binds, even when it is the only layer the (copied) token names; an
+edge whose owner has gone is taken over by the next reported client with
+nothing of the old incarnation carried across. When the owning Wayland client
+disconnects (Quoin crashed or exited), comp drops every explicit hold it
+acquired, its popups and any enforcement, and the edge conceals by the normal
+rules: the automatic pointer and focus holders are comp's own and still apply.
+Comp also subscribes to noded's registry (`noded.props.changed`,
+`services.registered`): when the holder service that reported an edge leaves
+the Bus, its explicit holds go, while the owner and any enforcement — which
+belong to the Wayland client — stay. This is the local node's registry: a
+holder reaching comp over the mesh is not in it, so its holds drop on the next
+local registry change until its next report. noded rate-limits each path's
+diffs, so one can be dropped; every diff carries the full set, so the next
+repairs it. The subscription is retried on every reconnect until it succeeds,
+after which the client replays it. Generations only move forward: a holder
+report with a higher `generation` is a new Bus incarnation whose
+predecessor's holds end there, and a lower one is refused. The liveness probe
+below bounds anything a missed registry event could leave behind.
+
+Comp enforces its conceals (shell design §7: a slow or stopped shell must not
+keep a panel shown or hold the input). When a conceal ends a reveal comp
+itself commanded, comp records the owner's layers showing for that edge — the
+panel layer and any popup layer acquired for it. If any of them unmaps or goes,
+the shell has applied the conceal and nothing is owed, so a panel the user
+shows again at once is never hidden. If they are still mapped 1 s later (the
+shell's slide takes 200 ms), comp asks whether the shell is alive: it re-sends
+each layer its current configure, unchanged, and waits up to 1 s for the
+`ack_configure` a live client sends and a stopped one cannot. The same probe
+runs when an owner layer stays shown for 1 s while the verdict is conceal for
+another reason (a shell that stopped during its startup intro or an explicit
+show), and at once when the user clicks or types somewhere the shell does not
+own while only a popup or focus hold keeps the edge revealed (a stopped menu
+or launcher). A probe costs a live shell one configure round-trip and one
+re-rendered frame; at most one runs per owner at a time, and an owner that has
+just answered is not probed by a press again for a second, however often the
+user clicks elsewhere. An answered probe owes nothing and is not repeated
+until the next trigger. An unanswered one marks the owner stalled: its popup and focus
+holds drop, its keyboard focus stops counting as a holder, its Exclusive
+layers lose their keyboard grab (arbitration treats them as on-demand, so the
+application gets the keyboard back), the edge conceals, and the showing layers
+are hidden and excluded from input at once. Any later acknowledgement or Bus
+request from the owner clears the stalled mark.
+
+Hiding goes through the same effective-visibility funnel as minimising, so
+the layers stop rendering, stop being hit-tested, lose keyboard and pointer
+focus and can no longer hold an exclusive keyboard grab; their subsurfaces and
+popups go with them. It acts only on the recorded surface ids, never on a
+namespace or prefix match, so no other client's surface — a foreign layer or
+toplevel on the same output — is touched. Enforcement ends when comp reveals
+the edge again, when the client unmaps or destroys the layer itself, on any
+mode report for the edge, and with the owner's disconnect. A hidden report
+that finds a conceal still owed lifts the exclusion but owes it again with a
+fresh grace, so a shell that resumes and stalls again stays bounded. A
+stopped shell's panel is therefore hidden about 2 s after the conceal: 1 s of
+grace and 1 s for the probe to go unanswered. The grace and the probe share
+the single one-shot timer with the conceal delay; nothing polls and nothing is
+sent to a shell that is not being checked.
+
+What remains open to a Bus peer: the verbs are mesh-open, so any caller can
+send a `comp.panel.mode` for an edge. Before a holder service has reported an
+edge, a registered service's report makes it the holder; after that, anyone
+else's report can change the edge's mode and lift an exclusion (owing it
+again), but cannot change the token, make another client's layer the panel or
+select it for hiding. A registered service name is trusted as the broker
+stamps it: the mesh is the trust boundary.
+
+Not covered: a docked panel's reservation from a stalled shell stays in place
+(shell design §7, "stale reservations"); tracked in TODO-cos.
+
+The read-only `input.corners.holders` leaf is the switch clients gate on. It
+reads `true`: the verbs, holder tracking, the conceal timer, the liveness
+probe and enforcement on a stalled client, disconnect cleanup and
+resynchronisation are all live, and Quoin hands reveal/conceal over to comp
+when it reads it. Two families of
+read-only, volatile leaves (served by `comp.props.get`/`list`/`describe`,
+never in `props.changed`) report the plane per edge, summed over outputs:
+`input.corners.enforced.{top,bottom,left,right}` counts the layers comp is
+hiding and excluding right now, and `input.corners.held.{top,bottom,left,right}`
+the explicit holds it records. A stalled-shell check reads them: with the
+shell stopped (`SIGSTOP`) after a pointer reveal, the pointer's departure
+conceals after 800 ms, comp probes a second later, and `enforced.<edge>` reads
+1 about a second after that; with a menu open instead, a click on an
+application probes at once, and a second later the keyboard returns to the
+application and the panel and menu are enforced. After `SIGCONT` the shell's
+own conceal returns `enforced` to 0, and `held.<edge>` returns to 0 once its
+menus have closed.
 
 Hot-corner detection is compositor-side and uses the current logical output.
 It emits one `entered`, then one `left` on deadzone exit, output or geometry

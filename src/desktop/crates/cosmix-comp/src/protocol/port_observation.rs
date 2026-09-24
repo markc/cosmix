@@ -19,7 +19,7 @@ use smithay::reexports::calloop::{
     LoopHandle, RegistrationToken,
     timer::{TimeoutAction, Timer},
 };
-use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::{Resource, backend::ClientId};
 use tokio::sync::Notify;
 
 use crate::hotspot_scene::{HotspotBridge, Square, View as HotspotView};
@@ -30,7 +30,7 @@ use super::{
     corner::{Corner, CornerConfig, CornerDetector, CornerEvent},
     pointer_observation::{LEASE, PointerLease, PointerPosition, PointerSample},
     port_snapshot::{
-        BindingRowSnapshot, CompSnapshot, FocusSnapshot, LayerSnapshot, OutputSnapshot,
+        BindingRowSnapshot, CompSnapshot, EdgeCounts, FocusSnapshot, LayerSnapshot, OutputSnapshot,
         SurfaceSnapshot, WindowSnapshot, WorkspaceRowSnapshot, project_focus, project_output,
         project_outputs, project_stack, project_surface_by_id, project_window_row, snapshot,
         volatile_path,
@@ -52,16 +52,25 @@ const DISCOVERY_PATH: &str = "input.corners.discovery";
 pub(crate) const POINTER_TOPIC_SUFFIX: &str = "pointer.changed";
 pub(crate) const PANEL_COMMAND_TOPIC_SUFFIX: &str = "panel.command";
 /// The `input.corners.holders` leaf. Quoin switches to command-driven
-/// reveal/conceal on this leaf, so it may only turn true in the comp build that
-/// also enforces the conceal on a stalled Quoin. Holder tracking and the
-/// conceal timer exist; enforcement does not yet (refactor chunk 15 flips it).
-pub(crate) const HOLDER_PLANE_AVAILABLE: bool = false;
+/// reveal/conceal on this leaf, so it may only be true in a comp build that
+/// also enforces the conceal on a stalled Quoin: holder tracking, the conceal
+/// timer, enforcement, disconnect cleanup and resynchronisation all exist.
+pub(crate) const HOLDER_PLANE_AVAILABLE: bool = true;
 /// Shell design §4.3: a pointer holder releases only after the pointer has
 /// been away from the hotspot, the panel and its popups this long. Focus and
 /// popup releases are deliberate and conceal at once.
 pub(crate) const CONCEAL_DELAY: Duration = Duration::from_millis(800);
+/// Shell design §7: how long Quoin has to apply a conceal (its slide is
+/// 200 ms) before comp checks whether it is alive. Enforcement is the
+/// stalled-client path, never the animation.
+pub(crate) const ENFORCE_GRACE: Duration = Duration::from_millis(1000);
+/// How long a liveness probe (an unchanged configure re-sent to the owner's
+/// layers) waits for its `ack_configure`. A stopped client cannot answer; a
+/// busy but live one does.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 
-const PANEL_ARGS: &[&str] = &["output", "edge", "surface", "holder", "acquire", "mode"];
+const PANEL_ARGS: &[&str] =
+    &["output", "edge", "surface", "holder", "acquire", "mode", "generation"];
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +81,14 @@ pub(crate) struct PanelRequest {
     pub(crate) holder: Option<String>,
     pub(crate) acquire: Option<bool>,
     pub(crate) mode: Option<String>,
+    /// `comp.panel.mode` only: the reporter's Bus connection generation. A
+    /// report from another generation is a new Bus incarnation of the
+    /// holder, whose predecessor's explicit holds must not survive.
+    pub(crate) generation: Option<u64>,
+    /// The broker-stamped sender (the registered service, or empty for an
+    /// anonymous caller). Set by the dispatch boundary, never by the body.
+    #[serde(skip)]
+    pub(crate) sender: String,
 }
 
 impl PanelRequest {
@@ -89,13 +106,14 @@ impl PanelRequest {
         }
         // A missing required field or a wrong JSON type names that field too.
         type Check = (&'static str, bool, fn(&Value) -> bool);
-        let typed: [Check; 6] = [
+        let typed: [Check; 7] = [
             ("output", true, Value::is_string),
             ("edge", true, Value::is_string),
             ("surface", true, Value::is_string),
             ("holder", false, Value::is_string),
             ("acquire", false, Value::is_boolean),
             ("mode", false, Value::is_string),
+            ("generation", false, Value::is_u64),
         ];
         for (name, required, ok) in typed {
             let valid = object.get(name).filter(|value| !value.is_null()).map_or(!required, ok);
@@ -121,6 +139,7 @@ impl PanelRequest {
             } else {
                 matches!(request.mode.as_deref(), Some("hidden" | "pinned" | "docked"))
             }),
+            ("generation", !hold || request.generation.is_none()),
         ];
         match checks.into_iter().find(|(_, ok)| !ok) {
             Some((field, _)) => Err(invalid(field)),
@@ -150,6 +169,60 @@ pub(crate) struct PanelHolders {
     /// The last command sent for this edge; `None` while persistent (pinned
     /// and docked panels have no holders) and before the first verdict.
     pub(crate) verdict: Option<bool>,
+    /// The Wayland client whose layers this edge belongs to: the Quoin
+    /// incarnation. Comp's own identity for the owner — the namespace token
+    /// is not one, since any client can copy it. Set by the first layer comp
+    /// resolves for the edge; that client's disconnect drops everything it
+    /// held ([`PanelHolders::drop_incarnation`]).
+    pub(crate) owner: Option<ClientId>,
+    /// Popup layers acquired for this edge under `owner`, while they live.
+    pub(crate) popups: BTreeSet<SurfaceId>,
+    /// The next step of an owed conceal: the grace Quoin has to apply it,
+    /// after which comp probes it for liveness.
+    pub(crate) enforce_at: Option<Instant>,
+    /// Shell design §7, recorded at a conceal that ended a reveal comp
+    /// commanded: the owner's layers that were showing then. If any of them
+    /// unmaps or goes, Quoin has applied the conceal and nothing is owed; at
+    /// the deadline only these, still mapped, are candidates.
+    pub(crate) pending: BTreeSet<SurfaceId>,
+    /// A conceal just ended a commanded reveal: record `pending` at the
+    /// next tracking pass, which has the Wayland facts.
+    pub(crate) arm_pending: bool,
+    /// An unanswered liveness probe of this edge's layers.
+    pub(crate) probe: Option<Probe>,
+    /// The owner answered a probe for the current showing state: nothing is
+    /// probed again until the next trigger (a commanded conceal, the verdict
+    /// revealing, or nothing showing any more).
+    pub(crate) quiet: bool,
+    /// The owner answered a probe: no press-triggered probe of it before
+    /// this ([`PROBE_TIMEOUT`] after the answer).
+    pub(crate) probe_rest_until: Option<Instant>,
+    /// A probe went unanswered: the owner is stopped. Its popup and focus
+    /// holds are dropped, its keyboard focus counts for nothing and its
+    /// Exclusive layers lose their grab, until it is heard from again.
+    pub(crate) stalled: bool,
+    /// The owner's layers comp itself hides and excludes from input: the
+    /// candidates still mapped when a probe went unanswered. Never
+    /// re-resolved from a token and never grown afterwards; each leaves once
+    /// its client unmaps or destroys it.
+    pub(crate) enforced: BTreeSet<SurfaceId>,
+    /// The registered Bus service whose mode report named this edge's token
+    /// (the holder service). Only such a report may give an unowned edge its
+    /// owner, and that service leaving the Bus drops its holds.
+    pub(crate) reporter: Option<String>,
+    /// The token the reporter itself named: the only one an unowned edge
+    /// is adopted for. A report from anyone else never replaces it.
+    pub(crate) reported_surface: Option<String>,
+    /// The reporter's Bus connection generation, when it states one.
+    pub(crate) generation: Option<u64>,
+}
+
+/// One liveness probe: an unchanged configure re-sent to each candidate
+/// layer, answered by any acknowledgement at or after its serial.
+#[derive(Clone, Debug)]
+pub(crate) struct Probe {
+    pub(crate) deadline: Instant,
+    pub(crate) serials: Vec<(SurfaceId, smithay::utils::Serial)>,
 }
 
 /// The pointer holder. `Lingering` is a released pointer still inside its
@@ -202,11 +275,87 @@ impl PanelHolders {
             pointer: PointerHold::Out,
             focused: false,
             verdict: None,
+            owner: None,
+            popups: BTreeSet::new(),
+            enforce_at: None,
+            pending: BTreeSet::new(),
+            arm_pending: false,
+            probe: None,
+            quiet: false,
+            probe_rest_until: None,
+            stalled: false,
+            enforced: BTreeSet::new(),
+            reporter: None,
+            reported_surface: None,
+            generation: None,
         }
     }
 
     fn hidden(&self) -> bool {
         self.mode == "hidden"
+    }
+
+    /// Follow a verdict just sent (`previous` is the one before it). A
+    /// reveal lifts everything owed or enforced. A conceal that ends a reveal
+    /// comp commanded owes Quoin's conceal: the showing layers are recorded
+    /// on the next pass ([`PanelHolders::pending`]).
+    pub(crate) fn note_verdict(&mut self, reveal: bool, previous: Option<bool>) {
+        if reveal {
+            self.clear_enforcement();
+            self.quiet = false;
+        } else if previous == Some(true) {
+            self.clear_enforcement();
+            self.quiet = false;
+            self.arm_pending = true;
+        }
+    }
+
+    /// Something is owed or enforced on this edge.
+    pub(crate) fn owed(&self) -> bool {
+        !self.enforced.is_empty() || self.enforce_at.is_some() || self.probe.is_some()
+    }
+
+    /// Quoin applied the conceal (a recorded layer unmapped or went), or
+    /// answered a probe: nothing is owed.
+    pub(crate) fn settle_owed(&mut self) {
+        self.pending.clear();
+        self.enforce_at = None;
+        self.probe = None;
+    }
+
+    fn clear_enforcement(&mut self) {
+        self.settle_owed();
+        self.arm_pending = false;
+        self.enforced.clear();
+    }
+
+    /// The popup and focus holds of a stopped owner end: they are the ones
+    /// that can keep a stopped menu or launcher on screen with the keyboard.
+    pub(crate) fn stall(&mut self) {
+        self.stalled = true;
+        self.held.remove("popup");
+        self.held.remove("focus");
+    }
+
+    /// The holder service's explicit holds end (it left the Bus, or a new Bus
+    /// generation of it reported). What comp observes itself — pointer,
+    /// focus, the owner and any enforcement — belongs to the Wayland client
+    /// and stays.
+    pub(crate) fn drop_holds(&mut self) {
+        self.held.clear();
+    }
+
+    /// The owning Wayland client is gone: every explicit hold, popup and
+    /// enforcement of that incarnation goes with it, so none survives into
+    /// the next one. The automatic pointer and focus holders are comp's own
+    /// observations and follow the normal rules.
+    pub(crate) fn drop_incarnation(&mut self) {
+        self.owner = None;
+        self.drop_holds();
+        self.popups.clear();
+        self.stalled = false;
+        self.quiet = false;
+        self.clear_enforcement();
     }
 
     /// Fold one observation into the automatic holders. The pointer acquires
@@ -324,7 +473,14 @@ fn apply_panel_request(
         panel.surface.clone_from(&request.surface);
         panel.id = id;
         panel.mode.clone_from(mode);
-        if mode != "hidden" { panel.held.clear(); }
+        // A report comes from a live Quoin: comp's exclusion lifts. A
+        // persistent panel is meant to show, so nothing is owed; a hidden one
+        // that still owed a conceal owes it again with a fresh grace (the
+        // caller re-arms it), so a Quoin that stalls again stays bounded.
+        if mode != "hidden" {
+            panel.drop_holds();
+        }
+        panel.clear_enforcement();
         return panel.settle(true);
     }
     if panel.mode != "hidden" { return None; }
@@ -904,7 +1060,8 @@ pub(crate) struct CornerRegion {
 
 pub(crate) struct ObservationState {
     pub(crate) panel_holders: BTreeMap<(String, String), PanelHolders>,
-    /// The one-shot conceal timer and the deadline it is armed for.
+    /// The one-shot panel timer and the deadline it is armed for: the
+    /// earliest conceal delay or enforcement grace of any edge.
     conceal_timer: Option<RegistrationToken>,
     pub(crate) conceal_deadline: Option<Instant>,
     #[cfg(test)]
@@ -917,6 +1074,17 @@ pub(crate) struct ObservationState {
     panel_request_serviced: bool,
     #[cfg(test)]
     pub(crate) conceal_timer_fired: usize,
+    /// Every layer some edge enforces ([`PanelHolders::enforced`]): the one
+    /// set `recompute_effective_visibility` reads, so comp's hiding and input
+    /// exclusion reach these surfaces (and their descendants) and nothing else.
+    pub(crate) enforced_surfaces: BTreeSet<SurfaceId>,
+    /// Owners that left a liveness probe unanswered
+    /// ([`PanelHolders::stalled`]), read by keyboard arbitration.
+    pub(crate) stalled_owners: Vec<ClientId>,
+    /// The Wayland clients that got a button or key press since the last
+    /// tracking pass (the pressed or focused surface's client): a trigger to
+    /// probe an owner whose menu or launcher alone keeps its panel shown.
+    pub(crate) user_input: Vec<Option<ClientId>>,
     pointer_lease: PointerLease,
     pointer_seen: Option<(CursorPositionSnapshot, bool)>,
     pointer_timer: Option<RegistrationToken>,
@@ -982,6 +1150,9 @@ impl ObservationState {
             #[cfg(test)]
             conceal_timer_arms: 0,
             popup_restores: BTreeMap::new(),
+            enforced_surfaces: BTreeSet::new(),
+            stalled_owners: Vec::new(),
+            user_input: Vec::new(),
             last_focus_change: None,
             panel_request_serviced: false,
             #[cfg(test)]
@@ -1713,8 +1884,15 @@ pub(super) fn service_observations(state: &mut WaylandState) {
     // after the pass above tracked the holders: reconcile again before the
     // loop sleeps, or a release that leaves a lingering pointer as the last
     // holder (or a mode that retires a deadline) waits for an unrelated event.
-    if retrack && !state.observations.panel_holders.is_empty() {
-        track_panel_holders(state, Instant::now());
+    // Enforcement that changes there moves visibility and focus after this
+    // cycle's edge passes: report those here too.
+    if retrack
+        && !state.observations.panel_holders.is_empty()
+        && track_panel_holders(state, Instant::now())
+    {
+        service_surface_edges(state);
+        service_focus_edge(state);
+        service_property_diffs(state);
     }
     state.service_window_waiters();
     service_pointer(state);
@@ -3065,12 +3243,15 @@ fn service_controls(state: &mut WaylandState) -> ControlMutation {
 /// pointer and focus holders itself (shell design §4.3). Membership moves with
 /// the pointer, so this runs at every stable dispatch boundary while Quoin has
 /// reported a panel — a few lookups per edge — but a command is emitted only
-/// when an edge's verdict changes, and the only timer is the one-shot conceal
-/// deadline: armed when a lingering pointer becomes the last holder, cancelled
-/// when any holder returns. Nothing polls.
+/// when an edge's verdict changes, and the only timer is one one-shot: the
+/// conceal deadline (armed when a lingering pointer becomes the last holder,
+/// cancelled when any holder returns) or the enforcement grace after a
+/// conceal (shell design §7: a stalled Quoin cannot keep a panel shown or
+/// taking input), whichever is earlier. Nothing polls.
 fn service_panel_holders(state: &mut WaylandState) {
     if state.observations.panel_holders.is_empty() {
         rearm_conceal_timer(state, None);
+        apply_panel_enforcement(state);
         return;
     }
     // Output removal drops that output's modes and holds without a signal to
@@ -3082,15 +3263,33 @@ fn service_panel_holders(state: &mut WaylandState) {
         state.observations.panel_holders.retain(|(output, _), _| live.contains(output));
     }
     // A mode RPC can arrive before its layer maps on the other connection,
-    // and concealment destroys the layer; both are surface edges.
+    // and concealment destroys the layer; both are surface edges. The token
+    // only finds the layer: it binds under the edge's incarnation fencing, so
+    // a copy of it on another client's layer never becomes the panel, and an
+    // unowned edge is adopted only for the token a registered holder service
+    // reported.
     if !state.observations.pending_surface_edges.is_empty() {
         let resolved: Vec<_> = state.observations.panel_holders.iter()
-            .map(|(key, panel)| (key.clone(), resolve_panel_surface(
-                panel_surface_candidates(state, &panel.surface, &key.0)).ok().flatten()))
+            .map(|(key, panel)| {
+                let id = resolve_panel_surface(panel_surface_candidates(state, &panel.surface, &key.0))
+                    .ok()
+                    .flatten();
+                // Only for the very token the holder service itself named.
+                let may_adopt = panel.reporter.as_deref().is_some_and(|reporter| !reporter.is_empty())
+                    && panel.reported_surface.as_deref() == Some(panel.surface.as_str());
+                let claim = id.map(|id| panel_claim(state, panel.owner.as_ref(), id, may_adopt));
+                (key.clone(), id, claim)
+            })
             .collect();
-        for (key, id) in resolved {
+        for (key, id, claim) in resolved {
             if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
-                panel.id = id;
+                panel.id = match claim {
+                    Some(claim) if claim.binds() => {
+                        claim.apply(panel);
+                        id
+                    }
+                    _ => None,
+                };
             }
         }
     }
@@ -3107,6 +3306,170 @@ fn layer_alive(state: &WaylandState, id: SurfaceId) -> bool {
         .is_some_and(|record| matches!(record.role, super::SurfaceRole::Layer(_)))
 }
 
+/// A live layer's mapped state and its Wayland client; `None` once the
+/// layer (or its role) is gone.
+fn layer_facts(state: &WaylandState, id: SurfaceId) -> Option<(bool, Option<ClientId>)> {
+    let record = state
+        .surface_objects
+        .get(&id)
+        .and_then(|object| state.surfaces.get(object))
+        .filter(|record| matches!(record.role, super::SurfaceRole::Layer(_)))?;
+    Some((record.mapped, record.role.wl_surface().client().map(|client| client.id())))
+}
+
+/// What a resolved layer may do to an edge's incarnation.
+#[derive(Clone, Debug, PartialEq)]
+enum Claim {
+    /// The layer is the owner's.
+    Accept,
+    /// The edge has no owner, and a registered holder service's mode report
+    /// named this layer's token: its client becomes the owner.
+    Adopt(ClientId),
+    /// The owner is gone without its disconnect having been handled yet, and
+    /// a registered holder service reported this layer: its client is the
+    /// next incarnation, and nothing of the last one survives into it.
+    Replace(ClientId),
+    /// No owner, and nothing entitles this layer to adopt the edge (a hold,
+    /// an anonymous report, or a token no registered service reported).
+    Unowned,
+    /// Another live client owns the edge: a copied token.
+    Refuse,
+}
+
+impl Claim {
+    fn binds(&self) -> bool {
+        matches!(self, Self::Accept | Self::Adopt(_) | Self::Replace(_))
+    }
+
+    fn apply(self, panel: &mut PanelHolders) {
+        match self {
+            Self::Accept => {}
+            Self::Adopt(client) => panel.owner = Some(client),
+            Self::Replace(client) => {
+                panel.drop_incarnation();
+                panel.owner = Some(client);
+            }
+            Self::Unowned | Self::Refuse => {}
+        }
+    }
+}
+
+/// Incarnation fencing by Wayland client, which comp itself attests. A layer
+/// whose client comp cannot name claims nothing. `may_adopt`: the token was
+/// named by a mode report from a registered holder service. Tokens carry 128
+/// random bits, so a client cannot guess one; any Bus peer that can read the
+/// panel topics can still copy one and report it — the mesh is the trust
+/// boundary, so that peer is trusted like any other.
+fn panel_claim(
+    state: &WaylandState,
+    owner: Option<&ClientId>,
+    id: SurfaceId,
+    may_adopt: bool,
+) -> Claim {
+    let Some((_, Some(client))) = layer_facts(state, id) else {
+        return Claim::Refuse;
+    };
+    match owner {
+        Some(owner) if *owner == client => Claim::Accept,
+        None if may_adopt => Claim::Adopt(client),
+        None => Claim::Unowned,
+        Some(owner) if state.display_handle.backend_handle().get_client_data(owner.clone()).is_ok() => {
+            Claim::Refuse
+        }
+        Some(_) if may_adopt => Claim::Replace(client),
+        Some(_) => Claim::Unowned,
+    }
+}
+
+/// Publish the union of every edge's enforced layers to the visibility
+/// funnel. Returns whether anything changed (visibility and focus moved).
+fn apply_panel_enforcement(state: &mut WaylandState) -> bool {
+    // A stopped owner keeps no keyboard grab: its Exclusive layers count as
+    // on-demand, so applications get the keyboard back.
+    let stalled: Vec<ClientId> = state
+        .observations
+        .panel_holders
+        .values()
+        .filter(|panel| panel.stalled)
+        .filter_map(|panel| panel.owner.clone())
+        .collect();
+    let stalled_changed = stalled != state.observations.stalled_owners;
+    if stalled_changed {
+        tracing::info!(owners = stalled.len(), "stalled panel owners changed");
+        state.observations.stalled_owners = stalled;
+        state.arbitrate_keyboard_focus(None, false, false);
+    }
+    let enforced: BTreeSet<SurfaceId> = state
+        .observations
+        .panel_holders
+        .values()
+        .flat_map(|panel| panel.enforced.iter().copied())
+        .collect();
+    if enforced == state.observations.enforced_surfaces {
+        return stalled_changed;
+    }
+    let added = enforced.difference(&state.observations.enforced_surfaces).count();
+    let lifted = state.observations.enforced_surfaces.difference(&enforced).count();
+    tracing::info!(added, lifted, total = enforced.len(), "panel enforcement changed");
+    state.observations.enforced_surfaces = enforced;
+    state.recompute_effective_visibility();
+    state.retarget_pointer_after_visibility_change();
+    true
+}
+
+/// Per-edge counts for the volatile `input.corners.enforced.*` and
+/// `input.corners.held.*` leaves, summed over outputs.
+pub(super) fn panel_edge_counts(state: &WaylandState) -> (EdgeCounts, EdgeCounts) {
+    let mut enforced = EdgeCounts::default();
+    let mut held = EdgeCounts::default();
+    for ((_, edge), panel) in &state.observations.panel_holders {
+        if let (Some(enforced), Some(held)) = (enforced.edge_mut(edge), held.edge_mut(edge)) {
+            *enforced += panel.enforced.len() as u64;
+            *held += panel.held.len() as u64;
+        }
+    }
+    (enforced, held)
+}
+
+/// The owning Wayland client disconnected (Quoin crashed or exited): its
+/// incarnation ends on every edge it owned. The next stable boundary settles
+/// the verdicts, so a panel nothing else holds is concealed normally.
+pub(super) fn panel_owner_disconnected(state: &mut WaylandState, client: &ClientId) {
+    for panel in state.observations.panel_holders.values_mut() {
+        if panel.owner.as_ref() == Some(client) {
+            panel.drop_incarnation();
+        }
+    }
+}
+
+/// A registry diff (the full registered set): a holder service that left the
+/// Bus takes its explicit holds with it. The Wayland-side state — owner,
+/// enforcement, comp's own pointer and focus holders — stays with the Wayland
+/// client, so a stalled Quoin that also lost its Bus connection is still
+/// hidden. The next stable boundary settles the verdicts. This is this
+/// node's registry: a reporter reaching comp over the mesh is not in it, so
+/// its holds drop on the next local registry change (the liveness probe and
+/// its next report repair that). noded caps each path's diffs at 10 Hz, so a
+/// diff can be dropped; every diff carries the full set, so the next repairs
+/// it.
+pub(super) fn panel_services_live(state: &mut WaylandState, live: &BTreeSet<String>) {
+    for panel in state.observations.panel_holders.values_mut() {
+        if panel.reporter.as_ref().is_some_and(|reporter| !live.contains(reporter)) {
+            panel.drop_holds();
+            panel.reporter = None;
+            panel.reported_surface = None;
+            panel.generation = None;
+        }
+    }
+}
+
+/// Whether a layer belongs to an owner that left a probe unanswered (see
+/// [`apply_panel_enforcement`]): arbitration treats its Exclusive
+/// interactivity as on-demand.
+pub(super) fn layer_owner_stalled(state: &WaylandState, client: Option<ClientId>) -> bool {
+    client.is_some_and(|client| state.observations.stalled_owners.contains(&client))
+}
+
 fn focus_surface_id(
     state: &WaylandState,
     target: Option<super::focus::SeatFocusTarget>,
@@ -3118,10 +3481,28 @@ fn focus_surface_id(
 }
 
 /// Observe every reported panel's membership at `now`, emit the verdicts that
-/// changed and arm the earliest conceal deadline.
-fn track_panel_holders(state: &mut WaylandState, now: Instant) {
+/// changed, run the stalled-owner checks (shell design §7) and arm the
+/// earliest deadline. Returns whether enforcement moved visibility or focus.
+///
+/// The checks, all on one-shot deadlines:
+/// - A conceal that ends a reveal comp commanded records the owner's layers
+///   showing then ([`PanelHolders::pending`]). One unmapping is Quoin applying
+///   it: nothing is owed.
+/// - Past [`ENFORCE_GRACE`] with the conceal still unapplied — those layers,
+///   or any owner layer shown while the verdict stays conceal (a stalled
+///   intro or explicit show) — comp probes the owner: an unchanged configure
+///   whose `ack_configure` a live client sends and a stopped one cannot.
+/// - A button or key press outside the owner's surfaces while only a popup
+///   or focus hold keeps the edge revealed (a stopped menu or launcher) is
+///   probed at once.
+/// - An answered probe owes nothing until the next trigger. One unanswered
+///   for [`PROBE_TIMEOUT`] marks the owner stalled: its popup and focus holds
+///   drop, its keyboard focus stops counting and its Exclusive grab goes, the
+///   edge conceals, and the showing layers are hidden and excluded at once.
+fn track_panel_holders(state: &mut WaylandState, now: Instant) -> bool {
     let pointer = focus_surface_id(state, state.pointer.current_focus());
     let keyboard = focus_surface_id(state, state.keyboard.current_focus());
+    let user_input = std::mem::take(&mut state.observations.user_input);
     // The hotspot the pointer is in, by output key; dwelling engages it.
     let detector = &state.observations.corner_detector;
     let corner = state
@@ -3130,20 +3511,58 @@ fn track_panel_holders(state: &mut WaylandState, now: Instant) {
         .and_then(|index| state.observations.corner_output_keys.get(index))
         .zip(detector.contact_corner())
         .map(|(key, corner)| (key.clone(), corner, detector.engaged_corner() == Some(corner)));
-    // A popup's closing is its release, whether or not Quoin's release request
-    // has arrived yet (it may be stalled, or overtaken by the destruction).
-    let closed: BTreeSet<u64> = state
+    // Every layer the holder state names, looked up once: `None` once gone.
+    let layers: BTreeMap<SurfaceId, Option<(bool, Option<ClientId>)>> = state
         .observations
         .panel_holders
         .values()
-        .flat_map(|panel| panel.held.iter())
-        .filter(|(kind, (_, id))| *kind == "popup" && !layer_alive(state, *id))
-        .map(|(_, (_, id))| id.0)
+        .flat_map(|panel| {
+            panel
+                .id
+                .into_iter()
+                .chain(panel.held.values().map(|(_, id)| *id))
+                .chain(panel.popups.iter().copied())
+                .chain(panel.pending.iter().copied())
+                .chain(panel.enforced.iter().copied())
+        })
+        .map(|id| (id, layer_facts(state, id)))
         .collect();
+    let alive = |id: &SurfaceId| layers.get(id).is_some_and(Option::is_some);
+    let mapped = |id: &SurfaceId| {
+        layers.get(id).is_some_and(|facts| facts.as_ref().is_some_and(|(mapped, _)| *mapped))
+    };
     let mut commands = Vec::new();
+    let mut probes = Vec::new();
+    // At most one press-triggered probe per owner in flight; an owner that
+    // just answered rests for PROBE_TIMEOUT.
+    let mut probing: Vec<ClientId> = state
+        .observations
+        .panel_holders
+        .values()
+        .filter(|panel| panel.probe.is_some())
+        .filter_map(|panel| panel.owner.clone())
+        .collect();
     let mut deadline: Option<Instant> = None;
-    for ((output, edge), panel) in &mut state.observations.panel_holders {
-        panel.held.retain(|kind, (_, id)| kind != "popup" || !closed.contains(&id.0));
+    for (key, panel) in &mut state.observations.panel_holders {
+        let (output, edge) = key;
+        // A popup's closing is its release, whether or not Quoin's release
+        // request has arrived yet (it may be stalled, or overtaken by the
+        // destruction).
+        panel.held.retain(|kind, (_, id)| kind != "popup" || alive(&*id));
+        panel.popups.retain(alive);
+        // A layer its client has unmapped or destroyed is hidden by the
+        // client itself: comp's enforcement of it is over.
+        panel.enforced.retain(mapped);
+        // A recorded layer unmapped: Quoin applied the conceal.
+        if panel.pending.iter().any(|id| !mapped(id)) {
+            panel.settle_owed();
+        }
+        // A probe went unanswered: the owner is stopped.
+        if panel.probe.as_ref().is_some_and(|probe| probe.deadline <= now) {
+            tracing::warn!(output = %output, edge = %edge, "panel owner left a liveness probe unanswered");
+            panel.probe = None;
+            panel.stall();
+        }
         let on_hotspot = corner.as_ref().filter(|(key, corner, _)| {
             corner.summoned_edge() == edge.as_str() && *key == super::workspaces::output_key(output)
         });
@@ -3156,14 +3575,104 @@ fn track_panel_holders(state: &mut WaylandState, now: Instant) {
             dwelled: on_hotspot.is_some_and(|(_, _, engaged)| *engaged),
             hotspot: on_hotspot.is_some(),
             surface: over(pointer),
-            focused: over(keyboard),
+            // A stopped owner's keyboard focus is about to be taken away.
+            focused: !panel.stalled && over(keyboard),
         };
         panel.observe(seen, now);
         panel.expire(now);
+        let previous = panel.verdict;
         if let Some(reveal) = panel.settle(false) {
+            panel.note_verdict(reveal, previous);
             commands.push((output.clone(), edge.clone(), panel.surface.clone(), reveal));
         }
-        if let Some(at) = panel.conceal_deadline() {
+        // The owner's layers this edge shows: the panel's and its popups',
+        // resolved identities only, never a token or prefix match.
+        let owner = panel.owner.clone();
+        let showing: BTreeSet<SurfaceId> = panel
+            .id
+            .into_iter()
+            .chain(panel.popups.iter().copied())
+            .filter(|id| {
+                owner.is_some()
+                    && layers.get(id).is_some_and(|facts| {
+                        facts.as_ref().is_some_and(|(mapped, client)| *mapped && *client == owner)
+                    })
+            })
+            .collect();
+        let owes = panel.hidden() && panel.verdict == Some(false);
+        if std::mem::take(&mut panel.arm_pending) && owes && !showing.is_empty() {
+            panel.pending.clone_from(&showing);
+            panel.enforce_at = Some(now + ENFORCE_GRACE);
+        }
+        if showing.is_empty() {
+            panel.quiet = false;
+        }
+        if !owes {
+            // Nothing to conceal; a probe of a revealed edge (a menu or
+            // launcher the user clicked away from) stands.
+            panel.pending.clear();
+            panel.enforce_at = None;
+        } else if panel.stalled && panel.enforced.is_empty() && !showing.is_empty() {
+            // A stopped owner's conceal is enforced without another grace.
+            panel.settle_owed();
+            panel.enforced = showing.clone();
+        } else if panel.pending.is_empty()
+            && panel.enforce_at.is_none()
+            && panel.probe.is_none()
+            && panel.enforced.is_empty()
+            && !panel.quiet
+            && !showing.is_empty()
+        {
+            // Shown while comp says conceal (an intro or explicit show that
+            // may belong to a stopped Quoin): the same grace, then a probe.
+            panel.enforce_at = Some(now + ENFORCE_GRACE);
+        }
+        if owes && panel.enforce_at.is_some_and(|at| at <= now) {
+            panel.enforce_at = None;
+            let candidates: Vec<SurfaceId> = if panel.pending.is_empty() {
+                showing.iter().copied().collect()
+            } else {
+                panel.pending.iter().copied().filter(|id| showing.contains(id)).collect()
+            };
+            if !candidates.is_empty() && panel.probe.is_none() {
+                probes.push((key.clone(), candidates));
+            }
+        }
+        // Only a popup or focus hold keeps the edge revealed, and the user
+        // pressed somewhere the owner does not own: is the owner still there?
+        let only_popup_or_focus = panel.verdict == Some(true)
+            && panel.pointer == PointerHold::Out
+            && !panel.held.contains_key("pointer")
+            && (panel.focused || panel.held.contains_key("popup") || panel.held.contains_key("focus"));
+        if only_popup_or_focus
+            && panel.probe.is_none()
+            && !panel.stalled
+            && !showing.is_empty()
+            && panel.probe_rest_until.is_none_or(|at| now >= at)
+            && user_input.iter().any(|client| *client != owner)
+            && let Some(client) = owner.clone()
+            && !probing.contains(&client)
+        {
+            probing.push(client);
+            probes.push((key.clone(), showing.iter().copied().collect()));
+        }
+        let probe_at = panel.probe.as_ref().map(|probe| probe.deadline);
+        for at in [panel.conceal_deadline(), panel.enforce_at, probe_at].into_iter().flatten() {
+            deadline = Some(deadline.map_or(at, |current| current.min(at)));
+        }
+    }
+    for (key, candidates) in probes {
+        let serials: Vec<(SurfaceId, smithay::utils::Serial)> = candidates
+            .into_iter()
+            .filter_map(|id| send_probe_configure(state, id).map(|serial| (id, serial)))
+            .collect();
+        if serials.is_empty() {
+            continue;
+        }
+        let at = now + PROBE_TIMEOUT;
+        if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
+            tracing::debug!(output = %key.0, edge = %key.1, layers = serials.len(), "probing panel owner");
+            panel.probe = Some(Probe { deadline: at, serials });
             deadline = Some(deadline.map_or(at, |current| current.min(at)));
         }
     }
@@ -3173,6 +3682,59 @@ fn track_panel_holders(state: &mut WaylandState, now: Instant) {
         });
     }
     rearm_conceal_timer(state, deadline);
+    apply_panel_enforcement(state)
+}
+
+/// Re-send a layer's current configure, unchanged: a live client answers
+/// with `ack_configure` (see [`note_layer_ack`]).
+fn send_probe_configure(state: &WaylandState, id: SurfaceId) -> Option<smithay::utils::Serial> {
+    let record = state.surface_objects.get(&id).and_then(|object| state.surfaces.get(object))?;
+    let super::SurfaceRole::Layer(layer) = &record.role else {
+        return None;
+    };
+    Some(layer.surface.layer_surface().send_configure())
+}
+
+/// A layer acknowledged a configure: its client is alive. An acknowledgement
+/// at or after a probe's serial answers that probe (nothing is owed until the
+/// next trigger), and any acknowledgement clears a stalled mark on its owner.
+pub(super) fn note_layer_ack(
+    state: &mut WaylandState,
+    id: SurfaceId,
+    client: Option<ClientId>,
+    serial: smithay::utils::Serial,
+) {
+    let mut answered = false;
+    for panel in state.observations.panel_holders.values_mut() {
+        if panel.probe.as_ref().is_some_and(|probe| {
+            probe.serials.iter().any(|(probed, sent)| *probed == id && serial >= *sent)
+        }) {
+            panel.settle_owed();
+            panel.quiet = true;
+            answered = true;
+        }
+        if client.is_some() && panel.owner == client {
+            panel.stalled = false;
+        }
+    }
+    // An owner that answered a probe rests: no press re-probes it for
+    // PROBE_TIMEOUT, however often the user clicks elsewhere.
+    if answered && client.is_some() {
+        let rest = Instant::now() + PROBE_TIMEOUT;
+        for panel in state.observations.panel_holders.values_mut() {
+            if panel.owner == client {
+                panel.probe_rest_until = Some(rest);
+            }
+        }
+    }
+}
+
+/// A button or key press reached `client` (the surface pressed, or the
+/// keyboard focus); see [`track_panel_holders`].
+pub(super) fn note_user_input(state: &mut WaylandState, client: Option<ClientId>) {
+    if !state.observations.panel_holders.is_empty() {
+        state.observations.user_input.push(client);
+    }
 }
 
 /// One-shot: the callback only clears the registration; the dispatch-cycle
@@ -3308,14 +3870,116 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
     if id.is_none() && request.acquire == Some(true) {
         return ControlReply::refused("unknown_panel_surface", json!({"surface":request.surface}));
     }
+    let key = (request.output.clone(), request.edge.clone());
+    let (owner, reporter, current_generation) = state
+        .observations
+        .panel_holders
+        .get(&key)
+        .map_or((None, None, None), |panel| (panel.owner.clone(), panel.reporter.clone(), panel.generation));
+    // The holder service is the first registered (broker-stamped) service to
+    // report the edge; only it reports it after that. A report from anyone
+    // else is recorded but binds nothing and never replaces the token the
+    // holder named.
+    let from_reporter = !request.sender.is_empty()
+        && reporter.as_deref().is_none_or(|reporter| reporter == request.sender);
+    let reporting = request.mode.is_some() && from_reporter;
+    let foreign_report = request.mode.is_some() && !reporting && reporter.is_some();
+    // Generations only move forward: a report from an older Bus connection
+    // of the holder (delayed, or from a dead incarnation) changes nothing.
+    if reporting
+        && let (Some(generation), Some(current)) = (request.generation, current_generation)
+        && generation < current
+    {
+        tracing::warn!(generation, current, edge = %request.edge, "stale holder generation refused");
+        return ControlReply::refused("stale_generation", json!({"generation":generation,"current":current}));
+    }
+    // Incarnation fencing: a layer names the edge's owner by its Wayland
+    // client, which comp attests; a copied token on another live client's
+    // layer is refused rather than bound, so it can never be held, tracked or
+    // enforced. Only the registered holder service adopts an unowned edge:
+    // by a mode report, or by a hold once it has reported the edge (a corner
+    // menu can open while its panel has no layer).
+    let may_adopt = reporting || (from_reporter && reporter.is_some());
+    let claim = id.map(|id| panel_claim(state, owner.as_ref(), id, may_adopt));
+    match &claim {
+        Some(Claim::Refuse) => {
+            return ControlReply::refused("panel_owner_mismatch", json!({"surface":request.surface}));
+        }
+        // No owned panel is there to hold yet: the layer's edge binds when
+        // its registered holder's mode report does (a mapping retries this).
+        Some(Claim::Unowned) if request.acquire == Some(true) => {
+            return ControlReply::refused("unknown_panel_surface", json!({"surface":request.surface}));
+        }
+        _ => {}
+    }
+    let bound = !foreign_report && claim.as_ref().is_some_and(Claim::binds);
+    let id = id.filter(|_| bound);
+    let recorded = state
+        .observations
+        .panel_holders
+        .get(&key)
+        .map(|panel| (panel.surface.clone(), panel.id));
+    if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
+        // A replacement drops the dead incarnation before this request lands.
+        if let Some(replace @ Claim::Replace(_)) = claim.clone()
+            && bound
+        {
+            replace.apply(panel);
+        }
+        // A newer Bus generation of the holder is a new Bus incarnation: its
+        // predecessor's holds end here.
+        if reporting
+            && let (Some(generation), Some(current)) = (request.generation, panel.generation)
+            && generation > current
+        {
+            panel.drop_holds();
+        }
+    }
     if request.holder.as_deref() == Some("popup")
         && request.acquire == Some(true)
         && let Some(popup) = id
     {
         record_popup_focus(state, popup);
     }
-    if let Some(reveal) = apply_panel_request(&mut state.observations.panel_holders, request, id) {
-        let key = (request.output.clone(), request.edge.clone());
+    // Resynchronisation: a report lifts comp's exclusion; if a conceal was
+    // still owed, it is owed again with a fresh grace (below).
+    let owed = request.mode.is_some()
+        && state.observations.panel_holders.get(&key).is_some_and(PanelHolders::owed);
+    let previous = state.observations.panel_holders.get(&key).and_then(|panel| panel.verdict);
+    let verdict = apply_panel_request(&mut state.observations.panel_holders, request, id);
+    if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
+        if foreign_report && let Some((surface, id)) = recorded {
+            panel.surface = surface;
+            panel.id = id;
+        }
+        if let Some(adopt @ Claim::Adopt(_)) = claim
+            && bound
+        {
+            adopt.apply(panel);
+        }
+        if reporting {
+            panel.reporter = Some(request.sender.clone());
+            panel.reported_surface = Some(request.surface.clone());
+            panel.generation = request.generation.or(panel.generation);
+        }
+        // The holder answered on the Bus: it is not stopped.
+        if bound || reporting {
+            panel.stalled = false;
+        }
+        if request.holder.as_deref() == Some("popup")
+            && request.acquire == Some(true)
+            && let Some(popup) = id
+        {
+            panel.popups.insert(popup);
+        }
+        if let Some(reveal) = verdict {
+            panel.note_verdict(reveal, previous);
+        }
+        if owed && panel.hidden() && panel.verdict == Some(false) {
+            panel.arm_pending = true;
+        }
+    }
+    if let Some(reveal) = verdict {
         // Commands name the panel's own token when comp has one; Quoin
         // accepts either its current panel or popup token for the edge.
         let surface = state.observations.panel_holders.get(&key)
@@ -3981,6 +4645,15 @@ pub(crate) fn validate_corner_value(
 ) -> Result<ValidatedCornerValue, SetValidationError> {
     match path {
         "input.corners.holders" => Err(SetValidationError::ReadOnly),
+        _ if ["input.corners.enforced", "input.corners.held"].iter().any(|counts| {
+            path == *counts
+                || path.strip_prefix(*counts).and_then(|rest| rest.strip_prefix('.')).is_some_and(
+                    |edge| matches!(edge, "top" | "bottom" | "left" | "right"),
+                )
+        }) =>
+        {
+            Err(SetValidationError::ReadOnly)
+        }
         "input.corners.enabled" => {
             let Some(value) = value.as_bool() else {
                 return Err(invalid_value(path, "bool", "true|false"));
@@ -4365,6 +5038,102 @@ mod tests {
         for pair in [[(a, true), (b, false)], [(b, false), (a, true)], [(a, true), (b, true)]] {
             assert_eq!(resolve_panel_surface(pair), Err("ambiguous_panel_surface"));
         }
+    }
+
+    /// A conceal that ends a commanded reveal arms the recorded-set check; a
+    /// reveal lifts everything owed or enforced; a probe timing out stalls
+    /// the owner (its popup and focus holds end); a mode report lifts the
+    /// exclusion; the end of an incarnation takes everything with it.
+    #[test]
+    fn owed_conceals_follow_commanded_reveals_and_stall_drops_popup_and_focus() {
+        let mut panel = PanelHolders::new("quoin-panel-1".into(), Some(SurfaceId(3)));
+        let settle = |panel: &mut PanelHolders, restate: bool| {
+            let previous = panel.verdict;
+            let verdict = panel.settle(restate);
+            if let Some(reveal) = verdict {
+                panel.note_verdict(reveal, previous);
+            }
+            verdict
+        };
+        // A first (re-stated) conceal is not a commanded one.
+        assert_eq!(settle(&mut panel, true), Some(false));
+        assert!(!panel.arm_pending);
+        // Comp reveals, then conceals: the showing set is recorded next pass.
+        let start = Instant::now();
+        panel.observe(Membership { dwelled: true, hotspot: true, ..Membership::default() }, start);
+        assert_eq!(settle(&mut panel, false), Some(true));
+        panel.observe(Membership::default(), start);
+        panel.expire(start + CONCEAL_DELAY);
+        assert_eq!(settle(&mut panel, false), Some(false));
+        assert!(panel.arm_pending);
+        // Owed and enforced state; a reveal lifts all of it.
+        panel.pending.insert(SurfaceId(3));
+        panel.enforce_at = Some(start);
+        panel.enforced.insert(SurfaceId(3));
+        assert!(panel.owed());
+        panel.note_verdict(true, Some(false));
+        assert!(!panel.owed() && panel.pending.is_empty() && !panel.arm_pending);
+        // Stalling drops the popup and focus holds, and only those.
+        panel.held.insert("popup".into(), ("menu-1".into(), SurfaceId(9)));
+        panel.held.insert("focus".into(), ("quoin-panel-1".into(), SurfaceId(3)));
+        panel.held.insert("pointer".into(), ("quoin-panel-1".into(), SurfaceId(3)));
+        panel.stall();
+        assert!(panel.stalled);
+        assert_eq!(panel.held.keys().collect::<Vec<_>>(), ["pointer"]);
+        // A mode report lifts the exclusion (the caller re-arms a still owed
+        // conceal); a persistent one also ends the holds.
+        panel.enforced.insert(SurfaceId(3));
+        panel.probe = Some(Probe { deadline: start, serials: Vec::new() });
+        let key = ("DP-1".to_owned(), "left".to_owned());
+        let mut panels = BTreeMap::from([(key.clone(), panel)]);
+        let report = PanelRequest::parse("comp.panel.mode", &json!({
+            "output":"DP-1","edge":"left","surface":"quoin-panel-1","mode":"hidden",
+        })).unwrap();
+        apply_panel_request(&mut panels, &report, Some(SurfaceId(3)));
+        let panel = panels.get_mut(&key).unwrap();
+        assert!(!panel.owed(), "the exclusion and the probe lift");
+        assert!(panel.held.contains_key("pointer"), "a hidden report keeps holds");
+        let pin = PanelRequest::parse("comp.panel.mode", &json!({
+            "output":"DP-1","edge":"left","surface":"quoin-panel-1","mode":"pinned",
+        })).unwrap();
+        apply_panel_request(&mut panels, &pin, Some(SurfaceId(3)));
+        let panel = panels.get_mut(&key).unwrap();
+        assert!(panel.held.is_empty());
+        // The owner's disconnect ends the incarnation.
+        panel.mode = "hidden".into();
+        panel.held.insert("focus".into(), ("quoin-panel-1".into(), SurfaceId(3)));
+        panel.popups.insert(SurfaceId(9));
+        panel.enforced.insert(SurfaceId(3));
+        panel.quiet = true;
+        panel.drop_incarnation();
+        assert!(panel.held.is_empty() && panel.popups.is_empty() && !panel.stalled && !panel.quiet);
+        assert!(!panel.owed() && panel.owner.is_none());
+        // Bus-side cleanup ends holds only.
+        panel.held.insert("focus".into(), ("quoin-panel-1".into(), SurfaceId(3)));
+        panel.enforced.insert(SurfaceId(3));
+        panel.drop_holds();
+        assert!(panel.held.is_empty());
+        assert_eq!(panel.enforced, BTreeSet::from([SurfaceId(3)]), "enforcement is Wayland-side");
+    }
+
+    /// Only a registered holder service's report adopts an unowned edge.
+    #[test]
+    fn claims_bind_only_what_the_holder_reported() {
+        let adopt = |claim: Claim| claim.binds();
+        assert!(!adopt(Claim::Unowned));
+        assert!(!adopt(Claim::Refuse));
+        let request = PanelRequest::parse("comp.panel.mode", &json!({
+            "output":"DP-1","edge":"left","surface":"quoin-panel-1","mode":"hidden","generation":3,
+        })).unwrap();
+        assert_eq!((request.generation, request.sender.as_str()), (Some(3), ""), "the body never names the sender");
+        let Err(reply) = PanelRequest::parse("comp.panel.hold", &json!({
+            "output":"DP-1","edge":"left","surface":"quoin-panel-1","holder":"focus","acquire":true,
+            "generation":3,
+        })) else {
+            panic!("a hold carries no generation");
+        };
+        let body: Value = serde_json::from_str(&reply.into_wire().1).unwrap();
+        assert_eq!(body["field"], "generation");
     }
 
     use std::{

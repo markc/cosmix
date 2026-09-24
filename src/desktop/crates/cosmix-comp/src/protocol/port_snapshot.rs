@@ -387,6 +387,36 @@ pub(crate) struct CornersSnapshot {
     pub(crate) velocity_max_px_s: f64,
     pub(crate) affordance: bool,
     pub(crate) discovery: bool,
+    /// Volatile, read snapshots only: per edge, the panel layers comp is
+    /// hiding and excluding from input itself because a conceal went
+    /// unapplied past its grace (a stalled shell).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) enforced: Option<EdgeCounts>,
+    /// Volatile, read snapshots only: per edge, the explicit holds
+    /// (`comp.panel.hold` acquisitions) comp currently records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) held: Option<EdgeCounts>,
+}
+
+/// One count per panel edge, summed over outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct EdgeCounts {
+    pub(crate) top: u64,
+    pub(crate) bottom: u64,
+    pub(crate) left: u64,
+    pub(crate) right: u64,
+}
+
+impl EdgeCounts {
+    pub(crate) fn edge_mut(&mut self, edge: &str) -> Option<&mut u64> {
+        match edge {
+            "top" => Some(&mut self.top),
+            "bottom" => Some(&mut self.bottom),
+            "left" => Some(&mut self.left),
+            "right" => Some(&mut self.right),
+            _ => None,
+        }
+    }
 }
 
 impl From<CornerConfig> for CornersSnapshot {
@@ -399,7 +429,19 @@ impl From<CornerConfig> for CornersSnapshot {
             velocity_max_px_s: config.velocity_max_px_s,
             affordance: config.affordance,
             discovery: config.discovery,
+            enforced: None,
+            held: None,
         }
+    }
+}
+
+impl CornersSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        select_serialised(self, path)
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        serialised_node_kind(self, path)
     }
 }
 
@@ -695,16 +737,6 @@ impl FocusSnapshot {
 }
 flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
-flat_snapshot!(
-    CornersSnapshot,
-    holders,
-    enabled,
-    deadzone_px,
-    dwell_ms,
-    velocity_max_px_s,
-    affordance,
-    discovery
-);
 flat_snapshot!(
     PortSnapshot,
     level,
@@ -1326,6 +1358,9 @@ pub(super) fn read_snapshot(
         .unwrap_or_else(|e| e.into_inner())
         .counters;
     snapshot.occlusion.counters = counters;
+    let (enforced, held) = super::port_observation::panel_edge_counts(state);
+    snapshot.input.corners.enforced = Some(enforced);
+    snapshot.input.corners.held = Some(held);
     let stats = &state.presentation.stats;
     for (key, window) in &mut snapshot.windows {
         if !scopes.wants(&format!("windows.{key}.presentation")) {
@@ -2156,6 +2191,46 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Whether every hotspot flashes slowly until the first corner reveal",
         mutable
     ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("top")],
+        Number,
+        "Top-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("bottom")],
+        Number,
+        "Bottom-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("left")],
+        Number,
+        "Left-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("right")],
+        Number,
+        "Right-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("top")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for top-edge panels; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("bottom")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for bottom-edge panels; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("left")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for left-edge panels; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("right")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for right-edge panels; read-only, never diffed"
+    ),
     descriptor!(
         &[L("input"), L("host"), L("passthrough")],
         Bool,
@@ -2548,10 +2623,16 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// Paths `props.changed` never reports: presentation statistics and the
-/// content-source registry change every frame.
+/// content-source registry change every frame; the holder-plane counts
+/// (`input.corners.enforced.*`, `input.corners.held.*`) are read-only
+/// diagnostics served only by reads.
 pub(crate) fn volatile_path(path: &str) -> bool {
     path == "sources"
         || path.starts_with("sources.")
+        || path == "input.corners.enforced"
+        || path.starts_with("input.corners.enforced.")
+        || path == "input.corners.held"
+        || path.starts_with("input.corners.held.")
         || path.split('.').any(|segment| segment == "presentation")
         || path.starts_with("occlusion.counters.")
 }
@@ -3195,7 +3276,12 @@ mod tests {
                 }],
             },
             input: InputSnapshot {
-                corners: CornerConfig::default().into(),
+                // A read snapshot, with the volatile holder-plane counts.
+                corners: CornersSnapshot {
+                    enforced: Some(EdgeCounts { left: 1, ..EdgeCounts::default() }),
+                    held: Some(EdgeCounts::default()),
+                    ..CornersSnapshot::from(CornerConfig::default())
+                },
                 host: Some(HostInputSnapshot { passthrough: true }),
             },
             #[cfg(feature = "xwayland")]
@@ -3318,9 +3404,24 @@ mod tests {
         let snapshot = fixture();
         assert_eq!(snapshot.select(&["input", "corners", "holders"]),
             Some(json!(super::super::port_observation::HOLDER_PLANE_AVAILABLE)));
-        // Quoin goes command-driven on this leaf: it must stay false until
-        // holder tracking, the conceal timer and enforcement all exist.
-        assert_eq!(snapshot.select(&["input", "corners", "holders"]), Some(json!(false)));
+        // Quoin goes command-driven on this leaf: it is true only because
+        // holder tracking, the conceal timer, enforcement on a stalled shell,
+        // disconnect cleanup and resynchronisation all exist (chunk 15).
+        assert_eq!(snapshot.select(&["input", "corners", "holders"]), Some(json!(true)));
+        // The enforcement and hold counts are read-only, volatile leaves.
+        assert_eq!(snapshot.select(&["input", "corners", "enforced", "left"]), Some(json!(1)));
+        for path in ["input.corners.enforced.left", "input.corners.held.top"] {
+            let descriptor: Value = serde_json::from_str(
+                &describe(&snapshot, &PropPath::new(path).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(descriptor["mutable"], false, "{path}");
+            assert_eq!(descriptor["volatile"], true, "{path}");
+            assert!(matches!(
+                super::super::port_observation::validate_set_request(path, &json!(0)),
+                Err(super::super::port_observation::SetValidationError::ReadOnly)
+            ), "{path}");
+        }
         let path = PropPath::new("input.corners.holders").unwrap();
         let descriptor: Value = serde_json::from_str(&describe(&snapshot, &path).unwrap()).unwrap();
         assert_eq!(descriptor["mutable"], false);
@@ -3380,7 +3481,8 @@ mod tests {
             assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
             volatile += usize::from(descriptor.volatile);
         }
-        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4);
+        // + 8: the four `input.corners.enforced.*` and four `held.*` counts.
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4 + 8);
     }
 
     #[test]
