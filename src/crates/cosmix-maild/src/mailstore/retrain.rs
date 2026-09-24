@@ -207,10 +207,10 @@ pub async fn retrain_logged(
 }
 
 /// Orders inline training (JMAP moves, `maild.bayesian.train`/`untrain`)
-/// against the outbox drain. An inline label is the newest event for its
-/// stamp, so it first cancels the stamp's pending outbox rows (older IMAP
-/// events). The drain re-checks that its row still exists before applying
-/// it. Both steps run under this lock, so a stale row can never be applied
+/// against the outbox drain. An inline label is newer than the stamp's
+/// pending outbox rows (older IMAP events), so once it has been written it
+/// cancels them. The drain re-checks that its row still exists before
+/// applying it. Both steps run under this lock, so a stale row can never be applied
 /// after the label that superseded it. Training is rare; one process-wide
 /// lock is cheaper than any finer scheme.
 fn train_order_lock() -> &'static tokio::sync::Mutex<()> {
@@ -258,8 +258,15 @@ fn log_superseded(account: &str, stamp: &str, cancelled: usize, via: TrainVia) {
 }
 
 /// Train one message inline — the JMAP move and `maild.bayesian.train`
-/// path. Supersedes the stamp's pending outbox rows first (see
-/// [`train_order_lock`]), then applies through [`retrain_logged`].
+/// path. Applies through [`retrain_logged`] first, and only on success
+/// supersedes the stamp's pending outbox rows (see [`train_order_lock`]).
+///
+/// Train-then-cancel, not cancel-then-train: if the classifier fails, the
+/// queued correction must survive, because nothing replaced it. A crash
+/// between a successful train and the cancel leaves a stale row that the
+/// next drain re-applies over this label. That is the exposure this path
+/// had before superseding existed, and it is strictly better than losing
+/// the correction.
 pub async fn train_inline(
     mds: &Arc<SqliteCasMds>,
     set: SetId,
@@ -268,14 +275,38 @@ pub async fn train_inline(
     via: TrainVia,
 ) -> anyhow::Result<RetrainOutcome> {
     let _order = train_order_lock().lock().await;
-    let cancelled = cancel_pending_rows(mds, set, req.stamp_id).await?;
-    log_superseded(req.account.as_str(), req.stamp_id, cancelled, via);
-    Ok(retrain_logged(classifier, req, via).await?)
+    let outcome = retrain_logged(classifier, req, via).await?;
+    supersede_after_success(mds, set, req.account.as_str(), req.stamp_id, via).await;
+    Ok(outcome)
 }
 
-/// Remove one message's label inline (`maild.bayesian.untrain`), cancelling
-/// its pending outbox rows first so a queued move cannot resurrect it.
-/// Returns the label that was reversed, if any.
+/// Cancel the stamp's pending rows once an inline write has succeeded. A
+/// failure here is logged, not returned: the label is already written, and
+/// the worst case is the stale-row re-apply described on [`train_inline`].
+async fn supersede_after_success(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    account: &str,
+    stamp: &str,
+    via: TrainVia,
+) {
+    match cancel_pending_rows(mds, set, stamp).await {
+        Ok(cancelled) => log_superseded(account, stamp, cancelled, via),
+        Err(e) => warn!(
+            target: "maild::bayesian::train",
+            account = %account,
+            stamp = %stamp,
+            via = via.as_str(),
+            error = %e,
+            "label written but pending outbox rows for {stamp} not cancelled: {e:#}"
+        ),
+    }
+}
+
+/// Remove one message's label inline (`maild.bayesian.untrain`), then
+/// cancel its pending outbox rows so a queued move cannot resurrect it. The
+/// order matches [`train_inline`] for the same reason. Returns the label
+/// that was reversed, if any.
 pub async fn untrain_inline(
     mds: &Arc<SqliteCasMds>,
     set: SetId,
@@ -285,12 +316,12 @@ pub async fn untrain_inline(
     message: &[u8],
 ) -> anyhow::Result<Option<Label>> {
     let _order = train_order_lock().lock().await;
-    let cancelled = cancel_pending_rows(mds, set, stamp).await?;
-    log_superseded(account.as_str(), stamp, cancelled, TrainVia::Bus);
     let conn = classifier.open_account_connection(account).await?;
-    Ok(classifier
+    let removed = classifier
         .forget_from(conn.as_ref(), stamp, message)
-        .await?)
+        .await?;
+    supersede_after_success(mds, set, account.as_str(), stamp, TrainVia::Bus).await;
+    Ok(removed)
 }
 
 /// One row claimed from `mail_retrain_outbox`, carrying the exact

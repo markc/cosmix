@@ -2006,6 +2006,44 @@ mod tests {
         assert_eq!((stats.labelled_spam, stats.labelled_ham), (1, 0));
     }
 
+    fn outbox_rows(mds: &SqliteCasMds, set: &cosmix_mds::SetId) -> i64 {
+        mds.with_set_tx(set, |tx| {
+            tx.tx()
+                .query_row("SELECT COUNT(*) FROM mail_retrain_outbox", [], |r| r.get(0))
+                .map_err(|e| cosmix_mds::Error::Other(e.to_string()))
+        })
+        .unwrap()
+    }
+
+    /// Review R1: when the classifier fails, the inline write never
+    /// happened, so the queued IMAP correction must survive — cancelling
+    /// first would lose it with nothing in its place.
+    #[tokio::test]
+    async fn failed_inline_train_keeps_the_queued_correction() {
+        let dir = TempDir::new().unwrap();
+        // A corpus base that is a regular FILE: opening any account fails.
+        let not_a_dir = dir.path().join("corpus");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let broken = disk_classifier(&not_a_dir);
+        let (_mdir, mds, store) = temp_mailstore();
+        let set = store.ensure_account_set(3).unwrap();
+        let inbox = create_mailbox(&mds, &set, "Inbox", Some("\\Inbox"));
+        let item = add_message(&mds, &set, inbox, b"Subject: x\r\n\r\nbody\r\n");
+        let database = database_with_accounts(&[3]);
+        let id = item.0.to_string();
+
+        enqueue_outbox_row(&mds, &set, 3, item, "junk");
+        let args = serde_json::json!({"account_id": 3, "email_id": id, "class": "ham"});
+        let (rc, body) = handle_train(&broken, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR, "body was: {body}");
+        assert_eq!(outbox_rows(&mds, &set), 1, "failed train cancelled the queued row");
+
+        let args = serde_json::json!({"account_id": 3, "email_id": id});
+        let (rc, body) = handle_untrain(&broken, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR, "body was: {body}");
+        assert_eq!(outbox_rows(&mds, &set), 1, "failed untrain cancelled the queued row");
+    }
+
     /// Review MINOR-7: an unsupported key such as `dry_run` must refuse the
     /// call, not be ignored while the message is trained for real.
     #[tokio::test]
