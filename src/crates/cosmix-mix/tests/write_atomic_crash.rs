@@ -1,19 +1,45 @@
 //! TODO-mix P3 acceptance, out of process: a `mix` rewriting a file in a
-//! tight loop with `write_atomic` is SIGKILLed at arbitrary points, several
-//! times. After every kill the target must be one COMPLETE version — never a
-//! prefix, never empty, never a mix of the two. Only a real process can be
-//! killed mid-write, so this cannot live in the in-process suite.
+//! tight loop with `write_atomic` is SIGKILLed, several times. After every
+//! kill the target must be one COMPLETE version — never a prefix, never
+//! empty, never a mix of the two. Only a real process can be killed
+//! mid-write, so this cannot live in the in-process suite.
 //!
-//! The payloads are large (4 MiB) so a kill lands inside a write far more
-//! often than between writes; the assertion holds wherever it lands.
+//! Review MINOR-13 hardened it two ways, so it cannot pass vacuously:
+//! * per-round progress — each round first waits for a NEW write to land
+//!   (the target's inode changes), so no round merely inherits the last
+//!   round's file;
+//! * a synchronised kill — the test watches the directory and SIGKILLs the
+//!   writer the moment a partially written temp (0 < size < SIZE) is on
+//!   disk, i.e. provably mid-write. At least one round must land that way.
 
 #![cfg(target_os = "linux")]
 
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SIZE: usize = 4 * 1024 * 1024;
+const SIZE: usize = 16 * 1024 * 1024;
+const ROUNDS: u64 = 5;
+
+fn inode(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|m| m.ino())
+}
+
+/// A temp beside the target that is partially written right now.
+fn partial_temp_present(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().starts_with(".state.mixtmp-")
+            && entry
+                .metadata()
+                .map(|m| m.len() > 0 && (m.len() as usize) < SIZE)
+                .unwrap_or(false)
+    })
+}
 
 #[test]
 fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
@@ -44,7 +70,17 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
         .expect("script");
     }
 
-    for round in 0..5u64 {
+    let mut mid_write_kills = 0;
+    for round in 0..ROUNDS {
+        // A killed round leaves its partial temp behind (documented: a
+        // SIGKILLed writer cannot clean up). Clear them, or the next round's
+        // "partial temp present" would be satisfied by a stale one.
+        for entry in std::fs::read_dir(&dir).expect("scratch dir").flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".state.mixtmp-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        let before = inode(&target);
         let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
             .arg(&script)
             .env("MIX_STATS", "off")
@@ -53,30 +89,51 @@ fn sigkill_mid_rewrite_leaves_a_complete_old_or_new_file() {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("mix binary must run");
-        // Let at least one write land, then kill at a varying point.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !target.exists() {
-            assert!(Instant::now() < deadline, "the loop never wrote the target");
+
+        // Progress: a new write must land this round.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while inode(&target).is_none() || inode(&target) == before {
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: no new write landed"
+            );
             assert!(
                 child.try_wait().expect("try_wait").is_none(),
-                "the rewrite loop exited early — write_atomic failed"
+                "round {round}: the rewrite loop exited early — write_atomic failed"
             );
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(2));
         }
-        std::thread::sleep(Duration::from_millis(40 + round * 37));
+
+        // Synchronised kill: the moment a partial temp is on disk.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut caught = false;
+        while Instant::now() < deadline {
+            if partial_temp_present(&dir) {
+                caught = true;
+                break;
+            }
+        }
         child.kill().expect("SIGKILL mix");
         let _ = child.wait();
+        if caught {
+            mid_write_kills += 1;
+        }
 
         let bytes = std::fs::read(&target).expect("target must still exist");
         let complete_a = bytes.len() == SIZE && bytes.iter().all(|b| *b == b'A');
         let complete_b = bytes.len() == SIZE && bytes.iter().all(|b| *b == b'B');
         assert!(
             complete_a || complete_b,
-            "round {round}: target is partial or mixed ({} bytes, first {:?}, last {:?})",
+            "round {round} (killed mid-write: {caught}): target is partial or mixed \
+             ({} bytes, first {:?}, last {:?})",
             bytes.len(),
             bytes.first().map(|b| *b as char),
             bytes.last().map(|b| *b as char)
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        mid_write_kills >= 1,
+        "no round caught the writer mid-write — the test proved nothing"
+    );
 }

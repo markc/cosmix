@@ -23432,6 +23432,62 @@ mod ssh_helpers_tests {
         crate::interrupt::_test_clear();
     }
 
+    /// Review MINOR-13: Ctrl-C sweeps the whole group. The leader obeys
+    /// SIGTERM at once; its descendant ignores it, so the interrupt path waits
+    /// the 2 s grace for the GROUP and then SIGKILLs it — the descendant is
+    /// gone, not orphaned, and its pid (echoed before the interrupt) proves it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_with_timeout_interrupt_sweeps_a_term_ignoring_descendant() {
+        let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
+        crate::interrupt::_test_clear();
+        let f = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = crate::interrupt::init(f.clone());
+        let sidecar = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::interrupt::INTERRUPT_FLAG
+                .get()
+                .expect("flag wired")
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let argv = sh("(trap '' TERM; exec sleep 60) & echo $!; wait");
+        let started = std::time::Instant::now();
+        let outcome = run_with_timeout(&argv, None, 0, "test", None).expect("spawn ok");
+        let elapsed = started.elapsed();
+        sidecar.join().unwrap();
+        crate::interrupt::_test_clear();
+        assert!(outcome.interrupted, "expected interrupted=true");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(2000),
+            "the grace must be waited for the group, not just the leader: {elapsed:?}"
+        );
+        let descendant: i32 = String::from_utf8_lossy(&outcome.stdout)
+            .trim()
+            .parse()
+            .expect("descendant pid on stdout");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let gone = loop {
+            let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(')').map(|(_, r)| r.trim_start().starts_with('Z')));
+            if state.unwrap_or(true) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        if !gone {
+            // SAFETY: cleanup of a process this test created.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        assert!(gone, "Ctrl-C left the TERM-ignoring descendant {descendant} running");
+    }
+
+
     #[test]
     fn run_with_timeout_signal_killed_exit_code() {
         let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
@@ -24463,6 +24519,65 @@ mod write_atomic_tests {
             }
             other => panic!("expected a structured error, got {other:?}"),
         }
+    }
+
+    /// Owner and group carry over to the new inode. Needs root to create a
+    /// target owned by someone else; an unprivileged run can own nothing but
+    /// its own files, which is also why the EPERM refusal branch cannot be
+    /// staged here — it is covered by reading: fchown's error aborts before
+    /// the rename, like every other staged failure (see the fault tests).
+    #[test]
+    fn the_owner_is_kept_when_replacing_another_users_file() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP the_owner_is_kept_when_replacing_another_users_file: not root");
+            return;
+        }
+        let d = tmpdir("owner");
+        let target = d.join("users-file");
+        std::fs::write(&target, "OLD").unwrap();
+        std::os::unix::fs::chown(&target, Some(65534), Some(65534)).unwrap();
+        builtin_write_atomic(vec![Value::String(s(&target)), Value::String("NEW".into())])
+            .expect("root keeps the owner");
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (65534, 65534), "owner must carry over");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A dangling symlink raises (nothing to resolve to) and a symlink whose
+    /// referent is a directory raises "not a regular file" — both touching
+    /// nothing, the link included.
+    #[test]
+    fn dangling_and_directory_symlinks_are_refused() {
+        let d = tmpdir("links");
+        let dangling = d.join("dangling");
+        std::os::unix::fs::symlink(d.join("absent"), &dangling).unwrap();
+        let e = builtin_write_atomic(vec![Value::String(s(&dangling)), Value::String("X".into())])
+            .unwrap_err();
+        assert!(format!("{e}").contains("resolving symlink"), "{e}");
+        assert!(std::fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert!(!d.join("absent").exists());
+
+        let sub = d.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let to_dir = d.join("to-dir");
+        std::os::unix::fs::symlink(&sub, &to_dir).unwrap();
+        let e = builtin_write_atomic(vec![Value::String(s(&to_dir)), Value::String("X".into())])
+            .unwrap_err();
+        assert!(format!("{e}").contains("not a regular file"), "{e}");
+        assert!(std::fs::symlink_metadata(&to_dir).unwrap().file_type().is_symlink());
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+
+        let e = builtin_write_atomic(vec![
+            Value::String(format!("{}/", s(&d.join("file")))),
+            Value::String("X".into()),
+        ])
+        .unwrap_err();
+        assert!(format!("{e}").contains("names a directory"), "{e}");
+        assert!(!d.join("file").exists(), "a trailing slash must not create a file");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
