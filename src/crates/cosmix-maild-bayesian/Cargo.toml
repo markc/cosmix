@@ -20,7 +20,7 @@ cosmix = ["dep:cosmix-lib-bus", "dep:cosmix-lib-client"]
 
 [dependencies]
 cosmix-maild-rules = { path = "../cosmix-maild-rules" }
-spamlite = { git = "https://github.com/markc/spamlite", rev = "c288fe94f14abea4fb734a24901e3fabb65eec9b", default-features = false }
+spamlite = { git = "https://github.com/markc/spamlite", rev = "98f91a9d8142f92ae89ba4f070a165ce86fa5e8d", default-features = false }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
