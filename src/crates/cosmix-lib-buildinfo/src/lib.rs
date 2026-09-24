@@ -139,9 +139,11 @@ fn provenance_json(
 // expands [`build_info!`] contributes its OWN marker as well, so a binary may
 // carry several: pick the one whose `component` names the binary's crate.
 
-/// The marker prefix, version 1. Assembled from two halves so this library's
-/// own code never holds the whole prefix as one literal beside non-marker
-/// bytes, where a byte scanner would find a false start.
+/// The marker prefix, version 1. Written as two halves for readability of
+/// intent only: rustc folds literal `format!` arguments, so a binary that
+/// links this function may still contain the whole prefix as a bare string.
+/// That is harmless — a reader counts a candidate only where the prefix is
+/// immediately followed by `{`, and keeps only JSON naming the right crate.
 pub fn marker_prefix() -> String {
     format!("{}{}", "COSMIX-BUILD", "INFO:1:")
 }
