@@ -1,40 +1,63 @@
 # version_flag_gate.mix — every cosmix Rust binary answers `--version`.
 #
-# Contract (AGENTS.md "Conventions"): `<bin> --version` and `<bin> -V` print
-# `<crate> <semver> (<sha12>[-dirty], built <rfc3339>)` on stdout and exit 0
-# before any other side effect. This gate proves it by RUNNING each built
-# binary, never by grepping source:
+# Contract (AGENTS.md "Conventions"): `<bin> --version` and `<bin> -V` exit 0
+# before any other side effect — before the async runtime, config, logging,
+# display, Bus or window — and print on stdout
+#
+#   <name> <semver> (<sha12>[-dirty][, features: …], built <rfc3339>)
+#
+# optionally followed by `key: value` lines; `--version --json` prints one
+# JSON object with at least component/version/git_sha/build_time. This gate
+# proves it by RUNNING each built binary, never by grepping source:
 #
 #   * every `bin` target of both workspaces (src/ and src/desktop/), read from
 #     `cargo metadata`, so a new binary is covered without editing this file;
 #   * a scrubbed environment (PATH only: no WAYLAND_DISPLAY, DISPLAY,
 #     XDG_RUNTIME_DIR, COSMIX_RUN, HOME), stdin closed, 5 s deadline;
-#   * exit 0, empty stderr, first stdout line `<name> <semver> (<sha12>`, where
-#     name is the crate (or the binary's own name, for `mix`), semver EQUALS
-#     the crate's Cargo.toml version (a stale binary fails here), and the sha
-#     is real hex (a crate with no build.rs `emit()` reports "unknown" and
-#     fails);
-#   * any further stdout line must be a `key: value` provenance line
+#   * exit 0 and stderr exactly empty;
+#   * the FULL first-line grammar above, where name is the crate (the one
+#     exception is in $ALIASES: `mix` names itself, not `cosmix-mix`), semver
+#     EQUALS the crate's Cargo.toml version, and the sha EQUALS the checkout's
+#     `git rev-parse --short=12 HEAD` (`-dirty` allowed; `unknown`, i.e. a
+#     crate with no build.rs `emit()`, fails) — so a stale binary fails;
+#   * any further stdout line is a `key: value` provenance line
 #     (cosmix-comp adds commit/features/profile);
-#   * `-V` must print exactly what `--version` printed.
+#   * `-V` prints exactly what `--version` printed;
+#   * `--version --json` parses, and its component/version/git_sha/
+#     build_time/git_dirty equal the text line's;
+#   * under `prlimit --nproc=1` (no thread or process can be created) the
+#     answer is unchanged: proof that it precedes runtime construction.
+#     RLIMIT_NPROC does not bind root, so as root this probe is reported as
+#     skipped rather than passed.
 #
 # A binary whose `required-features` are not in its crate's default features
 # is SKIPPED when absent (a default workspace build never produces it) and
-# checked when present. Build with the flags below to cover all of them.
+# checked when present. cosmix-foreman is decommissioned and always SKIPPED.
+# Cross-compiled builds (target/<triple>/<profile>) are not supported.
 #
-# Usage (from $COSMIX/src, after the release builds):
+# Usage (from $COSMIX/src; build everything first so no binary is stale):
 #   cargo build --release --workspace
 #   cargo build --release -p cosmix-mds --features _stress-helper
 #   (cd desktop && cargo build --release --workspace \
 #       && cargo build --release -p cosmix-comp --features kms-live \
 #       && cargo build --release -p cosmix-quoin --features demo)
-#   mix tools/version_flag_gate.mix [--src DIR] [--profile release]
+#   mix tools/version_flag_gate.mix [--src DIR] [--profile release|dev|NAME]
+#                                   [--expect-sha SHA]
+#
+# --expect-sha overrides the checkout's HEAD, for binaries built elsewhere.
+#
+# Negative control (must exit 1): build a commit from before the contract in a
+# scratch worktree and point this gate at it, e.g.
+#   git worktree add /tmp/vfg-base 5b1991fe && cd /tmp/vfg-base/src && cargo build --release --workspace && mix $COSMIX/src/tools/version_flag_gate.mix --src /tmp/vfg-base/src
 #
 # Exit 0 = every built binary conforms; 1 = at least one FAIL; 2 = usage.
+
+$ALIASES = {mix: "cosmix-mix"}
 
 $argv = args()
 $src = nil
 $profile = "release"
+$expect = nil
 $i = 0
 while $i < len($argv)
     $a = $argv[$i]
@@ -44,8 +67,11 @@ while $i < len($argv)
     elif $a == "--profile" and $i + 1 < len($argv) then
         $profile = $argv[$i + 1]
         $i = $i + 2
+    elif $a == "--expect-sha" and $i + 1 < len($argv) then
+        $expect = $argv[$i + 1]
+        $i = $i + 2
     else
-        print("usage: mix tools/version_flag_gate.mix [--src DIR] [--profile release]")
+        print("usage: mix tools/version_flag_gate.mix [--src DIR] [--profile release|dev|NAME] [--expect-sha SHA]")
         exit(2)
     end
 end
@@ -59,6 +85,36 @@ if $src == nil then
         exit(2)
     end
 end
+# Cargo's `dev` profile builds into target/debug; every other profile into
+# target/<profile>.
+$profile_dir = $profile
+if $profile == "dev" then
+    $profile_dir = "debug"
+end
+if $expect == nil then
+    $head = run_argv(["git", "-C", $src, "rev-parse", "--short=12", "HEAD"], {timeout: 30})
+    if !$head.ok then
+        print("version_flag_gate: cannot read HEAD of ${src}; pass --expect-sha SHA")
+        exit(2)
+    end
+    $expect = trim($head.stdout)
+end
+if !re_match($expect, "^[0-9a-f]{12,40}$") then
+    print("version_flag_gate: --expect-sha must be 12-40 lowercase hex, got " + $expect)
+    exit(2)
+end
+$expect = slice($expect, 0, 12)
+
+$nproc_probe = true
+$prlimit = which("prlimit")
+if uid() == 0 then
+    print("NOTE thread-starvation probe skipped: RLIMIT_NPROC does not bind root")
+    $nproc_probe = false
+elif $prlimit == nil then
+    print("NOTE thread-starvation probe skipped: prlimit (util-linux) not found")
+    $nproc_probe = false
+end
+
 $workspaces = [$src + "/Cargo.toml", $src + "/desktop/Cargo.toml"]
 
 # Transitive closure of a package's default features (feature names only;
@@ -83,12 +139,30 @@ fn default_features($features)
     return $seen
 end
 
+# One run of a binary. Returns nil when it exited 0 with an empty stderr,
+# else the reason. Interpolation takes names and fields only, never a call
+# or an index, so computed values are bound first.
+fn run_once($argv_list, $label)
+    $r = run_argv($argv_list, {timeout: 5, clear_env: true, env: {PATH: "/usr/bin:/bin"}, stdin: {null: true}})
+    $err1 = split(trim($r.stderr), "\n")[0]
+    if $r.timed_out then
+        return {why: "${label} timed out after 5 s", out: ""}
+    end
+    if $r.exit_code != 0 then
+        return {why: "${label} exit ${r.exit_code}, stderr: " + $err1, out: ""}
+    end
+    if $r.stderr != "" then
+        return {why: "${label} wrote to stderr: " + $err1, out: ""}
+    end
+    return {why: nil, out: $r.stdout}
+end
+
 $pass = 0
 $fail = 0
 $skip = 0
 $failures = []
-$scrubbed = {PATH: "/usr/bin:/bin"}
-$line_re = "^(\\S+) (\\d+\\.\\d+\\.\\d+\\S*) \\(([0-9a-f]{12})(-dirty)?[,)]"
+$seen_foreman = false
+$line_re = "^(\\S+) (\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.+-]+)?) \\(([0-9a-f]{12})(?:-dirty)?(?:, features: [^()]+?)?, built (\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z)\\)$"
 $kv_re = "^[a-z][a-z_-]*: \\S"
 
 for $ws in $workspaces
@@ -98,9 +172,12 @@ for $ws in $workspaces
         exit(1)
     end
     $m = json_parse($meta.stdout)
-    $bindir = $m.target_directory + "/" + $profile
+    $bindir = $m.target_directory + "/" + $profile_dir
     for $p in $m.packages
         if $p.name == "cosmix-foreman" then
+            print("SKIP cosmix-foreman: decommissioned (Mark, 2026-08-30)")
+            $skip = $skip + 1
+            $seen_foreman = true
             continue
         end
         $defaults = default_features($p.features)
@@ -130,44 +207,45 @@ for $ws in $workspaces
                 end
                 continue
             end
+
             $why = nil
-            $outs = []
-            for $flag in ["--version", "-V"]
-                $r = run_argv([$path, $flag], {timeout: 5, clear_env: true, env: $scrubbed, stdin: {null: true}})
-                # Interpolation takes plain names and fields only, never a
-                # call or an index, so computed values are bound first.
-                $err = trim($r.stderr)
-                $err1 = split($err, "\n")[0]
-                if $r.timed_out then
-                    $why = "${flag} timed out after 5 s"
-                elif $r.exit_code != 0 then
-                    $why = "${flag} exit ${r.exit_code}, stderr: " + $err1
-                elif $err != "" then
-                    $why = "${flag} wrote to stderr: " + $err1
-                end
-                if $why != nil then
-                    break
-                end
-                push($outs, $r.stdout)
-            end
-            if $why == nil and $outs[0] != $outs[1] then
-                $why = "-V output differs from --version"
-            end
-            $first = ""
+            $long = run_once([$path, "--version"], "--version")
+            $why = $long.why
             if $why == nil then
-                $lines = split(rtrim($outs[0]), "\n")
+                $short = run_once([$path, "-V"], "-V")
+                $why = $short.why
+                if $why == nil and $short.out != $long.out then
+                    $why = "-V output differs from --version"
+                end
+            end
+
+            # The text form: full first-line grammar, identity, freshness.
+            $first = ""
+            $name = ""
+            $semver = ""
+            $sha = ""
+            $built = ""
+            $dirty = false
+            if $why == nil then
+                $lines = split(rtrim($long.out), "\n")
                 $first = $lines[0]
                 $hit = re_find($first, $line_re)
                 if len($hit) == 0 then
-                    $why = "first line not '<name> <semver> (<sha12>': ${first}"
+                    $why = "first line does not match '<name> <semver> (<sha12>[-dirty][, features: …], built <rfc3339>)': ${first}"
                 else
                     $g = $hit[0].groups
                     $name = $g[0]
                     $semver = $g[1]
-                    if $name != $p.name and $name != $bin then
-                        $why = "name '${name}' is neither crate '${p.name}' nor binary '${bin}'"
+                    $sha = $g[2]
+                    $built = $g[3]
+                    $dirty = re_match($first, "\\([0-9a-f]{12}-dirty[,)]")
+                    $alias_ok = has_key($ALIASES, $bin) and $name == $bin and $ALIASES[$bin] == $p.name
+                    if $name != $p.name and !$alias_ok then
+                        $why = "name '${name}' is not crate '${p.name}' (nor an allowlisted alias)"
                     elif $semver != $p.version then
                         $why = "semver ${semver} != Cargo.toml ${p.version} (stale binary?)"
+                    elif $sha != $expect then
+                        $why = "sha ${sha} != expected ${expect} (stale binary, or pass --expect-sha)"
                     end
                 end
                 $n = 1
@@ -179,6 +257,50 @@ for $ws in $workspaces
                     $n = $n + 1
                 end
             end
+
+            # The JSON form must agree with the text form.
+            if $why == nil then
+                $js = run_once([$path, "--version", "--json"], "--version --json")
+                $why = $js.why
+                if $why == nil then
+                    $obj = nil
+                    try
+                        $obj = json_parse(trim($js.out))
+                    catch $msg
+                        $why = "--version --json is not JSON: " + trim($js.out)
+                    end
+                    if $why == nil and type($obj) != "map" then
+                        $why = "--version --json is not one object: " + trim($js.out)
+                    end
+                    if $why == nil then
+                        for $key in ["component", "version", "git_sha", "build_time", "git_dirty"]
+                            if $why == nil and !has_key($obj, $key) then
+                                $why = "--version --json lacks '${key}'"
+                            end
+                        end
+                    end
+                    if $why == nil then
+                        $jc = $obj["component"]
+                        $jv = $obj["version"]
+                        $jsha = $obj["git_sha"]
+                        $jb = $obj["build_time"]
+                        $jd = $obj["git_dirty"]
+                        if $jc != $name or $jv != $semver or $jsha != $sha or $jb != $built or $jd != $dirty then
+                            $why = "--version --json disagrees with the text line: " + trim($js.out)
+                        end
+                    end
+                end
+            end
+
+            # Starved of threads and processes, the answer must not change.
+            if $why == nil and $nproc_probe then
+                $starved = run_once([$prlimit, "--nproc=1:1", "--", $path, "--version"], "--version under nproc=1")
+                $why = $starved.why
+                if $why == nil and $starved.out != $long.out then
+                    $why = "--version under nproc=1 printed something else"
+                end
+            end
+
             if $why == nil then
                 print("PASS ${label}: ${first}")
                 $pass = $pass + 1
@@ -191,7 +313,14 @@ for $ws in $workspaces
     end
 end
 
-print("version_flag_gate: ${pass} pass, ${fail} fail, ${skip} skipped")
+# Not a workspace member (excluded in src/Cargo.toml), so metadata never
+# lists it; say so, so the counts are honest about what was not checked.
+if !$seen_foreman and exists($src + "/crates/cosmix-foreman") then
+    print("SKIP cosmix-foreman: decommissioned (Mark, 2026-08-30), not a workspace member")
+    $skip = $skip + 1
+end
+
+print("version_flag_gate: ${pass} pass, ${fail} fail, ${skip} skipped (expected sha ${expect}, profile ${profile})")
 if $fail > 0 then
     print("offenders: " + join($failures, ", "))
     exit(1)

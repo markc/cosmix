@@ -209,8 +209,8 @@ fn comp_log_layer(_: &mut App) -> Option<bevy::log::BoxedFmtLayer> {
 
 fn main() -> ExitCode {
     let cli = match Cli::parse(env::args_os().skip(1)) {
-        Ok(ParseOutcome::Version) => {
-            print!("{}", version_text());
+        Ok(ParseOutcome::Version { json }) => {
+            print!("{}", if json { version_json() } else { version_text() });
             return ExitCode::SUCCESS;
         }
         Ok(ParseOutcome::Run(cli)) => cli,
@@ -529,11 +529,11 @@ Options:
   -h, --help         Print this help
   --version, -V      Print build provenance and exit, touching no device, VT,
                      seat, Wayland socket or Bus; safe against a live compositor.
-                     Honoured anywhere in argv, including after `kms-live`
+                     Honoured anywhere in argv, including after `kms-live`;
+                     with --json, one JSON object carrying the same fields
 ";
 
-fn version_text() -> String {
-    let build = cosmix_buildinfo::build_info!();
+fn version_features() -> Vec<&'static str> {
     let mut features = Vec::new();
     if cfg!(feature = "kms-live") {
         features.push("kms-live");
@@ -565,6 +565,12 @@ fn version_text() -> String {
     if cfg!(feature = "explicit-sync-live-test") {
         features.push("explicit-sync-live-test");
     }
+    features
+}
+
+fn version_text() -> String {
+    let build = cosmix_buildinfo::build_info!();
+    let features = version_features();
     let features = if features.is_empty() {
         "none".to_string()
     } else {
@@ -575,6 +581,24 @@ fn version_text() -> String {
         build.line(),
         build.git_sha_full,
         features,
+        env!("COSMIX_KMS_LIVE_CARGO_PROFILE"),
+    )
+}
+
+/// `--version --json`: the substrate-wide object (`BuildInfo::json`, which
+/// already carries the full sha the text form prints as `commit:`) plus the
+/// text form's `features` and `profile`. Feature names and the cargo profile
+/// are fixed identifiers, so they need no JSON escaping.
+fn version_json() -> String {
+    let base = cosmix_buildinfo::build_info!().json();
+    let body = base.strip_suffix('}').unwrap_or(&base);
+    let features = version_features()
+        .iter()
+        .map(|feature| format!("\"{feature}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{body},\"features\":[{features}],\"profile\":\"{}\"}}\n",
         env!("COSMIX_KMS_LIVE_CARGO_PROFILE"),
     )
 }
@@ -590,7 +614,9 @@ struct Cli {
 }
 
 enum ParseOutcome {
-    Version,
+    Version {
+        json: bool,
+    },
     Run(Box<Cli>),
     ListBindings {
         keybindings_enabled: bool,
@@ -650,7 +676,8 @@ impl Cli {
             .iter()
             .any(|argument| argument == "--version" || argument == "-V")
         {
-            return Ok(ParseOutcome::Version);
+            let json = args.iter().any(|argument| argument == "--json");
+            return Ok(ParseOutcome::Version { json });
         }
         let (args, bus_service) = extract_bus_service(args)?;
         let (args, f9_bus) = extract_f9_bus(args)?;
@@ -2783,10 +2810,10 @@ mod tests {
 
     #[test]
     fn version_is_a_pure_parse_outcome_in_every_argument_position() {
-        assert!(matches!(parse(&["--version"]), Ok(ParseOutcome::Version)));
+        assert!(matches!(parse(&["--version"]), Ok(ParseOutcome::Version { json: false })));
         // `-V` is mix's spelling; both must work or an operator has to remember
         // which cosmix binary wants which flag.
-        assert!(matches!(parse(&["-V"]), Ok(ParseOutcome::Version)));
+        assert!(matches!(parse(&["-V"]), Ok(ParseOutcome::Version { json: false })));
         // The daily driver's exact unit argv with the flag appended — the case the
         // flag exists for.
         assert!(matches!(
@@ -2805,20 +2832,43 @@ mod tests {
                 "boing.kick",
                 "--version",
             ]),
-            Ok(ParseOutcome::Version)
+            Ok(ParseOutcome::Version { json: false })
         ));
         assert!(matches!(
             parse(&["kms-live", "--device", "/dev/dri/card0", "--version"]),
-            Ok(ParseOutcome::Version)
+            Ok(ParseOutcome::Version { json: false })
         ));
         assert!(matches!(
             parse(&["--nested", "--version", "--socket", "untouched"]),
-            Ok(ParseOutcome::Version)
+            Ok(ParseOutcome::Version { json: false })
         ));
         assert!(matches!(
             parse(&["--bus-service", "--version"]),
-            Ok(ParseOutcome::Version)
+            Ok(ParseOutcome::Version { json: false })
         ));
+    }
+
+    #[test]
+    fn version_json_is_one_object_carrying_the_text_fields() {
+        assert!(matches!(
+            parse(&["kms-live", "--json", "--version"]),
+            Ok(ParseOutcome::Version { json: true })
+        ));
+        let rendered = version_json();
+        assert_eq!(rendered.lines().count(), 1);
+        let object = rendered.trim_end();
+        assert!(object.starts_with("{\"component\":\"cosmix-comp\",\"version\":\""));
+        assert!(object.ends_with('}'));
+        for key in [
+            "\"git_sha\":",
+            "\"git_sha_full\":",
+            "\"git_dirty\":",
+            "\"build_time\":",
+            "\"features\":[",
+            "\"profile\":\"",
+        ] {
+            assert!(object.contains(key), "{key} missing from {object}");
+        }
     }
 
     #[test]

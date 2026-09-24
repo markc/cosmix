@@ -291,37 +291,57 @@ fn check_bind(sa: &SocketAddr, allow_non_loopback: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    // `--version`/`-V` before anything else (mirrors clap's early
-    // intercept in the sibling daemons): print to stdout, exit 0, ahead
-    // of logging init so there's no log noise and the hand-rolled
-    // `parse_args` never sees the flag as an "unknown argument".
+fn main() -> ExitCode {
+    // `--version`/`-V` before anything else — the tokio runtime included,
+    // so a thread- or fd-starved host still gets an answer: print to
+    // stdout, exit 0, ahead of logging init so there's no log noise and
+    // the hand-rolled `parse_args` never sees the flag as an "unknown
+    // argument".
     #[cfg(feature = "cosmix")]
     {
         cosmix_buildinfo::exit_on_version!();
     }
-    // The standalone arm pulls no cosmix crate at runtime, but build.rs
-    // (an unconditional build-dependency) still emits the provenance env,
-    // so it prints the same `<pkg> <semver> (<sha>, built <time>)` line.
     #[cfg(not(feature = "cosmix"))]
-    if std::env::args()
-        .skip(1)
-        .take_while(|a| a != "--")
-        .any(|a| a == "--version" || a == "-V")
-    {
-        let dirty = matches!(option_env!("COSMIX_GIT_DIRTY"), Some("1" | "true"));
-        println!(
-            "{} {} ({}{}, built {})",
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            option_env!("COSMIX_GIT_SHA").unwrap_or("unknown"),
-            if dirty { "-dirty" } else { "" },
-            option_env!("COSMIX_BUILD_TIME").unwrap_or("unknown"),
-        );
+    if let Some(text) = standalone_version_request() {
+        println!("{text}");
         return ExitCode::SUCCESS;
     }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
 
+/// The standalone arm pulls no cosmix crate at runtime, but build.rs (an
+/// unconditional build-dependency) still emits the provenance env, so it
+/// answers with the same line and JSON shapes as `cosmix_buildinfo`.
+/// Values are compile-time crate metadata (name, semver, hex sha, RFC 3339
+/// time), none of which can contain a character JSON would need escaped.
+#[cfg(not(feature = "cosmix"))]
+fn standalone_version_request() -> Option<String> {
+    let args: Vec<String> = std::env::args().skip(1).take_while(|a| a != "--").collect();
+    if !args.iter().any(|a| a == "--version" || a == "-V") {
+        return None;
+    }
+    let pkg = env!("CARGO_PKG_NAME");
+    let version = env!("CARGO_PKG_VERSION");
+    let sha = option_env!("COSMIX_GIT_SHA").unwrap_or("unknown");
+    let sha_full = option_env!("COSMIX_GIT_SHA_FULL").unwrap_or("unknown");
+    let dirty = matches!(option_env!("COSMIX_GIT_DIRTY"), Some("1" | "true"));
+    let built = option_env!("COSMIX_BUILD_TIME").unwrap_or("unknown");
+    Some(if args.iter().any(|a| a == "--json") {
+        format!(
+            "{{\"component\":\"{pkg}\",\"version\":\"{version}\",\"git_sha\":\"{sha}\",\
+             \"git_sha_full\":\"{sha_full}\",\"git_dirty\":{dirty},\"build_time\":\"{built}\"}}"
+        )
+    } else {
+        let dirty = if dirty { "-dirty" } else { "" };
+        format!("{pkg} {version} ({sha}{dirty}, built {built})")
+    })
+}
+
+async fn async_main() -> ExitCode {
     // Logging. The standalone (`--no-default-features`) arm is the P1
     // source VERBATIM — stderr-only, no cosmix-family dep
     // (goal-(c): the isolated-node server pulls ZERO cosmix crates;

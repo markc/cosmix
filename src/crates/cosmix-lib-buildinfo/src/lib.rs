@@ -216,8 +216,10 @@ pub fn version_request_scoped(
 /// Handle `--version` for the running process: when argv asks for it, print
 /// the answer to stdout and exit 0; otherwise return and let `main` carry on.
 ///
-/// Call it as `main`'s FIRST statement — before config reads, logging, fd
-/// quarantine, display checks, Bus connections or windows — so the answer can
+/// Call it as `main`'s FIRST statement — before the async runtime (so never
+/// under `#[tokio::main]`, which builds the runtime before the body runs and
+/// panics on a thread-starved host), config reads, logging, fd quarantine,
+/// display checks, Bus connections or windows — so the answer can
 /// never depend on startup succeeding and a second copy of a running program
 /// answers truthfully. Prefer the [`exit_on_version!`] macro, which expands
 /// [`build_info!`] in the caller for you. Non-UTF-8 arguments are compared

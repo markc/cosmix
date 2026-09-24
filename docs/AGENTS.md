@@ -29,6 +29,9 @@ names, addresses, domains, keys, operator home paths) anywhere in it.
 
 ```sh
 cd $COSMIX/src && cargo build --workspace --release     # or: mix $COSMIX/setup.mix
+cd $COSMIX/src/desktop && cargo build --workspace --release
+#   the gate also covers feature-gated binaries when present: build them with
+#   the extra commands in src/tools/version_flag_gate.mix's Usage header
 cd $COSMIX/src && mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 cd $COSMIX/src && cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
 cd $COSMIX/src/desktop && cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
@@ -69,16 +72,24 @@ defaults. Never hardcode an install path.
   do not add Quoin-like panel furniture to individual apps. See
   `src/desktop/APPS.md` for the layout policy and legacy migration scope.
 - Version-bump a crate when a consumer would observe the change.
-- Every binary answers `--version` and `-V` with one stdout line,
-  `<crate> <semver> (<sha12>[-dirty], built <rfc3339>)`, and exits 0 before
-  any other side effect: no config read, logging, display check, Bus connect,
-  fd quarantine or window, with or without a display or broker. `main`'s first
-  statement is `cosmix_buildinfo::exit_on_version!();` (whole argv up to `--`;
-  `exit_on_version!(leading)` reads only argv[1], for programs that forward
-  their argv), and the crate's `build.rs` calls `cosmix_buildinfo::emit()` so
-  the sha is real. `--version --json` gives the full sha. A new binary is
-  covered by `src/tools/version_flag_gate.mix` automatically; it fails until
-  the binary conforms.
+- Every binary answers `--version` and `-V` and exits 0 before any other side
+  effect: no async runtime, config read, logging, display check, Bus connect,
+  fd quarantine or window, with or without a display or broker. The FIRST
+  stdout line is `<crate> <semver> (<sha12>[-dirty][, features: …], built
+  <rfc3339>)`; any further lines are `key: value` (cosmix-comp adds `commit`,
+  `features`, `profile`). `--version --json` prints one JSON object with at
+  least `component`, `version`, `git_sha`, `build_time` and `git_dirty`,
+  agreeing with the line. The one naming exception is mix, which answers as
+  `mix`, its binary name, not its crate `cosmix-mix`. `main`'s first statement
+  is `cosmix_buildinfo::exit_on_version!();` and it precedes runtime
+  construction, so no `#[tokio::main]` on a binary: build the runtime
+  explicitly after the macro. The default scope is the whole argv up to `--`,
+  so a value literally spelled `-V` or `--version` must follow `--` (clap's
+  `--flag=-V` form also works); binaries whose options take free strings
+  with no `--` escape use `exit_on_version!(leading)`, which reads only
+  argv[1]. The crate's `build.rs` calls `cosmix_buildinfo::emit()` so the sha
+  is real. A new binary is covered by `src/tools/version_flag_gate.mix`
+  automatically; it fails until the binary conforms.
 - Public-safe architecture specifications belong in `docs/spec/`. Read their
   status and evidence labels: draft publication is not normative acceptance.
   Chapter ordering does not reassign legacy runtime specification IDs.

@@ -17,10 +17,11 @@ path = "src/main.rs"
 # Three-tier feature graph (the cosmix "core-first crate" pattern):
 #   default            → render + live-MIDI playback (cpal). Useful out of the box.
 #   --no-default-feats → the PURE render core only (rustysynth + hound): no cpal,
-#                        no midir, no Cosmix RUNTIME deps; the compiled artifact
-#                        links no C (the only Cosmix touch is the pure-Rust
-#                        cosmix-lib-buildinfo build-dependency below, a
-#                        build-time provenance stamp). `cargo test --lib
+#                        no midir; the compiled artifact links no C. The only
+#                        Cosmix dependency is cosmix-lib-buildinfo — std-only,
+#                        dependency-free pure Rust — used at build time for the
+#                        provenance stamp and at run time so the CLI answers
+#                        `--version` with its sha. `cargo test --lib
 #                        --no-default-features` is the FFI-free guarantee.
 #   --features cosmix  → the full Bus citizen daemon (`serve`): noded client,
 #                        SPEC-12 props, .conf.mix bootstrap, first-run sf2 fetch.

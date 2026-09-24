@@ -385,10 +385,20 @@ fn request(command: &str, body: &str) -> Result<Option<JobRequest>, String> {
         _ => Err("unknown capture command".into()),
     }
 }
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), String> {
-    // --version/-V: answer and exit 0 before any other side effect.
-    cosmix_buildinfo::exit_on_version!();
+fn main() -> Result<(), String> {
+    // --version/-V first, before the tokio runtime exists: a thread- or
+    // fd-starved host must still get an answer, not a runtime-build panic.
+    // `leading`: capture's option values are free strings with no `--`
+    // escape (`--output --version` names an output), so only argv[1] asks.
+    cosmix_buildinfo::exit_on_version!(leading);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), String> {
     let Some(options) = options()? else {
         return Ok(());
     };

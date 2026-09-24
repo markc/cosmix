@@ -72,10 +72,13 @@ fn version_reports_the_version_and_the_build_hash() {
         .and_then(|s| s.split_once(" ("))
         .unwrap_or_else(|| panic!("expected `mix X.Y.Z (sha)`, got {line:?}"));
     assert_eq!(version, env!("CARGO_PKG_VERSION"));
-    let sha = rest
+    let (sha, built) = rest
         .strip_suffix(')')
         .unwrap_or_else(|| panic!("unterminated build hash in {line:?}"))
-        .trim_end_matches("-dirty");
+        .split_once(", built ")
+        .unwrap_or_else(|| panic!("expected `(sha, built <time>)`, got {line:?}"));
+    assert!(!built.is_empty(), "blank build time in {line:?}");
+    let sha = sha.trim_end_matches("-dirty");
     assert!(!sha.is_empty(), "blank build hash in {line:?}");
     assert!(
         sha == "unknown" || sha.chars().all(|c| c.is_ascii_hexdigit()),

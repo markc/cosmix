@@ -2193,12 +2193,19 @@ async fn run_inspection_verb_cli(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // --version/-V anywhere in the daemon's exact argv: answer and exit 0
-    // before any other side effect.
+    // before any other side effect, the tokio runtime included, so a
+    // thread- or fd-starved host still gets an answer.
     cosmix_buildinfo::exit_on_version!();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
 
+async fn async_main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls CryptoProvider");

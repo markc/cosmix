@@ -2776,14 +2776,22 @@ impl ServerHandler for CosmixMcp {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // --version / -V: print build provenance and exit BEFORE starting the
-    // stdio server. mcp connects anonymously (no noded.register), so this
-    // CLI line is its only version surface — the 2026-06-01 stale-binary
-    // case, where a sha + build_time would have made the staleness obvious.
+    // stdio server — and before the tokio runtime exists, so a thread- or
+    // fd-starved host still gets an answer. mcp connects anonymously (no
+    // noded.register), so this CLI line is its only version surface — the
+    // 2026-06-01 stale-binary case, where a sha + build_time would have
+    // made the staleness obvious.
     cosmix_buildinfo::exit_on_version!();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the tokio runtime")
+        .block_on(async_main())
+}
 
+async fn async_main() {
     // Logging via the shared `cosmix_log` core. Preserves cosmix-mcp's
     // hand-tuned posture: the `info,cosmix_mcp=debug` baseline filter
     // (RUST_LOG still overrides — set RUST_LOG=cosmix_mcp=trace for full

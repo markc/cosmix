@@ -467,6 +467,9 @@ non-Mix script and exists solely because <code>mix</code> does not yet.</li>
 </ul>
 <h2 id="build-and-verify">Build and verify</h2>
 <pre><code class="language-sh">cd $COSMIX/src &amp;&amp; cargo build --workspace --release     # or: mix $COSMIX/setup.mix
+cd $COSMIX/src/desktop &amp;&amp; cargo build --workspace --release
+#   the gate also covers feature-gated binaries when present: build them with
+#   the extra commands in src/tools/version_flag_gate.mix's Usage header
 cd $COSMIX/src &amp;&amp; mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 cd $COSMIX/src &amp;&amp; cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
 cd $COSMIX/src/desktop &amp;&amp; cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
@@ -502,16 +505,23 @@ CTK menus and purpose-specific controls with compositor-managed window chrome;
 do not add Quoin-like panel furniture to individual apps. See
 <code>src/desktop/APPS.md</code> for the layout policy and legacy migration scope.</li>
 <li>Version-bump a crate when a consumer would observe the change.</li>
-<li>Every binary answers <code>--version</code> and <code>-V</code> with one stdout line,
-<code>&lt;crate&gt; &lt;semver&gt; (&lt;sha12&gt;[-dirty], built &lt;rfc3339&gt;)</code>, and exits 0 before
-any other side effect: no config read, logging, display check, Bus connect,
-fd quarantine or window, with or without a display or broker. <code>main</code>'s first
-statement is <code>cosmix_buildinfo::exit_on_version!();</code> (whole argv up to <code>--</code>;
-<code>exit_on_version!(leading)</code> reads only argv[1], for programs that forward
-their argv), and the crate's <code>build.rs</code> calls <code>cosmix_buildinfo::emit()</code> so
-the sha is real. <code>--version --json</code> gives the full sha. A new binary is
-covered by <code>src/tools/version_flag_gate.mix</code> automatically; it fails until
-the binary conforms.</li>
+<li>Every binary answers <code>--version</code> and <code>-V</code> and exits 0 before any other side
+effect: no async runtime, config read, logging, display check, Bus connect,
+fd quarantine or window, with or without a display or broker. The FIRST
+stdout line is <code>&lt;crate&gt; &lt;semver&gt; (&lt;sha12&gt;[-dirty][, features: …], built &lt;rfc3339&gt;)</code>; any further lines are <code>key: value</code> (cosmix-comp adds <code>commit</code>,
+<code>features</code>, <code>profile</code>). <code>--version --json</code> prints one JSON object with at
+least <code>component</code>, <code>version</code>, <code>git_sha</code>, <code>build_time</code> and <code>git_dirty</code>,
+agreeing with the line. The one naming exception is mix, which answers as
+<code>mix</code>, its binary name, not its crate <code>cosmix-mix</code>. <code>main</code>'s first statement
+is <code>cosmix_buildinfo::exit_on_version!();</code> and it precedes runtime
+construction, so no <code>#[tokio::main]</code> on a binary: build the runtime
+explicitly after the macro. The default scope is the whole argv up to <code>--</code>,
+so a value literally spelled <code>-V</code> or <code>--version</code> must follow <code>--</code> (clap's
+<code>--flag=-V</code> form also works); binaries whose options take free strings
+with no <code>--</code> escape use <code>exit_on_version!(leading)</code>, which reads only
+argv[1]. The crate's <code>build.rs</code> calls <code>cosmix_buildinfo::emit()</code> so the sha
+is real. A new binary is covered by <code>src/tools/version_flag_gate.mix</code>
+automatically; it fails until the binary conforms.</li>
 <li>Public-safe architecture specifications belong in <code>docs/spec/</code>. Read their
 status and evidence labels: draft publication is not normative acceptance.
 Chapter ordering does not reassign legacy runtime specification IDs.</li>

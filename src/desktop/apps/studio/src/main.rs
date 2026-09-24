@@ -82,8 +82,10 @@ fn autoplay(
 }
 
 fn main() {
-    // --version/-V: answer and exit 0 before any other side effect.
-    cosmix_buildinfo::exit_on_version!();
+    // --version/-V: answer and exit 0 before any other side effect. `leading`
+    // (argv[1] only): --view/--song/--stems/--soundfont take free strings with no `--` escape,
+    // so a value spelled --version must reach the parser, not this check.
+    cosmix_buildinfo::exit_on_version!(leading);
     let args: Vec<_> = std::env::args().skip(1).collect();
     let noded_url: Option<String> = app_port::parse_noded_url(&args)
         .unwrap_or_else(|error| {

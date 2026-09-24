@@ -40,8 +40,10 @@ fn required_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
 struct OpenPending(bool);
 
 fn main() {
-    // --version/-V: answer and exit 0 before any other side effect.
-    cosmix_buildinfo::exit_on_version!();
+    // --version/-V: answer and exit 0 before any other side effect. `leading`
+    // (argv[1] only): FILE/--directory/--service take free strings with no `--` escape,
+    // so a value spelled --version must reach the parser, not this check.
+    cosmix_buildinfo::exit_on_version!(leading);
     let mut options = Options {
         directory: std::env::var_os("HOME")
             .map(PathBuf::from)
