@@ -90,7 +90,7 @@ pub const LINT_DOCS: &[LintDoc] = &[
     LintDoc {
         code: "MIX-E1102",
         summary: "undefined function",
-        detail: "A bareword call that resolves against nothing: not a builtin, HOF, evaluator special form, `function` definition in the file, the embedded prelude, an `--allow-function` name, or an assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside `address … end` blocks are sends and never flagged; `MethodCall`/`ValueCall` are dynamic dispatch and skipped. A deleted legacy name (e.g. `grep`) gets this AND its MIX-D30xx rename pointer.",
+        detail: "A bareword call that resolves against nothing: not a builtin, HOF, evaluator special form, `function` definition in the file, the embedded prelude, an `--allow-function` name, or an assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside `address … end` blocks are sends and never flagged; `MethodCall`/`ValueCall` are dynamic dispatch and skipped. A deleted legacy name (e.g. `grep`) gets this AND its MIX-D30xx rename pointer. The hint carries the same \"did you mean\" the runtime prints for that name (one shared suggester): deleted-name pointers first, then a foreign-name synonym table (`json_decode`/`json_loads` → `json_parse`, `str` → `to_string`, `trim_end`/`rstrip` → `rtrim`, `len_bytes` → `byte_length`, …), then edit distance — so `json_decode` suggests `json_parse`, not its nearest-spelled opposite `json_encode`.",
     },
     LintDoc {
         code: "MIX-E1201",
@@ -186,7 +186,7 @@ pub const LINT_DOCS: &[LintDoc] = &[
     LintDoc {
         code: "MIX-W2402",
         summary: "bare bound variable in heredoc",
-        detail: "A heredoc literal contains bare `$NAME` where `NAME` is bound somewhere in the same visible universe. Heredocs interpolate `${NAME}`, not `$NAME`, so the bare form often means a generated config was silently corrupted. Does not fire for `${NAME}`, `$(` command substitution, escaped `\\$NAME`, all-digit names like `$1`, unknown names, or ordinary double-quoted strings. Lint-only: bare `$NAME` still evaluates to literal `$NAME`, and intentional literal output needs no change.",
+        detail: "A heredoc literal contains bare `$NAME` where `NAME` is bound somewhere in the same visible universe. Heredocs interpolate `${NAME}`, not `$NAME`, so the bare form often means a generated config was silently corrupted. Does not fire for `${NAME}`, `$(` command substitution, escaped `\\$NAME`, all-digit names like `$1`, unknown names, or ordinary double-quoted strings. Lint-only: bare `$NAME` still evaluates to literal `$NAME`, and intentional literal output needs no change. Silent, in a heredoc that ships as an `ssh_mix` body, for the names the REMOTE program owns — the call's `bindings`/`env` keys and the body's own binders — where bare is exactly right and `${NAME}` would splice the local value in; any other bound name still warns.",
     },
     LintDoc {
         code: "MIX-W2403",
@@ -247,7 +247,7 @@ pub const LINT_DOCS: &[LintDoc] = &[
     LintDoc {
         code: "MIX-D3012",
         summary: "ssh_mix body that could not be analysed",
-        detail: "An `ssh_mix` body (its second argument) that lint could not analyse — a non-literal argument (a variable, a concatenation, an interpolated string, a `read_file`), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist. Ship the remote half as a literal heredoc so lint (and inventories built from it) can see inside.",
+        detail: "An `ssh_mix` body (its second argument) that lint could not analyse — a non-literal argument (a variable NOT bound exactly once to a string or heredoc literal, a concatenation, an interpolated string or heredoc — named in the message, since `${x}` splices the LOCAL value — a `read_file`), or a literal that does not parse as Mix. Says so explicitly rather than passing silently, because an unreadable body counted as clean is exactly how an inventory reads zero while live sites exist. Ship the remote half as a literal heredoc so lint (and inventories built from it) can see inside.",
     },
     LintDoc {
         code: "MIX-D3015",
