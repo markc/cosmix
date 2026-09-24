@@ -140,6 +140,12 @@ pub(crate) fn mesh_open() -> bool {
     std::env::var("COSMIX_MESH_OPEN").map_or(true, |value| value != "0")
 }
 
+/// [`mesh_open`] as `term.session` reports it, so a caller reads the posture
+/// instead of inferring it from which replies differ.
+pub(crate) fn posture(open: bool) -> &'static str {
+    if open { "mesh-open" } else { "strict" }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Target {
@@ -923,6 +929,7 @@ impl Control {
                 Reply::ok(json!({
                     "instance_id":parent.instance_id, "incarnation":parent.incarnation,
                     "target":target, "policy":parent.policy,
+                    "posture":posture(mesh_open()),
                     "request_epoch":actor.connection_id,
                     "request_high_water":DecimalU64(state.history.get(&identity).map_or(0, |h| h.high_water)),
                     "panes":panes,

@@ -1,11 +1,11 @@
 use crate::tabs::{Cleanup, CompletionNote, Outcome, TabSet};
-use cosmix_client::{BoundedIncomingEvent, SupervisedClient};
+use cosmix_client::{BoundedIncomingEvent, IncomingCommand, SupervisedClient};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab; the reply adds binding=granted (native launch grant delivered, enrolment async), graphics-only (no usable grant) or unavailable (no native session)\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 /// The one spelling the handlers in this crate are written in.
 ///
 /// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
@@ -93,50 +93,8 @@ pub(crate) fn start_at(
             let result = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::connect_options(service, &url).bounded_incoming(16).connect()).await;
             let client = match result { Ok(Ok(client)) => Arc::new(client), _ => { eprintln!("{service} Bus unavailable or connection timed out"); return; } };
             let Some(mut incoming) = client.incoming_bounded() else { return; };
-            // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
-            // or closes at shutdown. `recv()` on a closed channel returns `None`
-            // immediately and forever, which would spin the select; the
-            // precondition retires the branch on the first `None` so it is never
-            // re-polled, while the loop keeps serving Bus verbs until the TabSet
-            // empties.
-            let mut notify_open = true;
             let mut notifications = tokio::task::JoinSet::new();
-            let mut replies = ReplyCache::default();
-            while !terminal.lock().unwrap().is_empty() {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                    note = notify_rx.recv(), if notify_open => {
-                        // Sink writes can block under backpressure. Poll them in
-                        // separate tracked tasks so verbs remain serviceable.
-                        match note {
-                            Some(note) => {
-                                let client = client.clone();
-                                notifications.spawn(async move { notify_complete(&client, &note).await });
-                            },
-                            None => notify_open = false,
-                        }
-                    },
-                    _ = notifications.join_next(), if !notifications.is_empty() => {},
-                    event = incoming.recv() => {
-                        let command = match event {
-                            Some(BoundedIncomingEvent::Command(c)) => c,
-                            Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
-                            None => break,
-                        };
-                        let result = dispatch(
-                            crate::control::mesh_open(),
-                            service,
-                            &terminal,
-                            &cleanup,
-                            &mut replies,
-                            &command.command,
-                            &command.body,
-                        );
-                        let (rc,body) = match result { Ok(body) => (0,body), Err(error) => (10,error) };
-                        let _ = tokio::time::timeout(Duration::from_secs(2),client.respond(&command,rc,&body)).await;
-                    }
-                }
-            }
+            serve(service, &terminal, &cleanup, &mut notify_rx, &mut notifications, &mut incoming, &client).await;
             // The final reap can queue notes just after the TabSet becomes
             // empty. Wait for channel closure and outstanding sends together,
             // under one total deadline (not two seconds per pane).
@@ -147,6 +105,142 @@ pub(crate) fn start_at(
             let _ = tokio::time::timeout(Duration::from_secs(2), client.close()).await;
         });
     }).expect("Bus thread")
+}
+
+/// Where the serving loop's commands come from. The broker's bounded lane in
+/// production; a plain channel under test, so the loop itself runs without a
+/// broker.
+trait Incoming {
+    fn next(&mut self) -> impl std::future::Future<Output = Option<BoundedIncomingEvent>>;
+}
+impl Incoming for cosmix_client::BoundedIncomingReceiver {
+    fn next(&mut self) -> impl std::future::Future<Output = Option<BoundedIncomingEvent>> {
+        self.recv()
+    }
+}
+
+/// Where the serving loop's replies and completion notes go.
+trait Peer {
+    fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) -> impl std::future::Future<Output = ()>;
+    fn completed(&self, note: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static;
+}
+impl Peer for Arc<SupervisedClient> {
+    async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), SupervisedClient::respond(self, command, rc, body)).await;
+    }
+    fn completed(&self, note: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let client = self.clone();
+        async move { notify_complete(&client, &note).await }
+    }
+}
+
+/// Serve verbs until the TabSet empties. Event-driven throughout: every
+/// branch is a real event (a command, a completion note, a finished send, the
+/// last tab closing), so an idle terminal never runs a turn — the loop used
+/// to tick a 100 ms sleep purely to re-check `is_empty()`. Returns the number
+/// of turns taken, which is what the idle test counts.
+async fn serve(
+    service: &str,
+    terminal: &Mutex<TabSet>,
+    cleanup: &Cleanup,
+    notify_rx: &mut tokio::sync::mpsc::UnboundedReceiver<CompletionNote>,
+    notifications: &mut tokio::task::JoinSet<()>,
+    incoming: &mut impl Incoming,
+    peer: &impl Peer,
+) -> usize {
+    // Taken once: the TabSet signals this whichever thread closes the last
+    // tab — a Bus verb here, or the frontend (keyboard, child exit, window
+    // close) — and the permit survives until this loop next waits.
+    let emptied = terminal.lock().unwrap().emptied();
+    // The completion-note channel is disabled (TERM_NOTIFY=0 → no sender)
+    // or closes at shutdown. `recv()` on a closed channel returns `None`
+    // immediately and forever, which would spin the select; the
+    // precondition retires the branch on the first `None` so it is never
+    // re-polled, while the loop keeps serving Bus verbs until the TabSet
+    // empties.
+    let mut notify_open = true;
+    let mut replies = ReplyCache::default();
+    let mut turns = 0;
+    while !terminal.lock().unwrap().is_empty() {
+        turns += 1;
+        tokio::select! {
+            _ = emptied.notified() => {},
+            note = notify_rx.recv(), if notify_open => {
+                // Sink writes can block under backpressure. Poll them in
+                // separate tracked tasks so verbs remain serviceable.
+                match note {
+                    Some(note) => { notifications.spawn(peer.completed(note)); },
+                    None => notify_open = false,
+                }
+            },
+            _ = notifications.join_next(), if !notifications.is_empty() => {},
+            event = incoming.next() => {
+                let command = match event {
+                    Some(BoundedIncomingEvent::Command(c)) => c,
+                    Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
+                    None => break,
+                };
+                let guarded = guard(terminal, std::panic::AssertUnwindSafe(|| dispatch(
+                    crate::control::mesh_open(),
+                    service,
+                    terminal,
+                    cleanup,
+                    &mut replies,
+                    &command.command,
+                    &command.body,
+                )));
+                let Ok(result) = guarded else {
+                    // The panic unwound through a held TabSet lock: the set may
+                    // be half-mutated, and the frontend's next lock would panic
+                    // on the poison anyway, somewhere less legible. Stop here,
+                    // saying why, rather than serve verbs over torn state.
+                    eprintln!("{service} Bus verb {:?} panicked while holding the tab set; aborting", command.command);
+                    std::process::abort();
+                };
+                let (rc, body) = match result { Ok(body) => (0, body), Err(error) => (10, error) };
+                peer.reply(&command, rc, &body).await;
+            }
+        }
+    }
+    turns
+}
+
+const HANDLER_PANICKED: &str = "internal error: verb handler panicked";
+
+/// A panic that unwound through the tab-set lock, poisoning it.
+#[derive(Debug, PartialEq, Eq)]
+struct Torn;
+
+/// Panic boundary for one Bus verb. Before this, a handler panic killed the
+/// Bus thread silently (the frontend discards its join result) while every
+/// other verb went unanswered.
+///
+/// The TabSet lock decides the outcome. Terminal, native-session and control
+/// state have locks of their own, but every one a handler takes is taken
+/// while it holds the TabSet lock, so a panic escaping any of them unwinds
+/// through the set lock and poisons it too. A poisoned set may be
+/// half-mutated: that is [`Torn`], and the caller must not carry on (serve()
+/// aborts before replying, so the in-flight caller gets no reply). An
+/// unpoisoned set means the panic happened outside those nested critical
+/// sections; the caller gets an ordinary error and the lane keeps serving.
+///
+/// Two limits. The boundary covers this one verb on this thread: panics on
+/// other threads, or at serve()'s own unguarded `is_empty()` lock, are
+/// outside it. And "unpoisoned" is not quite "nothing changed": `tab.close`
+/// and `pane.close` release the set lock before `cleanup.submit`, so a panic
+/// there would follow a completed close — and since the reply cache is only
+/// written after `handle()` returns, a retried targetless `pane.close` would
+/// close a DIFFERENT pane. Theoretical today (`submit` is a `let _ = send`),
+/// but anything added after those `drop(tabs)` calls inherits it.
+fn guard<T>(
+    set: &Mutex<T>,
+    run: impl FnOnce() -> Result<String, String> + std::panic::UnwindSafe,
+) -> Result<Result<String, String>, Torn> {
+    match std::panic::catch_unwind(run) {
+        Ok(result) => Ok(result),
+        Err(_) if set.is_poisoned() => Err(Torn),
+        Err(_) => Ok(Err(HANDLER_PANICKED.into())),
+    }
 }
 
 async fn drain_notifications<F, Fut>(
@@ -365,7 +459,7 @@ fn dispatch(
 fn diagnostic(service: &str, verb: &str) -> Result<String, String> {
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
-            "{service}: diagnostic discovery only; protected controls require the allocated native-session route"
+            "{service}: diagnostic discovery only (posture=strict, COSMIX_MESH_OPEN=0); protected controls require the allocated native-session route"
         )),
         _ => Err("{\"error_code\":\"FORBIDDEN\"}".into()),
     }
@@ -380,25 +474,44 @@ fn handle(
 ) -> Result<String, String> {
     // VERIFY: every term.* verb validates its JSON contract before locking/mutation.
     let args = parse_args(verb, body)?;
+    // Test-only verbs that drive the panic boundary through the real
+    // serve() path: one panics before the set lock, one while holding it.
+    #[cfg(test)]
+    if verb == "term.test.panic" {
+        panic!("test verb: panic outside the tab-set lock");
+    }
     let mut tabs = set.lock().unwrap();
+    #[cfg(test)]
+    if verb == "term.test.panic_locked" {
+        panic!("test verb: panic holding the tab-set lock");
+    }
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
             "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)",
             help(service)
         )),
-        "term.session" => Ok(tabs.session_status().to_string()),
+        "term.session" => {
+            let mut status = tabs.session_status();
+            // dispatch() refuses every verb but INFO/HELP under the strict
+            // posture before reaching here, so a handler reply is mesh-open.
+            status["posture"] = crate::control::posture(true).into();
+            Ok(status.to_string())
+        }
         "term.tabs" => Ok(tabs
             .list()
             .iter()
             .map(|tab| {
                 format!(
-                    "id={} active={} title={} cols={} rows={} child_pid={}",
-                    tab.id, tab.active, tab.title, tab.cols, tab.rows, tab.child_pid
+                    "id={} active={} title={} cols={} rows={} child_pid={} revision={}",
+                    tab.id, tab.active, tab.title, tab.cols, tab.rows, tab.child_pid, tabs.revision
                 )
             })
             .collect::<Vec<_>>()
             .join("\n")),
-        "term.tab.new" => tabs.open().map(|id| format!("opened id={id}")),
+        "term.tab.new" => tabs.open().map(|id| {
+            let binding = tabs.binding(tabs.active_tab().active_pane);
+            format!("opened id={id} {} binding={binding}", identity(&tabs))
+        }),
         "term.tab.select" => {
             let id = args["id"]
                 .as_u64()
@@ -406,7 +519,7 @@ fn handle(
             // select wakes the event loop; refresh compares View.rendered_id
             // with active_id and uploads even without a PTY damage event.
             if tabs.select(id) {
-                Ok(format!("selected id={id}"))
+                Ok(format!("selected id={id} {}", identity(&tabs)))
             } else {
                 Err(format!("unknown tab id={id}"))
             }
@@ -416,12 +529,15 @@ fn handle(
                 .as_u64()
                 .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             let (outcome, removed) = tabs.close(id);
+            let revision = tabs.revision;
             drop(tabs);
             cleanup.submit(removed.into_iter().collect());
             match outcome {
                 Outcome::Unknown => Err(format!("unknown tab id={id}")),
-                Outcome::Remaining(count) => Ok(format!("closed id={id} remaining={count}")),
-                Outcome::Empty => Ok(format!("closed id={id} last")),
+                Outcome::Remaining(count) => {
+                    Ok(format!("closed id={id} remaining={count} revision={revision}"))
+                }
+                Outcome::Empty => Ok(format!("closed id={id} last revision={revision}")),
             }
         }
         "term.panes" => Ok(tabs
@@ -430,8 +546,18 @@ fn handle(
             .map(|pane| {
                 let g = pane.geometry;
                 format!(
-                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={}",
-                    pane.id, pane.active, pane.cols, pane.rows, pane.child_pid, g.x, g.y, g.w, g.h
+                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={}",
+                    pane.id,
+                    pane.active,
+                    pane.cols,
+                    pane.rows,
+                    pane.child_pid,
+                    g.x,
+                    g.y,
+                    g.w,
+                    g.h,
+                    tabs.active_id(),
+                    tabs.revision
                 )
             })
             .collect::<Vec<_>>()
@@ -445,12 +571,13 @@ fn handle(
             )?;
             tabs.split_active(dir).map(|id| {
                 format!(
-                    "split id={id} dir={}",
+                    "split id={id} dir={} {}",
                     if dir == crate::panes::SplitDir::Horizontal {
                         "h"
                     } else {
                         "v"
-                    }
+                    },
+                    identity(&tabs)
                 )
             })
         }
@@ -459,7 +586,7 @@ fn handle(
                 .as_u64()
                 .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             if tabs.focus(id) {
-                Ok(format!("selected id={id}"))
+                Ok(format!("selected id={id} {}", identity(&tabs)))
             } else {
                 Err(format!("unknown pane in active tab id={id}"))
             }
@@ -469,15 +596,17 @@ fn handle(
                 return Err("application closing".into());
             }
             let id = tabs.active_tab().active_pane;
+            let tab = tabs.active_id();
             let tab_closed = tabs.leaves().len() == 1;
             let (_, removed) = tabs.close_active();
             let count = tabs.leaves().len();
+            let revision = tabs.revision;
             drop(tabs);
             cleanup.submit(removed.into_iter().collect());
             if tab_closed {
-                Ok(format!("closed id={id} tab-closed"))
+                Ok(format!("closed id={id} tab-closed tab={tab} revision={revision}"))
             } else {
-                Ok(format!("closed id={id} panes={count}"))
+                Ok(format!("closed id={id} panes={count} tab={tab} revision={revision}"))
             }
         }
         // VERIFY: active-pane snapshot/type — selection stays under the set lock.
@@ -486,9 +615,11 @@ fn handle(
                 return Err("application closing".into());
             }
             let active = tabs.active_terminal();
+            let identity = identity(&tabs);
             let terminal = active.lock().unwrap();
             if verb == "term.snapshot" {
-                Ok(terminal.snapshot())
+                // Onto the snapshot's own key=value header line.
+                Ok(format!("{identity} {}", terminal.snapshot()))
             } else {
                 // VERIFY: term.type extracts validated text, never the JSON envelope.
                 terminal
@@ -499,13 +630,26 @@ fn handle(
                             .ok_or_else(|| "internal: term verb/args desync (text)".to_string())?,
                     )
                     .map(|_| {
-                        "DIAGNOSTIC synthetic keys queued; inspect input_written for actual writes"
-                            .into()
+                        format!(
+                            "DIAGNOSTIC synthetic keys queued; inspect input_written for actual writes {identity}"
+                        )
                     })
             }
         }
         _ => Err("unknown verb; use HELP".into()),
     }
+}
+
+/// The identity a targetless verb acted on, echoed so a caller can detect
+/// drift after the fact (detection, not binding): the active tab and pane
+/// after the verb, and the tab-set revision. Requires a non-empty set.
+fn identity(tabs: &TabSet) -> String {
+    format!(
+        "tab={} pane={} revision={}",
+        tabs.active_id(),
+        tabs.active_tab().active_pane,
+        tabs.revision
+    )
 }
 
 fn parse_dir(body: &str) -> Result<crate::panes::SplitDir, String> {
@@ -526,6 +670,8 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     let field = match verb {
         "term.snapshot" | "term.tabs" | "term.tab.new" | "term.panes" | "term.pane.close"
         | "term.session" => None,
+        #[cfg(test)]
+        "term.test.panic" | "term.test.panic_locked" => None,
         "term.type" => Some("text"),
         "term.tab.select" | "term.tab.close" | "term.pane.select" => Some("id"),
         "term.pane.split" => Some("dir"),
@@ -702,6 +848,333 @@ mod tests {
             });
     }
 
+    struct Quiet(tokio::sync::mpsc::Receiver<BoundedIncomingEvent>);
+    impl Incoming for Quiet {
+        fn next(&mut self) -> impl std::future::Future<Output = Option<BoundedIncomingEvent>> {
+            self.0.recv()
+        }
+    }
+    struct Mute;
+    impl Peer for Mute {
+        async fn reply(&self, _: &IncomingCommand, _: u8, _: &str) {}
+        fn completed(&self, _: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+            std::future::ready(())
+        }
+    }
+
+    /// Event-driven law: an idle terminal's Bus loop must not wake. Every
+    /// input stays open and silent for a window that the old 100 ms re-poll
+    /// would have ticked through several times; the only turn allowed is the
+    /// one the last-tab close causes, and that close must end the loop.
+    #[test]
+    fn idle_bus_loop_takes_no_turns_until_the_last_tab_closes() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP idle Bus loop test: Mix unavailable");
+            return;
+        }
+        let set = Arc::new(Mutex::new(TabSet::new().unwrap()));
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        // Both senders stay alive, so neither branch retires with a `None`.
+        let (_notes, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_commands, commands) = tokio::sync::mpsc::channel(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let serving = {
+            let (set, cleanup) = (set.clone(), cleanup.clone());
+            std::thread::spawn(move || {
+                let turns = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut tasks = tokio::task::JoinSet::new();
+                        let mut incoming = Quiet(commands);
+                        serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut incoming, &Mute).await
+                    });
+                done_tx.send(turns).unwrap();
+            })
+        };
+        // Quiet window: 3.5 ticks of the retired re-poll.
+        assert!(
+            done.recv_timeout(Duration::from_millis(350)).is_err(),
+            "loop ended while the terminal still had a tab"
+        );
+        cleanup.submit(set.lock().unwrap().shutdown());
+        let turns = done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("closing the last tab must wake and end the loop");
+        assert_eq!(turns, 1, "an idle loop woke without an event");
+        serving.join().unwrap();
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    /// A set already empty when the loop starts is never waited on.
+    #[test]
+    fn bus_loop_on_an_empty_set_returns_without_a_turn() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP empty Bus loop test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        cleanup.submit(set.lock().unwrap().shutdown());
+        let (_notes, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_commands, commands) = tokio::sync::mpsc::channel(1);
+        let turns = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut tasks = tokio::task::JoinSet::new();
+                serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut Quiet(commands), &Mute).await
+            });
+        assert_eq!(turns, 0);
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    /// Exact replies for the tab verbs' identity echo, the no-bump rule for
+    /// select, both tab.close forms, and the closing latch after the last tab.
+    #[test]
+    fn tab_verbs_echo_exact_identity_and_the_last_close_latches() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP tab identity test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let revision = || set.lock().unwrap().revision;
+        // Every structural verb must bump the revision by exactly one: the
+        // expected values come from `before`, not a read after the call, so a
+        // verb that stopped bumping fails here.
+        let before = revision();
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.new", "").unwrap(),
+            format!("opened id=2 tab=2 pane=2 revision={} binding=unavailable", before + 1)
+        );
+        assert_eq!(revision(), before + 1);
+        let tabs = handle(&set, &cleanup, "term.tabs", "").unwrap();
+        let lines: Vec<Vec<(&str, &str)>> = tabs
+            .lines()
+            .map(|line| {
+                line.split(' ')
+                    .map(|pair| pair.split_once('=').expect("key=value token"))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for (line, (id, active)) in lines.iter().zip([("1", "false"), ("2", "true")]) {
+            let keys: Vec<_> = line.iter().map(|(key, _)| *key).collect();
+            assert_eq!(
+                keys,
+                ["id", "active", "title", "cols", "rows", "child_pid", "revision"],
+                "{tabs}"
+            );
+            assert_eq!(line[0], ("id", id));
+            assert_eq!(line[1], ("active", active));
+            assert_eq!(line[2], ("title", "mix"));
+            assert_eq!(line[6], ("revision", (before + 1).to_string().as_str()));
+        }
+        // Selecting does not bump the revision: drift from a select shows in
+        // tab=/pane=, never in revision=.
+        let before = revision();
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.select", r#"{"id":1}"#).unwrap(),
+            format!("selected id=1 tab=1 pane=1 revision={before}")
+        );
+        assert_eq!(revision(), before);
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.close", r#"{"id":2}"#).unwrap(),
+            format!("closed id=2 remaining=1 revision={}", before + 1)
+        );
+        assert_eq!(revision(), before + 1);
+        let before = revision();
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.close", r#"{"id":1}"#).unwrap(),
+            format!("closed id=1 last revision={}", before + 1)
+        );
+        assert_eq!(revision(), before + 1);
+        // The last close latches: no verb can reopen a closing terminal.
+        assert_eq!(
+            handle(&set, &cleanup, "term.tab.new", "").unwrap_err(),
+            "application closing"
+        );
+        assert!(set.lock().unwrap().is_empty());
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    /// The property serve() relies on to close the check-then-wait window:
+    /// a last-tab close with nobody waiting leaves a permit, so a wait that
+    /// starts afterwards completes at once instead of sleeping forever.
+    #[test]
+    fn a_close_before_the_wait_is_not_lost() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP emptied permit test: Mix unavailable");
+            return;
+        }
+        let set = Mutex::new(TabSet::new().unwrap());
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let emptied = set.lock().unwrap().emptied();
+        cleanup.submit(set.lock().unwrap().shutdown());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_millis(100), emptied.notified())
+                    .await
+                    .expect("the close's permit was lost");
+            });
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    struct Recorder(std::sync::mpsc::Sender<(String, u8, String)>);
+    impl Peer for Recorder {
+        async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
+            let _ = self.0.send((command.command.clone(), rc, body.into()));
+        }
+        fn completed(&self, _: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+            std::future::ready(())
+        }
+    }
+
+    fn command(verb: &str, body: &str) -> BoundedIncomingEvent {
+        BoundedIncomingEvent::Command(IncomingCommand {
+            from: "test".into(),
+            command: verb.into(),
+            id: None,
+            args: serde_json::Value::Null,
+            body: body.into(),
+            headers: Default::default(),
+        })
+    }
+
+    /// Command feed, recorded (verb, rc, body) replies, and the serve thread.
+    type Serving = (
+        tokio::sync::mpsc::Sender<BoundedIncomingEvent>,
+        std::sync::mpsc::Receiver<(String, u8, String)>,
+        std::thread::JoinHandle<()>,
+    );
+
+    /// Run serve() on its own thread with a recording peer; the caller feeds
+    /// commands and reads replies.
+    fn serving(set: &Arc<Mutex<TabSet>>, cleanup: &Cleanup) -> Serving {
+        let (commands_tx, commands) = tokio::sync::mpsc::channel(4);
+        let (replies_tx, replies) = std::sync::mpsc::channel();
+        let (set, cleanup) = (set.clone(), cleanup.clone());
+        let thread = std::thread::spawn(move || {
+            let (_notes, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let mut incoming = Quiet(commands);
+                    serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut incoming, &Recorder(replies_tx)).await;
+                });
+        });
+        (commands_tx, replies, thread)
+    }
+
+    /// Through the real serve() path: a verb that panics outside the set
+    /// lock answers rc 10 with the fixed message, and the NEXT command is
+    /// still served. Removing the boundary kills the Bus thread and the
+    /// second reply never comes.
+    #[test]
+    fn a_panicking_verb_is_answered_and_the_lane_keeps_serving() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP panic continuation test: Mix unavailable");
+            return;
+        }
+        let set = Arc::new(Mutex::new(TabSet::new().unwrap()));
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let (commands, replies, serving) = serving(&set, &cleanup);
+        commands.blocking_send(command("term.test.panic", "")).unwrap();
+        commands.blocking_send(command("term.tabs", "")).unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            replies.recv_timeout(wait).unwrap(),
+            ("term.test.panic".into(), 10, HANDLER_PANICKED.into())
+        );
+        let (verb, rc, body) = replies.recv_timeout(wait).expect("lane stopped serving after a panic");
+        assert_eq!((verb.as_str(), rc), ("term.tabs", 0));
+        assert!(body.starts_with("id=1 "), "{body}");
+        assert!(!set.is_poisoned());
+        cleanup.submit(set.lock().unwrap().shutdown());
+        serving.join().unwrap();
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    const ABORT_CHILD: &str = "COSMIX_TERM_TEST_ABORT_CHILD";
+
+    /// A verb that panics while holding the tab-set lock must take the whole
+    /// process down by SIGABRT, not carry on over torn state. Runs itself in
+    /// a child process (the abort would otherwise kill the test binary).
+    #[test]
+    fn a_verb_that_poisons_the_tab_set_aborts_the_process() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP poison abort test: Mix unavailable");
+            return;
+        }
+        if std::env::var_os(ABORT_CHILD).is_some() {
+            // The abort is the expected outcome here; never leave a core
+            // file in the caller's working directory for it.
+            let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: setrlimit reads one live rlimit.
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
+            let set = Arc::new(Mutex::new(TabSet::new().unwrap()));
+            let (cleanup, _worker) = Cleanup::start().unwrap();
+            let (commands, replies, _serving) = serving(&set, &cleanup);
+            commands.blocking_send(command("term.test.panic_locked", "")).unwrap();
+            let reply = replies.recv_timeout(Duration::from_secs(10));
+            eprintln!("CHILD SURVIVED the poisoning verb; reply: {reply:?}");
+            std::process::exit(3);
+        }
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bus::tests::a_verb_that_poisons_the_tab_set_aborts_the_process",
+                "--nocapture",
+            ])
+            .env(ABORT_CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{:?}\n{stderr}", output.status);
+        assert!(
+            stderr.contains("\"term.test.panic_locked\" panicked while holding the tab set; aborting"),
+            "{stderr}"
+        );
+    }
+
+    /// A handler panic outside the shared lock is an ordinary error reply and
+    /// the lock stays usable; one that unwinds through the lock is Torn.
+    #[test]
+    fn panic_boundary_answers_clean_panics_and_flags_torn_state() {
+        let set = Mutex::new(0u32);
+        assert_eq!(guard(&set, || Ok("fine".into())), Ok(Ok("fine".into())));
+        assert_eq!(guard(&set, || Err("refused".into())), Ok(Err("refused".into())));
+        assert_eq!(
+            guard(&set, || panic!("outside the lock")),
+            Ok(Err(HANDLER_PANICKED.into()))
+        );
+        assert!(!set.is_poisoned());
+        *set.lock().unwrap() += 1;
+        assert_eq!(
+            guard(&set, || {
+                let _held = set.lock().unwrap();
+                panic!("under the lock")
+            }),
+            Err(Torn)
+        );
+        assert!(set.is_poisoned());
+    }
+
     #[test]
     fn pane_body_parsers() {
         assert_eq!(parse_dir("h"), Ok(crate::panes::SplitDir::Horizontal));
@@ -719,16 +1192,29 @@ mod tests {
         let set = Mutex::new(TabSet::new().unwrap());
         let (cleanup, worker) = Cleanup::start().unwrap();
         let original = set.lock().unwrap().active_tab().active_pane;
+        let revision = || set.lock().unwrap().revision;
+        // Every reply echoes the identity it acted on (tab, pane, revision).
         assert_eq!(
             handle(&set, &cleanup, "term.pane.split", r#"{"dir":"v"}"#).unwrap(),
-            "split id=2 dir=v"
+            format!("split id=2 dir=v tab=1 pane=2 revision={}", revision())
         );
-        assert_eq!(
-            handle(&set, &cleanup, "term.panes", "")
+        let panes = handle(&set, &cleanup, "term.panes", "").unwrap();
+        assert_eq!(panes.lines().count(), 2);
+        for line in panes.lines() {
+            assert!(
+                line.ends_with(&format!(" tab=1 revision={}", revision())),
+                "{line}"
+            );
+        }
+        assert!(
+            handle(&set, &cleanup, "term.snapshot", "")
                 .unwrap()
-                .lines()
-                .count(),
-            2
+                .starts_with(&format!("tab=1 pane=2 revision={} cols=", revision()))
+        );
+        assert!(
+            handle(&set, &cleanup, "term.type", r#"{"text":""}"#)
+                .unwrap()
+                .ends_with(&format!(" tab=1 pane=2 revision={}", revision()))
         );
         let pid = set
             .lock()
@@ -749,9 +1235,10 @@ mod tests {
         assert!(handle(&set, &cleanup, "term.snapshot", "").is_ok());
         drop(held);
         assert!(handle(&set, &cleanup, "term.pane.select", r#"{"id":999}"#).is_err());
+        let closed = handle(&set, &cleanup, "term.pane.close", "").unwrap();
         assert_eq!(
-            handle(&set, &cleanup, "term.pane.close", "").unwrap(),
-            "closed id=2 panes=1"
+            closed,
+            format!("closed id=2 panes=1 tab=1 revision={}", revision())
         );
         assert_eq!(
             handle(
@@ -761,11 +1248,12 @@ mod tests {
                 &format!(r#"{{"id":{original}}}"#)
             )
             .unwrap(),
-            format!("selected id={original}")
+            format!("selected id={original} tab=1 pane={original} revision={}", revision())
         );
+        let closed = handle(&set, &cleanup, "term.pane.close", "").unwrap();
         assert_eq!(
-            handle(&set, &cleanup, "term.pane.close", "").unwrap(),
-            format!("closed id={original} tab-closed")
+            closed,
+            format!("closed id={original} tab-closed tab=1 revision={}", revision())
         );
         assert!(set.lock().unwrap().is_empty());
         drop(cleanup);
@@ -785,9 +1273,19 @@ mod tests {
             dispatch(false, &set, &cleanup, &mut replies, "term.tabs", "").unwrap_err(),
             "{\"error_code\":\"FORBIDDEN\"}"
         );
-        assert!(dispatch(false, &set, &cleanup, &mut replies, "HELP", "").is_ok());
-        // Open posture: the full verb set answers on the global name.
+        assert!(
+            dispatch(false, &set, &cleanup, &mut replies, "HELP", "")
+                .unwrap()
+                .contains("posture=strict")
+        );
+        // Open posture: the full verb set answers on the global name, and
+        // term.session names the posture instead of leaving it to inference.
         assert!(dispatch(true, &set, &cleanup, &mut replies, "term.tabs", "").is_ok());
+        let session: serde_json::Value = serde_json::from_str(
+            &dispatch(true, &set, &cleanup, &mut replies, "term.session", "").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session["posture"], "mesh-open");
         // A retried mutation with the same request_id replays the recorded
         // reply and must NOT re-execute: still two panes after the retry.
         let body = r#"{"dir":"v","request_id":"r1"}"#;
@@ -911,6 +1409,10 @@ mod tests {
             )
             .is_ok()
         );
+        // tab.new says whether the new pane got a native binding; this set
+        // was built without a native session, so it cannot have one.
+        let opened = dispatch(true, &set, &cleanup, &mut replies, "term.tab.new", "").unwrap();
+        assert!(opened.ends_with(" binding=unavailable"), "{opened}");
         set.lock().unwrap().shutdown();
         drop(cleanup);
         worker.join().unwrap();

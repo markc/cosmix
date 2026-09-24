@@ -507,6 +507,40 @@ pub struct RunConfig {
 }
 
 pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()> {
+    serve(config, None, ready_tx).await
+}
+
+/// [`run`] on a listener the caller already bound; `config.listen` must name
+/// its address. Test brokers use this to own an ephemeral port from the start
+/// — binding `:0`, dropping it and handing noded the number lets another
+/// socket take the port in between.
+// The noded binary never calls it; term-core's test broker compiles this
+// file by path and does.
+#[allow(dead_code)]
+pub async fn run_on(
+    config: RunConfig,
+    listener: tokio::net::TcpListener,
+    ready_tx: oneshot::Sender<()>,
+) -> Result<()> {
+    // `listen` labels the log line and feeds the bind/wg_bound checks, so a
+    // mismatch would misdescribe the socket actually being served.
+    let bound = listener.local_addr()?;
+    let named: std::net::SocketAddr = config.listen.parse().map_err(|error| {
+        anyhow::anyhow!("run_on: config.listen {:?} is not a socket address: {error}", config.listen)
+    })?;
+    anyhow::ensure!(
+        named == bound,
+        "run_on: config.listen {} does not name the listener's address {bound}",
+        config.listen
+    );
+    serve(config, Some(listener), ready_tx).await
+}
+
+async fn serve(
+    config: RunConfig,
+    bound: Option<tokio::net::TcpListener>,
+    ready_tx: oneshot::Sender<()>,
+) -> Result<()> {
     let RunConfig {
         #[cfg(test)]
         session_probe,
@@ -562,7 +596,11 @@ pub async fn run(config: RunConfig, ready_tx: oneshot::Sender<()>) -> Result<()>
         crate::authority::Posture::Verified(a) => (true, a.epoch),
         crate::authority::Posture::Unverified { .. } => (false, 0),
     };
-    let listener = tokio::net::TcpListener::bind(&listen).await?;
+    // Same point in start-up either way: validation above runs first.
+    let listener = match bound {
+        Some(listener) => listener,
+        None => tokio::net::TcpListener::bind(&listen).await?,
+    };
     let mut unix_listener = match unix_socket.as_deref() {
         Some(path) => match crate::native_ingress::bind(path).await {
             Ok(listener) => Some(listener),
@@ -5892,6 +5930,43 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// run_on refuses a config whose `listen` names some other address than
+    /// the listener it was handed, before readiness or any serving.
+    #[tokio::test]
+    async fn run_on_refuses_a_listen_that_is_not_the_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let other = if bound.port() == 1 { 2 } else { 1 };
+        let config = |listen: String| super::RunConfig {
+            session_probe: None,
+            unix_socket: None,
+            pending_grants_per_parent: 32,
+            listen,
+            node: "test-node".into(),
+            wg_ip: "127.0.0.1".into(),
+            mesh_config_path: None,
+            spec_dir: None,
+            admission_mode: cosmix_config::node::AdmissionMode::Off,
+            mesh_open: false,
+            observe_allowed_services: Vec::new(),
+        };
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let error = super::run_on(config(format!("127.0.0.1:{other}")), listener, ready_tx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not name the listener's address"), "{error}");
+        assert!(ready_rx.await.is_err(), "readiness must not be signalled");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (ready_tx, _ready_rx) = tokio::sync::oneshot::channel();
+        let error = super::run_on(config("not-an-address".into()), listener, ready_tx)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a socket address"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

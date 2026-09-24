@@ -28,10 +28,37 @@ use it on every mutation that might be resent after a lost reply. A reused
 id with a different verb or arguments is refused as a conflict, never
 answered with another request's reply; the replay is the recorded outcome
 of the original attempt, so retrying after changing state needs a fresh id.
-Reads never consult the cache and always answer current state. With
+Reads never consult the cache and always answer current state. Replies echo
+the identity the targetless verb acted on as trailing `key=value` tokens —
+`tab=<id> pane=<id> revision=<tab-set revision>` on `tab.new`, `tab.select`,
+`pane.split`, `pane.select` and `type`, and at the head of the `snapshot`
+header line; `tab.close` adds `revision=`, `pane.close` adds `tab=` and
+`revision=`; each `tabs` line adds `revision=` and each `panes` line
+`tab=` and `revision=`. This lets a caller detect drift after the fact; it
+is detection, not binding (e.g. `split id=2 dir=v tab=1 pane=2 revision=2`).
+The revision counts structural changes (tabs or panes opened or closed); it
+does not move on `tab.select` or `pane.select`, so drift from a select shows
+in `tab=`/`pane=`, never in `revision=`.
+`tab.new` also ends with `binding=`: `granted` (a native launch grant was
+delivered; enrolment completes asynchronously — `term.session` tracks it),
+`graphics-only` (no usable grant, e.g. look-ahead quota exhaustion) or
+`unavailable` (the instance has no native session).
+A verb whose
+handler panics answers `internal error: verb handler panicked` (rc 10) and
+the lane keeps serving; a panic that unwinds while the tab set is locked may
+have left it half-changed, so the terminal logs the verb and aborts rather
+than serve over torn state — before replying, so that caller gets no reply
+at all and sees only the terminal vanish from the Bus. With
 `COSMIX_MESH_OPEN=0` the strict diagnostic-only lane returns: `INFO`/`HELP`
 only, everything else refused with `FORBIDDEN`, including when
-native-session bootstrap fails.
+native-session bootstrap fails. The posture is reported, not left to
+inference: the global lane's `term.session` carries `"posture":"mesh-open"`
+(derived from the gate, not re-read from config: the strict lane refuses
+`term.session` before any handler runs, so a global-lane answer is by
+construction mesh-open),
+the strict lane's `INFO`/`HELP` reply says `posture=strict`, and the
+native-session lane's `term.session` carries `"posture"` as `mesh-open` or
+`strict` in either posture.
 
 Target-bound protected controls belong on the broker-allocated, verified Unix
 Term identity. BROKER-023 defines their policy; a service name is never proof
