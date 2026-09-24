@@ -115,6 +115,12 @@ try
   fixture("data/applications/xapp.desktop", "[Desktop Entry]\n" ..
     "Type=Application\nName=X App\nExec=" .. $tmp .. "/bin/display-recorder\n")
   fixture("run/cosmix-comp/wayland-apps-test.xwayland.env", "DISPLAY=:7\nGENERATION=1\n")
+  -- A program that does not exist, and one that is not executable.
+  fixture("data/applications/ghost.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=Ghost App\nExec=" .. $tmp .. "/bin/no-such-program\n")
+  fixture("bin/not-runnable", "#!/opt/cosmix/bin/mix\n")
+  fixture("data/applications/noexec.desktop", "[Desktop Entry]\n" ..
+    "Type=Application\nName=NoExec App\nExec=" .. $tmp .. "/bin/not-runnable\n")
   $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/recorder", $tmp .. "/bin/display-recorder"])
 
   $noded_pid = spawn(["/opt/cosmix/bin/cosmix-noded", "serve", "--listen", "127.0.0.1:" .. to_string($port),
@@ -160,6 +166,13 @@ try
   $svc_log = read_file_or_nil($tmp .. "/svc.log")
   check($svc_log != nil and contains($svc_log, "apps.launch xapp: DISPLAY unset: no XWayland descriptor at "),
     "the citizen did not log why DISPLAY was removed")
+  -- On that same env(1) -u path a missing or non-executable program is
+  -- still spawn_failed (rc 11), not a pid for env that dies afterwards.
+  $ghost = call("apps", "apps.launch", json_encode({id: "ghost"}))
+  -- A non-zero reply's body arrives as text, not a parsed map.
+  check($ghost.rc == 11 and contains(to_string($ghost.result), "spawn_failed"), "a missing program was reported launched")
+  $noexec = call("apps", "apps.launch", json_encode({id: "noexec"}))
+  check($noexec.rc == 11 and contains(to_string($noexec.result), "spawn_failed"), "a non-executable program was reported launched")
 
   -- apps.terminal may carry arguments: parsed with the Exec rules and
   -- prefixed as terminal argv + app argv (B7 over the Bus).
@@ -175,7 +188,7 @@ try
   fixture("data/applications/late.desktop", "[Desktop Entry]\n" ..
     "Type=Application\nName=Late App\nExec=" .. $tmp .. "/bin/recorder late-arg\n")
   $reload = call("apps", "apps.reload", "{}")
-  check($reload.rc == 0 and $reload.result.count == 5, "apps.reload count wrong (expected 5 index entries)")
+  check($reload.rc == 0 and $reload.result.count == 7, "apps.reload count wrong (expected 7 index entries)")
   check(call("apps", "apps.get", json_encode({id: "late"})).rc == 0, "apps.reload did not rebind the index")
 
   -- Icon resolution through the citizen (theme chain, fixture hicolor).

@@ -472,6 +472,20 @@ fn launch_display($runtime_dir, $wayland_display)
   return {display: $display, why: ""}
 end
 
+fn resolve_exec($cmd, $cwd)
+  -- The runnable file argv[0] names, or nil. A bare name searches PATH
+  -- (the citizen's PATH is the child's PATH: the launch env only adds
+  -- DISPLAY); a name with a slash is taken as a path, relative ones against
+  -- the launch cwd. Checked up front because the env(1) -u wrapper would
+  -- otherwise spawn successfully and fail only after apps.launch replied.
+  if type($cmd) != "string" or $cmd == "" then return nil end
+  if not contains($cmd, "/") then return which($cmd) end
+  $path = $cmd
+  if not starts_with($path, "/") and $cwd != "" then $path = $cwd .. "/" .. $path end
+  if is_file($path) and access($path, "x") then return $path end
+  return nil
+end
+
 fn launch_spawn($argv, $display)
   -- The argv and env for one launch. With a display the child gets
   -- DISPLAY=:N over its inherited environment; without one DISPLAY is

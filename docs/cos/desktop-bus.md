@@ -146,7 +146,9 @@ instead of drawing on another X server. The citizen writes one stderr line
 per such launch naming the reason, including an unreadable descriptor. The
 file is mode 0600, so the citizen must run as comp's uid. The unset goes
 through `env -u DISPLAY`, because Mix's spawn `env` option cannot remove a
-variable.
+variable. The program is resolved first, on the same `PATH` the child
+gets. A missing or non-executable program is still refused with rc 11
+`spawn_failed`, never answered with the wrapper's pid.
 
 A descriptor left behind by a comp killed with SIGKILL is not checked
 against its `GENERATION` or against a live XWayland. It is trusted until

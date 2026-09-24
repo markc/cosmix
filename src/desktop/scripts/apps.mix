@@ -110,15 +110,24 @@ on "apps.launch" desc "launch an application by id, detached (uris optional)"
       -- DISPLAY for X11 apps, read from comp's live XWayland descriptor at
       -- each launch (TODO-comp C8). No descriptor: DISPLAY is removed, never
       -- inherited, and the reason is logged once per launch.
-      $x = $a.launch_display(env("XDG_RUNTIME_DIR"), env("WAYLAND_DISPLAY"))
-      if $x.display == nil then eprint("apps.launch " .. $id .. ": DISPLAY unset: " .. $x.why) end
-      $launch = $a.launch_spawn($argv, $x.display)
-      if len(keys($launch.env)) > 0 then $opts.env = $launch.env end
-      try
-        $pid = spawn($launch.argv, $opts)
-        reply(0, json_encode({id: $id, pid: $pid, argv: $argv}))
-      catch $err
+      -- A missing or non-executable program is spawn_failed, as it was before
+      -- the env(1) wrapper: resolve it first, since the wrapper itself would
+      -- spawn fine and fail only after the reply.
+      $exe = len($argv) > 0 ? $a.resolve_exec($argv[0], get_or($opts, "cwd", "")) : nil
+      if $exe == nil then
+        eprint("apps.launch " .. $id .. ": spawn_failed: no executable for " .. (len($argv) > 0 ? $argv[0] : "<empty Exec>"))
         reply(11, json_encode({error: "spawn_failed", id: $id}))
+      else
+        $x = $a.launch_display(env("XDG_RUNTIME_DIR"), env("WAYLAND_DISPLAY"))
+        if $x.display == nil then eprint("apps.launch " .. $id .. ": DISPLAY unset: " .. $x.why) end
+        $launch = $a.launch_spawn($argv, $x.display)
+        if len(keys($launch.env)) > 0 then $opts.env = $launch.env end
+        try
+          $pid = spawn($launch.argv, $opts)
+          reply(0, json_encode({id: $id, pid: $pid, argv: $argv}))
+        catch $err
+          reply(11, json_encode({error: "spawn_failed", id: $id}))
+        end
       end
     end
   end

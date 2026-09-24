@@ -213,6 +213,18 @@ try
   fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=nope\n")
   $ld = $a.launch_display($tmp, "wayland-9")
   check($ld.display == nil and contains($ld.why, "no valid DISPLAY"), "malformed descriptor not reported")
+  -- argv[0] is resolved before the env(1) wrapper can hide a missing program.
+  check($a.resolve_exec("sh", "") != nil, "resolve_exec missed sh on PATH")
+  check($a.resolve_exec("definitely-not-a-real-binary-xyz", "") == nil, "resolve_exec invented a PATH hit")
+  fixture("bin/runnable", "#!/bin/sh\n")
+  fixture("bin/not-runnable", "#!/bin/sh\n")
+  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/runnable"])
+  $_chmod = run_argv_must(["chmod", "0644", $tmp .. "/bin/not-runnable"])
+  check($a.resolve_exec($tmp .. "/bin/runnable", "") == $tmp .. "/bin/runnable", "resolve_exec missed an absolute executable")
+  check($a.resolve_exec($tmp .. "/bin/not-runnable", "") == nil, "resolve_exec accepted a non-executable file")
+  check($a.resolve_exec($tmp .. "/bin/absent", "") == nil, "resolve_exec accepted a missing path")
+  check($a.resolve_exec("bin/runnable", $tmp) == $tmp .. "/bin/runnable", "resolve_exec ignored the launch cwd")
+  check($a.resolve_exec("", "") == nil, "resolve_exec accepted an empty argv[0]")
   -- With a display it is set; without one it is REMOVED via env -u, never inherited.
   $s = $a.launch_spawn(["xapp", "--flag"], ":4")
   check(deep_eq($s.argv, ["xapp", "--flag"]) and $s.env.DISPLAY == ":4", "launch_spawn with a display wrong")
