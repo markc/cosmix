@@ -347,7 +347,11 @@ fn setup(
     bindings.set(
         Edge::Bottom,
         vec![
-            QuoinPageContent::new("launcher", bottom_launcher(&mut commands)),
+            // The runtime ticks the clock only while this page is active.
+            QuoinPageContent::new(
+                cosmix_shell::runtime::CLOCK_PAGE_ID,
+                bottom_launcher(&mut commands),
+            ),
             QuoinPageContent::new("power", bottom_power(&mut commands)),
             QuoinPageContent::new(
                 "tasks",

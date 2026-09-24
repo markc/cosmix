@@ -639,13 +639,18 @@ fn update_model(
         }
     }
     let mut next_frame = ShellFrame::from_model(&runtime.model);
-    if next_frame.panel(Edge::Bottom).mapped {
+    // Tick only while the built-in clock is on screen: another bottom page
+    // (e.g. a citizen's scene page) hides it, and a hidden clock must not
+    // wake the host every second.
+    let bottom = next_frame.panel(Edge::Bottom);
+    if bottom.mapped && bottom.active_page_id.as_deref() == Some(CLOCK_PAGE_ID) {
         if runtime
             .clock_deadline
             .is_none_or(|deadline| now >= deadline)
         {
-            runtime.clock_text = local_clock_text_at(SystemTime::now());
-            runtime.clock_deadline = Some(now + Duration::from_secs(1));
+            let wall = SystemTime::now();
+            runtime.clock_text = local_clock_text_at(wall);
+            runtime.clock_deadline = Some(next_second_boundary(now, wall));
         }
         next_frame.content.bottom_clock_text = Some(runtime.clock_text.clone());
         if let Some(deadline) = runtime.clock_deadline {
@@ -663,6 +668,19 @@ fn update_model(
         next_frame.panels[index].page_change = change;
     }
     frame.0 = next_frame;
+}
+
+/// The bottom page whose content carries the built-in `QuoinClock`; the
+/// runtime publishes clock text and arms its wake only while it is active.
+pub const CLOCK_PAGE_ID: &str = "launcher";
+
+/// Monotonic time of the next wall-clock second, so the displayed seconds
+/// change on the boundary instead of drifting by one update's latency.
+fn next_second_boundary(now: Duration, wall: SystemTime) -> Duration {
+    let into = wall
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    now + Duration::from_nanos(u64::from(1_000_000_000 - into))
 }
 
 fn local_clock_text_at(wall: SystemTime) -> String {
@@ -909,6 +927,45 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
         app
+    }
+
+    #[test]
+    fn clock_ticks_only_while_its_page_is_shown() {
+        let mut app = app();
+        app.world_mut()
+            .resource_mut::<ShellRuntime>()
+            .model
+            .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::Dock)
+            .unwrap();
+        let pages = vec![CLOCK_PAGE_ID.to_owned(), "scene-panel".to_owned()];
+        set_shell_pages(app.world_mut(), Edge::Bottom, pages.clone(), Some("scene-panel"));
+        app.update();
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert!(frame.panel(Edge::Bottom).mapped);
+        assert_eq!(frame.content.bottom_clock_text, None);
+        assert_eq!(
+            app.world().resource::<ShellRuntime>().clock_deadline,
+            None,
+            "a hidden clock arms no wake"
+        );
+        set_shell_pages(app.world_mut(), Edge::Bottom, pages, Some(CLOCK_PAGE_ID));
+        app.update();
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert!(frame.content.bottom_clock_text.is_some());
+        let deadline = app.world().resource::<ShellRuntime>().clock_deadline.unwrap();
+        assert!(frame.wake_deadline.is_some_and(|wake| wake <= deadline));
+    }
+
+    #[test]
+    fn clock_wakes_on_the_next_wall_second() {
+        let now = Duration::from_secs(40);
+        let wall = std::time::UNIX_EPOCH + Duration::from_millis(5_250);
+        assert_eq!(
+            next_second_boundary(now, wall),
+            now + Duration::from_millis(750)
+        );
+        let exact = std::time::UNIX_EPOCH + Duration::from_secs(6);
+        assert_eq!(next_second_boundary(now, exact), now + Duration::from_secs(1));
     }
 
     #[test]

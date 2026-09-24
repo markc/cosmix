@@ -201,9 +201,11 @@ coalesces work into one `app.update()` demand. `Idle` removes the model timer
 and blocks on the Wayland file descriptor when no configure or frame request
 is outstanding. `WakeAt` owns one replaceable absolute calloop timer.
 `Animate` advances only from `wl_surface.frame` callbacks, with at most one
-outstanding callback per mapped animating panel. The visible bottom clock's
-one-second deadline is content work and disappears when that panel is
-unmapped. Callbacks are generation-tagged, so late or expired callbacks are
+outstanding callback per mapped animating panel. The bottom clock's deadline
+is content work, armed for the next wall-clock second only while the bottom
+panel is mapped with its clock-bearing `launcher` page active; any other
+bottom page (a citizen's scene page, for instance) or an unmapped panel arms
+none. Unchanged clock text is not rewritten. Callbacks are generation-tagged, so late or expired callbacks are
 ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
 requests, which no process lifetime reaches).
 
@@ -212,10 +214,14 @@ local time with an explicit numeric UTC offset. Persist timezone preferences
 through the operating system's timezone configuration; Quoin reuses that
 configuration on subsequent launches.
 
-Background preference reconciliation shares this deadline mechanism. It
-requests a fresh wallpaper snapshot once per second, including while panels
-are hidden, and also responds to Bus invalidations. Unchanged values do not
-rewrite widget text.
+Background preference reconciliation shares this deadline mechanism and does
+not poll. Quoin reads the wallpaper snapshot once per connection, again after
+each write, and again whenever the System page is opened; while that page is
+visible it re-reads on a `wallpaper.props.changed` (or
+`bg-showcase.props.changed`) invalidation or a Bus delivery gap. While the page
+is hidden an invalidation only marks the snapshot stale. A failed read retries
+only while the page is visible, backing off from 2 s to at most 30 s.
+Unchanged values do not rewrite widget text.
 
 Keyboard repeat shares this wake layer. The active key owns one replaceable
 absolute deadline; a due wake emits one coalesced repeat and arms the next
@@ -927,7 +933,11 @@ have a five-minute ceiling. Pending and finalising states are distinct from
 `~/Videos/Cosmix` in the capture citizen's account, or its configured directory.
 
 These controls share Quoin's existing asynchronous Bus bridge, reconcile after
-reconnect and report unavailable services. They do not launch competing
+reconnect and report unavailable services. Neither service publishes a change
+notification for this state, so Quoin reads both statuses once per connection,
+after each action and when the Demos tab opens, then at most every 5 s while
+the tab stays visible; a hidden tab polls nothing. Failed reads back off from
+2 s to at most 30 s, visible-only. They do not launch competing
 background processes. Session supervision starts one showcase and one capture
 citizen alongside the compositor. The existing System-page boids preferences
 can target the showcase with `COSMIX_QUOIN_BACKGROUND_SERVICE=bg-showcase`;
