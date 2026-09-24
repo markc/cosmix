@@ -126,9 +126,7 @@ fn verdict_source(verdict: &RuleVerdict) -> String {
             JunkReason::BlocklistSender => "rules:blocklist_sender".to_string(),
             JunkReason::MailAuthHardFail => "rules:mail_auth_hard_fail".to_string(),
             JunkReason::StructuralAnomaly => "rules:structural_anomaly".to_string(),
-            JunkReason::ScoreBreach if matched_rules.is_empty() => {
-                "rules:score_breach".to_string()
-            }
+            JunkReason::ScoreBreach if matched_rules.is_empty() => "rules:score_breach".to_string(),
             JunkReason::ScoreBreach => format!("rules:{}", matched_rules.join("+")),
         },
         RuleVerdict::Continue { .. } => "bayes".to_string(),
