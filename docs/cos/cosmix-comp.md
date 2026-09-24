@@ -65,8 +65,9 @@ surface because a callback releases only its own surface's present, so a root
 that requests again every second cannot starve a subsurface. This matches the ~1 Hz KWin and Mutter give
 hidden windows. The trickle is paced by the existing frame opportunities, with
 no timer of its own, and the window restarts whenever a root becomes occluded
-again. At most 64 callbacks are retained per occluded root. Excess older ones
-complete at once rather than being dropped.
+again. At most 64 callbacks are retained per surface of an occluded tree, so a
+root with one subsurface can hold 128. Excess older ones complete at once rather
+than being dropped.
 
 Coverage uses applied opaque-region transactions and renderer-confirmed installed
 content. A pending DMA-BUF replacement cannot lend its opaque region to an older
