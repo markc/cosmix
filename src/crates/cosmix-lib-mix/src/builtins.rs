@@ -23999,7 +23999,10 @@ mod owned_spawns_tests {
         }
     }
 
+    // The Child handle is deliberately never wait()ed: reaping an owned pid
+    // is the registry's job, and that is exactly what these tests check.
     #[test]
+    #[allow(clippy::zombie_processes)]
     fn process_alive_on_a_dead_owned_child_retires_it_and_the_sweep_signals_nothing() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let _ = owned_spawns::sweep();
@@ -24027,6 +24030,7 @@ mod owned_spawns_tests {
     }
 
     #[test]
+    #[allow(clippy::zombie_processes)]
     fn a_dead_leader_with_a_live_descendant_stays_pinned_and_is_swept() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let _ = owned_spawns::sweep();
