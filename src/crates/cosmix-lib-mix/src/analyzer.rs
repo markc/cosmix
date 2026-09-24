@@ -2405,7 +2405,7 @@ fn sole_string_definitions(stmts: &[Stmt]) -> HashMap<String, (RemoteBody, usize
 fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
     let sole = sole_string_definitions(stmts);
     let mut sites = Vec::new();
-    walk_frames(stmts, TOP_FRAME, &mut |node, _frame| {
+    walk_frames(stmts, TOP_FRAME, &mut |node, frame| {
         let FrameNode::Expr(expr, line) = node else {
             return;
         };
@@ -2414,8 +2414,14 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
             && let Some(body) = args.get(1)
         {
             let body = match body {
+                // Visible at the call only when bound at top level (a fn
+                // reads globals) or in the call's own frame. A local of
+                // another function is undefined here at runtime — the
+                // outer E1101 says so — and analysing its literal would
+                // only add noise about a body that never ships.
                 Expr::Variable(v) => sole
                     .get(v)
+                    .filter(|(_, bound_in)| *bound_in == TOP_FRAME || *bound_in == frame)
                     .map_or(RemoteBody::Opaque, |(shape, _)| shape.clone()),
                 other => body_shape(other, line).unwrap_or(RemoteBody::Opaque),
             };

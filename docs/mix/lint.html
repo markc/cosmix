@@ -676,7 +676,8 @@ end
 </code></pre>
 <p>"Sole" is strict. A second assignment, a loop variable or a parameter of the
 same name anywhere in the file makes the value unknowable, and the body is
-reported as unanalysable instead. Findings in a bound heredoc point at the
+reported as unanalysable instead. The binding must also be visible at the
+call: at top level, or in the same function as the call. Findings in a bound heredoc point at the
 heredoc's own lines. A heredoc shipped by several calls reports each finding
 once. Calls are found at any depth: in loops, branches, functions and lambdas.</p>
 <pre><code>deploy_thing.mix:283: MIX-D3001 note: [inside ssh_mix body] `regex_match` is

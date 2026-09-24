@@ -350,6 +350,24 @@ fn a_lambda_parameter_is_a_binder() {
 }
 
 #[test]
+fn another_functions_local_is_not_resolved() {
+    // `$q` is bound once, but as a local of build(); inside ship() it is
+    // undefined at runtime, so its heredoc never ships from there.
+    let src = format!(
+        "fn build()\n  $q = {LOST_PUSH}\n  return $q\nend\nfn ship($h)\n  return ssh_mix($h, $q)\nend\nprint(build())\nprint(ship(\"a\"))\n"
+    );
+    let c = codes(&src);
+    assert!(!c.iter().any(|x| x == "MIX-E1501"), "resolved across frames: {c:?}");
+    assert!(c.iter().any(|x| x == "MIX-D3012"), "{c:?}");
+    // The same local used in its OWN frame does resolve, and so does a
+    // top-level binding read from inside a function.
+    let own = format!("fn ship($h)\n  $q = {LOST_PUSH}\n  return ssh_mix($h, $q)\nend\nprint(ship(\"a\"))\n");
+    assert!(codes(&own).iter().any(|x| x == "MIX-E1501"), "{:?}", codes(&own));
+    let top = format!("$q = {LOST_PUSH}\nfn ship($h)\n  return ssh_mix($h, $q)\nend\nprint(ship(\"a\"))\n");
+    assert!(codes(&top).iter().any(|x| x == "MIX-E1501"), "{:?}", codes(&top));
+}
+
+#[test]
 fn a_file_with_source_or_include_resolves_nothing() {
     // The loaded file can rebind anything, so "sole binder" is unknowable.
     let src = "source(\"other.mix\")\n$p = 'print(1)'\n$r = ssh_mix(\"a\", $p)\n";
