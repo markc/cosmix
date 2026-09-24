@@ -200,7 +200,10 @@ Durability is explicit, and the default claims none it did not request:
 `"none"` is still fully atomic against readers and against the *process*
 dying. Only the machine dying can lose the new content. With `"full"`, a
 failed directory sync raises even though the new file is already in place.
-The message says so, because at that point its durability is unconfirmed.
+It is the one failure that happens *after* the replace, so it has its own
+code, `WRITE_NOT_DURABLE`, with `$err.details.replaced == true`. Every other
+failure leaves the target untouched. A gate must never "roll back" on
+`WRITE_NOT_DURABLE`, because the new content is already the file.
 
 Other rules:
 

@@ -13305,6 +13305,27 @@ fn set_access_acl(file: &std::fs::File, acl: Option<&[u8]>) -> std::io::Result<(
     Ok(())
 }
 
+/// The one failure AFTER the rename (review MINOR-8): the new content IS in
+/// place, only its durability is unconfirmed. A distinct code plus
+/// `details.replaced: true` lets a gate tell it from every other failure —
+/// which all leave the target untouched — so it never "rolls back" a file
+/// that was in fact replaced.
+fn write_atomic_not_durable(path: &str, error: &std::io::Error) -> MixError {
+    let mut details = indexmap::IndexMap::new();
+    details.insert("replaced".to_string(), Value::Bool(true));
+    details.insert("path".to_string(), Value::String(path.to_string()));
+    MixError::Structured(Box::new(
+        crate::error::ErrorInfo::new(
+            "WRITE_NOT_DURABLE",
+            format!(
+                "write_atomic '{path}': replaced, but syncing the directory failed \
+                 (the new content is in place and not yet known durable): {error}"
+            ),
+        )
+        .with_details(Value::map(details)),
+    ))
+}
+
 fn write_atomic_error(path: &str, what: &str, error: &std::io::Error) -> MixError {
     MixError::RuntimeError {
         span: None,
@@ -13476,13 +13497,7 @@ fn write_atomic_impl(
     if opts.durability == WriteDurability::Full {
         let synced = std::fs::File::open(Path::new(&dir)).and_then(|d| d.sync_all());
         if let Err(e) = synced {
-            // The new file IS in place; only its durability is unconfirmed.
-            return Err(write_atomic_error(
-                path,
-                "replaced, but syncing the directory failed (the new content is in place \
-                 and not yet known durable)",
-                &e,
-            ));
+            return Err(write_atomic_not_durable(path, &e));
         }
     }
     Ok(())
@@ -24287,6 +24302,26 @@ mod write_atomic_tests {
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o4755);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The post-rename durability failure is distinguishable by code and by
+    /// `details.replaced`, not only by message text. (A failing directory
+    /// fsync cannot be provoked portably in a test, so the error's shape is
+    /// pinned at its single construction site.)
+    #[test]
+    fn a_post_rename_sync_failure_says_the_file_was_replaced() {
+        let e = super::write_atomic_not_durable("/x/y", &std::io::Error::from_raw_os_error(libc::EIO));
+        match e {
+            MixError::Structured(info) => {
+                assert_eq!(info.code, "WRITE_NOT_DURABLE");
+                let Value::Map(details) = &info.details else {
+                    panic!("details must be a map: {:?}", info.details);
+                };
+                assert!(matches!(details.get("replaced"), Some(Value::Bool(true))));
+                assert!(info.message.contains("in place"), "{}", info.message);
+            }
+            other => panic!("expected a structured error, got {other:?}"),
+        }
     }
 
     #[test]

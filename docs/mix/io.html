@@ -601,7 +601,10 @@ it, and it is safe to delete.</p>
 <p><code>"none"</code> is still fully atomic against readers and against the <em>process</em>
 dying. Only the machine dying can lose the new content. With <code>"full"</code>, a
 failed directory sync raises even though the new file is already in place.
-The message says so, because at that point its durability is unconfirmed.</p>
+It is the one failure that happens <em>after</em> the replace, so it has its own
+code, <code>WRITE_NOT_DURABLE</code>, with <code>$err.details.replaced == true</code>. Every other
+failure leaves the target untouched. A gate must never "roll back" on
+<code>WRITE_NOT_DURABLE</code>, because the new content is already the file.</p>
 <p>Other rules:</p>
 <ul>
 <li><strong>data</strong> must be a string, bytes or a buffer. Nothing else is coerced. A
