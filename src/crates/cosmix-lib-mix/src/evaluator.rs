@@ -4702,46 +4702,6 @@ impl Evaluator {
         outcome
     }
 
-    /// Dispatch an event: classify the registered chain for
-    /// `event.command`, register the reply correlation, and route to
-    /// the Class S inline path or the Class C `tokio::task::spawn_local`
-    /// path per [`ChainClass::from_entries`] (plan §4 WS3
-    /// "Mixed-class-per-event rule — Class C if ANY matching handler is
-    /// `async`").
-    ///
-    /// **Class S (atomic).** Acquires the scheduler writer permit via
-    /// [`DispatchScheduler::acquire_writer_dispatch`], builds a
-    /// per-invocation activation via [`Evaluator::for_invocation`],
-    /// and awaits the chain inline on that activation (C.7g B1). No
-    /// other handler invocation (Class S or Class C) progresses until
-    /// the chain completes; today's atomic dispatch semantics are
-    /// preserved bit-for-bit, and cancellation between admission and
-    /// return discards the activation's private `InvocationCtx` /
-    /// local `Scope` frames without touching `self`.
-    ///
-    /// **Class C (spawnable).** Builds a per-invocation `Evaluator` via
-    /// [`Evaluator::for_invocation`] (γ activation — fresh
-    /// `InvocationCtx`, private local Scope frames, shared globals)
-    /// and `tokio::task::spawn_local`s the chain body on the ambient
-    /// LocalSet. Returns *immediately* — the chain runs concurrently
-    /// with other Class C invocations, gated by the scheduler reader
-    /// permit acquired inside the task body so a Class S writer can
-    /// preempt new starts. The task's `JoinHandle` is registered in
-    /// [`ClassCTaskRegistry`] for C.7f shutdown-drain enumeration; the
-    /// spawned task removes its own entry on normal completion.
-    ///
-    /// **Requires a `LocalSet` context for Class C events.**
-    /// `tokio::task::spawn_local` panics outside a `LocalSet`. The
-    /// production runners (`run_source` / serve) wrap their async
-    /// blocks in `LocalSet::new().run_until(...)`. Tests that exercise
-    /// only Class S handlers do not need a LocalSet; tests that fire
-    /// async handlers must wrap accordingly.
-    ///
-    /// Error semantics: handler body errors are caught inside
-    /// `run_handlers_for`, logged via `tracing::error!`, and do NOT
-    /// propagate. The handler stays registered, and subsequent events
-    /// continue to be servable. Main-body errors still crash the script
-    /// loudly — only handler errors are soft.
     /// Answer a `type=request` naming a command this script has no `on`
     /// handler for: rc 10 (the application-error band, as noded answers an
     /// unknown verb) with an `error_code` body, so `send` hands the caller a
@@ -4803,6 +4763,46 @@ impl Evaluator {
         }
     }
 
+    /// Dispatch an event: classify the registered chain for
+    /// `event.command`, register the reply correlation, and route to
+    /// the Class S inline path or the Class C `tokio::task::spawn_local`
+    /// path per [`ChainClass::from_entries`] (plan §4 WS3
+    /// "Mixed-class-per-event rule — Class C if ANY matching handler is
+    /// `async`").
+    ///
+    /// **Class S (atomic).** Acquires the scheduler writer permit via
+    /// [`DispatchScheduler::acquire_writer_dispatch`], builds a
+    /// per-invocation activation via [`Evaluator::for_invocation`],
+    /// and awaits the chain inline on that activation (C.7g B1). No
+    /// other handler invocation (Class S or Class C) progresses until
+    /// the chain completes; today's atomic dispatch semantics are
+    /// preserved bit-for-bit, and cancellation between admission and
+    /// return discards the activation's private `InvocationCtx` /
+    /// local `Scope` frames without touching `self`.
+    ///
+    /// **Class C (spawnable).** Builds a per-invocation `Evaluator` via
+    /// [`Evaluator::for_invocation`] (γ activation — fresh
+    /// `InvocationCtx`, private local Scope frames, shared globals)
+    /// and `tokio::task::spawn_local`s the chain body on the ambient
+    /// LocalSet. Returns *immediately* — the chain runs concurrently
+    /// with other Class C invocations, gated by the scheduler reader
+    /// permit acquired inside the task body so a Class S writer can
+    /// preempt new starts. The task's `JoinHandle` is registered in
+    /// [`ClassCTaskRegistry`] for C.7f shutdown-drain enumeration; the
+    /// spawned task removes its own entry on normal completion.
+    ///
+    /// **Requires a `LocalSet` context for Class C events.**
+    /// `tokio::task::spawn_local` panics outside a `LocalSet`. The
+    /// production runners (`run_source` / serve) wrap their async
+    /// blocks in `LocalSet::new().run_until(...)`. Tests that exercise
+    /// only Class S handlers do not need a LocalSet; tests that fire
+    /// async handlers must wrap accordingly.
+    ///
+    /// Error semantics: handler body errors are caught inside
+    /// `run_handlers_for`, logged via `tracing::error!`, and do NOT
+    /// propagate. The handler stays registered, and subsequent events
+    /// continue to be servable. Main-body errors still crash the script
+    /// loudly — only handler errors are soft.
     pub async fn dispatch_event(&mut self, event: IncomingEvent) -> MixResult<()> {
         // Snapshot the handler chain for this command. An empty (or
         // missing) entry list is the fast no-handler path: drop the
