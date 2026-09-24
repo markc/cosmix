@@ -39,10 +39,12 @@ impl Surface {
         &self.rgba
     }
 
+    #[cfg(test)]
     pub fn width(&self) -> u32 {
         self.width
     }
 
+    #[cfg(test)]
     pub fn height(&self) -> u32 {
         self.height
     }
