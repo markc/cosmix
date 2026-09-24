@@ -13111,6 +13111,10 @@ enum AtomicFault {
     AfterPartialWrite,
     /// Write and sync everything, then fail just before the rename.
     BeforeRename,
+    /// Just before the rename, move the target's directory aside and put a
+    /// fresh directory at its old path (the review MINOR-12 race): the
+    /// rename must still land in the directory that was pinned.
+    SwapDirectoryBeforeRename,
 }
 
 const WRITE_ATOMIC_OPT_KEYS: &[&str] = &["durability", "mode", "max_bytes"];
@@ -13264,7 +13268,9 @@ fn builtin_write_atomic(args: Vec<Value>) -> MixResult<Option<Value>> {
 const ACL_ACCESS_XATTR: &std::ffi::CStr = c"system.posix_acl_access";
 
 /// The file's POSIX access ACL as its raw xattr, `None` when it has none or
-/// the filesystem does not support ACLs.
+/// the filesystem does not support ACLs. The final component is not
+/// followed (lgetxattr): write_atomic passes /proc/self/fd/DIR/NAME, and an
+/// entry swapped for a symlink must not have its referent's ACL read.
 fn read_access_acl(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -13272,7 +13278,7 @@ fn read_access_acl(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
     loop {
         // SAFETY: size query — a null buffer of length 0.
         let size = unsafe {
-            libc::getxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+            libc::lgetxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
         };
         if size < 0 {
             let e = std::io::Error::last_os_error();
@@ -13284,7 +13290,7 @@ fn read_access_acl(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
         let mut buf = vec![0u8; size as usize];
         // SAFETY: `buf` is exactly `size` writable bytes.
         let got = unsafe {
-            libc::getxattr(
+            libc::lgetxattr(
                 c_path.as_ptr(),
                 ACL_ACCESS_XATTR.as_ptr(),
                 buf.as_mut_ptr().cast(),
@@ -13362,9 +13368,12 @@ fn write_atomic_impl(
     opts: &WriteAtomicOpts,
     fault: AtomicFault,
 ) -> MixResult<()> {
+    use std::ffi::CString;
     use std::io::Write as _;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     if let Some(max) = opts.max_bytes
@@ -13378,6 +13387,15 @@ fn write_atomic_impl(
             ),
         ));
     }
+    // "dir/file/" names a DIRECTORY `file`; open(2) would say ENOTDIR. Without
+    // this, Path::file_name() quietly drops the slash and a regular file is
+    // created (review NIT).
+    if path.ends_with('/') {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("write_atomic '{path}': a path ending in '/' names a directory"),
+        });
+    }
 
     // A symlink is followed to the file it names, so the LINK survives and its
     // target is what gets replaced — write_file's semantics. Renaming over the
@@ -13387,17 +13405,6 @@ fn write_atomic_impl(
             .map_err(|e| write_atomic_error(path, "resolving symlink", &e))?,
         _ => PathBuf::from(path),
     };
-    let existing = match std::fs::metadata(&target) {
-        Ok(meta) if meta.is_file() => Some(meta),
-        Ok(_) => {
-            return Err(MixError::RuntimeError {
-                span: None,
-                msg: format!("write_atomic '{path}': target exists and is not a regular file"),
-            });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(write_atomic_error(path, "stat target", &e)),
-    };
     let name = target.file_name().ok_or_else(|| MixError::RuntimeError {
         span: None,
         msg: format!("write_atomic '{path}': path names no file"),
@@ -13406,24 +13413,88 @@ fn write_atomic_impl(
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     };
+    let name_c = CString::new(name.as_bytes()).map_err(|_| MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': path contains a NUL byte"),
+    })?;
 
-    // The existing target's POSIX access ACL, carried to the new inode.
+    // Pin the directory (review MINOR-12). Every later step — inspecting the
+    // target, creating the temp, the rename, cleanup, the directory fsync —
+    // is relative to THIS open directory, so renaming or replacing it (or
+    // any parent) mid-call cannot redirect the write somewhere else.
+    let dir_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&dir)
+        .map_err(|e| write_atomic_error(path, "opening the target's directory", &e))?;
+    let dirfd = dir_fd.as_raw_fd();
+
+    // Inspect the final name WITHOUT following it. A regular target resolved
+    // above that is now a symlink was swapped concurrently: refuse rather
+    // than replace a link the caller never named.
+    struct Existing {
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    }
+    let existing: Option<Existing> = {
+        // SAFETY: fstatat writes only into the zeroed local `st`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::fstatat(dirfd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if rc == -1 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(write_atomic_error(path, "stat target", &e));
+            }
+            None
+        } else {
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => Some(Existing {
+                    uid: st.st_uid,
+                    gid: st.st_gid,
+                    mode: st.st_mode & 0o7777,
+                }),
+                libc::S_IFLNK => {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "write_atomic '{path}': the target became a symlink while it was \
+                             being resolved (concurrent replacement); nothing was written"
+                        ),
+                    });
+                }
+                _ => {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "write_atomic '{path}': target exists and is not a regular file"
+                        ),
+                    });
+                }
+            }
+        }
+    };
+
+    // The existing target's POSIX access ACL, read through the pinned
+    // directory (/proc/self/fd/N/name, final component not followed).
     let existing_acl = match &existing {
-        Some(_) => read_access_acl(&target)
-            .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?,
+        Some(_) => {
+            let via_dir = PathBuf::from(format!("/proc/self/fd/{dirfd}")).join(name);
+            read_access_acl(&via_dir)
+                .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?
+        }
         None => None,
     };
 
     // Final permissions: an explicit mode wins; otherwise an existing target
     // keeps its own (including setuid/setgid/sticky); a brand-new file gets
     // write_file's 0o666 & ~umask, by creating the temp with 0o666.
-    let final_mode = opts
-        .mode
-        .or_else(|| existing.as_ref().map(|meta| meta.permissions().mode() & 0o7777));
+    let final_mode = opts.mode.or_else(|| existing.as_ref().map(|ex| ex.mode));
 
-    // Claim a temp name beside the target, O_EXCL, never following a symlink
-    // planted at that name. The visible name is kept short enough that the
-    // temp name cannot exceed NAME_MAX when the target's own name is long.
+    // Claim a temp name in the pinned directory, O_EXCL, never following a
+    // symlink planted at that name. The visible name is kept short enough
+    // that the temp name cannot exceed NAME_MAX when the target's own name is
+    // long.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let stem = name.to_string_lossy();
     let mut cut = stem.len().min(200);
@@ -13431,51 +13502,56 @@ fn write_atomic_impl(
         cut -= 1;
     }
     let stem = &stem[..cut];
-    let mut claimed: Option<(PathBuf, std::fs::File)> = None;
+    let create_mode: libc::c_uint = if final_mode.is_some() { 0o600 } else { 0o666 };
+    let mut claimed: Option<(CString, std::fs::File)> = None;
     for _ in 0..16 {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let candidate = dir.join(format!(
+        let tmp_name = format!(
             ".{stem}.mixtmp-{}-{}-{nonce:08x}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(if final_mode.is_some() { 0o600 } else { 0o666 })
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                claimed = Some((candidate, file));
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(write_atomic_error(path, "creating temp file", &e)),
+        );
+        let tmp_c = CString::new(tmp_name).expect("temp name built from a NUL-free stem");
+        // SAFETY: openat with a valid dirfd and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                tmp_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                create_mode,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat returned a fresh descriptor we now own.
+            claimed = Some((tmp_c, unsafe { std::fs::File::from_raw_fd(fd) }));
+            break;
         }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(write_atomic_error(path, "creating temp file", &e));
     }
-    let (tmp_path, mut file) = claimed.ok_or_else(|| MixError::RuntimeError {
+    let (tmp_c, mut file) = claimed.ok_or_else(|| MixError::RuntimeError {
         span: None,
         msg: format!("write_atomic '{path}': could not claim a unique temp name"),
     })?;
 
     let staged = (|| -> Result<(), (&'static str, std::io::Error)> {
         // Owner first; mode and ACL after the write (see below).
-        if let Some(meta) = &existing {
+        if let Some(ex) = &existing {
             let mine = file.metadata().map_err(|e| ("stat temp file", e))?;
-            if mine.uid() != meta.uid() || mine.gid() != meta.gid() {
-                std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid())).map_err(
-                    |e| {
-                        (
-                            "cannot keep the existing owner (write_atomic will not silently \
-                             change who owns a file)",
-                            e,
-                        )
-                    },
-                )?;
+            if mine.uid() != ex.uid || mine.gid() != ex.gid {
+                std::os::unix::fs::fchown(&file, Some(ex.uid), Some(ex.gid)).map_err(|e| {
+                    (
+                        "cannot keep the existing owner (write_atomic will not silently \
+                         change who owns a file)",
+                        e,
+                    )
+                })?;
             }
         }
         if fault == AtomicFault::AfterPartialWrite {
@@ -13508,20 +13584,33 @@ fn write_atomic_impl(
         if fault == AtomicFault::BeforeRename {
             return Err(("renaming", std::io::Error::other("injected rename failure")));
         }
-        std::fs::rename(&tmp_path, &target).map_err(|e| ("renaming over target", e))?;
+        if fault == AtomicFault::SwapDirectoryBeforeRename {
+            let aside = dir.with_extension("moved");
+            std::fs::rename(&dir, &aside).map_err(|e| ("test: moving dir aside", e))?;
+            std::fs::create_dir(&dir).map_err(|e| ("test: recreating dir", e))?;
+        }
+        // renameat never follows the final component: if another process
+        // swapped the target for a symlink after the check above, THAT name
+        // is what gets replaced — last writer wins on the name.
+        // SAFETY: both names are NUL-terminated; dirfd is open.
+        if unsafe { libc::renameat(dirfd, tmp_c.as_ptr(), dirfd, name_c.as_ptr()) } == -1 {
+            return Err(("renaming over target", std::io::Error::last_os_error()));
+        }
         Ok(())
     })();
     drop(file);
     if let Err((what, e)) = staged {
-        let _ = std::fs::remove_file(&tmp_path);
+        // SAFETY: removing our own temp name inside the pinned directory.
+        unsafe {
+            libc::unlinkat(dirfd, tmp_c.as_ptr(), 0);
+        }
         return Err(write_atomic_error(path, what, &e));
     }
 
-    if opts.durability == WriteDurability::Full {
-        let synced = std::fs::File::open(Path::new(&dir)).and_then(|d| d.sync_all());
-        if let Err(e) = synced {
-            return Err(write_atomic_not_durable(path, &e));
-        }
+    if opts.durability == WriteDurability::Full
+        && let Err(e) = dir_fd.sync_all()
+    {
+        return Err(write_atomic_not_durable(path, &e));
     }
     Ok(())
 }
@@ -24171,6 +24260,31 @@ mod write_atomic_tests {
         .expect_err("an injected rename failure must fail the call");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD-COMPLETE");
         assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review MINOR-12: the directory is pinned when the call starts. Moving
+    /// it aside and putting a fresh directory at its old path just before the
+    /// rename must not redirect the rename: the new content lands in the
+    /// directory that was opened, and nothing appears in the impostor.
+    #[test]
+    fn a_directory_swapped_mid_call_cannot_redirect_the_rename() {
+        let d = tmpdir("pin");
+        let sub = d.join("conf");
+        std::fs::create_dir(&sub).unwrap();
+        let target = sub.join("app.conf");
+        std::fs::write(&target, "OLD").unwrap();
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::Full),
+            AtomicFault::SwapDirectoryBeforeRename,
+        )
+        .expect("the rename lands in the pinned directory");
+        let moved = d.join("conf.moved").join("app.conf");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "NEW");
+        assert!(!target.exists(), "nothing may be written into the impostor directory");
+        assert_eq!(leftovers(&d.join("conf.moved")), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&d);
     }
 

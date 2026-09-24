@@ -242,6 +242,17 @@ Other rules:
 - **Symlinks.** A symlink path replaces the file the link names and keeps the
   link. That is `write_file`'s behaviour, and it avoids turning the link into
   a regular file. A dangling link raises.
+- **Concurrent changes.** The target's directory is opened once, at the
+  start. Checking the target, creating the temp, the rename, cleanup and the
+  directory fsync all happen relative to that open directory. Renaming or
+  replacing the directory, or any parent, while the call runs cannot
+  redirect the write elsewhere. If the resolved target has turned into a
+  symlink by the time it is checked, the call raises and writes nothing. The
+  final rename replaces whatever the name holds at that instant, and
+  `rename` never follows the last component. So if another process swaps in
+  a symlink between the check and the rename, the rename replaces the link
+  itself: the last writer to the name wins, and the call never writes
+  through the link.
 - **max_bytes** bounds the write. If the data is larger, the call raises
   `WRITE_TOO_LARGE` before anything touches the disk.
 - **Refusals.** A target that exists but is not a regular file, such as a
