@@ -122,11 +122,9 @@ fn validate_iface(name: String) -> Result<String, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!(concat!("cosmix-wgd ", env!("CARGO_PKG_VERSION")));
-        return ExitCode::SUCCESS;
-    }
     let opts = match parse_args(&args[1..]) {
         Ok(o) => o,
         Err(e) => {

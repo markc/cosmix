@@ -15,6 +15,8 @@ use cosmix_mds::{ContainerAttrs, Flags, Mds, Membership, SetId, SqliteCasMds};
 use std::path::PathBuf;
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let mut args = std::env::args().skip(1);
     let root: PathBuf = args
         .next()

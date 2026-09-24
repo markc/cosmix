@@ -1094,6 +1094,8 @@ fn start_ssh_publisher(service: TrayDaemon, connection: &Connection) -> Result<(
 }
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let _instance_lock = match acquire_instance_lock() {
         Ok(Some(lock)) => lock,
         Ok(None) => {

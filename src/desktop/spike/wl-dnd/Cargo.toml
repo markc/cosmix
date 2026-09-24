@@ -5,9 +5,14 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 bevy = { version = "=0.19.0", default-features = false, features = ["ui"] }
 raw-window-handle = "=0.6.2"
 smithay-client-toolkit = { version = "=0.19.2", default-features = false }
 wayland-backend = { version = "=0.3.15", features = ["client_system"] }
 wayland-client = "=0.31.14"
 wayland-protocols = "=0.32.13"
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

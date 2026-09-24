@@ -235,6 +235,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

@@ -368,6 +368,8 @@ const BENCH_REPLAY_ITERATIONS: u32 = 50;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     // `--json` is accepted for compatibility with program.md's invocation
     // shape; we don't actually emit JSON, but the loop driver may pass it.
     let _args: Vec<String> = env::args().skip(1).collect();

@@ -14,6 +14,8 @@ pub(crate) const IDENTITY: AppIdentity = AppIdentity {
 };
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     browser::run();
 }
 

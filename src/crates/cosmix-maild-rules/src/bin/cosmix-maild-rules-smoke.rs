@@ -70,6 +70,8 @@ fn synthetic_verify_result() -> VerifyResult {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let mut buf = Vec::new();
     std::io::stdin().read_to_end(&mut buf)?;
 

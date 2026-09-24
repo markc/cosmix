@@ -450,6 +450,8 @@ fn notify(summary: &str, body: &str) {
 }
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     if let Err(error) = IDENTITY.validate() {
         eprintln!("cosmix-tray: invalid identity: {error}");
         std::process::exit(2);

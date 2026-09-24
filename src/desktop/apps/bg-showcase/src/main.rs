@@ -187,6 +187,8 @@ fn default_media_root() -> Result<PathBuf, String> {
 }
 
 fn main() -> AppExit {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] {
         println!(
@@ -195,10 +197,6 @@ fn main() -> AppExit {
         println!(
             "--msaa 1|4 selects off or four samples (default 4). Native background.select accepts optional msaa; omission retains current quality."
         );
-        return AppExit::Success;
-    }
-    if args == ["--version"] {
-        println!("cosmix-bg-showcase {}", env!("CARGO_PKG_VERSION"));
         return AppExit::Success;
     }
     let options = match Options::parse(&args) {

@@ -233,6 +233,8 @@ enum Midi2Cmd {
 }
 
 fn main() -> Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Render {

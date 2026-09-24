@@ -23,6 +23,8 @@ const OUTPUT: &str = "quoin-dev-window";
 
 #[allow(dead_code)]
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let size = LogicalSize::new(1440.0, 900.0).expect("static demo geometry is valid");
     let output = OutputKey::new(OUTPUT).expect("static output key is valid");
     let registry = page_registry();

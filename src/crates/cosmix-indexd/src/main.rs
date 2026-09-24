@@ -2696,6 +2696,8 @@ impl Drop for LongReaderGuard {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let cli = Cli::parse();
     // Keep the handle: SPEC-12 `indexd.log` needs its `LogReloadHandle`
     // for live EnvFilter swaps (attach_props below).

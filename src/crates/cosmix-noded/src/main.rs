@@ -83,6 +83,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let _log = cosmix_log::init(
         &cosmix_log::LogOpts::default(),
         &cosmix_log::StatsOpts::default(),

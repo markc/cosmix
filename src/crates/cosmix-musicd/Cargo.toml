@@ -47,7 +47,6 @@ cosmix = [
     "dep:cosmix_config",
     "dep:cosmix_client",
     "dep:cosmix_bus",
-    "dep:cosmix_buildinfo",
     "dep:cosmix_props",
     "dep:cosmix_props_core",
     "dep:tokio",
@@ -95,7 +94,9 @@ cosmix_log = { package = "cosmix-lib-log", path = "../cosmix-lib-log", optional 
 cosmix_config = { package = "cosmix-lib-config", path = "../cosmix-lib-config", features = ["client-helpers"], optional = true }
 cosmix_client = { package = "cosmix-lib-client", path = "../cosmix-lib-client", optional = true }
 cosmix_bus = { package = "cosmix-lib-bus", path = "../cosmix-lib-bus", optional = true }
-cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo", optional = true }
+# Unconditional (dep-free): the CLI binary builds without `cosmix` and must
+# still answer `--version` with its sha (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
 cosmix_props = { package = "cosmix-lib-props-store", path = "../cosmix-lib-props-store", optional = true }
 # The opt-in revisioned write facility (Q8): RevWriteStore + generic wire types.
 # props-store re-exports the read-side props-core types but NOT `revwrite`, so

@@ -10,6 +10,8 @@ name = "cosmix-mesh-sign"
 path = "src/main.rs"
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
 # Core (mesh-free) types + the one shared canonicaliser + verify — the
 # signer MUST share this with the verifier (noded, 1b-c) so they cannot
 # disagree on canonical bytes (SPEC 13 §6). default-features = false keeps
@@ -29,3 +31,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

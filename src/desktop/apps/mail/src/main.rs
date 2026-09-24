@@ -33,6 +33,8 @@ pub(crate) const IDENTITY: AppIdentity = AppIdentity {
 };
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let plan = match probe::ProbePlan::parse(&args) {
         Ok(plan) => plan,

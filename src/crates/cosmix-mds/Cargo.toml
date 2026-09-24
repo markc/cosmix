@@ -37,6 +37,8 @@ mem-store = []
 _stress-helper = []
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -59,3 +61,6 @@ proptest = "1"
 assert_cmd = "2"
 predicates = "3"
 libc = "0.2"
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../cosmix-lib-buildinfo" }

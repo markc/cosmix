@@ -19,6 +19,8 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     match Cli::parse().command {
         Command::Serve => cosmix_powerd::citizen::serve().await,
     }

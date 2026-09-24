@@ -297,11 +297,28 @@ async fn main() -> ExitCode {
     // intercept in the sibling daemons): print to stdout, exit 0, ahead
     // of logging init so there's no log noise and the hand-rolled
     // `parse_args` never sees the flag as an "unknown argument".
+    #[cfg(feature = "cosmix")]
+    {
+        cosmix_buildinfo::exit_on_version!();
+    }
+    // The standalone arm pulls no cosmix crate at runtime, but build.rs
+    // (an unconditional build-dependency) still emits the provenance env,
+    // so it prints the same `<pkg> <semver> (<sha>, built <time>)` line.
+    #[cfg(not(feature = "cosmix"))]
     if std::env::args()
         .skip(1)
+        .take_while(|a| a != "--")
         .any(|a| a == "--version" || a == "-V")
     {
-        println!(concat!("cosmix-dnsd ", env!("CARGO_PKG_VERSION")));
+        let dirty = matches!(option_env!("COSMIX_GIT_DIRTY"), Some("1" | "true"));
+        println!(
+            "{} {} ({}{}, built {})",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            option_env!("COSMIX_GIT_SHA").unwrap_or("unknown"),
+            if dirty { "-dirty" } else { "" },
+            option_env!("COSMIX_BUILD_TIME").unwrap_or("unknown"),
+        );
         return ExitCode::SUCCESS;
     }
 

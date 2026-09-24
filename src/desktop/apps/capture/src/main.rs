@@ -96,10 +96,6 @@ fn options() -> Result<Option<Options>, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--version" => {
-                println!("cosmix-capture {}", env!("CARGO_PKG_VERSION"));
-                return Ok(None);
-            }
             "--help" => {
                 println!(
                     "cosmix-capture [--output NAME] [--directory /absolute/path] [--vaapi-device /dev/dri/renderD128]\nNative Bus service capture: capture.screenshot, capture.start {{fps:30}}, capture.stop, capture.status.\nRecordings automatically stop at 300 seconds. Files default to ~/Videos/Cosmix.\nEncoding defaults to software libx264. An explicit VAAPI device requires hardware H.264; failures never fall back."
@@ -391,6 +387,8 @@ fn request(command: &str, body: &str) -> Result<Option<JobRequest>, String> {
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), String> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let Some(options) = options()? else {
         return Ok(());
     };

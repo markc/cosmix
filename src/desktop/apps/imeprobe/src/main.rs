@@ -431,6 +431,8 @@ impl Dispatch<XdgActivationTokenV1, ()> for App {
 delegate_noop!(App: ignore ZwpInputPopupSurfaceV2);
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let options = match parse_args(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {

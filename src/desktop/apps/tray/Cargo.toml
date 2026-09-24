@@ -24,7 +24,12 @@ name = "cosmix-tray"
 path = "src/main.rs"
 
 [dependencies]
+# `--version` build provenance (cosmix_buildinfo::exit_on_version!).
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 cosmix-app-identity = { path = "../../../crates/cosmix-app-identity" }
 ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
 libc = "0.2"
 zbus = { version = "5.18.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[build-dependencies]
+cosmix_buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }

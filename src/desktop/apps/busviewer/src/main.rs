@@ -11,14 +11,12 @@ use ctk::prelude::*;
 use std::time::Duration;
 
 fn main() {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     let mut url = configured_noded_url();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--version" => {
-                println!("BusViewer {}", env!("CARGO_PKG_VERSION"));
-                return;
-            }
             "--help" => {
                 println!("busviewer [--noded-url URL]\nBrowse local ABP services and HELP verbs, inspect mesh membership, and call verbs with optional JSON bodies. Uses the shared node configuration by default.");
                 return;

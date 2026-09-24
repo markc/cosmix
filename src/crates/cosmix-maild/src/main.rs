@@ -2195,14 +2195,9 @@ async fn run_inspection_verb_cli(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Allow appending the version flag to the daemon's exact argv.
-    if std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--version" || arg == "-V")
-    {
-        println!("cosmix-maild {}", VERSION);
-        std::process::exit(0);
-    }
+    // --version/-V anywhere in the daemon's exact argv: answer and exit 0
+    // before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
 
     rustls::crypto::ring::default_provider()
         .install_default()

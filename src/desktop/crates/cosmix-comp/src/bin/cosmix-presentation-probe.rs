@@ -881,6 +881,8 @@ fn run() -> Result<bool, String> {
 }
 
 fn main() -> ExitCode {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,

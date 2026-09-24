@@ -2782,13 +2782,7 @@ async fn main() {
     // stdio server. mcp connects anonymously (no noded.register), so this
     // CLI line is its only version surface — the 2026-06-01 stale-binary
     // case, where a sha + build_time would have made the staleness obvious.
-    if std::env::args()
-        .skip(1)
-        .any(|a| a == "--version" || a == "-V")
-    {
-        println!("{}", cosmix_buildinfo::build_info!().line());
-        return;
-    }
+    cosmix_buildinfo::exit_on_version!();
 
     // Logging via the shared `cosmix_log` core. Preserves cosmix-mcp's
     // hand-tuned posture: the `info,cosmix_mcp=debug` baseline filter

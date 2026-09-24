@@ -6960,6 +6960,8 @@ async fn run_readonly_verb_cli(verb: &'static str) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --version/-V: answer and exit 0 before any other side effect.
+    cosmix_buildinfo::exit_on_version!();
     // Held for the whole of `main` — must outlive the process (drop
     // flushes). Renamed from `_log` because the Serve branch reads it
     // to attach the live `webd.log` watcher.
