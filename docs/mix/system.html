@@ -1134,10 +1134,12 @@ SIGKILLs the child (<code>PR_SET_PDEATHSIG</code>). That reaches the child only,
 its descendants, and gives it no chance to clean up.</li>
 </ul>
 <p><code>detach</code> together with <code>die_with_parent</code> raises <code>OPTION_INVALID</code>, because
-they contradict each other. If the script reaps the child itself, for
-example by calling <code>process_alive</code> after it has exited, Mix can no longer
-prove the group id is still that child's. The group is then skipped, so any
-survivors are not swept. PDEATHSIG is keyed to the thread that called
+they contradict each other. Mix itself is the only thing that reaps an
+owned child. <code>process_alive</code> answers for it without freeing its pid, so
+the group id cannot be recycled while it is registered. A finished child
+whose group has emptied is reaped at the next <code>process_alive</code> or <code>spawn</code>.
+One whose descendants are still running is kept as a zombie until the
+sweep ends them. PDEATHSIG is keyed to the thread that called
 <code>spawn</code>, and the ownership registry is process-wide. So the option works
 only on a thread whose host owns it. The <code>mix</code> binary evaluates on one
 thread that lives until exit and sweeps before it ends. Elsewhere, for

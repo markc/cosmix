@@ -806,10 +806,12 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
     its descendants, and gives it no chance to clean up.
 
   `detach` together with `die_with_parent` raises `OPTION_INVALID`, because
-  they contradict each other. If the script reaps the child itself, for
-  example by calling `process_alive` after it has exited, Mix can no longer
-  prove the group id is still that child's. The group is then skipped, so any
-  survivors are not swept. PDEATHSIG is keyed to the thread that called
+  they contradict each other. Mix itself is the only thing that reaps an
+  owned child. `process_alive` answers for it without freeing its pid, so
+  the group id cannot be recycled while it is registered. A finished child
+  whose group has emptied is reaped at the next `process_alive` or `spawn`.
+  One whose descendants are still running is kept as a zombie until the
+  sweep ends them. PDEATHSIG is keyed to the thread that called
   `spawn`, and the ownership registry is process-wide. So the option works
   only on a thread whose host owns it. The `mix` binary evaluates on one
   thread that lives until exit and sweeps before it ends. Elsewhere, for

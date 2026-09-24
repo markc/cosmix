@@ -4402,8 +4402,47 @@ pub mod owned_spawns {
         HOST.get() == Some(&std::thread::current().id())
     }
 
+    /// Register a new owned child, first retiring entries that are finished:
+    /// a leader that exited AND whose group has no live member is reaped and
+    /// dropped, so a long-lived citizen's registry stays bounded by the groups
+    /// that are actually alive. A dead leader whose group still has members is
+    /// KEPT unreaped — its zombie pins the pgid for the sweep.
     pub(crate) fn register(pid: libc::pid_t) {
-        OWNED.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+        owned.retain(|pid| retain_entry(*pid));
+        owned.push(pid);
+    }
+
+    /// Keep an entry? Reaps (and drops) a finished one. Call with the lock
+    /// held: the registry is the ONLY reaper of an owned pid.
+    fn retain_entry(pid: libc::pid_t) -> bool {
+        match leader_state(pid) {
+            Some(false) => true,
+            Some(true) if super::group_has_live_members(pid) => true,
+            Some(true) => {
+                let mut status = 0;
+                // SAFETY: reaping our own exited child.
+                unsafe {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// `process_alive` for an owned pid, answered WITHOUT an unowned reap
+    /// (review MAJOR-4): a plain waitpid there would free the pid while the
+    /// registration survived, and a recycled pid would then pass the sweep's
+    /// check and get its group signalled. `None` when `pid` is not owned.
+    pub(crate) fn observe(pid: libc::pid_t) -> Option<bool> {
+        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+        let index = owned.iter().position(|p| *p == pid)?;
+        let alive = leader_state(pid) == Some(false);
+        if !retain_entry(pid) {
+            owned.swap_remove(index);
+        }
+        Some(alive)
     }
 
     /// Leader state without reaping it: `Some(false)` running, `Some(true)`
@@ -4433,7 +4472,10 @@ pub mod owned_spawns {
     /// signals nothing. A group whose leader was already reaped elsewhere is
     /// skipped — its pgid can no longer be proven ours.
     pub fn sweep() -> usize {
-        let pids = std::mem::take(&mut *OWNED.lock().unwrap_or_else(|e| e.into_inner()));
+        // The lock is held for the whole sweep: no other path may reap an
+        // owned pid between the identity check below and the last signal.
+        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+        let pids = std::mem::take(&mut *owned);
         let live: Vec<libc::pid_t> = pids
             .into_iter()
             .filter(|pid| leader_state(*pid).is_some())
@@ -4763,6 +4805,12 @@ fn builtin_process_alive(args: Vec<Value>) -> MixResult<Option<Value>> {
         // non-blocking. We ignore the return value because we only care
         // about its side-effect (reaping a zombie child) — the kill(0)
         // below is the authoritative liveness check.
+        // An owned (die_with_parent) child is answered by its registry, which
+        // is the only thing allowed to reap it.
+        #[cfg(target_os = "linux")]
+        if let Some(alive) = owned_spawns::observe(pid as libc::pid_t) {
+            return Ok(Some(Value::Bool(alive)));
+        }
         let managed = MANAGED_PIDS.lock().unwrap();
         if !managed.contains(&pid) {
             unsafe {
@@ -23813,6 +23861,104 @@ mod chmod_tests {
             Some("VALUE_OUT_OF_RANGE")
         );
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// Review MAJOR-4: the owned-spawn registry is the only reaper of an owned
+/// pid. These drive the registry directly (no host enable needed) and are the
+/// only unit tests that register, so the process-wide sweep sees only theirs;
+/// one mutex keeps them from sweeping each other.
+#[cfg(all(test, target_os = "linux"))]
+mod owned_spawns_tests {
+    use super::{builtin_process_alive, owned_spawns};
+    use crate::value::Value;
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn state(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    fn gone(pid: i32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if matches!(state(pid), None | Some('Z')) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn process_alive_on_a_dead_owned_child_retires_it_and_the_sweep_signals_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = owned_spawns::sweep();
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        owned_spawns::register(pid);
+        // SAFETY: killing our own child.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state(pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alive = builtin_process_alive(vec![Value::Number(pid as f64)])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(alive, Value::Bool(false)), "{alive:?}");
+        assert_eq!(state(pid), None, "the registry reaps its own finished child");
+        assert_eq!(owned_spawns::sweep(), 0, "a retired pid must never be signalled");
+    }
+
+    #[test]
+    fn a_dead_leader_with_a_live_descendant_stays_pinned_and_is_swept() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = owned_spawns::sweep();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; exec sleep 0.1"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: i32 = line.trim().parse().unwrap();
+        owned_spawns::register(pid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state(pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alive = builtin_process_alive(vec![Value::Number(pid as f64)])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(alive, Value::Bool(false)), "the leader itself is dead: {alive:?}");
+        assert_eq!(state(pid), Some('Z'), "kept unreaped: it pins the live group");
+        assert_eq!(owned_spawns::sweep(), 1);
+        let swept = gone(descendant, Duration::from_secs(5));
+        if !swept {
+            // SAFETY: cleanup of a process this test created.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        assert!(swept, "the sweep must end the pinned group's descendant");
+        assert_eq!(state(pid), None, "the sweep reaps the leader");
     }
 }
 
