@@ -772,11 +772,14 @@ restores it. Two verbs drive the workspaces:
     are at most 4096 bytes. With `id`, the wait is about that window; an id
     comp never handed out is refused with `unknown_window`. Without it, the
     wait is about the lowest-id mapped window whose names match.
-  - `until` is `mapped`, `visible`, `presented` (the renderer showed new
-    content of the window at or after the current mapping began, the same
-    evidence `comp.window.stats` counts, so no `wp_presentation` feedback is
-    needed; feedback presented in that span also counts; a late report of
-    an earlier frame does not), `size` (needs `width` and `height`, compared with the
+  - `until` is `mapped`, `visible`, `presented` (the renderer showed the
+    window in a frame at or after the current mapping began, judged from
+    the renderer's frame reports that `comp.window.stats` also reads, so no
+    `wp_presentation` feedback is needed. Static content that was hidden at
+    map time counts once exposed. Feedback presented in that span also
+    counts. A late report of an earlier frame does not. The window must
+    also be unminimised and on the current workspace when the wait
+    resolves), `size` (needs `width` and `height`, compared with the
     window-geometry size), `focused`, `unmapped` or `gone`. For a match
     without `id`, `unmapped` and `gone` mean no mapped window matches.
     `mapped` is workspace-blind; `visible` and `presented` need the

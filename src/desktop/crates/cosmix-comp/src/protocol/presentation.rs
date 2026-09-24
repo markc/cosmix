@@ -921,6 +921,11 @@ impl WaylandState {
         };
         let mut reported = HashSet::new();
         let mut windows = HashMap::<u64, (u64, WindowFrame)>::new();
+        // Windows with any surface Shown in this frame, whatever its
+        // sequence: the stats fold only counts NEW content, so a static
+        // window that mapped while hidden and was then exposed would never
+        // satisfy `until: presented` on the fold alone.
+        let mut shown_windows = HashSet::new();
         // Once per report, not once per surface (see `workspaces::on_workspace`).
         let current_workspace = self.workspace_current();
         for surface in &content.surfaces {
@@ -952,6 +957,9 @@ impl WaylandState {
                 let (_, fold) = windows
                     .entry(window)
                     .or_insert_with(|| (generation, WindowFrame::default()));
+                if state == SurfaceShown::Shown {
+                    shown_windows.insert(window);
+                }
                 self.presentation.stats.surface_frame(
                     surface.id.0,
                     window == surface.id.0,
@@ -996,7 +1004,7 @@ impl WaylandState {
             .stats
             .hide_unlisted(|window| windows.contains_key(&window));
         for (window, (generation, fold)) in windows {
-            if fold.presented() {
+            if fold.presented() || shown_windows.contains(&window) {
                 self.note_window_shown(SurfaceId(window), generation, time_us);
             }
             self.presentation

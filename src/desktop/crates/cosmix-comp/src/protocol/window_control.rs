@@ -567,8 +567,9 @@ pub(crate) struct WindowWaiters {
     /// pre-hide frame satisfies it.
     presented_base: HashMap<SurfaceId, MappingBase>,
     /// Per window root: its generation and the newest frame time at which
-    /// the renderer showed new content of it — the evidence
-    /// `comp.window.stats` counts. Needs no `wp_presentation` feedback, which
+    /// the renderer showed any surface of it (new content, or content hidden
+    /// at map time and since exposed), from the same frame reports
+    /// `comp.window.stats` reads. Needs no `wp_presentation` feedback, which
     /// most clients never request. Sized like `presented_base`: at
     /// `MAX_PRESENTED_BASES` a new entry prunes DEAD surfaces only, so the
     /// table holds max(1024, live window roots) — a pruning threshold, not a
