@@ -49,20 +49,17 @@ CoS — substrate libraries and daemon family
 | crate | version |
 |---|---|
 | `cosmix-actions` | 0.4.0 |
-| `cosmix-agentd` | 0.2.0 |
 | `cosmix-app-identity` | 0.2.0 |
-| `cosmix-claud` | 0.2.0 |
 | `cosmix-dbusd` | 0.3.0 |
 | `cosmix-dnsd` | 0.3.2 |
 | `cosmix-filesd` | 0.8.1 |
 | `cosmix-indexd` | 0.9.1 |
 | `cosmix-input-core` | 0.1.3 |
 | `cosmix-input-schema` | 0.1.4 |
-| `cosmix-inputd` | 0.4.2 |
+| `cosmix-inputd` | 0.4.3 |
 | `cosmix-interactd` | 0.5.1 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
-| `cosmix-lib-agent` | 0.1.0 |
 | `cosmix-lib-config` | 0.8.5 |
 | `cosmix-lib-daemon` | 0.7.1 |
 | `cosmix-lib-davproto` | 0.1.2 |
@@ -135,4 +132,4 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 
 ---
 
-53 crates in `$COSMIX/src` and 32 in the separate `$COSMIX/src/desktop` workspace.
+50 crates in `$COSMIX/src` and 32 in the separate `$COSMIX/src/desktop` workspace.
