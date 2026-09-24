@@ -1620,19 +1620,6 @@ pub(crate) fn json_to_value(val: &serde_json::Value) -> Value {
     }
 }
 
-/// Map a reply-awaiting `call_with_headers_raw` triple `(rc, body,
-/// error_header)` into the `(i32, Value)` result the `send` keyword yields,
-/// applying the SAME rc-band contract as the JSON-body `call_typed` path so a
-/// `body=`-bearing send round-trips its reply exactly like a positional or
-/// scalar-header send:
-///
-/// * `rc >= 10` — an application error: `$rc` keeps the EXACT peer rc and
-///   `$result` is the error MESSAGE, resolved with `call_with_headers`'s
-///   precedence (body `message` field → body `error` field → response `error`
-///   header → `rc=N (no error body)` sentinel).
-/// * `rc < 10` — success or a warning: `$rc` keeps the rc and `$result` is the
-///   JSON-parsed body (empty → Nil; non-JSON → the verbatim String), matching
-///   `call_typed`'s body handling.
 /// `$reply` (0.92.0): the reply body JSON-parsed, for every response —
 /// success or refusal, whatever its dialect — and `Nil` when the body is
 /// empty or not JSON. `$result` keeps its own, deliberately reduced shape.
@@ -1690,6 +1677,19 @@ fn typed_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> 
     (i32::from(rc), value)
 }
 
+/// Map a reply-awaiting `call_with_headers_raw` triple `(rc, body,
+/// error_header)` into the `(i32, Value)` result the `send` keyword yields,
+/// applying the SAME rc-band contract as the JSON-body `call_typed` path so a
+/// `body=`-bearing send round-trips its reply exactly like a positional or
+/// scalar-header send:
+///
+/// * `rc >= 10` — an application error: `$rc` keeps the EXACT peer rc and
+///   `$result` is the error MESSAGE, resolved with `call_with_headers`'s
+///   precedence (body `message` field → body `error` field → response `error`
+///   header → `rc=N (no error body)` sentinel).
+/// * `rc < 10` — success or a warning: `$rc` keeps the rc and `$result` is the
+///   JSON-parsed body (empty → Nil; non-JSON → the verbatim String), matching
+///   `call_typed`'s body handling.
 fn headers_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
     if rc >= 10 {
         let parsed: Option<serde_json::Value> = if body.is_empty() {
@@ -1896,7 +1896,11 @@ mod tests {
     fn reply_body_parse_success_identity_and_non_json_nil() {
         let body = r#"{"pong":true,"n":2}"#;
         let (_, result) = typed_reply_to_result(0, body.into(), None);
-        assert_eq!(parse_reply_body(body), result);
+        let reply = parse_reply_body(body);
+        // Value's `==` never equates two maps, so compare field by field.
+        for k in ["pong", "n"] {
+            assert_eq!(field(&reply, k), field(&result, k), "{k}");
+        }
         assert_eq!(parse_reply_body(""), Value::Nil);
         assert_eq!(parse_reply_body("# markdown"), Value::Nil);
         assert_eq!(rpc_body(&serde_json::Value::Null), "");
