@@ -38,6 +38,40 @@ fn unsupported_state_does_not_install_a_fullscreen_output_selection() {
 }
 
 #[test]
+fn winit_fullscreen_rejects_an_output_outside_its_live_registry() {
+    let (mut harness, _, _) = KeybindingHarness::new_with_port();
+    let (other, _, _) = KeybindingHarness::new_with_port();
+    let stale = other.server.state.backend.default_output().unwrap();
+    stale.change_current_state(
+        Some(smithay::output::Mode {
+            size: (640, 480).into(),
+            refresh: 60_000,
+        }),
+        None,
+        None,
+        Some((320, 0).into()),
+    );
+    map_initial_test_toplevel(&mut harness);
+    let surface = test_toplevel_record(&harness).role.wl_surface().clone();
+    harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .unwrap()
+        .fullscreen_output = Some(stale.clone());
+    assert!(stale.current_mode().is_some());
+    assert!(!harness.server.state.backend.output_is_registered(&stale));
+    assert!(harness.server.state.backend.port_output(&stale).is_none());
+    assert_eq!(
+        harness.server.state.fullscreen_rect_for(&surface),
+        harness.server.state.logical_output_rect()
+    );
+    harness.server.state.reconfigure_window_states_for_output();
+    assert!(test_toplevel_record(&harness).fullscreen_output.is_none());
+}
+
+#[test]
 fn explicit_fullscreen_reflows_when_secondary_changes_or_disappears() {
     let (mut harness, _, _) = KeybindingHarness::new_with_port_backend(BackendKind::Kms, "kms");
     let first = kms_security_test_key(226, "Test-A");
@@ -110,6 +144,8 @@ fn explicit_fullscreen_reflows_when_secondary_changes_or_disappears() {
         KmsTopologyLifecycleEvent::Initial(kms_security_test_snapshot(&first, 41)),
     );
     let traffic = harness.sync();
+    assert!(output.current_mode().is_some(), "unplug retains the mode");
+    assert!(!harness.server.state.backend.output_is_registered(&output));
     assert!(harness.server.state.backend.port_output(&output).is_none());
     assert_eq!(harness.server.state.logical_output_rect(), previous_output);
     assert_eq!(harness.server.state.usable_output_rect(), previous_usable);

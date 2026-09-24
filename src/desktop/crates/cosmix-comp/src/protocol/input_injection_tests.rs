@@ -46,6 +46,58 @@ fn keyboard_without_an_owner_refuses_and_cleans_up_generated_holds() {
 }
 
 #[test]
+fn bare_modifier_without_focus_is_held_for_a_following_binding() {
+    let (mut harness, ingress, _) = KeybindingHarness::new_with_port();
+    let runtime = control_reply_runtime();
+    assert!(harness.server.state.keyboard.current_focus().is_none());
+    assert_eq!(harness.server.state.workspace_current(), 1);
+    let key = |name: &str, action| InputOp::Key {
+        key: KeySpec::Name(name.into()),
+        action,
+        modifiers: vec![],
+    };
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        key("Super_L", PressAction::Press),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(body["target"], Value::Null);
+    assert!(!harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.keyboard.modifier_state().logo);
+
+    // An unhandled payload is refused without releasing the earlier prefix.
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        key("a", PressAction::Press),
+    );
+    assert_eq!(rc, 10, "{body}");
+    assert_eq!(body["error"], "no_keyboard_target");
+    assert!(harness.server.state.keyboard.modifier_state().logo);
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        key("2", PressAction::Both),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(harness.server.state.workspace_current(), 2);
+    let (rc, body) = inject(
+        &mut harness,
+        &ingress,
+        &runtime,
+        key("Super_L", PressAction::Release),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
+    assert!(!harness.server.state.keyboard.modifier_state().logo);
+}
+
+#[test]
 fn release_and_already_held_keys_work_after_focus_is_lost() {
     let (mut harness, ingress, runtime, _, _, _) = two_windows();
     let key = |action| InputOp::Key {
@@ -261,12 +313,15 @@ fn targeted_button_release_respects_corner_ownership() {
         &runtime,
         InputOp::Key {
             key: KeySpec::Evdev(KEY_A),
-            action: PressAction::Both,
+            action: PressAction::Press,
             modifiers: vec![],
         },
     );
-    assert_eq!(rc, 0, "corner owns the seat: {body}");
+    assert_eq!(rc, 10, "a corner does not consume keys: {body}");
+    assert_eq!(body["error"], "no_keyboard_target");
     assert_eq!(body["target"], Value::Null);
+    assert!(harness.server.state.injection.held.is_empty());
+    assert!(harness.server.state.keyboard.pressed_keys().is_empty());
     route_pointer_button(&mut harness, BTN_LEFT, ButtonState::Pressed);
     route_pointer_to(&mut harness, 100.0, 100.0);
     let _ = harness.sync();

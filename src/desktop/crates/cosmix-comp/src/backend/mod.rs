@@ -318,9 +318,14 @@ impl BackendData {
     }
 
     /// Owned facts for one protocol-visible output without projecting the
-    /// complete output set. Observation dirty hooks use this fixed-cost path.
+    /// complete output set. Observation dirty hooks use this lookup path.
     #[cfg(feature = "bus")]
     pub(crate) fn port_output(&self, requested: &Output) -> Option<PortOutputSource> {
+        // Retired Smithay Output clones retain their mode after hot-unplug.
+        // Only the live registry establishes whether these facts still apply.
+        if !self.output_is_registered(requested) {
+            return None;
+        }
         let default = self.default_output().as_ref() == Some(requested);
         match self {
             Self::Winit(data) if data.output == *requested => Some(PortOutputSource {

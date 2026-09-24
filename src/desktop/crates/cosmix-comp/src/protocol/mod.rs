@@ -12370,7 +12370,9 @@ impl WaylandState {
                         let forwarded = matches!(&disposition, KeyDisposition::Forward);
                         state.injection.key_handled = !forwarded
                             || state.keyboard.current_focus().is_some()
-                            || state.corner_engaged();
+                            // Bare modifiers are prefixes for a later binding,
+                            // even when there is no focused client yet.
+                            || keysym.is_some_and(|sym| sym.is_modifier_key());
                         state.injection.key_delivery = if forwarded {
                             state.delivery_target(true)
                         } else {
@@ -14176,8 +14178,7 @@ impl WaylandState {
     fn fullscreen_rect_for(&self, surface: &WlSurface) -> LogicalOutputRect {
         let selected = self.surfaces.get(&surface.id())
             .and_then(|record| record.fullscreen_output.as_ref());
-        #[cfg(feature = "bus")]
-        let selected = selected.filter(|output| self.backend.port_output(output).is_some());
+        let selected = selected.filter(|output| self.backend.output_is_registered(output));
         if let Some(output) = selected && let Some(mode) = output.current_mode() {
             let size = mode.size.to_f64()
                 .to_logical(output.current_scale().fractional_scale())
@@ -14345,12 +14346,11 @@ impl WaylandState {
     fn reconfigure_window_states_for_output(&mut self) {
         // A retired Output clone must not keep a fullscreen selection alive.
         // Reconcile before both protocol families calculate their next rect.
-        #[cfg(feature = "bus")]
         for record in self.surfaces.values_mut() {
             if record
                 .fullscreen_output
                 .as_ref()
-                .is_some_and(|output| self.backend.port_output(output).is_none())
+                .is_some_and(|output| !self.backend.output_is_registered(output))
             {
                 record.fullscreen_output = None;
             }

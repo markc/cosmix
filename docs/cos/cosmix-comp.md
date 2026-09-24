@@ -988,7 +988,9 @@ focus eligibility or refocus/raise the window; the seat's modal and lock gates
 continue to handle those releases.
 
 Without `window`, `no_keyboard_target` is returned only after the seat finds no
-client/native focus, compositor binding or modal owner for a payload press.
+client/native focus, compositor binding or modal owner for a non-modifier payload press.
+Bare modifier presses are accepted and held as prefixes for later bindings;
+an engaged hot corner alone does not consume keyboard input.
 Releases and keys already held by injection are always processed; generated new
 holds are cleaned up on refusal. Modifier setup can advance XKB before the
 payload is refused. Empty workspaces still accept compositor chords, and Escape
@@ -1020,15 +1022,18 @@ uses the same clock.
 Each single verb replies:
 
 ```text
-{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null}
+{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
 ```
 
 - `input_seq` increases by one per verb.
 - `injected_at_us` is CLOCK_MONOTONIC microseconds.
 - `pointer` is the cursor after the verb, in output-local coordinates.
-- `target` is the root surface the seat now delivers to: pointer focus for
-  pointer verbs, keyboard focus for key verbs. It can be a layer or lock
-  surface, not only a window.
+- `targeted` is the requested window, or null for untargeted input.
+- `target` records client delivery of the payload for keys and targeted buttons,
+  not the keyboard focus after a binding runs. It is null when a binding consumes
+  the payload. Untargeted pointer verbs retain their pointer-focus fallback.
+  A delivery target can be a layer or lock surface, not only a window.
+- `completed_events` counts generated key events processed before completion or refusal.
 
 `text` maps each character through the live seat keymap, honouring Caps Lock
 and the active layout. Only characters on the first two shift levels map; each

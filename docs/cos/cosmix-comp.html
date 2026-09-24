@@ -1368,7 +1368,9 @@ Targeted key releases still validate the window identity, but do not require
 focus eligibility or refocus/raise the window; the seat's modal and lock gates
 continue to handle those releases.</p>
 <p>Without <code>window</code>, <code>no_keyboard_target</code> is returned only after the seat finds no
-client/native focus, compositor binding or modal owner for a payload press.
+client/native focus, compositor binding or modal owner for a non-modifier payload press.
+Bare modifier presses are accepted and held as prefixes for later bindings;
+an engaged hot corner alone does not consume keyboard input.
 Releases and keys already held by injection are always processed; generated new
 holds are cleaned up on refusal. Modifier setup can advance XKB before the
 payload is refused. Empty workspaces still accept compositor chords, and Escape
@@ -1394,15 +1396,18 @@ uses the same clock.</p>
 <tr><td><code>comp.input.sequence</code></td><td><code>{steps:[{verb,args?,delay_ms?}],interval_ms?}</code></td></tr>
 </tbody></table>
 <p>Each single verb replies:</p>
-<pre><code class="language-text">{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null}
+<pre><code class="language-text">{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
 </code></pre>
 <ul>
 <li><code>input_seq</code> increases by one per verb.</li>
 <li><code>injected_at_us</code> is CLOCK_MONOTONIC microseconds.</li>
 <li><code>pointer</code> is the cursor after the verb, in output-local coordinates.</li>
-<li><code>target</code> is the root surface the seat now delivers to: pointer focus for
-pointer verbs, keyboard focus for key verbs. It can be a layer or lock
-surface, not only a window.</li>
+<li><code>targeted</code> is the requested window, or null for untargeted input.</li>
+<li><code>target</code> records client delivery of the payload for keys and targeted buttons,
+not the keyboard focus after a binding runs. It is null when a binding consumes
+the payload. Untargeted pointer verbs retain their pointer-focus fallback.
+A delivery target can be a layer or lock surface, not only a window.</li>
+<li><code>completed_events</code> counts generated key events processed before completion or refusal.</li>
 </ul>
 <p><code>text</code> maps each character through the live seat keymap, honouring Caps Lock
 and the active layout. Only characters on the first two shift levels map; each
