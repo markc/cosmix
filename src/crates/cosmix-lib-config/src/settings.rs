@@ -105,7 +105,7 @@ impl Default for LlmSettings {
             },
         );
         // Paid Anthropic Messages API. Required for tool-calling workloads
-        // (cosmix-agentd). Keyed by COSMIX_ANTHROPIC_KEY to avoid collision
+        // (multi-turn agent loops). Keyed by COSMIX_ANTHROPIC_KEY to avoid collision
         // with ANTHROPIC_API_KEY, which Claude Code picks up and uses to
         // bypass the MAX subscription.
         backends.insert(
