@@ -22578,8 +22578,8 @@ mod ssh_helpers_tests {
 
     // ---- ssh_run helpers --------------------------------------------------
     use super::{
-        SshOpts, build_remote_command, build_ssh_argv, builtin_ssh_mix, builtin_ssh_run,
-        is_valid_env_key, parse_env_opt, parse_ssh_opts,
+        SshOpts, build_remote_command, build_ssh_argv, builtin_ssh_mix, builtin_ssh_mix_many,
+        builtin_ssh_run, is_valid_env_key, parse_env_opt, parse_ssh_opts,
     };
     use crate::error::MixError;
     use indexmap::IndexMap;
