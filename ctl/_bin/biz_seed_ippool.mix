@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- biz_seed_ippool.mix — seed one configured `free` ip_pool row in a webd
 -- site's business database.
 --

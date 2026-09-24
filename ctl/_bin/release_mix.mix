@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- release_mix.mix — build x86_64 Mix release archives and attach them to an
 -- existing GitHub release.
 --

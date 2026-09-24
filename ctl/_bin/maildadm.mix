@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- maildadm.mix <node> <subcommand> [args] — read-only maild statistics.
 --
 -- Every request runs against the selected node's local broker. The private hub

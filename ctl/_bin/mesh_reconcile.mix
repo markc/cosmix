@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh_reconcile.mix — compare the authenticated declared mesh with live
 -- WireGuard and local Bus membership. Read-only: it observes but never mutates.
 --

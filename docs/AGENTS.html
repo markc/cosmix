@@ -515,15 +515,23 @@ into the public suite. Update accepted public contracts with affected code.</li>
 <code>mix SCRIPT --version</code> (or <code>-V</code>) prints one line and exits 0 without running
 it: the script name, its declared version, the first 12 hex digits of the
 SHA-256 of its bytes, its mtime, and the interpreter's own version and sha.
-The version comes from a header in the first 32 lines, in exactly this form:</p>
+The version comes from a header in the leading comment region (shebang, blank
+and <code>--</code> lines, first 32 lines), in exactly this form:</p>
 <pre><code class="language-mix">-- version: 0.1.0
 </code></pre>
 <ul>
-<li>Every script this repo ships carries the header. Bump it when the script's
-observable behaviour changes. That is the same test as a crate bump.</li>
-<li>Mix owns the first argument after the script path. A script cannot give
-<code>--version</code> or <code>-V</code> its own meaning in that position.</li>
-<li><code>mix lint</code> notes a missing header on a shebang or <code>bin/</code>/<code>_bin/</code> script as
+<li>Every runnable script this repo ships carries the header: <code>setup.mix</code>,
+<code>docs/build/</code>, <code>src/desktop/scripts/</code>, toolsd, the <code>check-*</code>/export scripts,
+and the starter <code>ctl/_bin/</code> and <code>ctl/_share/</code>. Libraries, handlers and data
+files that are loaded rather than run do not. A new script gets one;
+<code>mix docs/build/add-version-headers.mix</code> adds any that are missing.</li>
+<li>Bump the header when the script's observable behaviour changes. That is the
+same test as a crate bump.</li>
+<li>Mix owns the first argument after the script path. A wrapper that must
+answer <code>--version</code> itself declares <code>-- version-flag: script</code> in the same
+region and then receives the flag in <code>args()</code>.</li>
+<li><code>mix lint</code> notes a missing header on a file it judges to be a script
+(shebang, a <code>bin</code>/<code>_bin</code>/<code>scripts</code>/<code>build</code> directory, or a serve citizen) as
 MIX-D3016. Add <code>--require-version</code> to make it a warning.</li>
 <li>Contract, header grammar, <code>--serve</code>/stdin forms and the <code>script_version()</code>
 builtin: <code>docs/mix/invocation.md</code>, section "<code>--version</code> for scripts".</li>

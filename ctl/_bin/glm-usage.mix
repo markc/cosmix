@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- glm-usage.mix — GLM Coding Plan quota + usage from its monitor API.
 --
 --   glm-usage.mix                 quota + recent usage, human output

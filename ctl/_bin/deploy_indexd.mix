@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_indexd.mix — install cosmix-indexd and its systemd unit on the
 -- configured index nodes, or a named configured subset.
 --

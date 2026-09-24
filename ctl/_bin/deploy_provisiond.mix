@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_provisiond.mix — install the provisiond wake citizen and credentialed
 -- drain stack on its configured controller node.
 --

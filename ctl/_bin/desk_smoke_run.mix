@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- desk_smoke_run.mix — preflight the standing local compositor smoke bed.
 --
 -- This is a workstation-only tool. It controls a local nspawn container and a

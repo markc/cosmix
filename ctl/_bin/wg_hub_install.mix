@@ -1,4 +1,5 @@
 #!/opt/cosmix/bin/mix
+-- version: 0.1.0
 -- wg_hub_install.mix — privileged on-hub installer for deploy_wg.mix.
 --
 -- This helper is copied to a mesh hub and run there as root. It remains

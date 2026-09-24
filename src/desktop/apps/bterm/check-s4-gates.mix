@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate: the S4 recipient-enforcement fixtures (BROKER-025 p0i-07/08/09/10)
 -- actually RUN. They are #[ignore]'d because each one spawns a real broker and
 -- a real Mix child over a PTY, which means a plain `cargo test` reports them as

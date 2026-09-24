@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- dnd-drive.mix — gesture driver for the filemgr drag-and-drop test rig.
 --
 -- SAFETY. dotool injects into the physical seat. Every injection is bracketed

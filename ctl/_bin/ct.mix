@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- ct.mix — operator CLI for the nspawn placement controller (C2).
 -- Talks to the controller's nspawnd.ct.* verbs over the Bus from any rostered
 -- node.

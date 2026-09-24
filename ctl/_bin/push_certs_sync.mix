@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- push_certs_sync.mix — push acme.sh-issued certificates from this host (the
 -- acme.sh source; runs as root) to the TLS-terminating nodes, set ownership,
 -- reload the consumers, and print what landed. Idempotent; safe to re-run.

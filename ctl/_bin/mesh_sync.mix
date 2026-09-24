@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh_sync.mix — gated signed-inventory fan-out for every bus+active node.
 --
 -- The authored inventory is frozen once, authorised bytes are selected or

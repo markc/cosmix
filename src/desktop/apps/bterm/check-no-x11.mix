@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Run from the repository src/ directory on the build worker.
 -- Cargo selects the package cosmix-bterm; its binary is named bterm (renamed
 -- from cosmix-term/term 2026-09-21, TODO-term T1). `cargo tree -p` fails loudly

@@ -5508,3 +5508,109 @@ async fn serve_name_reads_the_serve_runtime() {
     assert_eq!(probe(Rc::new(Named(Some("probe")))).await, "probe\n");
     assert_eq!(probe(Rc::new(Unnamed)).await, "<nil>\n");
 }
+
+// ── script_version(): one record per evaluator, so per serve generation ──
+
+fn provenance_record(version: &str) -> Option<std::sync::Arc<cosmix_mix::ScriptProvenance>> {
+    Some(std::sync::Arc::new(cosmix_mix::ScriptProvenance {
+        name: "citizen.mix".into(),
+        version: Some(version.into()),
+        sha256: "0".repeat(64),
+        modified: None,
+        mix_version: "0.0.0".into(),
+        mix_sha: "test".into(),
+        mix_dirty: false,
+    }))
+}
+
+/// Build one serve "generation": an evaluator with its own record, a reply
+/// recorder, captured stdout, and `source` executed as its init body.
+async fn provenance_generation(
+    source: &str,
+    log: &ReplyLog,
+    version: &str,
+) -> (Evaluator, SharedBuf) {
+    let stdout = SharedBuf::new();
+    let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(SharedBuf::new()));
+    eval.set_bus_handler(Rc::new(ReplyRecorder(log.clone())));
+    eval.set_script_provenance(provenance_record(version));
+    let stmts = Parser::new(Lexer::new(source).tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    eval.execute(&stmts).await.unwrap();
+    (eval, stdout)
+}
+
+const PROVENANCE_CITIZEN: &str = r#"
+print("init " .. script_version().version)
+on test.req async
+    sleep(0.05)
+    reply(0, script_version().version)
+end
+"#;
+
+/// The serve RELOAD shape: the replacement evaluator is built and runs its
+/// init WHILE an old-generation async handler is parked mid-body, and the old
+/// generation drains afterwards. With a process-global record the old handler
+/// resumed into the NEW script's version (review V4); with the record owned by
+/// each evaluator it cannot. (a) old handler during the drain → old record,
+/// (b) replacement init + handlers → new record, (c) a discarded (reverted)
+/// replacement leaves the old generation answering with its own record.
+#[tokio::test(flavor = "current_thread")]
+#[cfg_attr(not(feature = "tokio-sleep"), ignore = "requires tokio-sleep feature")]
+async fn script_version_is_bound_to_its_serve_generation() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+            let req = |id: &'static str| {
+                mk_event(
+                    "test.req",
+                    "",
+                    &[("type", "request"), ("from", "caller"), ("id", id)],
+                )
+            };
+
+            let (mut old, old_out) = provenance_generation(PROVENANCE_CITIZEN, &log, "1.0.0").await;
+            assert_eq!(old_out.to_string_lossy().trim_end(), "init 1.0.0");
+            old.dispatch_event(req("old-1")).await.unwrap();
+            // Let the old task start and park inside sleep().
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert_eq!(old.class_c_task_count(), 1, "old handler must be in flight");
+
+            // Replacement built + init run while the old task is parked.
+            let (mut new, new_out) = provenance_generation(PROVENANCE_CITIZEN, &log, "2.0.0").await;
+            assert_eq!(new_out.to_string_lossy().trim_end(), "init 2.0.0", "(b) init");
+
+            // (a) The old generation drains AFTER the replacement exists.
+            old.drain_class_c_for_shutdown(std::time::Duration::from_secs(5), true)
+                .await;
+            assert_eq!(log.borrow().len(), 1);
+            assert_eq!(log.borrow()[0].2.as_deref(), Some("old-1"));
+            assert_eq!(log.borrow()[0].4, "1.0.0", "(a) old handler read the new record");
+
+            // (b) The committed replacement's handlers answer for the new file.
+            new.dispatch_event(req("new-1")).await.unwrap();
+            new.drain_class_c_for_shutdown(std::time::Duration::from_secs(5), true)
+                .await;
+            assert_eq!(log.borrow()[1].4, "2.0.0", "(b) handler");
+
+            // (c) A reverted reload: the replacement is discarded and the
+            // live generation keeps answering with its own record.
+            let (mut live, _) = provenance_generation(PROVENANCE_CITIZEN, &log, "3.0.0").await;
+            let (reverted, _) = provenance_generation(PROVENANCE_CITIZEN, &log, "4.0.0").await;
+            drop(reverted);
+            live.dispatch_event(req("live-1")).await.unwrap();
+            live.drain_class_c_for_shutdown(std::time::Duration::from_secs(5), true)
+                .await;
+            assert_eq!(log.borrow()[2].4, "3.0.0", "(c) revert");
+        })
+        .await;
+}
+
+/// No record installed (REPL, `-c`, embedders): nil, and the call is legal.
+#[tokio::test]
+async fn script_version_is_nil_without_a_record() {
+    let out = run_mix_capturing("print(type(script_version()))\n").await.unwrap();
+    assert_eq!(out.trim_end(), "nil");
+}

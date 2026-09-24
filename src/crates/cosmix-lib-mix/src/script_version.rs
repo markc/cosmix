@@ -2,32 +2,30 @@
 //! (Mark 2026-09-25: "ALL binaries and mix script should emit a --version with
 //! build details").
 //!
-//! A script declares its own version with ONE header form, somewhere in its
-//! first [`HEADER_SCAN_LINES`] lines:
+//! A script declares its own version with ONE header form, in its LEADING
+//! COMMENT REGION (see [`parse_script_header`]):
 //!
 //! ```text
 //! -- version: 1.2.3
 //! ```
 //!
 //! This module owns the pieces every consumer must agree on: the header
-//! parser (read by `mix SCRIPT --version`, by `script_version()`, and by the
-//! MIX-D3016 lint note), the provenance record the CLI installs for the
-//! running entry script, and the `script_version()` builtin that reads it.
-//! Hashing and file metadata are the CLI's job — this crate's default build
-//! carries no hash dependency — so the record arrives fully computed.
+//! parser (read by `mix SCRIPT --version`, by the CLI when it builds the
+//! record `script_version()` returns, and by the MIX-D3016 lint note) and the
+//! provenance record itself. The record is installed PER EVALUATOR
+//! ([`crate::Evaluator::set_script_provenance`]), so each `--serve`
+//! generation answers for its own file. Hashing and file metadata are the
+//! CLI's job — this crate's default build carries no hash dependency — so the
+//! record arrives fully computed.
 
-use std::sync::{Arc, RwLock};
-
-use crate::error::MixResult;
 use crate::value::Value;
 use indexmap::IndexMap;
 
-/// How many leading lines are searched for the `-- version:` header. The
-/// header belongs in the file's opening comment block; 32 lines leaves room
-/// for a shebang and a paragraph of description without scanning the body.
+/// How many leading lines are searched for header lines. The scan also stops
+/// earlier, at the first line outside the leading comment region.
 pub const HEADER_SCAN_LINES: usize = 32;
 
-/// What the header scan found.
+/// What the scan found for `-- version:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionHeader {
     /// A well-formed `-- version: X.Y.Z` on 1-based line `line`.
@@ -36,7 +34,7 @@ pub enum VersionHeader {
     /// `-pre` / `+build` suffix). Treated as undeclared at runtime; lint
     /// names the line so the typo is found rather than silently ignored.
     Malformed { raw: String, line: usize },
-    /// No header in the scanned lines.
+    /// No header in the leading comment region.
     Absent,
 }
 
@@ -50,40 +48,94 @@ impl VersionHeader {
     }
 }
 
-/// Scan the first [`HEADER_SCAN_LINES`] lines of `source` for the header.
-/// The first `-- version:` line wins, well-formed or not. Text, not syntax:
-/// the source is never lexed, so a script with a parse error still answers.
+/// Everything the leading comment region declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHeader {
+    /// The `-- version:` declaration.
+    pub version: VersionHeader,
+    /// `-- version-flag: script` was declared: the script answers `--version`
+    /// itself, so `mix SCRIPT --version` runs it with `--version` in `args()`
+    /// instead of answering on its behalf. For wrappers that forward argv.
+    pub version_flag_script: bool,
+}
+
+/// Parse one comment line of the form `-- <key>: <value>` (whitespace-
+/// tolerant, lowercase key, colon required). Returns the trimmed value.
+fn header_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.trim_start().strip_prefix("--")?;
+    let rest = rest.trim_start().strip_prefix(key)?;
+    let value = rest.trim_start().strip_prefix(':')?;
+    Some(value.trim())
+}
+
+/// Scan the LEADING COMMENT REGION of `source`: an optional `#!` shebang on
+/// line 1, then blank lines and `--` comment lines, at most
+/// [`HEADER_SCAN_LINES`] lines. The scan stops at the first line that is none
+/// of those, so a `-- version:` inside a heredoc or string further down — a
+/// script that generates scripts — is never mistaken for this file's header.
+/// Text, not syntax: the source is never lexed, so a script with a parse
+/// error still answers.
 ///
-/// Accepted spelling, whitespace-tolerant: optional leading whitespace, `--`,
-/// optional whitespace, the lowercase word `version`, optional whitespace,
-/// `:`, then the value. `-- version 1.2.3` (no colon) is NOT a header — prose
-/// comments say "version" too often for a colon-less form to be safe.
-pub fn parse_version_header(source: &str) -> VersionHeader {
-    for (idx, line) in source.lines().take(HEADER_SCAN_LINES).enumerate() {
-        let Some(rest) = line.trim_start().strip_prefix("--") else {
+/// Recognised lines, first occurrence of each wins:
+/// - `-- version: X.Y.Z` — `-- version 1.2.3` (no colon) is prose, not a
+///   header; `-- versioning: …` and `-- Version: …` are not headers either.
+/// - `-- version-flag: script` — any other value is ignored.
+pub fn parse_script_header(source: &str) -> ScriptHeader {
+    let mut version = VersionHeader::Absent;
+    let mut version_flag_script = false;
+    let mut flag_seen = false;
+    for (line_no, line) in leading_comment_lines(source) {
+        if !flag_seen && let Some(value) = header_value(line, "version-flag") {
+            flag_seen = true;
+            version_flag_script = value == "script";
             continue;
-        };
-        let Some(rest) = rest.trim_start().strip_prefix("version") else {
-            continue;
-        };
-        let Some(value) = rest.trim_start().strip_prefix(':') else {
-            continue;
-        };
-        let value = value.trim();
-        let line = idx + 1;
-        return if is_semver(value) {
-            VersionHeader::Declared {
-                version: value.to_string(),
-                line,
-            }
-        } else {
-            VersionHeader::Malformed {
-                raw: value.to_string(),
-                line,
-            }
-        };
+        }
+        if matches!(version, VersionHeader::Absent)
+            && let Some(value) = header_value(line, "version")
+        {
+            let line = line_no;
+            version = if is_semver(value) {
+                VersionHeader::Declared {
+                    version: value.to_string(),
+                    line,
+                }
+            } else {
+                VersionHeader::Malformed {
+                    raw: value.to_string(),
+                    line,
+                }
+            };
+        }
     }
-    VersionHeader::Absent
+    ScriptHeader {
+        version,
+        version_flag_script,
+    }
+}
+
+/// The `--` comment lines of the leading comment region, as (1-based line
+/// number, line): skips a line-1 `#!` shebang and blank lines, stops at the
+/// first line that is neither those nor a `--` comment, and never looks past
+/// [`HEADER_SCAN_LINES`]. The one definition of "the header region", shared
+/// by the header parser and lint.
+pub fn leading_comment_lines(source: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    for (idx, line) in source.lines().take(HEADER_SCAN_LINES).enumerate() {
+        let trimmed = line.trim_start();
+        if (idx == 0 && line.starts_with("#!")) || trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.starts_with("--") {
+            break;
+        }
+        out.push((idx + 1, line));
+    }
+    out
+}
+
+/// The `-- version:` half of [`parse_script_header`].
+pub fn parse_version_header(source: &str) -> VersionHeader {
+    parse_script_header(source).version
 }
 
 /// `MAJOR.MINOR.PATCH` of ASCII digits, optionally followed by `-pre` and/or
@@ -125,13 +177,15 @@ fn is_semver(v: &str) -> bool {
 /// Provenance of the running entry script, computed by the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptProvenance {
-    /// Basename of the script path; `-` for a script read from stdin.
+    /// Basename of the script path as given (a symlink's own name); `-` for
+    /// a script read from stdin.
     pub name: String,
     /// The declared `-- version:` value, `None` when absent or malformed.
     pub version: Option<String>,
     /// Full lowercase hex SHA-256 of the script's bytes.
     pub sha256: String,
-    /// File mtime as RFC 3339 UTC; `None` for stdin.
+    /// mtime of the file the bytes were read from (a symlink's target), as
+    /// RFC 3339 UTC; `None` for stdin.
     pub modified: Option<String>,
     /// The interpreter's version (`0.94.0`).
     pub mix_version: String,
@@ -190,38 +244,6 @@ impl ScriptProvenance {
     }
 }
 
-/// The running entry script's provenance. Replaceable rather than
-/// set-once: a `--serve` citizen's RELOAD swaps in a new script.
-static PROVENANCE: RwLock<Option<Arc<ScriptProvenance>>> = RwLock::new(None);
-
-/// Install (or clear) the running script's provenance; returns the previous
-/// record so a reverted RELOAD can put it back.
-pub fn replace_script_provenance(
-    next: Option<Arc<ScriptProvenance>>,
-) -> Option<Arc<ScriptProvenance>> {
-    match PROVENANCE.write() {
-        Ok(mut guard) => std::mem::replace(&mut *guard, next),
-        Err(poisoned) => std::mem::replace(&mut *poisoned.into_inner(), next),
-    }
-}
-
-/// The running script's provenance, if the CLI installed one.
-pub fn script_provenance() -> Option<Arc<ScriptProvenance>> {
-    match PROVENANCE.read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    }
-}
-
-/// `script_version()` — the entry script's provenance map, or nil when no
-/// script is running (REPL, `mix -c`, an embedder that never installed one).
-pub(crate) fn builtin_script_version(_args: Vec<Value>) -> MixResult<Option<Value>> {
-    Ok(Some(match script_provenance() {
-        Some(p) => p.to_value(),
-        None => Value::Nil,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +264,10 @@ mod tests {
         );
         assert_eq!(parse_version_header("--  version  :  2.0.0-rc.1+b7\n"), declared("2.0.0-rc.1+b7", 1));
         assert_eq!(parse_version_header("-- version: 1.0.0+build.5\n"), declared("1.0.0+build.5", 1));
+        assert_eq!(
+            parse_version_header("-- a tool\n\n--\n-- version: 4.0.0\n"),
+            declared("4.0.0", 4)
+        );
     }
 
     #[test]
@@ -257,6 +283,19 @@ mod tests {
         ] {
             assert_eq!(parse_version_header(src), VersionHeader::Absent, "{src:?}");
         }
+    }
+
+    #[test]
+    fn scan_stops_at_the_first_code_line() {
+        // A generator script: the header-shaped line is inside a heredoc.
+        let src = "-- makes scripts\n$out = <<EOF\n-- version: 9.9.9\nEOF\nprint($out)\n";
+        assert_eq!(parse_version_header(src), VersionHeader::Absent);
+        // Same inside a multi-line string.
+        let src = "print(\"x\n-- version: 9.9.9\n\")\n";
+        assert_eq!(parse_version_header(src), VersionHeader::Absent);
+        // A shebang only counts on line 1.
+        let src = "-- a\n#!/bin/mix\n-- version: 1.0.0\n";
+        assert_eq!(parse_version_header(src), VersionHeader::Absent);
     }
 
     #[test]
@@ -286,12 +325,28 @@ mod tests {
             parse_version_header("-- version: 1.0.0\n-- version: 2.0.0\n"),
             declared("1.0.0", 1)
         );
-        let mut late = "print(1)\n".repeat(HEADER_SCAN_LINES - 1);
+        let mut late = "--\n".repeat(HEADER_SCAN_LINES - 1);
         late.push_str("-- version: 3.0.0\n");
         assert_eq!(parse_version_header(&late), declared("3.0.0", HEADER_SCAN_LINES));
-        let mut too_late = "print(1)\n".repeat(HEADER_SCAN_LINES);
+        let mut too_late = "--\n".repeat(HEADER_SCAN_LINES);
         too_late.push_str("-- version: 3.0.0\n");
         assert_eq!(parse_version_header(&too_late), VersionHeader::Absent);
+    }
+
+    #[test]
+    fn version_flag_opt_out() {
+        let h = parse_script_header("#!/usr/bin/env mix\n-- version: 1.0.0\n-- version-flag: script\n");
+        assert_eq!(h.version, declared("1.0.0", 2));
+        assert!(h.version_flag_script);
+        // Whitespace-tolerant, exact value, and it does not shadow version.
+        assert!(parse_script_header("--version-flag :  script \n").version_flag_script);
+        assert!(!parse_script_header("-- version-flag: mix\n").version_flag_script);
+        assert!(!parse_script_header("-- version-flag script\n").version_flag_script);
+        assert!(!parse_script_header("print(1)\n-- version-flag: script\n").version_flag_script);
+        assert_eq!(
+            parse_script_header("-- version-flag: script\n").version,
+            VersionHeader::Absent
+        );
     }
 
     #[test]

@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gallery_spike_index.mix — build an incremental metadata-only media index.
 --
 -- The source tree is read-only. Existing rows are keyed by relative path,

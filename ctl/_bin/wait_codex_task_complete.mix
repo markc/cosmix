@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- wait_codex_task_complete.mix — wait for a live Codex turn to finish.
 --
 -- Codex work can outlive an MCP tool's idle window. A process listing cannot

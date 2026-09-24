@@ -284,3 +284,147 @@ fn lint_names_a_malformed_header_line() {
     assert!(out.contains("typo.mix:2: MIX-D3016 note:"), "{out}");
     assert!(out.contains("1.2"), "{out}");
 }
+
+// ── round 2: opt-out, -i, leading region, --json, symlink, lint scope ──
+
+#[test]
+fn opt_out_script_receives_its_own_version_flag() {
+    let d = tempfile::tempdir().unwrap();
+    let body = "#!/usr/bin/env mix\n-- version: 1.0.0\n-- version-flag: script\nprint(\"SCRIPT-BODY-RAN\")\nprint(\"argv:\" .. join(args(), \",\"))\n";
+    let p = write(d.path(), "wrapper.mix", body);
+    for flag in ["--version", "-V"] {
+        let o = run(&[p.to_str().unwrap(), flag]);
+        assert!(o.status.success(), "{:?}", stderr(&o));
+        let out = stdout(&o);
+        assert!(out.contains(RAN), "an opted-out script must run: {out:?}");
+        assert!(out.contains(&format!("argv:{flag}")), "{out:?}");
+    }
+    // Control: the same file minus the opt-out line is answered for.
+    let plain = body.replace("-- version-flag: script\n", "");
+    let p2 = write(d.path(), "plain.mix", &plain);
+    assert_version_line(&run(&[p2.to_str().unwrap(), "--version"]), "plain.mix", "1.0.0", &plain);
+    // Serve has no argv to hand the flag to, so Mix still answers there.
+    let o = run(&["--serve", p.to_str().unwrap(), "--version"]);
+    assert_version_line(&o, "wrapper.mix", "1.0.0", body);
+}
+
+#[test]
+fn opt_out_from_stdin_still_runs_the_bytes() {
+    let body = "-- version: 1.0.0\n-- version-flag: script\nprint(\"stdin-argv:\" .. join(args(), \",\"))\n";
+    let mut child = mix()
+        .args(["-", "--version"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(body.as_bytes()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success(), "{:?}", stderr(&o));
+    assert_eq!(stdout(&o).trim_end(), "stdin-argv:--version");
+}
+
+#[test]
+fn interactive_flag_before_the_script_is_still_a_query() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "deploy.mix", VERSIONED);
+    let o = mix()
+        .args(["-i", p.to_str().unwrap(), "--version"])
+        .env("HOME", d.path())
+        .output()
+        .unwrap();
+    assert_version_line(&o, "deploy.mix", "1.2.3", VERSIONED);
+}
+
+#[test]
+fn header_inside_a_heredoc_is_not_the_header() {
+    let d = tempfile::tempdir().unwrap();
+    let body = "-- makes scripts\n$gen = <<EOF\n-- version: 9.9.9\nprint(1)\nEOF\nprint(\"SCRIPT-BODY-RAN\")\n";
+    let p = write(d.path(), "gen.mix", body);
+    let p = p.to_str().unwrap();
+    assert_version_line(&run(&[p, "--version"]), "gen.mix", "unversioned", body);
+    // And lint still owes it a header (it is under bin/ here).
+    let lp = write(d.path(), "bin/gen.mix", body);
+    let (_, out) = lint(&[lp.to_str().unwrap()]);
+    assert!(out.contains("MIX-D3016"), "{out}");
+}
+
+#[test]
+fn json_form_is_the_builtin_map() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "deploy.mix", VERSIONED);
+    let o = run(&[p.to_str().unwrap(), "--version", "--json"]);
+    assert!(o.status.success(), "{:?}", stderr(&o));
+    let out = stdout(&o);
+    assert!(!out.contains(RAN), "{out:?}");
+    assert_eq!(out.lines().count(), 1, "{out:?}");
+    let v: serde_json::Value = serde_json::from_str(&out).expect("one JSON object");
+    let full: String = Sha256::digest(VERSIONED.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(v["name"], "deploy.mix");
+    assert_eq!(v["version"], "1.2.3");
+    assert_eq!(v["sha"], sha12(VERSIONED));
+    assert_eq!(v["sha256"], full);
+    assert!(v["modified"].as_str().is_some_and(|m| m.ends_with('Z')), "{v}");
+    assert_eq!(v["mix"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(v["mix"]["dirty"].is_boolean(), "{v}");
+    // Unversioned and stdin: nulls, not strings.
+    let p = write(d.path(), "plain.mix", UNVERSIONED);
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout(&run(&[p.to_str().unwrap(), "-V", "--json"]))).unwrap();
+    assert!(v["version"].is_null(), "{v}");
+}
+
+#[test]
+fn symlink_reports_the_link_name_and_the_target_bytes() {
+    let d = tempfile::tempdir().unwrap();
+    let target = write(d.path(), "real-tool.mix", VERSIONED);
+    let link = d.path().join("tool");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    assert_version_line(&run(&[link.to_str().unwrap(), "--version"]), "tool", "1.2.3", VERSIONED);
+}
+
+#[test]
+fn lint_gates_serve_citizens_and_script_directories() {
+    let d = tempfile::tempdir().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    // The real shipped files carry headers: silent even under --require-version.
+    for rel in ["src/desktop/scripts/desktop-session.mix", "docs/build/gen-doc-pages.mix"] {
+        let (code, out) = lint(&["--require-version", "--deny-warnings", root.join(rel).to_str().unwrap()]);
+        assert_eq!(code, 0, "{rel}: {out}");
+        assert!(!out.contains("MIX-D3016"), "{rel}: {out}");
+    }
+    // The same files with the header stripped are gated: desktop-session by
+    // its `--serve` marker (no shebang, no script directory in this path),
+    // gen-doc-pages by its `build/` directory.
+    let strip = |rel: &str| {
+        let src = std::fs::read_to_string(root.join(rel)).unwrap();
+        src.lines()
+            .filter(|l| !l.starts_with("-- version:"))
+            .map(|l| format!("{l}\n"))
+            .collect::<String>()
+    };
+    let session = write(d.path(), "flat/desktop-session.mix", &strip("src/desktop/scripts/desktop-session.mix"));
+    let pages = write(d.path(), "build/gen-doc-pages.mix", &strip("docs/build/gen-doc-pages.mix"));
+    for p in [&session, &pages] {
+        let (code, out) = lint(&["--require-version", "--deny-warnings", p.to_str().unwrap()]);
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("MIX-D3016 warning:"), "{out}");
+    }
+    // A top-level `on` handler marks a citizen; `scripts/` counts as a
+    // script directory; `scripts/lib/` is still a library.
+    let citizen = write(d.path(), "flat/citizen.mix", "on ping\n  reply(0, \"pong\")\nend\n");
+    let in_scripts = write(d.path(), "scripts/tool.mix", "print(1)\n");
+    for p in [&citizen, &in_scripts] {
+        let (_, out) = lint(&[p.to_str().unwrap()]);
+        assert!(out.contains("MIX-D3016 note:"), "{}: {out}", p.display());
+    }
+    let library = write(d.path(), "scripts/lib/util.mix", "fn f()\n  return 1\nend\n");
+    let plain = write(d.path(), "flat/util.mix", "fn f()\n  return 1\nend\n");
+    for p in [&library, &plain] {
+        let (_, out) = lint(&[p.to_str().unwrap()]);
+        assert!(!out.contains("MIX-D3016"), "{}: {out}", p.display());
+    }
+}

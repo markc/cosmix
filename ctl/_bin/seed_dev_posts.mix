@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- seed_dev_posts.mix — seed configured published development posts into one
 -- webd CMS database on a rostered node.
 --

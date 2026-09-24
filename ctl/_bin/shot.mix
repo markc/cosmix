@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- shot.mix — render a URL to a PNG with a local headless browser.
 --
 --   mix _bin/shot.mix <url> [out.png]

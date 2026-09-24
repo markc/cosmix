@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_noded.mix — install and/or restart the per-node Bus broker
 -- (cosmix-noded) across the mesh, hubs last.
 --

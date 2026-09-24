@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gallery_spike_render.mix — render a static gallery from a media index.
 --
 -- Reads indexed media metadata and writes an album index plus one thumbnail

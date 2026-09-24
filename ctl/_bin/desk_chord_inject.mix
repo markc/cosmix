@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- desk_chord_inject.mix — inject one Ctrl+Alt+F<n> chord through ydotool.
 --
 -- This is a local workstation test tool. A uinput keyboard can reach whichever

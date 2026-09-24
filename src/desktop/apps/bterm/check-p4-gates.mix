@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate: the P4 isolated-task fixtures actually RUN.
 --
 -- Sibling of check-stage-d-gates.mix, and pinned the same two ways. libtest

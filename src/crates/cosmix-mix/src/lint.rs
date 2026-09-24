@@ -257,18 +257,54 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
 }
 
 /// Is `file` run as a script (so it owes a `-- version:` header), rather than
-/// a module loaded by `require`/`include`? Deliberately simple and documented
-/// in lint.md: a `#!` shebang on line 1, or a path with a `bin` or `_bin`
-/// directory component. Stdin (`-`) qualifies only by shebang.
+/// a module loaded by `require`/`include`? A deliberately simple heuristic,
+/// documented in lint.md, decided in this order over the path AS GIVEN:
+/// 1. a `#!` shebang on line 1 — a script;
+/// 2. a `lib` or `_lib` directory component — a library, never reported;
+/// 3. a `bin`, `_bin`, `scripts` or `build` directory component — a script;
+/// 4. a serve citizen: a top-level `on <verb>` handler (column 0), or a
+///    `--serve` mention in the leading comment region — a script.
+///
+/// Stdin (`-`) has no path, so only rules 1 and 4 apply. Known false
+/// positive, Wontfix: a library under an absolute `/…/bin/…` path with no
+/// `lib` component is reported; lint it by a relative path.
 fn runs_as_script(source: &str, file: &str) -> bool {
     if source.starts_with("#!") {
         return true;
     }
-    file != "-"
-        && std::path::Path::new(file).parent().is_some_and(|dir| {
-            dir.components()
-                .any(|c| matches!(c.as_os_str().to_str(), Some("bin" | "_bin")))
-        })
+    if file != "-" {
+        let dirs: Vec<String> = std::path::Path::new(file)
+            .parent()
+            .map(|dir| {
+                dir.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if dirs.iter().any(|d| d == "lib" || d == "_lib") {
+            return false;
+        }
+        if dirs
+            .iter()
+            .any(|d| matches!(d.as_str(), "bin" | "_bin" | "scripts" | "build"))
+        {
+            return true;
+        }
+    }
+    declares_serve(source)
+}
+
+/// A serve citizen: a top-level `on <verb>` handler, or a `--serve` mention
+/// in the leading comment region ("Run with mix --serve x.mix").
+fn declares_serve(source: &str) -> bool {
+    let top_level_handler = source.lines().any(|line| {
+        line.strip_prefix("on ")
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+    });
+    top_level_handler
+        || cosmix_mix::script_version::leading_comment_lines(source)
+            .iter()
+            .any(|(_, line)| line.trim_start()[2..].contains("--serve"))
 }
 
 /// MIX-D3016: a script with no well-formed `-- version: X.Y.Z` header in its

@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- journal_upload_install.mix — configure this node's systemd-journal-upload
 -- service to send its journal to one explicitly supplied receiver URL.
 --

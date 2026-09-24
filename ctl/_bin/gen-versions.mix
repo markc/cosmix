@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gen-versions.mix — regenerate this checkout's docs/VERSIONS.md from Cargo manifests.
 --
 -- WHY THIS EXISTS. Version numbers written into prose rot, and a stale one

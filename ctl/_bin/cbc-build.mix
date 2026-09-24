@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- cbc-build.mix — run one watched build command on a configured foreign
 -- build-cluster worker.
 --

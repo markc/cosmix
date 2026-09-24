@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_alloy.mix — install Grafana Alloy and its journal-shipping config on
 -- the hub's fleet roster (or a named subset), then prove the restarted service
 -- is active, logging, and delivering fresh samples to Loki.

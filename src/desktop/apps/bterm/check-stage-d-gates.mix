@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate: the P0-J stage-D fixtures — idle-prompt execution admission and
 -- per-evaluation cancellation — actually RUN, on both sides of the path.
 --

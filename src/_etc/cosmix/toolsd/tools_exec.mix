@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- tools_exec.mix — the DAEMON-SIDE half of the tool registry: the argv templates and the
 -- fail-closed exec preconditions. Lives ONLY on the toolsd node
 -- (/opt/cosmix/share/cosmix/tools_exec.mix); webd never sees it.

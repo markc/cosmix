@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- dav_gauntlet.mix — exercise a CalDAV/CardDAV server through the conformance
 -- flows used by common DAV clients.
 --

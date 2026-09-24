@@ -49,8 +49,7 @@ use value::Value;
 pub use builtins::{CapabilityClass, CategoryAllowList, capability_category, set_script_argv};
 pub use error::{MixError, MixResult};
 pub use script_version::{
-    ScriptProvenance, VersionHeader, parse_version_header, replace_script_provenance,
-    script_provenance,
+    ScriptHeader, ScriptProvenance, VersionHeader, parse_script_header, parse_version_header,
 };
 pub use evaluator::{
     ArityMode, BusCallFuture, BusCallHandler, BusHandler, CapabilityPolicy,

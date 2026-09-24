@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_toolsd.mix — install the toolsd wake citizen, drain and immutable
 -- tool assets on the configured mesh nodes, or a named configured subset.
 --

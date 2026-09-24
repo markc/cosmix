@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- desk_bin_refresh.mix — atomically refresh the compositor test binaries in
 -- the canonical system bin directory used by the local desktop.
 --

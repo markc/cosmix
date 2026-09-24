@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- sshm_worker.mix — the sshm job worker (P2a/P2b).
 --
 -- A hardened systemd unit runs this as the hub-configured drain identity with

@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- toolsd_drain.mix — the toolsd DRAIN: claim a tool run, execute it, report the output.
 --
 -- Runs as the UNPRIVILEGED `cosmix-toolsd` user under a systemd oneshot (flock'd), woken

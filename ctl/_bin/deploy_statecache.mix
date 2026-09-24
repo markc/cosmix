@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_statecache.mix — install the SPEC-18 statecache citizen script and
 -- systemd unit on configured mesh nodes, then prove the new invocation works.
 --

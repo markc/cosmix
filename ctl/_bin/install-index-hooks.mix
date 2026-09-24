@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- install-index-hooks.mix — install the tracked post-commit indexd hooks.
 --
 --   mix _bin/install-index-hooks.mix             install or refresh all repos

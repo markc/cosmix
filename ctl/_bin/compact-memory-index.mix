@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- compact-memory-index.mix — trim over-long hooks in a Claude memory MEMORY.md.
 --
 --   mix _bin/compact-memory-index.mix <MEMORY.md> [max_len] [--apply]

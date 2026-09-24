@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- scan_fleet_mix_parse.mix — ask every rostered node whether a candidate Mix
 -- binary can parse the .mix files that node actually has before it is deployed.
 --
