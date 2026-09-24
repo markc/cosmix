@@ -187,7 +187,8 @@ struct AccountSelector {
     /// corpus tree.
     #[serde(default)]
     account_id: Option<serde_json::Value>,
-    #[serde(default)]
+    /// Also accepted as `account`, the key the `maild.stats.*` verbs use.
+    #[serde(default, alias = "account")]
     email: Option<String>,
 }
 
@@ -284,8 +285,15 @@ fn reject_unknown_keys(args: &serde_json::Value, allowed: &[&str]) -> Result<(),
     ))
 }
 
-const TRAIN_KEYS: &[&str] = &["account_id", "email", "email_id", "message_id", "class"];
-const UNTRAIN_KEYS: &[&str] = &["account_id", "email", "email_id", "message_id"];
+const TRAIN_KEYS: &[&str] = &[
+    "account_id",
+    "email",
+    "account",
+    "email_id",
+    "message_id",
+    "class",
+];
+const UNTRAIN_KEYS: &[&str] = &["account_id", "email", "account", "email_id", "message_id"];
 
 /// Which message to (un)train: exactly one of `email_id` (the JMAP Email
 /// id, i.e. the MDS item UUID — also the classifier stamp) or `message_id`
@@ -2179,6 +2187,12 @@ mod tests {
         assert_eq!(v["account_id"], 13);
         assert_eq!(v["email"], "account-13@example.com");
         assert_eq!(v["ham_messages"], 2);
+
+        // `account` is the maild.stats.* spelling of the same selector.
+        let args = serde_json::json!({"account": "account-13@example.com"});
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        assert!(body.contains("\"account_id\":13"), "{body}");
 
         let args = serde_json::json!({"email": "nobody@example.com"});
         let (rc, body) = handle_stats(&cls, &database, &args).await;

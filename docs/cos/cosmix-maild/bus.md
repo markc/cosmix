@@ -43,6 +43,8 @@ An unknown account and a wrong password both produce `valid: false` from `verify
 | `maild.bayesian.train` | `account_id` or `email`; `email_id` or `message_id`; `class` (`spam` / `ham`) | Train one stored message through the Junk-move path; returns `result` (`applied` / `already_labeled`) |
 | `maild.bayesian.untrain` | `account_id` or `email`; `email_id` or `message_id` | Remove the message's training label and reverse its counts; returns `removed` (`spam`, `ham`, or null) |
 
+The per-account Bayesian verbs take `email` or `account` for the address; `account` is the name the `maild.stats.*` verbs use. The address match is exact and case-sensitive, with no alias or `+tag` expansion, so an unmatched address fails closed. An unknown account is reported as `account not found`, the same text `maild.bayesian.rebuild` uses. The `maild.stats.*` verbs report `no such account: <address>` instead.
+
 `train` and `untrain` refuse any key outside those listed (for example `dry_run`) with `rc=10` rather than ignoring it.
 
 `maild.rules.explain` accepts:
