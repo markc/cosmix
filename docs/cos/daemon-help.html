@@ -519,15 +519,19 @@ citizen receives the whole string as the command and has no such verb.</p>
 <code>rebind refused: InvalidService</code>. Rows without the field serialize without it,
 so older files and callers are unaffected.</p>
 <p>The keymap file is admitted row by row. A row that does not parse, such as one
-whose <code>service</code> is not a string, is dropped. So is a row whose <code>service</code> fails
+whose <code>service</code> is a number, list or object, is dropped. The exception is
+<code>"service": null</code>, which loads as an untargeted row. So is a row whose <code>service</code> fails
 the grammar. The other rows still load, and the file is not reseeded. Each
 dropped row is logged with its code, modifiers, action, service and reason.
 <code>input.reload</code> also returns them in a <code>dropped</code> list in its reply:</p>
 <pre><code class="language-json">{"ok":true,"generation":7,"dropped":[{"code":108,"modifiers":{"right_ctrl":true},
   "action":"desktop.clipboard.menu","service":7,"reason":"malformed row: ..."}]}
 </code></pre>
-<p>The file on disk is left as written until the next <code>input.bind</code> or
-<code>input.unbind</code>, which rewrites it from the live rows without the dropped ones.</p>
+<p>The file on disk is left as written until the next successful <code>input.bind</code>,
+or an <code>input.unbind</code> that removes a live row. Either one rewrites the file from
+the live rows, so the dropped rows are gone from it. An <code>input.unbind</code> of a
+stroke that is not live, including one whose row was dropped, returns
+<code>"removed":false</code> and does not rewrite the file.</p>
 <p>One legacy shape is migrated at load. A row with no <code>service</code> whose action
 starts with <code>desktop-vt1.desktop.clipboard.</code> is rewritten to service
 <code>desktop-vt1</code> with the rest of the action, for example
@@ -540,8 +544,8 @@ local caller. Since citizen 0.3.5, <code>instance</code> is optional on those tw
 When a caller sends it, a stale value is still refused with rc 12.</p>
 <p>Rolling back to an inputd without this field is lossy. The older binary ignores
 <code>service</code> and routes by first segment, so the clipboard rows go to <code>desktop</code>,
-which has no such verb, and nothing is logged. The next <code>input.bind</code> or
-<code>input.unbind</code> under the older binary also rewrites the file without the field.
+which has no such verb, and nothing is logged. Under the older binary, the next successful <code>input.bind</code>, or an
+<code>input.unbind</code> that removes a live row, rewrites the file without the field.
 After rolling forward again, those rows must be rebound with <code>service</code>.</p>
 <p>The shipped default keymap binds these right-Ctrl rows:</p>
 <table><thead><tr><th>Chord</th><th>Code</th><th>Action</th><th>Service</th><th>Repeat</th></tr></thead><tbody>

@@ -92,7 +92,8 @@ citizen receives the whole string as the command and has no such verb.
 so older files and callers are unaffected.
 
 The keymap file is admitted row by row. A row that does not parse, such as one
-whose `service` is not a string, is dropped. So is a row whose `service` fails
+whose `service` is a number, list or object, is dropped. The exception is
+`"service": null`, which loads as an untargeted row. So is a row whose `service` fails
 the grammar. The other rows still load, and the file is not reseeded. Each
 dropped row is logged with its code, modifiers, action, service and reason.
 `input.reload` also returns them in a `dropped` list in its reply:
@@ -102,8 +103,11 @@ dropped row is logged with its code, modifiers, action, service and reason.
   "action":"desktop.clipboard.menu","service":7,"reason":"malformed row: ..."}]}
 ```
 
-The file on disk is left as written until the next `input.bind` or
-`input.unbind`, which rewrites it from the live rows without the dropped ones.
+The file on disk is left as written until the next successful `input.bind`,
+or an `input.unbind` that removes a live row. Either one rewrites the file from
+the live rows, so the dropped rows are gone from it. An `input.unbind` of a
+stroke that is not live, including one whose row was dropped, returns
+`"removed":false` and does not rewrite the file.
 
 One legacy shape is migrated at load. A row with no `service` whose action
 starts with `desktop-vt1.desktop.clipboard.` is rewritten to service
@@ -119,8 +123,8 @@ When a caller sends it, a stale value is still refused with rc 12.
 
 Rolling back to an inputd without this field is lossy. The older binary ignores
 `service` and routes by first segment, so the clipboard rows go to `desktop`,
-which has no such verb, and nothing is logged. The next `input.bind` or
-`input.unbind` under the older binary also rewrites the file without the field.
+which has no such verb, and nothing is logged. Under the older binary, the next successful `input.bind`, or an
+`input.unbind` that removes a live row, rewrites the file without the field.
 After rolling forward again, those rows must be rebound with `service`.
 
 The shipped default keymap binds these right-Ctrl rows:
