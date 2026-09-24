@@ -189,6 +189,12 @@ impl HolderClient {
         self.backoff = RETRY_FIRST;
     }
 
+    /// The activation focus holds Quoin currently wants.
+    #[cfg(test)]
+    pub(crate) fn focus_holds(&self) -> usize {
+        self.focus.len()
+    }
+
     /// The capability to hand the model when it differs from what the model
     /// was last told. The host calls this after draining events and again
     /// after messages, so a gate that opened is applied before the commands it

@@ -3869,8 +3869,11 @@ mod tests {
         capable: std::cell::Cell<bool>,
         focus: std::cell::RefCell<Value>,
         outputs: std::cell::RefCell<BTreeMap<u64, &'static str>>,
-        /// Refuse hold acquisitions as a layer comp has not mapped yet.
-        refuse_holds: std::cell::Cell<bool>,
+        /// Refuse hold acquisitions with this code — `unknown_panel_surface`
+        /// for a layer comp has not mapped yet, `locked` under a session
+        /// lock (comp refuses before touching holder state, publishing
+        /// nothing).
+        refuse_holds: std::cell::Cell<Option<&'static str>>,
         left_surface: std::cell::RefCell<Option<String>>,
         left_hidden: std::cell::Cell<bool>,
         left_holds: std::cell::RefCell<BTreeSet<String>>,
@@ -3888,7 +3891,7 @@ mod tests {
                 capable: capable.into(),
                 focus: json!({"keyboard":null,"pointer":null}).into(),
                 outputs: BTreeMap::new().into(),
-                refuse_holds: false.into(),
+                refuse_holds: None.into(),
                 left_surface: None.into(),
                 left_hidden: true.into(),
                 left_holds: BTreeSet::new().into(),
@@ -3955,8 +3958,8 @@ mod tests {
                             .unwrap_or_else(|| panic!("unexpected read {path}"));
                         (0, json!(comp.outputs.borrow().get(&id)))
                     }
-                    ("comp.panel.hold", _) if body["acquire"] == true && comp.refuse_holds.get() => {
-                        (10, json!({"error":"unknown_panel_surface","surface":body["surface"]}))
+                    ("comp.panel.hold", _) if body["acquire"] == true && comp.refuse_holds.get().is_some() => {
+                        (10, json!({"error":comp.refuse_holds.get(),"surface":body["surface"]}))
                     }
                     _ => (0, json!({"accepted":true,"surface":body["surface"]})),
                 };
@@ -4218,7 +4221,7 @@ mod tests {
         // holds yet) — delivered after the mode report's ack and before any
         // hold ack, since comp refuses the hold until the layer is mapped:
         // the explicit reveal survives it (the anti-vanish invariant).
-        comp.refuse_holds.set(true);
+        comp.refuse_holds.set(Some("unknown_panel_surface"));
         map_left_layer(&mut app, "panel-left");
         let calls = pump(&mut app, &peer, &comp);
         let commands: Vec<_> = calls.iter().map(|call| (call.to.as_str(), call.command.as_str())).collect();
@@ -4228,7 +4231,7 @@ mod tests {
         assert_eq!(comp.published(), [false], "the re-stated conceal verdict");
         assert!(left(&app).transient_revealed, "a conceal before the hold leaves the reveal");
         // The layer maps: the refused hold is sent again and holds the edge.
-        comp.refuse_holds.set(false);
+        comp.refuse_holds.set(None);
         peer.deliver_message(comp_message("surface.mapped", json!({"id":4,"role":"layer","event_seq":3})));
         let acquired = holds(&pump(&mut app, &peer, &comp));
         assert_eq!(acquired.len(), 1);
@@ -4295,6 +4298,43 @@ mod tests {
         assert_eq!(comp.published(), [false], "nothing else holds: comp conceals");
         let panel = left(&app);
         assert!(!panel.transient_revealed && !panel.keyboard_requested);
+    }
+
+    /// The session-lock shape (review round 2): comp refuses the hold
+    /// `locked` before touching its holder state and publishes nothing, so
+    /// no reveal/conceal transition ever reaches Quoin and only the model can
+    /// end the reveal. At the grant timeout it does: the activation-made
+    /// reveal hides and no hold intent is left. A `focus=false` reveal has no
+    /// keyboard request to lapse and keeps the `shell.panel.show` lifecycle.
+    #[test]
+    fn an_ungranted_activation_under_a_lock_hides_at_the_grant_timeout() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        comp.refuse_holds.set(Some("locked"));
+        map_left_layer(&mut app, "panel-left");
+        let refused = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(refused.len(), 1, "the hold was sent and refused");
+        assert_eq!(refused[0]["acquire"], true);
+        comp.published();
+        assert!(left(&app).transient_revealed);
+        std::thread::sleep(cosmix_shell::core::FOCUS_GRANT_TIMEOUT + std::time::Duration::from_millis(100));
+        pump(&mut app, &peer, &comp);
+        assert!(comp.published().is_empty(), "comp said nothing");
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested, "the model ended it");
+        assert_eq!(panel.mode, PanelMode::Hidden);
+        assert_eq!(app.world().resource::<crate::holders::HolderClient>().focus_holds(), 0,
+            "no hold intent is left");
+
+        // focus=false under the same lock: nothing lapses, the reveal stays.
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate",
+            json!({"name":"alpha","focus":false}));
+        assert_eq!(rc, 0, "{body}");
+        std::thread::sleep(cosmix_shell::core::FOCUS_GRANT_TIMEOUT + std::time::Duration::from_millis(100));
+        assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+        assert!(left(&app).transient_revealed, "a focus=false reveal is untouched");
     }
 
     /// `focus=false`: reveal or switch for attention, without asking for the
