@@ -982,10 +982,6 @@ but that is the platform's fallback, not a guarantee.) Pass an absolute
 <em>relative</em> <code>argv[0]</code> is resolved in a directory the OS deliberately leaves
 platform-specific, so <code>run_stream(["./build.sh"], {cwd: "/srv/app"})</code> is not
 portable; spell it <code>/srv/app/build.sh</code>.</p>
-<h3 id="repository-version-gate">Repository version gate</h3>
-<p>The repository's <code>src/tools/version_flag_gate.mix</code> reports every skipped
-binary as <code>SKIP &lt;bin&gt; (&lt;crate&gt;): &lt;reason&gt;</code>; its summary skip count matches
-those lines, including binaries absent because required features were not built.</p>
 <h3 id="run_parallel--process-level-fan-out-v0820">run_parallel — process-level fan-out (v0.82.0)</h3>
 <p><code>run_parallel(jobs [, {max, timeout}])</code> runs many <code>run_argv</code> jobs at once through
 a bounded worker pool and returns a <strong>list of <code>process_result</code> maps in input

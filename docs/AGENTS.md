@@ -27,6 +27,14 @@ names, addresses, domains, keys, operator home paths) anywhere in it.
 
 ## Build and verify
 
+`src/tools/version_flag_gate.mix` reports every skipped binary as
+`SKIP <bin> (<crate>): <reason>`; its summary skip count matches those lines,
+including binaries absent because required features were not built. Preserve
+the full gate output when collecting build logs; a tail omits earlier verdicts.
+The selftest checks that each skip is named and rejects a counted skip without
+a named line. Its `--skip-accounting-only` mode runs these log controls without
+Cargo or stub binaries.
+
 ```sh
 cd $COSMIX/src && cargo build --workspace --release     # or: mix $COSMIX/setup.mix
 cd $COSMIX/src/desktop && cargo build --workspace --release

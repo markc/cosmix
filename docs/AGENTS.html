@@ -466,6 +466,13 @@ area you are changing.</li>
 non-Mix script and exists solely because <code>mix</code> does not yet.</li>
 </ul>
 <h2 id="build-and-verify">Build and verify</h2>
+<p><code>src/tools/version_flag_gate.mix</code> reports every skipped binary as
+<code>SKIP &lt;bin&gt; (&lt;crate&gt;): &lt;reason&gt;</code>; its summary skip count matches those lines,
+including binaries absent because required features were not built. Preserve
+the full gate output when collecting build logs; a tail omits earlier verdicts.
+The selftest checks that each skip is named and rejects a counted skip without
+a named line. Its <code>--skip-accounting-only</code> mode runs these log controls without
+Cargo or stub binaries.</p>
 <pre><code class="language-sh">cd $COSMIX/src &amp;&amp; cargo build --workspace --release     # or: mix $COSMIX/setup.mix
 cd $COSMIX/src/desktop &amp;&amp; cargo build --workspace --release
 #   the gate also covers feature-gated binaries when present: build them with

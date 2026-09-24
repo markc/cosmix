@@ -631,12 +631,6 @@ but that is the platform's fallback, not a guarantee.) Pass an absolute
 platform-specific, so `run_stream(["./build.sh"], {cwd: "/srv/app"})` is not
 portable; spell it `/srv/app/build.sh`.
 
-### Repository version gate
-
-The repository's `src/tools/version_flag_gate.mix` reports every skipped
-binary as `SKIP <bin> (<crate>): <reason>`; its summary skip count matches
-those lines, including binaries absent because required features were not built.
-
 ### run_parallel — process-level fan-out (v0.82.0)
 
 `run_parallel(jobs [, {max, timeout}])` runs many `run_argv` jobs at once through
