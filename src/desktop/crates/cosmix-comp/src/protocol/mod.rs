@@ -14445,21 +14445,13 @@ impl WaylandState {
                     record.window_origin.0 - record.layout.x,
                     record.window_origin.1 - record.layout.y,
                 );
-                const SLACK: f32 = 1e-3;
-                let inside = |(x, y): (f32, f32)| {
-                    x >= bounds.0.0 - SLACK
-                        && x <= bounds.0.1 + SLACK
-                        && y >= bounds.1.0 - SLACK
-                        && y <= bounds.1.1 + SLACK
-                };
-                let snapped =
-                    choose_grid_origin(record, record.window_origin, offset, scale120, inside);
-                let snapped = if inside(snapped) {
-                    snapped
-                } else {
-                    // The clamp interval is narrower than a pixel: keep the
-                    // clamped origin rather than leave the work area.
+                let snapped = if grid_exempt(record) {
                     record.window_origin
+                } else {
+                    (
+                        clamp_axis_to_grid(record.window_origin.0, offset.0, bounds.0, scale120),
+                        clamp_axis_to_grid(record.window_origin.1, offset.1, bounds.1, scale120),
+                    )
                 };
                 let extra = (
                     snapped.0 - record.window_origin.0,
@@ -14715,12 +14707,15 @@ impl WaylandState {
         new_size: (i32, i32),
         (left, top): (bool, bool),
     ) -> (f32, f32) {
-        if !left && !top {
-            return raw;
-        }
         let Some(record) = self.surfaces.get(&surface.id()) else {
             return raw;
         };
+        // The axis no one is dragging carries its recorded anchor, so the
+        // resize does not re-anchor it at a snapped value.
+        let anchor = placement_anchor(record);
+        if !left && !top {
+            return anchor;
+        }
         let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let offset = record
             .committed_window_geometry
@@ -14731,10 +14726,36 @@ impl WaylandState {
             edge(start_origin.0 + start_size.0 as f32),
             edge(start_origin.1 + start_size.1 as f32),
         );
-        choose_grid_origin(record, raw, offset, scale120, |candidate| {
-            (!left || edge(candidate.0 + new_size.0 as f32) == far.0)
-                && (!top || edge(candidate.1 + new_size.1 as f32) == far.1)
-        })
+        let far_edges = |candidate: (f32, f32)| {
+            (
+                edge(candidate.0 + new_size.0 as f32),
+                edge(candidate.1 + new_size.1 as f32),
+            )
+        };
+        let candidates = grid_origin_candidates(record, raw, offset, scale120);
+        // Exactly on the starting pixel when a candidate can be. A far edge
+        // that sits on ZERO may have none (half-away rounding sends -0.5 to -1
+        // and +0.5 to +1); then keep it on the visible side, never behind the
+        // output's left or top edge, rather than let a fallback pick a side.
+        let chosen = candidates
+            .iter()
+            .copied()
+            .find(|candidate| {
+                let edges = far_edges(*candidate);
+                (!left || edges.0 == far.0) && (!top || edges.1 == far.1)
+            })
+            .or_else(|| {
+                candidates.iter().copied().find(|candidate| {
+                    let edges = far_edges(*candidate);
+                    (!left || (edges.0 >= far.0 && edges.0 - far.0 <= 1))
+                        && (!top || (edges.1 >= far.1 && edges.1 - far.1 <= 1))
+                })
+            })
+            .unwrap_or(candidates[0]);
+        (
+            if left { chosen.0 } else { anchor.0 },
+            if top { chosen.1 } else { anchor.1 },
+        )
     }
 
     /// A window size inside the client's (clamped) min/max constraints.
@@ -14763,8 +14784,9 @@ impl WaylandState {
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
-        let placed = physical_grid_window_origin(record, origin, offset, scale120);
-        set_grid_origin(record, origin, placed);
+        let anchor = requested_anchor(record, origin);
+        let placed = physical_grid_window_origin(record, anchor, offset, scale120);
+        set_grid_origin(record, anchor, placed);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         let delta = (
@@ -14822,8 +14844,9 @@ impl WaylandState {
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
-        let placed = physical_grid_window_origin(record, origin, offset, scale120);
-        set_grid_origin(record, origin, placed);
+        let anchor = requested_anchor(record, origin);
+        let placed = physical_grid_window_origin(record, anchor, offset, scale120);
+        set_grid_origin(record, anchor, placed);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         record.configured_size = size;
@@ -16803,6 +16826,54 @@ fn placement_anchor(record: &SurfaceRecord) -> (f32, f32) {
         Some(placement) if placement.placed == record.window_origin => placement.anchor,
         _ => record.window_origin,
     }
+}
+
+/// One axis of a clamped window origin on the whole-pixel grid: the nearest
+/// grid neighbour inside `[low, high]`, else (an interval narrower than a
+/// pixel, which is what `max(usable.x)` collapses to when the window is wider
+/// than the work area) the nearest neighbour at or past `low`, so the window
+/// never slides under a panel; the size clamp that follows shrinks it anyway.
+/// The result is on the grid, so the caller records it as the anchor and a
+/// later commit's settle keeps it rather than re-snapping to the nearest.
+fn clamp_axis_to_grid(value: f32, offset: f32, (low, high): (f32, f32), scale120: u32) -> f32 {
+    const SLACK: f32 = 1e-3;
+    let neighbours =
+        crate::compositor_scene::physical_grid_neighbours(value - offset, scale120).map(|v| v + offset);
+    if let Some(inside) = neighbours
+        .iter()
+        .copied()
+        .find(|v| *v >= low - SLACK && *v <= high + SLACK)
+    {
+        return inside;
+    }
+    neighbours
+        .iter()
+        .copied()
+        .filter(|v| *v >= low - SLACK)
+        .min_by(f32::total_cmp)
+        .unwrap_or(value)
+}
+
+/// The anchor a move or resize request should record. An axis the request
+/// leaves where the window already stands (a right-edge drag, a size-only
+/// place, the unmoved axis of a left drag) keeps its recorded anchor; taking
+/// the snapped position as a new anchor there would let an inset that changes
+/// between requests walk the window 0.2 logical per round at 2.5x.
+fn requested_anchor(record: &SurfaceRecord, origin: (f32, f32)) -> (f32, f32) {
+    const SAME: f32 = 1e-3;
+    let anchor = placement_anchor(record);
+    (
+        if (origin.0 - record.window_origin.0).abs() < SAME {
+            anchor.0
+        } else {
+            origin.0
+        },
+        if (origin.1 - record.window_origin.1).abs() < SAME {
+            anchor.1
+        } else {
+            origin.1
+        },
+    )
 }
 
 /// Stand the window at `placed`, remembering `anchor` for later re-snaps.

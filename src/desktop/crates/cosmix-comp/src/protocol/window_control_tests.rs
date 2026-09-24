@@ -2779,46 +2779,228 @@ fn place_validates_the_snapped_origin_and_keeps_the_window_on_its_output() {
     assert!(record.window_origin.0 < width, "a sliver stays on the output");
 }
 
-/// Dragging the LEFT edge must not move the right edge at all.
-#[test]
-fn left_edge_drag_keeps_the_stationary_right_edge_on_its_pixel() {
+/// Start an interactive resize of the harness toplevel and move the pointer
+/// by `(dx, dy)` from its press point.
+fn drag_test_toplevel(
+    harness: &mut KeybindingHarness,
+    edges: xdg_toplevel::ResizeEdge,
+    start_origin: (f32, f32),
+    start_size: (i32, i32),
+    (dx, dy): (f64, f64),
+) {
+    let surface = toplevel_surface(harness);
+    harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
+        surface,
+        edges,
+        start_pointer: (50.0, 50.0),
+        start_origin,
+        start_size,
+    });
+    harness
+        .server
+        .state
+        .update_interactive_pointer(50.0 + dx, 50.0 + dy);
+}
+
+/// Put the harness toplevel at `origin` with `size` configured, at `scale`.
+fn positioned_test_toplevel(scale: f64, origin: (f32, f32), size: (i32, i32)) -> KeybindingHarness {
     let mut harness = KeybindingHarness::new(false);
     map_initial_test_toplevel(&mut harness);
-    harness.server.state.change_output_scale(2.5);
+    harness.server.state.change_output_scale(scale);
     let surface = toplevel_surface(&harness);
     harness
         .server
         .state
-        .move_window_to(&surface, (100.0, 40.0), "comp.window");
-    let start_origin = test_toplevel_record(&harness).window_origin;
-    let start_size = (200, 150);
+        .move_window_to(&surface, origin, "comp.window");
     harness
         .server
         .state
         .surfaces
         .get_mut(&surface.id())
         .expect("toplevel record")
-        .configured_size = start_size;
+        .configured_size = size;
+    harness
+}
+
+/// Dragging the left, top or top-left edge must not move the far edges.
+#[test]
+fn edge_drags_keep_the_stationary_far_edges_on_their_pixels() {
+    use xdg_toplevel::ResizeEdge;
     let edge = |value: f32| crate::compositor_scene::physical_edge(value, 300);
-    let right = edge(start_origin.0 + start_size.0 as f32);
-    for dx in [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, -1.0, -2.0, -3.0] {
-        harness.server.state.interactive_pointer = Some(InteractivePointer::Resize {
-            surface: surface.clone(),
-            edges: xdg_toplevel::ResizeEdge::Left,
-            start_pointer: (50.0, 50.0),
-            start_origin,
-            start_size,
-        });
-        harness.server.state.update_interactive_pointer(50.0 + dx, 50.0);
-        let record = test_toplevel_record(&harness);
-        assert_eq!(record.configured_size.0, start_size.0 - dx as i32);
-        assert_eq!(
-            edge(record.window_origin.0 + record.configured_size.0 as f32),
-            right,
-            "dx {dx}: the right edge stays on its pixel"
+    for edges in [ResizeEdge::Left, ResizeEdge::Top, ResizeEdge::TopLeft] {
+        let (moves_x, moves_y) = match edges {
+            ResizeEdge::Left => (true, false),
+            ResizeEdge::Top => (false, true),
+            _ => (true, true),
+        };
+        let start_size = (200, 150);
+        let mut harness = positioned_test_toplevel(2.5, (100.0, 40.0), start_size);
+        let start_origin = test_toplevel_record(&harness).window_origin;
+        let far = (
+            edge(start_origin.0 + start_size.0 as f32),
+            edge(start_origin.1 + start_size.1 as f32),
         );
-        assert_on_physical_grid(record, 2.5, &format!("dx {dx}"));
+        for d in [1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, -1.0, -2.0, -3.0] {
+            let delta = (
+                if moves_x { d } else { 0.0 },
+                if moves_y { d } else { 0.0 },
+            );
+            drag_test_toplevel(&mut harness, edges, start_origin, start_size, delta);
+            let record = test_toplevel_record(&harness);
+            let context = format!("{edges:?} by {d}");
+            if moves_x {
+                assert_eq!(record.configured_size.0, start_size.0 - d as i32, "{context}");
+            }
+            if moves_y {
+                assert_eq!(record.configured_size.1, start_size.1 - d as i32, "{context}");
+            }
+            assert_eq!(
+                (
+                    edge(record.window_origin.0 + record.configured_size.0 as f32),
+                    edge(record.window_origin.1 + record.configured_size.1 as f32),
+                ),
+                far,
+                "{context}: the far edges stay on their pixels"
+            );
+            assert_on_physical_grid(record, 2.5, &context);
+        }
     }
+}
+
+/// A far edge exactly on the output's left (or top) edge has no candidate
+/// that keeps it at 0 at 2.5x (-0.5 rounds to -1, +0.5 to +1). It must move to
+/// the visible side, not behind the output edge.
+#[test]
+fn edge_drag_with_the_far_edge_on_zero_keeps_it_on_the_visible_side() {
+    use xdg_toplevel::ResizeEdge;
+    let edge = |value: f32| crate::compositor_scene::physical_edge(value, 300);
+    let mut harness = positioned_test_toplevel(2.5, (-200.0, 40.0), (200, 150));
+    let start = test_toplevel_record(&harness).window_origin;
+    assert_eq!(edge(start.0 + 200.0), 0);
+    drag_test_toplevel(&mut harness, ResizeEdge::Left, start, (200, 150), (-1.0, 0.0));
+    let record = test_toplevel_record(&harness);
+    assert_eq!(record.configured_size.0, 201);
+    assert_eq!(edge(record.window_origin.0 + 201.0), 1, "the right edge stays visible");
+
+    let mut harness = positioned_test_toplevel(2.5, (40.0, -150.0), (200, 150));
+    let start = test_toplevel_record(&harness).window_origin;
+    assert_eq!(edge(start.1 + 150.0), 0);
+    drag_test_toplevel(&mut harness, ResizeEdge::Top, start, (200, 150), (0.0, -1.0));
+    let record = test_toplevel_record(&harness);
+    assert_eq!(record.configured_size.1, 151);
+    assert_eq!(edge(record.window_origin.1 + 151.0), 1, "the bottom edge stays visible");
+}
+
+/// Resizes interleaved with inset changes (an agent's size-only place while
+/// the window is unfocused, a right-edge drag while it is focused) must not
+/// re-anchor at a snapped value: that walked +0.2 logical per round at 2.5x.
+#[test]
+fn resizes_interleaved_with_inset_changes_do_not_walk_the_window() {
+    use xdg_toplevel::ResizeEdge;
+    let mut harness = positioned_test_toplevel(2.5, (101.0, 41.0), (60, 40));
+    let surface = toplevel_surface(&harness);
+    let buffer = harness.create_dmabuf_buffer_sized(120, 80);
+    set_test_window_geometry(&mut harness, [24, 24, 60, 40]);
+    commit_test_toplevel(&mut harness, Some(buffer));
+    let settled = test_toplevel_record(&harness).window_origin;
+    for round in 0..5 {
+        // A size-only place at inset 24.
+        let origin = test_toplevel_record(&harness).window_origin;
+        harness.server.state.resize_window_to(
+            &surface,
+            origin,
+            (61 + 2 * round, 40),
+            "comp.window",
+        );
+        set_test_window_geometry(&mut harness, [23, 23, 60, 40]);
+        commit_test_toplevel(&mut harness, None);
+        // A right-edge drag at inset 23.
+        let record = test_toplevel_record(&harness);
+        let (start_origin, start_size) = (record.window_origin, record.configured_size);
+        drag_test_toplevel(&mut harness, ResizeEdge::Right, start_origin, start_size, (1.0, 0.0));
+        set_test_window_geometry(&mut harness, [24, 24, 60, 40]);
+        commit_test_toplevel(&mut harness, None);
+        assert_eq!(
+            test_toplevel_record(&harness).window_origin,
+            settled,
+            "round {round}: back at inset 24 the window is where it started"
+        );
+    }
+}
+
+/// Place a window partly off the top-left corner: its nearest whole pixels
+/// would leave it wholly off the output, so it takes the grid point inside.
+#[test]
+fn place_at_a_negative_boundary_keeps_a_sliver_on_the_output() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let (width, height) = geometry_size_of(&harness, &alpha);
+    let (rc, body) = window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        WindowOp::Place(PlaceSpec {
+            x: Some(-f64::from(width) + 0.1),
+            y: Some(-f64::from(height) + 0.1),
+            ..place(id, generation)
+        }),
+    );
+    assert_eq!(rc, 0, "{body}");
+    assert_eq!(
+        harness.server.state.surfaces[&alpha].window_origin,
+        (1.0 - width as f32, 1.0 - height as f32)
+    );
+}
+
+/// A window wider than the work area collapses the clamp interval to the
+/// panel edge. The fallback grid point must be past the panel and must be the
+/// anchor, so the next commit's settle does not re-snap it to the nearest
+/// grid point, under the panel.
+#[test]
+fn oversized_clamp_fallback_stays_past_the_panel_across_a_commit() {
+    const TOP_BOTTOM_LEFT: u32 = 1 | 2 | 4;
+    let mut wire = ScreencopyWireHarness::new(3);
+    map_initial_test_toplevel(&mut wire.harness);
+    wire.harness.server.state.change_output_scale(1.25);
+    map_test_layer_surface(
+        &mut wire.harness,
+        0,
+        TestLayerSpec {
+            size: (1, 0),
+            anchor: TOP_BOTTOM_LEFT,
+            exclusive_zone: 1,
+            ..TestLayerSpec::default()
+        },
+    );
+    let (_wide, buffer) = wire.shm_buffer(400, 100, 1600);
+    commit_test_toplevel(&mut wire.harness, Some(buffer));
+    let surface = toplevel_surface(&wire.harness);
+    wire.harness
+        .server
+        .state
+        .surfaces
+        .get_mut(&surface.id())
+        .expect("toplevel record")
+        .configured_size = (400, 100);
+    wire.harness
+        .server
+        .state
+        .move_window_to(&surface, (-20.0, 40.0), "comp.window");
+    let output = wire.harness.server.state.backend.output_size();
+    wire.harness.server.state.resize_output(output.0, output.1 - 1);
+    let record = test_toplevel_record(&wire.harness);
+    assert!(record.layout.x >= 1.0, "past the panel: {}", record.layout.x);
+    assert_on_physical_grid(record, 1.25, "oversized clamp");
+
+    let (_narrow, buffer) = wire.shm_buffer(300, 100, 1200);
+    commit_test_toplevel(&mut wire.harness, Some(buffer));
+    let record = test_toplevel_record(&wire.harness);
+    assert!(
+        record.layout.x >= 1.0,
+        "the next commit keeps it past the panel: {}",
+        record.layout.x
+    );
+    assert_on_physical_grid(record, 1.25, "after the commit");
 }
 
 /// A left panel one logical pixel wide puts the work area at x = 1, which is
@@ -2916,6 +3098,7 @@ fn cascade_slot_opens_on_a_whole_physical_pixel() {
     );
     let (_, _, _, object) = map_named_test_toplevel(&mut harness, "Gamma", "dev.cosmix.Gamma");
     let record = &harness.server.state.surfaces[&object];
-    assert!(record.layout.x > 1.0);
+    // Slot 1 is 1 + 36 + 48 = 85 logical = 212.5 physical; it opens at 213.
+    assert_eq!(record.window_origin, (85.2, 84.0));
     assert_on_physical_grid(record, 2.5, "cascade slot");
 }

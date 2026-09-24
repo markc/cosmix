@@ -42001,6 +42001,8 @@ fn screencopy_s1a_03_logical_region_clipping_and_invalid_regions() {
 /// A 1367-wide KMS mode at 1.25 is 1093.6 logical, rounded to 1094. Projected
 /// back that is 1367.5 -> 1368, one pixel past the mode, so a whole-output
 /// capture used to be refused. Output-edge sides map to the mode edge.
+/// Coverage for the edge mapping of 6293586c; the whole-pixel fix pass did
+/// not change it.
 #[test]
 fn kms_whole_output_capture_at_a_rounded_up_logical_size_is_the_whole_mode() {
     let key = OutputKey {
