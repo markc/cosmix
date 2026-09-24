@@ -380,7 +380,7 @@ fn analyze_at(
     remote_body: bool,
 ) -> Analysis {
     let mut a = Analysis::default();
-    let ctx = FileContext::build(stmts, file, cfg);
+    let ctx = FileContext::build(stmts, file, cfg, remote_body);
 
     // W2401 + undefined-check suppression on dynamic includes.
     if let (true, line) = has_dynamic_include(stmts) {
@@ -616,6 +616,9 @@ struct FileContext {
     user_fn_arity: HashMap<String, (usize, usize)>,
     /// Undefined-name checks suppressed (dynamic include present).
     dynamic: bool,
+    /// These statements are an `ssh_mix` remote body, a separate program:
+    /// "this file" in a message would point at the wrong scope.
+    remote_body: bool,
     /// String nodes shipped as `ssh_mix` bodies (by [`node_id`]) → the
     /// names that are the remote program's own; MIX-W2402 stays silent
     /// for those (see [`remote_body_names`]).
@@ -623,7 +626,12 @@ struct FileContext {
 }
 
 impl FileContext {
-    fn build(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> FileContext {
+    fn build(
+        stmts: &[Stmt],
+        file: Option<&str>,
+        cfg: &AnalyzerConfig,
+        remote_body: bool,
+    ) -> FileContext {
         let mut top_level_names = HashSet::new();
         // The TOP-LEVEL bound universe: blocks don't scope and
         // definition order is runtime order (no read-before-assign
@@ -672,6 +680,7 @@ impl FileContext {
             known_callables,
             user_fn_arity,
             dynamic,
+            remote_body,
             remote_body_names: remote_body_names(stmts),
         }
     }
@@ -1265,7 +1274,14 @@ fn check_expr(
                     "MIX-E1101",
                     Severity::Error,
                     line,
-                    format!("undefined variable '${name}' (assigned nowhere in this file)"),
+                    if ctx.remote_body {
+                        format!(
+                            "undefined variable '${name}' (not bound in the remote body or by the \
+                             call's bindings/env — outer-file variables do not ship)"
+                        )
+                    } else {
+                        format!("undefined variable '${name}' (assigned nowhere in this file)")
+                    },
                     Some(format!(
                         "assign it, use env(\"{name}\") for environment values, or pass --allow-global {name}"
                     )),
@@ -1298,7 +1314,14 @@ fn check_expr(
                     "MIX-E1102",
                     Severity::Error,
                     line,
-                    format!("undefined function '{name}' (defined nowhere in this file)"),
+                    if ctx.remote_body {
+                        format!(
+                            "undefined function '{name}' (not defined in the remote body — \
+                             outer-file functions do not ship)"
+                        )
+                    } else {
+                        format!("undefined function '{name}' (defined nowhere in this file)")
+                    },
                     Some(hint),
                 ));
             }
@@ -3039,6 +3062,8 @@ pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     row[right_chars.len()]
 }
 
+const INT_CAVEAT: &str = " (then trunc() or floor() for a whole number: to_number(\"3.7\") is 3.7)";
+
 /// Foreign-language function names → the Mix builtin that does that job.
 ///
 /// Edit distance answers "what is SPELLED like this", which is the wrong
@@ -3052,32 +3077,37 @@ pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
 /// Grow it from every E1102 an agent hits. Two invariants, both tested: every
 /// target is a live builtin, and no foreign name is one (a name that exists
 /// can never be undefined, so its row would be dead and misleading).
-pub(crate) const FOREIGN_FUNCTION_SYNONYMS: &[(&str, &str)] = &[
-    ("json_decode", "json_parse"),
-    ("json_loads", "json_parse"),
-    ("json_load", "json_parse"),
-    ("json_dumps", "json_encode"),
-    ("json_dump", "json_encode"),
-    ("json_stringify", "json_encode"),
-    ("str", "to_string"),
-    ("tostring", "to_string"),
-    ("int", "to_number"),
-    ("float", "to_number"),
-    ("parse_int", "to_number"),
-    ("parse_float", "to_number"),
-    ("trim_end", "rtrim"),
-    ("rstrip", "rtrim"),
-    ("trim_start", "ltrim"),
-    ("lstrip", "ltrim"),
-    ("strlen", "length"),
-    ("len_bytes", "byte_length"),
-    ("byte_len", "byte_length"),
-    ("tolower", "lower"),
-    ("lowercase", "lower"),
-    ("toupper", "upper"),
-    ("uppercase", "upper"),
-    ("getenv", "env"),
-    ("file_exists", "exists"),
+///
+/// Rows are (foreign name, Mix builtin, caveat). The caveat is appended to
+/// the suggestion when the builtin is not a drop-in: `to_number("3.7")` is
+/// 3.7, not the 3 an `int()` caller expects.
+pub(crate) const FOREIGN_FUNCTION_SYNONYMS: &[(&str, &str, &str)] = &[
+    ("json_decode", "json_parse", ""),
+    ("json_loads", "json_parse", ""),
+    ("json_load", "json_parse", ""),
+    ("json_dumps", "json_encode", ""),
+    ("json_dump", "json_encode", ""),
+    ("json_stringify", "json_encode", ""),
+    ("str", "to_string", ""),
+    ("tostring", "to_string", ""),
+    ("int", "to_number", INT_CAVEAT),
+    ("parse_int", "to_number", INT_CAVEAT),
+    ("float", "to_number", ""),
+    ("parse_float", "to_number", ""),
+    ("trim_end", "rtrim", ""),
+    ("rstrip", "rtrim", ""),
+    ("trim_start", "ltrim", ""),
+    ("lstrip", "ltrim", ""),
+    // C/PHP strlen counts BYTES; Mix length() counts codepoints.
+    ("strlen", "byte_length", " (bytes; length() counts characters)"),
+    ("len_bytes", "byte_length", ""),
+    ("byte_len", "byte_length", ""),
+    ("tolower", "lower", ""),
+    ("lowercase", "lower", ""),
+    ("toupper", "upper", ""),
+    ("uppercase", "upper", ""),
+    ("getenv", "env", ""),
+    ("file_exists", "exists", ""),
 ];
 
 /// The "did you mean" for an undefined function, WITHOUT framing — shared by
@@ -3107,8 +3137,9 @@ pub(crate) fn function_suggestion<'a>(
     {
         return Some(format!("deleted in mix 0.73.0; use {replacement}"));
     }
-    if let Some((_, target)) = FOREIGN_FUNCTION_SYNONYMS.iter().find(|(n, _)| *n == name) {
-        return Some(format!("did you mean '{target}'?"));
+    if let Some((_, target, caveat)) = FOREIGN_FUNCTION_SYNONYMS.iter().find(|(n, _, _)| *n == name)
+    {
+        return Some(format!("did you mean '{target}'?{caveat}"));
     }
     let threshold = if name.chars().count() <= 4 { 1 } else { 2 };
     let mut best: Option<(usize, String)> = None;
@@ -3532,7 +3563,7 @@ mod instructional_error_tests {
 
     #[test]
     fn every_foreign_synonym_points_at_a_live_builtin_and_is_not_one() {
-        for (foreign, target) in FOREIGN_FUNCTION_SYNONYMS {
+        for (foreign, target, _) in FOREIGN_FUNCTION_SYNONYMS {
             assert!(
                 builtins::builtin_info_of(target).is_some(),
                 "{foreign} -> {target}: target is not a builtin"
@@ -3551,10 +3582,10 @@ mod instructional_error_tests {
 
     #[test]
     fn each_foreign_name_maps_to_its_target() {
-        for (foreign, target) in FOREIGN_FUNCTION_SYNONYMS {
+        for (foreign, target, caveat) in FOREIGN_FUNCTION_SYNONYMS {
             assert_eq!(
                 undefined_function_hint(foreign, &fns(&[])),
-                Some(format!(" — did you mean '{target}'?")),
+                Some(format!(" — did you mean '{target}'?{caveat}")),
                 "{foreign}"
             );
         }
@@ -3570,6 +3601,11 @@ mod instructional_error_tests {
                 Some(format!("did you mean '{target}'?"))
             );
         }
+        // Not drop-ins: the suggestion says what differs.
+        let int = function_suggestion("int", std::iter::empty()).unwrap();
+        assert!(int.starts_with("did you mean 'to_number'?") && int.contains("trunc()"), "{int}");
+        let strlen = function_suggestion("strlen", std::iter::empty()).unwrap();
+        assert!(strlen.starts_with("did you mean 'byte_length'?"), "{strlen}");
     }
 
     #[test]

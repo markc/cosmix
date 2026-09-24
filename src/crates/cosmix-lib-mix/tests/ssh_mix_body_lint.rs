@@ -147,7 +147,10 @@ fn nested_ssh_mix_does_not_recurse_unboundedly() {
     // looping.
     let src =
         "$h = \"a\"\n$r = ssh_mix($h, '\n$q = ssh_mix(\"b\", \\'\nprint(regex_match(\"^a\", \"b\"))\n\\')\n')\n";
-    let _ = codes(src); // must simply return
+    // It must return, and the INNER body (the only place `regex_match`
+    // appears) must stay unanalysed: one level deep only.
+    let c = codes(src);
+    assert!(!c.iter().any(|x| x == "MIX-D3001"), "inner body was analysed: {c:?}");
 }
 
 // ── heredoc bound once + `bindings` (TODO-mix, filed 2026-09-18) ──────
@@ -298,6 +301,17 @@ fn an_undefined_function_in_the_body_is_reported_with_its_suggestion() {
     assert!(e1102.iter().all(|x| x.3.contains("inside ssh_mix body")));
     assert!(e1102.iter().any(|x| x.3.contains("json_decode")));
     assert!(e1102.iter().any(|x| x.3.contains("helper")));
+    // "defined nowhere in this file" would be false: helper IS defined in
+    // this file. The message names the real scope.
+    assert!(
+        e1102.iter().all(|x| x.3.contains("outer-file functions do not ship")),
+        "{e1102:?}"
+    );
+    let e1101 = diags("$z = 1\n$r = ssh_mix(\"a\", 'print($z)')\n");
+    assert!(
+        e1101.iter().any(|x| x.0 == "MIX-E1101" && x.3.contains("outer-file variables do not ship")),
+        "{e1101:?}"
+    );
 }
 
 #[test]
