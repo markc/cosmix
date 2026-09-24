@@ -13238,6 +13238,73 @@ fn builtin_write_atomic(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::Nil))
 }
 
+const ACL_ACCESS_XATTR: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// The file's POSIX access ACL as its raw xattr, `None` when it has none or
+/// the filesystem does not support ACLs.
+fn read_access_acl(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    loop {
+        // SAFETY: size query — a null buffer of length 0.
+        let size = unsafe {
+            libc::getxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+        };
+        if size < 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENODATA) | Some(libc::EOPNOTSUPP) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` is exactly `size` writable bytes.
+        let got = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                ACL_ACCESS_XATTR.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(Some(buf));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ERANGE) {
+            return Err(e);
+        }
+        // ERANGE: the ACL grew between the two calls — size it again.
+    }
+}
+
+/// Make `file`'s access ACL exactly `acl`: set it, or — when the old target
+/// had none — remove one the new inode may have inherited from a default ACL
+/// on the directory. A filesystem without ACL support has nothing to carry.
+fn set_access_acl(file: &std::fs::File, acl: Option<&[u8]>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is open for the call; `acl` is a valid byte slice.
+    let rc = unsafe {
+        match acl {
+            Some(acl) => {
+                libc::fsetxattr(fd, ACL_ACCESS_XATTR.as_ptr(), acl.as_ptr().cast(), acl.len(), 0)
+            }
+            None => libc::fremovexattr(fd, ACL_ACCESS_XATTR.as_ptr()),
+        }
+    };
+    if rc == -1 {
+        let e = std::io::Error::last_os_error();
+        if acl.is_none() && matches!(e.raw_os_error(), Some(libc::ENODATA) | Some(libc::EOPNOTSUPP)) {
+            return Ok(());
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn write_atomic_error(path: &str, what: &str, error: &std::io::Error) -> MixError {
     MixError::RuntimeError {
         span: None,
@@ -13296,6 +13363,13 @@ fn write_atomic_impl(
         _ => PathBuf::from("."),
     };
 
+    // The existing target's POSIX access ACL, carried to the new inode.
+    let existing_acl = match &existing {
+        Some(_) => read_access_acl(&target)
+            .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?,
+        None => None,
+    };
+
     // Final permissions: an explicit mode wins; otherwise an existing target
     // keeps its own (including setuid/setgid/sticky); a brand-new file gets
     // write_file's 0o666 & ~umask, by creating the temp with 0o666.
@@ -13345,7 +13419,7 @@ fn write_atomic_impl(
     })?;
 
     let staged = (|| -> Result<(), (&'static str, std::io::Error)> {
-        // Owner first, then mode: chown can clear setuid/setgid bits.
+        // Owner first; mode and ACL after the write (see below).
         if let Some(meta) = &existing {
             let mine = file.metadata().map_err(|e| ("stat temp file", e))?;
             if mine.uid() != meta.uid() || mine.gid() != meta.gid() {
@@ -13360,16 +13434,30 @@ fn write_atomic_impl(
                 )?;
             }
         }
-        if let Some(mode) = final_mode {
-            file.set_permissions(std::fs::Permissions::from_mode(mode))
-                .map_err(|e| ("setting mode", e))?;
-        }
         if fault == AtomicFault::AfterPartialWrite {
             file.write_all(&data[..data.len() / 2])
                 .map_err(|e| ("writing", e))?;
             return Err(("writing", std::io::Error::other("injected short write")));
         }
         file.write_all(data).map_err(|e| ("writing", e))?;
+        // Permissions go on AFTER the write: a write by a process without
+        // CAP_FSETID clears setuid (and group-exec setgid), so a mode applied
+        // first would silently lose those bits. First the access ACL (review
+        // MAJOR-5): the new inode must not be WIDER than the old one, which it
+        // would be if an ACL's mask were dropped and only the mode bits copied.
+        if existing.is_some() {
+            set_access_acl(&file, existing_acl.as_deref()).map_err(|e| {
+                (
+                    "cannot carry the existing access ACL onto the new file \
+                     (write_atomic will not widen access by dropping it)",
+                    e,
+                )
+            })?;
+        }
+        if let Some(mode) = final_mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| ("setting mode", e))?;
+        }
         if opts.durability != WriteDurability::None {
             file.sync_all().map_err(|e| ("syncing temp file", e))?;
         }
@@ -24116,6 +24204,88 @@ mod write_atomic_tests {
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
         assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review MAJOR-5: a target whose access ACL narrows the group (group::---
+    /// with a named user and mask r--) keeps that exact ACL after the
+    /// replace — copying only the mode bits onto a fresh inode would widen
+    /// group access. Built from the raw xattr so no setfacl is needed; skips
+    /// (loudly) where the filesystem has no ACL support.
+    #[test]
+    fn the_access_acl_is_carried_not_widened() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmpdir("acl");
+        let target = d.join("guarded");
+        std::fs::write(&target, "OLD").unwrap();
+        // posix_acl_xattr v2: {tag u16, perm u16, id u32}, sorted by tag.
+        let entry = |tag: u16, perm: u16, id: u32| {
+            let mut e = tag.to_le_bytes().to_vec();
+            e.extend_from_slice(&perm.to_le_bytes());
+            e.extend_from_slice(&id.to_le_bytes());
+            e
+        };
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        acl.extend(entry(0x01, 6, u32::MAX)); // user::rw-
+        acl.extend(entry(0x02, 6, 65534)); // user:65534:rw-
+        acl.extend(entry(0x04, 0, u32::MAX)); // group::---
+        acl.extend(entry(0x10, 4, u32::MAX)); // mask::r--
+        acl.extend(entry(0x20, 0, u32::MAX)); // other::---
+        let c_path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid path and buffer.
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                super::ACL_ACCESS_XATTR.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if rc == -1 {
+            eprintln!(
+                "SKIP the_access_acl_is_carried_not_widened: setxattr: {}",
+                std::io::Error::last_os_error()
+            );
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let before = super::read_access_acl(&target).unwrap().expect("ACL was set");
+        let mode_before = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        builtin_write_atomic(vec![Value::String(s(&target)), Value::String("NEW".into())])
+            .expect("write_atomic over an ACL'd file");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        let after = super::read_access_acl(&target).unwrap();
+        assert_eq!(after.as_deref(), Some(before.as_slice()), "the access ACL must carry over");
+        let mode_after = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode_after, mode_before);
+        assert_eq!(mode_after & 0o070, 0o040, "group bits show the r-- mask, not wider");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The final mode is applied after the write, so a requested setuid bit
+    /// is not cleared by the kernel's write-clears-setuid rule for writers
+    /// without CAP_FSETID. (As root the kernel keeps the bit either way; the
+    /// test still pins the result.)
+    #[test]
+    fn a_requested_setuid_bit_survives_the_write() {
+        let d = tmpdir("suid");
+        let target = d.join("tool");
+        let mut o = indexmap::IndexMap::new();
+        o.insert("mode".to_string(), Value::Number(0o4755 as f64));
+        builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::String("#!/bin/sh\n".into()),
+            Value::map(o),
+        ])
+        .expect("write_atomic with setuid mode");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4755);
+        // A later replace keeps it too (carried from the existing target).
+        builtin_write_atomic(vec![Value::String(s(&target)), Value::String("#!/bin/sh\n# v2\n".into())])
+            .expect("second write");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4755);
         let _ = std::fs::remove_dir_all(&d);
     }
 

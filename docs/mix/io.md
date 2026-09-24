@@ -209,7 +209,15 @@ Other rules:
 - **Mode.** An existing target keeps its permission bits, including
   setuid/setgid. A new file gets `write_file`'s `0o666 & ~umask`. `mode:`
   (octal number or string, as for `chmod`) sets it exactly, not masked by the
-  umask.
+  umask. The mode is applied after the data is written, so the kernel's
+  rule that a write clears setuid does not strip a requested setuid bit.
+- **Access ACL.** An existing target's POSIX access ACL is copied onto the
+  new file exactly. Copying only the mode bits would widen access. For example,
+  a file with `group::---` and a named-user entry has its group bits showing
+  the ACL mask, and a plain file with those bits would grant the whole owning
+  group that access. If the ACL cannot be set, the call raises and leaves the
+  target untouched. If the old file had no ACL, one inherited from the
+  directory's default ACL is removed, so the replacement matches the original.
 - **Owner.** An existing target keeps its owner and group. The new file is a
   new inode, so root rewriting a user's file would otherwise hand it to root.
   If the owner cannot be kept, typically because you are not root, the call
