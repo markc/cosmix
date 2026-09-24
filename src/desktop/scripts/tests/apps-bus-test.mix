@@ -25,7 +25,9 @@ $citizen_env = {
   XDG_DATA_DIRS: $tmp .. "/sys",
   -- comp's XWayland descriptor lives under the fixture runtime dir.
   XDG_RUNTIME_DIR: $tmp .. "/run",
-  WAYLAND_DISPLAY: "wayland-apps-test"
+  WAYLAND_DISPLAY: "wayland-apps-test",
+  -- The static value the desk-boot units carry: must never leak to a child.
+  DISPLAY: ":0"
 }
 -- Pre-bound so the finally block can run even when a setup step fails
 -- before the two daemons are spawned (an unbound read would raise there
@@ -47,8 +49,14 @@ fn write_recorder()
   write_file($tmp .. "/bin/recorder", "#!/opt/cosmix/bin/mix\n" ..
     "write_file(env(\"HOME\") .. \"/launched-\" .. basename($0), join(args(), \"\\n\") .. \"\\n\")\n")
   -- Records the DISPLAY the launched app actually inherited.
+  -- Unset and empty differ, and env() cannot tell them apart, so it reads
+  -- the real environment through env(1).
   write_file($tmp .. "/bin/display-recorder", "#!/opt/cosmix/bin/mix\n" ..
-    "write_file(env(\"HOME\") .. \"/launched-display\", env(\"DISPLAY\") .. \"\\n\")\n")
+    "$seen = \"UNSET\"\n" ..
+    "for each $l in lines(run_argv([\"env\"]).stdout)\n" ..
+    "  if starts_with($l, \"DISPLAY=\") then $seen = substr($l, 8, len($l)) end\n" ..
+    "end\n" ..
+    "write_file(env(\"HOME\") .. \"/launched-display\", $seen .. \"\\n\")\n")
 end
 fn check($condition, $message)
   if not $condition then raise("APPS_BUS_TEST", $message) end
@@ -142,6 +150,16 @@ try
   fixture("run/cosmix-comp/wayland-apps-test.xwayland.env", "DISPLAY=:9\nGENERATION=2\n")
   check(call("apps", "apps.launch", json_encode({id: "xapp"})).rc == 0, "second xapp apps.launch failed")
   check(wait_file($tmp .. "/launched-display") == ":9\n", "launch reused a stale DISPLAY after an XWayland restart")
+  -- No descriptor (XWayland down or restarting): the citizen's inherited
+  -- DISPLAY=:0 must NOT reach the child -- DISPLAY is removed -- and the
+  -- citizen logs why.
+  $_rm = run_argv_must(["rm", "-f", "--", $tmp .. "/launched-display",
+    $tmp .. "/run/cosmix-comp/wayland-apps-test.xwayland.env"])
+  check(call("apps", "apps.launch", json_encode({id: "xapp"})).rc == 0, "descriptor-less xapp apps.launch failed")
+  check(wait_file($tmp .. "/launched-display") == "UNSET\n", "an inherited DISPLAY leaked to a launch with no descriptor")
+  $svc_log = read_file_or_nil($tmp .. "/svc.log")
+  check($svc_log != nil and contains($svc_log, "apps.launch xapp: DISPLAY unset: no XWayland descriptor at "),
+    "the citizen did not log why DISPLAY was removed")
 
   -- apps.terminal may carry arguments: parsed with the Exec rules and
   -- prefixed as terminal argv + app argv (B7 over the Bus).

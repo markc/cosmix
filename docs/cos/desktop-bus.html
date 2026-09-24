@@ -542,13 +542,24 @@ Start it like the session provider:</p>
 <code>apps.reload</code>. There is no timer or poll loop; a future inotify wake is the
 intended rescan trigger. <code>src/desktop/scripts/cosmix-desk-apps.service</code> is
 an example user unit bound to <code>graphical-session.target</code>.</p>
-<p><code>apps.launch</code> gives X11 applications the right <code>DISPLAY</code> without any static
-environment. At every launch it reads comp's XWayland descriptor,
-<code>$XDG_RUNTIME_DIR/cosmix-comp/$WAYLAND_DISPLAY.xwayland.env</code>, and passes its
-<code>DISPLAY=:N</code> to the child on top of the inherited environment. Because it
-is read per launch, an XWayland restart on another display number is seen
-by the next launch. With no descriptor (XWayland not running) nothing is
-added.</p>
+<p><code>apps.launch</code> sets <code>DISPLAY</code> for each child from comp's live XWayland,
+not from the citizen's own environment. A static <code>DISPLAY</code> in the
+citizen's unit is ignored. At every launch it reads comp's XWayland
+descriptor, <code>$XDG_RUNTIME_DIR/cosmix-comp/$WAYLAND_DISPLAY.xwayland.env</code>,
+and passes its <code>DISPLAY=:N</code> to the child on top of the inherited
+environment. Because it is read per launch, an XWayland restart on another
+display number is seen by the next launch.</p>
+<p>With no usable descriptor, the child is launched with <code>DISPLAY</code> removed,
+never inherited. That covers XWayland not ready yet, restarting or
+disabled, and a nested comp without it. An X11 app then fails at once
+instead of drawing on another X server. The citizen writes one stderr line
+per such launch naming the reason, including an unreadable descriptor. The
+file is mode 0600, so the citizen must run as comp's uid. The unset goes
+through <code>env -u DISPLAY</code>, because Mix's spawn <code>env</code> option cannot remove a
+variable.</p>
+<p>A descriptor left behind by a comp killed with SIGKILL is not checked
+against its <code>GENERATION</code> or against a live XWayland. It is trusted until
+comp's next start republishes or removes it.</p>
 <table><thead><tr><th>Verb</th><th>JSON request</th><th>Successful response</th></tr></thead><tbody>
 <tr><td><code>apps.list</code></td><td><code>{category?, query?}</code></td><td>array of <code>{id,name,generic_name,comment,icon,categories,exec,terminal,path}</code> sorted by name</td></tr>
 <tr><td><code>apps.get</code></td><td><code>{id}</code></td><td>the entry with all parsed fields (adds <code>keywords</code>, <code>try_exec</code>, <code>no_display</code>, <code>workdir</code>, <code>only_show_in</code>, <code>not_show_in</code>)</td></tr>

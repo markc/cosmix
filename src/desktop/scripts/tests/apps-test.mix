@@ -201,13 +201,24 @@ try
   check($a.parse_xwayland_descriptor("GENERATION=2\nDISPLAY=:12\n") == ":12", "DISPLAY not found after another key")
   check($a.parse_xwayland_descriptor("DISPLAY=:0; rm -rf /\n") == nil, "malformed DISPLAY accepted")
   check($a.parse_xwayland_descriptor("") == nil, "empty descriptor produced a DISPLAY")
-  -- No descriptor (XWayland not up, or died): nothing is added.
-  check(len(keys($a.launch_env($tmp, "wayland-9"))) == 0, "launch_env invented a DISPLAY with no descriptor")
+  -- No descriptor (XWayland not up, or died): no display, with a reason.
+  $ld = $a.launch_display($tmp, "wayland-9")
+  check($ld.display == nil and contains($ld.why, "no XWayland descriptor"), "launch_display invented a DISPLAY with no descriptor")
+  check($a.launch_display("", "wayland-9").display == nil, "launch_display without a runtime dir")
   fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=:1\nGENERATION=1\n")
-  check($a.launch_env($tmp, "wayland-9").DISPLAY == ":1", "launch_env did not read the descriptor")
+  check($a.launch_display($tmp, "wayland-9").display == ":1", "launch_display did not read the descriptor")
   -- A restarted XWayland on a different number is seen on the next launch.
   fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=:4\nGENERATION=2\n")
-  check($a.launch_env($tmp, "wayland-9").DISPLAY == ":4", "launch_env cached a stale DISPLAY")
+  check($a.launch_display($tmp, "wayland-9").display == ":4", "launch_display cached a stale DISPLAY")
+  fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=nope\n")
+  $ld = $a.launch_display($tmp, "wayland-9")
+  check($ld.display == nil and contains($ld.why, "no valid DISPLAY"), "malformed descriptor not reported")
+  -- With a display it is set; without one it is REMOVED via env -u, never inherited.
+  $s = $a.launch_spawn(["xapp", "--flag"], ":4")
+  check(deep_eq($s.argv, ["xapp", "--flag"]) and $s.env.DISPLAY == ":4", "launch_spawn with a display wrong")
+  $s = $a.launch_spawn(["xapp", "--flag"], nil)
+  check(deep_eq($s.argv, ["env", "-u", "DISPLAY", "--", "xapp", "--flag"]) and len(keys($s.env)) == 0,
+    "launch_spawn without a display must unset DISPLAY")
 
   print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache, XWayland launch DISPLAY")
 finally

@@ -420,6 +420,13 @@ end
 -- "DISPLAY=:N\nGENERATION=G\n", and removes it when XWayland dies. The
 -- launcher reads it at EVERY launch (never cached): a restarted XWayland may
 -- take a different display number.
+--
+-- Without a usable descriptor (XWayland not ready yet, restarting, disabled,
+-- or a nested comp without it) the child gets NO DISPLAY at all, never an
+-- inherited or static one: an X11 app then fails fast instead of drawing on
+-- some other X server. Known limit: a descriptor left behind by a comp
+-- killed with SIGKILL is not checked against GENERATION or liveness, so it
+-- is trusted until comp's next start republishes or removes it.
 
 fn xwayland_descriptor_path($runtime_dir, $wayland_display)
   -- "" when the session cannot name comp's descriptor: no runtime dir, no
@@ -442,19 +449,38 @@ fn parse_xwayland_descriptor($text)
   return nil
 end
 
-fn launch_env($runtime_dir, $wayland_display)
-  -- Environment additions for one launch: {DISPLAY: ":N"} while comp's
-  -- XWayland is serving, else {} (the inherited environment is left alone).
+fn launch_display($runtime_dir, $wayland_display)
+  -- {display: ":N", why: ""} while comp's XWayland is serving, else
+  -- {display: nil, why: <one-line reason for the log>}.
   $path = xwayland_descriptor_path($runtime_dir, $wayland_display)
-  if $path == "" or not is_file($path) then return {} end
+  if $path == "" then
+    return {display: nil, why: "no XDG_RUNTIME_DIR/WAYLAND_DISPLAY name to find comp's XWayland descriptor"}
+  end
+  if not is_file($path) then
+    return {display: nil, why: "no XWayland descriptor at " .. $path}
+  end
   try
     $display = parse_xwayland_descriptor(read_file($path))
   catch $err
-    -- Removed between the check and the read: XWayland just died.
-    return {}
+    -- Removed between the check and the read (XWayland just died), or not
+    -- readable: the file is 0600, so the citizen must run as comp's uid.
+    return {display: nil, why: "XWayland descriptor " .. $path .. " unreadable: " .. to_string($err)}
   end
-  if $display == nil then return {} end
-  return {DISPLAY: $display}
+  if $display == nil then
+    return {display: nil, why: "XWayland descriptor " .. $path .. " has no valid DISPLAY"}
+  end
+  return {display: $display, why: ""}
+end
+
+fn launch_spawn($argv, $display)
+  -- The argv and env for one launch. With a display the child gets
+  -- DISPLAY=:N over its inherited environment; without one DISPLAY is
+  -- REMOVED. Mix's spawn env option cannot unset a variable (a nil value
+  -- is OPTION_INVALID), so the unset goes through env(1) -u.
+  if $display == nil then
+    return {argv: concat(["env", "-u", "DISPLAY", "--"], $argv), env: {}}
+  end
+  return {argv: $argv, env: {DISPLAY: $display}}
 end
 
 -- ── icon-theme lookup ───────────────────────────────────────────────────
