@@ -5201,8 +5201,15 @@ mod tests {
         // renewal tick observes it. Codex C4a rev-2 MAJOR fix: plan
         // registration is unconditional for enabled ACME rows; the
         // coverage split only gates fresh-issuance.
+        //
+        // "Covered" means the cert really is on disk: `apply_vhost_row`
+        // now adopts it (4c) rather than trusting `cert_blob_id` alone.
+        // A row whose claimed cert is gone re-issues instead — pinned by
+        // `apply_vhost_row_reissues_when_row_claims_cert_but_disk_has_none`.
         let tmp = tempfile::tempdir().unwrap();
         let mut p = _new_acme_provisioner(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        _stage_fake_live(tmp.path(), "covered.example");
         let mut row = _acme_prod_row("covered.example");
         row.cert_blob_id =
             Some("fs:/var/lib/cosmix/webd/acme/covered.example/live/fullchain.pem".into());
