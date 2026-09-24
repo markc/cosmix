@@ -295,9 +295,15 @@ impl WallpaperState {
             self.pending = None;
             self.settings = None;
             self.feedback = "Request timed out; checking settings".into();
-            // The 3 s timeout already bounds this retry's rate.
-            self.refresh = Some(now);
-            self.owed |= matches!(kind, RequestKind::Set);
+            match kind {
+                // An unconfirmed write owes its readback at once.
+                RequestKind::Set => {
+                    self.refresh = Some(now);
+                    self.owed = true;
+                }
+                // A hung producer is a failed read: back off, visible-only.
+                RequestKind::Get => self.failed(now),
+            }
         }
         let due = self.refresh.is_some_and(|at| at <= now) && self.may_read();
         if self.pending.is_none() && (self.queued.is_some() || due) {
@@ -769,27 +775,52 @@ mod tests {
         }
         assert!(peer.drain_calls().is_empty());
         assert_eq!(deadline.0, Some(Duration::from_secs(3)));
+        // A timed-out read is a failed read: it backs off before retrying.
         state.tick(&bridge, Duration::from_secs(3), &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "no flat 3 s retry");
+        assert_eq!(state.refresh, Some(Duration::from_secs(3) + RETRY_INITIAL));
+        let at = Duration::from_secs(3) + RETRY_INITIAL;
+        state.tick(&bridge, at, &mut deadline);
         let retry = peer.drain_calls().remove(0);
-        state.event(&reply(old.request_id, settings()), Duration::from_secs(3));
+        state.event(&reply(old.request_id, settings()), at);
         assert!(state.settings.is_none());
         connected(&mut state, 2);
-        state.tick(&bridge, Duration::from_secs(3), &mut deadline);
+        state.tick(&bridge, at, &mut deadline);
         let current = peer.drain_calls().remove(0);
-        state.event(&reply(retry.request_id, settings()), Duration::from_secs(3));
+        state.event(&reply(retry.request_id, settings()), at);
         assert!(state.settings.is_none());
-        state.event(
-            &reply(current.request_id, settings()),
-            Duration::from_secs(3),
-        );
+        state.event(&reply(current.request_id, settings()), at);
         assert!(state.available());
         drop(peer);
         // A gone worker arms nothing; the shared deadline belongs to other
         // projections too, so it is never cleared here.
         let mut fresh = LayerHostDeadline::default();
-        state.tick(&bridge, Duration::from_secs(4), &mut fresh);
+        state.tick(&bridge, at + Duration::from_secs(1), &mut fresh);
         assert!(!state.available());
         assert_eq!(fresh.0, None);
+    }
+
+    #[test]
+    fn a_hidden_timed_out_read_is_not_retried_and_a_set_readback_is() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = WallpaperState::default();
+        connected(&mut state, 1);
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        peer.drain_calls();
+        let late = Duration::from_secs(3);
+        let mut deadline = LayerHostDeadline::default();
+        state.tick(&bridge, late, &mut deadline);
+        state.tick(&bridge, late + RETRY_CAP, &mut deadline);
+        assert!(peer.drain_calls().is_empty(), "hidden: no retry");
+        assert_eq!(deadline.0, None, "hidden: no retry wake");
+        // A timed-out write is read back at once, even hidden.
+        state.queued = Some(("paused", json!(true)));
+        let now = late + RETRY_CAP;
+        state.tick(&bridge, now, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls()[0].command, "wallpaper.props.set");
+        let timeout = now + Duration::from_secs(3);
+        state.tick(&bridge, timeout, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls()[0].command, "wallpaper.props.get");
     }
 
     #[test]

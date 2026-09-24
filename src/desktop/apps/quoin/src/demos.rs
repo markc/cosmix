@@ -138,9 +138,14 @@ impl Lane {
             self.snapshot = None;
             self.queued = None;
             self.feedback = "Timed out; checking service state".into();
-            // The 3 s timeout already bounds this retry's rate.
-            self.refresh = Some(now);
-            self.owed |= action;
+            if action {
+                // An unconfirmed action owes its status readback at once.
+                self.refresh = Some(now);
+                self.owed = true;
+            } else {
+                // A hung producer is a failed read: back off, visible-only.
+                self.failed(now);
+            }
         }
         let may_read = visible || self.owed;
         let due = may_read && self.refresh.is_some_and(|at| now >= at);
@@ -701,6 +706,33 @@ mod tests {
         let call = peer.drain_calls().remove(0);
         lane.event(&ok(call.request_id, json!({"phase":"idle"})), now);
         assert_eq!(lane.backoff, RETRY_INITIAL, "success resets the backoff");
+    }
+
+    #[test]
+    fn a_timed_out_status_backs_off_and_a_hidden_one_is_not_retried() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut id = 0;
+        let mut tick = |lane: &mut Lane, now: Duration, visible: bool| {
+            let mut deadline = LayerHostDeadline::default();
+            lane.tick(&bridge, now, &mut id, ("capture", "capture.status"), visible, &mut deadline);
+            deadline.0
+        };
+        for visible in [true, false] {
+            let mut lane = Lane::default();
+            tick(&mut lane, Duration::ZERO, visible);
+            assert_eq!(peer.drain_calls().len(), 1);
+            let timeout = Duration::from_secs(3);
+            tick(&mut lane, timeout, visible);
+            assert!(peer.drain_calls().is_empty(), "no flat 3 s retry");
+            assert_eq!(lane.refresh, Some(timeout + RETRY_INITIAL));
+            let armed = tick(&mut lane, timeout + RETRY_INITIAL, visible);
+            if visible {
+                assert_eq!(peer.drain_calls().len(), 1, "visible: backed-off retry");
+            } else {
+                assert!(peer.drain_calls().is_empty(), "hidden: no retry");
+                assert_eq!(armed, None, "hidden: no retry wake");
+            }
+        }
     }
 
     #[test]
