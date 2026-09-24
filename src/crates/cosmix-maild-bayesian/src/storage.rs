@@ -239,9 +239,10 @@ impl StorageBackend for SqliteBackend {
     /// Read-only stats. A cached live connection answers directly. Otherwise
     /// the first file that `open_account` WOULD start from is opened
     /// read-only — `bayes.db`, else a legacy `db.sqlite`, else the global
-    /// seed (reported through `seeded_from`) — and an account with none of
-    /// them reads as an empty cold-start corpus. No directory or database is
-    /// created on any path.
+    /// seed (reported through `seeded_from`, opened `immutable=1`) — and an
+    /// account with none of them reads as an empty cold-start corpus. No
+    /// account directory or database is created; only a live WAL database's
+    /// own -shm/-wal sidecars can appear.
     async fn peek_stats(&self, account: &AccountId) -> Result<AccountStats> {
         {
             let cache = self.cache.lock().await;
@@ -255,13 +256,22 @@ impl StorageBackend for SqliteBackend {
         let cold_floor = self.cold_floor;
         tokio::task::spawn_blocking(move || -> Result<AccountStats> {
             let legacy = path.with_file_name("db.sqlite");
-            let (source, seeded_from) = if path.exists() {
-                (path, None)
+            // (file to open, SQLite name to open it by, seed label). The live
+            // databases are opened by plain path, read-only: they may be in
+            // use, so they must not be treated as immutable. The seed is a
+            // static file in a directory maild may not own, so it is opened
+            // `immutable=1`: no -wal/-shm sidecar is created next to it, and
+            // a root-owned seed directory cannot fail the open.
+            let (source, open_name, seeded_from) = if path.exists() {
+                let name = path.display().to_string();
+                (path, name, None)
             } else if legacy.exists() {
-                (legacy, None)
+                let name = legacy.display().to_string();
+                (legacy, name, None)
             } else if let Some(s) = seed.filter(|p| p.exists()) {
                 let label = s.display().to_string();
-                (s, Some(label))
+                let name = immutable_uri(&s);
+                (s, name, Some(label))
             } else {
                 return Ok(AccountStats {
                     cold_start: true,
@@ -269,7 +279,7 @@ impl StorageBackend for SqliteBackend {
                 });
             };
             let conn = Connection::open_with_flags(
-                &source,
+                &open_name,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
                     | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -282,6 +292,20 @@ impl StorageBackend for SqliteBackend {
         .await
         .map_err(|e| Error::Storage(format!("spawn_blocking: {e}")))?
     }
+}
+
+/// SQLite URI that opens `path` as an immutable file (no locking, no
+/// sidecars). Characters that are special in a URI are percent-encoded.
+fn immutable_uri(path: &Path) -> String {
+    let mut out = String::from("file:");
+    for b in path.to_string_lossy().bytes() {
+        match b {
+            b'%' | b'?' | b'#' | 0x80.. => out.push_str(&format!("%{b:02X}")),
+            _ => out.push(b as char),
+        }
+    }
+    out.push_str("?immutable=1");
+    out
 }
 
 /// Corpus statistics from an open spamlite database.
@@ -927,11 +951,18 @@ mod tests {
             .await
             .unwrap();
         drop(seed_conn);
+        let sidecars = [base.join("seed.db-wal"), base.join("seed.db-shm")];
+        for s in &sidecars {
+            let _ = std::fs::remove_file(s);
+        }
         let seeded = SqliteBackend::new(&base, Some(seed.clone()), 100);
         let stats = seeded.peek_stats(&ghost).await.unwrap();
         assert_eq!(stats.spam_messages, 1);
         assert_eq!(stats.seeded_from, Some(seed.display().to_string()));
         assert!(!base.join("9").exists(), "peek_stats seeded a corpus");
+        for s in &sidecars {
+            assert!(!s.exists(), "peek_stats created {} next to the seed", s.display());
+        }
 
         // An existing corpus is read as it stands.
         let real_path = base.join("4").join("bayes.db");
