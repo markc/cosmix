@@ -566,6 +566,27 @@ pub struct AcmeProvisioner {
     /// `namespace_write_seq` against the shared `seq`
     /// counter.
     publish_instrumentation: Option<PublishInstrumentation>,
+
+    /// Chain check `classify_live` applies to a carrying `live/`
+    /// chain. Production is always [`default_chain_validator`] (the
+    /// LE trust-set validator); tests swap in a permissive one via
+    /// `set_chain_validator` because no LE-issued fixture chain can be
+    /// minted offline.
+    chain_validator: ChainValidatorFn,
+}
+
+/// Signature of the carrying-chain check `classify_live` applies:
+/// `(chain_pem, fqdn, now, environment) -> servable?`.
+type ChainValidatorFn = fn(&[u8], &str, UnixTime, ChainEnvironment) -> bool;
+
+/// Production chain check: the LE trust-set validator for `env`.
+fn default_chain_validator(
+    chain_pem: &[u8],
+    fqdn: &str,
+    now_unix: UnixTime,
+    env: ChainEnvironment,
+) -> bool {
+    validate_le_chain_for_environment(chain_pem, &[fqdn], now_unix, env).is_ok()
 }
 
 // Manual `Debug` impl — `WebdAcmeClient` and `AcmeTosAcceptance` are
@@ -729,7 +750,15 @@ impl AcmeProvisioner {
             key_locks: Arc::new(TokioMutex::new(HashMap::new())),
             force_renew_fqdns: Arc::new(TokioMutex::new(HashSet::new())),
             publish_instrumentation: None,
+            chain_validator: default_chain_validator,
         })
+    }
+
+    /// Test-only: replace the carrying-chain validator (see
+    /// [`AcmeProvisioner::chain_validator`]).
+    #[cfg(test)]
+    pub(crate) fn set_chain_validator(&mut self, validator: ChainValidatorFn) {
+        self.chain_validator = validator;
     }
 
     /// Build a fresh [`TlsStatusSnapshot`] from current provisioner
@@ -1047,151 +1076,16 @@ impl AcmeProvisioner {
                 ),
             }
 
-            let live_dir = fqdn_dir.join(LIVE_DIR);
-            let live_chain = live_dir.join(FULLCHAIN_FILE);
-            let live_key = live_dir.join(PRIVKEY_FILE);
-            let live_meta = live_dir.join(META_FILE);
-
-            // Classification: existence first, then servability for
-            // carrying chains. See plan §"Commit 5 — startup_pass".
-            let needs_issue = match read_meta_json(&live_meta) {
-                Err(MetaReadError::NotFound { .. }) => true,
-                Err(e) => {
-                    return Err(anyhow!(
-                        "[webd-acme] reading {} live meta.json for vhost {:?}: {} \
-                         — corrupt / unreadable state must not be silently \
-                         re-issued; rotate the state dir or roll back the binary",
-                        plan.fqdn,
-                        plan.fqdn,
-                        e,
-                    ));
+            let needs_issue = match self.classify_live(plan, now, now_unix)? {
+                Some(identity) => {
+                    identities.push(identity.clone());
+                    // C5d2 needs the live identity for each FQDN so a
+                    // future renewal can rebuild the ServerConfig from a
+                    // coherent union of manual + ACME identities.
+                    self.acme_identities.insert(plan.fqdn.clone(), identity);
+                    false
                 }
-                Ok(meta) => {
-                    // Existence check passed → classify servability.
-                    // (i) chain present + readable;
-                    // (ii) privkey.pem present + non-empty;
-                    // (iii) validator OK against the configured
-                    //     environment;
-                    // (iv) `not_after > now`.
-                    // Any of those failing means "carrying-unservable
-                    // → collapse to the fresh path." A missing or
-                    // truncated PEM file is recoverable disk damage,
-                    // not a reason to refuse to bind :443; only meta
-                    // corruption / unsupported-version / true I/O
-                    // policy errors above propagate as hard errors.
-                    let chain_pem = match std::fs::read(&live_chain) {
-                        Ok(b) if !b.is_empty() => b,
-                        Ok(_) => {
-                            warn!(
-                                fqdn = %plan.fqdn,
-                                "ACME live fullchain.pem is empty — re-issuing"
-                            );
-                            Vec::new()
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            warn!(
-                                fqdn = %plan.fqdn,
-                                "ACME live fullchain.pem missing alongside meta.json — re-issuing"
-                            );
-                            Vec::new()
-                        }
-                        Err(e) => {
-                            return Err(anyhow!(
-                                "[webd-acme] reading {} for vhost {:?}: {} \
-                                 — unrecoverable I/O on live chain; rotate \
-                                 the state dir or restore from backup",
-                                live_chain.display(),
-                                plan.fqdn,
-                                e,
-                            ));
-                        }
-                    };
-                    // privkey.pem must exist non-empty too; the
-                    // rustls splice below references its path
-                    // verbatim, so an absent/empty key would otherwise
-                    // surface as a runtime handshake failure on the
-                    // first connection.
-                    let key_ok = match std::fs::metadata(&live_key) {
-                        Ok(m) => m.len() > 0,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                        Err(e) => {
-                            return Err(anyhow!(
-                                "[webd-acme] stat {} for vhost {:?}: {} \
-                                 — unrecoverable I/O on live key; rotate \
-                                 the state dir or restore from backup",
-                                live_key.display(),
-                                plan.fqdn,
-                                e,
-                            ));
-                        }
-                    };
-                    if !key_ok {
-                        warn!(
-                            fqdn = %plan.fqdn,
-                            "ACME live privkey.pem missing or empty — re-issuing"
-                        );
-                    }
-                    let env = chain_environment_for(plan.provider);
-                    let chain_ok = !chain_pem.is_empty()
-                        && validate_le_chain_for_environment(
-                            &chain_pem,
-                            &[&plan.fqdn],
-                            now_unix,
-                            env,
-                        )
-                        .is_ok();
-                    let now_unix_secs = now.unix_timestamp();
-                    let expired = meta.not_after_unix <= now_unix_secs;
-                    let provider_drift = meta.provider != plan.provider;
-                    match (chain_ok, expired, provider_drift, key_ok) {
-                        (true, false, false, true) => {
-                            // Carrying & servable. Splice the live
-                            // PEMs into the identity set unchanged.
-                            // (Aliases: see "Known gap" in the
-                            // closeout — C5d1 issues per-fqdn only.)
-                            let identity = TlsIdentityConfig {
-                                server_name: plan.fqdn.clone(),
-                                cert: live_chain.to_string_lossy().into_owned(),
-                                key: live_key.to_string_lossy().into_owned(),
-                                default: false,
-                                no_sni_fallback: false,
-                            };
-                            identities.push(identity.clone());
-                            // C5d2 needs the live identity for each
-                            // FQDN so a future renewal can rebuild the
-                            // ServerConfig from a coherent union of
-                            // manual + ACME identities.
-                            self.acme_identities.insert(plan.fqdn.clone(), identity);
-                            if meta.not_after_unix - now_unix_secs < RENEWAL_WINDOW.as_secs() as i64
-                            {
-                                info!(
-                                    fqdn = %plan.fqdn,
-                                    not_after_unix = meta.not_after_unix,
-                                    "ACME chain inside 30d window — \
-                                     renewal will fire on the next \
-                                     C5d2 tick"
-                                );
-                            }
-                            false
-                        }
-                        _ => {
-                            // Validator rejected, expired, provider
-                            // drift, or PEM material missing/empty.
-                            // Collapse to the fresh path. The plan
-                            // calls this "carrying-unservable".
-                            warn!(
-                                fqdn = %plan.fqdn,
-                                chain_ok,
-                                key_ok,
-                                expired,
-                                provider_drift,
-                                "ACME live chain is carrying-unservable \
-                                 — re-issuing as fresh"
-                            );
-                            true
-                        }
-                    }
-                }
+                None => true,
             };
 
             if !needs_issue {
@@ -1210,6 +1104,167 @@ impl AcmeProvisioner {
             self.acme_identities.insert(plan.fqdn.clone(), identity);
         }
         Ok(identities)
+    }
+
+    /// Classify the on-disk `acme/<fqdn>/live/` state for `plan`.
+    ///
+    /// * `Ok(Some(identity))` — carrying & servable: meta readable,
+    ///   chain present and accepted by the chain validator, key present,
+    ///   not expired, provider matches. The identity points at the live
+    ///   PEM pair verbatim.
+    /// * `Ok(None)` — nothing servable (no live meta at all, or
+    ///   carrying-unservable: empty/missing PEM, validator rejection,
+    ///   expiry, provider drift). The caller issues fresh.
+    /// * `Err` — corrupt / unsupported meta or real I/O failure. Must
+    ///   not be silently re-issued; `startup_pass` propagates it as a
+    ///   hard startup error, the runtime row path logs and skips.
+    ///
+    /// Pure read: creates nothing, mutates nothing. Shared by
+    /// `startup_pass` (config plans) and `apply_vhost_row` (runtime
+    /// rows after a restart, whose certs `startup_pass` never sees
+    /// because `acme_plans` is built from `node.conf.mix` alone).
+    fn classify_live(
+        &self,
+        plan: &AcmeVhostPlan,
+        now: OffsetDateTime,
+        now_unix: UnixTime,
+    ) -> Result<Option<TlsIdentityConfig>> {
+        let fqdn_dir = self.acme_dir.join(&plan.fqdn);
+        let live_dir = fqdn_dir.join(LIVE_DIR);
+        let live_chain = live_dir.join(FULLCHAIN_FILE);
+        let live_key = live_dir.join(PRIVKEY_FILE);
+        let live_meta = live_dir.join(META_FILE);
+
+        // Classification: existence first, then servability for
+        // carrying chains. See plan §"Commit 5 — startup_pass".
+        let classified = match read_meta_json(&live_meta) {
+            Err(MetaReadError::NotFound { .. }) => None,
+            Err(e) => {
+                return Err(anyhow!(
+                    "[webd-acme] reading {} live meta.json for vhost {:?}: {} \
+                     — corrupt / unreadable state must not be silently \
+                     re-issued; rotate the state dir or roll back the binary",
+                    plan.fqdn,
+                    plan.fqdn,
+                    e,
+                ));
+            }
+            Ok(meta) => {
+                // Existence check passed → classify servability.
+                // (i) chain present + readable;
+                // (ii) privkey.pem present + non-empty;
+                // (iii) validator OK against the configured
+                //     environment;
+                // (iv) `not_after > now`.
+                // Any of those failing means "carrying-unservable
+                // → collapse to the fresh path." A missing or
+                // truncated PEM file is recoverable disk damage,
+                // not a reason to refuse to bind :443; only meta
+                // corruption / unsupported-version / true I/O
+                // policy errors above propagate as hard errors.
+                let chain_pem = match std::fs::read(&live_chain) {
+                    Ok(b) if !b.is_empty() => b,
+                    Ok(_) => {
+                        warn!(
+                            fqdn = %plan.fqdn,
+                            "ACME live fullchain.pem is empty — re-issuing"
+                        );
+                        Vec::new()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        warn!(
+                            fqdn = %plan.fqdn,
+                            "ACME live fullchain.pem missing alongside meta.json — re-issuing"
+                        );
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "[webd-acme] reading {} for vhost {:?}: {} \
+                             — unrecoverable I/O on live chain; rotate \
+                             the state dir or restore from backup",
+                            live_chain.display(),
+                            plan.fqdn,
+                            e,
+                        ));
+                    }
+                };
+                // privkey.pem must exist non-empty too; the
+                // rustls splice below references its path
+                // verbatim, so an absent/empty key would otherwise
+                // surface as a runtime handshake failure on the
+                // first connection.
+                let key_ok = match std::fs::metadata(&live_key) {
+                    Ok(m) => m.len() > 0,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "[webd-acme] stat {} for vhost {:?}: {} \
+                             — unrecoverable I/O on live key; rotate \
+                             the state dir or restore from backup",
+                            live_key.display(),
+                            plan.fqdn,
+                            e,
+                        ));
+                    }
+                };
+                if !key_ok {
+                    warn!(
+                        fqdn = %plan.fqdn,
+                        "ACME live privkey.pem missing or empty — re-issuing"
+                    );
+                }
+                let env = chain_environment_for(plan.provider);
+                let chain_ok = !chain_pem.is_empty()
+                    && (self.chain_validator)(&chain_pem, &plan.fqdn, now_unix, env);
+                let now_unix_secs = now.unix_timestamp();
+                let expired = meta.not_after_unix <= now_unix_secs;
+                let provider_drift = meta.provider != plan.provider;
+                match (chain_ok, expired, provider_drift, key_ok) {
+                    (true, false, false, true) => {
+                        // Carrying & servable. Splice the live
+                        // PEMs into the identity set unchanged.
+                        // (Aliases: see "Known gap" in the
+                        // closeout — C5d1 issues per-fqdn only.)
+                        let identity = TlsIdentityConfig {
+                            server_name: plan.fqdn.clone(),
+                            cert: live_chain.to_string_lossy().into_owned(),
+                            key: live_key.to_string_lossy().into_owned(),
+                            default: false,
+                            no_sni_fallback: false,
+                        };
+                        if meta.not_after_unix - now_unix_secs < RENEWAL_WINDOW.as_secs() as i64
+                        {
+                            info!(
+                                fqdn = %plan.fqdn,
+                                not_after_unix = meta.not_after_unix,
+                                "ACME chain inside 30d window — \
+                                 renewal will fire on the next \
+                                 C5d2 tick"
+                            );
+                        }
+                        Some(identity)
+                    }
+                    _ => {
+                        // Validator rejected, expired, provider
+                        // drift, or PEM material missing/empty.
+                        // Collapse to the fresh path. The plan
+                        // calls this "carrying-unservable".
+                        warn!(
+                            fqdn = %plan.fqdn,
+                            chain_ok,
+                            key_ok,
+                            expired,
+                            provider_drift,
+                            "ACME live chain is carrying-unservable \
+                             — re-issuing as fresh"
+                        );
+                        None
+                    }
+                }
+            }
+        };
+        Ok(classified)
     }
 
     /// Shared issuance core for both [`AcmeProvisioner::startup_pass`]
@@ -1779,13 +1834,17 @@ impl AcmeProvisioner {
     ///     but writeback never landed; **retry writeback** and return.
     /// 4b. `self.acme_identities.contains_key(fqdn)` AND
     ///     `row.cert_blob_id.is_some()` → fully covered; return.
-    /// 4c. `row.cert_blob_id.is_some()` (acme_identities empty —
-    ///     post-restart bus_runtime case) → covered for
-    ///     renewal-scheduling purposes; the on-disk PEM survives
-    ///     under `live/`. Loading it back into `acme_identities` so
-    ///     the resolver can serve it is C4b's load-runtime-
-    ///     identities arm. Return.
-    /// 4d. Neither set → fresh-add path. Continue to cooldown gate
+    /// 4c. No in-memory identity (the post-restart `bus_runtime`
+    ///     case, whatever `cert_blob_id` says) → classify the on-disk
+    ///     `live/` state exactly as `startup_pass` does. Servable →
+    ///     adopt it into `acme_identities`, republish the resolver,
+    ///     return. Unreadable/corrupt → log, return (never re-issue
+    ///     over it). Nothing servable → fall through to 4d. Before
+    ///     this arm existed a restarted node trusted `cert_blob_id`,
+    ///     never loaded the cert, and served another vhost's cert for
+    ///     every runtime-added ACME vhost.
+    /// 4d. Fresh-add path (skipped when `allow_issue` is false — the
+    ///     pre-bind startup adopt pass). Continue to cooldown gate
     ///     + `issue_one` + writeback.
     ///
     /// On a fresh-issue success: populate `self.acme_identities`,
@@ -1796,6 +1855,85 @@ impl AcmeProvisioner {
     /// existing resolver snapshot keeps serving (no manual-PEM
     /// identity affected since this was a fresh add).
     async fn apply_vhost_row(&mut self, fqdn: &str, row: VhostRow) -> Result<()> {
+        self.apply_vhost_row_inner(fqdn, row, true).await
+    }
+
+    /// Pre-bind startup pass over the `webd.vhosts` namespace: adopt
+    /// the on-disk `live/` cert of every enabled ACME row that
+    /// `startup_pass` did not cover — i.e. the `bus_runtime` rows a
+    /// `vhost.add` created in an earlier run. Registers their plans (so
+    /// the renewal tick sees them) and republishes each adopted
+    /// identity into the attached listeners' resolvers.
+    ///
+    /// Called from `main` after the `attach_*` wiring and **before**
+    /// the listener set binds, so the first handshake for a
+    /// runtime-added vhost already gets its own certificate. Never
+    /// issues: HTTP-01 needs the `:80` listener that is not bound yet,
+    /// and a failed order here would only arm a cooldown. Rows with
+    /// nothing servable on disk wait for the next reconcile (any
+    /// notify, e.g. `webd.acme.renew`).
+    ///
+    /// Returns the number of identities adopted. Errors are logged per
+    /// row; one broken row never blocks the others or the boot.
+    pub async fn adopt_namespace_rows_at_startup(
+        &mut self,
+        now: OffsetDateTime,
+        staging_orphan_ttl: Duration,
+    ) -> usize {
+        let Some(runtime) = self.vhosts_runtime.clone() else {
+            return 0;
+        };
+        let rows = match crate::vhosts_namespace::snapshot_rows(&runtime).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "ACME startup adopt: namespace list failed — runtime-added \
+                     vhosts keep no cert until the next reconcile"
+                );
+                return 0;
+            }
+        };
+        let mut adopted = 0;
+        for row in rows {
+            let fqdn = row.fqdn.clone();
+            if self.acme_identities.contains_key(&fqdn) {
+                continue;
+            }
+            // Roll forward an interrupted promotion first, exactly as
+            // `startup_pass` does for config plans.
+            let fqdn_dir = self.acme_dir.join(&fqdn);
+            if fqdn_dir.is_dir()
+                && let Err(e) = reconcile_on_startup(&fqdn_dir, staging_orphan_ttl, now)
+            {
+                warn!(
+                    fqdn = %fqdn,
+                    error = %e,
+                    "ACME startup adopt: reconciling on-disk state failed — skipping row"
+                );
+                continue;
+            }
+            if let Err(e) = self.apply_vhost_row_inner(&fqdn, row, false).await {
+                warn!(
+                    fqdn = %fqdn,
+                    error = %e,
+                    "ACME startup adopt: row rejected — skipping"
+                );
+                continue;
+            }
+            if self.acme_identities.contains_key(&fqdn) {
+                adopted += 1;
+            }
+        }
+        adopted
+    }
+
+    async fn apply_vhost_row_inner(
+        &mut self,
+        fqdn: &str,
+        row: VhostRow,
+        allow_issue: bool,
+    ) -> Result<()> {
         // Codex MINOR: pin the substrate invariant. `before_set`
         // rule 2 enforces `row.fqdn == ctx.key.key` on every
         // committed write; a mismatched event is a substrate bug.
@@ -1941,9 +2079,6 @@ impl AcmeProvisioner {
             }
             return Ok(());
         }
-        if row.cert_blob_id.is_some() {
-            return Ok(());
-        }
         let now = OffsetDateTime::now_utc();
         let now_unix_secs = now.unix_timestamp();
         let Ok(now_unix_secs_u64) = u64::try_from(now_unix_secs) else {
@@ -1957,6 +2092,53 @@ impl AcmeProvisioner {
             return Ok(());
         };
         let now_unix = UnixTime::since_unix_epoch(Duration::from_secs(now_unix_secs_u64));
+        // 4c — no in-memory identity. After a restart this is every
+        // `bus_runtime` ACME row: `startup_pass` only walks the
+        // `node.conf.mix` plans, so a runtime row's cert sits under
+        // `live/` unloaded and the listener would serve another
+        // vhost's cert for this SNI name. Adopt the on-disk cert when
+        // it is servable (the same classification `startup_pass`
+        // applies) instead of trusting `cert_blob_id` and returning.
+        match self.classify_live(&plan, now, now_unix) {
+            Ok(Some(identity)) => {
+                self.acme_identities.insert(plan.fqdn.clone(), identity);
+                if let Err(e) = self.republish_tls_config() {
+                    // Drop the identity again so the next reconcile
+                    // retries the adopt instead of seeing it "covered".
+                    self.acme_identities.remove(&plan.fqdn);
+                    warn!(
+                        fqdn = %fqdn,
+                        error = %e,
+                        "ACME apply_vhost_row: TLS republish failed while adopting \
+                         the on-disk live cert — leaving for next reconcile"
+                    );
+                    return Ok(());
+                }
+                info!(
+                    fqdn = %fqdn,
+                    "ACME apply_vhost_row: adopted on-disk live cert into the resolver"
+                );
+                self.publish_tls_status();
+                return Ok(());
+            }
+            // Nothing servable on disk — fresh issue below.
+            Ok(None) => {}
+            Err(e) => {
+                // Corrupt meta / real I/O: never silently re-issue
+                // over it (the `startup_pass` policy). Log and leave
+                // the row for an operator.
+                warn!(
+                    fqdn = %fqdn,
+                    error = %e,
+                    "ACME apply_vhost_row: on-disk live state unreadable — \
+                     not adopting, not re-issuing"
+                );
+                return Ok(());
+            }
+        }
+        if !allow_issue {
+            return Ok(());
+        }
         // Cooldown gate, mirroring `tick_once`. A row that just landed
         // after a retry-during-cooldown should not burn another
         // attempt against the same backoff bucket.
@@ -5279,6 +5461,132 @@ mod tests {
              the cooldown gate (count_after_first={count_after_first}, \
              count_after_second={count_after_second})"
         );
+    }
+
+    /// Permissive chain check for the adopt tests: no LE-issued chain
+    /// can be minted offline, and what these tests pin is the adopt /
+    /// re-issue routing, not the LE trust-set validator.
+    fn _accept_any_chain(_: &[u8], _: &str, _: UnixTime, _: ChainEnvironment) -> bool {
+        true
+    }
+
+    fn _runtime_row_claiming_cert(fqdn: &str) -> VhostRow {
+        let mut row = _acme_prod_row(fqdn);
+        row.cert_blob_id = Some(format!("acme/{fqdn}/live/fullchain.pem"));
+        row.key_blob_id = Some(format!("acme/{fqdn}/live/privkey.pem"));
+        row.not_after = Some("2100-01-01T00:00:00Z".to_string());
+        row
+    }
+
+    /// After a restart a `bus_runtime` ACME row with a cert
+    /// on disk must be ADOPTED into the resolver identity set. The old
+    /// 4c arm trusted `cert_blob_id` and returned, so a restarted node
+    /// served another vhost's cert for every runtime-added vhost.
+    #[tokio::test]
+    async fn apply_vhost_row_adopts_on_disk_cert_for_runtime_row_after_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A fresh provisioner = the restarted daemon: no plans, no
+        // in-memory identities for runtime rows.
+        let mut p = _new_acme_provisioner(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        _stage_fake_live(tmp.path(), "runtime.example");
+        p.apply_vhost_row("runtime.example", _runtime_row_claiming_cert("runtime.example"))
+            .await
+            .expect("apply Ok");
+        let ident = p
+            .acme_identities
+            .get("runtime.example")
+            .expect("on-disk live cert adopted into acme_identities");
+        assert!(ident.cert.ends_with("runtime.example/live/fullchain.pem"));
+        assert!(
+            p.plans.iter().any(|pl| pl.fqdn == "runtime.example"),
+            "plan registered so the renewal tick sees it"
+        );
+        assert_eq!(
+            p.vhost_state
+                .get("runtime.example")
+                .map(|s| s.last_error_count),
+            Some(0),
+            "a servable cert on disk must not trigger an issuance attempt"
+        );
+    }
+
+    /// The other half of the old 4c arm: a row claiming a cert whose
+    /// `live/` is gone must fall through to issuance instead of
+    /// sitting "covered" forever with nothing to serve.
+    #[tokio::test]
+    async fn apply_vhost_row_reissues_when_row_claims_cert_but_disk_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = _new_acme_provisioner(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        p.apply_vhost_row("lost.example", _runtime_row_claiming_cert("lost.example"))
+            .await
+            .expect("apply Ok");
+        assert!(!p.acme_identities.contains_key("lost.example"));
+        assert_eq!(
+            p.vhost_state.get("lost.example").map(|s| s.last_error_count),
+            Some(1),
+            "issuance must be attempted (and fails hermetically: no ToS)"
+        );
+    }
+
+    /// Corrupt live meta is neither adopted nor silently re-issued over
+    /// (the `startup_pass` policy, applied to runtime rows).
+    #[tokio::test]
+    async fn apply_vhost_row_corrupt_live_meta_neither_adopts_nor_reissues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = _new_acme_provisioner(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        _stage_fake_live(tmp.path(), "corrupt.example");
+        std::fs::write(
+            tmp.path()
+                .join("corrupt.example")
+                .join(LIVE_DIR)
+                .join(META_FILE),
+            b"{not json",
+        )
+        .unwrap();
+        p.apply_vhost_row("corrupt.example", _runtime_row_claiming_cert("corrupt.example"))
+            .await
+            .expect("apply Ok");
+        assert!(!p.acme_identities.contains_key("corrupt.example"));
+        assert_eq!(
+            p.vhost_state
+                .get("corrupt.example")
+                .map(|s| s.last_error_count),
+            Some(0),
+            "no issuance over corrupt state"
+        );
+    }
+
+    /// The pre-bind startup pass adopts servable runtime certs from
+    /// the namespace and never issues (`:80` is not bound yet).
+    #[tokio::test]
+    async fn startup_adopt_loads_runtime_certs_and_never_issues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut p, runtime, _rx) = _new_acme_provisioner_with_runtime(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        _write_row(&runtime, &_runtime_row_claiming_cert("ondisk.example")).await;
+        _write_row(&runtime, &_acme_prod_row("nocert.example")).await;
+        _stage_fake_live(tmp.path(), "ondisk.example");
+
+        let adopted = p
+            .adopt_namespace_rows_at_startup(OffsetDateTime::now_utc(), Duration::from_secs(3600))
+            .await;
+        assert_eq!(adopted, 1);
+        assert!(p.acme_identities.contains_key("ondisk.example"));
+        assert!(!p.acme_identities.contains_key("nocert.example"));
+        assert!(
+            p.plans.iter().any(|pl| pl.fqdn == "nocert.example"),
+            "a cert-less runtime row is still registered for later issuance"
+        );
+        for fqdn in ["ondisk.example", "nocert.example"] {
+            assert_eq!(
+                p.vhost_state.get(fqdn).map(|s| s.last_error_count),
+                Some(0),
+                "startup adopt must never attempt issuance ({fqdn})"
+            );
+        }
     }
 
     #[tokio::test]

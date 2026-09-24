@@ -958,6 +958,14 @@ struct NodeState {
     /// nodes (no TLS). The verb returns a helpful `rc=10` when `None`.
     /// See [`bus::tls`].
     tls_reload: Option<bus::tls::TlsReloadState>,
+    /// Where `webd.vhost.add` / `webd.vhost.remove` read the node config
+    /// the NEXT restart will enforce, so they can refuse a change that
+    /// would make `synthesize_listeners` abort the boot (a host no
+    /// enabled listener serves, or a listener naming a removed host).
+    /// `Disk` on the serving node; `Fixed` on fixtures and the
+    /// bootstrap / dev-static nodes. See
+    /// [`bus::vhost_verbs::ListenerConfigSource`].
+    listener_config: bus::vhost_verbs::ListenerConfigSource,
 }
 
 /// Which Basic seam a cached service token belongs to (keeps the dev and
@@ -6373,6 +6381,7 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
         )),
         handler_ast_cache: mix_handler::new_ast_cache(),
         tls_reload: None,
+        listener_config: crate::bus::vhost_verbs::ListenerConfigSource::Fixed(None),
     });
 
     let listen = addr.to_string();
@@ -7250,6 +7259,7 @@ async fn main() -> Result<()> {
                         handler_ast_cache: mix_handler::new_ast_cache(),
                         // Pre-ACME bootstrap node serves no TLS — no reload.
                         tls_reload: None,
+                        listener_config: crate::bus::vhost_verbs::ListenerConfigSource::Fixed(None),
                     });
                     let redirect = build_http_redirect_router(bootstrap_node);
                     let listener = tokio::net::TcpListener::bind(&http_listen)
@@ -7805,6 +7815,7 @@ async fn main() -> Result<()> {
                 handlers,
                 handler_ast_cache,
                 tls_reload,
+                listener_config: bus::vhost_verbs::ListenerConfigSource::Disk,
             });
 
             // Slice #3 — webd.handlers reload task. The namespace hooks
@@ -7899,6 +7910,25 @@ async fn main() -> Result<()> {
                             disabled_hosts.clone(),
                         );
                         provisioner.attach_key_locks(webd_key_locks.clone());
+                        // Adopt the on-disk certs of runtime-added
+                        // (`vhost.add`) ACME rows BEFORE the listener set
+                        // binds below. `startup_pass` only walked the
+                        // `node.conf.mix` plans, so without this a
+                        // restarted node served another vhost's cert for
+                        // every runtime-added vhost.
+                        let adopted = provisioner
+                            .adopt_namespace_rows_at_startup(
+                                time::OffsetDateTime::now_utc(),
+                                std::time::Duration::from_secs(6 * 60 * 60),
+                            )
+                            .await;
+                        if adopted > 0 {
+                            provisioner.publish_tls_status();
+                            tracing::info!(
+                                adopted,
+                                "ACME: adopted on-disk certs for runtime-added vhosts"
+                            );
+                        }
                         Some(tokio::spawn(async move { provisioner.run_forever().await }))
                     }
                     _ => None,
@@ -8792,6 +8822,7 @@ vhost: [
             )),
             handler_ast_cache: mix_handler::new_ast_cache(),
             tls_reload: None,
+            listener_config: crate::bus::vhost_verbs::ListenerConfigSource::Fixed(None),
         })
     }
 
@@ -10044,6 +10075,7 @@ mod session_login_tests {
             handlers: Arc::new(ArcSwap::from(Arc::new(handlers))),
             handler_ast_cache: mix_handler::new_ast_cache(),
             tls_reload: None,
+            listener_config: crate::bus::vhost_verbs::ListenerConfigSource::Fixed(None),
         })
     }
 

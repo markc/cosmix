@@ -35,7 +35,13 @@ Dotted names take precedence. `enabled` accepts `true`, `false`, `1`, or `0` and
 
 The add verb stamps `source = "bus_runtime"` and uses a tombstone-aware version anchor. It supports re-adding a previously removed FQDN.
 
-The remove verb deletes the property row. Namespace hooks notify the runtime and certificate provisioner so routing and managed state can be reconciled.
+Runtime rows survive restarts, so both verbs check the change against the `node.conf.mix` the next restart will read. They re-read it from disk on every call. On a node with an explicit `[[webd.listener]]` array, the add verb refuses an FQDN that no listener's `vhosts` list names. It also refuses one that only a disabled listener names, or that two listeners name. Each of those would make the next restart abort and take every vhost on the node down. A refused add writes nothing: no row, no tombstone, no provisioner event. Add the host to exactly one enabled listener's `vhosts` first, then retry. A node without explicit listeners serves every host, so the check always passes there. If the config file does not load, both verbs refuse, because the next restart would fail anyway.
+
+The remove verb deletes the property row. Namespace hooks notify the runtime and certificate provisioner so routing and managed state can be reconciled. It refuses while a listener still names the FQDN and no `[[webd.vhost]]` block defines it as a host or alias. Otherwise the listener would point at an unknown vhost and abort the next boot. Drop the host from the listener first.
+
+On a node with explicit listeners, a runtime-added host is not served until the next restart. Each listener's allowlist is read from configuration at startup. After a restart, webd loads the on-disk certificate of every runtime-added ACME vhost into the listener resolvers before the listeners bind. The first handshake then gets the vhost's own certificate, not another vhost's. Loading never issues a certificate. A row with no servable certificate on disk is issued on the next reconcile, which any `webd.acme.renew` triggers.
+
+The verbs cannot see a front proxy. On a node behind an nginx SNI router, the router's `stream` map entry and its `:80` `server_name` entry still have to be added by the operator.
 
 The list verb adds a derived `acme_status` to each row. Secret fields are returned only when the caller has the secret-read capability.
 
