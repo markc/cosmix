@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-term"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -27,7 +27,7 @@ engine = "iced"
 # own swapchain, so it cannot get under the 80 MB gate at desktop sizes.
 default = ["tiny-skia"]
 # iced's CPU rasteriser into `wl_shm`: no DRM fd at all, like foot.
-tiny-skia = ["iced/tiny-skia", "iced/image"]
+tiny-skia = ["iced/tiny-skia", "iced/image", "dep:bytes"]
 # The shader-widget path, kept buildable: one persistent wgpu texture,
 # damage-band uploads. `--features wgpu` on top of the default selects it —
 # when both are compiled in, main.rs takes the wgpu grid and iced_renderer
@@ -43,6 +43,7 @@ naga27-termcolor = ["dep:naga27"]
 cosmix-buildinfo = { package = "cosmix-lib-buildinfo", path = "../../../crates/cosmix-lib-buildinfo" }
 
 [dependencies]
+bytes = { version = "1.12", optional = true }
 # iced 0.14 (D3), its own winit/Wayland backend (D2). default-features off is
 # not tidiness: `x11`, `tiny-skia`, `fira-sans` and the theme-detection D-Bus
 # client are all dead weight in a Wayland-only terminal that renders a texture

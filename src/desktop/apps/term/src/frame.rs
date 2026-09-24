@@ -2,15 +2,20 @@
 //!
 //! A [`Frame`] is created per visible pane and lives while that pane is on
 //! screen. The VT loop rasterises into it in place and appends the damaged
-//! bands; the renderer uploads those bands and clears them. Neither side ever
-//! allocates a grid-sized buffer per frame, which is the requirement this whole
-//! frontend exists to meet: the Bevy terminal's `Image::new`-per-damaged-frame
+//! bands; the renderer consumes them. The wgpu arm keeps one Vec-backed
+//! surface; tiny-skia shares its Bytes-backed surface with its image handle,
+//! reclaiming it for painting or copying if a widget still holds it. Reusing
+//! storage matters: the Bevy terminal's `Image::new`-per-damaged-frame
 //! is where 320 MB of its 344 MB of mapped GEM went
 //! (`_journal/2026-09-20-term-vs-foot-memory-anatomy.md`).
 
+#[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+use crate::cpu_grid::Surface;
 use cosmix_term_core::config::Cursor;
 use cosmix_term_core::font::FontSize;
-use cosmix_term_core::raster::{DamageBand, Raster, Surface};
+#[cfg(not(all(feature = "tiny-skia", not(feature = "wgpu"))))]
+use cosmix_term_core::raster::Surface;
+use cosmix_term_core::raster::{DamageBand, Raster};
 use cosmix_term_core::terminal::Screen;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -31,6 +36,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+    pub fn cpu_surface_mut(&mut self) -> &mut Surface {
+        &mut self.surface
+    }
+
     pub fn surface(&self) -> &Surface {
         &self.surface
     }
@@ -214,7 +224,10 @@ impl Painter {
             let Frame {
                 surface, damage, ..
             } = &mut *frame;
+            #[cfg(not(all(feature = "tiny-skia", not(feature = "wgpu"))))]
             let bands = self.raster.render_into(screen, dirty, surface);
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            let bands = surface.paint(&mut self.raster, screen, dirty);
             damage.extend_from_slice(bands);
             !bands.is_empty()
         };
