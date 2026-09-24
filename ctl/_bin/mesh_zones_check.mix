@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh_zones_check.mix — assert that the committed zones.mix is current.
 --
 -- The generated DNS zones are a committed artifact derived from the verified

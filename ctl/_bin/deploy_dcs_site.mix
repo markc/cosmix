@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_dcs_site.mix — publish one configured static documentation site to
 -- its configured webd nodes.
 --

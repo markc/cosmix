@@ -83,6 +83,18 @@ try
   end
   check($d.prepare($ctx,"desktop.capabilities",$headers,{},400001).rc == 10,"oversize envelope")
   $caps = $d.prepare($ctx,"desktop.capabilities",$headers,{},2).body
+  -- desktop-session.mix's `-- version:` header is the citizen's version; the
+  -- library's fallback literal (what this test's header-less entry script
+  -- gets) must agree with it, or an old mix would report a stale version.
+  $session_header = nil
+  for each $line in split(read_file(dirname($0) .. "/../desktop-session.mix"), "\n")
+    $m = re_find($line, '^--\s*version\s*:\s*(\S+)')
+    if length($m) > 0 and $session_header == nil then
+      $session_header = $m[0].groups[0]
+    end
+  end
+  check($session_header != nil, "desktop-session.mix has no -- version: header")
+  check($caps.implementation_version == $session_header, "implementation_version " .. $caps.implementation_version .. " != desktop-session.mix header " .. $session_header)
   check(len($caps.verbs) == 12 and contains($caps.verbs,"desktop.clipboard.pick") and contains($caps.verbs,"desktop.clipboard.rotate") and contains($caps.verbs,"desktop.clipboard.menu"),"capabilities verb list incomplete")
   check($caps.clipboard.history.persistence == "ok" and $caps.clipboard.history.topic == "desktop.clipboard.changed","history capabilities block wrong")
   check($d.prepare($ctx,"desktop.clipboard.read",$headers,{instance:"old"},2).rc == 12,"stale instance accepted")

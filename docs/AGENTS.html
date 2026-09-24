@@ -475,6 +475,7 @@ cd $COSMIX/src/desktop &amp;&amp; cargo test -p ctk --lib --features bus,theme a
 cd $COSMIX/src &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cd $COSMIX/src/desktop &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p &lt;crate&gt;          # never a repo-wide fmt from a task
+mix path/to/script.mix --version   # every shipped Mix script answers; "unversioned" = add a "-- version: X.Y.Z" header
 </code></pre>
 <p>On a machine without a real GPU the desktop run fails exactly two llvmpipe
 pixel tests in <code>cosmix-comp</code> (<code>client_surface_material::…_on_a_real_gpu</code> and
@@ -507,6 +508,35 @@ Chapter ordering does not reassign legacy runtime specification IDs.</li>
 <li>Operational docs (<code>_doc/</code>, <code>_plan/</code>, journals, private specs and decisions)
 remain in the maintainer's private control repo. Never copy them wholesale
 into the public suite. Update accepted public contracts with affected code.</li>
+</ul>
+<h2 id="--version--mix-scripts"><code>--version</code> — Mix scripts</h2>
+<p>Every binary AND every Mix script answers <code>--version</code> with build details
+(Mark, 2026-09-25). For a script, <code>mix</code> answers on its behalf:
+<code>mix SCRIPT --version</code> (or <code>-V</code>) prints one line and exits 0 without running
+it: the script name, its declared version, the first 12 hex digits of the
+SHA-256 of its bytes, its mtime, and the interpreter's own version and sha.
+The version comes from a header in the leading comment region (shebang, blank
+and <code>--</code> lines, first 32 lines), in exactly this form:</p>
+<pre><code class="language-mix">-- version: 0.1.0
+</code></pre>
+<ul>
+<li>Every runnable script this repo ships carries the header: <code>setup.mix</code>,
+<code>docs/build/</code>, <code>src/desktop/scripts/</code> (not its <code>tests/</code>), toolsd, the <code>check-*</code>/export scripts,
+and the starter <code>ctl/_bin/</code> and <code>ctl/_share/</code>. Libraries, handlers and data
+files that are loaded rather than run do not, and neither do test scripts:
+a header would make the test the entry script whose version
+<code>script_version()</code> reports. A new script gets one;
+<code>mix docs/build/add-version-headers.mix</code> adds any that are missing.</li>
+<li>Bump the header when the script's observable behaviour changes. That is the
+same test as a crate bump.</li>
+<li>Mix owns the first argument after the script path. A wrapper that must
+answer <code>--version</code> itself declares <code>-- version-flag: script</code> in the same
+region and then receives the flag in <code>args()</code>.</li>
+<li><code>mix lint</code> notes a missing header on a file it judges to be a script
+(shebang, a <code>bin</code>/<code>_bin</code>/<code>scripts</code>/<code>build</code> directory, or a serve citizen) as
+MIX-D3016. Add <code>--require-version</code> to make it a warning.</li>
+<li>Contract, header grammar, <code>--serve</code>/stdin forms and the <code>script_version()</code>
+builtin: <code>docs/mix/invocation.md</code>, section "<code>--version</code> for scripts".</li>
 </ul>
 <h2 id="history">History</h2>
 <p>Merged 2026-08-30 from <code>markc/bus</code>, <code>markc/mix</code>, <code>markc/cos</code> (git subtree —

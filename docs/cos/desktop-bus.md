@@ -6,6 +6,14 @@ Cross-node calls use native ABP between noded instances, requiring noded
 0.15.0 or newer at both ends. Automatic clipboard synchronisation is not
 implemented.
 
+The implementation version is the `-- version:` header of
+`src/desktop/scripts/desktop-session.mix`, which is what
+`mix desktop-session.mix --version` prints and what `desktop.capabilities`
+reports as `implementation_version` (read through `script_version()`). Bump
+the header. `lib/desktop.mix` keeps the same number as a literal fallback for
+a mix older than 0.95.0, and `tests/desktop-test.mix` fails when the two
+disagree.
+
 The reusable scripts live in `src/desktop/scripts/`. One supervised Mix citizen
 belongs to one desktop session. It uses the Wayland display, runtime directory
 and session D-Bus inherited at launch; requests cannot select another session

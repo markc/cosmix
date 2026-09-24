@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_nspawnd.mix — install cosmix-nspawnd on its configured controller
 -- and executor nodes, then prove each restarted service is healthy.
 --

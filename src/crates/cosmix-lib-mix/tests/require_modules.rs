@@ -751,3 +751,36 @@ async fn send_bound_vars_are_not_exported() {
     .unwrap();
     assert_eq!(out, "true\nfalse\nfalse\nfalse\n");
 }
+
+// script_version() inside a `require`d module reports the ENTRY script: the
+// module runs in the caller's evaluator and reads the record installed there.
+#[tokio::test]
+async fn script_version_in_a_required_module_is_the_entry_script() {
+    let dir = test_dir("script_version_entry");
+    write_module(
+        &dir,
+        "helper.mix",
+        "return script_version().name .. \"|\" .. script_version().version\n",
+    );
+    let out = run_in_dir_with(&dir, "print(require(\"helper.mix\"))\n", false, |eval| {
+        eval.set_script_provenance(Some(std::sync::Arc::new(cosmix_mix::ScriptProvenance {
+            name: "main.mix".into(),
+            version: Some("1.2.3".into()),
+            sha256: "0".repeat(64),
+            modified: None,
+            mix_version: "0.0.0".into(),
+            mix_sha: "test".into(),
+            mix_dirty: false,
+        })));
+    })
+    .await
+    .unwrap();
+    assert_eq!(out.trim_end(), "main.mix|1.2.3");
+    // Control: with no record installed the same module sees nil, so the
+    // line above came from the installed record and nothing else.
+    write_module(&dir, "helper2.mix", "return script_version()\n");
+    let out = run_in_dir_with(&dir, "print(type(require(\"helper2.mix\")))\n", false, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(out.trim_end(), "nil");
+}

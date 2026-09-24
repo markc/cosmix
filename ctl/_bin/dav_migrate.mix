@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- dav_migrate.mix — migrate calendar and address-book exports into DAV.
 --
 --   mix _bin/dav_migrate.mix <job>

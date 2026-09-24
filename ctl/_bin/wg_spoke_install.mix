@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- wg_spoke_install.mix — privileged WireGuard Address setter for one spoke.
 --
 -- Run this script on the spoke as root:

@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_webd.mix — install cosmix-webd and its systemd unit on configured
 -- mesh nodes, then prove the restarted daemon is healthy.
 --

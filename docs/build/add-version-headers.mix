@@ -1,0 +1,108 @@
+#!/usr/bin/env mix
+-- version: 0.1.0
+-- add-version-headers.mix — give every shipped Mix script a `-- version:`
+-- header, so `mix SCRIPT --version` never answers "unversioned" for code
+-- this repo ships (docs/mix/invocation.md, "--version for scripts").
+--
+--   mix docs/build/add-version-headers.mix [--dry-run] [PATH...]
+--
+-- With no PATH it sweeps the scripts the public repo ships: setup.mix,
+-- docs/build/, src/desktop/scripts/, src/_etc/cosmix/toolsd/, ctl/_bin/,
+-- ctl/_share/cosmix/, and the check/export scripts in src/crates/cosmix-mix/,
+-- src/desktop/apps/bterm/ and src/desktop/apps/bg-showcase/assets-src/.
+-- Not swept, because they are loaded rather than run: the std prelude,
+-- webd vhost handlers, keymap and settings data. Library modules (a `_lib/` or `lib/` directory) and
+-- strict-data files (`*.conf.mix` and the other data suffixes) are skipped:
+-- they are loaded, never run. A file that already declares `-- version:` in
+-- its leading comment region is left alone, so re-running is a no-op.
+--
+-- The header goes on line 1, or line 2 after a `#!` shebang: inside the
+-- leading comment region by construction. The region rule mirrors
+-- `parse_script_header` in cosmix-lib-mix: shebang on line 1, then blank and
+-- `--` comment lines, at most 32 lines.
+
+$DEFAULT_VERSION = "0.1.0"
+$DATA_SUFFIXES = [".conf.mix", ".spec.mix", ".state.mix", ".journal.mix", ".verdict.mix", ".call.mix"]
+
+fn has_header($src)
+  $n = 0
+  for each $line in split($src, "\n")
+    $n = $n + 1
+    if $n > 32 then
+      return false
+    end
+    $t = trim($line)
+    if $n == 1 and starts_with($line, "#!") then
+      continue
+    end
+    if $t == "" then
+      continue
+    end
+    if not starts_with($t, "--") then
+      return false
+    end
+    if re_match($t, '^--\s*version\s*:') then
+      return true
+    end
+  end
+  return false
+end
+
+fn skipped($path)
+  for each $suffix in $DATA_SUFFIXES
+    if ends_with($path, $suffix) then
+      return true
+    end
+  end
+  return contains($path, "/_lib/") or contains($path, "/lib/")
+end
+
+fn with_header($src)
+  $hdr = "-- version: " .. $DEFAULT_VERSION .. "\n"
+  if starts_with($src, "#!") then
+    $nl = index_of($src, "\n")
+    return substr($src, 0, $nl + 1) .. $hdr .. substr($src, $nl + 1)
+  end
+  return $hdr .. $src
+end
+
+$dry = false
+$targets = []
+for each $arg in args()
+  if $arg == "--dry-run" then
+    $dry = true
+  else
+    push($targets, $arg)
+  end
+end
+
+$repo = trim(run_argv_must(["git", "rev-parse", "--show-toplevel"]))
+if length($targets) == 0 then
+  $targets = [$repo .. "/setup.mix"]
+  for each $dir in ["docs/build", "src/desktop/scripts", "src/_etc/cosmix/toolsd", "ctl/_bin", "ctl/_share/cosmix", "src/crates/cosmix-mix", "src/desktop/apps/bterm", "src/desktop/apps/bg-showcase/assets-src"]
+    for each $f in glob($repo .. "/" .. $dir .. "/*.mix")
+      push($targets, $f)
+    end
+  end
+end
+
+$added = 0
+$present = 0
+$skip = 0
+for each $f in $targets
+  if skipped($f) then
+    $skip = $skip + 1
+  else
+    $src = read_file($f)
+    if has_header($src) then
+      $present = $present + 1
+    else
+      $added = $added + 1
+      print("add " .. $f)
+      if not $dry then
+        write_file($f, with_header($src))
+      end
+    end
+  end
+end
+print("added " .. $added .. ", already versioned " .. $present .. ", skipped " .. $skip .. ($dry ? " (dry run)" : ""))

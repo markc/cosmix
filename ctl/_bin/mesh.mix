@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh.mix — inspect the mesh through the local cosmix-noded broker.
 --
 --   mix _bin/mesh.mix             node names only (self first)

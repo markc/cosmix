@@ -1,4 +1,5 @@
 #!/opt/cosmix/bin/mix
+-- version: 0.1.0
 -- Prometheus textfile collector for the ABP version-discovery surface.
 -- Queries the local broker and atomically publishes build provenance for
 -- noded and every registered service.

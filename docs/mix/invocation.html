@@ -463,7 +463,9 @@ machine-readably, including the full 40-hex <code>git_sha_full</code>.</p>
 capture, the native-session lane, Bus dispatch and the evaluation thread, so it
 neither starts a session nor disturbs one: <code>mix --version</code> is truthful and
 side-effect-free while other mix processes are running (0.89.1). Only <code>argv[1]</code>
-is a version query — <code>mix -c 'print("--version")'</code> runs the program, as before.</p>
+is a version query for the interpreter — <code>mix -c 'print("--version")'</code> runs the
+program, as before. A <code>--version</code> straight after a script path asks for the
+<strong>script's</strong> version instead: see <a href="/mix/invocation#--version-for-scripts"><code>--version</code> for scripts</a>.</p>
 <h2 id="modes-at-a-glance">Modes at a glance</h2>
 <table><thead><tr><th>Form</th><th>What it does</th></tr></thead><tbody>
 <tr><td><code>mix</code></td><td>Interactive REPL (loads <code>~/.mixrc</code>)</td></tr>
@@ -479,6 +481,7 @@ is a version query — <code>mix -c 'print("--version")'</code> runs the program
 <tr><td><code>mix --strict-arity …</code></td><td>Strict call arity: wrong-arity user-function/builtin calls raise catchable <code>ARITY_MISMATCH</code> instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see <a href="/mix/functions">functions</a>)</td></tr>
 <tr><td><code>mix --serve &lt;script&gt; [--name &lt;svc&gt;]</code></td><td>Run the script as a supervised Bus daemon citizen — see <a href="/mix/serve">serve</a></td></tr>
 <tr><td><code>mix --version</code> / <code>-V</code></td><td>Print version + build hash, and nothing else — no session lane, no Bus (0.89.1)</td></tr>
+<tr><td><code>mix script.mix --version</code> / <code>-V</code></td><td>Print the <strong>script's</strong> version line without running it (also <code>mix --serve script.mix --version</code>, <code>mix - --version</code>) — see <a href="/mix/invocation#--version-for-scripts">below</a> (0.95.0)</td></tr>
 <tr><td><code>mix --help</code> / <code>-h</code></td><td>Usage summary</td></tr>
 <tr><td><code>mix stats [sub…]</code></td><td>Window-labelled usage reports and static authorship coverage — see <a href="/mix/stats">stats</a></td></tr>
 <tr><td><code>mix help</code> / <code>mix what &lt;name&gt;</code> / <code>mix man [topic]</code></td><td>Builtin/keyword reference and this manual — see <a href="/mix/cli">the <code>mix</code> meta-command</a></td></tr>
@@ -552,6 +555,99 @@ Meta names keep precedence over files: if <code>status</code> exists in the CWD,
 last statement — it stays alive pumping events for those handlers. For the
 supervised daemon variant (broker registration, reconnect, journald logging),
 use <a href="/mix/serve"><code>--serve</code></a>.</p>
+<h2 id="--version-for-scripts"><code>--version</code> for scripts</h2>
+<p>Every cosmix binary AND every Mix script answers <code>--version</code> with build details
+(Mark's rule, 2026-09-25). A script declares its version with one header line
+in its leading comment region:</p>
+<pre><code class="language-mix">#!/usr/bin/env mix
+-- version: 1.4.0
+-- deploy_widget.mix — ship the widget to the fleet
+</code></pre>
+<p>and <code>mix</code> answers for it:</p>
+<pre><code class="language-text">$ mix deploy_widget.mix --version
+deploy_widget.mix 1.4.0 (3f9a0c1d22be, modified 2026-09-25T01:14:07Z; mix 0.95.0 (a1b2c3d4e5f6))
+$ mix plain.mix --version
+plain.mix unversioned (9e107d9d372b, modified 2026-09-24T22:03:41Z; mix 0.95.0 (a1b2c3d4e5f6))
+$ mix deploy_widget.mix --version --json
+{"mix":{"dirty":false,"sha":"a1b2c3d4e5f6","version":"0.95.0"},"modified":"2026-09-25T01:14:07Z","name":"deploy_widget.mix","sha":"3f9a0c1d22be","sha256":"3f9a0c1d22be…","version":"1.4.0"}
+</code></pre>
+<p>The contract:</p>
+<ul>
+<li><strong>One line, exit 0, script not run.</strong> The fields are the script's basename,
+its declared version (or <code>unversioned</code>), the first 12 hex digits of the
+SHA-256 of its bytes, its mtime as RFC 3339 UTC, and the interpreter's own
+<code>mix --version</code> provenance (<code>-dirty</code> suffix included). The hash is what
+proves two nodes run the same bytes; the header is what a human bumps.</li>
+<li><strong><code>--json</code></strong> straight after the flag prints the same facts as one JSON
+object, the same map <code>script_version()</code> returns (<code>version</code> and <code>modified</code>
+are <code>null</code> when absent), matching <code>mix --version --json</code>. Its keys come
+out in a different order from the in-script map; JSON objects are
+unordered, so read them by name.</li>
+<li><strong>Read, never parsed.</strong> The answer comes from the same cold position as
+<code>mix --version</code> — no session lane, no Bus, no prelude, no rc — and the file
+is only read, so a script with a syntax error still reports its version. An
+unreadable path prints the usual <code>Error reading '…'</code> and exits 1. The bytes
+and the mtime come from one open of the file, so they always describe the
+same inode.</li>
+<li><strong>Symlinks.</strong> The name is the basename of the path as given (the link's
+own name, so <code>~/.local/bin/zcode</code> reports <code>zcode</code>); the hash and the mtime
+are the target's. The same rule holds for a running <code>--serve</code> citizen's
+<code>script_version()</code>, although serve reads the script by its canonical path.</li>
+<li><strong>The header form is exactly <code>-- version: X.Y.Z</code></strong> (optional <code>-pre</code> /
+<code>+build</code> suffix), and it must sit in the <strong>leading comment region</strong>: an
+optional <code>#!</code> shebang on line 1, then only blank lines and <code>--</code> comment
+lines, within the first 32 lines. The scan stops at the first line that is
+anything else, so a <code>-- version:</code> inside a heredoc or string further down —
+a script that generates scripts — is never taken for this file's header.
+Whitespace-tolerant (<code>--version:1.4.0</code> counts), but lowercase and the colon
+is required: <code>-- version 1.4.0</code> is prose, not a header. The first
+<code>-- version:</code> line wins; one whose value is not <code>X.Y.Z</code> makes the script
+<code>unversioned</code>, and <a href="/mix/lint"><code>mix lint</code></a> names that line (MIX-D3016).</li>
+<li><strong>Mix owns exactly one position: the first argument after the script
+path.</strong> <code>mix script.mix --version</code> and <code>-V</code> there are Mix's; anywhere else
+they are ordinary script arguments — <code>mix script.mix x --version</code> runs the
+script with <code>args()</code> = <code>["x", "--version"]</code>. The interpreter flags that may
+come before the script (<code>-i</code>, <code>--no-prelude</code>, <code>--no-traceback</code>,
+<code>--strict-arity</code>) do not change this. Under <code>--serve</code> the position is the
+one right after the script path, so <code>mix --serve s.mix --name x --version</code>
+and <code>mix --serve s.mix --no-prelude --version</code> are NOT queries (serve
+refuses the stray <code>--version</code> as a usage error).</li>
+<li><strong>Opting out: <code>-- version-flag: script</code>.</strong> A script that must answer
+<code>--version</code> itself — a wrapper that forwards argv to another program, such
+as <code>ctl/_bin/zcode.mix</code> behind <code>~/.local/bin/zcode</code> — declares this line in
+the same leading comment region. <code>mix</code> then does not take position 1: the
+script runs with <code>--version</code> in <code>args()</code> and is expected to answer the flag
+itself. Only the exact value <code>script</code> counts. <code>--serve</code> still answers for an
+opted-out script, because a daemon has no argv to hand the flag to, so
+<code>mix --serve SCRIPT --version</code> is the cold provenance route for an
+opted-out script: it only reads the file, whether or not the script is a
+citizen, and never starts it.</li>
+<li><strong><code>mix --serve script.mix --version</code></strong> answers the same way and exits before
+any broker connect. <strong><code>mix - --version</code></strong> reads the script from stdin and
+names it <code>-</code>, with no <code>modified</code> field:
+<code>- 1.4.0 (3f9a0c1d22be; mix 0.95.0 (a1b2c3d4e5f6))</code>.</li>
+</ul>
+<p>A running script reads the same facts as data with <code>script_version()</code>:
+<code>{name, version, sha, sha256, modified, mix: {version, sha, dirty}}</code>, where
+<code>version</code> is nil for an undeclared header and <code>modified</code> is nil for stdin.</p>
+<ul>
+<li>It describes the <strong>entry script</strong>: a <code>require</code>d module that calls it gets
+the entry script's record, not its own.</li>
+<li>It is <strong>nil</strong> in the REPL, under <code>-c</code>, and in any embedder that runs Mix
+without installing a record (the MCP <code>mix_execute</code> tool, a Rust host
+calling the evaluator directly).</li>
+<li>It is held <strong>per evaluator</strong>, so under <code>--serve</code> each RELOAD generation
+answers for its own file: a handler of the old generation still draining
+after a reload reads the old record, the new script's init and handlers
+read the new one, and a reverted reload leaves the old one untouched.</li>
+<li>Its <code>mix</code> block is deliberately <strong>not</strong> <code>mix_version()</code>'s shape. It carries
+the version string and build sha of the interpreter, which is what
+provenance needs, where <code>mix_version()</code> splits the number into
+major/minor/patch for version gates.</li>
+</ul>
+<pre><code class="language-mix">$v = script_version()
+log("starting " .. $v.name .. " " .. ($v.version ?? "unversioned") .. " @ " .. $v.sha)
+</code></pre>
 <h2 id="mix--c--one-liners-and-the-shell-first-classifier"><code>mix -c</code> — one-liners and the shell-first classifier</h2>
 <p><code>mix -c '&lt;code&gt;'</code> runs a single line. <strong>It is shell-first</strong>: the same classifier
 the REPL uses decides whether the line is Mix code or an external command. This

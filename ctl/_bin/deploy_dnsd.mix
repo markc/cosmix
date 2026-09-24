@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_dnsd.mix — staged cosmix-dnsd deployment to the configured mesh.
 --
 --   mix _bin/deploy_dnsd.mix sysusers [nodes...]

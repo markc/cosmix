@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate, ELF layer: the BUILT mix binary links no GUI/display
 -- libraries and stays within a size ceiling. Companion to check-no-gui.mix
 -- (which checks the Cargo graph): this one catches whatever reaches the

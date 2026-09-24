@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_shared.mix — publish the shared webd CMS/PIM tree to configured
 -- nodes, then restart webd so its cached handler ASTs cannot remain stale.
 --

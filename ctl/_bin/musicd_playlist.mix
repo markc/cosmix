@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- musicd_playlist.mix — play a configured MIDI playlist through the local
 -- cosmix-musicd service and announce each title with a desktop notification.
 -- Pacing comes from duration_s in each successful musicd.play reply; a failed

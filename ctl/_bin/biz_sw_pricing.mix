@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- biz_sw_pricing.mix — refresh a configured CMS site's domain pricing from
 -- Synergy Wholesale on its nominated mesh node.
 --

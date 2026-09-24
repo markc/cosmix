@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_filesd.mix — install cosmix-filesd, its template unit, and one
 -- private per-corpus config on the configured mesh nodes.
 --

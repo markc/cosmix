@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gallery_spike_thumbs.mix — generate gallery grid and preview thumbnails.
 --
 -- Reads pending image/video rows from the configured metadata index and writes

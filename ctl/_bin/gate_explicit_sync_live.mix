@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gate_explicit_sync_live.mix — live DRM explicit-sync syscall gate.
 --
 --   mix _bin/gate_explicit_sync_live.mix <test-filter> \

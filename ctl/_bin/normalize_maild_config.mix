@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- normalize_maild_config.mix [in_path] [out_path] — run on a mail node as
 -- root, or locally for testing. Renders a brace/JSON-style maild config into
 -- native conf.mix `key: value` form, value-identical through parse and render.

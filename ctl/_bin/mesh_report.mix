@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh_report.mix — report the mesh substrate state observed over Bus.
 --
 --   mix _bin/mesh_report.mix           -- report every rostered mesh node

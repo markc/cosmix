@@ -1,4 +1,5 @@
 #!/opt/cosmix/bin/mix
+-- version: 0.1.0
 -- hygiene-hook.mix — the body of the installed git hooks.
 --
 --   mix _bin/hygiene-hook.mix pre-commit

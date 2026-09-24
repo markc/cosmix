@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- desktop-workspace -- the workspace-switching citizen. Registers Bus service
 -- `desktop` and answers desktop.workspace.*, which inputd's default
 -- RightCtrl+Left / RightCtrl+Right rows fire, by forwarding to cosmix-comp:

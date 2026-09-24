@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate: the canonical `mix` binary links NO GUI/terminal-emulator
 -- crates. The shell runs as root's login shell fleet-wide; it must stay
 -- small and boring. The graphical terminal is a SEPARATE binary in the

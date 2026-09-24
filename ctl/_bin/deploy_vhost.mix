@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_vhost.mix — deploy one CMS/PIM vhost from the private hub: ship its
 -- site configuration and generated thin handlers, then register its routes on
 -- the selected node. The shared vhost tree must already be deployed.

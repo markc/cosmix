@@ -38,6 +38,7 @@ mod repl;
 mod repl_editor;
 mod serve_runtime;
 mod result_fd;
+mod script_meta;
 mod session_task;
 mod session_execute;
 mod session_state;
@@ -553,6 +554,7 @@ fn run_source(
     filename: Option<&str>,
     script_args: &[String],
     no_prelude: bool,
+    provenance: Option<cosmix_mix::ScriptProvenance>,
 ) -> i32 {
     // `args()` reads this. It must be told, not left to guess from the
     // process argv — a flag before the script name shifts that by one.
@@ -575,6 +577,8 @@ fn run_source(
         let mut eval = Evaluator::new();
         eval.set_limits(script_limits());
         apply_arity_mode(&mut eval);
+        // `script_version()` reads this: the entry script's provenance.
+        eval.set_script_provenance(provenance.map(std::sync::Arc::new));
         eval.set_bus_handler(std::rc::Rc::new(bus::MixBusHandler::new()));
         // Make `source x` fall back to the REPL-style shell
         // classifier when `x` contains bareword shell lines (matches
@@ -1197,13 +1201,16 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
     // relative path would then resolve against the changed directory and
     // reload a different file (or none). Fall back to the given path if the
     // file does not exist yet (the read below reports it).
+    // The record names the script by the path it was invoked with (a
+    // symlink keeps its own name), exactly as the cold `--version` query does.
+    let invoked_path = script_path.to_string();
     let script_path_abs = std::fs::canonicalize(script_path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| script_path.to_string());
     let script_path = script_path_abs.as_str();
 
-    let source = match fs::read_to_string(script_path) {
-        Ok(s) => s,
+    let (source, initial_provenance) = match script_meta::read_script_text_as(script_path, &invoked_path) {
+        Ok((s, p)) => (s, script_meta::shared(p)),
         Err(e) => {
             tracing::error!(
                 service = %service_name,
@@ -1356,6 +1363,11 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
         }
 
         let mut eval = build_serve_eval(&bus_handler, &identity, service_name, script_path, no_prelude).await;
+        // Per evaluator, so each RELOAD generation answers
+        // `script_version()` for its own file: an old-generation handler
+        // still draining reads the old record, the replacement's init the
+        // new one, and a reverted reload never touched the old one.
+        eval.set_script_provenance(initial_provenance);
         cosmix_mix::interrupt::init(eval.interrupt_flag());
 
         // Serve mode ALWAYS enters the pump after the init body — it is
@@ -1448,8 +1460,8 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             // (file changed since) or a runtime failure in the new init
             // body reverts to the old evaluator — loudly, never silently.
             tracing::info!(service = %service_name, "serve: RELOAD accepted; building replacement evaluator");
-            let new_source = match std::fs::read_to_string(script_path) {
-                Ok(s) => s,
+            let (new_source, new_provenance) = match script_meta::read_script_text_as(script_path, &invoked_path) {
+                Ok((s, p)) => (s, script_meta::shared(p)),
                 Err(e) => {
                     tracing::error!(service = %service_name, error = %e,
                         "serve: reload REVERTED — script re-read failed; old script resumes");
@@ -1469,6 +1481,8 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             };
             let mut new_eval =
                 build_serve_eval(&bus_handler, &identity, service_name, script_path, no_prelude).await;
+            // The replacement's own record; the old evaluator keeps its own.
+            new_eval.set_script_provenance(new_provenance);
             // interrupt::init is once-only, bound to the FIRST evaluator's
             // flag — share that flag so the evaluator-internal interrupt path
             // keeps working after any number of reloads.
@@ -1790,6 +1804,21 @@ fn main() {
             println!("{text}");
             return;
         }
+        // `mix SCRIPT --version` (and `--serve SCRIPT`, `mix -`): the same
+        // cold answer for a script. The script is read, never parsed or run.
+        let reserved =
+            |s: &str| matches!(s, "stats" | "lint" | "edit") || META_CLI_COMMANDS.contains(&s);
+        match script_meta::script_version_request(&args, &reserved) {
+            script_meta::Answer::Print(line) => {
+                println!("{line}");
+                return;
+            }
+            script_meta::Answer::Fail(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            script_meta::Answer::NotQuery => {}
+        }
     }
     // Before native_session::start(), because that begins Bus dispatch and a
     // shell.task.submit can arrive immediately. Every invocation mode serves
@@ -1898,6 +1927,10 @@ fn real_main() -> i32 {
                 };
                 return check_syntax(&source, filename);
             }
+            // Every arm below that `continue`s (a flag that may precede a
+            // script path) must also be in `script_meta::NEUTRAL_FLAGS`, or
+            // `mix <flag> SCRIPT --version` runs the script instead of
+            // answering for it.
             "-i" => {
                 // Interactive-config one-shot, à la `bash -ci`: load ~/.mixrc
                 // (aliases + toolkit PATH) before the `-c` command runs.
@@ -2034,13 +2067,26 @@ fn real_main() -> i32 {
                 // Explicit only: bare `mix` with piped stdin still starts
                 // the REPL (see main()'s args.len() < 2 guard), so an
                 // accidental pipe can't silently execute a script.
-                let mut source = String::new();
-                if let Err(e) = io::stdin().read_to_string(&mut source) {
-                    eprintln!("mix: error reading script from stdin: {}", e);
+                // A `-- version-flag: script` opt-out made the cold path
+                // read stdin already; run those bytes.
+                let bytes = match script_meta::take_preread_stdin() {
+                    Some(bytes) => bytes,
+                    None => {
+                        let mut bytes = Vec::new();
+                        if let Err(e) = io::stdin().read_to_end(&mut bytes) {
+                            eprintln!("mix: error reading script from stdin: {}", e);
+                            return 1;
+                        }
+                        bytes
+                    }
+                };
+                let provenance = script_meta::provenance(None, &bytes, None);
+                let Ok(source) = String::from_utf8(bytes) else {
+                    eprintln!("mix: error reading script from stdin: stream did not contain valid UTF-8");
                     return 1;
-                }
+                };
                 let script_args: Vec<String> = args[i + 1..].to_vec();
-                return run_source(&source, Some("-"), &script_args, no_prelude);
+                return run_source(&source, Some("-"), &script_args, no_prelude, Some(provenance));
             }
             arg if arg.starts_with('-') => {
                 eprintln!("mix: unknown option '{}'", arg);
@@ -2084,15 +2130,15 @@ fn real_main() -> i32 {
             _ => {
                 // First non-flag argument is the script filename
                 let filename = &args[i];
-                let source = match fs::read_to_string(filename) {
-                    Ok(s) => s,
+                let (source, provenance) = match script_meta::read_script_text(filename) {
+                    Ok(read) => read,
                     Err(e) => {
                         eprintln!("Error reading '{}': {}", filename, e);
                         return 1;
                     }
                 };
                 let script_args: Vec<String> = args[i + 1..].to_vec();
-                return run_source(&source, Some(filename), &script_args, no_prelude);
+                return run_source(&source, Some(filename), &script_args, no_prelude, Some(provenance));
             }
         }
     }

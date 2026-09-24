@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate: the sovereign `send` lane actually reaches a protected verb.
 --
 -- Sibling of check-p4-gates.mix and pinned the same two ways. libtest exits 0

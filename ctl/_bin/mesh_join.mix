@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh_join.mix — author one node into a mesh inventory and create a signed
 -- proposal for a later deliberate rollout.
 --

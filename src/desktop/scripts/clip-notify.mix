@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- clip-notify — the wl-paste --watch child. Runs per selection change with
 -- the selection bytes on stdin and CLIPBOARD_STATE in the environment
 -- (data / nil / clear / sensitive per wl-clipboard(1)).

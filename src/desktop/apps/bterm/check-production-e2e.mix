@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- Hard gate: the p0i-01 production child-proof actually RUNS.
 -- The e2e is #[ignore]d so ordinary test runs stay hermetic, which means a
 -- green suite alone carries no evidence the production spawn path was ever

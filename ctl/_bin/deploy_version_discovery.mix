@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- deploy_version_discovery.mix — install the version-aware broker and client
 -- daemons, then enable the Prometheus version collector.
 --

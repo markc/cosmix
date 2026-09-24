@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- term-desktop.mix — agentless desktop-workflow launcher for CosMix Term.
 --
 -- Drives CosMix Term over the Bus with NO AI agent in the loop: the desktop

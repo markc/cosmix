@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- comp_rescue.mix [vt] — dead-man rescue for local cosmix-comp kms-live runs.
 --
 -- Run as root after arming it through a delayed transient unit before a live

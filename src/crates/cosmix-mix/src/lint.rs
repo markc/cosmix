@@ -2,7 +2,7 @@
 //! record D3).
 //!
 //! ```text
-//! mix lint [--json | --data] [--deny-warnings]
+//! mix lint [--json | --data] [--deny-warnings] [--require-version]
 //!          [--allow-global NAME]... [--allow-function NAME]...
 //!          FILE...
 //! ```
@@ -20,7 +20,7 @@ use cosmix_mix::error::MixError;
 use cosmix_mix::token::Token;
 
 const USAGE: &str = "Usage: mix lint [--json | --data] [--deny-warnings] \
-[--allow-global NAME]... [--allow-function NAME]... FILE...";
+[--require-version] [--allow-global NAME]... [--allow-function NAME]... FILE...";
 
 /// Line/column pair lifted from a lexer/parser span.
 struct SpanLite {
@@ -52,6 +52,7 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
     let mut format = Format::Human;
     let mut format_set = false;
     let mut deny_warnings = false;
+    let mut require_version = false;
     let mut cfg = AnalyzerConfig::default();
     let mut files: Vec<String> = Vec::new();
     let mut stdin_used = false;
@@ -72,6 +73,7 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
                 format_set = true;
             }
             "--deny-warnings" => deny_warnings = true,
+            "--require-version" => require_version = true,
             "--allow-global" | "--allow-function" => {
                 let Some(name) = args.get(i + 1) else {
                     eprintln!("mix lint: {} requires a NAME", args[i]);
@@ -132,6 +134,9 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
         match lint_one(&source, file_label, &cfg) {
             Ok(LintOutcome::Script(analysis)) => {
                 all_diags.extend(analysis.diagnostics);
+                if let Some(diag) = version_header_diag(&source, file, require_version) {
+                    all_diags.push(diag);
+                }
                 for cap in analysis.capabilities {
                     if !capabilities.contains(&cap) {
                         capabilities.push(cap);
@@ -249,6 +254,103 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
     }
 
     if errors > 0 || denied { 1 } else { 0 }
+}
+
+/// Is `file` run as a script (so it owes a `-- version:` header), rather than
+/// a module loaded by `require`/`include`? A deliberately simple heuristic,
+/// documented in lint.md, decided in this order over the path AS GIVEN:
+/// 1. a `#!` shebang on line 1 — a script;
+/// 2. a `lib`, `_lib`, `tests` or `test` directory component — never
+///    reported: a library is loaded, not run, and a test script must NOT
+///    carry a header (it would become the entry script whose record
+///    `script_version()` returns, masking the code under test's own);
+/// 3. a `bin`, `_bin`, `scripts` or `build` directory component — a script;
+/// 4. a serve citizen: a top-level `on <verb>` handler (column 0), or a
+///    `--serve` mention in the leading comment region — a script.
+///
+/// Stdin (`-`) has no path, so only rules 1 and 4 apply. Known false
+/// positive, Wontfix: a library under an absolute `/…/bin/…` path with no
+/// `lib` component is reported; lint it by a relative path. The mirror also
+/// holds: ANY `lib`/`tests` ancestor in an absolute path (`/…/lib/…`)
+/// exempts a script beneath it.
+fn runs_as_script(source: &str, file: &str) -> bool {
+    if source.starts_with("#!") {
+        return true;
+    }
+    if file != "-" {
+        let dirs: Vec<String> = std::path::Path::new(file)
+            .parent()
+            .map(|dir| {
+                dir.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if dirs
+            .iter()
+            .any(|d| matches!(d.as_str(), "lib" | "_lib" | "tests" | "test"))
+        {
+            return false;
+        }
+        if dirs
+            .iter()
+            .any(|d| matches!(d.as_str(), "bin" | "_bin" | "scripts" | "build"))
+        {
+            return true;
+        }
+    }
+    declares_serve(source)
+}
+
+/// A serve citizen: a top-level `on <verb>` handler, or a `--serve` mention
+/// in the leading comment region ("Run with mix --serve x.mix").
+fn declares_serve(source: &str) -> bool {
+    let top_level_handler = source.lines().any(|line| {
+        line.strip_prefix("on ")
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+    });
+    top_level_handler
+        || cosmix_mix::script_version::leading_comment_lines(source)
+            .iter()
+            .any(|(_, line)| line.trim_start()[2..].contains("--serve"))
+}
+
+/// MIX-D3016: a script with no well-formed `-- version: X.Y.Z` header in its
+/// first lines, so `mix SCRIPT --version` can only say `unversioned`. A note
+/// by default; `--require-version` makes it a warning (same code — D3xxx is
+/// the promotable namespace).
+fn version_header_diag(source: &str, file: &str, require: bool) -> Option<Diagnostic> {
+    use cosmix_mix::VersionHeader;
+    if !runs_as_script(source, file) {
+        return None;
+    }
+    let scan = cosmix_mix::script_version::HEADER_SCAN_LINES;
+    let (line, message) = match cosmix_mix::parse_version_header(source) {
+        VersionHeader::Declared { .. } => return None,
+        VersionHeader::Malformed { raw, line } => (
+            Some(line),
+            format!(
+                "`-- version:` header value `{raw}` is not X.Y.Z, so `mix SCRIPT --version` reports this script as unversioned"
+            ),
+        ),
+        VersionHeader::Absent => (
+            None,
+            format!(
+                "script declares no `-- version: X.Y.Z` header in its first {scan} lines, so `mix SCRIPT --version` reports it as unversioned"
+            ),
+        ),
+    };
+    Some(Diagnostic {
+        code: "MIX-D3016",
+        severity: if require { Severity::Warning } else { Severity::Note },
+        file: Some(file.to_string()),
+        line,
+        column: None,
+        message,
+        hint: Some(format!(
+            "add a `-- version: 0.1.0` comment near the top (the first {scan} lines are searched)"
+        )),
+    })
 }
 
 /// Lex+parse+analyze one file. If script parsing fails but the same

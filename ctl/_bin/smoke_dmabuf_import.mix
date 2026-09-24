@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- smoke_dmabuf_import.mix — prove that a real client DMA-BUF is imported
 -- into Vulkan with the format mapping required by the sampling contract.
 --

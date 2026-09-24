@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- sshm.mix — the sshm BUS WAKE citizen.
 --
 -- Runs as `mix --serve sshm.mix --name sshm` under the low-privilege

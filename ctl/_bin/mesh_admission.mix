@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- mesh_admission.mix <off|observe|enforce> [node...] — roll the noded
 -- admission posture across the mesh.
 --

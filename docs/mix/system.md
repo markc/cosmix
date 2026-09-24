@@ -1014,6 +1014,7 @@ platform()      {os, arch} map
 which("cmd")    the PATH entry joined with cmd if EXECUTABLE, else nil
 has_builtin(n)  does THIS mix have the named builtin? -> bool (v0.78.0)
 mix_version()   {major, minor, patch, string} — the runtime version (v0.78.0)
+script_version() the entry script's provenance map, nil outside a script (v0.95.0)
 exit([code])    unwind finally, then terminate with status code (default 0)
 sleep(secs)     suspend for secs seconds (fractional ok; async-aware)
 ```
@@ -1033,6 +1034,13 @@ A feature-gated builtin missing from *this* build still reads `true` from
 `has_builtin` (the binary knows the name — calling it raises "requires the
 X feature"); that is the honest answer, distinct from a name the binary
 has never heard of.
+
+`script_version()` is the script-side twin of `mix_version()`: the running
+entry script's `{name, version, sha, sha256, modified, mix: {version, sha,
+dirty}}` — the facts `mix SCRIPT --version` prints, as data, so a script can
+log its own provenance. `version` comes from the `-- version: X.Y.Z` header
+(nil when absent); the map is nil in the REPL and under `-c`. See
+[`--version` for scripts](invocation.md#--version-for-scripts).
 
 `env` reads an environment variable, returning `""` (not nil, no raise) when
 unset — distinct from the string-interpolation `${NAME}` form, which walks

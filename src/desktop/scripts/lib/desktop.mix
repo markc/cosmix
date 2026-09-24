@@ -414,6 +414,22 @@ fn mesh_open()
   return env("COSMIX_MESH_OPEN", "1") != "0"
 end
 
+-- The citizen's implementation version is the `-- version:` header of the
+-- ENTRY script (desktop-session.mix, the citizen that answers
+-- desktop.capabilities). The header is canonical and is the one to bump; the
+-- literal below is only the answer on a mix too old to have script_version()
+-- (before 0.95.0) or an entry script without a header, and tests/desktop-test.mix
+-- asserts it still equals desktop-session.mix's header.
+fn implementation_version()
+  if has_builtin("script_version") then
+    $v = script_version()
+    if $v != nil and $v.version != nil then
+      return $v.version
+    end
+  end
+  return "0.3.6"
+end
+
 fn caller_allowed($ctx,$verb,$headers)
   if $headers.broker_origin == "local" then
     return type($headers.from) == "string" and re_match($headers.from,"^[a-z][a-z0-9-]{1,30}$")
@@ -469,7 +485,7 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
   if $verb == "desktop.capabilities" then
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
-    return {rc:0, body:{api_version:1, implementation_version:"0.3.6", session:$ctx.session,
+    return {rc:0, body:{api_version:1, implementation_version:implementation_version(), session:$ctx.session,
       instance:$ctx.instance, access:(mesh_open() ? "mesh-open" : "registered-local-with-explicit-mesh-clipboard-grants"), mesh_open:mesh_open(), max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},

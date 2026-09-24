@@ -2853,6 +2853,7 @@ pub(crate) const INLINE_SPECIAL_FORMS: &[&str] = &[
     "quit",
     "publish",
     "serve_name",
+    "script_version",
 ];
 
 /// Per-evaluator capability gate for the builtin table (the capability
@@ -3563,6 +3564,12 @@ pub(crate) struct EvaluatorGlobals {
     /// slice lets C.5 wrap `globals` without a follow-up reshape on
     /// `serve_runtime` if a future runtime verb gains an async leg.
     serve_runtime: Option<Rc<dyn ServeRuntime>>,
+    /// The entry script's provenance — what `script_version()` returns.
+    /// Lives in `globals`, so a `require`d module (same evaluator) and every
+    /// per-invocation handler activation read the ENTRY script's record,
+    /// while a `--serve` RELOAD's replacement evaluator carries its own:
+    /// an old-generation handler still draining reads the old record.
+    script_provenance: Option<std::sync::Arc<crate::script_version::ScriptProvenance>>,
     /// Per-evaluator capability gate for the builtin table. `None` =
     /// fully permissive (the default — every existing caller is
     /// unaffected). Set via [`Evaluator::set_capability_policy`];
@@ -3695,6 +3702,7 @@ impl EvaluatorGlobals {
             bus_call_handler: None,
             shell_handler: None,
             serve_runtime: None,
+            script_provenance: None,
             capability_policy: None,
             arity_strict: false,
             limits: EvalLimits::default(),
@@ -4389,6 +4397,16 @@ impl Evaluator {
     /// shadowed by design (DECIDED §7-Q4: runtime wins).
     pub fn set_serve_runtime(&mut self, runtime: Rc<dyn ServeRuntime>) {
         self.globals.borrow_mut().serve_runtime = Some(runtime);
+    }
+
+    /// Install the entry script's provenance for `script_version()`. The
+    /// CLI calls this once per evaluator it runs a script in; an embedder
+    /// that never calls it gets nil from `script_version()`.
+    pub fn set_script_provenance(
+        &mut self,
+        provenance: Option<std::sync::Arc<crate::script_version::ScriptProvenance>>,
+    ) {
+        self.globals.borrow_mut().script_provenance = provenance;
     }
 
     /// Install a per-evaluator capability gate over the builtin table.
@@ -11928,6 +11946,16 @@ impl Evaluator {
                             .unwrap_or(Value::Nil));
                     }
 
+                    // script_version() — the entry script's provenance map,
+                    // read from THIS evaluator's globals (so each serve
+                    // generation answers for its own file); nil when the
+                    // host installed none (REPL, -c, embedders).
+                    if name == "script_version" {
+                        self.check_capability(name)?; // Knob A
+                        let record = self.globals.borrow().script_provenance.clone();
+                        return Ok(record.map(|p| p.to_value()).unwrap_or(Value::Nil));
+                    }
+
                     // subscribe(name) / unsubscribe(name) — Ch03 topic
                     // (un)subscription (SPEC 18 WS2). One chokepoint for
                     // both init-body and handler-body callers: the
@@ -12733,6 +12761,7 @@ impl Evaluator {
                     | "reply"
                     | "quit"
                     | "serve_name"
+                    | "script_version"
                     | "push"
                     | "pop"
                     | "shift"

@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- Bridge Syncthing events to non-retained Bus topics and expose two folder
 -- control commands.
 --

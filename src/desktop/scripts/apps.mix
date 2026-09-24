@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- apps -- the application-registry citizen: the data foundation for the
 -- desktop launcher and the taskbar's app icons. It scans the freedesktop
 -- desktop-entry directories, resolves icons through the icon-theme spec and

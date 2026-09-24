@@ -1,3 +1,4 @@
+-- version: 0.3.6
 -- Explicit Bus operations. Entry output is metadata only; history output is
 -- previews (which for short entries are the full text) — the CLI never prints
 -- an entry body on its own initiative.

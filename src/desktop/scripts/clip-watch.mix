@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- clip-watch — one-shot registered deliverer for one observed selection.
 -- Launched by clip-notify.mix with the clipboard text on stdin. Registers a
 -- unique Bus identity (the provider only accepts registered local callers),
