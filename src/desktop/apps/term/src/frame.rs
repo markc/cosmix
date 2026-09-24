@@ -143,6 +143,9 @@ impl Painter {
         self.raster.scale
     }
 
+    // Read by the tests; nothing in the app needs the size back until a
+    // font verb exists (T7).
+    #[cfg(test)]
     pub fn font(&self) -> FontSize {
         self.font
     }

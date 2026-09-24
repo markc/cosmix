@@ -912,7 +912,7 @@ mod tests {
     /// keyboard handler does, on a real PTY-backed `TabSet`.
     #[test]
     fn chords_drive_the_tab_set_like_bterm() {
-        let mut tabs = TabSet::new().expect("a PTY");
+        let mut tabs = layout::test_tabs();
         let first_tab = tabs.active_id();
         let left = active_pane(&tabs);
 

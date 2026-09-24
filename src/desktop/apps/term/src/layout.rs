@@ -215,6 +215,20 @@ pub fn grid(pane: Geometry, cell: (u32, u32), scale: f32) -> (u16, u16) {
     (cols as u16, rows as u16)
 }
 
+/// A real PTY-backed tab set with default settings, for tests. The core's
+/// own `TabSet::new` is `cfg(test)` inside the core and so not reachable here.
+#[cfg(test)]
+pub fn test_tabs() -> TabSet {
+    TabSet::with_session(
+        cosmix_term_core::config::Settings {
+            config: cosmix_term_core::config::Config::default(),
+            term: "xterm-256color",
+        },
+        None,
+    )
+    .expect("a Mix PTY (/opt/cosmix/bin/mix)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,7 +329,7 @@ mod tests {
     /// `term.tab.new` or `term.pane.split` shows up with no keyboard involved.
     #[test]
     fn the_shape_follows_the_tab_set() {
-        let mut tabs = TabSet::new().expect("a PTY");
+        let mut tabs = test_tabs();
         let first = Shape::of(&tabs);
         assert_eq!(first.tabs.len(), 1);
         assert!(first.tabs[0].active);
