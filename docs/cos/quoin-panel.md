@@ -109,37 +109,51 @@ The scene click handlers above keep their toggle behaviour.
 |---|---|---|
 | `launcher.open` | `{query?, category?}` | Same as `launcher.state` |
 | `launcher.close` | `{}` | `{open: false}` |
-| `launcher.state` | `{}` | `{open, query, category, count, items}` |
+| `launcher.state` | `{}` | `{open, shown, query, category, count, items}` |
 | `launcher.search` | `{query, category?, limit?}` | `{query, category, count, items}` |
 | `launcher.launch` | `{id}` | `{launched: id}` |
-| `calendar.open`, `calendar.state` | `{}` | `{open, month, year}` |
+| `calendar.open`, `calendar.state` | `{}` | `{open, shown, month, year}` |
 | `calendar.close` | `{}` | `{open: false}` |
-| `notes.open`, `notes.state` | `{}` | `{open, count}` |
+| `notes.open`, `notes.state` | `{}` | `{open, shown, count}` |
 | `notes.close` | `{}` | `{open: false}` |
 | `popups.state` | `{}` | `{launcher, calendar, notes}` (booleans) |
 
 Open and close are idempotent. Opening a closed popup closes the other popups
 through the same generation-checked reveal/pin path as a click. Opening an
 already-open launcher preserves omitted filters; opening a closed launcher
-defaults them to empty strings. Query and category must be strings; category
-uses the apps citizen's freedesktop category names (`""` means all).
-An already-open calendar retains its navigated month.
+defaults them to empty strings. Numeric queries are converted to strings;
+other query values and categories must be strings. Open truncates the query
+to 128 characters and validates category against the launcher chips (case
+sensitive; `""` means all). Search accepts any apps category string.
+An already-open calendar retains its navigated month. Every open retries the
+render. `open` records intent; `shown` records whether the latest render had
+its load, page selection, reveal and pin accepted, not a compositor frame
+confirmation. A failed close returns rc 22 with
+`{error: "release_failed", open: false, edge}`. Repeated closes retry pending
+pin records, without releasing an edge another popup is using.
 
 Launcher items contain only `{id, name, generic_name, comment, icon, categories}`.
 `count` is the full matching count, before truncation; state includes at most
-50 items and uses the loaded list without another Bus request (fetching if
-not loaded). Search always calls `apps.list`, changes no UI or cached state,
+50 items and uses the list cached for that exact query/category. Replies to
+obsolete fetches are discarded. When the cache needs fetching, an open
+launcher is re-rendered so its content and the reply stay together.
+Search always calls `apps.list`, changes no UI or cached state,
 and defaults category to `""` and limit to 50. Limit is a non-negative integer;
 zero returns only the count. There is no additional search limit cap.
 Launch requires a non-empty string id and closes the launcher only on success.
-Apps refusals are relayed, including rc 14 `not_found`; local transport failures
-use rc 11. Notes count is the full cached notification count, even when the
+Apps rc 0–9 counts as success. Transport failures return rc 20 and
+`{error: "apps_transport", rc, reply}`; apps/broker refusals return rc 21 and
+`{error: "apps_refused", rc, reply}` (including nested rc 14 `not_found`).
+A non-list or malformed search reply returns rc 23 `apps_invalid_reply`.
+Notes count is the full cached notification count, even when the
 popup's 50-row display cap applies. Calendar month is 1–12 in local time.
 
 `COSMIX=<checkout> mix src/desktop/scripts/tests/panel-bus-test.mix` tests the
 production panel citizen over an isolated Bus broker with fixture dependencies.
-It checks popup idempotency and edge release, cached state, search isolation,
-launch/refusal, popup exclusivity and argument validation, without a live GUI.
+It checks delayed cache replies, refused reveals and release retries, search
+isolation, transport and peer rc handling, popup exclusivity, scene clicks and
+argument validation. Children use a cleared environment and explicit PATH;
+no live GUI is needed.
 
 ## Running it
 

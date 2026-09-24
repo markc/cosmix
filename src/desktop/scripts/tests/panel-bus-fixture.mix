@@ -3,12 +3,30 @@ $edges = {left: {pinned: false, visible: false}, right: {pinned: false, visible:
 $lists = 0
 $loads = 0
 $launches = []
+$mode = {}
+$pending = false
+
+on fixture.mode
+  $mode = $event.args
+  reply(0, "{}")
+end
+
+on fixture.refresh
+  emit quoin-panel props.changed
+  reply(0, "{}")
+end
 
 on "shell.scene.load"
+  if $mode.load_refused ?? false then reply(14, "{}"); return end
+  if $mode.restart_once ?? false then
+    $mode.restart_once = false
+    reply(0, json_encode({revision: 1})); return
+  end
   $loads = $loads + 1
   reply(0, json_encode({revision: $loads}))
 end
 on "shell.panel.page.set"
+  if $mode.page_refused ?? false then reply(14, "{}"); return end
   reply(0, "{}")
 end
 on "shell.panel.show"
@@ -20,10 +38,12 @@ on "shell.panel.pin"
   reply(0, "{}")
 end
 on "shell.panel.unpin"
+  if $mode.release_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].pinned = false
   reply(0, "{}")
 end
 on "shell.panel.hide"
+  if $mode.hide_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].visible = false
   reply(0, "{}")
 end
@@ -48,23 +68,30 @@ end
 on "apps.icon"
   reply(0, json_encode({path: ""}))
 end
-on "apps.list"
+on "apps.list" async
+  $args = $event.args
   $lists = $lists + 1
+  if has_key($mode, "delay_query") and $args.query == $mode.delay_query then
+    $pending = true
+    sleep($mode.delay_seconds ?? 2)
+    $pending = false
+  end
+  if has_key($mode, "list_reply") then reply($mode.rc ?? 0, $mode.list_reply); return end
   $items = []
   for each $i in range(1, 60)
-    push($items, {id: "app-" .. to_string($i), name: "Fixture " .. ($event.args.query ?? ""),
-      generic_name: "Utility", comment: "Test app", icon: "", categories: [$event.args.category ?? ""]})
+    push($items, {id: "app-" .. to_string($i), name: "Fixture " .. ($args.query ?? ""),
+      generic_name: "Utility", comment: "Test app", icon: "", categories: [$args.category ?? ""]})
   end
-  reply(0, json_encode($items))
+  reply($mode.rc ?? 0, json_encode($items))
 end
 on "apps.launch"
   if $event.args.id != "app-1" then
     reply(14, json_encode({error: "not_found"}))
   else
     push($launches, $event.args.id)
-    reply(0, json_encode({pid: 123}))
+    reply($mode.rc ?? 0, json_encode({pid: 123}))
   end
 end
 on fixture.state
-  reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches}))
+  reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches, pending: $pending, loads: $loads}))
 end

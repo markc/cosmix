@@ -7,10 +7,7 @@ $scripts = $root .. "/src/desktop/scripts"
 $mix = "/opt/cosmix/bin/mix"
 $tmp = trim(run_argv_must(["mktemp", "-d", "/tmp/cosmix-panel-bus-test.XXXXXXXX"]))
 $tag = uuid()
-$port = random(47000, 47999)
 $node = $tmp .. "/node.conf.mix"
-write_file($node, json_encode({node: "panel-bus-test-" .. $tag, wg_ip: "", mesh: "panel-bus-test.invalid",
-  noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
 $env = {COSMIX_NODE_CONFIG: $node, MIX_STATS: "off", PATH: "/usr/bin:/bin",
   HOME: $tmp, XDG_STATE_HOME: $tmp, XDG_RUNTIME_DIR: $tmp, PIPEWIRE_RUNTIME_DIR: $tmp,
   SCENE_HOST: "panel-fixture", COMP_SERVICE: "panel-fixture", APPS_SERVICE: "panel-fixture",
@@ -24,7 +21,7 @@ fn check($condition, $message)
   if not $condition then raise("PANEL_BUS_TEST", $message) end
 end
 fn call($target, $verb, $body)
-  return json_parse(run_argv_must([$mix, $tmp .. "/cli.mix", $target, $verb, $body], {env: $env, timeout: 25}))
+  return json_parse(run_argv_must([$mix, $tmp .. "/cli.mix", $target, $verb, $body], {clear_env: true, env: $env, timeout: 25}))
 end
 fn panel($verb, $args)
   $r = call("quoin-panel", $verb, json_encode($args))
@@ -43,14 +40,27 @@ fn wait_ready($target, $verb)
   raise("PANEL_BUS_TEST", $target .. " did not register")
 end
 try
-  $noded_pid = spawn(["/opt/cosmix/bin/cosmix-noded", "serve", "--listen", "127.0.0.1:" .. to_string($port),
-    "--node", "panel-bus-test-" .. $tag, "--no-monitor", "--no-log"],
-    {detach: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+  -- Retry an exited broker on a fresh port (bounded to five attempts).
+  -- Older installed brokers report only "Broker failed to start" on a bind
+  -- collision and may serve TCP without creating the configured Unix socket.
+  $broker_alive = false
+  for each $attempt in range(1, 5)
+    $port = random(47000, 47999)
+    write_file($node, json_encode({node: "panel-bus-test-" .. $tag, wg_ip: "", mesh: "panel-bus-test.invalid",
+      noded: {port: $port, admission: "off", unix_socket: $tmp .. "/bus.sock"}}))
+    $noded_pid = spawn(["/opt/cosmix/bin/cosmix-noded", "serve", "--listen", "127.0.0.1:" .. to_string($port),
+      "--node", "panel-bus-test-" .. $tag, "--no-monitor", "--no-log"],
+      {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/noded.log"}, stderr: "stdout"})
+    sleep(0.5)
+    $broker_alive = run_argv(["kill", "-0", "--", to_string($noded_pid)]).ok
+    if $broker_alive then break end
+  end
+  check($broker_alive, "broker exhausted port retries")
   $fixture_pid = spawn([$mix, "--serve", $scripts .. "/tests/panel-bus-fixture.mix", "--name", "panel-fixture"],
-    {detach: true, env: $env, stdout: {file: $tmp .. "/fixture.log"}, stderr: "stdout"})
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/fixture.log"}, stderr: "stdout"})
   wait_ready("panel-fixture", "fixture.state")
   $svc_pid = spawn([$mix, "--serve", $scripts .. "/quoin-panel.mix", "--name", "quoin-panel"],
-    {detach: true, env: $env, stdout: {file: $tmp .. "/svc.log"}, stderr: "stdout"})
+    {detach: true, clear_env: true, env: $env, stdout: {file: $tmp .. "/svc.log"}, stderr: "stdout"})
   wait_ready("quoin-panel", "popups.state")
 
   $before = fixture()
@@ -76,7 +86,7 @@ try
   panel("launcher.search", {query: "different"})
   check(deep_eq(panel("launcher.state", {}), $opened), "search changed loaded UI state")
   $missing = call("quoin-panel", "launcher.launch", "{\"id\":\"missing\"}")
-  check($missing.rc == 14 and deep_eq($missing.reply, {error: "not_found"}), "launch refusal not relayed")
+  check($missing.rc == 21 and deep_eq($missing.reply, {error: "apps_refused", rc: 14, reply: {error: "not_found"}}), "launch refusal not relayed")
   check(panel("launcher.state", {}).open, "failed launch closed launcher")
   check(deep_eq(panel("launcher.launch", {id: "app-1"}), {launched: "app-1"}), "launch success")
   check(not panel("launcher.state", {}).open and not fixture().edges.left.pinned, "launch did not release launcher")
@@ -85,7 +95,11 @@ try
   check(deep_eq(panel("launcher.close", {}), {open: false}), "second close reply")
   check(not fixture().edges.left.pinned and not fixture().edges.left.visible, "close left stale edge")
 
+  panel("launcher.open", {})
   $cal = panel("calendar.open", {})
+  check(not fixture().edges.left.pinned and fixture().edges.right.pinned, "launcher to calendar edges")
+  check(deep_eq(json_parse(read_file($tmp .. "/cosmix/quoin-panel-pins.json")), ["right"]), "launcher to calendar records")
+  check(not panel("popups.state", {}).launcher, "calendar left launcher open")
   check($cal.open and $cal.month >= 1 and $cal.month <= 12 and $cal.year > 2000, "calendar state")
   check(deep_eq(panel("calendar.open", {}), $cal), "calendar second open")
   check(deep_eq(panel("calendar.state", {}), $cal), "calendar snapshot")
@@ -104,9 +118,102 @@ try
   panel("calendar.close", {})
   check(not fixture().edges.right.pinned, "calendar close left stale pin")
 
+  -- Refused reveals stay retryable, including repeat opens of calendar/notes.
+  for each $kind in ["launcher", "calendar", "notes"]
+    for each $mode in [{page_refused: true}, {load_refused: true}]
+      call("panel-fixture", "fixture.mode", json_encode($mode))
+      $refused = panel($kind .. ".open", {})
+      check($refused.open and not $refused.shown, $kind .. " claimed a refused reveal")
+      call("panel-fixture", "fixture.mode", "{}")
+      check(panel($kind .. ".open", {}).shown, $kind .. " did not retry reveal")
+      panel($kind .. ".close", {})
+    end
+    -- Test both refused unpin and accepted unpin without confirmed hide.
+    for each $mode in [{release_refused: true}, {hide_refused: true}]
+      panel($kind .. ".open", {})
+      call("panel-fixture", "fixture.mode", json_encode($mode))
+      $failed = call("quoin-panel", $kind .. ".close", "{}")
+      check($failed.rc == 22 and $failed.reply.error == "release_failed", $kind .. " hid release failure")
+      check(length(json_parse(read_file($tmp .. "/cosmix/quoin-panel-pins.json"))) == 1, "lost pending pin")
+      $again = call("quoin-panel", $kind .. ".close", "{}")
+      check($again.rc == 22, "repeated close did not retry pending release")
+      call("panel-fixture", "fixture.mode", "{}")
+      panel($kind .. ".close", {})
+      check(length(json_parse(read_file($tmp .. "/cosmix/quoin-panel-pins.json"))) == 0, "retry kept released pin")
+    end
+  end
+  check(panel("launcher.search", {query: 123}).query == "123", "numeric query")
+  $long = ""
+  for each $i in range(1, 300)
+    $long = $long .. "q"
+  end
+  check(length(panel("launcher.open", {query: $long}).query) == 128, "query not bounded")
+  panel("launcher.close", {})
+  for each $body in ["{}", "not json"]
+    call("panel-fixture", "fixture.mode", json_encode({list_reply: $body}))
+    $bad_reply = call("quoin-panel", "launcher.search", "{\"query\":\"\"}")
+    check($bad_reply.rc == 23 and $bad_reply.reply.error == "apps_invalid_reply", "malformed apps response")
+  end
+  call("panel-fixture", "fixture.mode", json_encode({list_reply: "{}", rc: 10}))
+  $refusal = call("quoin-panel", "launcher.search", "{\"query\":\"\"}")
+  check($refusal.rc == 21 and $refusal.reply.rc == 10 and $refusal.reply.error == "apps_refused", "peer rc collision")
+  panel("launcher.open", {query: "recover"})
+  call("panel-fixture", "fixture.mode", "{}")
+  $lists = fixture().lists
+  $loads = fixture().loads
+  $recovered = panel("launcher.state", {})
+  check($recovered.count == 60 and $recovered.shown and fixture().lists > $lists, "open state did not recover apps")
+  check(fixture().loads > $loads, "recovery never loaded a scene")
+  for each $code in range(1, 9)
+    call("panel-fixture", "fixture.mode", json_encode({rc: $code}))
+    check(panel("launcher.search", {query: "success"}).count == 60, "nonzero success search")
+    panel("launcher.open", {})
+    panel("launcher.launch", {id: "app-1"})
+    check(not panel("launcher.state", {}).open, "nonzero success launch")
+  end
+  call("panel-fixture", "fixture.mode", "{}")
+  -- Exercise the unchanged scene toggle and filter entry points.
+  panel("launcher", {})
+  check(panel("launcher.state", {}).open, "launcher click did not open")
+  panel("filter", {value: 123})
+  check(panel("launcher.state", {}).query == "123", "click numeric filter")
+  panel("launcher", {})
+  check(not panel("launcher.state", {}).open, "launcher click did not close")
+  panel("calendar", {})
+  panel("notes", {})
+  check(deep_eq(panel("popups.state", {}), {launcher: false, calendar: false, notes: true}), "click exclusivity")
+  panel("notes", {})
+
+  -- A registration retry starts an old query in an async panel rebuild.
+  -- Change both filters while that apps.list reply is delayed on the Bus.
+  panel("launcher.open", {query: "old", category: "Utility"})
+  call("panel-fixture", "fixture.mode", json_encode({restart_once: true, delay_query: "old"}))
+  call("panel-fixture", "fixture.refresh", "{}")
+  $pending = false
+  for each $i in range(1, 50)
+    if fixture().pending then $pending = true; break end
+    sleep(0.05)
+  end
+  check($pending, "registration fetch did not enter delayed reply")
+  panel("launcher.open", {query: "new", category: "Development"})
+  for each $i in range(1, 60)
+    if not fixture().pending then break end
+    sleep(0.05)
+  end
+  check(not fixture().pending, "delayed reply never completed")
+  $fresh = panel("launcher.state", {})
+  check($fresh.query == "new" and $fresh.category == "Development" and $fresh.items[0].name == "Fixture new" and $fresh.items[0].categories[0] == "Development", "old reply overwrote current filter cache")
+  call("panel-fixture", "fixture.mode", "{}")
+  panel("launcher.close", {})
+
+  call("panel-fixture", "fixture.mode", json_encode({delay_query: "timeout", delay_seconds: 4}))
+  $transport = call("quoin-panel", "launcher.search", json_encode({query: "timeout"}))
+  check($transport.rc == 20 and $transport.reply.error == "apps_transport" and $transport.reply.rc < 0, "transport rc collision")
+  call("panel-fixture", "fixture.mode", "{}")
+
   for each $bad in [
     ["launcher.open", "[]"], ["launcher.open", "{bad"], ["launcher.open", "{\"query\":null}"],
-    ["launcher.search", "{}"], ["launcher.search", "{\"query\":1}"],
+    ["launcher.search", "{}"], ["launcher.open", "{\"category\":\"development\"}"],
     ["launcher.search", "{\"query\":\"\",\"limit\":-1}"],
     ["launcher.search", "{\"query\":\"\",\"limit\":1.5}"],
     ["launcher.search", "{\"query\":\"\",\"limit\":\"2\"}"],
@@ -114,7 +221,7 @@ try
     $r = call("quoin-panel", $bad[0], $bad[1])
     check($r.rc == 10 and $r.reply.error == "invalid_request" and type($r.reply.detail) == "string", "bad args: " .. json_encode($bad))
   end
-  print("PASS panel Bus surface: idempotent opens/closes, cached state, UI-free search, launch refusals, popup exclusivity and validation")
+  print("PASS panel Bus surface: cached filters, reveal/release retries, rc handling, malformed replies, click paths, popup exclusivity and validation")
 catch $err
   for each $log in ["noded.log", "fixture.log", "svc.log", "quoin-panel.log"]
     if exists($tmp .. "/" .. $log) then print(read_file($tmp .. "/" .. $log)) end
