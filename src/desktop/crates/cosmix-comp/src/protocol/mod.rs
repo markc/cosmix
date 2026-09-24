@@ -6436,10 +6436,24 @@ fn capture_physical_region(
         let rounded = numerator.checked_add(60)?.checked_div(120)?;
         u32::try_from(rounded).ok()
     };
+    let (displayed_width, displayed_height) = source.displayed_physical_extent;
     let physical_left = project(left)?;
     let physical_top = project(top)?;
-    let physical_right = project(right)?;
-    let physical_bottom = project(bottom)?;
+    // The output's own far edge IS the displayed physical edge. The logical
+    // size is a rounded or truncated quotient of it, so projecting it back can
+    // land short (nested 2762 at 2.5 is 1104 logical, 2760 projected) or past
+    // it (a region then refused below), and a whole-output copy must be the
+    // whole buffer.
+    let physical_right = if right == i64::from(logical_width) {
+        displayed_width
+    } else {
+        project(right)?
+    };
+    let physical_bottom = if bottom == i64::from(logical_height) {
+        displayed_height
+    } else {
+        project(bottom)?
+    };
     let (x, y, width, height) = (
         physical_left,
         physical_top,
@@ -6449,7 +6463,6 @@ fn capture_physical_region(
     if width == 0 || height == 0 {
         return None;
     }
-    let (displayed_width, displayed_height) = source.displayed_physical_extent;
     let right = x.checked_add(width)?;
     let bottom = y.checked_add(height)?;
     if right > displayed_width || bottom > displayed_height {

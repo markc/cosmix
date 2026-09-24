@@ -41858,6 +41858,12 @@ fn screencopy_nested_advertises_the_host_swapchain_at_a_non_integral_host_size()
         screencopy_buffer_words(&events, frame),
         vec![wl_shm::Format::Xrgb8888 as u32, 2762, 1555, 11048]
     );
+    // A region reaching the output's right edge reaches the swapchain's.
+    let (region, events) = wire.capture_region(1000, 0, 104, 10);
+    assert_eq!(
+        screencopy_buffer_words(&events, region),
+        vec![wl_shm::Format::Xrgb8888 as u32, 262, 25, 1048]
+    );
     // Reporting the same size again is not a change.
     assert!(
         !wire
