@@ -339,6 +339,11 @@ impl ShellModel {
     pub fn keyboard_focus_observed(&mut self, edge: Option<Edge>) {
         let previous = std::mem::replace(&mut self.keyboard_focus, edge);
         self.focus_reported = true;
+        // The keyboard in a shown panel is the compositor's focus holder:
+        // it carries the show from here, as the pointer would.
+        if let Some(edge) = edge {
+            self.panels[edge.index()].hand_show_to_compositor();
+        }
         if matches!(self.focus_directive, FocusDirective::Panel(target) if edge == Some(target)) {
             self.focus_grant_deadline = None;
         }

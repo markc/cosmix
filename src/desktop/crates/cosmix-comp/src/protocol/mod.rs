@@ -3501,6 +3501,9 @@ impl ProtocolServer {
                             state.pending_port_controls.push(PortControl::Panel(request));
                         }
                     }
+                    ChannelEvent::Msg(PortCommand::ServicesLive(live)) => {
+                        port_observation::panel_services_live(state, &live);
+                    }
                     ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
                         if state.pending_port_requests.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_requests.push(request);
@@ -13533,8 +13536,18 @@ impl WaylandState {
                 let SurfaceRole::Layer(role) = &record.role else {
                     return None;
                 };
+                // A shell whose panel hold lapsed (stopped or wedged) keeps no
+                // keyboard grab: its layer counts as on-demand.
+                #[cfg(feature = "bus")]
+                let lapsed = port_observation::layer_owner_lapsed(
+                    self,
+                    role.surface.wl_surface().client().map(|client| client.id()),
+                );
+                #[cfg(not(feature = "bus"))]
+                let lapsed = false;
                 (record.mapped
                     && record.layout.visible
+                    && !lapsed
                     && role.surface.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::Exclusive)
                     .then_some((object.clone(), role.surface.wl_surface().clone(), record))

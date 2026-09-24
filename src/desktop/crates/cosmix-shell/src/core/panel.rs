@@ -208,6 +208,12 @@ pub struct PanelSnapshot {
     /// Reports either latch: despite the name (kept because only tests read
     /// it), this is the local `hover_latched` OR the holder-plane `latched`.
     pub hover_latched: bool,
+    /// A reveal this panel holds on its own — the startup intro, an explicit
+    /// show the pointer has not yet taken over, a resize — which the host
+    /// reports to the compositor as a `local` hold, so the compositor does
+    /// not treat the panel as a stalled shell's (shell design §7). The corner
+    /// menu is reported as its own popup hold instead.
+    pub local_hold: bool,
 }
 
 /// Result of applying input or advancing real time.
@@ -248,6 +254,10 @@ pub struct PanelStateMachine {
     /// An explicit transient reveal (Reveal, Toggle): kept until a deliberate
     /// conceal or until the compositor's holders take it and release it.
     shown: bool,
+    /// Command-driven: the pointer has entered the panel or its hotspot during
+    /// the current explicit show, so the compositor's pointer holder now
+    /// carries it and the show no longer needs a `local` hold of its own.
+    show_touched: bool,
     /// A deliberate conceal the compositor's holders have not yet released:
     /// its reveals are ignored until it reports the holders released.
     ///
@@ -290,6 +300,7 @@ impl PanelStateMachine {
             holder_plane: false,
             comp_held: false,
             shown: false,
+            show_touched: false,
             latched: false,
             verdict_due: None,
             latch_local: false,
@@ -383,6 +394,7 @@ impl PanelStateMachine {
                 if self.mode == PanelMode::Hidden {
                     self.transient_revealed = true;
                     self.shown = true;
+                    self.show_touched = false;
                     self.latched = false;
                     self.clear_deadline();
                 }
@@ -392,6 +404,7 @@ impl PanelStateMachine {
                 if self.mode == PanelMode::Hidden && !self.transient_revealed {
                     self.transient_revealed = true;
                     self.shown = true;
+                    self.show_touched = false;
                     self.latched = false;
                     self.clear_deadline();
                     self.motion.reveal();
@@ -411,8 +424,14 @@ impl PanelStateMachine {
             // Command-driven: membership is the compositor's to judge; the
             // local flags stay current for the undock hold check and for a
             // fall back to local behaviour.
-            PanelInput::CornerEntered if plane => self.corner_inside = true,
-            PanelInput::PointerEntered if plane => self.pointer_inside = true,
+            PanelInput::CornerEntered if plane => {
+                self.corner_inside = true;
+                self.hand_show_to_compositor();
+            }
+            PanelInput::PointerEntered if plane => {
+                self.pointer_inside = true;
+                self.hand_show_to_compositor();
+            }
             PanelInput::CornerLeft | PanelInput::PointerLeft if plane => {
                 if input == PanelInput::CornerLeft {
                     self.corner_inside = false;
@@ -567,6 +586,13 @@ impl PanelStateMachine {
     }
 
     /// A startup hold never claims real corner or pointer membership.
+    /// A compositor holder (the pointer in the panel, the keyboard landing
+    /// there) now carries the current explicit show, so it is no longer
+    /// reported as a `local` hold; its release after that ends the show.
+    pub fn hand_show_to_compositor(&mut self) {
+        self.show_touched |= self.shown;
+    }
+
     pub fn start_intro(&mut self, duration: Duration) {
         if self.mode == PanelMode::Hidden {
             self.intro_until = Some(self.last_update + duration);
@@ -693,6 +719,11 @@ impl PanelStateMachine {
             hide_at: self.hide_at,
             conceal_reason: self.conceal_reason,
             hover_latched: self.hover_latched || self.latched,
+            local_hold: self.mode == PanelMode::Hidden
+                && self.transient_revealed
+                && (self.resize_start.is_some()
+                    || self.intro_until.is_some()
+                    || (self.shown && !self.show_touched)),
         }
     }
 
@@ -1286,6 +1317,46 @@ mod intro_tests {
             .unwrap();
         assert_eq!(update.effect, Some(holders_conceal()));
         assert_eq!(update.snapshot.target_fraction, 0.0, "at once: comp served the delay");
+    }
+
+    /// The reveals the panel holds on its own are reported as `local_hold`
+    /// (the host tells the compositor): an explicit show until the pointer
+    /// takes it over, a resize while it lasts, the startup intro until it
+    /// expires. Holder reveals and the menu are not local holds.
+    #[test]
+    fn local_hold_reports_show_resize_and_intro_until_they_end() {
+        let at = Duration::ZERO;
+        let mut panel = commanded();
+        assert!(!panel.snapshot().local_hold);
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(!panel.snapshot().local_hold, "the compositor's own holders");
+        panel.apply(at, PanelInput::MenuHold(true)).unwrap();
+        assert!(!panel.snapshot().local_hold, "the menu is a popup hold");
+        // An explicit show, until the pointer arrives and comp holds it.
+        let mut panel = commanded();
+        panel.apply(at, PanelInput::Reveal).unwrap();
+        assert!(panel.snapshot().local_hold);
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        assert!(panel.snapshot().local_hold, "a verdict alone does not take it over");
+        panel.apply(at, PanelInput::PointerEntered).unwrap();
+        assert!(!panel.snapshot().local_hold, "the pointer holder carries it now");
+        assert!(panel.snapshot().transient_revealed);
+        panel.apply(at, PanelInput::PointerLeft).unwrap();
+        let update = panel.apply(at, PanelInput::HolderConceal).unwrap();
+        assert_eq!(update.effect, Some(holders_conceal()), "the pointer came and went");
+        // A resize.
+        let mut panel = commanded();
+        panel.apply(at, PanelInput::HolderReveal).unwrap();
+        panel.apply(at, PanelInput::ResizeStarted).unwrap();
+        assert!(panel.snapshot().local_hold);
+        panel.apply(at, PanelInput::ResizeCompleted).unwrap();
+        assert!(!panel.snapshot().local_hold);
+        // The startup intro.
+        let mut panel = commanded();
+        panel.start_intro(Duration::from_secs(2));
+        assert!(panel.snapshot().local_hold);
+        panel.tick(Duration::from_secs(2)).unwrap();
+        assert!(!panel.snapshot().local_hold);
     }
 
     #[test]

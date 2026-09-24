@@ -67,8 +67,14 @@ const CLIENT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
 const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 
+/// noded's own props topic; its `services.registered` diffs carry the full
+/// registration set, which is how comp sees a holder service leave the Bus.
+const REGISTRY_TOPIC: &str = "noded.props.changed";
+
 pub(crate) enum PortCommand {
     Panel(PortPanelRequest),
+    /// The registered services, from a registry diff (full set, not a delta).
+    ServicesLive(std::collections::BTreeSet<String>),
     Snapshot(PortRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
@@ -767,6 +773,14 @@ impl PortIngress {
         Ok(LongAdmission { receive, timeout })
     }
 
+    /// Best effort: a full queue drops the set, and the next registry diff or
+    /// the holds' leases repair it.
+    pub(crate) fn services_live(&self, live: std::collections::BTreeSet<String>) {
+        if self.sender.try_send(PortCommand::ServicesLive(live)).is_err() {
+            tracing::debug!("registry update dropped: compositor port queue full");
+        }
+    }
+
     pub(crate) fn set_watch_state(&self, active: bool) {
         let order = self.next_control_order();
         if let Err(TrySendError::Full(_)) = self
@@ -1257,6 +1271,8 @@ trait WorkerClient: Send + Sync + 'static {
     ) -> WorkerFuture<'a, Result<(), String>>;
     fn deregister(&self) -> WorkerFuture<'_, Result<(), String>>;
     fn close(&self) -> WorkerFuture<'_, ()>;
+    /// Subscribe once; the supervised client replays it on every reconnect.
+    fn subscribe_topic<'a>(&'a self, topic: &'a str) -> WorkerFuture<'a, Result<(), String>>;
 }
 
 impl WorkerClient for SupervisedClient {
@@ -1317,6 +1333,14 @@ impl WorkerClient for SupervisedClient {
 
     fn close(&self) -> WorkerFuture<'_, ()> {
         Box::pin(SupervisedClient::close(self))
+    }
+
+    fn subscribe_topic<'a>(&'a self, topic: &'a str) -> WorkerFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            SupervisedClient::subscribe_topic(self, topic)
+                .await
+                .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -1396,6 +1420,16 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&publish_timeouts),
         shutdown.clone(),
     ));
+    // Holder cleanup on Bus departure. Best effort: the holds' leases bound
+    // what a missed departure can leave behind.
+    let registry_task = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move {
+            if let Err(error) = client.subscribe_topic(REGISTRY_TOPIC).await {
+                tracing::warn!(%error, "registry subscription failed; panel holds rely on their leases");
+            }
+        }
+    });
 
     loop {
         tokio::select! {
@@ -1444,6 +1478,7 @@ async fn worker_loop<F, Fut, C>(
         }
     }
 
+    registry_task.abort();
     responders.abort_all();
     while responders.join_next().await.is_some() {}
     drop(reply_sender);
@@ -1553,6 +1588,22 @@ fn dispatch_incoming(
         })
     {
         ingress.set_watch_state(command.command == "topic.active");
+        return;
+    }
+    // The broker's registry (only noded may publish its props topic): a
+    // holder service that left takes its panel holds with it.
+    if command.topic() == Some(REGISTRY_TOPIC) {
+        if let Ok(body) = serde_json::from_str::<Value>(&command.body)
+            && body["path"] == "services.registered"
+            && let Some(live) = body["new"].as_array().and_then(|names| {
+                names
+                    .iter()
+                    .map(|name| name.as_str().map(str::to_owned))
+                    .collect::<Option<std::collections::BTreeSet<String>>>()
+            })
+        {
+            ingress.services_live(live);
+        }
         return;
     }
     if command.command == "comp.ping" {
@@ -1841,7 +1892,11 @@ fn dispatch_incoming(
             port_observation::PanelRequest::parse(&command.command, &command.args)
         };
         let op = match parsed {
-            Ok(op) => op,
+            Ok(mut op) => {
+                // Only the broker's stamp names the holder service.
+                op.sender.clone_from(&command.from);
+                op
+            }
             Err(reply) => {
                 queue_reply(reply_sender, reply_timeouts,
                     PendingReply::new(command, reply.into_wire()));
@@ -3745,6 +3800,10 @@ mod tests {
             self.closed.fetch_add(1, Ordering::AcqRel);
             Box::pin(future::ready(()))
         }
+
+        fn subscribe_topic<'a>(&'a self, _topic: &'a str) -> WorkerFuture<'a, Result<(), String>> {
+            Box::pin(future::ready(Ok(())))
+        }
     }
 
     fn test_ingress() -> (PortIngress, channel::Channel<PortCommand>, Arc<AtomicUsize>) {
@@ -4692,6 +4751,50 @@ mod tests {
         assert_eq!(long_permits.available_permits(), 1);
         drop(other_operations);
         assert_eq!(long_permits.available_permits(), LONG_VERB_PERMITS);
+    }
+
+    /// noded's registry diffs reach the compositor as the full live set,
+    /// unanswered (a topic delivery is not a verb); other props diffs, and a
+    /// malformed set, change nothing.
+    #[tokio::test]
+    async fn registry_diffs_reach_the_compositor_as_the_live_set() {
+        let (ingress, source, _depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        for (index, body) in [
+            json!({"path":"services.registered","old":["quoin"],"new":["noded","comp-nested"]}),
+            json!({"path":"mesh.peers","old":[],"new":["x"]}),
+            json!({"path":"services.registered","old":[],"new":["noded", 7]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut delivery = command("props.changed", index);
+            delivery.from = "noded".into();
+            delivery.id = None;
+            delivery.body = body.to_string();
+            delivery.args = body;
+            delivery.headers.insert("topic".into(), REGISTRY_TOPIC.into());
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                delivery,
+            );
+        }
+        let Ok(PortCommand::ServicesLive(live)) = source.try_recv() else {
+            panic!("the registry diff reaches the compositor");
+        };
+        assert_eq!(live, std::collections::BTreeSet::from(["noded".to_owned(), "comp-nested".to_owned()]));
+        assert!(source.try_recv().is_err(), "nothing else is admitted");
+        assert!(replies.try_recv().is_err(), "a topic delivery is never answered");
     }
 
     #[tokio::test]

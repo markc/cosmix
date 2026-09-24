@@ -609,22 +609,28 @@ Nothing polls. Pinned and
 docked panels have no holders. The embedded host has no Wayland panel layers
 and does not install this standalone transport adapter.
 
-A slow or crashed Quoin cannot keep a panel shown, take input, or leave holds
-behind (shell design §7, implemented). Comp identifies Quoin by the Wayland
-client of its layers, never by a namespace token, and refuses another live
-client's layer under a copied token (`panel_owner_mismatch`). When a conceal
-ends a reveal comp commanded and Quoin has not applied it within 1 s — it is
-stopped or wedged — comp hides that edge's panel and popup layers itself and
-excludes them from input; nothing of any other client is touched. A first or
-re-stated conceal is never enforced, because Quoin's own local holds (the
-startup intro, an explicit show) keep a panel comp did not reveal on screen.
-When Quoin's Wayland connection dies, comp drops every hold it acquired and
-conceals by the normal rules; a restarted Quoin is a new client with fresh
-tokens and inherits nothing. Any mode report — the replay after a restart, a
-Bus reconnect or a gap, or the next report of a Quoin resuming from a stall —
-lifts comp's enforcement for that edge, and the resumed Quoin applies the
-verdict the report draws. Comp's read-only `input.corners.enforced.<edge>` and
-`input.corners.held.<edge>` counts show the state.
+A slow, stopped or crashed Quoin cannot keep a panel shown, hold the keyboard
+or leave holds behind; stale docked reservations are the part of shell design
+§7 not yet covered. Comp identifies Quoin by the Wayland client of its layers,
+never by a namespace token (Quoin adds 128 random bits to each token so it
+cannot be guessed), and an edge is adopted only for a token Quoin itself
+reported; another live client's layer under a copied token is refused
+(`panel_owner_mismatch`). Every hold Quoin acquires is leased by comp for
+10 s and renewed by re-sending it every 5 s — a one-shot host deadline that
+exists only while something is held — so a stopped Quoin's holds lapse, its
+Exclusive menu loses the keyboard at once, and the edge conceals. Quoin's own
+reveals — the startup intro, an explicit show until the pointer or the
+keyboard takes it over, a resize, a named activation's reveal — are reported
+as `local` holds, so comp knows a shown panel is meant to be shown. A panel
+still showing 1 s after comp's conceal (Quoin stopped or wedged) is hidden and
+excluded from input by comp itself, and nothing of any other client is
+touched. When Quoin's Wayland connection dies comp drops everything it held;
+when its Bus connection goes (comp watches noded's registry), or a report
+arrives from a new Bus generation (mode reports carry `generation`), its holds
+end there. A Quoin resuming from a stall applies the conceal it was sent, and
+that unmap ends comp's exclusion. Comp's read-only
+`input.corners.enforced.<edge>` and `input.corners.held.<edge>` counts show
+the state.
 
 ### Corner input
 
