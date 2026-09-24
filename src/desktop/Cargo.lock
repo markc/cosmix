@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cosmix-design",
  "cosmix-iced-widgets",
@@ -3479,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-term-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cosmix-lib-buildinfo",
  "cosmix-lib-bus",
