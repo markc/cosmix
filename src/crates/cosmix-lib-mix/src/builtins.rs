@@ -6803,8 +6803,11 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
+                if crate::interrupt::is_interrupted() {
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= n {
+                if i >= n || crate::interrupt::is_interrupted() {
                     break;
                 }
                 let p = &parsed[i];
@@ -6830,7 +6833,20 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
         let outcome = slot
             .into_inner()
             .expect("run_parallel slot poisoned")
-            .expect("every job index is assigned exactly once");
+            // Unstarted jobs, including one claimed just before Ctrl-C,
+            // retain their input position and report interruption as data.
+            .unwrap_or_else(|| Ok(ProcOutcome {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: -2,
+                timed_out: false,
+                interrupted: true,
+                signal: None,
+                natural_code: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: 0,
+            }));
         let val = match outcome {
             Ok(o) => run_argv_result_map(&o),
             Err((code, message)) if is_process_data_error(&code) => {

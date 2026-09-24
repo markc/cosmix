@@ -988,6 +988,10 @@ a bounded worker pool and returns a <strong>list of <code>process_result</code> 
 order</strong> — each map is exactly what the same <code>run_argv</code> call would return, so
 existing result-handling code ports unchanged. One job's ordinary failure
 (nonzero exit, timeout, a spawn error) is <strong>data in its map, never a raise</strong>.</p>
+<p>Ctrl-C is checked before taking each job and again before starting it. Jobs
+that have not started return <code>ok: false, interrupted: true</code> in their original
+input positions without spawning a process; running jobs use the normal
+process interruption and cleanup path.</p>
 <pre><code class="language-mix">-- Fan a health check across a fleet; collect every result.
 $hosts = ["alpha", "beta", "gamma"]
 $jobs = map($hosts, fn($h) = ["ssh", $h, "uptime"])

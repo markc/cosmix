@@ -639,6 +639,11 @@ order** — each map is exactly what the same `run_argv` call would return, so
 existing result-handling code ports unchanged. One job's ordinary failure
 (nonzero exit, timeout, a spawn error) is **data in its map, never a raise**.
 
+Ctrl-C is checked before taking each job and again before starting it. Jobs
+that have not started return `ok: false, interrupted: true` in their original
+input positions without spawning a process; running jobs use the normal
+process interruption and cleanup path.
+
 ```mix
 -- Fan a health check across a fleet; collect every result.
 $hosts = ["alpha", "beta", "gamma"]
