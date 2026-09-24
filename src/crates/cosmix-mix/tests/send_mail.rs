@@ -233,7 +233,7 @@ fn host_without_the_sendmail_option_runs_usr_sbin_sendmail_remotely() {
 fn a_long_line_body_arrives_quoted_printable_and_decodes_exactly() {
     let bed = Bed::new();
     let (out, err, ok) = bed.run(
-        "$line = \"\"\nfor each $i in range(0, 300)\n  $line = $line .. \"a=b; \"\nend\n$r = send_mail({to: \"ops@example.com\", from: \"r@example.com\", subject: \"csv\", body: \"head\\n\" .. $line .. \"\\ntail\"})\nprint($r.ok .. \" \" .. length($line))\n",
+        "$line = \"\"\nfor each $i in range(1, 300)\n  $line = $line .. \"a=b; \"\nend\n$r = send_mail({to: \"ops@example.com\", from: \"r@example.com\", subject: \"csv\", body: \"head\\n\" .. $line .. \"\\ntail\"})\nprint($r.ok .. \" \" .. length($line))\n",
         false,
     );
     assert!(ok, "stdout={out} stderr={err}");

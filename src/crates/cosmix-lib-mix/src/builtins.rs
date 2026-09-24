@@ -23634,7 +23634,7 @@ mod ssh_helpers_tests {
 
     #[test]
     fn send_mail_folds_long_headers_within_the_line_limits() {
-        let subject: String = (0..240).map(|i| format!("w{i:03}")).collect::<Vec<_>>().join(" ");
+        let subject: String = (0..250).map(|i| format!("w{i:03}")).collect::<Vec<_>>().join(" ");
         assert!(subject.len() > 1200);
         let to: Vec<Value> = (0..40)
             .map(|i| Value::String(format!("Recipient {i} <r{i}@example.com>")))
