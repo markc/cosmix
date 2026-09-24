@@ -801,6 +801,11 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
     the child's whole process group, waits up to 2 s for the group to empty,
     then SIGKILLs whatever is left. The child gets its chance to clean up, and its own
     children go too.
+  - **`--serve` RELOAD.** The old generation's owned children are ended the
+    same way *before* the new script's init runs. An init that starts its
+    helper again therefore never races a leftover one for the same port. If
+    the reload then reverts, because the new init failed, the old script
+    resumes without those children.
   - **Crash.** If mix is SIGKILLed, panics or is OOM-killed, the kernel
     SIGKILLs the child (`PR_SET_PDEATHSIG`). That reaches the child only, not
     its descendants, and gives it no chance to clean up.

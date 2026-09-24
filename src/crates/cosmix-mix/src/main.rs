@@ -1474,6 +1474,19 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             // keeps working after any number of reloads.
             new_eval.set_interrupt_flag(eval.interrupt_flag());
 
+            // End the OLD generation's spawn(argv, {die_with_parent: true})
+            // children BEFORE the new init runs (review MINOR-6): an init that
+            // spawns its helper again would otherwise get a second one beside
+            // the old (the goose case — two servers, one port). The registry
+            // is process-wide, so sweeping after the commit would also end
+            // the helper the new init just started. Cost, documented: a
+            // reload that then REVERTS resumes the old script without them.
+            let swept = owned_spawns_sweep_count();
+            if swept > 0 {
+                tracing::info!(service = %service_name, swept,
+                    "serve: RELOAD ended the old generation's owned children");
+            }
+
             // Execute the new init body RACED against shutdown: a new script
             // whose top-level sleeps/hangs must still yield to SIGTERM. A
             // top-level `sleep()` dispatches events, so the new (not-yet-
@@ -1800,8 +1813,18 @@ fn main() {
 /// End `spawn(argv, {die_with_parent: true})` children with this process.
 /// Idempotent — the registry drains on the first call.
 pub(crate) fn owned_spawns_sweep() {
-    #[cfg(target_os = "linux")]
-    cosmix_mix::builtins::owned_spawns::sweep();
+    owned_spawns_sweep_count();
+}
+
+/// [`owned_spawns_sweep`], reporting how many groups it ended.
+#[cfg(target_os = "linux")]
+pub(crate) fn owned_spawns_sweep_count() -> usize {
+    cosmix_mix::builtins::owned_spawns::sweep()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn owned_spawns_sweep_count() -> usize {
+    0
 }
 
 /// The evaluation thread's body: run, then end `spawn(argv, {die_with_parent:
