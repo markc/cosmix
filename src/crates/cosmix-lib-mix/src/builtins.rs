@@ -4355,8 +4355,8 @@ fn arm_die_with_parent(command: &mut std::process::Command) {
 ///   is SIGKILL, so the child gets no chance to clean up.
 /// * [`sweep`] is the graceful path, run by the interpreter on its way out
 ///   (end of script, `mix --serve` QUIT/SIGTERM drain, REPL restart): SIGTERM
-///   to every owned child's whole process group, up to [`SWEEP_GRACE`] for the
-///   leaders to exit, then SIGKILL to the groups — so descendants go too.
+///   to every owned child's whole process group, up to [`SWEEP_GRACE`] for
+///   every group to empty, then SIGKILL to the groups — so descendants go too.
 ///
 /// PDEATHSIG is keyed to the THREAD that called spawn. The `mix` binary
 /// evaluates on one long-lived thread and sweeps on that thread before it
@@ -4414,9 +4414,11 @@ pub mod owned_spawns {
                 libc::kill(-pid, libc::SIGTERM);
             }
         }
+        // Wait for every GROUP to empty (not just its leader), bounded by the
+        // grace: a helper's own TERM-honouring children finish cleanly.
         let deadline = Instant::now() + SWEEP_GRACE;
         while Instant::now() < deadline
-            && live.iter().any(|pid| leader_state(*pid) == Some(false))
+            && live.iter().any(|pid| super::group_has_live_members(*pid))
         {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -9748,6 +9750,77 @@ fn leader_exited_unreaped(pid: i32) -> std::io::Result<bool> {
     }
 }
 
+/// Does process group `pgid` still have a member that is not a zombie?
+///
+/// `kill(-pgid, 0)` cannot answer this: an unreaped zombie leader — which
+/// Mix deliberately keeps so the pgid stays reserved — still counts as a
+/// member. So Linux scans `/proc/*/stat` for a live process whose pgrp is
+/// `pgid`. Any failure to read /proc answers `true` (keep waiting; the
+/// grace deadline still bounds it). Elsewhere there is no /proc and the
+/// conservative `kill(-pgid, 0)` is used, which waits out the full grace.
+#[cfg(target_os = "linux")]
+pub(crate) fn group_has_live_members(pgid: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) else {
+            continue; // exited between readdir and read
+        };
+        // Fields after the parenthesised comm: state ppid pgrp ...
+        let Some((_, rest)) = stat.rsplit_once(')') else { continue };
+        let mut fields = rest.split_whitespace();
+        let state = fields.next().unwrap_or("");
+        let _ppid = fields.next();
+        let pgrp = fields.next().and_then(|p| p.parse::<i32>().ok());
+        if pgrp == Some(pgid) && state != "Z" && state != "X" {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn group_has_live_members(pgid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// End process group `pgid`: with a zero `grace`, SIGKILL at once; otherwise
+/// SIGTERM, then wait until the grace deadline OR until no live member is
+/// left, then SIGKILL whatever remains. Waiting on the whole GROUP, not just
+/// its leader, is the point: a TERM-honouring descendant (the `gzip` in
+/// `sh -c "pg_dump | gzip > f"`) gets the full grace to finish, and a
+/// TERM-ignoring one is killed at the deadline.
+///
+/// The caller must still hold the group's identity: on Linux every caller
+/// signals while the leader is running or an unreaped zombie, so `pgid`
+/// cannot have been recycled.
+#[cfg(unix)]
+pub(crate) fn terminate_process_group(pgid: i32, grace: std::time::Duration) {
+    use std::time::{Duration, Instant};
+    if !grace.is_zero() {
+        // SAFETY: kill(2) on a group whose id the caller holds.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && group_has_live_members(pgid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // SAFETY: as above. A group that already emptied answers ESRCH, or — with
+    // a zombie leader still pinning it — reaches no live process.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
 fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -10041,13 +10114,30 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     let mut natural_exit: Option<std::process::ExitStatus> = None;
     let mut try_wait_failed: Option<std::io::Error> = None;
 
+    // `leader_done`: the direct child has exited. On Linux it is observed
+    // WITHOUT being reaped (waitid WNOWAIT): the zombie keeps its pid, so the
+    // process-group id stays ours through every group signal below — the
+    // deadline, the grace wait and the capture-drain deadline — and is only
+    // released by the final `child.wait()` once all signalling is done.
+    // Elsewhere the historical reaping try_wait is kept.
+    let mut leader_done = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        #[cfg(target_os = "linux")]
+        let polled = leader_exited_unreaped(child_pid);
+        #[cfg(not(target_os = "linux"))]
+        let polled = child.try_wait().map(|status| match status {
+            Some(status) => {
                 natural_exit = Some(status);
+                true
+            }
+            None => false,
+        });
+        match polled {
+            Ok(true) => {
+                leader_done = true;
                 break;
             }
-            Ok(None) => {}
+            Ok(false) => {}
             // EINTR is expected when SIGINT fires during the syscall —
             // it does NOT mean the child is dead, just that the wait
             // was interrupted. Retry on the next poll, where the
@@ -10082,106 +10172,27 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         std::thread::sleep(poll_interval);
     }
 
-    // Kill if we exited the loop without a natural exit. The escalation
-    // differs by cause (see function docstring): timeout = SIGKILL to
-    // the process group immediately; interrupt = SIGTERM-grace-SIGKILL
-    // to the process group; try_wait_failed = SIGKILL to the process
-    // group (defensive, we can't trust the child's state).
-    if natural_exit.is_none() {
+    // Kill if we left the loop before the leader exited. The escalation
+    // differs by cause (see function docstring): timeout = SIGKILL to the
+    // process group at once, or SIGTERM → `grace` → SIGKILL when the caller
+    // asked for grace; interrupt = SIGTERM → 2 s → SIGKILL; try_wait failure
+    // = SIGKILL (defensive, the child's state is unknown). Every TERM path
+    // waits until the grace deadline OR until the group has no live member
+    // left — not merely until the leader exits — so a descendant that
+    // honours SIGTERM (`pg_dump | gzip` under an `sh -c` leader) gets the
+    // whole grace to finish, and one that ignores it is SIGKILLed at the
+    // deadline.
+    if !leader_done {
         #[cfg(unix)]
         {
-            // Negative pid → kill the whole process group. We placed the
-            // child in its own group via `setpgid(0, 0)` at spawn, so
-            // `child_pid` is also the PGID. This is the load-bearing
-            // change vs. signalling only the direct child: it reaches
-            // descendants (ssh helpers / orphaned children) that would
-            // otherwise keep our stdout/stderr pipe FDs open and block
-            // the drain threads past the timeout.
-            //
-            // SAFETY: `libc::kill` is async-signal-safe; signalling a
-            // stale pgid is not catastrophic (kernel returns ESRCH
-            // which we ignore).
-            let pgid = -child_pid;
-            if timed_out && grace_ms == 0 {
-                // Hard local deadline — no grace, no cooperation (the
-                // default; `grace` opts into the escalation below).
-                unsafe {
-                    libc::kill(pgid, libc::SIGKILL);
-                }
-            } else if try_wait_failed.is_some() {
-                // Defensive: state is unknown, escalate immediately.
-                unsafe {
-                    libc::kill(pgid, libc::SIGKILL);
-                }
+            let grace = if try_wait_failed.is_some() {
+                Duration::ZERO
+            } else if timed_out {
+                Duration::from_millis(grace_ms)
             } else {
-                // Interrupt path, or a deadline with `grace` — cooperative
-                // SIGTERM, then SIGKILL if the group leader hasn't exited
-                // within the grace window. The group SIGKILL below the loop
-                // runs either way, so a descendant that outlives a leader
-                // which honoured SIGTERM is still reached.
-                unsafe {
-                    libc::kill(pgid, libc::SIGTERM);
-                }
-                let grace = if timed_out {
-                    Duration::from_millis(grace_ms)
-                } else {
-                    Duration::from_secs(2)
-                };
-                let term_deadline = Instant::now() + grace;
-                let mut term_grace_failed = false;
-                loop {
-                    // Linux: observe the leader's exit WITHOUT reaping it. A
-                    // zombie leader still pins its pid, so the pgid cannot be
-                    // recycled, and the group SIGKILL below reaches exactly
-                    // the descendants that ignored SIGTERM and would otherwise
-                    // be left running as orphans once the leader honoured it.
-                    // The blocking wait after this block then reaps the
-                    // leader. Elsewhere: the historical reaping try_wait,
-                    // with no descendant sweep (a reaped pgid may recycle).
-                    #[cfg(target_os = "linux")]
-                    let polled = leader_exited_unreaped(child_pid).map(|exited| {
-                        if exited {
-                            unsafe {
-                                libc::kill(pgid, libc::SIGKILL);
-                            }
-                            Some(())
-                        } else {
-                            None
-                        }
-                    });
-                    #[cfg(not(target_os = "linux"))]
-                    let polled = child.try_wait().map(|status| {
-                        status.map(|status| {
-                            natural_exit = Some(status);
-                        })
-                    });
-                    match polled {
-                        Ok(Some(())) => break,
-                        Ok(None) => {}
-                        // EINTR: another SIGINT arrived during the wait —
-                        // retry the poll, don't give up on the grace period.
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        // Real failure: we can no longer trust try_wait.
-                        // Stop grace polling and fall through to SIGKILL.
-                        Err(_) => {
-                            term_grace_failed = true;
-                            break;
-                        }
-                    }
-                    if Instant::now() >= term_deadline || term_grace_failed {
-                        unsafe {
-                            libc::kill(pgid, libc::SIGKILL);
-                        }
-                        break;
-                    }
-                    std::thread::sleep(poll_interval);
-                }
-                if natural_exit.is_none() && term_grace_failed {
-                    unsafe {
-                        libc::kill(pgid, libc::SIGKILL);
-                    }
-                }
-            }
+                Duration::from_secs(2)
+            };
+            terminate_process_group(child_pid, grace);
         }
         #[cfg(not(unix))]
         {
@@ -10189,19 +10200,14 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
             // child only. Descendant cleanup is the OS's problem.
             let _ = child.kill();
         }
-        if natural_exit.is_none() {
-            // Final blocking wait so the OS releases the direct child's
-            // PID slot. The kill above guarantees we won't block forever
-            // on the leader; group-mates exit independently.
-            natural_exit = child.wait().ok();
-        }
     }
 
-    // The child is reaped, but capture completion can still block
-    // past the deadline when a DESCENDANT (same process group) inherited
-    // our pipe write ends and outlives the leader (`sh -c "sleep 9 &"`).
-    // Keep enforcing the deadline while the drains finish; on expiry,
-    // SIGKILL the group (closing those write ends) and report timed_out.
+    // The leader has exited (or been killed), but capture completion can
+    // still block past the deadline when a DESCENDANT (same process group)
+    // inherited our pipe write ends and outlives the leader (`sh -c "sleep 9
+    // &"`). Keep enforcing the deadline while the drains finish; on expiry,
+    // end the group with the same TERM → grace → KILL escalation and report
+    // timed_out.
     if !timed_out
         && !interrupted
         && let Some(t) = timeout
@@ -10217,14 +10223,20 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         {
             if start.elapsed() >= t {
                 #[cfg(unix)]
-                unsafe {
-                    libc::kill(-child_pid, libc::SIGKILL);
-                }
+                terminate_process_group(child_pid, Duration::from_millis(grace_ms));
                 timed_out = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    if natural_exit.is_none() {
+        // Final blocking wait so the OS releases the direct child's pid slot
+        // — only now, after every group signal above has been sent while the
+        // (possibly zombie) leader still reserved the pgid. The kills above
+        // guarantee this cannot block on a live leader.
+        natural_exit = child.wait().ok();
     }
 
     if timed_out || interrupted {

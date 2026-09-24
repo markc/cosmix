@@ -75,12 +75,17 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
   exited. Note `run`/`run_rc` default to no deadline.
 - `grace`: seconds, default **0**, fractional ok — what happens AT the
   deadline. `0` SIGKILLs the child's process group at once (the historic hard
-  kill). A positive grace sends SIGTERM to the group, waits up to `grace` for
-  the child to exit, then SIGKILLs the group. The group is SIGKILLed even when
-  the child honours SIGTERM, so a descendant that ignores it is not left
-  running. The call can therefore take up to `timeout + grace`. The result still
-  reports `timed_out: true`, and `signal` says how it ended: `15` if the child
-  obeyed SIGTERM, `9` if it had to be killed. `grace` with `timeout: 0` raises
+  kill). A positive grace sends SIGTERM to the group, then waits until the
+  **whole group** is gone or `grace` runs out, then SIGKILLs whatever is
+  left. The grace covers the group, not only the child. In
+  `sh -c "pg_dump app | gzip > f"`, `sh` may die at once, but `pg_dump` and
+  `gzip` still get the full grace to finish. A descendant that ignores SIGTERM
+  is killed at the grace deadline, never left running. The same escalation
+  applies when the child has already exited but a descendant still holds a
+  captured stream open at the deadline. The call can therefore take up to
+  `timeout + grace`. The result still reports `timed_out: true`, and `signal`
+  says how the child ended: `15` if it obeyed SIGTERM, `9` if it had to be
+  killed. `grace` with `timeout: 0` raises
   `OPTION_INVALID`, because without a deadline it would do nothing.
 
   ```mix
@@ -491,10 +496,11 @@ spawned in its **own process group**, so the kill reaches every descendant — a
 `ssh` helper or forked worker can't keep the pipes open past the deadline. A
 timeout SIGKILLs the group immediately (`run_argv` can opt into SIGTERM first
 with `grace`); a Ctrl-C sends SIGTERM, waits a 2-second grace, then SIGKILLs.
-On Linux the group is SIGKILLed even when the child obeys the SIGTERM, before
-the child is reaped. The zombie still holds the group id, so the kill reaches
-exactly the descendants that ignored the SIGTERM and would otherwise be left
-running as orphans. An interrupt that lands on the same poll as the deadline
+Every SIGTERM path waits for the whole group to empty, bounded by its grace,
+then SIGKILLs the group. A descendant that honours SIGTERM can finish its
+cleanup; one that ignores it is killed at the deadline, not orphaned. On Linux
+the child is reaped only after that, so its zombie keeps the group id
+reserved and every signal reaches the right group. An interrupt that lands on the same poll as the deadline
 wins the tie — it's reported as the cause.
 
 The opts map is validated **loudly** — a mistake can't silently leave a call
@@ -787,8 +793,8 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   The child leads its own process group. Two mechanisms end it:
   - **Graceful exit.** This covers the script ending, `exit()`, a `--serve`
     citizen's QUIT or SIGTERM drain, and a REPL restart. Mix sends SIGTERM to
-    the child's whole process group, waits up to 2 s for the child to exit,
-    then SIGKILLs the group. The child gets its chance to clean up, and its own
+    the child's whole process group, waits up to 2 s for the group to empty,
+    then SIGKILLs whatever is left. The child gets its chance to clean up, and its own
     children go too.
   - **Crash.** If mix is SIGKILLed, panics or is OOM-killed, the kernel
     SIGKILLs the child (`PR_SET_PDEATHSIG`). That reaches the child only, not

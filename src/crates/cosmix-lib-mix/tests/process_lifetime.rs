@@ -90,27 +90,71 @@ async fn deadline_grace_escalates_to_sigkill_and_reaps_the_descendant() {
     assert!(gone, "descendant {descendant} outlived the escalated deadline");
 }
 
-/// A leader that honours SIGTERM ends inside the grace window: the result
-/// reports signal 15 (the reason) and the call does NOT wait out the grace.
-/// Its descendant ignores SIGTERM — and is still reaped, because the group is
-/// SIGKILLed once the leader has gone. Before this, that descendant was left
-/// running as an orphan.
+/// The grace belongs to the whole GROUP, not the leader: the leader honours
+/// SIGTERM at once (signal 15 is the reported reason), but its descendant
+/// ignores SIGTERM, so the call waits out the grace and the descendant is
+/// SIGKILLed AT the grace deadline — never left running as an orphan.
 #[tokio::test]
-async fn cooperative_leader_ends_early_and_its_term_ignoring_descendant_is_swept() {
+async fn term_ignoring_descendant_is_killed_at_the_grace_deadline() {
     let output = run_ok(
-        "$r = run_argv([\"sh\", \"-c\", \"(trap '' TERM; exec sleep 60) & echo $!; wait\"], {timeout: 0.3, grace: 10})\n\
-         print($r.timed_out .. \" \" .. $r.signal .. \" \" .. ($r.duration_ms < 5000))\n\
+        "$r = run_argv([\"sh\", \"-c\", \"(trap '' TERM; exec sleep 60) & echo $!; wait\"], {timeout: 0.3, grace: 1})\n\
+         print($r.timed_out .. \" \" .. $r.signal .. \" \" .. ($r.duration_ms >= 1250) .. \" \" .. ($r.duration_ms < 5000))\n\
          print(trim($r.stdout))\n",
     )
     .await;
     let lines = parse_lines(&output);
-    assert_eq!(lines[0], "true 15 true", "full output: {output:?}");
+    assert_eq!(lines[0], "true 15 true true", "full output: {output:?}");
     let descendant: u32 = lines[1].parse().expect("descendant pid on stdout");
     let gone = wait_gone(descendant, Duration::from_secs(5));
     if !gone {
         kill_leftover(descendant);
     }
     assert!(gone, "TERM-ignoring descendant {descendant} was orphaned");
+}
+
+fn marker_path(label: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("mix-grace-{label}-{}-{nonce}", std::process::id()))
+}
+
+/// The review's `pg_dump | gzip` case: the leader (`sh`) dies on SIGTERM at
+/// once, but its child traps SIGTERM, takes a second to clean up and writes a
+/// marker. With grace 5 it must be allowed to finish — the call returns once
+/// the group is empty, well before the grace runs out.
+#[tokio::test]
+async fn term_honouring_descendant_gets_the_grace_to_finish() {
+    let marker = marker_path("honour");
+    let m = marker.display();
+    let output = run_ok(&format!(
+        "$r = run_argv([\"sh\", \"-c\", \"(trap 'sleep 1; echo done > {m}; exit 0' TERM; while true; do sleep 0.1; done) & wait\"], {{timeout: 0.3, grace: 5}})\n\
+         print($r.timed_out .. \" \" .. $r.signal .. \" \" .. ($r.duration_ms >= 1200) .. \" \" .. ($r.duration_ms < 4500))\n",
+    ))
+    .await;
+    let finished = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(output, "true 15 true true\n", "full output: {output:?}");
+    assert!(finished, "the TERM-honouring descendant was killed before its cleanup");
+}
+
+/// The capture-drain deadline uses the same escalation: the leader has
+/// already exited, a TERM-honouring descendant still holds stdout, and when
+/// the deadline fires it gets SIGTERM and the grace — not an instant SIGKILL.
+#[tokio::test]
+async fn drain_deadline_honours_grace_for_a_pipe_holding_descendant() {
+    let marker = marker_path("drain");
+    let m = marker.display();
+    let output = run_ok(&format!(
+        "$r = run_argv([\"sh\", \"-c\", \"(trap 'sleep 0.5; echo done > {m}; exit 0' TERM; while true; do sleep 0.1; done) &\"], {{timeout: 0.3, grace: 5}})\n\
+         print($r.timed_out .. \" \" .. $r.exit_code .. \" \" .. ($r.duration_ms < 4500))\n",
+    ))
+    .await;
+    let finished = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(output, "true 0 true\n", "full output: {output:?}");
+    assert!(finished, "the drain deadline SIGKILLed a TERM-honouring descendant");
 }
 
 /// The default is unchanged: no grace means SIGKILL at the deadline.
