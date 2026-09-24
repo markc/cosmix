@@ -2176,6 +2176,53 @@ async fn unknown_command_request_is_refused_immediately() {
     assert!(body.contains("\"available\":[\"b.verb\",\"q\"]"), "body: {body}");
 }
 
+/// dispatch_event is also reached from the `sleep()` yield loop, which does
+/// not run the pump's reserved-verb interception first: a verb the serve
+/// runtime reserves must not be refused there as UNKNOWN_COMMAND.
+#[tokio::test]
+async fn reserved_verbs_are_not_refused_as_unknown() {
+    use cosmix_mix::evaluator::{ReservedOutcome, ServeRuntime};
+    struct Claims;
+    impl ServeRuntime for Claims {
+        fn handle_reserved(
+            &self,
+            command: &str,
+            _: Option<&str>,
+            _: &str,
+            _: &[(&str, Option<&str>)],
+            _: bool,
+        ) -> Option<ReservedOutcome> {
+            (command == "HELP" || command == "svc.props.get").then(|| ReservedOutcome {
+                rc: 0,
+                body: "{}".into(),
+                quit: false,
+                reload: false,
+            })
+        }
+    }
+    let source = "on q\n    reply(\"v\")\ndone\n";
+    let mut lexer = Lexer::new(source);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+    let mut eval = Evaluator::with_output(Box::new(SharedBuf::new()), Box::new(SharedBuf::new()));
+    eval.set_bus_handler(Rc::new(ReplyRecorder(log.clone())));
+    eval.set_serve_runtime(Rc::new(Claims));
+    eval.execute(&stmts).await.expect("main body runs");
+    for cmd in ["HELP", "svc.props.get"] {
+        eval.dispatch_event(mk_event(cmd, "", &[("id", "1"), ("type", "request")]))
+            .await
+            .expect("dispatch is soft");
+    }
+    assert!(log.borrow().is_empty(), "reserved verbs must not get UNKNOWN_COMMAND: {:?}", log.borrow());
+    eval.dispatch_event(mk_event("nosuch", "", &[("id", "2"), ("type", "request")]))
+        .await
+        .expect("dispatch is soft");
+    assert_eq!(log.borrow().len(), 1, "a genuinely unknown verb is still refused");
+    assert_eq!(log.borrow()[0].3, 10);
+}
+
 /// A topic delivery (no `type=request`) for an unhandled command has no
 /// caller to answer and stays a silent drop.
 #[tokio::test]

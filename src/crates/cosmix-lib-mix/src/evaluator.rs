@@ -4751,6 +4751,21 @@ impl Evaluator {
         if event.headers.get("type").map(String::as_str) != Some("request") {
             return;
         }
+        // A verb the serve runtime reserves (HELP/INFO/QUIT/RELOAD,
+        // `<svc>.props.get|list|describe`) is never "unknown". The event
+        // pump answers those before dispatch; the `sleep()` yield loop calls
+        // dispatch_event directly, and a reserved verb arriving there keeps
+        // its old fate (dropped) rather than a false UNKNOWN_COMMAND.
+        // `correlated: false` makes the probe side-effect free (RELOAD skips
+        // its re-read; nothing is sent).
+        let runtime = self.globals.borrow().serve_runtime.clone();
+        if let Some(rt) = runtime
+            && rt
+                .handle_reserved(&event.command, None, "", &[], false)
+                .is_some()
+        {
+            return;
+        }
         let (handler, mut available) = {
             let g = self.globals.borrow();
             let available: Vec<String> = g
