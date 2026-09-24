@@ -214,6 +214,19 @@ fn a_shared_heredoc_with_different_bindings_still_reports_each_finding_once() {
 }
 
 #[test]
+fn two_different_bodies_on_one_line_keep_a_finding_each() {
+    // Distinct bodies whose findings land on the same line with the same
+    // text are still two findings: the dedupe is per body.
+    for src in [
+        "$r = [ssh_mix(\"a\", 'missing()'), ssh_mix(\"b\", 'missing()')]\nprint($r)\n",
+        "$r = ssh_mix(\"a\", 'missing()'); $s = ssh_mix(\"b\", 'missing()')\nprint($r .. $s)\n",
+    ] {
+        let n = codes(src).iter().filter(|c| *c == "MIX-E1102").count();
+        assert_eq!(n, 2, "{src:?}: {:?}", codes(src));
+    }
+}
+
+#[test]
 fn a_variable_bound_more_than_once_is_not_resolved() {
     // "Sole definition" is the guarantee: with two binders the value at
     // the call is not knowable, so the body stays unanalysable.

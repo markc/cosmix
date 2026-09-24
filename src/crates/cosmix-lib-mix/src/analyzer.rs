@@ -2097,7 +2097,7 @@ fn check_ssh_mix_bodies(
     // disagree about which names are undefined), and `reported` then keeps
     // one copy of every (code, line, message) they share.
     let mut analysed: HashSet<(usize, Option<Vec<String>>)> = HashSet::new();
-    let mut reported: HashSet<(&'static str, Option<usize>, String)> = HashSet::new();
+    let mut reported = BodyDedupe::default();
     let openers = cfg.source.as_deref().map(literal_openers).unwrap_or_default();
     for site in collect_remote_sites(stmts) {
         match site.body {
@@ -2126,6 +2126,7 @@ fn check_ssh_mix_bodies(
                 });
                 if analysed.insert((origin, key)) {
                     let injected = site.injected.as_ref();
+                    reported.origin = origin;
                     analyse_remote_body(&src, first_line, injected, ctx, a, cfg, &mut reported);
                 }
             }
@@ -2162,6 +2163,26 @@ fn check_ssh_mix_bodies(
                 ),
             )),
         }
+    }
+}
+
+/// Which body findings have been reported. Keyed by the BODY (its origin
+/// node) as well as (code, line, message): one heredoc shipped by calls
+/// with different bindings is one body, so a finding they share is
+/// reported once, while two DIFFERENT bodies whose lines coincide (two
+/// one-line literals in one statement) keep a finding each.
+#[derive(Default)]
+struct BodyDedupe {
+    /// The body being analysed; set before each `analyse_remote_body`.
+    origin: usize,
+    seen: HashSet<(usize, &'static str, Option<usize>, String)>,
+}
+
+impl BodyDedupe {
+    /// True the first time this body reports this finding.
+    fn first(&mut self, d: &Diagnostic) -> bool {
+        self.seen
+            .insert((self.origin, d.code, d.line, d.message.clone()))
     }
 }
 
@@ -2605,7 +2626,7 @@ fn analyse_remote_body(
     ctx: &FileContext,
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
-    reported: &mut HashSet<(&'static str, Option<usize>, String)>,
+    reported: &mut BodyDedupe,
 ) {
     let mut lexer = crate::lexer::Lexer::new(src);
     let tokens = match lexer.tokenize() {
@@ -2635,7 +2656,7 @@ fn analyse_remote_body(
         d.file.clone_from(&ctx.file);
         d.line = Some(first_line + d.line.unwrap_or(1).saturating_sub(1));
         d.message = format!("[inside ssh_mix body] {}", d.message);
-        if reported.insert((d.code, d.line, d.message.clone())) {
+        if reported.first(&d) {
             a.diagnostics.push(d);
         }
     }
@@ -2646,7 +2667,7 @@ fn push_unparsable(
     ctx: &FileContext,
     line: usize,
     why: &str,
-    reported: &mut HashSet<(&'static str, Option<usize>, String)>,
+    reported: &mut BodyDedupe,
 ) {
     let d = diag(
         ctx,
@@ -2660,7 +2681,7 @@ fn push_unparsable(
                 .to_string(),
         ),
     );
-    if reported.insert((d.code, d.line, d.message.clone())) {
+    if reported.first(&d) {
         a.diagnostics.push(d);
     }
 }
