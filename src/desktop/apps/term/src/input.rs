@@ -47,8 +47,16 @@ impl Action {
 /// everything but Ctrl applied (iced's `key` and `modified_key`). Both are
 /// needed for foot's `Control+plus`: on a US layout plus is Shift+=, so `key`
 /// says "=" and `modified` says "+", while on a layout with a dedicated plus
-/// key `key` itself says "+". The keypad's plus, minus and zero report as
-/// those characters too, which covers `KP_Add`, `KP_Subtract` and `KP_0`.
+/// key `key` itself says "+". The keypad's plus and minus report as those
+/// characters in both, which covers `KP_Add` and `KP_Subtract`.
+///
+/// The keypad's zero does NOT: `key` is winit's `key_without_modifiers`,
+/// which ignores NumLock too, so it reports the level-0 keysym `KP_Insert`
+/// (`Named::Insert`). Only `modified` says "0". So minus and zero are matched
+/// on either — which is safe, because Shift is refused for both and no
+/// layout's unshifted `modified` says "0" or "-" on a key that means
+/// something else. With NumLock off both say Insert and nothing fires, as in
+/// foot, whose binding is on the `KP_0` keysym.
 ///
 /// Alt and Super chords are never ours, exactly as in [`keys_for`].
 pub fn action_for(key: &Key, modified: &Key, modifiers: Modifiers) -> Option<Action> {
@@ -60,10 +68,10 @@ pub fn action_for(key: &Key, modified: &Key, modifiers: Modifiers) -> Option<Act
     if is(modified, "+") || is(modified, "=") || is(key, "+") || is(key, "=") {
         return Some(Action::FontIncrease);
     }
-    if !shift && is(key, "-") {
+    if !shift && (is(key, "-") || is(modified, "-")) {
         return Some(Action::FontDecrease);
     }
-    if !shift && is(key, "0") {
+    if !shift && (is(key, "0") || is(modified, "0")) {
         return Some(Action::FontReset);
     }
     match key.as_ref() {
@@ -330,8 +338,17 @@ mod tests {
         assert_eq!(action_for(&plus, &plus, Modifiers::CTRL), Some(Action::FontIncrease));
         // Control+minus and Control+KP_Subtract.
         assert_eq!(action_for(&minus, &minus, Modifiers::CTRL), Some(Action::FontDecrease));
-        // Control+0 and Control+KP_0.
+        // Control+0.
         assert_eq!(action_for(&zero, &zero, Modifiers::CTRL), Some(Action::FontReset));
+        // Control+KP_0 as winit really reports it with NumLock on: the
+        // unmodified key is the level-0 keysym KP_Insert, only the modified
+        // key is "0" (review finding: the first cut faked "0" in both).
+        let insert = named(Named::Insert);
+        assert_eq!(action_for(&insert, &zero, Modifiers::CTRL), Some(Action::FontReset));
+        // NumLock off: Insert in both, and nothing fires — as in foot.
+        assert_eq!(action_for(&insert, &insert, Modifiers::CTRL), None);
+        // Shift+0 is ")" on US: Ctrl+Shift+0 must not reset.
+        assert_eq!(action_for(&zero, &character(")"), ctrl_shift()), None);
         // Without Ctrl, or with Alt, these are text.
         assert_eq!(action_for(&equal, &equal, Modifiers::empty()), None);
         assert_eq!(action_for(&minus, &minus, Modifiers::CTRL | Modifiers::ALT), None);
