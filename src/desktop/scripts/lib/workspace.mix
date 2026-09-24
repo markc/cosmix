@@ -3,14 +3,20 @@
 -- functions (no `on` handlers, no Bus). The citizen and the unit test
 -- (../tests/workspace-test.mix) both require this module.
 --
--- The citizen translates desktop.workspace.* into cosmix-comp's workspace
--- verbs. prepare() turns a request into either a refusal {rc, body} or a
--- plan {kind, send: {service, verb, body}} naming exactly one comp call;
--- finish() turns comp's answer into the reply {ok, backend, desktop}.
+-- prepare() turns a request into either a refusal {rc, body} or a plan
+-- {kind, send: {service, verb, body}} naming exactly one comp call; finish()
+-- turns comp's answer into the reply.
 --
 -- next/prev send comp {index: "next"|"prev", wrap: true}: comp owns the
 -- workspace count, so the wrap at either end happens in comp, and `wrap` is
 -- sent explicitly so the citizen's behaviour does not ride comp's default.
+--
+-- Reply rc bands (Bus contract: 1..9 is delivered-with-warning SUCCESS, so
+-- every failure here is >= 10):
+--   10   the request is malformed (checked locally, never reaches comp)
+--   11   comp unreachable: the send never got a reply (negative send rc)
+--   12   comp answered, but not in the shape its contract promises
+--   >=10 comp's own refusal, rc kept, its whole reply map under `comp`
 
 fn comp_service()
   -- The comp Bus service the citizen forwards to (a nested comp registers
@@ -19,7 +25,8 @@ fn comp_service()
 end
 
 fn max_desktop()
-  return 64
+  -- comp's WORKSPACE_COUNT_MAX; comp still range-checks against the live count.
+  return 16
 end
 
 fn refuse($message)
@@ -28,6 +35,9 @@ end
 
 fn request_args($body)
   -- {ok, args} for an empty body or a JSON object; {ok:false, error} else.
+  -- Reads the raw body rather than $event.args (the siblings' habit) because
+  -- $event.args is nil for BOTH an empty body and a non-JSON one, and only
+  -- the first is acceptable.
   if $body == nil or trim($body) == "" then
     return {ok: true, args: {}}
   end
@@ -53,13 +63,17 @@ fn only_fields($args, $allowed)
   return nil
 end
 
+fn is_int($v)
+  return type($v) == "number" and floor($v) == $v
+end
+
 fn desktop_index($args)
   -- A 1-based integer <= max_desktop() from {n}, or nil.
   if not has_key($args, "n") then
     return nil
   end
   $n = $args["n"]
-  if type($n) != "number" or $n < 1 or $n > max_desktop() or floor($n) != $n then
+  if not is_int($n) or $n < 1 or $n > max_desktop() then
     return nil
   end
   return $n
@@ -87,7 +101,8 @@ fn prepare($verb, $body)
     if $verb == "desktop.workspace.prev" then
       return switch_plan("prev")
     end
-    return {kind: "current", send: {service: comp_service(), verb: "comp.props.get", body: {path: "workspaces.current"}}}
+    -- The subtree, not the leaf: one read answers both current and count.
+    return {kind: "current", send: {service: comp_service(), verb: "comp.props.get", body: {path: "workspaces"}}}
   end
   if $verb == "desktop.workspace.set" then
     $extra = only_fields($args, ["n"])
@@ -100,42 +115,37 @@ fn prepare($verb, $body)
   return refuse("unknown verb " .. $verb)
 end
 
-fn decoded($r)
-  if type($r) == "string" and starts_with(trim($r), "{") then
-    try
-      return json_parse($r)
-    catch $err
-      return $r
+fn malformed($reply)
+  return {rc: 12, body: {ok: false, error: "malformed comp reply", comp: $reply}}
+end
+
+fn finish($plan, $rc, $result, $reply)
+  -- The reply for comp's answer to the plan's send: $rc and $result as send
+  -- set them, $reply the parsed reply body (nil when there was none).
+  -- Success: switch -> {ok, from, to}; current -> {ok, desktop, count}.
+  if $rc < 0 then
+    return {rc: 11, body: {ok: false, error: "comp unreachable: " .. to_string($result)}}
+  end
+  if $rc >= 10 then
+    $code = $rc > 255 ? 255 : $rc
+    if type($reply) == "map" then
+      $msg = type($reply.error) == "string" ? $reply.error : to_string($result)
+      return {rc: $code, body: {ok: false, error: $msg, comp: $reply}}
     end
+    -- A plain-text refusal (e.g. the broker's "Service ... not found").
+    return {rc: $code, body: {ok: false, error: to_string($result)}}
   end
-  return $r
-end
-
-fn failed($rc, $message)
-  $code = $rc
-  if type($code) != "number" or $code < 1 or $code > 255 then
-    $code = 1
+  if type($reply) != "map" then
+    return malformed($reply)
   end
-  return {rc: $code, body: {ok: false, backend: "comp", error: $message}}
-end
-
-fn finish($plan, $rc, $result)
-  -- The reply for comp's answer ($rc/$result of the plan's send).
-  -- Success: {rc:0, body:{ok:true, backend:"comp", desktop:N}}. A comp
-  -- refusal or an unreachable comp keeps comp's rc (transport failures,
-  -- which are negative, become 1) and carries its text in `error`.
-  if $rc != 0 then
-    return failed($rc, to_string($result))
-  end
-  $r = decoded($result)
   if $plan.kind == "switch" then
-    if type($r) == "map" and has_key($r, "to") and type($r["to"]) == "number" then
-      return {rc: 0, body: {ok: true, backend: "comp", desktop: $r["to"]}}
+    if is_int($reply.from) and is_int($reply.to) then
+      return {rc: 0, body: {ok: true, from: $reply.from, to: $reply.to}}
     end
-    return failed(1, "unexpected comp.workspace.switch reply: " .. json_encode($r))
+    return malformed($reply)
   end
-  if type($r) == "number" then
-    return {rc: 0, body: {ok: true, backend: "comp", desktop: $r}}
+  if is_int($reply.current) and is_int($reply.count) then
+    return {rc: 0, body: {ok: true, desktop: $reply.current, count: $reply.count}}
   end
-  return failed(1, "unexpected workspaces.current value: " .. json_encode($r))
+  return malformed($reply)
 end

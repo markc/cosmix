@@ -617,32 +617,54 @@ citizen with no <code>service</code> field (see
 Start it under that name:</p>
 <pre><code class="language-text">mix --serve /path/to/cosmix/src/desktop/scripts/desktop-workspace.mix --name desktop
 </code></pre>
-<p>Each verb makes exactly one call to comp. <code>COSMIX_DESKTOP_COMP_SERVICE</code> names
-comp's Bus service and defaults to <code>comp</code>.</p>
-<table><thead><tr><th>Verb</th><th>JSON request</th><th>Forwards to comp</th></tr></thead><tbody>
-<tr><td><code>desktop.workspace.next</code></td><td>empty or <code>{}</code></td><td><code>comp.workspace.switch {"index":"next","wrap":true}</code></td></tr>
-<tr><td><code>desktop.workspace.prev</code></td><td>empty or <code>{}</code></td><td><code>comp.workspace.switch {"index":"prev","wrap":true}</code></td></tr>
-<tr><td><code>desktop.workspace.set</code></td><td><code>{"n":N}</code>, N an integer 1–64</td><td><code>comp.workspace.switch {"index":N,"wrap":true}</code></td></tr>
-<tr><td><code>desktop.workspace.current</code></td><td>empty or <code>{}</code></td><td><code>comp.props.get {"path":"workspaces.current"}</code></td></tr>
+<p>Each verb makes exactly one call to comp, with a 3-second budget.
+<code>COSMIX_DESKTOP_COMP_SERVICE</code> names comp's Bus service and defaults to <code>comp</code>.</p>
+<table><thead><tr><th>Verb</th><th>JSON request</th><th>Forwards to comp</th><th>Reply</th></tr></thead><tbody>
+<tr><td><code>desktop.workspace.next</code></td><td>empty or <code>{}</code></td><td><code>comp.workspace.switch {"index":"next","wrap":true}</code></td><td><code>{ok,from,to}</code></td></tr>
+<tr><td><code>desktop.workspace.prev</code></td><td>empty or <code>{}</code></td><td><code>comp.workspace.switch {"index":"prev","wrap":true}</code></td><td><code>{ok,from,to}</code></td></tr>
+<tr><td><code>desktop.workspace.set</code></td><td><code>{"n":N}</code>, N an integer 1–16</td><td><code>comp.workspace.switch {"index":N,"wrap":true}</code></td><td><code>{ok,from,to}</code></td></tr>
+<tr><td><code>desktop.workspace.current</code></td><td>empty or <code>{}</code></td><td><code>comp.props.get {"path":"workspaces"}</code></td><td><code>{ok,desktop,count}</code></td></tr>
 </tbody></table>
 <p>comp does the wrap: <code>next</code> on the last workspace lands on the first, and
 <code>prev</code> on the first lands on the last. The citizen sends <code>wrap</code> explicitly, so
-it does not depend on comp's default. comp still range-checks <code>set</code>, so an <code>N</code>
-above the live workspace count is comp's <code>invalid_value</code>.</p>
-<p>A successful reply is rc 0 with the workspace comp reports: the switch
-reply's <code>to</code>, or the <code>workspaces.current</code> value.</p>
-<pre><code class="language-json">{"ok":true,"backend":"comp","desktop":2}
+it does not depend on comp's default. <code>from</code> and <code>to</code> are comp's own numbers.
+<code>current</code> returns <code>count</code> too, so a caller knows where <code>next</code> will wrap. comp
+still range-checks <code>set</code>, so an <code>N</code> above the live workspace count is comp's
+<code>invalid_value</code>.</p>
+<pre><code class="language-json">{"ok":true,"from":4,"to":1}
+{"ok":true,"desktop":3,"count":4}
 </code></pre>
-<p>A malformed request is refused with rc 10 and never reaches comp. That covers
-a body that is not a JSON object, any field on <code>next</code>, <code>prev</code> or <code>current</code>,
-and a <code>set</code> without exactly an integer <code>n</code> in range. A comp refusal, such as
-<code>locked</code> under a session lock, keeps comp's rc and carries its text in
-<code>{"ok":false,"backend":"comp","error":...}</code>. An unreachable broker becomes
-rc 1 with the same shape. There is no retry and no second backend. Mesh
+<p>Every failure has an rc of 10 or more, so the <code>$rc &gt;= 10</code> test reads it as a
+failure:</p>
+<table><thead><tr><th>rc</th><th>Meaning</th><th>Body</th></tr></thead><tbody>
+<tr><td>10</td><td>Malformed request, refused locally and never sent to comp</td><td><code>{ok:false,error}</code></td></tr>
+<tr><td>11</td><td>comp unreachable: no reply, including the 3-second timeout</td><td><code>{ok:false,error}</code></td></tr>
+<tr><td>12</td><td>comp replied outside its contract</td><td><code>{ok:false,error:"malformed comp reply",comp}</code></td></tr>
+<tr><td>comp's rc</td><td>comp refused, for example <code>locked</code> under a session lock</td><td><code>{ok:false,error,comp}</code></td></tr>
+</tbody></table>
+<p>A malformed request is a body that is not a JSON object, any field on <code>next</code>,
+<code>prev</code> or <code>current</code>, or a <code>set</code> without exactly an integer <code>n</code> in range. On a
+comp refusal, <code>error</code> is comp's <code>error</code> and <code>comp</code> is comp's whole reply,
+<code>error_code</code> and range fields included. A broker refusal, such as an unknown
+service, has no <code>comp</code> field. There is no retry and no second backend. Mesh
 callers reach every verb with no authorization gate, and only well-formedness
 is checked.</p>
-<p><code>src/desktop/scripts/cosmix-desktop-workspace.service</code> is an example user
-unit. Validation and reply shaping live in <code>src/desktop/scripts/lib/workspace.mix</code>.</p>
+<p><code>next</code> is a Mix keyword, so quote the verb in a Mix <code>send</code> until the parser
+fix lands:</p>
+<pre><code class="language-mix">send desktop "desktop.workspace.next"
+$b = json_encode({n: 2})
+send desktop desktop.workspace.set body=$b
+</code></pre>
+<p>Install: the citizen requires <code>lib/workspace.mix</code> beside it, so install both
+files into <code>/opt/cosmix/share/desktop/</code>. Stop any running <code>desktop</code> citizen
+first, because two registrations of the same service name are undefined.</p>
+<pre><code class="language-text">install -D -m 0644 src/desktop/scripts/desktop-workspace.mix /opt/cosmix/share/desktop/desktop-workspace.mix
+install -D -m 0644 src/desktop/scripts/lib/workspace.mix /opt/cosmix/share/desktop/lib/workspace.mix
+</code></pre>
+<p><code>src/desktop/scripts/cosmix-desktop-workspace.service</code> is an example system
+unit with a <code>User=</code> placeholder. Its comment describes the user-unit form for
+hosts that run a user session manager. Validation and reply shaping live in
+<code>src/desktop/scripts/lib/workspace.mix</code>.</p>
 <p>Earlier deployments ran a private copy of this citizen with a KWin fallback
 over the session D-Bus. This script replaces that copy. The KWin path is not
 carried over, because cosmix components reach D-Bus only through

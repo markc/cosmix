@@ -215,39 +215,68 @@ Start it under that name:
 mix --serve /path/to/cosmix/src/desktop/scripts/desktop-workspace.mix --name desktop
 ```
 
-Each verb makes exactly one call to comp. `COSMIX_DESKTOP_COMP_SERVICE` names
-comp's Bus service and defaults to `comp`.
+Each verb makes exactly one call to comp, with a 3-second budget.
+`COSMIX_DESKTOP_COMP_SERVICE` names comp's Bus service and defaults to `comp`.
 
-| Verb | JSON request | Forwards to comp |
-|---|---|---|
-| `desktop.workspace.next` | empty or `{}` | `comp.workspace.switch {"index":"next","wrap":true}` |
-| `desktop.workspace.prev` | empty or `{}` | `comp.workspace.switch {"index":"prev","wrap":true}` |
-| `desktop.workspace.set` | `{"n":N}`, N an integer 1–64 | `comp.workspace.switch {"index":N,"wrap":true}` |
-| `desktop.workspace.current` | empty or `{}` | `comp.props.get {"path":"workspaces.current"}` |
+| Verb | JSON request | Forwards to comp | Reply |
+|---|---|---|---|
+| `desktop.workspace.next` | empty or `{}` | `comp.workspace.switch {"index":"next","wrap":true}` | `{ok,from,to}` |
+| `desktop.workspace.prev` | empty or `{}` | `comp.workspace.switch {"index":"prev","wrap":true}` | `{ok,from,to}` |
+| `desktop.workspace.set` | `{"n":N}`, N an integer 1–16 | `comp.workspace.switch {"index":N,"wrap":true}` | `{ok,from,to}` |
+| `desktop.workspace.current` | empty or `{}` | `comp.props.get {"path":"workspaces"}` | `{ok,desktop,count}` |
 
 comp does the wrap: `next` on the last workspace lands on the first, and
 `prev` on the first lands on the last. The citizen sends `wrap` explicitly, so
-it does not depend on comp's default. comp still range-checks `set`, so an `N`
-above the live workspace count is comp's `invalid_value`.
-
-A successful reply is rc 0 with the workspace comp reports: the switch
-reply's `to`, or the `workspaces.current` value.
+it does not depend on comp's default. `from` and `to` are comp's own numbers.
+`current` returns `count` too, so a caller knows where `next` will wrap. comp
+still range-checks `set`, so an `N` above the live workspace count is comp's
+`invalid_value`.
 
 ```json
-{"ok":true,"backend":"comp","desktop":2}
+{"ok":true,"from":4,"to":1}
+{"ok":true,"desktop":3,"count":4}
 ```
 
-A malformed request is refused with rc 10 and never reaches comp. That covers
-a body that is not a JSON object, any field on `next`, `prev` or `current`,
-and a `set` without exactly an integer `n` in range. A comp refusal, such as
-`locked` under a session lock, keeps comp's rc and carries its text in
-`{"ok":false,"backend":"comp","error":...}`. An unreachable broker becomes
-rc 1 with the same shape. There is no retry and no second backend. Mesh
+Every failure has an rc of 10 or more, so the `$rc >= 10` test reads it as a
+failure:
+
+| rc | Meaning | Body |
+|---|---|---|
+| 10 | Malformed request, refused locally and never sent to comp | `{ok:false,error}` |
+| 11 | comp unreachable: no reply, including the 3-second timeout | `{ok:false,error}` |
+| 12 | comp replied outside its contract | `{ok:false,error:"malformed comp reply",comp}` |
+| comp's rc | comp refused, for example `locked` under a session lock | `{ok:false,error,comp}` |
+
+A malformed request is a body that is not a JSON object, any field on `next`,
+`prev` or `current`, or a `set` without exactly an integer `n` in range. On a
+comp refusal, `error` is comp's `error` and `comp` is comp's whole reply,
+`error_code` and range fields included. A broker refusal, such as an unknown
+service, has no `comp` field. There is no retry and no second backend. Mesh
 callers reach every verb with no authorization gate, and only well-formedness
 is checked.
 
-`src/desktop/scripts/cosmix-desktop-workspace.service` is an example user
-unit. Validation and reply shaping live in `src/desktop/scripts/lib/workspace.mix`.
+`next` is a Mix keyword, so quote the verb in a Mix `send` until the parser
+fix lands:
+
+```mix
+send desktop "desktop.workspace.next"
+$b = json_encode({n: 2})
+send desktop desktop.workspace.set body=$b
+```
+
+Install: the citizen requires `lib/workspace.mix` beside it, so install both
+files into `/opt/cosmix/share/desktop/`. Stop any running `desktop` citizen
+first, because two registrations of the same service name are undefined.
+
+```text
+install -D -m 0644 src/desktop/scripts/desktop-workspace.mix /opt/cosmix/share/desktop/desktop-workspace.mix
+install -D -m 0644 src/desktop/scripts/lib/workspace.mix /opt/cosmix/share/desktop/lib/workspace.mix
+```
+
+`src/desktop/scripts/cosmix-desktop-workspace.service` is an example system
+unit with a `User=` placeholder. Its comment describes the user-unit form for
+hosts that run a user session manager. Validation and reply shaping live in
+`src/desktop/scripts/lib/workspace.mix`.
 
 Earlier deployments ran a private copy of this citizen with a KWin fallback
 over the session D-Bus. This script replaces that copy. The KWin path is not
