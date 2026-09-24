@@ -227,7 +227,7 @@ impl ShellModel {
     ) -> Result<[PanelUpdate; 4], PanelTimeError> {
         self.ensure_monotonic(at)?;
         let [left, bottom, right, top] = &mut self.panels;
-        let mut updates = [
+        let updates = [
             left.set_holder_plane(available, at)?,
             bottom.set_holder_plane(available, at)?,
             right.set_holder_plane(available, at)?,
