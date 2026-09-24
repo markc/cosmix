@@ -214,14 +214,18 @@ local time with an explicit numeric UTC offset. Persist timezone preferences
 through the operating system's timezone configuration; Quoin reuses that
 configuration on subsequent launches.
 
-Background preference reconciliation shares this deadline mechanism and does
-not poll. Quoin reads the wallpaper snapshot once per connection, again after
-each write, and again whenever the System page is opened; while that page is
-visible it re-reads on a `wallpaper.props.changed` (or
-`bg-showcase.props.changed`) invalidation or a Bus delivery gap. While the page
-is hidden an invalidation only marks the snapshot stale. A failed read retries
-only while the page is visible, backing off from 2 s to at most 30 s.
-Unchanged values do not rewrite widget text.
+Background preference reconciliation shares this deadline mechanism and
+never polls while its page is hidden. Quoin reads the wallpaper snapshot once
+per connection, again after each write, and again whenever the System page is
+opened; while that page is visible it re-reads on a `wallpaper.props.changed`
+(or `bg-showcase.props.changed`) invalidation, on a delivery gap in Quoin's own
+Bus queue, and as a backstop 30 s after its last good read. While the page is
+hidden an invalidation only marks the snapshot stale. The backstop exists
+because noded drops a notification silently when a subscriber's queue is full,
+and the last notice of a burst has no successor to reveal the loss: a visible
+page can therefore show stale values until the next change, the 30 s backstop,
+or a reopen. A failed read retries only while the page is visible, backing off
+from 2 s to at most 30 s. Unchanged values do not rewrite widget text.
 
 Keyboard repeat shares this wake layer. The active key owns one replaceable
 absolute deadline; a due wake emits one coalesced repeat and arms the next

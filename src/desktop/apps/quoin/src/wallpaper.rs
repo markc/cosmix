@@ -42,6 +42,15 @@ enum RequestKind {
 pub(crate) const RETRY_INITIAL: Duration = Duration::from_secs(2);
 pub(crate) const RETRY_CAP: Duration = Duration::from_secs(30);
 
+/// Backstop re-read while — and only while — the page is visible. noded fans
+/// notifications out with a non-blocking send, and a full subscriber queue
+/// drops a `props.changed` silently (no gap reaches this client; the bridge's
+/// `DroppedMessages` covers only Quoin's own inbound queue). The LAST notice
+/// of a burst has no successor to reveal the loss, so without this the page
+/// would stay stale until the next change or a reopen. Remove it once noded
+/// signals subscriber-side gaps (TODO-cos § session plumbing).
+const VISIBLE_RECONCILE: Duration = Duration::from_secs(30);
+
 pub(crate) fn next_backoff(current: Duration) -> Duration {
     (current * 2).min(RETRY_CAP)
 }
@@ -179,8 +188,9 @@ impl WallpaperState {
                                     if self.feedback == "Background unavailable" {
                                         self.feedback.clear();
                                     }
-                                    // Authoritative: no re-read until invalidated.
-                                    self.refresh = None;
+                                    // Authoritative: re-read on invalidation, or
+                                    // the visible-only backstop.
+                                    self.refresh = Some(now + VISIBLE_RECONCILE);
                                     self.backoff = RETRY_INITIAL;
                                 }
                             }
@@ -269,8 +279,7 @@ impl WallpaperState {
             self.owed |= matches!(kind, RequestKind::Set);
         }
         let due = self.refresh.is_some_and(|at| at <= now) && self.may_read();
-        let write = self.queued.is_some() && self.refresh.is_none_or(|at| at <= now);
-        if self.pending.is_none() && (write || due) {
+        if self.pending.is_none() && (self.queued.is_some() || due) {
             self.next_id = self
                 .next_id
                 .checked_add(1)
@@ -582,8 +591,9 @@ mod tests {
         state.event(&reply(get.request_id, changed), Duration::ZERO);
         assert!(state.available());
         // The write's readback was owed although the page is hidden; after
-        // it nothing polls. Lost notifications arrive as DroppedMessages.
-        state.tick(&bridge, Duration::from_secs(1), &mut deadline);
+        // it a hidden page sends nothing, even past the visible-only
+        // reconcile backstop (a notice noded drops is recovered on reopen).
+        state.tick(&bridge, VISIBLE_RECONCILE * 2, &mut deadline);
         assert!(peer.drain_calls().is_empty());
     }
 
@@ -598,20 +608,23 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_read_is_not_polled_and_invalidation_waits_for_the_page() {
+    fn authoritative_read_reconciles_only_while_visible_and_invalidation_waits_for_the_page() {
         let (bridge, peer) = test_bridge("shell");
         let mut state = WallpaperState::default();
         connected(&mut state, 1);
         state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
         let get = peer.drain_calls().remove(0);
         state.event(&reply(get.request_id, settings()), Duration::ZERO);
-        assert_eq!(state.refresh, None, "a good reply arms no re-read");
-        for secs in [1, 5, 60] {
+        assert_eq!(
+            state.refresh,
+            Some(VISIBLE_RECONCILE),
+            "a good reply arms only the visible-only backstop"
+        );
+        for secs in [1, 30, 60] {
             let mut deadline = LayerHostDeadline::default();
-            state.visible = secs == 5;
             state.tick(&bridge, Duration::from_secs(secs), &mut deadline);
-            assert!(peer.drain_calls().is_empty(), "no poll at {secs}s");
-            assert_eq!(deadline.0, None, "no wake armed at {secs}s");
+            assert!(peer.drain_calls().is_empty(), "hidden poll at {secs}s");
+            assert_eq!(deadline.0, None, "hidden wake armed at {secs}s");
         }
         // A change notice while the page is hidden marks the snapshot stale
         // but neither sends nor wakes the host.
@@ -627,12 +640,22 @@ mod tests {
         state.tick(&bridge, Duration::from_secs(63), &mut deadline);
         let get = peer.drain_calls().remove(0);
         assert_eq!(get.command, "wallpaper.props.get");
-        state.event(&reply(get.request_id, settings()), Duration::from_secs(63));
-        state.tick(&bridge, Duration::from_secs(120), &mut deadline);
+        let read_at = Duration::from_secs(63);
+        state.event(&reply(get.request_id, settings()), read_at);
+        // Visible and current: nothing before the backstop, which is armed.
+        let mut deadline = LayerHostDeadline::default();
+        state.tick(&bridge, read_at + VISIBLE_RECONCILE - Duration::from_millis(1), &mut deadline);
         assert!(peer.drain_calls().is_empty(), "visible, current: no poll");
+        assert_eq!(deadline.0, Some(read_at + VISIBLE_RECONCILE));
+        // The backstop recovers a notice noded dropped with no successor.
+        let backstop = read_at + VISIBLE_RECONCILE;
+        state.tick(&bridge, backstop, &mut deadline);
+        let get = peer.drain_calls().remove(0);
+        state.event(&reply(get.request_id, settings()), backstop);
         // A notice while visible re-reads on the next update.
-        state.message(&changed_notice(1), Duration::from_secs(121));
-        state.tick(&bridge, Duration::from_secs(121), &mut deadline);
+        let later = backstop + Duration::from_secs(1);
+        state.message(&changed_notice(1), later);
+        state.tick(&bridge, later, &mut deadline);
         assert_eq!(peer.drain_calls().len(), 1);
     }
 
