@@ -996,6 +996,9 @@ impl WaylandState {
             .stats
             .hide_unlisted(|window| windows.contains_key(&window));
         for (window, (generation, fold)) in windows {
+            if fold.presented() {
+                self.note_window_shown(SurfaceId(window), generation, time_us);
+            }
             self.presentation
                 .stats
                 .window_frame(window, generation, fold, time_us, refresh_us);

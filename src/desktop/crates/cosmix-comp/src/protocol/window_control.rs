@@ -566,6 +566,11 @@ pub(crate) struct WindowWaiters {
     /// (the counters live as long as the `wl_surface`) nor a late report of a
     /// pre-hide frame satisfies it.
     presented_base: HashMap<SurfaceId, MappingBase>,
+    /// Per window root: its generation and the newest frame time at which
+    /// the renderer showed new content of it — the evidence
+    /// `comp.window.stats` counts. Needs no `wp_presentation` feedback, which
+    /// most clients never request.
+    shown: HashMap<SurfaceId, (u64, u64)>,
 }
 
 const MAX_PRESENTED_BASES: usize = 1024;
@@ -885,6 +890,25 @@ impl WaylandState {
         );
     }
 
+    /// The renderer showed new content of window root `id` in a frame at
+    /// `tv_us` (called from the frame report, alongside the stats fold).
+    pub(crate) fn note_window_shown(&mut self, id: SurfaceId, generation: u64, tv_us: u64) {
+        let objects = &self.surface_objects;
+        let shown = &mut self.window_waiters.shown;
+        if shown.len() >= MAX_PRESENTED_BASES && !shown.contains_key(&id) {
+            shown.retain(|id, _| objects.contains_key(id));
+        }
+        let entry = shown.entry(id).or_insert((generation, tv_us));
+        if entry.0 != generation {
+            *entry = (generation, tv_us);
+        }
+        // A late report of an older frame never moves the evidence back.
+        entry.1 = entry.1.max(tv_us);
+    }
+
+    /// A frame of this mapping was shown: renderer-shown content (what
+    /// `comp.window.stats` counts) or, additionally, `wp_presentation`
+    /// feedback. Either must be at or after the map time.
     fn presented_since_map(&self, record: &SurfaceRecord) -> bool {
         let counters = self.presentation.ledger.counters(record.id);
         let (base, mapped_at_us) = self
@@ -893,10 +917,18 @@ impl WaylandState {
             .get(&record.id)
             .filter(|base| base.generation == record.generation)
             .map_or((0, 0), |base| (base.presented, base.mapped_at_us));
-        counters.presented > base
+        let shown = self
+            .window_waiters
+            .shown
+            .get(&record.id)
+            .is_some_and(|&(generation, tv_us)| {
+                generation == record.generation && tv_us >= mapped_at_us
+            });
+        let fed_back = counters.presented > base
             && counters
                 .last_presented_us
-                .is_some_and(|presented_us| presented_us >= mapped_at_us)
+                .is_some_and(|presented_us| presented_us >= mapped_at_us);
+        shown || fed_back
     }
 
     /// The target's role ended or was replaced (as opposed to a live window

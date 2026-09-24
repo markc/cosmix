@@ -1445,6 +1445,64 @@ fn presented_waits_for_a_frame_of_the_current_mapping() {
     assert_eq!(rc, 0, "a frame of this mapping: {body}");
 }
 
+/// Most clients never request `wp_presentation` feedback. `presented` must
+/// rest on what the renderer showed (the evidence `comp.window.stats`
+/// counts), so such a window, once shown, satisfies it; a window whose new
+/// content the renderer never showed still times out.
+#[test]
+fn presented_needs_no_presentation_feedback_but_needs_a_shown_frame() {
+    let (mut harness, ingress, _observations, runtime, alpha, _beta) = two_mapped_windows();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let surface_id = harness.server.state.surfaces[&alpha].id;
+    // Mapped and committed, but the renderer has not shown this content.
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (frame, content) = test_frame_report(
+        surface_id,
+        monotonic_micros(),
+        content_seq(&harness, &alpha),
+        false,
+    );
+    harness.server.state.frame_presented(frame, content);
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 30),
+        |_| {},
+    );
+    assert_eq!(rc, 10, "mapped but never shown is not presented: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["until"], "presented");
+
+    // No feedback object was ever requested; the renderer shows a frame.
+    commit_test_buffer(&mut harness, TEST_TOPLEVEL_SURFACE_ID);
+    harness.dispatch_client();
+    let (rc, body) = long_window_op(
+        &mut harness,
+        &ingress,
+        &runtime,
+        wait_for(by_id(id, generation), WaitUntil::Presented, 5_000),
+        |harness| {
+            let (frame, content) = test_frame_report(
+                surface_id,
+                monotonic_micros(),
+                content_seq(harness, &alpha),
+                true,
+            );
+            harness.server.state.frame_presented(frame, content);
+        },
+    );
+    assert_eq!(rc, 0, "shown without feedback is presented: {body}");
+    assert_eq!(body["until"], "presented");
+    assert_eq!(body["window"]["id"], id);
+    assert_eq!(
+        harness.server.state.presentation.ledger.counters(surface_id).presented,
+        0,
+        "the feedback ledger never moved: the shown frame alone decided"
+    );
+}
+
 /// Waits learn nothing under a session lock (a named id's `gone` still
 /// resolves), a kill never lands under it, and a never-issued id is
 /// refused.

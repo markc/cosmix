@@ -1144,9 +1144,11 @@ window reaches a state.
 are at most 4096 bytes. With <code>id</code>, the wait is about that window; an id
 comp never handed out is refused with <code>unknown_window</code>. Without it, the
 wait is about the lowest-id mapped window whose names match.</li>
-<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (a frame presented at or
-after the current mapping began; a late report of an earlier frame does
-not count), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
+<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (the renderer showed new
+content of the window at or after the current mapping began, the same
+evidence <code>comp.window.stats</code> counts, so no <code>wp_presentation</code> feedback is
+needed; feedback presented in that span also counts; a late report of
+an earlier frame does not), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
 window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
 without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.
 <code>mapped</code> is workspace-blind; <code>visible</code> and <code>presented</code> need the
