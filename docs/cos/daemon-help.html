@@ -578,11 +578,13 @@ After rolling forward again, those rows must be rebound with <code>service</code
 <p>The default keymap only seeds a missing keymap file, or one whose whole
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a <code>physical</code> list, or lack an unsigned
-32-bit <code>version</code>. A <code>version</code> other than the one this inputd writes, currently
-<code>1</code>, is also unusable, with the reason <code>keymap version 2 is newer than this inputd's 1</code>. A newer file is never loaded as the current version, and it is
-never written over. At startup it is moved aside as below. If it appears
-while inputd runs, <code>input.reload</code> refuses it and also turns keymap writing
-off, as described further down. No older version exists yet. Since inputd 0.4.2, startup first renames such a file to
+32-bit <code>version</code>. Since inputd 0.4.3, a <code>version</code> other than the one this
+inputd writes, currently <code>1</code>, is also unusable, with the reason <code>keymap version 2 is newer than this inputd's 1</code>. A newer file is never loaded as the
+current version, and it is never written over. At startup it is moved aside
+as below. If it appears while inputd runs, <code>input.reload</code> refuses it and also
+turns keymap writing off, as described further down. No older version exists
+yet.</p>
+<p>Since inputd 0.4.2, startup first renames an unusable file to
 <code>keymap.json.bad-YYYYmmdd-HHMMSS</code> in the same directory, then seeds the
 defaults. The rename never replaces an existing name. If the name is taken,
 even by a file created a moment earlier, inputd tries <code>-1</code>, <code>-2</code> and so on.

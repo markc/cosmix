@@ -164,12 +164,15 @@ The shipped default keymap binds these right-Ctrl rows:
 The default keymap only seeds a missing keymap file, or one whose whole
 document is unusable. A document is unusable when its bytes are not UTF-8, are
 not JSON, are not a JSON object, lack a `physical` list, or lack an unsigned
-32-bit `version`. A `version` other than the one this inputd writes, currently
-`1`, is also unusable, with the reason `keymap version 2 is newer than this
-inputd's 1`. A newer file is never loaded as the current version, and it is
-never written over. At startup it is moved aside as below. If it appears
-while inputd runs, `input.reload` refuses it and also turns keymap writing
-off, as described further down. No older version exists yet. Since inputd 0.4.2, startup first renames such a file to
+32-bit `version`. Since inputd 0.4.3, a `version` other than the one this
+inputd writes, currently `1`, is also unusable, with the reason `keymap
+version 2 is newer than this inputd's 1`. A newer file is never loaded as the
+current version, and it is never written over. At startup it is moved aside
+as below. If it appears while inputd runs, `input.reload` refuses it and also
+turns keymap writing off, as described further down. No older version exists
+yet.
+
+Since inputd 0.4.2, startup first renames an unusable file to
 `keymap.json.bad-YYYYmmdd-HHMMSS` in the same directory, then seeds the
 defaults. The rename never replaces an existing name. If the name is taken,
 even by a file created a moment earlier, inputd tries `-1`, `-2` and so on.

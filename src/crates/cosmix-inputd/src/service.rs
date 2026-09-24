@@ -665,6 +665,13 @@ mod tests {
                 reader.read_exact(&mut event).unwrap();
             }
         }
+        // Exactly the expected frames: nothing further is readable.
+        reader.set_nonblocking(true).unwrap();
+        let extra = reader.read(&mut [0; 24]);
+        assert!(
+            matches!(&extra, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "unexpected extra frame: {extra:?}"
+        );
     }
 
     #[test]
@@ -1021,10 +1028,12 @@ mod tests {
         assert_eq!(rc, 0, "{reply}");
         assert_eq!(reply["persisted"], false);
         assert_eq!(reply["persist_disabled"], disabled);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "unchanged after bind");
         let (rc, reply) = run(&resolver, &store, verbs::UNBIND, json!({"code":63}));
         assert_eq!(rc, 0, "{reply}");
         assert_eq!(reply["persisted"], false);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "file bytes unchanged");
+        assert_eq!(reply["persist_disabled"], disabled);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "unchanged after unbind");
         // The operator restores a current-version file: reload re-enables.
         std::fs::write(&path, current).unwrap();
         let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
