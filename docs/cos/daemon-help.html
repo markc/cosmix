@@ -461,7 +461,24 @@ counters will remain unchanged.</p>
 <h2 id="inputd-key-and-pointer-injection">Inputd key and pointer injection</h2>
 <p><code>cosmix-inputd</code> 0.4.0 serves these writable verbs on the <code>inputd</code> Bus service.
 All accept JSON bodies and are reachable by local and mesh callers, with no
-node-local gate. The existing keymap mutation gates are unchanged.</p>
+node-local gate, whatever the mesh posture below.</p>
+<h2 id="inputd-mesh-access">Inputd mesh access</h2>
+<p>Every <code>inputd</code> verb is reachable by mesh callers. This includes the keymap
+mutations <code>input.bind</code>, <code>input.unbind</code>, <code>input.mode</code> and <code>input.reload</code>.
+noded stamps each command's <code>broker_origin</code> from its source socket and strips
+any value the client sent. A caller stamped <code>local</code> or <code>mesh</code> is admitted, and
+being on the mesh is the whole authorization. A command carrying neither stamp
+did not come through the broker and is refused with rc 10.</p>
+<p>Opening the gate does not relax admission. A mesh rebind is validated exactly
+like a local one: action grammar, <code>service</code> shape, <code>args</code> shape and size, and
+the row cap. A refused rebind changes nothing and leaves the generation as it
+was.</p>
+<p>The lock is opt-in. Start the daemon with <code>COSMIX_MESH_OPEN=0</code> and the four
+keymap mutations refuse mesh callers with rc 10 and an error naming the lock.
+Local callers are unaffected. Queries and key and pointer injection stay open
+either way. This is the same switch, with the same rule, as the clipboard
+citizen: any value other than exactly <code>0</code> means open. inputd reads it once at
+startup and logs the posture, so a running unit must be restarted to flip it.</p>
 <table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
 <tr><td><code>input.key</code></td><td><code>{"key":"F9","action":"tap"}</code></td><td>Key press (value 1), release (value 0), or tap (press then release); SYN_REPORT after each state change</td></tr>
 <tr><td><code>input.pointer.move</code></td><td><code>{"dx":12,"dy":-4}</code></td><td>Relative X/Y motion, then SYN_REPORT</td></tr>

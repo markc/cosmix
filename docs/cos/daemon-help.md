@@ -23,7 +23,28 @@ counters will remain unchanged.
 
 `cosmix-inputd` 0.4.0 serves these writable verbs on the `inputd` Bus service.
 All accept JSON bodies and are reachable by local and mesh callers, with no
-node-local gate. The existing keymap mutation gates are unchanged.
+node-local gate, whatever the mesh posture below.
+
+## Inputd mesh access
+
+Every `inputd` verb is reachable by mesh callers. This includes the keymap
+mutations `input.bind`, `input.unbind`, `input.mode` and `input.reload`.
+noded stamps each command's `broker_origin` from its source socket and strips
+any value the client sent. A caller stamped `local` or `mesh` is admitted, and
+being on the mesh is the whole authorization. A command carrying neither stamp
+did not come through the broker and is refused with rc 10.
+
+Opening the gate does not relax admission. A mesh rebind is validated exactly
+like a local one: action grammar, `service` shape, `args` shape and size, and
+the row cap. A refused rebind changes nothing and leaves the generation as it
+was.
+
+The lock is opt-in. Start the daemon with `COSMIX_MESH_OPEN=0` and the four
+keymap mutations refuse mesh callers with rc 10 and an error naming the lock.
+Local callers are unaffected. Queries and key and pointer injection stay open
+either way. This is the same switch, with the same rule, as the clipboard
+citizen: any value other than exactly `0` means open. inputd reads it once at
+startup and logs the posture, so a running unit must be restarted to flip it.
 
 | Verb | Body | Effect |
 |---|---|---|
