@@ -158,6 +158,82 @@ async fn argv_detach_puts_the_child_in_a_new_session() {
     unsafe { libc::kill(pid, libc::SIGKILL); }
 }
 
+/// `/proc/<pid>/stat` fields after the `(comm)` group: [0]=state, [1]=ppid.
+fn proc_stat_fields(pid: i32) -> Option<Vec<String>> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit(')').next()?;
+    Some(after.split_whitespace().map(str::to_string).collect())
+}
+
+/// Wait (bounded) until the pid has exec'd `sleep`, so the fields read are
+/// the real child's, not a pre-exec fork of the test binary.
+fn wait_for_exec(pid: i32, comm: &str) -> bool {
+    for _ in 0..250 {
+        if std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .is_ok_and(|c| c.trim() == comm)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+#[tokio::test]
+async fn argv_detach_double_forks_so_the_caller_never_holds_a_zombie() {
+    // TODO-mix P8: a setsid-only child stays the caller's child, so when it
+    // exits it is a zombie until the caller reaps — and a long-lived caller
+    // (a serve citizen launcher) never does. This test process IS such a
+    // long-lived caller: it never waits on the pid. With the double fork the
+    // child's parent is not us, and once killed it is reaped by init (or a
+    // subreaper) and vanishes from /proc. Against a setsid-only spawn both
+    // assertions fail: ppid == our pid, and the killed child lingers as Z.
+    let out = run("$p = spawn([\"sleep\", \"30\"], {detach: true})\nprint($p)\n")
+        .await
+        .expect("detached argv spawn");
+    let pid: i32 = out.trim().parse().expect("a numeric pid");
+    assert!(wait_for_exec(pid, "sleep"), "the returned pid must be the exec'd child");
+    let fields = proc_stat_fields(pid).expect("child alive");
+    let ppid: u32 = fields[1].parse().unwrap();
+    assert_ne!(ppid, std::process::id(), "detach:true must reparent the child away from the caller");
+    assert_eq!(fields[3], pid.to_string(), "the returned pid must still lead its own session");
+
+    unsafe { libc::kill(pid, libc::SIGKILL); }
+    let mut last_state = String::new();
+    for _ in 0..250 {
+        match proc_stat_fields(pid) {
+            None => return,
+            Some(f) => last_state = f[0].clone(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    panic!("killed detached child {pid} was never reaped (state {last_state}) — the caller still owns it");
+}
+
+#[tokio::test]
+async fn argv_without_detach_stays_the_callers_child() {
+    // Non-detached spawn keeps its semantics: a plain child of the caller.
+    let out = run("$p = spawn([\"sleep\", \"30\"])\nprint($p)\n")
+        .await
+        .expect("argv spawn");
+    let pid: i32 = out.trim().parse().expect("a numeric pid");
+    let fields = proc_stat_fields(pid).expect("child alive");
+    let ppid: u32 = fields[1].parse().unwrap();
+    assert_eq!(ppid, std::process::id(), "a non-detached child is the caller's");
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+}
+
+#[tokio::test]
+async fn argv_detach_still_reports_a_missing_binary() {
+    // The exec-error pipe must survive the double fork: a missing program is
+    // still a raise, not a pid of a grandchild that died on exec.
+    let e = run_err("spawn([\"/nonexistent/mix-p8-no-such-binary\"], {detach: true})\n").await;
+    assert!(format!("{e}").contains("spawn failed"), "got: {e}");
+}
+
 #[tokio::test]
 async fn argv_env_reaches_the_child() {
     let w = witness("env");
