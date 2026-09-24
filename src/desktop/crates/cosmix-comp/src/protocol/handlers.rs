@@ -1,4 +1,5 @@
 use super::*;
+use super::dmabuf_ledger::DmabufFailureReason;
 
 /// Publish the removal a subsurface re-create owes the renderer.
 ///
@@ -1922,10 +1923,18 @@ impl DmabufHandler for WaylandState {
                 %error,
                 "rejected invalid or unsupported DMA-BUF metadata"
             );
+            self.dmabuf_ledger.record_failed(
+                dmabuf.format(),
+                DmabufFailureReason::InvalidMetadata,
+                error.to_string(),
+            );
             notifier.failed();
             return;
         }
         let Some(validation) = &self.dmabuf_validation else {
+            // No probe: metadata validation is the whole check, so this is
+            // what comp accepted.
+            self.dmabuf_ledger.record_accepted();
             if let Err(error) = notifier.successful::<Self>() {
                 tracing::debug!(%error, "DMA-BUF client destroyed params during import");
             }
@@ -1947,6 +1956,11 @@ impl DmabufHandler for WaylandState {
                     %error,
                     "failed to duplicate DMA-BUF for asynchronous validation"
                 );
+                self.dmabuf_ledger.record_failed(
+                    dmabuf.format(),
+                    DmabufFailureReason::DescriptorDupFailed,
+                    error.to_string(),
+                );
                 notifier.failed();
                 return;
             }
@@ -1963,10 +1977,20 @@ impl DmabufHandler for WaylandState {
                     capacity = DMABUF_VALIDATION_QUEUE_CAPACITY,
                     "DMA-BUF validation queue is full; refusing import without blocking protocol"
                 );
+                self.dmabuf_ledger.record_failed(
+                    request.format,
+                    DmabufFailureReason::QueueFull,
+                    format!("validation queue full ({DMABUF_VALIDATION_QUEUE_CAPACITY})"),
+                );
                 request.notifier.failed();
             }
             Err(TrySendError::Disconnected(request)) => {
                 tracing::error!("DMA-BUF validation worker stopped");
+                self.dmabuf_ledger.record_failed(
+                    request.format,
+                    DmabufFailureReason::WorkerStopped,
+                    "validation worker stopped",
+                );
                 request.notifier.failed();
             }
         }

@@ -1774,6 +1774,27 @@ clients.</p>
 <tr><td><code>zwlr_screencopy_manager_v1</code></td><td style="text-align: right">3</td><td>Compatibility output capture into exact-layout <code>wl_shm</code> buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion.</td></tr>
 <tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below).</td></tr>
 </tbody></table>
+<h3 id="dma-buf-import-observations">DMA-BUF import observations</h3>
+<p>The linux-dmabuf format table says what the driver <em>claims</em> to support.
+The <code>dmabuf.*</code> properties say what comp actually <em>accepted</em>, which is a
+different fact. Every buffer a client asks comp to import through
+<code>zwp_linux_buffer_params_v1</code> is counted:</p>
+<ul>
+<li><code>dmabuf.accepted</code> counts accepted imports.</li>
+<li><code>dmabuf.failed</code> counts refused imports.</li>
+<li><code>dmabuf.failures</code> lists the newest 16 refusals, oldest first. Each is
+<code>{format, modifier, reason, detail, at_us}</code>: the fourcc as four
+characters, the modifier as <code>0x</code> plus 16 hex digits, a reason, the
+refusing check's own message, and the CLOCK_MONOTONIC µs it happened.</li>
+</ul>
+<p><code>reason</code> is one of <code>invalid_metadata</code> (comp's own size, plane or format
+checks), <code>vulkan_rejected</code> (the Vulkan test import on the renderer's
+device said no), <code>descriptor_dup_failed</code>, <code>queue_full</code>, <code>worker_stopped</code>,
+<code>probe_panicked</code> or <code>probe_retired</code> (refused because an earlier panic
+retired the probe). The leaves are read-only and volatile: <code>comp.props.get dmabuf</code> reads them, but they never appear in <code>props.changed</code>, because a
+refusal storm would flood the topic. They live in memory only and start
+from zero when comp starts. The advertised format set is not yet demoted
+from these observations.</p>
 <h3 id="presentation-feedback">Presentation feedback</h3>
 <p><code>wp_presentation</code> reports when a client's commit was actually shown. The
 global is advertised only once a backend has wired a frame reporter, so no

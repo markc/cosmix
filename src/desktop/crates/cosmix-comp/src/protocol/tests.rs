@@ -28685,6 +28685,79 @@ fn a_rejected_dmabuf_fails_that_import_only() {
     }
 }
 
+/// Every probe outcome lands in the import ledger that `dmabuf.*` props
+/// serve (TODO-comp C4): an accept counts, a driver rejection keeps its
+/// format, modifier and the probe's own message, and a panic retires the
+/// probe so the next buffer is recorded as refused by the retired probe
+/// without the probe being called.
+#[test]
+fn every_dmabuf_probe_outcome_is_recorded_in_the_import_ledger() {
+    use super::dmabuf_ledger::DmabufImportLedger;
+    let (validator, calls) = ScriptedValidator::new(vec![
+        ProbeStep::Accept,
+        ProbeStep::Reject,
+        ProbeStep::Panic,
+        ProbeStep::Accept,
+    ]);
+    let mut validator: Box<dyn ValidateDmabuf> = Box::new(validator);
+    let ledger = DmabufImportLedger::default();
+    let mut poisoned = false;
+    let format = smithay::backend::allocator::Format {
+        code: smithay::backend::allocator::Fourcc::Argb8888,
+        modifier: smithay::backend::allocator::Modifier::Linear,
+    };
+    let descriptor = || DmabufDescriptor {
+        explicit_acquire: false,
+        width: VALIDATION_WIDTH,
+        height: VALIDATION_HEIGHT,
+        fourcc: smithay::backend::allocator::Fourcc::Argb8888 as u32,
+        modifier: u64::from(smithay::backend::allocator::Modifier::Linear),
+        planes: vec![DmabufPlane {
+            fd: std::os::fd::OwnedFd::from(anonymous_plane(
+                "cosmix-dmabuf-ledger",
+                u64::from(VALIDATION_STRIDE) * u64::from(VALIDATION_HEIGHT),
+            )),
+            offset: 0,
+            stride: VALIDATION_STRIDE,
+        }],
+    };
+
+    let outcomes = (0..4)
+        .map(|_| {
+            validate_and_record(
+                validator.as_mut(),
+                &mut poisoned,
+                descriptor(),
+                format,
+                &ledger,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, [true, false, false, false]);
+    assert!(poisoned, "the panic retired the probe");
+    assert_eq!(
+        calls.lock().expect("probe call log mutex poisoned").len(),
+        3,
+        "the retired probe was not called for the fourth buffer"
+    );
+
+    let snapshot = ledger.snapshot();
+    assert_eq!((snapshot.accepted, snapshot.failed), (1, 3));
+    let reasons = snapshot
+        .failures
+        .iter()
+        .map(|record| record.reason)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        ["vulkan_rejected", "probe_panicked", "probe_retired"]
+    );
+    let rejected = &snapshot.failures[0];
+    assert_eq!(rejected.format, "AR24");
+    assert_eq!(rejected.modifier, "0x0000000000000000");
+    assert_eq!(rejected.detail, "scripted probe rejection");
+}
+
 /// The same rejection reached through `create_immed` must kill the client.
 ///
 /// `create_immed` promises the client a usable `wl_buffer` immediately, so there

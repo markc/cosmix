@@ -4766,6 +4766,7 @@ fn known_read_only_path(path: &str) -> bool {
         "focus",
         "decoration",
         "bindings",
+        "dmabuf",
         "port",
     ];
     #[cfg(feature = "xwayland")]

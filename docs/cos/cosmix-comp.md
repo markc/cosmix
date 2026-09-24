@@ -1452,6 +1452,30 @@ clients.
 | `zwlr_screencopy_manager_v1` | 3 | Compatibility output capture into exact-layout `wl_shm` buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion. |
 | `wp_presentation` | 2 | Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below). |
 
+### DMA-BUF import observations
+
+The linux-dmabuf format table says what the driver *claims* to support.
+The `dmabuf.*` properties say what comp actually *accepted*, which is a
+different fact. Every buffer a client asks comp to import through
+`zwp_linux_buffer_params_v1` is counted:
+
+- `dmabuf.accepted` counts accepted imports.
+- `dmabuf.failed` counts refused imports.
+- `dmabuf.failures` lists the newest 16 refusals, oldest first. Each is
+  `{format, modifier, reason, detail, at_us}`: the fourcc as four
+  characters, the modifier as `0x` plus 16 hex digits, a reason, the
+  refusing check's own message, and the CLOCK_MONOTONIC µs it happened.
+
+`reason` is one of `invalid_metadata` (comp's own size, plane or format
+checks), `vulkan_rejected` (the Vulkan test import on the renderer's
+device said no), `descriptor_dup_failed`, `queue_full`, `worker_stopped`,
+`probe_panicked` or `probe_retired` (refused because an earlier panic
+retired the probe). The leaves are read-only and volatile: `comp.props.get
+dmabuf` reads them, but they never appear in `props.changed`, because a
+refusal storm would flood the topic. They live in memory only and start
+from zero when comp starts. The advertised format set is not yet demoted
+from these observations.
+
 ### Presentation feedback
 
 `wp_presentation` reports when a client's commit was actually shown. The
