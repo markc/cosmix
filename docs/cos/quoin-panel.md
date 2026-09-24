@@ -98,6 +98,70 @@ rebuilds every open scene on demand.
 "Open calendar app" launches the first application in the `Calendar`
 category, falling back to `thunderbird -calendar`.
 
+### Agent verbs
+
+Send these to `quoin-panel` with a JSON object body (an absent body means
+`{}`). Success replies are JSON objects with rc 0. Bad arguments return rc 10
+with `{error: "invalid_request", detail: "..."}`; unknown fields are rejected.
+The scene click handlers above keep their toggle behaviour.
+
+| Verb | Arguments | Reply |
+|---|---|---|
+| `launcher.open` | `{query?, category?}` | Same as `launcher.state` |
+| `launcher.close` | `{}` | `{open: false}` |
+| `launcher.state` | `{}` | `{open, shown, query, category, count, items}` |
+| `launcher.search` | `{query, category?, limit?}` | `{query, category, count, items}` |
+| `launcher.launch` | `{id}` | `{launched: id}` |
+| `calendar.open`, `calendar.state` | `{}` | `{open, shown, month, year}` |
+| `calendar.close` | `{}` | `{open: false}` |
+| `notes.open`, `notes.state` | `{}` | `{open, shown, count}` |
+| `notes.close` | `{}` | `{open: false}` |
+| `popups.state` | `{}` | `{launcher, calendar, notes}` (booleans) |
+
+Open and close are idempotent. Opening a closed popup closes the other popups
+through the same generation-checked reveal/pin path as a click. Opening an
+already-open launcher preserves omitted filters; opening a closed launcher
+defaults them to empty strings. Numeric queries are converted to strings;
+other query values and categories must be strings. Open truncates the query
+to 128 characters and validates category against the launcher chips (case
+sensitive; `""` means all). Search accepts any apps category string.
+An already-open calendar retains its navigated month. Every open retries the
+render. `open` records intent; `shown` records whether the latest render had
+its load, page selection, reveal and pin accepted, not a compositor frame
+confirmation. A failed close returns rc 22 with
+`{error: "release_failed", open: false, edge}`. Repeated closes retry pending
+pin records, without releasing an edge another popup is using.
+Popup switches also return rc 22 if releasing the previous popup fails;
+the destination stays closed and another open retries the release.
+Scene launch/calendar actions dismiss shell-revealed popups even when the
+citizen has no open flag or pin record. A refused reveal is never pinned;
+both clicks and agent opens leave it retryable.
+
+Launcher items contain only `{id, name, generic_name, comment, icon, categories}`.
+`count` is the full matching count, before truncation; state includes at most
+50 items and uses the list cached for that exact query/category. Replies to
+obsolete fetches are discarded. When the cache needs fetching, an open
+launcher is re-rendered so its content and the reply stay together.
+Search always calls `apps.list`, changes no UI or cached state,
+and defaults category to `""` and limit to 50. Limit is a non-negative integer;
+zero returns only the count. There is no additional search limit cap.
+Launch requires a non-empty string id and closes the launcher only on success.
+If launch succeeds but release fails, rc 22 includes `launched: id` alongside
+the release error: retry `launcher.close`, not the launch.
+Apps and shell rc 0–9 count as success. Transport failures return rc 20 and
+`{error: "apps_transport", rc, reply}`; apps/broker refusals return rc 21 and
+`{error: "apps_refused", rc, reply}` (including nested rc 14 `not_found`).
+A non-list or malformed search reply returns rc 23 `apps_invalid_reply`.
+Notes count is the full cached notification count, even when the
+popup's 50-row display cap applies. Calendar month is 1–12 in local time.
+
+`COSMIX=<checkout> mix src/desktop/scripts/tests/panel-bus-test.mix` tests the
+production panel citizen over an isolated Bus broker with fixture dependencies.
+It checks delayed cache replies, refused reveals and release retries, search
+isolation, transport and peer rc handling, popup exclusivity, scene clicks and
+argument validation. Children use a cleared environment and explicit PATH;
+no live GUI is needed.
+
 ## Running it
 
 ```sh
