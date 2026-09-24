@@ -1062,45 +1062,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmix-agentd"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "cosmix-lib-agent",
- "cosmix-lib-bus",
- "cosmix-lib-config",
- "cosmix-lib-daemon",
- "cosmix-lib-llm",
- "cosmix-lib-log",
- "mimalloc",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "cosmix-app-identity"
 version = "0.2.0"
-
-[[package]]
-name = "cosmix-claud"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "cosmix-lib-bus",
- "cosmix-lib-config",
- "cosmix-lib-daemon",
- "cosmix-lib-llm",
- "cosmix-lib-log",
- "cosmix-lib-mix",
- "cosmix-lib-skills",
- "mimalloc",
- "serde_json",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "cosmix-dbusd"
@@ -1261,22 +1224,6 @@ version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "cosmix-lib-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "cosmix-lib-config",
- "cosmix-lib-llm",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]
