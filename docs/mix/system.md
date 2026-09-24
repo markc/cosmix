@@ -687,7 +687,7 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   is FREE as soon as the child exits and the kernel may hand it to an unrelated
   process: a later `kill($pid)` or `process_alive($pid)` can hit a stranger.
   A live pid only says SOME process holds that number; to stop a detached
-  daemon later, have it write its own pidfile or answer a Bus verb rather than
+  daemon later, have it write its own pidfile together with its start time (a pidfile alone does not establish process identity once the pid can be recycled) or answer a Bus verb rather than
   trusting a pid remembered from long ago. Default `false` (a plain child
   in the caller's session, which stays the caller's to reap).
 - `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)

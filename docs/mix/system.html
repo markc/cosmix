@@ -1014,7 +1014,7 @@ process, and it still leads its own session. Because init reaps it, the pid
 is FREE as soon as the child exits and the kernel may hand it to an unrelated
 process: a later <code>kill($pid)</code> or <code>process_alive($pid)</code> can hit a stranger.
 A live pid only says SOME process holds that number; to stop a detached
-daemon later, have it write its own pidfile or answer a Bus verb rather than
+daemon later, have it write its own pidfile together with its start time (a pidfile alone does not establish process identity once the pid can be recycled) or answer a Bus verb rather than
 trusting a pid remembered from long ago. Default <code>false</code> (a plain child
 in the caller's session, which stays the caller's to reap).</li>
 <li><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
