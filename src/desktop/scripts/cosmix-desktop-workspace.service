@@ -1,0 +1,47 @@
+# Example SYSTEM unit for the workspace-switching citizen (Bus service
+# `desktop`), which inputd's default RightCtrl+Left / RightCtrl+Right rows
+# fire. Not installed by default.
+#
+# Install: the citizen requires lib/workspace.mix beside it, so install BOTH
+# files into /opt/cosmix/share/desktop/:
+#   install -D -m 0644 src/desktop/scripts/desktop-workspace.mix /opt/cosmix/share/desktop/desktop-workspace.mix
+#   install -D -m 0644 src/desktop/scripts/lib/workspace.mix /opt/cosmix/share/desktop/lib/workspace.mix
+# STOP any existing `desktop` citizen first: two registrations of the same
+# service name are undefined. Then copy this file to /etc/systemd/system/,
+# replace the User=CHANGE-ME placeholder with the desktop user (systemd sets
+# HOME from it), and
+#   systemctl daemon-reload && systemctl enable --now cosmix-desktop-workspace.service
+#
+# The citizen only forwards Bus verbs to cosmix-comp; it opens no display, so
+# it needs no WAYLAND_DISPLAY / DISPLAY. It needs the local broker:
+# COSMIX_NODE_CONFIG names the node configuration and COSMIX_RUN the runtime
+# root holding noded's socket. COSMIX_DESKTOP_COMP_SERVICE names comp's Bus
+# service (default `comp`).
+#
+# Hosts with a user session manager can run it as a USER unit instead: drop
+# User=, the noded ordering and multi-user.target, and use
+#   PartOf=graphical-session.target / After=graphical-session.target /
+#   WantedBy=graphical-session.target  (installed to ~/.config/systemd/user/).
+[Unit]
+Description=CosMix workspace citizen (desktop.workspace.* -> comp.workspace.switch)
+After=cosmix-noded.service
+Wants=cosmix-noded.service
+
+[Service]
+Type=simple
+# The desktop user (placeholder, set per host):
+User=CHANGE-ME
+ExecStart=/opt/cosmix/bin/mix --serve /opt/cosmix/share/desktop/desktop-workspace.mix --name desktop
+Environment=COSMIX_NODE_CONFIG=/etc/cosmix/node.conf.mix
+Environment=COSMIX_RUN=/run/cosmix
+Environment=COSMIX_DESKTOP_COMP_SERVICE=comp
+Environment=MIX_STATS=off
+Restart=always
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

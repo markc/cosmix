@@ -1,0 +1,158 @@
+-- Workspace-switching library for the `desktop` citizen
+-- (../desktop-workspace.mix): request validation and reply shaping as pure
+-- functions (no `on` handlers, no Bus). The citizen and the unit test
+-- (../tests/workspace-test.mix) both require this module.
+--
+-- prepare() turns a request into either a refusal {rc, body} or a plan
+-- {kind, send: {service, verb, body}} naming exactly one comp call; finish()
+-- turns comp's answer into the reply.
+--
+-- next/prev send comp {index: "next"|"prev", wrap: true}: comp owns the
+-- workspace count, so the wrap at either end happens in comp, and `wrap` is
+-- sent explicitly so the citizen's behaviour does not ride comp's default.
+--
+-- Reply rc bands (Bus contract: 1..9 is delivered-with-warning SUCCESS, so
+-- every failure here is >= 10):
+--   10   the request is malformed (checked locally, never reaches comp)
+--   11   comp unreachable: no comp reply (negative send rc, or the broker's
+--        plain-text refusal such as an unregistered service)
+--   12   comp answered, but not in the shape its contract promises
+--   >=10 comp's own refusal, rc kept, its whole reply map under `comp`
+
+fn comp_service()
+  -- The comp Bus service the citizen forwards to (a nested comp registers
+  -- under another name).
+  return env("COSMIX_DESKTOP_COMP_SERVICE", "comp")
+end
+
+fn max_desktop()
+  -- comp's WORKSPACE_COUNT_MAX; comp still range-checks against the live count.
+  return 16
+end
+
+fn refuse($message)
+  return {rc: 10, body: {ok: false, error: $message}}
+end
+
+fn request_args($body)
+  -- {ok, args} for an empty body or a JSON object; {ok:false, error} else.
+  -- Reads the raw body rather than $event.args (the siblings' habit) because
+  -- $event.args is nil for BOTH an empty body and a non-JSON one, and only
+  -- the first is acceptable.
+  if $body == nil or trim($body) == "" then
+    return {ok: true, args: {}}
+  end
+  $v = nil
+  try
+    $v = json_parse($body)
+  catch $err
+    return {ok: false, error: "body is not JSON"}
+  end
+  if type($v) != "map" then
+    return {ok: false, error: "body must be a JSON object"}
+  end
+  return {ok: true, args: $v}
+end
+
+fn only_fields($args, $allowed)
+  -- The first field of $args not in $allowed, or nil.
+  for each $k in keys($args)
+    if not contains($allowed, $k) then
+      return $k
+    end
+  end
+  return nil
+end
+
+fn is_int($v)
+  return type($v) == "number" and floor($v) == $v
+end
+
+fn desktop_index($args)
+  -- A 1-based integer <= max_desktop() from {n}, or nil.
+  if not has_key($args, "n") then
+    return nil
+  end
+  $n = $args["n"]
+  if not is_int($n) or $n < 1 or $n > max_desktop() then
+    return nil
+  end
+  return $n
+end
+
+fn switch_plan($index)
+  return {kind: "switch", send: {service: comp_service(), verb: "comp.workspace.switch", body: {index: $index, wrap: true}}}
+end
+
+fn prepare($verb, $body)
+  -- $verb is the event's command, $body its raw body string.
+  $parsed = request_args($body)
+  if not $parsed.ok then
+    return refuse($verb .. ": " .. $parsed.error)
+  end
+  $args = $parsed.args
+  if $verb == "desktop.workspace.next" or $verb == "desktop.workspace.prev" or $verb == "desktop.workspace.current" then
+    $extra = only_fields($args, [])
+    if $extra != nil then
+      return refuse($verb .. " takes no fields (got " .. $extra .. ")")
+    end
+    if $verb == "desktop.workspace.next" then
+      return switch_plan("next")
+    end
+    if $verb == "desktop.workspace.prev" then
+      return switch_plan("prev")
+    end
+    -- The subtree, not the leaf: one read answers both current and count.
+    return {kind: "current", send: {service: comp_service(), verb: "comp.props.get", body: {path: "workspaces"}}}
+  end
+  if $verb == "desktop.workspace.set" then
+    $extra = only_fields($args, ["n"])
+    $n = desktop_index($args)
+    if $extra != nil or $n == nil then
+      return refuse("desktop.workspace.set needs exactly {n: <1.." .. to_string(max_desktop()) .. ">}")
+    end
+    return switch_plan($n)
+  end
+  return refuse("unknown verb " .. $verb)
+end
+
+fn malformed($reply)
+  return {rc: 12, body: {ok: false, error: "malformed comp reply", comp: $reply}}
+end
+
+fn finish($plan, $rc, $result, $reply)
+  -- The reply for comp's answer to the plan's send: $rc and $result as send
+  -- set them, $reply the parsed reply body (nil when there was none).
+  -- Success: switch -> {ok, from, to}; current -> {ok, desktop, count}.
+  -- No comp reply at all: the send failed (negative rc), or the broker
+  -- refused it in plain text (rc >= 10 with no parsed body, e.g. "Service
+  -- 'comp' not found"). Both mean comp is unreachable.
+  if $rc < 0 or ($rc >= 10 and type($reply) != "map") then
+    return {rc: 11, body: {ok: false, error: "comp unreachable: " .. to_string($result)}}
+  end
+  if $rc >= 10 then
+    -- comp's own refusal: every comp reply carries `error` and the stamped
+    -- `error_code` alias, plus detail fields such as path/expected/range.
+    $code = $rc > 255 ? 255 : $rc
+    $msg = to_string($result)
+    if type($reply.error) == "string" then
+      $msg = $reply.error
+    elif type($reply.error_code) == "string" then
+      $msg = $reply.error_code
+    end
+    return {rc: $code, body: {ok: false, error: $msg, comp: $reply}}
+  end
+  if type($reply) != "map" then
+    return malformed($reply)
+  end
+  if $plan.kind == "switch" then
+    if is_int($reply.from) and is_int($reply.to) then
+      return {rc: 0, body: {ok: true, from: $reply.from, to: $reply.to}}
+    end
+    return malformed($reply)
+  end
+  if is_int($reply.current) and is_int($reply.count) then
+    return {rc: 0, body: {ok: true, desktop: $reply.current, count: $reply.count}}
+  end
+  return malformed($reply)
+end

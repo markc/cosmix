@@ -1,11 +1,13 @@
 //! The `input.*` Bus verb surface, dispatched over the shared [`Resolver`].
 //!
 //! This module needs no keyboard at all — an agent or `inputctl` can query and
-//! rebind the keymap whether or not the evdev reader is running. Mutations
-//! (`bind`/`unbind`/`mode`/`reload`) are gated to node-local callers for now
-//! (the broker stamps `broker_origin: local`); remote mesh rebinds behind a
-//! mesh-trust capability are a P3 refinement. Reads (`query`) are open.
-//! Key and pointer injection are also mesh-reachable, with no node-local gate.
+//! rebind the keymap whether or not the evdev reader is running. Every verb is
+//! reachable by node-local AND mesh callers (full mesh access, Mark
+//! 2026-09-15): the broker stamps `broker_origin` (`local` or `mesh`) from the
+//! source socket, and membership of the WG mesh is the whole authorization.
+//! The opt-in lock `COSMIX_MESH_OPEN=0` (read once at process start) restores
+//! the old rule for the keymap mutations (`bind`/`unbind`/`mode`/`reload`):
+//! node-local callers only. Reads and key/pointer injection are never gated.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -72,18 +74,39 @@ pub fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
 /// The resolver shared between the Bus service and the (optional) evdev reader.
 pub type Shared = Arc<Mutex<Resolver>>;
 
-/// Where the keymap lives and whether this process may write it.
+/// The mesh posture from the environment: open (the default) unless
+/// `COSMIX_MESH_OPEN` is exactly `0`, the opt-in lock. The same switch, same
+/// name and same rule as the clipboard citizen's `mesh_open()`. `main` reads
+/// it ONCE at start, so a running unit must be restarted to flip it.
+pub fn mesh_open_from_env() -> bool {
+    mesh_open_value(std::env::var("COSMIX_MESH_OPEN").ok().as_deref())
+}
+
+fn mesh_open_value(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Where the keymap lives, whether this process may write it, and the mesh
+/// posture the mutation verbs are served under.
 ///
 /// The CONFIGURED path is kept even when writing is disabled, so `input.reload`
 /// can still read it (and re-enable writing once the operator has fixed it) and
 /// replies can say truthfully why a rebind was not persisted.
-#[derive(Default)]
 pub struct Store {
     path: Option<PathBuf>,
     /// Where THIS process moved an unusable keymap document at startup.
     recovered_from: Option<PathBuf>,
     /// `Some("<path>: <reason>")` while the path must not be written.
     persist_disabled: Mutex<Option<String>>,
+    /// `true` (the default): mesh callers reach the keymap mutations. `false`
+    /// is the opt-in lock (`COSMIX_MESH_OPEN=0`): node-local callers only.
+    mesh_open: bool,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store::new(None, None, None)
+    }
 }
 
 impl Store {
@@ -96,7 +119,14 @@ impl Store {
             path,
             recovered_from,
             persist_disabled: Mutex::new(persist_disabled),
+            mesh_open: true,
         }
+    }
+
+    /// Set the mesh posture (see [`mesh_open_from_env`]).
+    pub fn with_mesh_open(mut self, mesh_open: bool) -> Self {
+        self.mesh_open = mesh_open;
+        self
     }
 
     fn disabled(&self) -> Option<String> {
@@ -115,10 +145,10 @@ pub fn dispatch(
 ) -> (u8, String) {
     match cmd.command.as_str() {
         verbs::QUERY => query(resolver, store),
-        verbs::BIND => guard_local(cmd, || bind(resolver, store, &cmd.body)),
-        verbs::UNBIND => guard_local(cmd, || unbind(resolver, store, &cmd.body)),
-        verbs::MODE => guard_local(cmd, || mode(resolver, &cmd.body)),
-        verbs::RELOAD => guard_local(cmd, || reload(resolver, store)),
+        verbs::BIND => guard_mutation(store, cmd, || bind(resolver, store, &cmd.body)),
+        verbs::UNBIND => guard_mutation(store, cmd, || unbind(resolver, store, &cmd.body)),
+        verbs::MODE => guard_mutation(store, cmd, || mode(resolver, &cmd.body)),
+        verbs::RELOAD => guard_mutation(store, cmd, || reload(resolver, store)),
         verbs::KEY => key(injector, &cmd.body),
         verbs::POINTER_MOVE | verbs::POINTER_BUTTON | verbs::POINTER_SCROLL => {
             pointer(injector, &cmd.command, &cmd.body)
@@ -189,19 +219,29 @@ fn persist(resolver: &Shared, store: &Store, reply: &mut Value) {
     }
 }
 
-/// The broker stamps `broker_origin` from the source socket; a node-local
-/// caller (loopback/same-node) is stamped `local`. Keymap mutations require it.
-fn guard_local(cmd: &IncomingCommand, apply: impl FnOnce() -> (u8, String)) -> (u8, String) {
-    let local = cmd
+/// Admission for the keymap mutations. noded stamps `broker_origin` from the
+/// source socket (a client-supplied value is stripped, so it cannot be
+/// forged): `local` for a same-node caller, `mesh` for an admitted WG peer.
+/// Open posture (the default): both are admitted — being on the mesh is the
+/// whole authorization. Lock (`COSMIX_MESH_OPEN=0`): `local` only. A command
+/// with neither stamp did not come through the broker and is refused in both.
+fn guard_mutation(
+    store: &Store,
+    cmd: &IncomingCommand,
+    apply: impl FnOnce() -> (u8, String),
+) -> (u8, String) {
+    let origin = cmd
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
-        .map(|(_, value)| value == "local")
-        .unwrap_or(false);
-    if local {
-        apply()
-    } else {
-        error("input mutations require a node-local caller (remote rebind is gated, P3)")
+        .map(|(_, value)| value.as_str());
+    match origin {
+        Some("local") => apply(),
+        Some("mesh") if store.mesh_open => apply(),
+        Some("mesh") => error(
+            "input mutations require a node-local caller (mesh access locked: COSMIX_MESH_OPEN=0)",
+        ),
+        _ => error("input mutations require a broker-stamped caller (broker_origin local or mesh)"),
     }
 }
 
@@ -334,6 +374,30 @@ fn reload(resolver: &Shared, store: &Store) -> (u8, String) {
         // in place and the live keymap is unchanged. The reply names the real
         // state: configured but unusable, plus why writing is off if it is.
         Err(load_error) => {
+            // A file sits at the path that is unusable (bad JSON, a newer
+            // version, ...) or unreadable (EACCES/EIO/EISDIR — it may well be
+            // valid). The next bind/unbind would rename our document over it
+            // with no backup, so writing goes off until a good reload — the
+            // startup rule, applied at runtime. An existing reason is kept.
+            // Absent is different: nothing of the user's is there, so writing
+            // stays on and the next bind creates the file.
+            let state = match &load_error {
+                keymap_file::LoadError::Invalid(reason, _) => Some(format!("unusable ({reason})")),
+                keymap_file::LoadError::Io(reason) => Some(format!("unreadable ({reason})")),
+                keymap_file::LoadError::Absent => None,
+            };
+            if let Some(state) = state {
+                store
+                    .persist_disabled
+                    .lock()
+                    .expect("store poisoned")
+                    .get_or_insert_with(|| {
+                        let why =
+                            format!("{}: {state}; left in place by input.reload", path.display());
+                        eprintln!("cosmix-inputd: keymap persistence disabled: {why}");
+                        why
+                    });
+            }
             let mut reply = json!({
                 "error": format!(
                     "keymap file {} could not be read: {}",
@@ -571,10 +635,169 @@ mod tests {
         let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("key injection failed"));
+        // Under the opt-in lock the keymap gate is still in force for mesh.
         let cmd = command(verbs::MODE, json!({"mode": "transparent"}), Some("mesh"));
-        let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
+        let locked = Store::default().with_mesh_open(false);
+        let (rc, reply) = dispatch(&resolver(), &locked, &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("node-local caller"));
+    }
+
+    #[test]
+    fn the_lock_never_gates_injection() {
+        // The lock covers the four keymap mutations only: a mesh key and
+        // pointer injection still reach the device under it.
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut injector = PointerInjector::with_test_file(File::from(OwnedFd::from(writer)));
+        let locked = Store::default().with_mesh_open(false);
+        for (verb, body, frames) in [
+            (verbs::KEY, json!({"key": "F9", "action": "press"}), 2),
+            (verbs::POINTER_MOVE, json!({"dx": 1, "dy": 2}), 3),
+        ] {
+            let cmd = command(verb, body, Some("mesh"));
+            let (rc, reply) = dispatch(&resolver(), &locked, &mut injector, &cmd);
+            assert_eq!(rc, 0, "{verb}: {reply}");
+            let mut event = [0; 24];
+            for _ in 0..frames {
+                reader.read_exact(&mut event).unwrap();
+            }
+        }
+        // Exactly the expected frames: nothing further is readable.
+        reader.set_nonblocking(true).unwrap();
+        let extra = reader.read(&mut [0; 24]);
+        assert!(
+            matches!(&extra, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "unexpected extra frame: {extra:?}"
+        );
+    }
+
+    #[test]
+    fn mesh_open_switch_locks_only_on_exactly_zero() {
+        // Same rule as the clipboard citizen: env("COSMIX_MESH_OPEN","1") != "0".
+        assert!(mesh_open_value(None));
+        assert!(mesh_open_value(Some("1")));
+        assert!(mesh_open_value(Some("")));
+        assert!(mesh_open_value(Some("false")));
+        assert!(!mesh_open_value(Some("0")));
+        assert!(Store::default().mesh_open, "open is the default posture");
+    }
+
+    fn run_as(
+        resolver: &Shared,
+        store: &Store,
+        origin: Option<&str>,
+        verb: &str,
+        body: Value,
+    ) -> (u8, Value) {
+        let mut injector = PointerInjector::default();
+        let cmd = command(verb, body, origin);
+        let (rc, reply) = dispatch(resolver, store, &mut injector, &cmd);
+        (rc, serde_json::from_str(&reply).unwrap())
+    }
+
+    #[test]
+    fn a_mesh_caller_reaches_every_keymap_mutation_by_default() {
+        let (dir, path) = keymap_dir("mesh-open", r#"{"version":1,"physical":[]}"#);
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let before = resolver.lock().unwrap().generation();
+        let mesh = Some("mesh");
+        // bind: reaches the live keymap, bumps the generation, persists.
+        let (rc, reply) = run_as(&resolver, &store, mesh, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        let bound = reply["generation"].as_u64().unwrap();
+        assert!(bound > before, "{reply}");
+        assert_eq!(resolver.lock().unwrap().generation(), bound);
+        assert!(
+            resolver
+                .lock()
+                .unwrap()
+                .physical_rows()
+                .iter()
+                .any(|r| r.action.as_str() == "user.f05")
+        );
+        let written = keymap_file::load(&path).unwrap();
+        assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
+        // unbind, mode and reload too.
+        let (rc, reply) = run_as(&resolver, &store, mesh, verbs::UNBIND, json!({"code":63}));
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply["generation"].as_u64().unwrap() > bound, "{reply}");
+        assert!(reply.get("removed").is_none(), "a live row was removed: {reply}");
+        let (rc, reply) = run_as(&resolver, &store, mesh, verbs::MODE, json!({"mode":"transparent"}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["mode"], "transparent");
+        let (rc, reply) = run_as(&resolver, &store, mesh, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["ok"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mesh_bind_is_still_held_to_admission() {
+        // Opening the gate removes "who may", not "is this well-formed": an
+        // invalid row from a mesh caller is refused exactly as from a local one
+        // and leaves the generation where it was.
+        let resolver = resolver();
+        let before = resolver.lock().unwrap().generation();
+        let bad = json!({"layer":"physical","stroke":{"code":63},"action":"x","service":"Desktop"});
+        for origin in [Some("mesh"), Some("local")] {
+            let (rc, reply) = run_as(&resolver, &Store::default(), origin, verbs::BIND, bad.clone());
+            assert_eq!(rc, 10, "{origin:?}: {reply}");
+            assert!(reply["error"].as_str().unwrap().contains("rebind refused"), "{reply}");
+        }
+        assert_eq!(resolver.lock().unwrap().generation(), before);
+    }
+
+    #[test]
+    fn the_lock_restores_the_node_local_rule() {
+        let (dir, path) = keymap_dir("mesh-locked", r#"{"version":1,"physical":[]}"#);
+        let store = Store::new(Some(path.clone()), None, None).with_mesh_open(false);
+        let resolver = resolver();
+        let before = resolver.lock().unwrap().generation();
+        let rows_before = resolver.lock().unwrap().physical_rows().to_vec();
+        for (verb, body) in [
+            (verbs::BIND, bind_row()),
+            (verbs::UNBIND, json!({"code":106,"modifiers":{"right_ctrl":true}})),
+            (verbs::MODE, json!({"mode":"transparent"})),
+            (verbs::RELOAD, json!({})),
+        ] {
+            let (rc, reply) = run_as(&resolver, &store, Some("mesh"), verb, body);
+            assert_eq!(rc, 10, "{verb}: {reply}");
+            let error = reply["error"].as_str().unwrap();
+            assert!(error.contains("node-local caller"), "{verb}: {error}");
+            assert!(error.contains("COSMIX_MESH_OPEN=0"), "{verb}: {error}");
+        }
+        {
+            let live = resolver.lock().unwrap();
+            assert_eq!(live.generation(), before, "nothing applied");
+            assert_eq!(live.physical_rows(), rows_before.as_slice());
+            assert_eq!(live.mode(), InputMode::Normal);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"version":1,"physical":[]}"#,
+            "file untouched"
+        );
+        // Local callers are unaffected by the lock.
+        let (rc, reply) = run_as(&resolver, &store, Some("local"), verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unstamped_caller_is_refused_in_both_postures() {
+        for store in [Store::default(), Store::default().with_mesh_open(false)] {
+            let resolver = resolver();
+            for origin in [None, Some("peer"), Some("")] {
+                let (rc, reply) = run_as(&resolver, &store, origin, verbs::BIND, bind_row());
+                assert_eq!(rc, 10, "{origin:?}: {reply}");
+                assert!(reply["error"].as_str().unwrap().contains("broker-stamped"), "{reply}");
+            }
+            assert_eq!(resolver.lock().unwrap().generation(), 0);
+        }
     }
 
     #[test]
@@ -777,6 +1000,124 @@ mod tests {
         assert!(reply.get("persisted").is_none(), "{reply}");
         let written = keymap_file::load(&path).unwrap();
         assert_eq!(written.rows.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_version_placed_at_runtime_is_never_overwritten() {
+        // Persistence was ON (startup was clean). A newer-version document
+        // then lands at the path; before the fix, reload refused it but the
+        // next bind renamed a version-1 document over it with no backup.
+        let current = r#"{"version":1,"physical":[]}"#;
+        let (dir, path) = keymap_dir("runtime-newer", current);
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let newer = format!(
+            r#"{{"version":{},"physical":[]}}"#,
+            cosmix_input_schema::KEYMAP_SCHEMA_VERSION + 1
+        );
+        std::fs::write(&path, &newer).unwrap();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        assert!(reply["error"].as_str().unwrap().contains("is newer than"), "{reply}");
+        let disabled = reply["persist_disabled"].as_str().expect("writing turned off");
+        assert!(disabled.contains(&path.display().to_string()), "{disabled}");
+        assert!(disabled.contains("is newer than"), "{disabled}");
+        // bind/unbind still change the live table but never touch the file.
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], disabled);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "unchanged after bind");
+        let (rc, reply) = run(&resolver, &store, verbs::UNBIND, json!({"code":63}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], disabled);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer, "unchanged after unbind");
+        // The operator restores a current-version file: reload re-enables.
+        std::fs::write(&path, current).unwrap();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persist_reenabled"], disabled);
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        let written = keymap_file::load(&path).expect("bind persisted a loadable file");
+        assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reload_read_error_disables_writing_until_a_good_reload() {
+        // A VALID file the daemon cannot read (mode 0000, EACCES). The whole
+        // sequence runs in one child process (one Store), dropped to uid 65534
+        // when started as root, since root bypasses the mode bits. The file is
+        // owned by the child's uid so it can restore the mode itself, and the
+        // directory is world-writable so a wrong save WOULD succeed.
+        use crate::keymap_file::tests::{chmod, run_perm_child_in, scratch_tmp};
+        let dir = scratch_tmp("reload-eacces");
+        chmod(&dir, 0o777);
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, r#"{"version":1,"physical":[]}"#).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path and plain ids.
+            assert_eq!(unsafe { libc::chown(c_path.as_ptr(), 65534, 65534) }, 0);
+        }
+        chmod(&path, 0o000);
+        run_perm_child_in("service::tests", "perm_child_reload_eacces", &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn perm_child_reload_eacces() {
+        let Some(dir) = crate::keymap_file::tests::perm_child("perm_child_reload_eacces") else {
+            return;
+        };
+        let path = dir.join("keymap.json");
+        let valid = r#"{"version":1,"physical":[]}"#;
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        let disabled = reply["persist_disabled"].as_str().expect("writing turned off");
+        assert!(disabled.starts_with(&path.display().to_string()), "{disabled}");
+        assert!(disabled.contains("unreadable (open failed"), "{disabled}");
+        assert!(disabled.ends_with("left in place by input.reload"), "{disabled}");
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], disabled);
+        // The operator restores the mode: the file was never touched.
+        crate::keymap_file::tests::chmod(&path, 0o644);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), valid);
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persist_reenabled"], disabled);
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        let written = keymap_file::load(&path).expect("bind persisted a loadable file");
+        assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
+    }
+
+    #[test]
+    fn a_reload_of_a_missing_file_leaves_writing_on() {
+        // Unchanged behaviour: rc 10 "could not be read: absent", no
+        // persist_disabled, and the next bind creates the file.
+        let (dir, path) = keymap_dir("reload-absent", "{}");
+        std::fs::remove_file(&path).unwrap();
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        assert!(reply["error"].as_str().unwrap().ends_with("could not be read: absent"), "{reply}");
+        assert!(reply.get("persist_disabled").is_none(), "{reply}");
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        assert!(keymap_file::load(&path).is_ok(), "bind created the file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

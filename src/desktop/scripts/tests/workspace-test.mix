@@ -1,0 +1,145 @@
+-- Deterministic tests for the workspace citizen's request validation and
+-- reply shaping (lib/workspace.mix); no Bus, no compositor, nothing switches.
+-- Run from the repo root: mix src/desktop/scripts/tests/workspace-test.mix
+--
+-- finish() is fed what `send` really sets: $reply is the parsed reply MAP
+-- (never a JSON string) whenever comp answered, and nil when the send got
+-- no reply; $result is that same map, or the reason string when there was
+-- no map. NOT covered here, because they need a broker: desktop-workspace.mix's
+-- respond() itself — the early return of a refused plan, the send with its
+-- timeout, and the two "internal:" catch arms.
+$w = require("../lib/workspace.mix")
+fn check($condition, $message)
+  if not $condition then raise("WORKSPACE_TEST", $message) end
+end
+fn same($a, $b)
+  -- Structural comparison through the canonical encoding (Mix map == is
+  -- identity-blind; both sides are built with the same key order here).
+  return json_encode($a) == json_encode($b)
+end
+fn sorted_keys($m)
+  return sort(keys($m))
+end
+$prev_service = env("COSMIX_DESKTOP_COMP_SERVICE", "")
+export COSMIX_DESKTOP_COMP_SERVICE = ""
+try
+  -- ── next / prev: one comp.workspace.switch, relative, wrap explicit ──
+  for each $dir in ["next", "prev"]
+    $verb = "desktop.workspace." .. $dir
+    for each $empty in ["", "   ", "{}", nil]
+      $p = $w.prepare($verb, $empty)
+      check($p.rc == nil and $p.kind == "switch", $verb .. " with an empty body was refused: " .. json_encode($p))
+      check($p.send.service == "comp", $verb .. " went to " .. $p.send.service)
+      check($p.send.verb == "comp.workspace.switch", $verb .. " sent " .. $p.send.verb)
+      $body = json_parse(json_encode($p.send.body))
+      check(same(sorted_keys($body), ["index", "wrap"]) and $body["index"] == $dir and $body["wrap"] == true, $verb .. " body wrong: " .. json_encode($body))
+    end
+  end
+
+  -- ── wrap: comp does the arithmetic; its {from,to} is relayed as-is ──
+  -- next from the last of 4 lands on 1, prev from 1 lands on 4.
+  $next = $w.prepare("desktop.workspace.next", "")
+  $prev = $w.prepare("desktop.workspace.prev", "")
+  for each $case in [[$next, 4, 1], [$prev, 1, 4], [$next, 2, 3], [$prev, 3, 2], [$next, 1, 1]]
+    $comp = {output: "o_a", from: $case[1], to: $case[2]}
+    $r = $w.finish($case[0], 0, $comp, $comp)
+    check($r.rc == 0 and same($r.body, {ok: true, from: $case[1], to: $case[2]}), "switch reply not relayed: " .. json_encode($r))
+  end
+
+  -- ── comp refusals: rc kept, message from comp, whole map under `comp` ──
+  -- Fixtures are comp's wire shapes: the builder's `error` (+ detail,
+  -- cosmix-comp protocol/window_control.rs:441-443 for an index refusal)
+  -- with `error_code` stamped on every reply by PendingReply::new ->
+  -- with_error_code (cosmix-comp port.rs:1270, 460-474). Both are rc 10.
+  $locked = {error: "locked", error_code: "locked"}
+  $r = $w.finish($next, 10, $locked, $locked)
+  check($r.rc == 10 and same(sorted_keys($r.body), ["comp", "error", "ok"]), "refusal keys wrong: " .. json_encode($r))
+  check($r.body.ok == false and $r.body.error == "locked" and $r.body.comp.error_code == "locked", "comp refusal not relayed structurally: " .. json_encode($r))
+  $range = {error: "invalid_value", path: "index", expected: "unsigned integer", range: "1..=4", error_code: "invalid_value"}
+  $set9 = $w.prepare("desktop.workspace.set", "{\"n\":9}")
+  $r = $w.finish($set9, 10, $range, $range)
+  check($r.rc == 10 and $r.body.error == "invalid_value" and $r.body.comp.path == "index" and $r.body.comp.range == "1..=4" and $r.body.comp.expected == "unsigned integer" and $r.body.comp.error_code == "invalid_value", "invalid_value lost its fields: " .. json_encode($r))
+  -- A refusal map with only `error_code` names that code as the error.
+  $odd = {error_code: "busy"}
+  $r = $w.finish($next, 10, $odd, $odd)
+  check($r.rc == 10 and $r.body.error == "busy" and $r.body.comp.error_code == "busy", "error_code-only refusal mishandled: " .. json_encode($r))
+  -- A refusal map with neither falls back to $result's text.
+  $bare = {reason: "x"}
+  $r = $w.finish($next, 10, "refused", $bare)
+  check($r.rc == 10 and $r.body.error == "refused" and $r.body.comp.reason == "x", "code-less refusal mishandled: " .. json_encode($r))
+  -- The broker's plain-text refusal (comp not registered) carries no comp
+  -- reply: it is comp unreachable, rc 11, never rc 10 "malformed request".
+  $r = $w.finish($next, 10, "Service 'comp' not found", nil)
+  check($r.rc == 11 and same($r.body, {ok: false, error: "comp unreachable: Service 'comp' not found"}), "broker refusal wrong: " .. json_encode($r))
+  -- An rc above 255 is clamped into the reply range.
+  $r = $w.finish($next, 300, $locked, $locked)
+  check($r.rc == 255, "rc not clamped: " .. json_encode($r))
+
+  -- ── no reply at all: comp unreachable, rc 11 ──
+  for each $neg in [-1, -2, -3]
+    $r = $w.finish($next, $neg, "Bus unavailable", nil)
+    check($r.rc == 11 and same($r.body, {ok: false, error: "comp unreachable: Bus unavailable"}), "unreachable comp wrong for rc " .. to_string($neg) .. ": " .. json_encode($r))
+  end
+
+  -- ── comp answered off-contract: rc 12, never ok with a nil field ──
+  for each $bad in [{output: "o_a"}, {from: 1, to: "two"}, {from: 1.5, to: 2}, "ok", 3, nil]
+    $r = $w.finish($next, 0, $bad, $bad)
+    check($r.rc == 12 and $r.body.ok == false and $r.body.error == "malformed comp reply", "malformed comp switch reply accepted: " .. json_encode($bad))
+  end
+  -- rc 1..9 is a delivered-with-warning success, read like rc 0.
+  $comp = {output: "o_a", from: 1, to: 2}
+  $r = $w.finish($next, 3, $comp, $comp)
+  check($r.rc == 0 and same($r.body, {ok: true, from: 1, to: 2}), "warning rc not treated as success: " .. json_encode($r))
+
+  -- ── set {n}: absolute index, validated before it reaches comp ──
+  for each $n in [1, 2, 16]
+    $p = $w.prepare("desktop.workspace.set", json_encode({n: $n}))
+    check($p.kind == "switch" and $p.send.verb == "comp.workspace.switch" and same($p.send.body, {index: $n, wrap: true}), "set " .. to_string($n) .. " wrong: " .. json_encode($p))
+  end
+
+  -- ── current: one comp.props.get of the workspaces subtree ──
+  $cur = $w.prepare("desktop.workspace.current", "")
+  check($cur.kind == "current" and $cur.send.service == "comp" and $cur.send.verb == "comp.props.get", "current plan wrong: " .. json_encode($cur))
+  check(same($cur.send.body, {path: "workspaces"}), "current body wrong: " .. json_encode($cur.send.body))
+  $tree = {count: 4, current: 3, list: [{index: 1}, {index: 2}, {index: 3}, {index: 4}]}
+  $r = $w.finish($cur, 0, $tree, $tree)
+  check($r.rc == 0 and same($r.body, {ok: true, desktop: 3, count: 4}), "current reply shape wrong: " .. json_encode($r))
+  for each $bad in [{current: 3}, {count: 4}, {current: "3", count: 4}, 3, nil]
+    $r = $w.finish($cur, 0, $bad, $bad)
+    check($r.rc == 12 and $r.body.ok == false, "off-contract current accepted: " .. json_encode($bad))
+  end
+  -- A pre-count comp: rc 12 with the subtree it did send under `comp`.
+  $old = {current: 2, list: []}
+  $r = $w.finish($cur, 0, $old, $old)
+  check($r.rc == 12 and $r.body.error == "malformed comp reply" and $r.body.comp.current == 2, "pre-count subtree not relayed: " .. json_encode($r))
+
+  -- ── malformed requests: rc 10, exact refusal shape, never reach comp ──
+  $bad_cases = [
+    ["desktop.workspace.next", "not json"],
+    ["desktop.workspace.next", "[1,2]"],
+    ["desktop.workspace.next", "\"next\""],
+    ["desktop.workspace.prev", "{\"index\":3}"],
+    ["desktop.workspace.current", "{\"path\":\"x\"}"],
+    ["desktop.workspace.set", ""],
+    ["desktop.workspace.set", "{}"],
+    ["desktop.workspace.set", "{\"n\":0}"],
+    ["desktop.workspace.set", "{\"n\":-1}"],
+    ["desktop.workspace.set", "{\"n\":1.5}"],
+    ["desktop.workspace.set", "{\"n\":17}"],
+    ["desktop.workspace.set", "{\"n\":\"2\"}"],
+    ["desktop.workspace.set", "{\"n\":2,\"wrap\":false}"],
+    ["desktop.workspace.jump", ""]]
+  for each $case in $bad_cases
+    $p = $w.prepare($case[0], $case[1])
+    check($p.rc == 10 and same(sorted_keys($p), ["body", "rc"]) and same(sorted_keys($p.body), ["error", "ok"]), "malformed request plan wrong: " .. json_encode($case) .. " -> " .. json_encode($p))
+    check($p.body.ok == false and type($p.body.error) == "string" and $p.body.error != "", "malformed request accepted: " .. json_encode($case))
+  end
+
+  -- ── the comp service name is configurable (a nested comp) ──
+  export COSMIX_DESKTOP_COMP_SERVICE = "comp-nested"
+  check($w.prepare("desktop.workspace.next", "").send.service == "comp-nested", "COSMIX_DESKTOP_COMP_SERVICE ignored")
+
+  print("PASS workspace next/prev/set plans (comp.workspace.switch, wrap:true), {from,to} relayed incl. wrap, comp refusals structured under comp (rc kept), unreachable rc 11, off-contract rc 12, current {desktop,count} from one subtree read, malformed requests rc 10 exact shape")
+finally
+  export COSMIX_DESKTOP_COMP_SERVICE = $prev_service
+end
