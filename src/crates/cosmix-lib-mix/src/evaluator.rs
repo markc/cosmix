@@ -1778,9 +1778,10 @@ pub trait BusHandler {
     /// `$result` reduces an `{"error": …}` refusal to its message string on
     /// purpose; `$reply` keeps every field (`occluded.under`,
     /// `stale_target.current`, …). The default derives it from `send`'s
-    /// result — exact for a success and for an `error_code` map, `Nil` for a
-    /// reduced error string — so a handler that can see the raw body
-    /// overrides this.
+    /// result: a map/list/number/bool/nil passes through, and any STRING is
+    /// `Nil` — it cannot tell a JSON string body from a non-JSON one (or from
+    /// a reduced error message), and the manual promises nil for non-JSON.
+    /// A handler that can see the raw body overrides this.
     fn send_with_reply<'a>(
         &'a self,
         target: &'a str,
@@ -1790,7 +1791,7 @@ pub trait BusHandler {
         Box::pin(async move {
             let (rc, result) = self.send(target, command, args).await?;
             let reply = match &result {
-                Value::String(_) if rc >= 10 => Value::Nil,
+                Value::String(_) => Value::Nil,
                 other => other.clone(),
             };
             Ok((rc, result, reply))

@@ -5335,6 +5335,42 @@ mod rc_band_contract_tests {
         let eval = run("send svc ping\n", Some(std::rc::Rc::new(RcHandler { send_rc: Some(0) }))).await;
         assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
         assert_eq!(eval.get_global("result").unwrap(), Value::Nil);
+
+        // A send-only handler's success STRING (which may have been a
+        // non-JSON body) is nil in `$reply`, as the manual promises; a
+        // non-string value passes through.
+        struct Fixed(Value);
+        impl BusHandler for Fixed {
+            fn send<'a>(
+                &'a self,
+                _t: &'a str,
+                _c: &'a str,
+                _a: &'a Value,
+            ) -> BusFuture<'a, MixResult<(i32, Value)>> {
+                let v = self.0.clone();
+                Box::pin(async move { Ok((0, v)) })
+            }
+            fn emit<'a>(
+                &'a self,
+                _t: &'a str,
+                _c: &'a str,
+                _a: &'a Value,
+            ) -> BusFuture<'a, MixResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn port_exists<'a>(&'a self, _t: &'a str) -> BusFuture<'a, MixResult<bool>> {
+                Box::pin(async { Ok(false) })
+            }
+            fn next_incoming<'a>(&'a self) -> BusFuture<'a, Option<IncomingEvent>> {
+                Box::pin(async { None })
+            }
+        }
+        let text = Value::String("# markdown".into());
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(Fixed(text.clone())))).await;
+        assert_eq!(eval.get_global("result").unwrap(), text);
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(Fixed(Value::Number(2.0))))).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Number(2.0));
     }
 }
 
