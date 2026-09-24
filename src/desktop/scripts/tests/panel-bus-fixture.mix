@@ -1,0 +1,70 @@
+-- Bus-only dependencies for panel-bus-test.mix. No desktop or app effects.
+$edges = {left: {pinned: false, visible: false}, right: {pinned: false, visible: false}, bottom: {pinned: false, visible: false}}
+$lists = 0
+$loads = 0
+$launches = []
+
+on "shell.scene.load"
+  $loads = $loads + 1
+  reply(0, json_encode({revision: $loads}))
+end
+on "shell.panel.page.set"
+  reply(0, "{}")
+end
+on "shell.panel.show"
+  $edges[$event.args.edge].visible = true
+  reply(0, "{}")
+end
+on "shell.panel.pin"
+  $edges[$event.args.edge].pinned = true
+  reply(0, "{}")
+end
+on "shell.panel.unpin"
+  $edges[$event.args.edge].pinned = false
+  reply(0, "{}")
+end
+on "shell.panel.hide"
+  $edges[$event.args.edge].visible = false
+  reply(0, "{}")
+end
+on "shell.props.get"
+  reply(0, json_encode($edges[after($event.args.path, "panels.")]))
+end
+on "comp.windows.list"
+  reply(0, json_encode({windows: []}))
+end
+on "comp.props.get"
+  reply(0, json_encode({count: 1, current: 1}))
+end
+on "comp.props.watch"
+  reply(0, "{}")
+end
+on "tray.list"
+  reply(0, json_encode({items: []}))
+end
+on "notify.props.get"
+  reply(0, json_encode({n1: {app: "Fixture", summary: "Hello", body: "Test", created_at: "1"}}))
+end
+on "apps.icon"
+  reply(0, json_encode({path: ""}))
+end
+on "apps.list"
+  $lists = $lists + 1
+  $items = []
+  for each $i in range(1, 60)
+    push($items, {id: "app-" .. to_string($i), name: "Fixture " .. ($event.args.query ?? ""),
+      generic_name: "Utility", comment: "Test app", icon: "", categories: [$event.args.category ?? ""]})
+  end
+  reply(0, json_encode($items))
+end
+on "apps.launch"
+  if $event.args.id != "app-1" then
+    reply(14, json_encode({error: "not_found"}))
+  else
+    push($launches, $event.args.id)
+    reply(0, json_encode({pid: 123}))
+  end
+end
+on fixture.state
+  reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches}))
+end

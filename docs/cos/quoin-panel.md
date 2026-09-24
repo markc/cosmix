@@ -98,6 +98,49 @@ rebuilds every open scene on demand.
 "Open calendar app" launches the first application in the `Calendar`
 category, falling back to `thunderbird -calendar`.
 
+### Agent verbs
+
+Send these to `quoin-panel` with a JSON object body (an absent body means
+`{}`). Success replies are JSON objects with rc 0. Bad arguments return rc 10
+with `{error: "invalid_request", detail: "..."}`; unknown fields are rejected.
+The scene click handlers above keep their toggle behaviour.
+
+| Verb | Arguments | Reply |
+|---|---|---|
+| `launcher.open` | `{query?, category?}` | Same as `launcher.state` |
+| `launcher.close` | `{}` | `{open: false}` |
+| `launcher.state` | `{}` | `{open, query, category, count, items}` |
+| `launcher.search` | `{query, category?, limit?}` | `{query, category, count, items}` |
+| `launcher.launch` | `{id}` | `{launched: id}` |
+| `calendar.open`, `calendar.state` | `{}` | `{open, month, year}` |
+| `calendar.close` | `{}` | `{open: false}` |
+| `notes.open`, `notes.state` | `{}` | `{open, count}` |
+| `notes.close` | `{}` | `{open: false}` |
+| `popups.state` | `{}` | `{launcher, calendar, notes}` (booleans) |
+
+Open and close are idempotent. Opening a closed popup closes the other popups
+through the same generation-checked reveal/pin path as a click. Opening an
+already-open launcher preserves omitted filters; opening a closed launcher
+defaults them to empty strings. Query and category must be strings; category
+uses the apps citizen's freedesktop category names (`""` means all).
+An already-open calendar retains its navigated month.
+
+Launcher items contain only `{id, name, generic_name, comment, icon, categories}`.
+`count` is the full matching count, before truncation; state includes at most
+50 items and uses the loaded list without another Bus request (fetching if
+not loaded). Search always calls `apps.list`, changes no UI or cached state,
+and defaults category to `""` and limit to 50. Limit is a non-negative integer;
+zero returns only the count. There is no additional search limit cap.
+Launch requires a non-empty string id and closes the launcher only on success.
+Apps refusals are relayed, including rc 14 `not_found`; local transport failures
+use rc 11. Notes count is the full cached notification count, even when the
+popup's 50-row display cap applies. Calendar month is 1–12 in local time.
+
+`COSMIX=<checkout> mix src/desktop/scripts/tests/panel-bus-test.mix` tests the
+production panel citizen over an isolated Bus broker with fixture dependencies.
+It checks popup idempotency and edge release, cached state, search isolation,
+launch/refusal, popup exclusivity and argument validation, without a live GUI.
+
 ## Running it
 
 ```sh

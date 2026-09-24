@@ -525,6 +525,43 @@ host sends them <code>{scene, node, kind, value?, item?}</code>). <code>panel.re
 rebuilds every open scene on demand.</p>
 <p>"Open calendar app" launches the first application in the <code>Calendar</code>
 category, falling back to <code>thunderbird -calendar</code>.</p>
+<h3 id="agent-verbs">Agent verbs</h3>
+<p>Send these to <code>quoin-panel</code> with a JSON object body (an absent body means
+<code>{}</code>). Success replies are JSON objects with rc 0. Bad arguments return rc 10
+with <code>{error: "invalid_request", detail: "..."}</code>; unknown fields are rejected.
+The scene click handlers above keep their toggle behaviour.</p>
+<table><thead><tr><th>Verb</th><th>Arguments</th><th>Reply</th></tr></thead><tbody>
+<tr><td><code>launcher.open</code></td><td><code>{query?, category?}</code></td><td>Same as <code>launcher.state</code></td></tr>
+<tr><td><code>launcher.close</code></td><td><code>{}</code></td><td><code>{open: false}</code></td></tr>
+<tr><td><code>launcher.state</code></td><td><code>{}</code></td><td><code>{open, query, category, count, items}</code></td></tr>
+<tr><td><code>launcher.search</code></td><td><code>{query, category?, limit?}</code></td><td><code>{query, category, count, items}</code></td></tr>
+<tr><td><code>launcher.launch</code></td><td><code>{id}</code></td><td><code>{launched: id}</code></td></tr>
+<tr><td><code>calendar.open</code>, <code>calendar.state</code></td><td><code>{}</code></td><td><code>{open, month, year}</code></td></tr>
+<tr><td><code>calendar.close</code></td><td><code>{}</code></td><td><code>{open: false}</code></td></tr>
+<tr><td><code>notes.open</code>, <code>notes.state</code></td><td><code>{}</code></td><td><code>{open, count}</code></td></tr>
+<tr><td><code>notes.close</code></td><td><code>{}</code></td><td><code>{open: false}</code></td></tr>
+<tr><td><code>popups.state</code></td><td><code>{}</code></td><td><code>{launcher, calendar, notes}</code> (booleans)</td></tr>
+</tbody></table>
+<p>Open and close are idempotent. Opening a closed popup closes the other popups
+through the same generation-checked reveal/pin path as a click. Opening an
+already-open launcher preserves omitted filters; opening a closed launcher
+defaults them to empty strings. Query and category must be strings; category
+uses the apps citizen's freedesktop category names (<code>""</code> means all).
+An already-open calendar retains its navigated month.</p>
+<p>Launcher items contain only <code>{id, name, generic_name, comment, icon, categories}</code>.
+<code>count</code> is the full matching count, before truncation; state includes at most
+50 items and uses the loaded list without another Bus request (fetching if
+not loaded). Search always calls <code>apps.list</code>, changes no UI or cached state,
+and defaults category to <code>""</code> and limit to 50. Limit is a non-negative integer;
+zero returns only the count. There is no additional search limit cap.
+Launch requires a non-empty string id and closes the launcher only on success.
+Apps refusals are relayed, including rc 14 <code>not_found</code>; local transport failures
+use rc 11. Notes count is the full cached notification count, even when the
+popup's 50-row display cap applies. Calendar month is 1–12 in local time.</p>
+<p><code>COSMIX=&lt;checkout&gt; mix src/desktop/scripts/tests/panel-bus-test.mix</code> tests the
+production panel citizen over an isolated Bus broker with fixture dependencies.
+It checks popup idempotency and edge release, cached state, search isolation,
+launch/refusal, popup exclusivity and argument validation, without a live GUI.</p>
 <h2 id="running-it">Running it</h2>
 <pre><code class="language-sh">mix --serve src/desktop/scripts/apps.mix --name apps
 mix --serve src/desktop/scripts/quoin-panel.mix --name quoin-panel

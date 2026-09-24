@@ -326,9 +326,11 @@ fn fetch_apps()
   $r = rpc($APPS, "apps.list", {query: $state.query, category: $state.category})
   if $r == nil or type($r) != "list" then
     $state.apps = []
+    $state.apps_loaded = false
     return
   end
   $state.apps = $r
+  $state.apps_loaded = true
 end
 
 -- A 20px monochrome status icon from the dark theme, with a fallback icon
@@ -896,6 +898,171 @@ fn node_of()
   $a = $event.args
   if $a == nil or type($a) != "map" then return "" end
   return to_string($a.node ?? "")
+end
+
+-- Agent requests use JSON objects; an absent body is the empty object.
+-- Return validation results so handlers retain control of replies/state.
+fn agent_args($allowed)
+  $a = $event.args
+  if trim($event.body ?? "") == "" then $a = {} end
+  if type($a) != "map" then return {error: "expected a JSON object"} end
+  for each $key in keys($a)
+    if not contains($allowed, $key) then return {error: "unknown argument: " .. $key} end
+    if $key != "limit" and type($a[$key]) != "string" then
+      return {error: $key .. " must be a string"}
+    end
+  end
+  if has_key($a, "limit") then
+    $n = $a.limit
+    if type($n) != "number" then return {error: "limit must be a non-negative integer"} end
+    if $n < 0 or floor($n) != $n then return {error: "limit must be a non-negative integer"} end
+  end
+  return {args: $a}
+end
+
+fn agent_invalid($detail)
+  reply(10, json_encode({error: "invalid_request", detail: $detail}))
+end
+
+fn launcher_items($apps, $limit)
+  $items = []
+  for each $app in slice($apps, 0, $limit)
+    push($items, {id: $app.id, name: $app.name, generic_name: $app.generic_name ?? "",
+      comment: $app.comment ?? "", icon: $app.icon ?? "", categories: $app.categories ?? []})
+  end
+  return $items
+end
+
+fn launcher_snapshot()
+  return {open: $state.launcher_open, query: $state.query, category: $state.category,
+    count: length($state.apps), items: launcher_items($state.apps, 50)}
+end
+
+fn calendar_snapshot()
+  $today = $p.ymd(time())
+  $shown = $p.shift_month($today.year, $today.month, $state.cal_offset)
+  return {open: $state.calendar_open, month: $shown.month, year: $shown.year}
+end
+
+on launcher.open desc "open launcher idempotently {query?, category?}; return launcher.state"
+  $v = agent_args(["query", "category"])
+  if $v.error != nil then agent_invalid($v.error); return end
+  $a = $v.args
+  if not $state.launcher_open then
+    close_popups()
+    $state.launcher_open = true
+    bump_popups()
+    $state.query = ""
+    $state.category = ""
+  end
+  if has_key($a, "query") then $state.query = $a.query end
+  if has_key($a, "category") then $state.category = $a.category end
+  render_launcher()
+  render_panel()
+  reply(0, json_encode(launcher_snapshot()))
+end
+
+on launcher.close desc "close launcher idempotently {}; return {open:false}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  if $state.launcher_open then close_launcher(); render_panel() end
+  reply(0, json_encode({open: false}))
+end
+
+on launcher.state desc "launcher {open,query,category,count,items}; at most 50 items, cached when loaded"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  if not $state.apps_loaded then fetch_apps() end
+  reply(0, json_encode(launcher_snapshot()))
+end
+
+on launcher.search desc "search without UI changes {query,category?,limit?=50}; return {query,category,count,items}"
+  $v = agent_args(["query", "category", "limit"])
+  if $v.error != nil then agent_invalid($v.error); return end
+  $a = $v.args
+  if not has_key($a, "query") then agent_invalid("query is required"); return end
+  $category = $a.category ?? ""
+  send $APPS apps.list body=json_encode({query: $a.query, category: $category}) timeout=3
+  if $rc != 0 then
+    reply($rc < 0 ? 11 : $rc, json_encode(type($reply) == "map" ? $reply : {error: to_string($result)}))
+    return
+  end
+  $apps = type($result) == "string" ? json_parse($result) : $result
+  reply(0, json_encode({query: $a.query, category: $category, count: length($apps),
+    items: launcher_items($apps, $a.limit ?? 50)}))
+end
+
+on launcher.launch desc "launch {id}; close launcher on success; return {launched:id}, rc14 if not found"
+  $v = agent_args(["id"])
+  if $v.error != nil then agent_invalid($v.error); return end
+  $id = $v.args.id ?? ""
+  if $id == "" then agent_invalid("id must be a non-empty string"); return end
+  send $APPS apps.launch body=json_encode({id: $id}) timeout=3
+  if $rc != 0 then
+    reply($rc < 0 ? 11 : $rc, json_encode(type($reply) == "map" ? $reply : {error: to_string($result)}))
+    return
+  end
+  if $state.launcher_open then close_launcher(); render_panel() end
+  reply(0, json_encode({launched: $id}))
+end
+
+on calendar.open desc "open calendar idempotently {}; return {open,month,year}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  if not $state.calendar_open then
+    close_popups()
+    $state.calendar_open = true
+    bump_popups()
+    $state.cal_offset = 0
+    render_calendar()
+    render_panel()
+  end
+  reply(0, json_encode(calendar_snapshot()))
+end
+
+on calendar.close desc "close calendar idempotently {}; return {open:false}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  if $state.calendar_open then close_calendar(); render_panel() end
+  reply(0, json_encode({open: false}))
+end
+
+on calendar.state desc "calendar snapshot {}; return {open,month,year}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  reply(0, json_encode(calendar_snapshot()))
+end
+
+on notes.open desc "open notifications idempotently {}; return {open,count}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  if not $state.notes_open then
+    close_popups()
+    $state.notes_open = true
+    bump_popups()
+    render_notes()
+    render_panel()
+  end
+  reply(0, json_encode({open: $state.notes_open, count: length($state.notes)}))
+end
+
+on notes.close desc "close notifications idempotently {}; return {open:false}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  if $state.notes_open then close_notes(); render_panel() end
+  reply(0, json_encode({open: false}))
+end
+
+on notes.state desc "notifications snapshot {}; return {open,count}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  reply(0, json_encode({open: $state.notes_open, count: length($state.notes)}))
+end
+
+on popups.state desc "popup flags {}; return {launcher,calendar,notes}"
+  $v = agent_args([])
+  if $v.error != nil then agent_invalid($v.error); return end
+  reply(0, json_encode({launcher: $state.launcher_open, calendar: $state.calendar_open, notes: $state.notes_open}))
 end
 
 on launcher desc "toggle the application launcher"
