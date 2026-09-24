@@ -70,27 +70,25 @@ fn main() -> anyhow::Result<()> {
     // An unusable document is moved aside (never deleted) before the defaults
     // are seeded; see keymap_file::open. Dropped rows and the recovery were
     // already logged there.
-    let mut keymap_path: Option<PathBuf> = args
+    // The configured path is kept even when writing is disabled, so replies
+    // stay truthful and input.reload can re-enable writing once it is fixed.
+    let keymap_path: Option<PathBuf> = args
         .keymap
         .map(PathBuf::from)
         .or_else(keymap_file::default_path);
-    let keymap = match keymap_path.as_deref() {
+    let (keymap, store) = match keymap_path {
         Some(path) => {
-            let opened = keymap_file::open(path, &keymap_file::local_stamp());
-            if let Some(backup) = opened.recovered_from {
-                service::set_recovered_from(backup);
-            }
-            if !opened.persist {
-                // The unusable file could not be moved aside: never write over it.
-                keymap_path = None;
-            }
-            InputKeymap {
+            let opened = keymap_file::open(&path, &keymap_file::local_stamp());
+            let keymap = InputKeymap {
                 version: KEYMAP_SCHEMA_VERSION,
                 semantic: cosmix_input_schema::Keymap::default(),
                 physical: opened.rows,
-            }
+            };
+            let store =
+                service::Store::new(Some(path), opened.recovered_from, opened.persist_disabled);
+            (keymap, store)
         }
-        None => default_keymap(),
+        None => (default_keymap(), service::Store::default()),
     };
     let resolver: Shared = Arc::new(Mutex::new(Resolver::new(keymap)));
 
@@ -147,14 +145,14 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(resolver, keymap_path, fire_rx))
+    runtime.block_on(serve(resolver, store, fire_rx))
 }
 
 /// Reconnect loop: (re)register `inputd` with noded and serve `input.*` until the
 /// connection drops, then reconnect.
 async fn serve(
     resolver: Shared,
-    keymap_path: Option<PathBuf>,
+    store: service::Store,
     mut fire_rx: tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
 ) -> anyhow::Result<()> {
     let bi = cosmix_buildinfo::build_info!();
@@ -181,7 +179,7 @@ async fn serve(
                 serve_bus(
                     &client,
                     &resolver,
-                    keymap_path.as_deref(),
+                    &store,
                     &mut injector,
                     &mut fire_rx,
                 )
@@ -201,7 +199,7 @@ async fn serve(
 async fn serve_bus(
     client: &cosmix_client::NodedClient,
     resolver: &Shared,
-    keymap_path: Option<&std::path::Path>,
+    store: &service::Store,
     injector: &mut reader::PointerInjector,
     fire_rx: &mut tokio::sync::mpsc::UnboundedReceiver<reader::FiredVerb>,
 ) {
@@ -212,7 +210,7 @@ async fn serve_bus(
         tokio::select! {
             maybe_cmd = rx.recv() => {
                 let Some(cmd) = maybe_cmd else { break };
-                let (rc, body) = service::dispatch(resolver, keymap_path, injector, &cmd);
+                let (rc, body) = service::dispatch(resolver, store, injector, &cmd);
                 let _ = client
                     .respond_parts(&cmd.from, &cmd.command, cmd.id.as_deref(), rc, &body)
                     .await;

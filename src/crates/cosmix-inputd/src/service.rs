@@ -7,8 +7,8 @@
 //! mesh-trust capability are a P3 refinement. Reads (`query`) are open.
 //! Key and pointer injection are also mesh-reachable, with no node-local gate.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use cosmix_client::IncomingCommand;
 use cosmix_input_core::Resolver;
@@ -72,21 +72,53 @@ pub fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
 /// The resolver shared between the Bus service and the (optional) evdev reader.
 pub type Shared = Arc<Mutex<Resolver>>;
 
+/// Where the keymap lives and whether this process may write it.
+///
+/// The CONFIGURED path is kept even when writing is disabled, so `input.reload`
+/// can still read it (and re-enable writing once the operator has fixed it) and
+/// replies can say truthfully why a rebind was not persisted.
+#[derive(Default)]
+pub struct Store {
+    path: Option<PathBuf>,
+    /// Where THIS process moved an unusable keymap document at startup.
+    recovered_from: Option<PathBuf>,
+    /// `Some("<path>: <reason>")` while the path must not be written.
+    persist_disabled: Mutex<Option<String>>,
+}
+
+impl Store {
+    pub fn new(
+        path: Option<PathBuf>,
+        recovered_from: Option<PathBuf>,
+        persist_disabled: Option<String>,
+    ) -> Self {
+        Store {
+            path,
+            recovered_from,
+            persist_disabled: Mutex::new(persist_disabled),
+        }
+    }
+
+    fn disabled(&self) -> Option<String> {
+        self.persist_disabled.lock().expect("store poisoned").clone()
+    }
+}
+
 /// Dispatch one `input.*` command to `(rc, json body)`. `rc` 0 = ok, 10 = error.
-/// After a mutation the keymap is persisted to `keymap_path` (if set) so a
-/// rebind is remembered across restarts.
+/// After a mutation the keymap is persisted to the store's path (if set and
+/// writable) so a rebind is remembered across restarts.
 pub fn dispatch(
     resolver: &Shared,
-    keymap_path: Option<&Path>,
+    store: &Store,
     injector: &mut PointerInjector,
     cmd: &IncomingCommand,
 ) -> (u8, String) {
     match cmd.command.as_str() {
-        verbs::QUERY => query(resolver),
-        verbs::BIND => guard_local(cmd, || bind(resolver, keymap_path, &cmd.body)),
-        verbs::UNBIND => guard_local(cmd, || unbind(resolver, keymap_path, &cmd.body)),
+        verbs::QUERY => query(resolver, store),
+        verbs::BIND => guard_local(cmd, || bind(resolver, store, &cmd.body)),
+        verbs::UNBIND => guard_local(cmd, || unbind(resolver, store, &cmd.body)),
         verbs::MODE => guard_local(cmd, || mode(resolver, &cmd.body)),
-        verbs::RELOAD => guard_local(cmd, || reload(resolver, keymap_path)),
+        verbs::RELOAD => guard_local(cmd, || reload(resolver, store)),
         verbs::KEY => key(injector, &cmd.body),
         verbs::POINTER_MOVE | verbs::POINTER_BUTTON | verbs::POINTER_SCROLL => {
             pointer(injector, &cmd.command, &cmd.body)
@@ -130,20 +162,30 @@ fn pointer(injector: &mut PointerInjector, verb: &str, body: &str) -> (u8, Strin
     }
 }
 
-/// Persist the current physical rows to the keymap file, logging on failure. A
-/// save failure does not fail the verb — the in-memory rebind still took.
-fn persist(resolver: &Shared, keymap_path: Option<&Path>) {
-    let Some(path) = keymap_path else { return };
+/// Persist the current physical rows to the keymap file and annotate a
+/// mutation's reply with the outcome. A persistence failure does not fail the
+/// verb (rc stays 0 — the live table DID change), but the reply says so:
+/// `persisted:false` plus `persist_disabled` (writing is off this run) or
+/// `persist_error` (the save itself failed). A successful save, or no
+/// configured path, leaves the reply unchanged.
+fn persist(resolver: &Shared, store: &Store, reply: &mut Value) {
+    let Some(path) = store.path.as_deref() else { return };
+    if let Some(reason) = store.disabled() {
+        eprintln!("cosmix-inputd: rebind not persisted: {reason}");
+        reply["persisted"] = json!(false);
+        reply["persist_disabled"] = json!(reason);
+        return;
+    }
     let rows = resolver
         .lock()
         .expect("resolver poisoned")
         .physical_rows()
         .to_vec();
     if let Err(error) = keymap_file::save(path, &rows) {
-        eprintln!(
-            "cosmix-inputd: keymap save to {} failed: {error}",
-            path.display()
-        );
+        let reason = format!("keymap save to {} failed: {error}", path.display());
+        eprintln!("cosmix-inputd: {reason}");
+        reply["persisted"] = json!(false);
+        reply["persist_error"] = json!(reason);
     }
 }
 
@@ -163,34 +205,27 @@ fn guard_local(cmd: &IncomingCommand, apply: impl FnOnce() -> (u8, String)) -> (
     }
 }
 
-/// Where THIS process moved an unusable keymap document at startup, if it did.
-static RECOVERED_FROM: OnceLock<PathBuf> = OnceLock::new();
-
-/// Record the startup recovery so `input.query` reports it. Set once, by main.
-pub fn set_recovered_from(backup: PathBuf) {
-    let _ = RECOVERED_FROM.set(backup);
-}
-
-fn query(resolver: &Shared) -> (u8, String) {
-    query_body(resolver, RECOVERED_FROM.get().map(PathBuf::as_path))
-}
-
-/// `input.query`'s body. `recovered_from` is present only when this process
-/// moved an unusable keymap aside at startup — additive, absent otherwise.
-fn query_body(resolver: &Shared, recovered_from: Option<&Path>) -> (u8, String) {
+/// `input.query`'s body. Two additive fields, each absent unless it applies:
+/// `recovered_from` when this process moved an unusable keymap aside at
+/// startup (it stays for the life of the process, even after a later
+/// successful reload), and `persist_disabled` while rebinds cannot be written.
+fn query(resolver: &Shared, store: &Store) -> (u8, String) {
     let resolver = resolver.lock().expect("resolver poisoned");
     let mut body = json!({
         "mode": resolver.mode(),
         "generation": resolver.generation(),
         "physical": resolver.physical_rows(),
     });
-    if let Some(backup) = recovered_from {
+    if let Some(backup) = store.recovered_from.as_deref() {
         body["recovered_from"] = json!(backup.to_string_lossy());
+    }
+    if let Some(reason) = store.disabled() {
+        body["persist_disabled"] = json!(reason);
     }
     (0, body.to_string())
 }
 
-fn bind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, String) {
+fn bind(resolver: &Shared, store: &Store, body: &str) -> (u8, String) {
     let row: BindingRow = match serde_json::from_str(body) {
         Ok(row) => row,
         Err(err) => return error(&format!("invalid binding row: {err}")),
@@ -207,17 +242,15 @@ fn bind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, Strin
         .bind_physical(binding);
     match result {
         Ok(generation) => {
-            persist(resolver, keymap_path);
-            (
-                0,
-                json!({ "ok": true, "generation": generation }).to_string(),
-            )
+            let mut reply = json!({ "ok": true, "generation": generation });
+            persist(resolver, store, &mut reply);
+            (0, reply.to_string())
         }
         Err(err) => error(&format!("rebind refused: {err:?}")),
     }
 }
 
-fn unbind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, String) {
+fn unbind(resolver: &Shared, store: &Store, body: &str) -> (u8, String) {
     let stroke: PhysicalStroke = match serde_json::from_str(body) {
         Ok(stroke) => stroke,
         Err(err) => return error(&format!("invalid stroke: {err}")),
@@ -228,11 +261,9 @@ fn unbind(resolver: &Shared, keymap_path: Option<&Path>, body: &str) -> (u8, Str
         .unbind_physical(&stroke);
     match removed {
         Some(generation) => {
-            persist(resolver, keymap_path);
-            (
-                0,
-                json!({ "ok": true, "generation": generation }).to_string(),
-            )
+            let mut reply = json!({ "ok": true, "generation": generation });
+            persist(resolver, store, &mut reply);
+            (0, reply.to_string())
         }
         None => {
             let generation = resolver.lock().expect("resolver poisoned").generation();
@@ -272,8 +303,8 @@ fn mode(resolver: &Shared, body: &str) -> (u8, String) {
     )
 }
 
-fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
-    let Some(path) = keymap_path else {
+fn reload(resolver: &Shared, store: &Store) -> (u8, String) {
+    let Some(path) = store.path.as_deref() else {
         let generation = resolver.lock().expect("resolver poisoned").generation();
         return (
             0,
@@ -287,19 +318,33 @@ fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
                 .lock()
                 .expect("resolver poisoned")
                 .replace_physical(loaded.rows);
-            (
-                0,
-                json!({ "ok": true, "generation": generation, "dropped": loaded.dropped })
-                    .to_string(),
-            )
+            // The configured file is usable again (the operator fixed it, or
+            // the file that reappeared at startup is valid): rebinds may be
+            // written from here on.
+            let was = store.persist_disabled.lock().expect("store poisoned").take();
+            let mut reply =
+                json!({ "ok": true, "generation": generation, "dropped": loaded.dropped });
+            if let Some(reason) = was {
+                eprintln!("cosmix-inputd: keymap persistence re-enabled (was: {reason})");
+                reply["persist_reenabled"] = json!(reason);
+            }
+            (0, reply.to_string())
         }
-        // Reload never rewrites the file, so an unusable one is left in place
-        // and the live keymap is unchanged.
-        Err(keymap_file::LoadError::Absent) => {
-            error(&format!("keymap file {} could not be read: absent", path.display()))
-        }
-        Err(keymap_file::LoadError::Unreadable(reason)) => {
-            error(&format!("keymap file {} could not be read: {reason}", path.display()))
+        // Reload never rewrites or moves the file, so an unusable one is left
+        // in place and the live keymap is unchanged. The reply names the real
+        // state: configured but unusable, plus why writing is off if it is.
+        Err(load_error) => {
+            let mut reply = json!({
+                "error": format!(
+                    "keymap file {} could not be read: {}",
+                    path.display(),
+                    load_error.reason()
+                ),
+            });
+            if let Some(reason) = store.disabled() {
+                reply["persist_disabled"] = json!(reason);
+            }
+            (10, reply.to_string())
         }
     }
 }
@@ -404,7 +449,7 @@ mod tests {
         for origin in [Some("mesh"), Some("local"), None] {
             for (verb, body, expected) in &cases {
                 let cmd = command(verb, body.clone(), origin);
-                let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+                let (rc, reply) = dispatch(&resolver, &Store::default(), &mut injector, &cmd);
                 assert_eq!(rc, 0, "{reply}");
                 assert_eq!(
                     serde_json::from_str::<Value>(&reply).unwrap(),
@@ -453,13 +498,13 @@ mod tests {
             (verbs::POINTER_MOVE, json!([])),
         ] {
             let cmd = command(verb, body, Some("mesh"));
-            let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+            let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
             assert_eq!(rc, 10);
             assert!(reply.contains("invalid pointer request"), "{reply}");
         }
         let mut cmd = command(verbs::POINTER_MOVE, json!({}), None);
         cmd.body = "{".into();
-        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("invalid pointer request"));
     }
@@ -482,7 +527,7 @@ mod tests {
                 json!({"key": key, "action": "tap"}),
                 Some("mesh"),
             );
-            let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+            let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
             assert_eq!(rc, 10);
             let reply: Value = serde_json::from_str(&reply).unwrap();
             let error = reply["error"].as_str().unwrap();
@@ -499,13 +544,13 @@ mod tests {
             json!([]),
         ] {
             let cmd = command(verbs::KEY, body, Some("mesh"));
-            let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+            let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
             assert_eq!(rc, 10);
             assert!(reply.contains("invalid key request"), "{reply}");
         }
         let mut cmd = command(verbs::KEY, json!({}), None);
         cmd.body = "{".into();
-        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("invalid key request"));
     }
@@ -515,7 +560,7 @@ mod tests {
         let mut injector =
             PointerInjector::with_test_file(File::options().write(true).open("/dev/full").unwrap());
         let cmd = command(verbs::POINTER_MOVE, json!({"dx": 1, "dy": 0}), Some("mesh"));
-        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("pointer injection failed"));
         let cmd = command(
@@ -523,11 +568,11 @@ mod tests {
             json!({"key": "F9", "action": "tap"}),
             Some("mesh"),
         );
-        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("key injection failed"));
         let cmd = command(verbs::MODE, json!({"mode": "transparent"}), Some("mesh"));
-        let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver(), &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("node-local caller"));
     }
@@ -546,16 +591,16 @@ mod tests {
         };
         for bad in ["", "Desktop", "desk.vt1"] {
             let cmd = command(verbs::BIND, row(bad), Some("local"));
-            let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+            let (rc, reply) = dispatch(&resolver, &Store::default(), &mut injector, &cmd);
             assert_eq!(rc, 10, "{bad:?}: {reply}");
             assert!(reply.contains("InvalidService"), "{reply}");
         }
         let cmd = command(verbs::BIND, row("desktop-vt1"), Some("local"));
-        let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver, &Store::default(), &mut injector, &cmd);
         assert_eq!(rc, 0, "{reply}");
         let (rc, reply) = dispatch(
             &resolver,
-            None,
+            &Store::default(),
             &mut injector,
             &command(verbs::QUERY, json!({}), None),
         );
@@ -591,7 +636,7 @@ mod tests {
         let mut injector = PointerInjector::default();
         let resolver = resolver();
         let cmd = command(verbs::RELOAD, json!({}), Some("local"));
-        let (rc, reply) = dispatch(&resolver, Some(&path), &mut injector, &cmd);
+        let (rc, reply) = dispatch(&resolver, &Store::new(Some(path.clone()), None, None), &mut injector, &cmd);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rc, 0, "{reply}");
         let reply: Value = serde_json::from_str(&reply).unwrap();
@@ -606,22 +651,146 @@ mod tests {
         assert_eq!(rows[0].action.as_str(), "desktop.workspace.next");
     }
 
+    fn run(resolver: &Shared, store: &Store, verb: &str, body: Value) -> (u8, Value) {
+        let mut injector = PointerInjector::default();
+        let cmd = command(verb, body, Some("local"));
+        let (rc, reply) = dispatch(resolver, store, &mut injector, &cmd);
+        (rc, serde_json::from_str(&reply).unwrap())
+    }
+
+    fn bind_row() -> Value {
+        json!({"layer":"physical","stroke":{"code":63},"action":"user.f05"})
+    }
+
+    /// A fresh directory holding `keymap.json` with `text`.
+    fn keymap_dir(tag: &str, text: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("inputd-store-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
     #[test]
-    fn query_reports_recovered_from_only_after_a_recovery() {
+    fn query_reports_recovery_and_disabled_persistence_only_when_they_apply() {
         let resolver = resolver();
-        let (rc, plain) = query_body(&resolver, None);
+        let (rc, plain) = run(&resolver, &Store::default(), verbs::QUERY, json!({}));
         assert_eq!(rc, 0);
-        let plain: Value = serde_json::from_str(&plain).unwrap();
         assert!(plain.get("recovered_from").is_none(), "{plain}");
-        let backup = Path::new("/var/lib/example/keymap.json.bad-20260924-101112");
-        let (rc, recovered) = query_body(&resolver, Some(backup));
+        assert!(plain.get("persist_disabled").is_none(), "{plain}");
+        let backup = PathBuf::from("/var/lib/example/keymap.json.bad-20260924-101112");
+        let store = Store::new(
+            Some(PathBuf::from("/var/lib/example/keymap.json")),
+            Some(backup.clone()),
+            Some("/var/lib/example/keymap.json: file reappeared".to_string()),
+        );
+        let (rc, flagged) = run(&resolver, &store, verbs::QUERY, json!({}));
         assert_eq!(rc, 0);
-        let recovered: Value = serde_json::from_str(&recovered).unwrap();
-        assert_eq!(recovered["recovered_from"], backup.to_str().unwrap());
+        assert_eq!(flagged["recovered_from"], backup.to_str().unwrap());
+        assert_eq!(
+            flagged["persist_disabled"],
+            "/var/lib/example/keymap.json: file reappeared"
+        );
         // Additive: every other field is unchanged.
         for key in ["mode", "generation", "physical"] {
-            assert_eq!(recovered[key], plain[key], "{key}");
+            assert_eq!(flagged[key], plain[key], "{key}");
         }
+    }
+
+    #[test]
+    fn a_disabled_store_never_writes_and_says_so() {
+        // main hands the startup outcome straight to the Store: the path stays
+        // configured and persistence is off. bind/unbind still change the live
+        // table (rc 0) but must not touch the file, and must say why.
+        let (dir, path) = keymap_dir("disabled", "not json");
+        let reason = format!("{}: unusable and could not be moved aside", path.display());
+        let store = Store::new(Some(path.clone()), None, Some(reason.clone()));
+        let resolver = resolver();
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], reason.as_str());
+        let (rc, reply) = run(&resolver, &store, verbs::UNBIND, json!({"code":63}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert_eq!(reply["persist_disabled"], reason.as_str());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_enabled_store_writes_and_leaves_the_reply_shape_unchanged() {
+        let (dir, path) = keymap_dir("enabled", "{}");
+        let store = Store::new(Some(path.clone()), None, None);
+        let resolver = resolver();
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        let written = keymap_file::load(&path).expect("bind persisted a loadable file");
+        assert!(written.rows.iter().any(|r| r.action.as_str() == "user.f05"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_as_persist_error() {
+        // The path's parent is a regular FILE, so create_dir_all fails (as
+        // root too): persistence is enabled but the save itself errors.
+        let (dir, blocker) = keymap_dir("save-error", "x");
+        let store = Store::new(Some(blocker.join("keymap.json")), None, None);
+        let (rc, reply) = run(&resolver(), &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persisted"], false);
+        assert!(reply["persist_error"].as_str().unwrap().contains("save"), "{reply}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_reports_the_real_state_and_reenables_once_the_file_is_fixed() {
+        let (dir, path) = keymap_dir("reenable", "not json");
+        let reason = format!("{}: unusable and could not be moved aside", path.display());
+        let store = Store::new(Some(path.clone()), None, Some(reason.clone()));
+        let resolver = resolver();
+        // Still broken: rc 10, names the configured file, the parse reason and
+        // why writing is off — never "no keymap file configured".
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 10, "{reply}");
+        let error = reply["error"].as_str().unwrap();
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(error.contains("not JSON"), "{error}");
+        assert_eq!(reply["persist_disabled"], reason.as_str());
+        // The operator fixes the file: reload loads it and re-enables writes.
+        std::fs::write(
+            &path,
+            r#"{"version":1,"physical":[{"stroke":{"code":106},"action":"desktop.workspace.next"}]}"#,
+        )
+        .unwrap();
+        let (rc, reply) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0, "{reply}");
+        assert_eq!(reply["persist_reenabled"], reason.as_str());
+        let (_, query) = run(&resolver, &store, verbs::QUERY, json!({}));
+        assert!(query.get("persist_disabled").is_none(), "{query}");
+        // And a rebind now reaches the disk.
+        let (rc, reply) = run(&resolver, &store, verbs::BIND, bind_row());
+        assert_eq!(rc, 0);
+        assert!(reply.get("persisted").is_none(), "{reply}");
+        let written = keymap_file::load(&path).unwrap();
+        assert_eq!(written.rows.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovered_from_survives_a_later_successful_reload() {
+        let (dir, path) = keymap_dir("survives", r#"{"version":1,"physical":[]}"#);
+        let backup = dir.join("keymap.json.bad-20260924-101112");
+        let store = Store::new(Some(path), Some(backup.clone()), None);
+        let resolver = resolver();
+        let (rc, _) = run(&resolver, &store, verbs::RELOAD, json!({}));
+        assert_eq!(rc, 0);
+        let (_, query) = run(&resolver, &store, verbs::QUERY, json!({}));
+        assert_eq!(query["recovered_from"], backup.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

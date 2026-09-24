@@ -138,24 +138,49 @@ The shipped default keymap binds these right-Ctrl rows:
 | RightCtrl+Up | 103 | `desktop.clipboard.rotate` | `desktop-vt1` | ignore |
 
 The default keymap only seeds a missing keymap file, or one whose whole
-document is unusable. A document is unusable when it cannot be read, is not
-JSON, is not a JSON object, lacks a `physical` list, or lacks an unsigned
+document is unusable. A document is unusable when its bytes are not UTF-8, are
+not JSON, are not a JSON object, lack a `physical` list, or lack an unsigned
 32-bit `version`. Since inputd 0.4.2, startup first renames such a file to
 `keymap.json.bad-YYYYmmdd-HHMMSS` in the same directory, then seeds the
-defaults. A second recovery in the same second appends `-1`, `-2` and so on,
-so no backup is overwritten. The file is never deleted. inputd logs one line
-naming the reason and the backup path, and `input.query` in that process
-carries the path:
+defaults. The rename never replaces an existing name. If the name is taken,
+even by a file created a moment earlier, inputd tries `-1`, `-2` and so on.
+The file is never deleted. inputd logs one line naming the reason and the
+backup path, and `input.query` in that process carries the path:
 
 ```json
 {"mode":"normal","generation":0,"physical":[...],
  "recovered_from":"/var/lib/cosmix/inputd/keymap.json.bad-20260924-101112"}
 ```
 
-The field is absent when no recovery happened. If the rename fails, inputd
-serves the defaults but never writes the keymap file for the rest of that run.
-`input.reload` of an unusable file returns rc 10 with the reason and leaves
-both the file and the live keymap unchanged.
+The field is absent when no recovery happened. It stays for the life of the
+process, even after a later successful `input.reload`.
+
+inputd checks that the file it renamed is the one that failed to parse. If the
+file was replaced in between, it renames the replacement back and loads that
+instead. The defaults are only created at a vacant path. If a file appears
+there before they are written, that file is left untouched.
+
+A file that cannot be read at all is never moved, because it may be valid.
+This covers a permission error, an I/O error, or a directory at the path.
+
+In these cases inputd serves the defaults in memory and does not write the
+keymap file:
+
+- the file cannot be read;
+- the unusable file cannot be renamed;
+- a file appears at the path while the defaults are being written.
+
+`input.query` then carries `persist_disabled`, naming the path and the reason.
+`input.bind` and `input.unbind` still change the live keymap and return rc 0,
+but their reply adds `"persisted":false` and the same `persist_disabled`
+reason. A save that fails while writing is enabled adds `"persisted":false`
+and `persist_error` instead. A successful save leaves the reply unchanged.
+
+`input.reload` never moves or rewrites the file. On a file that is still
+unusable it returns rc 10 with the reason, plus `persist_disabled` when
+writing is off, and the live keymap is unchanged. Once the file is fixed,
+`input.reload` loads it and turns writing back on. Its reply then carries
+`persist_reenabled` with the reason that no longer applies.
 
 A host with a usable file keeps its rows, apart from the legacy clipboard
 migration above. Other
