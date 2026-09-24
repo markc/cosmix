@@ -72,12 +72,17 @@ fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .or_else(keymap_file::default_path);
     let keymap = match keymap_path.as_deref().and_then(keymap_file::load) {
-        Some(physical) => {
-            eprintln!("cosmix-inputd: loaded keymap ({} rows) from file", physical.len());
+        Some(loaded) => {
+            // Dropped rows were already logged one by one during the load.
+            eprintln!(
+                "cosmix-inputd: loaded keymap ({} rows, {} dropped) from file",
+                loaded.rows.len(),
+                loaded.dropped.len()
+            );
             InputKeymap {
                 version: KEYMAP_SCHEMA_VERSION,
                 semantic: cosmix_input_schema::Keymap::default(),
-                physical,
+                physical: loaded.rows,
             }
         }
         None => {
@@ -227,16 +232,29 @@ async fn serve_bus(
     }
 }
 
-/// Deliver a resolved verb fire-and-forget. The target service is the verb's
-/// first dot-segment (`desktop.workspace.next` -> `desktop`); a placeholder verb
-/// with no handler (e.g. `user.f09`) simply no-routes, which is fine. A binding
-/// with `args` sends them as the body — the ARexx model: a message is a verb
-/// plus arguments.
-async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVerb) {
-    let service = fired.verb.split('.').next().unwrap_or("");
+/// The `(service, command)` a fired verb is sent as. A row with an explicit
+/// `service` targets it with the verb UNCHANGED; without one the service is the
+/// verb's first dot-segment (`desktop.workspace.next` -> `desktop`) and the
+/// command is still the whole verb. `None` when no target can be derived.
+fn fire_target(fired: &reader::FiredVerb) -> Option<(&str, &str)> {
+    let service = match fired.service.as_deref() {
+        Some(explicit) => explicit,
+        None => fired.verb.split('.').next().unwrap_or(""),
+    };
     if service.is_empty() {
-        return;
+        return None;
     }
+    Some((service, fired.verb.as_str()))
+}
+
+/// Deliver a resolved verb fire-and-forget to [`fire_target`]; a placeholder
+/// verb with no handler (e.g. `user.f09`) simply no-routes, which is fine. A
+/// binding with `args` sends them as the body — the ARexx model: a message is
+/// a verb plus arguments.
+async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVerb) {
+    let Some((service, command)) = fire_target(fired) else {
+        return;
+    };
     // Belt-and-braces: whatever path admitted the row (bind, file load, a
     // future replace_physical caller), a non-map must never reach the wire.
     let body = match fired.args.clone() {
@@ -247,8 +265,8 @@ async fn fire_verb(client: &cosmix_client::NodedClient, fired: &reader::FiredVer
         }
         None => serde_json::json!({}),
     };
-    if let Err(error) = client.send(service, &fired.verb, body).await {
-        eprintln!("cosmix-inputd: fire {} -> {service}: {error}", fired.verb);
+    if let Err(error) = client.send(service, command, body).await {
+        eprintln!("cosmix-inputd: fire {command} -> {service}: {error}");
     }
 }
 
@@ -280,4 +298,62 @@ fn resolve_device_by_name(name: &str) -> anyhow::Result<String> {
         }
     }
     anyhow::bail!("no input device named {name:?} in /proc/bus/input/devices");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fired(verb: &str, service: Option<&str>) -> reader::FiredVerb {
+        reader::FiredVerb {
+            verb: verb.to_string(),
+            args: None,
+            service: service.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn explicit_service_is_the_target_and_the_verb_is_unchanged() {
+        let f = fired("desktop.clipboard.menu", Some("desktop-vt1"));
+        assert_eq!(fire_target(&f), Some(("desktop-vt1", "desktop.clipboard.menu")));
+    }
+
+    #[test]
+    fn absent_service_routes_by_first_segment() {
+        let f = fired("desktop.workspace.next", None);
+        assert_eq!(fire_target(&f), Some(("desktop", "desktop.workspace.next")));
+        // The pre-fix live row still routes exactly as before (to the first
+        // segment, whole string as command) — the rule itself is unchanged.
+        let f = fired("desktop-vt1.desktop.clipboard.menu", None);
+        assert_eq!(
+            fire_target(&f),
+            Some(("desktop-vt1", "desktop-vt1.desktop.clipboard.menu"))
+        );
+    }
+
+    #[test]
+    fn no_derivable_target_fires_nothing() {
+        assert_eq!(fire_target(&fired(".x", None)), None);
+        assert_eq!(fire_target(&fired("desktop.x", Some(""))), None);
+    }
+
+    #[test]
+    fn default_clipboard_rows_fire_at_the_citizen() {
+        // End to end through the shipped keymap: resolve the stroke, build the
+        // FiredVerb the grab reader would, and derive the wire target.
+        let r = cosmix_input_core::Resolver::new(default_keymap());
+        for (code, verb) in [(108, "desktop.clipboard.menu"), (103, "desktop.clipboard.rotate")] {
+            let out = r.resolve(
+                code,
+                cosmix_input_schema::SideModifiers::RIGHT_CTRL,
+                cosmix_input_core::Edge::Press,
+            );
+            let f = reader::FiredVerb {
+                verb: out.verb.expect("bound").as_str().to_string(),
+                args: out.args,
+                service: out.service,
+            };
+            assert_eq!(fire_target(&f), Some(("desktop-vt1", verb)));
+        }
+    }
 }

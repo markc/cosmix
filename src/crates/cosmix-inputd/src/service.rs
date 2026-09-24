@@ -265,14 +265,15 @@ fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
         );
     };
     match keymap_file::load(path) {
-        Some(rows) => {
+        Some(loaded) => {
             let generation = resolver
                 .lock()
                 .expect("resolver poisoned")
-                .replace_physical(rows);
+                .replace_physical(loaded.rows);
             (
                 0,
-                json!({ "ok": true, "generation": generation }).to_string(),
+                json!({ "ok": true, "generation": generation, "dropped": loaded.dropped })
+                    .to_string(),
             )
         }
         None => error(&format!("keymap file {} could not be read", path.display())),
@@ -505,6 +506,80 @@ mod tests {
         let (rc, reply) = dispatch(&resolver(), None, &mut injector, &cmd);
         assert_eq!(rc, 10);
         assert!(reply.contains("node-local caller"));
+    }
+
+    #[test]
+    fn bind_admits_a_service_target_and_query_shows_it() {
+        let mut injector = PointerInjector::default();
+        let resolver = resolver();
+        let row = |service: &str| {
+            json!({
+                "layer": "physical",
+                "stroke": {"code": 63, "modifiers": {}},
+                "action": "desktop.clipboard.menu",
+                "service": service,
+            })
+        };
+        for bad in ["", "Desktop", "desk.vt1"] {
+            let cmd = command(verbs::BIND, row(bad), Some("local"));
+            let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+            assert_eq!(rc, 10, "{bad:?}: {reply}");
+            assert!(reply.contains("InvalidService"), "{reply}");
+        }
+        let cmd = command(verbs::BIND, row("desktop-vt1"), Some("local"));
+        let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+        assert_eq!(rc, 0, "{reply}");
+        let (rc, reply) = dispatch(
+            &resolver,
+            None,
+            &mut injector,
+            &command(verbs::QUERY, json!({}), None),
+        );
+        assert_eq!(rc, 0);
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        let rows = reply["physical"].as_array().unwrap();
+        let f5 = rows.iter().find(|r| r["stroke"]["code"] == 63).unwrap();
+        assert_eq!(f5["service"], "desktop-vt1");
+        assert_eq!(f5["action"], "desktop.clipboard.menu");
+        // Rows without a target keep the old wire shape: no `service` key.
+        let next = rows
+            .iter()
+            .find(|r| r["action"] == "desktop.workspace.next")
+            .unwrap();
+        assert!(next.get("service").is_none(), "{next}");
+    }
+
+    #[test]
+    fn reload_reports_dropped_rows_and_keeps_the_good_ones() {
+        let dir =
+            std::env::temp_dir().join(format!("inputd-reload-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keymap.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"physical":[
+                {"stroke":{"code":108,"modifiers":{"right_ctrl":true}},
+                 "action":"desktop.clipboard.menu","service":7},
+                {"stroke":{"code":106,"modifiers":{"right_ctrl":true}},
+                 "action":"desktop.workspace.next"}]}"#,
+        )
+        .unwrap();
+        let mut injector = PointerInjector::default();
+        let resolver = resolver();
+        let cmd = command(verbs::RELOAD, json!({}), Some("local"));
+        let (rc, reply) = dispatch(&resolver, Some(&path), &mut injector, &cmd);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc, 0, "{reply}");
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        let dropped = reply["dropped"].as_array().expect("dropped list");
+        assert_eq!(dropped.len(), 1, "{reply}");
+        assert_eq!(dropped[0]["code"], 108);
+        assert_eq!(dropped[0]["action"], "desktop.clipboard.menu");
+        assert_eq!(dropped[0]["service"], 7);
+        assert_eq!(dropped[0]["modifiers"]["right_ctrl"], true);
+        let rows = resolver.lock().unwrap().physical_rows().to_vec();
+        assert_eq!(rows.len(), 1, "only the good row is live");
+        assert_eq!(rows[0].action.as_str(), "desktop.workspace.next");
     }
 
     #[test]

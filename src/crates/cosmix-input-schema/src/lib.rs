@@ -123,6 +123,16 @@ pub struct PhysicalBinding {
     /// verb with an empty body, exactly as before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
+    /// Optional explicit target: the registered Bus service name the verb is
+    /// sent to, with `action` delivered UNCHANGED as the command. `None` keeps
+    /// the original rule — the target is the action's first dot-segment
+    /// (`desktop.workspace.next` -> `desktop`). Needed whenever the handler's
+    /// registered name is not its verbs' first segment (a `mix --serve`
+    /// citizen registered as `desktop-vt1` answering `desktop.clipboard.menu`).
+    /// Must match the broker's registered-name grammar
+    /// (`^[a-z][a-z0-9-]{1,30}$`, enforced at bind and load time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
     /// Focus/global scope, reused from the semantic vocabulary.
     #[serde(default)]
     pub scope: BindingScope,
@@ -339,6 +349,7 @@ mod tests {
             },
             action: ActionId::from_static("desktop.workspace.next"),
             args: None,
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::default(),
             passthrough: false,
@@ -347,6 +358,8 @@ mod tests {
         // `args: None` must not appear on the wire — pre-args readers and
         // keymap files see exactly the old shape.
         assert!(!json.contains("args"), "None args serialized: {json}");
+        // Likewise `service: None` — untargeted rows keep the old wire shape.
+        assert!(!json.contains("service"), "None service serialized: {json}");
         let back: PhysicalBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(binding, back);
     }
@@ -361,6 +374,7 @@ mod tests {
             },
             action: ActionId::from_static("launch.run"),
             args: Some(serde_json::json!({"command": "kcalc"})),
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::default(),
             passthrough: false,
@@ -372,6 +386,19 @@ mod tests {
         let old = r#"{"stroke":{"code":65},"action":"launch.run"}"#;
         let parsed: PhysicalBinding = serde_json::from_str(old).expect("old shape");
         assert_eq!(parsed.args, None);
+        assert_eq!(parsed.service, None, "a pre-service body has no target");
+    }
+
+    #[test]
+    fn binding_service_round_trips() {
+        let json = r#"{"stroke":{"code":108,"modifiers":{"right_ctrl":true}},
+            "action":"desktop.clipboard.menu","service":"desktop-vt1"}"#;
+        let parsed: PhysicalBinding = serde_json::from_str(json).expect("targeted row");
+        assert_eq!(parsed.service.as_deref(), Some("desktop-vt1"));
+        assert_eq!(parsed.action.as_str(), "desktop.clipboard.menu");
+        let back: PhysicalBinding =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(parsed, back);
     }
 
     #[test]
@@ -383,6 +410,7 @@ mod tests {
             },
             action: ActionId::from_static("user.f05"),
             args: None,
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::default(),
             passthrough: false,

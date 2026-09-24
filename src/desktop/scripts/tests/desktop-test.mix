@@ -199,6 +199,18 @@ try
   -- ── History: rotate (the clipboard ring) + menu ───────────────────────
   $menu = $d.prepare($ctx,"desktop.clipboard.menu",$headers,{instance:$ctx.instance},2)
   check($menu.rc == 0 and $menu.body.menu == true and $menu.context == nil,"menu verb failed")
+  -- inputd's keymap row fires menu/rotate with an EMPTY body (a static row
+  -- cannot carry the per-start instance uuid): both must be accepted.
+  $menu = $d.prepare($ctx,"desktop.clipboard.menu",$headers,{},2)
+  check($menu.rc == 0 and $menu.body.menu == true,"menu refused the keybind's empty body: " .. json_encode($menu))
+  $rot = $d.prepare($ctx,"desktop.clipboard.rotate",$headers,{},2)
+  check($rot.rc == 0 or $rot.action == "clipboard_rotate","rotate refused the keybind's empty body: " .. json_encode($rot))
+  -- The fence still bites when a caller DOES send an instance.
+  for each $verb in ["desktop.clipboard.menu","desktop.clipboard.rotate"]
+    check($d.prepare($ctx,$verb,$headers,{instance:"stale-instance"},2).rc == 12,"wrong instance accepted by " .. $verb)
+    check($d.prepare($ctx,$verb,$headers,{instance:$ctx.instance,extra:1},2).rc == 10,"extra key accepted by " .. $verb)
+    check($d.prepare($ctx,$verb,$headers,{instance:nil},2).rc == 10,"nil instance accepted by " .. $verb)
+  end
   -- A fresh ring of two, so rotate semantics are exact and isolated.
   $ring = {session:"test",instance:"instance-one",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true",
     history:$d.history_state({path:$tmp .. "/ring.json"}, "test")}

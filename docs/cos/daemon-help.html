@@ -492,7 +492,74 @@ retried on the next valid request. Drop or process exit destroys the device.
 The keyboard grab device retains its existing keyboard capabilities.</p>
 <p>Injection enters the kernel/libinput path for the compositor owning the seat,
 including cosmix-comp and Plasma. Absolute pointer warp is a follow-up requiring
-an EV_ABS device or a compositor verb with output geometry.</p></div></div>
+an EV_ABS device or a compositor verb with output geometry.</p>
+<h2 id="inputd-keymap-rows-and-their-target-service">Inputd keymap rows and their target service</h2>
+<p>A physical keymap row, as <code>input.bind</code> accepts it (with <code>"layer":"physical"</code>),
+as <code>input.query</code> returns it under <code>physical</code>, and as the keymap file stores it:</p>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>stroke</code></td><td>yes</td><td><code>{"code":108,"modifiers":{"right_ctrl":true}}</code>: an evdev code plus exact side-specific modifiers</td></tr>
+<tr><td><code>action</code></td><td>yes</td><td>The Bus verb sent when the row fires, e.g. <code>desktop.clipboard.menu</code></td></tr>
+<tr><td><code>service</code></td><td>no</td><td>The registered Bus service the verb is sent to</td></tr>
+<tr><td><code>args</code></td><td>no</td><td>A JSON object sent as the verb's body; absent means an empty body</td></tr>
+<tr><td><code>scope</code></td><td>no</td><td><code>global</code> (default)</td></tr>
+<tr><td><code>repeat</code></td><td>no</td><td><code>ignore</code> (default) or <code>allow</code>: whether auto-repeat fires again</td></tr>
+<tr><td><code>passthrough</code></td><td>no</td><td><code>true</code> reserves the chord but re-emits it and fires nothing</td></tr>
+</tbody></table>
+<p>When a row has no <code>service</code>, inputd sends the verb to the service named by its
+first dot-segment: <code>desktop.workspace.next</code> goes to <code>desktop</code>. When <code>service</code> is
+present, the verb goes to that service unchanged. Use <code>service</code> when the
+handler's registered name differs from its verbs' first segment. For example,
+the desktop-session clipboard citizen registers as <code>desktop-vt1</code> and answers
+<code>desktop.clipboard.menu</code>. A row whose action is written as
+<code>desktop-vt1.desktop.clipboard.menu</code> never reaches that handler, because the
+citizen receives the whole string as the command and has no such verb.</p>
+<p><code>service</code> must match the broker's registered-name grammar
+<code>^[a-z][a-z0-9-]{1,30}$</code>, so a mesh-qualified target is not accepted. An
+<code>input.bind</code> with a malformed <code>service</code> returns rc 10 with
+<code>rebind refused: InvalidService</code>. Rows without the field serialize without it,
+so older files and callers are unaffected.</p>
+<p>The keymap file is admitted row by row. A row that does not parse, such as one
+whose <code>service</code> is a number, list or object, is dropped. The exception is
+<code>"service": null</code>, which loads as an untargeted row. So is a row whose <code>service</code> fails
+the grammar. The other rows still load, and the file is not reseeded. Each
+dropped row is logged with its code, modifiers, action, service and reason.
+<code>input.reload</code> also returns them in a <code>dropped</code> list in its reply:</p>
+<pre><code class="language-json">{"ok":true,"generation":7,"dropped":[{"code":108,"modifiers":{"right_ctrl":true},
+  "action":"desktop.clipboard.menu","service":7,"reason":"malformed row: ..."}]}
+</code></pre>
+<p>The file on disk is left as written until the next successful <code>input.bind</code>,
+or an <code>input.unbind</code> that removes a live row. Either one rewrites the file from
+the live rows, so the dropped rows are gone from it. An <code>input.unbind</code> of a
+stroke that is not live, including one whose row was dropped, returns
+<code>"removed":false</code> and does not rewrite the file.</p>
+<p>One legacy shape is migrated at load. A row with no <code>service</code> whose action
+starts with <code>desktop-vt1.desktop.clipboard.</code> is rewritten to service
+<code>desktop-vt1</code> with the rest of the action, for example
+<code>desktop.clipboard.menu</code>. inputd logs each migration with the row's code,
+modifiers, old action and new target. No other action is rewritten, so a row
+such as <code>foo-bar.baz.qux</code> keeps first-segment routing.</p>
+<p>The clipboard rows work with no <code>args</code> because the clipboard citizen accepts an
+empty body for <code>desktop.clipboard.menu</code> and <code>desktop.clipboard.rotate</code> from a
+local caller. Since citizen 0.3.5, <code>instance</code> is optional on those two verbs.
+When a caller sends it, a stale value is still refused with rc 12.</p>
+<p>Rolling back to an inputd without this field is lossy. The older binary ignores
+<code>service</code> and routes by first segment, so the clipboard rows go to <code>desktop</code>,
+which has no such verb, and nothing is logged. Under the older binary, the next successful <code>input.bind</code>, or an
+<code>input.unbind</code> that removes a live row, rewrites the file without the field.
+After rolling forward again, those rows must be rebound with <code>service</code>.</p>
+<p>The shipped default keymap binds these right-Ctrl rows:</p>
+<table><thead><tr><th>Chord</th><th>Code</th><th>Action</th><th>Service</th><th>Repeat</th></tr></thead><tbody>
+<tr><td>RightCtrl+Left</td><td>105</td><td><code>desktop.workspace.prev</code></td><td>first segment</td><td>allow</td></tr>
+<tr><td>RightCtrl+Right</td><td>106</td><td><code>desktop.workspace.next</code></td><td>first segment</td><td>allow</td></tr>
+<tr><td>RightCtrl+Down</td><td>108</td><td><code>desktop.clipboard.menu</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
+<tr><td>RightCtrl+Up</td><td>103</td><td><code>desktop.clipboard.rotate</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
+</tbody></table>
+<p>The default keymap only seeds a missing keymap file. A host with an existing
+file keeps its rows, apart from the legacy clipboard migration above. Other
+rows change only when they are rebound with <code>input.bind</code>, or when the file is
+edited and <code>input.reload</code> is sent. The <code>desktop-vt1</code> target suits a host whose
+clipboard citizen runs under that name. On a host whose citizen has another
+name, rebind these two rows with that host's name.</p></div></div>
     </div>
 
 </main>
