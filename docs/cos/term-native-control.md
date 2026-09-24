@@ -36,6 +36,9 @@ header line; `tab.close` adds `revision=`, `pane.close` adds `tab=` and
 `revision=`; each `tabs` line adds `revision=` and each `panes` line
 `tab=` and `revision=`. This lets a caller detect drift after the fact; it
 is detection, not binding (e.g. `split id=2 dir=v tab=1 pane=2 revision=2`).
+The revision counts structural changes (tabs or panes opened or closed); it
+does not move on `tab.select` or `pane.select`, so drift from a select shows
+in `tab=`/`pane=`, never in `revision=`.
 `tab.new` also ends with `binding=`: `granted` (a native launch grant was
 delivered; enrolment completes asynchronously — `term.session` tracks it),
 `graphics-only` (no usable grant, e.g. look-ahead quota exhaustion) or
@@ -49,7 +52,10 @@ at all and sees only the terminal vanish from the Bus. With
 `COSMIX_MESH_OPEN=0` the strict diagnostic-only lane returns: `INFO`/`HELP`
 only, everything else refused with `FORBIDDEN`, including when
 native-session bootstrap fails. The posture is reported, not left to
-inference: the global lane's `term.session` carries `"posture":"mesh-open"`,
+inference: the global lane's `term.session` carries `"posture":"mesh-open"`
+(derived from the gate, not re-read from config: the strict lane refuses
+`term.session` before any handler runs, so a global-lane answer is by
+construction mesh-open),
 the strict lane's `INFO`/`HELP` reply says `posture=strict`, and the
 native-session lane's `term.session` carries `"posture"` as `mesh-open` or
 `strict` in either posture.

@@ -479,6 +479,9 @@ header line; <code>tab.close</code> adds <code>revision=</code>, <code>pane.clos
 <code>revision=</code>; each <code>tabs</code> line adds <code>revision=</code> and each <code>panes</code> line
 <code>tab=</code> and <code>revision=</code>. This lets a caller detect drift after the fact; it
 is detection, not binding (e.g. <code>split id=2 dir=v tab=1 pane=2 revision=2</code>).
+The revision counts structural changes (tabs or panes opened or closed); it
+does not move on <code>tab.select</code> or <code>pane.select</code>, so drift from a select shows
+in <code>tab=</code>/<code>pane=</code>, never in <code>revision=</code>.
 <code>tab.new</code> also ends with <code>binding=</code>: <code>granted</code> (a native launch grant was
 delivered; enrolment completes asynchronously — <code>term.session</code> tracks it),
 <code>graphics-only</code> (no usable grant, e.g. look-ahead quota exhaustion) or
@@ -492,7 +495,10 @@ at all and sees only the terminal vanish from the Bus. With
 <code>COSMIX_MESH_OPEN=0</code> the strict diagnostic-only lane returns: <code>INFO</code>/<code>HELP</code>
 only, everything else refused with <code>FORBIDDEN</code>, including when
 native-session bootstrap fails. The posture is reported, not left to
-inference: the global lane's <code>term.session</code> carries <code>"posture":"mesh-open"</code>,
+inference: the global lane's <code>term.session</code> carries <code>"posture":"mesh-open"</code>
+(derived from the gate, not re-read from config: the strict lane refuses
+<code>term.session</code> before any handler runs, so a global-lane answer is by
+construction mesh-open),
 the strict lane's <code>INFO</code>/<code>HELP</code> reply says <code>posture=strict</code>, and the
 native-session lane's <code>term.session</code> carries <code>"posture"</code> as <code>mesh-open</code> or
 <code>strict</code> in either posture.</p>
