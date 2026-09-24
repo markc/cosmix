@@ -2,7 +2,7 @@
 //! record D3).
 //!
 //! ```text
-//! mix lint [--json | --data] [--deny-warnings]
+//! mix lint [--json | --data] [--deny-warnings] [--require-version]
 //!          [--allow-global NAME]... [--allow-function NAME]...
 //!          FILE...
 //! ```
@@ -20,7 +20,7 @@ use cosmix_mix::error::MixError;
 use cosmix_mix::token::Token;
 
 const USAGE: &str = "Usage: mix lint [--json | --data] [--deny-warnings] \
-[--allow-global NAME]... [--allow-function NAME]... FILE...";
+[--require-version] [--allow-global NAME]... [--allow-function NAME]... FILE...";
 
 /// Line/column pair lifted from a lexer/parser span.
 struct SpanLite {
@@ -52,6 +52,7 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
     let mut format = Format::Human;
     let mut format_set = false;
     let mut deny_warnings = false;
+    let mut require_version = false;
     let mut cfg = AnalyzerConfig::default();
     let mut files: Vec<String> = Vec::new();
     let mut stdin_used = false;
@@ -72,6 +73,7 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
                 format_set = true;
             }
             "--deny-warnings" => deny_warnings = true,
+            "--require-version" => require_version = true,
             "--allow-global" | "--allow-function" => {
                 let Some(name) = args.get(i + 1) else {
                     eprintln!("mix lint: {} requires a NAME", args[i]);
@@ -132,6 +134,9 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
         match lint_one(&source, file_label, &cfg) {
             Ok(LintOutcome::Script(analysis)) => {
                 all_diags.extend(analysis.diagnostics);
+                if let Some(diag) = version_header_diag(&source, file, require_version) {
+                    all_diags.push(diag);
+                }
                 for cap in analysis.capabilities {
                     if !capabilities.contains(&cap) {
                         capabilities.push(cap);
@@ -249,6 +254,59 @@ pub fn run_lint(args: &[String], version: &str) -> i32 {
     }
 
     if errors > 0 || denied { 1 } else { 0 }
+}
+
+/// Is `file` run as a script (so it owes a `-- version:` header), rather than
+/// a module loaded by `require`/`include`? Deliberately simple and documented
+/// in lint.md: a `#!` shebang on line 1, or a path with a `bin` or `_bin`
+/// directory component. Stdin (`-`) qualifies only by shebang.
+fn runs_as_script(source: &str, file: &str) -> bool {
+    if source.starts_with("#!") {
+        return true;
+    }
+    file != "-"
+        && std::path::Path::new(file).parent().is_some_and(|dir| {
+            dir.components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some("bin" | "_bin")))
+        })
+}
+
+/// MIX-D3016: a script with no well-formed `-- version: X.Y.Z` header in its
+/// first lines, so `mix SCRIPT --version` can only say `unversioned`. A note
+/// by default; `--require-version` makes it a warning (same code — D3xxx is
+/// the promotable namespace).
+fn version_header_diag(source: &str, file: &str, require: bool) -> Option<Diagnostic> {
+    use cosmix_mix::VersionHeader;
+    if !runs_as_script(source, file) {
+        return None;
+    }
+    let scan = cosmix_mix::script_version::HEADER_SCAN_LINES;
+    let (line, message) = match cosmix_mix::parse_version_header(source) {
+        VersionHeader::Declared { .. } => return None,
+        VersionHeader::Malformed { raw, line } => (
+            Some(line),
+            format!(
+                "`-- version:` header value `{raw}` is not X.Y.Z, so `mix SCRIPT --version` reports this script as unversioned"
+            ),
+        ),
+        VersionHeader::Absent => (
+            None,
+            format!(
+                "script declares no `-- version: X.Y.Z` header in its first {scan} lines, so `mix SCRIPT --version` reports it as unversioned"
+            ),
+        ),
+    };
+    Some(Diagnostic {
+        code: "MIX-D3016",
+        severity: if require { Severity::Warning } else { Severity::Note },
+        file: Some(file.to_string()),
+        line,
+        column: None,
+        message,
+        hint: Some(format!(
+            "add a `-- version: 0.1.0` comment near the top (the first {scan} lines are searched)"
+        )),
+    })
 }
 
 /// Lex+parse+analyze one file. If script parsing fails but the same

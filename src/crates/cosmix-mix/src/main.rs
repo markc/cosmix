@@ -38,6 +38,7 @@ mod repl;
 mod repl_editor;
 mod serve_runtime;
 mod result_fd;
+mod script_meta;
 mod session_task;
 mod session_execute;
 mod session_state;
@@ -557,6 +558,16 @@ fn run_source(
     // `args()` reads this. It must be told, not left to guess from the
     // process argv — a flag before the script name shifts that by one.
     cosmix_mix::set_script_argv(script_args.to_vec());
+    // `script_version()` reads this: the entry script's provenance.
+    match filename {
+        Some("-") => {
+            script_meta::install(script_meta::provenance(None, source.as_bytes(), None));
+        }
+        Some(path) => {
+            script_meta::install(script_meta::provenance_for_file(path, source));
+        }
+        None => {}
+    }
     // Remember the source (keyed by the same filename the frames carry) so an
     // uncaught error can show its offending line.
     set_entry_source(filename.map(str::to_string), source);
@@ -1214,6 +1225,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             return 1;
         }
     };
+    script_meta::install(script_meta::provenance_for_file(script_path, &source));
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1469,6 +1481,10 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             };
             let mut new_eval =
                 build_serve_eval(&bus_handler, &identity, service_name, script_path, no_prelude).await;
+            // The new init body already answers `script_version()` for the
+            // new file; a revert below puts the old record back.
+            let previous_provenance =
+                script_meta::install(script_meta::provenance_for_file(script_path, &new_source));
             // interrupt::init is once-only, bound to the FIRST evaluator's
             // flag — share that flag so the evaluator-internal interrupt path
             // keeps working after any number of reloads.
@@ -1538,6 +1554,7 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // Cancel any Class C tasks the failed init admitted, so
                     // the discarded evaluator leaves nothing replying behind
                     // the resumed old one.
+                    cosmix_mix::replace_script_provenance(previous_provenance);
                     let drained = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
                     // The old generation's owned children were swept before
                     // this init ran, so the registry now holds ONLY what the
@@ -1789,6 +1806,21 @@ fn main() {
         if let Some(text) = meta::version_request(&args, VERSION) {
             println!("{text}");
             return;
+        }
+        // `mix SCRIPT --version` (and `--serve SCRIPT`, `mix -`): the same
+        // cold answer for a script. The script is read, never parsed or run.
+        let reserved =
+            |s: &str| matches!(s, "stats" | "lint" | "edit") || META_CLI_COMMANDS.contains(&s);
+        match script_meta::script_version_request(&args, &reserved) {
+            Some(Ok(line)) => {
+                println!("{line}");
+                return;
+            }
+            Some(Err(msg)) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+            None => {}
         }
     }
     // Before native_session::start(), because that begins Bus dispatch and a

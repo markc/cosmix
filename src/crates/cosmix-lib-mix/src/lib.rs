@@ -13,6 +13,7 @@ pub mod lint_docs;
 mod numeric;
 pub mod parser;
 pub mod scope;
+pub mod script_version;
 pub mod shell_observation;
 pub mod stats;
 pub mod token;
@@ -47,6 +48,10 @@ use value::Value;
 
 pub use builtins::{CapabilityClass, CategoryAllowList, capability_category, set_script_argv};
 pub use error::{MixError, MixResult};
+pub use script_version::{
+    ScriptProvenance, VersionHeader, parse_version_header, replace_script_provenance,
+    script_provenance,
+};
 pub use evaluator::{
     ArityMode, BusCallFuture, BusCallHandler, BusHandler, CapabilityPolicy,
     DEFAULT_RECURSION_LIMIT, DbFuture, DbHandler, EvalLimits, ExtFn, JmapCall, JmapFuture,
