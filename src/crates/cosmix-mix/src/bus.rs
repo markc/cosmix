@@ -510,6 +510,18 @@ impl BusHandler for MixBusHandler {
         args: &'a Value,
     ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value)>> + 'a>> {
         Box::pin(async move {
+            let (rc, result, _reply) = self.send_with_reply(target, command, args).await?;
+            Ok((rc, result))
+        })
+    }
+
+    fn send_with_reply<'a>(
+        &'a self,
+        target: &'a str,
+        command: &'a str,
+        args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value, Value)>> + 'a>> {
+        Box::pin(async move {
             let json_args = value_to_json(args);
 
             // Try local Unix socket first for simple names. The local
@@ -526,12 +538,16 @@ impl BusHandler for MixBusHandler {
                 // — while a peer `rc >= 10` reply is a distinct AppError that
                 // preserves the real status in `$rc` (the rc-band contract; the
                 // old call_port collapsed both into rc=10).
+                // The native-port reply carries no raw body past
+                // `call_port_typed`, so `$reply` is the decoded success
+                // value, or nil for a refusal (its message is `$result`).
                 return match cosmix_lib_bus::call_port_typed(&socket, command, json_args).await {
                     Ok(cosmix_lib_bus::PortReply::Ok { rc, value }) => {
-                        Ok((i32::from(rc), json_to_value(&value)))
+                        let v = json_to_value(&value);
+                        Ok((i32::from(rc), v.clone(), v))
                     }
                     Ok(cosmix_lib_bus::PortReply::AppError { rc, message }) => {
-                        Ok((i32::from(rc), Value::String(message)))
+                        Ok((i32::from(rc), Value::String(message), Value::Nil))
                     }
                     Err(e) => Err(mesh_unavailable(&format!(
                         "call_port({target}, {command}) transport failure: {e}"
@@ -553,6 +569,7 @@ impl BusHandler for MixBusHandler {
                     return Ok((
                         RC_UNAVAILABLE,
                         Value::String("Bus unavailable: broker never present".to_string()),
+                        Value::Nil,
                     ));
                 }
                 Err(MeshErr::Lost) => {
@@ -581,7 +598,9 @@ impl BusHandler for MixBusHandler {
                     .await
                 {
                     Ok((rc, reply_body, error_header)) => {
-                        Ok(headers_reply_to_result(rc, reply_body, error_header))
+                        let reply = parse_reply_body(&reply_body);
+                        let (rc, result) = headers_reply_to_result(rc, reply_body, error_header);
+                        Ok((rc, result, reply))
                     }
                     // A TRANSPORT failure (broker close, send error, 60s
                     // timeout) → mark Lost (if our Arc is still the cached
@@ -605,12 +624,20 @@ impl BusHandler for MixBusHandler {
             // send_raw failed, 60s timeout) is an `Err` → transition to Lost
             // and raise `mesh unavailable` (→ `$rc = -1`). A success reply
             // carries its rc too (0 or a warning 5).
-            match client.call_typed(target, command, json_args).await {
-                Ok(cosmix_lib_bus::PortReply::Ok { rc, value }) => {
-                    Ok((i32::from(rc), json_to_value(&value)))
-                }
-                Ok(cosmix_lib_bus::PortReply::AppError { rc, message }) => {
-                    Ok((i32::from(rc), Value::String(message)))
+            //
+            // Sent through `call_with_headers_raw` with no extra headers —
+            // the same wire request `call_typed` builds — because `$reply`
+            // needs the raw body that `call_typed` reduces to a message.
+            // `typed_reply_to_result` reproduces `call_typed`'s `$result`.
+            let body = rpc_body(&json_args);
+            match client
+                .call_with_headers_raw(target, command, &BTreeMap::new(), &body)
+                .await
+            {
+                Ok((rc, reply_body, error_header)) => {
+                    let reply = parse_reply_body(&reply_body);
+                    let (rc, result) = typed_reply_to_result(rc, reply_body, error_header);
+                    Ok((rc, result, reply))
                 }
                 Err(e) => {
                     self.mark_lost_if_current(&client).await;
@@ -1174,6 +1201,18 @@ impl BusHandler for MixServeHandler {
         args: &'a Value,
     ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value)>> + 'a>> {
         Box::pin(async move {
+            let (rc, result, _reply) = self.send_with_reply(target, command, args).await?;
+            Ok((rc, result))
+        })
+    }
+
+    fn send_with_reply<'a>(
+        &'a self,
+        target: &'a str,
+        command: &'a str,
+        args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value, Value)>> + 'a>> {
+        Box::pin(async move {
             // Header/body shape (`body=` present, or a SPEC-12 `*.props.*`
             // command — see `wants_header_routing`) → header routing;
             // otherwise JSON-body RPC. Same split as the transient handler,
@@ -1194,7 +1233,9 @@ impl BusHandler for MixServeHandler {
                     .await
                 {
                     Ok((rc, reply_body, error_header)) => {
-                        Ok(headers_reply_to_result(rc, reply_body, error_header))
+                        let reply = parse_reply_body(&reply_body);
+                        let (rc, result) = headers_reply_to_result(rc, reply_body, error_header);
+                        Ok((rc, result, reply))
                     }
                     Err(e) => Err(mesh_unavailable(&format!(
                         "serve call_with_headers({target}, {command}) transport failure: {e}"
@@ -1206,12 +1247,17 @@ impl BusHandler for MixServeHandler {
             // `Err` (→ `$rc = -1`) while a peer `rc >= 10` reply preserves its
             // real status (→ `$rc = rc`), matching the rc-band contract (was
             // every Err → rc=10, conflating transport with application error).
-            match self.supervised.call_typed(target, command, json_args).await {
-                Ok(cosmix_lib_bus::PortReply::Ok { rc, value }) => {
-                    Ok((i32::from(rc), json_to_value(&value)))
-                }
-                Ok(cosmix_lib_bus::PortReply::AppError { rc, message }) => {
-                    Ok((i32::from(rc), Value::String(message)))
+            // Raw call for `$reply` — see MixBusHandler::send_with_reply.
+            let body = rpc_body(&json_args);
+            match self
+                .supervised
+                .call_with_headers_raw(target, command, &BTreeMap::new(), &body)
+                .await
+            {
+                Ok((rc, reply_body, error_header)) => {
+                    let reply = parse_reply_body(&reply_body);
+                    let (rc, result) = typed_reply_to_result(rc, reply_body, error_header);
+                    Ok((rc, result, reply))
                 }
                 Err(e) => Err(mesh_unavailable(&format!(
                     "serve call({target}, {command}) transport failure: {e}"
@@ -1587,6 +1633,63 @@ pub(crate) fn json_to_value(val: &serde_json::Value) -> Value {
 /// * `rc < 10` — success or a warning: `$rc` keeps the rc and `$result` is the
 ///   JSON-parsed body (empty → Nil; non-JSON → the verbatim String), matching
 ///   `call_typed`'s body handling.
+/// `$reply` (0.92.0): the reply body JSON-parsed, for every response —
+/// success or refusal, whatever its dialect — and `Nil` when the body is
+/// empty or not JSON. `$result` keeps its own, deliberately reduced shape.
+fn parse_reply_body(body: &str) -> Value {
+    if body.is_empty() {
+        return Value::Nil;
+    }
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(j) => json_to_value(&j),
+        Err(_) => Value::Nil,
+    }
+}
+
+/// The JSON-body RPC request body, exactly as `NodedClient::call_typed`
+/// frames it: a null arg is an empty body.
+fn rpc_body(args: &serde_json::Value) -> String {
+    if args.is_null() {
+        String::new()
+    } else {
+        args.to_string()
+    }
+}
+
+/// `$rc`/`$result` for a JSON-body RPC from its raw `(rc, body,
+/// error_header)` — a byte-for-byte reproduction of what
+/// `NodedClient::call_typed` + `BusMessage::error_message` produced before
+/// `send` switched to the raw call to recover the body for `$reply`:
+///
+/// * `rc >= 10` — `$result` is the MESSAGE: the `error` header, else the
+///   body's `error` string, else the trimmed body verbatim, else
+///   `"unknown error"`.
+/// * `rc < 10` — the JSON-parsed body (empty → Nil, non-JSON → the String).
+fn typed_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
+    if rc >= 10 {
+        let message = error_header.unwrap_or_else(|| {
+            let trimmed = body.trim();
+            if trimmed.is_empty() {
+                return "unknown error".to_string();
+            }
+            serde_json::from_str::<serde_json::Value>(trimmed)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .unwrap_or_else(|| trimmed.to_string())
+        });
+        return (i32::from(rc), Value::String(message));
+    }
+    let value = if body.is_empty() {
+        Value::Nil
+    } else {
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(j) => json_to_value(&j),
+            Err(_) => Value::String(body),
+        }
+    };
+    (i32::from(rc), value)
+}
+
 fn headers_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
     if rc >= 10 {
         let parsed: Option<serde_json::Value> = if body.is_empty() {
@@ -1741,6 +1844,63 @@ mod tests {
         // be mis-coerced to an integer).
         assert!(!value_to_json(&Value::Number(f64::INFINITY)).is_i64());
         assert!(!value_to_json(&Value::Number(f64::NAN)).is_i64());
+    }
+
+    // --- `$reply` + the typed `$result` reproduction (0.92.0) ---
+
+    fn field(v: &Value, k: &str) -> Value {
+        match v {
+            Value::Map(m) => m.get(k).cloned().unwrap_or(Value::Nil),
+            other => panic!("expected a map, got {other:?}"),
+        }
+    }
+
+    /// The motivating comp refusal: `$result` stays the reduced string, and
+    /// `$reply` exposes every field — the whole point of the change.
+    #[test]
+    fn error_dialect_refusal_keeps_its_fields_in_reply() {
+        let body = r#"{"error":"occluded","id":2,"under":{"id":1,"generation":1}}"#;
+        let (rc, result) = typed_reply_to_result(10, body.to_string(), None);
+        assert_eq!(rc, 10);
+        assert_eq!(result, Value::String("occluded".to_string()));
+        let reply = parse_reply_body(body);
+        assert_eq!(field(&field(&reply, "under"), "generation"), Value::Number(1.0));
+        // Same through the header route.
+        let (_, hresult) = headers_reply_to_result(10, body.to_string(), None);
+        assert_eq!(hresult, Value::String("occluded".to_string()));
+    }
+
+    /// `typed_reply_to_result` reproduces `call_typed` +
+    /// `BusMessage::error_message` exactly: header first, then the body's
+    /// `error`, then the trimmed body verbatim, then "unknown error".
+    #[test]
+    fn typed_result_matches_the_call_typed_mapping() {
+        let s = |v: &str| Value::String(v.to_string());
+        assert_eq!(
+            typed_reply_to_result(10, r#"{"error":"body"}"#.into(), Some("header".into())).1,
+            s("header")
+        );
+        assert_eq!(typed_reply_to_result(10, r#"{"error":"body"}"#.into(), None).1, s("body"));
+        let coded = r#"{"error_code":"not_found","message":"m"}"#;
+        assert_eq!(typed_reply_to_result(10, coded.into(), None).1, s(coded));
+        assert_eq!(typed_reply_to_result(42, "  plain text \n".into(), None), (42, s("plain text")));
+        assert_eq!(typed_reply_to_result(10, "   ".into(), None).1, s("unknown error"));
+        assert_eq!(typed_reply_to_result(0, String::new(), None), (0, Value::Nil));
+        assert_eq!(typed_reply_to_result(5, "\"ok\"".into(), None), (5, s("ok")));
+        assert_eq!(typed_reply_to_result(0, "# markdown".into(), None).1, s("# markdown"));
+    }
+
+    /// A success body is identical in `$result` and `$reply`; a non-JSON or
+    /// empty body is nil in `$reply`.
+    #[test]
+    fn reply_body_parse_success_identity_and_non_json_nil() {
+        let body = r#"{"pong":true,"n":2}"#;
+        let (_, result) = typed_reply_to_result(0, body.into(), None);
+        assert_eq!(parse_reply_body(body), result);
+        assert_eq!(parse_reply_body(""), Value::Nil);
+        assert_eq!(parse_reply_body("# markdown"), Value::Nil);
+        assert_eq!(rpc_body(&serde_json::Value::Null), "");
+        assert_eq!(rpc_body(&serde_json::json!({"a": 1})), r#"{"a":1}"#);
     }
 
     // --- headers_reply_to_result: the `send body=` reply mapping ---

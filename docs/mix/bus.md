@@ -45,11 +45,12 @@ Mix it is grammar.
 ## `send` — RPC (request/reply)
 
 `send <target> <command> [key=value …]` dispatches a command and **waits for the
-reply**. Two result variables are set as a side effect:
+reply**. Three result variables are set as a side effect:
 
 | Var | Meaning |
 |---|---|
 | `$result` | the reply value (a [map](collections.md), list, string, … — field-accessible) |
+| `$reply` | the WHOLE reply body, JSON-parsed, for every response — success or refusal, whatever its dialect — and `nil` when the body is empty or not JSON, or the send never got a reply (0.92.0). See [below](#reading-rc-ok-vs-application-error-vs-transport-failure). |
 | `$rc` | numeric status in signed bands: `0` delivered+accepted · `1..9` delivered with a warning (still success) · `>= 10` peer application error (the exact peer rc is kept) · `-1` transport failure · `-2` per-send `timeout=` exceeded · `-3` Bus unavailable (no broker). All negatives are non-fatal. |
 
 ```mix
@@ -150,6 +151,26 @@ refusal; flattened to prose it leaves a script parsing English to decide whether
 to retry. This is narrow on purpose: a peer that answers an error as plain text,
 or as JSON of some other shape, still produces exactly the string it always did.
 Only a body naming `error_code` takes the structured path. (0.87.0)
+
+**`$reply` keeps every field of every reply.** Most daemons refuse in the other
+dialect — `{"error": "occluded", "under": {…}}` — and `$result` reduces that to
+its message string on purpose, so existing scripts keep working. The detail
+(`occluded.under`, `stale_target.current`, `timeout.waited_ms`,
+`invalid_args.allowed`) is in `$reply`, the whole parsed body:
+
+```mix
+send comp comp.window.focus id=2
+if $rc == 10 and $result == "occluded" then
+  print("covered by window " .. to_string($reply.under.id))
+end
+```
+
+`$reply` is set on every `send` (and every address-block line): the parsed body
+for a success (the same value as `$result`) or a refusal of either dialect, and
+`nil` when the body is empty or not JSON, or when no reply arrived (`$rc < 0`).
+One limit: a target reached over its **local Unix port** (a sibling
+user-service, not the broker) reports a refusal as a message only, so there
+`$reply` is `nil` for a refusal. (0.92.0)
 
 **A wrong verb name answers at once.** A `mix --serve` citizen (or any script
 with `on` handlers) that receives a request for a command it has no handler

@@ -478,9 +478,10 @@ Mix it is grammar.</p>
 <hr />
 <h2 id="send--rpc-requestreply"><code>send</code> — RPC (request/reply)</h2>
 <p><code>send &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches a command and <strong>waits for the
-reply</strong>. Two result variables are set as a side effect:</p>
+reply</strong>. Three result variables are set as a side effect:</p>
 <table><thead><tr><th>Var</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>$result</code></td><td>the reply value (a <a href="/mix/collections">map</a>, list, string, … — field-accessible)</td></tr>
+<tr><td><code>$reply</code></td><td>the WHOLE reply body, JSON-parsed, for every response — success or refusal, whatever its dialect — and <code>nil</code> when the body is empty or not JSON, or the send never got a reply (0.92.0). See <a href="/mix/bus#reading-rc-ok-vs-application-error-vs-transport-failure">below</a>.</td></tr>
 <tr><td><code>$rc</code></td><td>numeric status in signed bands: <code>0</code> delivered+accepted · <code>1..9</code> delivered with a warning (still success) · <code>&gt;= 10</code> peer application error (the exact peer rc is kept) · <code>-1</code> transport failure · <code>-2</code> per-send <code>timeout=</code> exceeded · <code>-3</code> Bus unavailable (no broker). All negatives are non-fatal.</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send noded noded.info
@@ -557,6 +558,22 @@ refusal; flattened to prose it leaves a script parsing English to decide whether
 to retry. This is narrow on purpose: a peer that answers an error as plain text,
 or as JSON of some other shape, still produces exactly the string it always did.
 Only a body naming <code>error_code</code> takes the structured path. (0.87.0)</p>
+<p><strong><code>$reply</code> keeps every field of every reply.</strong> Most daemons refuse in the other
+dialect — <code>{"error": "occluded", "under": {…}}</code> — and <code>$result</code> reduces that to
+its message string on purpose, so existing scripts keep working. The detail
+(<code>occluded.under</code>, <code>stale_target.current</code>, <code>timeout.waited_ms</code>,
+<code>invalid_args.allowed</code>) is in <code>$reply</code>, the whole parsed body:</p>
+<pre><code class="language-mix">send comp comp.window.focus id=2
+if $rc == 10 and $result == "occluded" then
+  print("covered by window " .. to_string($reply.under.id))
+end
+</code></pre>
+<p><code>$reply</code> is set on every <code>send</code> (and every address-block line): the parsed body
+for a success (the same value as <code>$result</code>) or a refusal of either dialect, and
+<code>nil</code> when the body is empty or not JSON, or when no reply arrived (<code>$rc &lt; 0</code>).
+One limit: a target reached over its <strong>local Unix port</strong> (a sibling
+user-service, not the broker) reports a refusal as a message only, so there
+<code>$reply</code> is <code>nil</code> for a refusal. (0.92.0)</p>
 <p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
 with <code>on</code> handlers) that receives a request for a command it has no handler
 for refuses it immediately with <code>rc 10</code> and a structured body —

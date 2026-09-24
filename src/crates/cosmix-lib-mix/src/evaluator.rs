@@ -1773,6 +1773,30 @@ pub trait BusHandler {
         args: &'a Value,
     ) -> BusFuture<'a, MixResult<(i32, Value)>>;
 
+    /// [`Self::send`] plus the reply BODY, JSON-parsed (`Nil` when the body
+    /// is empty or not JSON) — what the `send` keyword binds to `$reply`.
+    /// `$result` reduces an `{"error": …}` refusal to its message string on
+    /// purpose; `$reply` keeps every field (`occluded.under`,
+    /// `stale_target.current`, …). The default derives it from `send`'s
+    /// result — exact for a success and for an `error_code` map, `Nil` for a
+    /// reduced error string — so a handler that can see the raw body
+    /// overrides this.
+    fn send_with_reply<'a>(
+        &'a self,
+        target: &'a str,
+        command: &'a str,
+        args: &'a Value,
+    ) -> BusFuture<'a, MixResult<(i32, Value, Value)>> {
+        Box::pin(async move {
+            let (rc, result) = self.send(target, command, args).await?;
+            let reply = match &result {
+                Value::String(_) if rc >= 10 => Value::Nil,
+                other => other.clone(),
+            };
+            Ok((rc, result, reply))
+        })
+    }
+
     /// Fire-and-forget send. Returns immediately after dispatching.
     fn emit<'a>(
         &'a self,
@@ -13780,17 +13804,19 @@ impl Evaluator {
                     "result",
                     Value::String("Bus not available (no handler registered)".to_string()),
                 );
+                self.scope.update_or_set("reply", Value::Nil);
                 return Ok(Value::Nil);
             }
         };
         // SPEC 18 Phase 2 WS3-C.7e — yield-on-send. The outer `?` keeps
         // a yield-machinery error fatal; the inner send outcome is
         // mapped to the rc bands, never aborts.
-        let send_fut = handler.send(&target, name, &args_map);
+        let send_fut = handler.send_with_reply(&target, name, &args_map);
         match self.await_with_class_c_yield(send_fut).await? {
-            Ok((rc, result)) => {
+            Ok((rc, result, reply)) => {
                 self.scope.update_or_set("rc", Value::Number(rc as f64));
                 self.scope.update_or_set("result", result.clone());
+                self.scope.update_or_set("reply", reply);
                 Ok(result)
             }
             Err(e) => {
@@ -13798,6 +13824,7 @@ impl Evaluator {
                     .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
                 self.scope
                     .update_or_set("result", Value::String(e.to_string()));
+                self.scope.update_or_set("reply", Value::Nil);
                 Ok(Value::Nil)
             }
         }
@@ -14138,6 +14165,7 @@ impl Evaluator {
                     self.scope
                         .update_or_set("rc", Value::Number(RC_UNAVAILABLE as f64));
                     self.scope.update_or_set("result", Value::String(err_msg));
+                    self.scope.update_or_set("reply", Value::Nil);
                     return Ok(Value::Nil);
                 }
             };
@@ -14162,7 +14190,7 @@ impl Evaluator {
             // is dropped at the broker — no resource leak) and write the
             // typed `(rc=-1, result="timeout: ...")` shape that mirrors
             // other transport failures (don't invent a new rc="timeout").
-            let send_fut = handler.send(&target_str, &command_str, &args_map);
+            let send_fut = handler.send_with_reply(&target_str, &command_str, &args_map);
             let timeout_secs = timeout.map(|d| d.as_secs_f64());
             let outcome = match timeout {
                 None => self.await_with_class_c_yield(send_fut).await?,
@@ -14179,18 +14207,21 @@ impl Evaluator {
                             self.scope
                                 .update_or_set("rc", Value::Number(RC_TIMEOUT as f64));
                             self.scope.update_or_set("result", Value::String(err_msg));
+                            self.scope.update_or_set("reply", Value::Nil);
                             return Ok(Value::Nil);
                         }
                     }
                 }
             };
             match outcome {
-                Ok((rc, result)) => {
+                Ok((rc, result, reply)) => {
                     // The handler's signed rc verbatim: 0 ok, >=10 broker/app
                     // error, or RC_UNAVAILABLE (-3) for its own no-broker
-                    // degrade. Always numeric.
+                    // degrade. Always numeric. `$reply` is the whole parsed
+                    // reply body, success or refusal (0.92.0).
                     self.scope.update_or_set("rc", Value::Number(rc as f64));
                     self.scope.update_or_set("result", result.clone());
+                    self.scope.update_or_set("reply", reply);
                     Ok(result)
                 }
                 Err(e) => {
@@ -14201,6 +14232,7 @@ impl Evaluator {
                     self.scope
                         .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
                     self.scope.update_or_set("result", Value::String(err_msg));
+                    self.scope.update_or_set("reply", Value::Nil);
                     Ok(Value::Nil)
                 }
             }

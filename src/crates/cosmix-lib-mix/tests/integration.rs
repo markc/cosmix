@@ -5195,6 +5195,97 @@ mod rc_band_contract_tests {
         let eval = run("emit svc event\n$after = 4\n", None).await;
         assert_eq!(eval.get_global("after").unwrap(), Value::Number(4.0));
     }
+
+    /// A handler that sees the raw body (as cosmix-mix's do) overrides
+    /// `send_with_reply`; `send` itself is never consulted by the keyword.
+    struct ReplyHandler;
+    impl BusHandler for ReplyHandler {
+        fn send<'a>(
+            &'a self,
+            _t: &'a str,
+            _c: &'a str,
+            _a: &'a Value,
+        ) -> BusFuture<'a, MixResult<(i32, Value)>> {
+            // An Err here would surface as $rc = -1 and fail the rc assertion.
+            Box::pin(async {
+                Err(MixError::RuntimeError {
+                    span: None,
+                    msg: "the send keyword must go through send_with_reply".into(),
+                })
+            })
+        }
+        fn send_with_reply<'a>(
+            &'a self,
+            _t: &'a str,
+            _c: &'a str,
+            _a: &'a Value,
+        ) -> BusFuture<'a, MixResult<(i32, Value, Value)>> {
+            Box::pin(async {
+                let under = cosmix_mix::IndexMap::from([("id".to_string(), Value::Number(1.0))]);
+                let body = cosmix_mix::IndexMap::from([
+                    ("error".to_string(), Value::String("occluded".into())),
+                    ("under".to_string(), Value::map(under)),
+                ]);
+                Ok((10, Value::String("occluded".into()), Value::map(body)))
+            })
+        }
+        fn emit<'a>(
+            &'a self,
+            _t: &'a str,
+            _c: &'a str,
+            _a: &'a Value,
+        ) -> BusFuture<'a, MixResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn port_exists<'a>(&'a self, _t: &'a str) -> BusFuture<'a, MixResult<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+        fn next_incoming<'a>(&'a self) -> BusFuture<'a, Option<IncomingEvent>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// TODO-mix "send drops the fields of an error-dialect refusal":
+    /// `$result` stays the message string, `$reply` carries every field —
+    /// for `send`, `$x = send …` and an address-block line alike.
+    #[tokio::test]
+    async fn send_binds_reply_alongside_rc_and_result() {
+        let h: std::rc::Rc<dyn BusHandler> = std::rc::Rc::new(ReplyHandler);
+        let eval = run(
+            "send comp comp.window.focus id=2\n$r1 = $result\n$u1 = $reply.under.id\n\
+             $x = send comp comp.window.focus\n$u2 = $reply.under.id\n\
+             address comp\n  ping\nend\n$u3 = $reply.under.id\n",
+            Some(h),
+        )
+        .await;
+        assert_eq!(eval.get_global("rc").unwrap(), Value::Number(10.0));
+        assert_eq!(eval.get_global("r1").unwrap(), Value::String("occluded".into()));
+        for v in ["u1", "u2", "u3"] {
+            assert_eq!(eval.get_global(v).unwrap(), Value::Number(1.0), "{v}");
+        }
+    }
+
+    /// Every non-delivery path binds `$reply` to nil, so a stale reply from
+    /// an earlier send can never be read as this send's.
+    #[tokio::test]
+    async fn reply_is_nil_on_transport_failure_and_without_a_bus() {
+        let h: std::rc::Rc<dyn BusHandler> = std::rc::Rc::new(ReplyHandler);
+        let eval = run("send comp x\n", Some(h)).await;
+        assert_ne!(eval.get_global("reply").unwrap(), Value::Nil);
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(RcHandler { send_rc: None }))).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+        let eval = run("send svc ping\n", None).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+    }
+
+    /// The trait default (a handler that only implements `send`): a success
+    /// result is the reply, a reduced error STRING is not a body (nil).
+    #[tokio::test]
+    async fn default_send_with_reply_derives_from_send() {
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(RcHandler { send_rc: Some(0) }))).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+        assert_eq!(eval.get_global("result").unwrap(), Value::Nil);
+    }
 }
 
 /// A user fn named after an evaluator special form (EVAL_SPECIAL_BUILTINS:
