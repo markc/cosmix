@@ -41793,6 +41793,38 @@ fn screencopy_s1a_02_exact_whole_output_shm_advertisement() {
     );
 }
 
+/// The nested output is 320x240 logical. At 2.5 its screencopy frame is the
+/// 800x600 physical buffer, never the logical size, and a logical region is
+/// projected to physical pixels. A client that composes the result at
+/// `wl_output.scale` (nested advertises 1, as grim reads it) downsamples it
+/// again on its own side; that is why a pixel gate must ask for the scale.
+#[test]
+fn screencopy_nested_frame_is_physical_pixels_at_two_point_five() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 320, 240, 1280]
+    );
+    assert!(
+        wire.harness
+            .server
+            .state
+            .backend
+            .change_host_output_scale(2.5)
+    );
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 800, 600, 3200]
+    );
+    let (region, events) = wire.capture_region(10, 20, 30, 40);
+    assert_eq!(
+        screencopy_buffer_words(&events, region),
+        vec![wl_shm::Format::Xrgb8888 as u32, 75, 100, 300]
+    );
+}
+
 #[test]
 fn first_light_wire_copy_then_copy_with_damage_complete_across_animation_frames() {
     let started = Instant::now();

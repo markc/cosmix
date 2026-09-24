@@ -1048,7 +1048,8 @@ window is not a valid X11 activation target
 (<code>window_switch_candidate</code>), un-minimising is the separate request that
 restores it. Two verbs drive the workspaces:</p>
 <ul>
-<li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
+<li>
+<p><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
 current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
 the current one, which wrap at the ends unless <code>wrap:false</code>, when they are
 refused with <code>{"error":"at_end",output,from,count}</code> (<code>output</code> there is the
@@ -1061,8 +1062,10 @@ is <code>invalid_value</code> naming <code>index</code> with the range. The repl
 <code>from == to</code> and does nothing. Minimise state is untouched: a minimised
 window on the arriving workspace stays minimised. The verb names no
 window but changes what is on screen, so a session lock refuses it
-(<code>locked</code>).</li>
-<li><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
+(<code>locked</code>).</p>
+</li>
+<li>
+<p><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
 window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</code> relative to the
 window's own workspace, always wrapping) without switching; the window
 becomes <code>visible:false, minimized:false</code> if it leaves the current
@@ -1085,8 +1088,10 @@ and <code>current</code> reads 1, so a send to workspace 1 answers <code>followe
 The move has happened either way. The reply is <code>{id,generation,index}</code>
 (plus <code>followed</code> with <code>follow:true</code>). A move never changes the window's
 <code>generation</code>. Out-of-range indices are <code>invalid_value</code> and change
-nothing; the usual <code>{id,generation}</code> fence applies.</li>
-<li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
+nothing; the usual <code>{id,generation}</code> fence applies.</p>
+</li>
+<li>
+<p><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
 <code>focused</code> is false, <code>reason</code> says why, the first that holds in this
@@ -1095,15 +1100,19 @@ order: <code>exclusive_layer</code> (an exclusive layer surface holds the keyboa
 or <code>refused</code>. The first three are what keep an off-workspace window's
 switch from running, so such a window names the gate that held it, not
 the visibility the switch would have given it; a refusal changes nothing
-and attributes nothing to the window.</li>
-<li><code>comp.window.raise {id,generation}</code> raises the window within its band
+and attributes nothing to the window.</p>
+</li>
+<li>
+<p><code>comp.window.raise {id,generation}</code> raises the window within its band
 without focusing it. The reply is <code>{id,generation,raised}</code>. Raise is
 stacking only: it never switches workspace and never un-minimises. An
 off-workspace or minimised window is restacked in place and stays where it
 is; <code>raised</code> reports the stacking change alone. <code>comp.window.focus</code> and
-<code>comp.window.restore</code> are the verbs that bring a window into view.</li>
-<li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
-or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
+<code>comp.window.restore</code> are the verbs that bring a window into view.</p>
+</li>
+<li>
+<p><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
+or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.</p>
 <ul>
 <li>With <code>force:true</code> (and optional <code>timeout_ms</code>, default 3000, at most
 60000) the reply waits. The deadline runs from when the port admitted
@@ -1123,8 +1132,9 @@ and the verb replies at once with
 <code>{"error":"still_open","reason":"x11_kill_unsupported",polite_close_sent:true}</code>.</li>
 </ul>
 </li>
-<li><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
-and/or resizes the window, with at least one field given.
+<li>
+<p><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
+and/or resizes the window, with at least one field given.</p>
 <ul>
 <li><code>x</code>/<code>y</code> are output-local logical coordinates of the window-geometry
 origin (<code>window_x</code>/<code>window_y</code>). <code>output</code> is an <code>outputs</code> key or output
@@ -1138,14 +1148,21 @@ size for the other axis in the configure. For an xdg window this is a configure,
 changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
 <li>The reply is
 <code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
+<li>The window lands on whole physical pixels, so <code>window_x</code>/<code>window_y</code> can
+differ from the request by up to half a physical pixel and need not be
+integers: at scale 2.5, <code>x: 1</code> answers <code>window_x: 1.2</code>. See
+<a href="/cos/cosmix-comp#whole-pixel-placement">Whole-pixel placement</a>. To put a neighbour flush
+against this window, place it at the REPLIED origin plus the window's
+logical size, not the requested one.</li>
 <li>A maximised or fullscreen window is refused with
 <code>{"error":"invalid_state",maximized,fullscreen}</code>. An unknown output is
 <code>unknown_output</code>. A place that would leave the window wholly outside
 every output is refused with <code>{"error":"off_output",x,y,width,height}</code>.</li>
 </ul>
 </li>
-<li><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
-window reaches a state.
+<li>
+<p><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
+window reaches a state.</p>
 <ul>
 <li><code>match</code> is either <code>{id,generation?}</code> or
 <code>{app_id?,title?,title_contains?}</code> with at least one field. Name filters
@@ -1182,16 +1199,47 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 <code>comp.input.sequence</code>.</li>
 </ul>
 </li>
-<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
+<li>
+<p><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
 returns <code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field
 (text filters at most 4096 bytes; <code>workspace</code> is an index in <code>1..=count</code>
 — above the count is <code>invalid_value</code>, not an empty list — <code>"current"</code> for
 the current workspace, or <code>"all"</code>, the default). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
-windows and is empty while a session lock is active.</li>
+windows and is empty while a session lock is active.</p>
+</li>
 </ul>
 <p>Every argument object is checked for unknown fields
 (<code>{"error":"invalid_args",field,allowed}</code>).</p>
+<h4 id="whole-pixel-placement">Whole-pixel placement</h4>
+<p>At a fractional output scale a logical origin can fall between physical
+pixels: x = 1 at 2.5 is physical 2.5. The renderer projects each window edge
+to a whole pixel on its own, so a 795-wide window there spans 1987 pixels
+while its fractional-scale client drew <code>round(795 x 2.5)</code> = 1988, and the
+content is resampled and blurs. comp therefore places every Wayland
+toplevel's buffer origin on a whole physical pixel: the cascade slot a new
+window opens in, <code>comp.window.place</code>, interactive move and resize, a clamp
+after the output shrinks, a change in the client's window-geometry inset, and
+a nested host scale change. The snap moves the buffer by at most half a
+physical pixel. The reported <code>window_x</code>/<code>window_y</code> and the <code>windows.s&lt;id&gt;</code>
+position leaves are the snapped values, so they can be fractional in logical
+units.</p>
+<p>On the grid, both edges of the buffer project exactly, so the drawn width is
+the client's <code>round(width x scale)</code> buffer and it is sampled 1:1. A neighbour
+placed at the reported origin plus the window's logical size projects its
+left edge to the same physical pixel as this window's right edge, with no
+seam and no overlap. The same rule applies at scale 1, where it rounds a
+fractional pointer-driven origin to a whole pixel.</p>
+<p>Three kinds of surface are left alone:</p>
+<ul>
+<li>X11 windows keep integer X coordinates.</li>
+<li>Maximised and fullscreen windows start exactly at the work area or output
+origin.</li>
+<li>Popups and subsurfaces keep their client-chosen offsets from the parent.</li>
+</ul>
+<p>A window whose right or bottom edge falls on a negative half pixel, straddling
+the left or top output edge, can still project one pixel short. The renderer
+rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
 <p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply

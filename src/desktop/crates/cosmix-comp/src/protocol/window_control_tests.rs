@@ -167,6 +167,107 @@ fn place_moves_the_window_geometry_origin_output_locally() {
     assert_eq!(body, json!({"error": "unknown_output", "output": "o_elsewhere"}));
 }
 
+/// The renderer's physical edges for a record's buffer at `scale120`.
+fn physical_edges(record: &SurfaceRecord, scale120: u32) -> (i64, i64, i64, i64) {
+    crate::compositor_scene::projected_renderer_physical_edges(
+        record.layout.x,
+        record.layout.y,
+        record.layout.width,
+        record.layout.height,
+        scale120,
+    )
+}
+
+fn assert_on_physical_grid(record: &SurfaceRecord, scale: f64, context: &str) {
+    for (axis, value) in [("x", record.layout.x), ("y", record.layout.y)] {
+        let physical = f64::from(value) * scale;
+        assert!(
+            (physical - physical.round()).abs() < 1e-3,
+            "{context}: buffer {axis} {value} is {physical} physical, not a whole pixel"
+        );
+    }
+}
+
+#[test]
+fn place_at_two_point_five_lands_buffers_on_whole_physical_pixels_and_neighbours_share_edges() {
+    const SCALE120: u32 = 300;
+    let (mut harness, ingress, _observations, runtime, alpha, beta) = two_mapped_windows();
+    // An odd logical size is the case that resamples: 65 x 2.5 = 162.5, so a
+    // fractional-scale client draws round(162.5) = 163 pixels, and only a
+    // buffer standing on a whole pixel projects to exactly that.
+    let buffer = harness.create_dmabuf_buffer_sized(65, 33);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    let (id, generation) = window_id_and_generation(&harness, &alpha);
+    let (beta_id, beta_generation) = window_id_and_generation(&harness, &beta);
+    let place_at = |harness: &mut KeybindingHarness, id: u64, generation: u64, x: f64, y: f64| {
+        let (rc, body) = window_op(
+            harness,
+            &ingress,
+            &runtime,
+            WindowOp::Place(PlaceSpec {
+                x: Some(x),
+                y: Some(y),
+                ..place(id, generation)
+            }),
+        );
+        assert_eq!(rc, 0, "{body}");
+        (
+            body["window_x"].as_f64().expect("window_x"),
+            body["window_y"].as_f64().expect("window_y"),
+        )
+    };
+
+    // A window on the scale-one grid is off the 2.5 grid until the scale
+    // change re-settles it.
+    place_at(&mut harness, id, generation, 1.0, 3.0);
+    assert_eq!(harness.server.state.surfaces[&alpha].window_origin, (1.0, 3.0));
+    harness.server.state.change_output_scale(2.5);
+    assert_on_physical_grid(&harness.server.state.surfaces[&alpha], 2.5, "after scale change");
+
+    // The gate can fail: the raw odd origin projects one pixel narrow.
+    let (left, _, right, _) =
+        crate::compositor_scene::projected_renderer_physical_edges(1.0, 3.0, 65.0, 33.0, SCALE120);
+    assert_eq!(right - left, 162, "an unsnapped x = 1 buffer is resampled");
+
+    for (x, y) in [(1.0, 3.0), (7.0, 13.0), (101.0, 41.0), (40.3, 17.7), (2.0, 4.0)] {
+        let (window_x, window_y) = place_at(&mut harness, id, generation, x, y);
+        let record = &harness.server.state.surfaces[&alpha];
+        let context = format!("placed at ({x}, {y})");
+        assert_on_physical_grid(record, 2.5, &context);
+        assert!(
+            (f64::from(record.window_origin.0) - window_x).abs() < 1e-4
+                && (f64::from(record.window_origin.1) - window_y).abs() < 1e-4,
+            "{context}: the reply reports where the window really is"
+        );
+        let (left, top, right, bottom) = physical_edges(record, SCALE120);
+        assert_eq!(
+            (right - left, bottom - top),
+            (163, 83),
+            "{context}: the buffer is sampled 1:1"
+        );
+
+        // A neighbour placed flush right, and one flush below, at the
+        // reported origin plus the window's logical size, shares its edge.
+        let size = (f64::from(record.layout.width), f64::from(record.layout.height));
+        place_at(&mut harness, beta_id, beta_generation, window_x + size.0, window_y);
+        let neighbour = &harness.server.state.surfaces[&beta];
+        assert_on_physical_grid(neighbour, 2.5, &context);
+        let (beta_left, beta_top, _, _) = physical_edges(neighbour, SCALE120);
+        assert_eq!((beta_left, beta_top), (right, top), "{context}: no seam to the right");
+        place_at(&mut harness, beta_id, beta_generation, window_x, window_y + size.1);
+        let neighbour = &harness.server.state.surfaces[&beta];
+        let (beta_left, beta_top, _, _) = physical_edges(neighbour, SCALE120);
+        assert_eq!((beta_left, beta_top), (left, bottom), "{context}: no seam below");
+    }
+}
+
 /// Every renderer batch published so far, flattened.
 fn take_renderer_events(harness: &mut KeybindingHarness) -> Vec<ProtocolEvent> {
     let mut events = std::mem::take(&mut harness.server.state.events);

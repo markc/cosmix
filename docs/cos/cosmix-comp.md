@@ -766,10 +766,17 @@ restores it. Two verbs drive the workspaces:
     {until:"size"}`.
   - The reply is
     `{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}`.
+  - The window lands on whole physical pixels, so `window_x`/`window_y` can
+    differ from the request by up to half a physical pixel and need not be
+    integers: at scale 2.5, `x: 1` answers `window_x: 1.2`. See
+    [Whole-pixel placement](#whole-pixel-placement). To put a neighbour flush
+    against this window, place it at the REPLIED origin plus the window's
+    logical size, not the requested one.
   - A maximised or fullscreen window is refused with
     `{"error":"invalid_state",maximized,fullscreen}`. An unknown output is
     `unknown_output`. A place that would leave the window wholly outside
     every output is refused with `{"error":"off_output",x,y,width,height}`.
+
 - `comp.window.wait {match,until,width?,height?,timeout_ms?}` replies when a
   window reaches a state.
   - `match` is either `{id,generation?}` or
@@ -815,6 +822,38 @@ restores it. Two verbs drive the workspaces:
 
 Every argument object is checked for unknown fields
 (`{"error":"invalid_args",field,allowed}`).
+
+#### Whole-pixel placement
+
+At a fractional output scale a logical origin can fall between physical
+pixels: x = 1 at 2.5 is physical 2.5. The renderer projects each window edge
+to a whole pixel on its own, so a 795-wide window there spans 1987 pixels
+while its fractional-scale client drew `round(795 x 2.5)` = 1988, and the
+content is resampled and blurs. comp therefore places every Wayland
+toplevel's buffer origin on a whole physical pixel: the cascade slot a new
+window opens in, `comp.window.place`, interactive move and resize, a clamp
+after the output shrinks, a change in the client's window-geometry inset, and
+a nested host scale change. The snap moves the buffer by at most half a
+physical pixel. The reported `window_x`/`window_y` and the `windows.s<id>`
+position leaves are the snapped values, so they can be fractional in logical
+units.
+
+On the grid, both edges of the buffer project exactly, so the drawn width is
+the client's `round(width x scale)` buffer and it is sampled 1:1. A neighbour
+placed at the reported origin plus the window's logical size projects its
+left edge to the same physical pixel as this window's right edge, with no
+seam and no overlap. The same rule applies at scale 1, where it rounds a
+fractional pointer-driven origin to a whole pixel.
+
+Three kinds of surface are left alone:
+- X11 windows keep integer X coordinates.
+- Maximised and fullscreen windows start exactly at the work area or output
+  origin.
+- Popups and subsurfaces keep their client-chosen offsets from the parent.
+
+A window whose right or bottom edge falls on a negative half pixel, straddling
+the left or top output edge, can still project one pixel short. The renderer
+rounds half away from zero on both sides of the origin.
 
 ### Input injection
 

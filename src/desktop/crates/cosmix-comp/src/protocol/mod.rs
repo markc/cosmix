@@ -14329,6 +14329,7 @@ impl WaylandState {
         self.begin_pointer_hit_test_batch();
         self.arrange_all_layer_outputs();
         let usable = self.usable_output_rect();
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
 
         let mut shifted_roots = Vec::new();
         let mut configure_surfaces = Vec::new();
@@ -14390,6 +14391,27 @@ impl WaylandState {
                     record.layout.x - previous_origin.0,
                     record.layout.y - previous_origin.1,
                 )
+            };
+            // A clamp lands on the work-area edge minus the window's logical
+            // size, which is off the physical grid whenever that size is odd
+            // at 2.5x; settle the buffer back onto a whole pixel.
+            let delta = if delta != (0.0, 0.0) {
+                let offset = (
+                    record.window_origin.0 - record.layout.x,
+                    record.window_origin.1 - record.layout.y,
+                );
+                let snapped =
+                    physical_grid_window_origin(record, record.window_origin, offset, scale120);
+                let extra = (
+                    snapped.0 - record.window_origin.0,
+                    snapped.1 - record.window_origin.1,
+                );
+                record.window_origin = snapped;
+                record.layout.x += extra.0;
+                record.layout.y += extra.1;
+                (delta.0 + extra.0, delta.1 + extra.1)
+            } else {
+                delta
             };
             if delta != (0.0, 0.0) {
                 shifted_roots.push((record.id, delta));
@@ -14464,7 +14486,34 @@ impl WaylandState {
         // not the nested output's integer coordinate scale. Keep
         // wl_output.scale at 1 as the legacy-client fallback.
         self.publish_surface_preferred_scale(scale);
+        self.resnap_toplevels_to_physical_grid();
         tracing::info!(scale, "nested output scale changed");
+    }
+
+    /// Settle every placed Wayland toplevel onto the current scale's physical
+    /// pixel grid. A scale change moves the grid under windows that were on
+    /// the old one (x = 2 is whole at 2.5x, not at 1.75x).
+    fn resnap_toplevels_to_physical_grid(&mut self) {
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+        let targets = self
+            .surfaces
+            .values()
+            .filter(|record| {
+                if !matches!(record.role, SurfaceRole::Toplevel(_)) {
+                    return false;
+                }
+                let offset = record
+                    .committed_window_geometry
+                    .map(|geometry| (geometry.x, geometry.y))
+                    .unwrap_or_default();
+                physical_grid_window_origin(record, record.window_origin, offset, scale120)
+                    != record.window_origin
+            })
+            .map(|record| (record.role.wl_surface().clone(), record.window_origin))
+            .collect::<Vec<_>>();
+        for (surface, origin) in targets {
+            self.move_window_to(&surface, origin, "output.geometry");
+        }
     }
 
     fn publish_surface_preferred_scale(&self, scale: f64) {
@@ -14591,13 +14640,14 @@ impl WaylandState {
         origin: (f32, f32),
         #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
     ) -> Option<bool> {
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let record = self.surfaces.get_mut(&surface.id())?;
         let old_origin = record.window_origin;
-        record.window_origin = origin;
         let offset = record
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
+        record.window_origin = physical_grid_window_origin(record, origin, offset, scale120);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         let delta = (
@@ -14645,16 +14695,17 @@ impl WaylandState {
         size: (i32, i32),
         #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
     ) -> Option<bool> {
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let record = self.surfaces.get_mut(&surface.id())?;
         if size == record.configured_size {
             return Some(false);
         }
         let old_origin = record.window_origin;
-        record.window_origin = origin;
         let offset = record
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
+        record.window_origin = physical_grid_window_origin(record, origin, offset, scale120);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         record.configured_size = size;
@@ -16531,6 +16582,46 @@ fn validate_surface_buffer_size(
         ));
     }
     Ok(bytes)
+}
+
+/// The window-geometry origin nearest `origin` whose SURFACE origin
+/// (`origin - offset`, the buffer's top-left) lies on a whole physical pixel.
+///
+/// At a fractional scale an odd logical origin (x = 1 at 2.5x is 2.5 physical)
+/// makes the renderer's edge projection one pixel narrower or wider than the
+/// client's `round(width x scale)` buffer, so the content is resampled and
+/// blurs. On the grid, both edges project exactly and a neighbour placed at
+/// this window's reported origin plus its width shares its edge. The surface
+/// origin is snapped rather than the geometry origin because the buffer is what
+/// is sampled; a CSD shadow offset is an integer logical inset, not a pixel
+/// one. X11 windows keep their origin: X positions are integers in the X
+/// coordinate space, and Xwayland buffers are not fractional-scale anyway.
+/// Maximised and fullscreen windows keep theirs too: they are sized to the
+/// work area or output and must start exactly where it does.
+fn physical_grid_window_origin(
+    record: &SurfaceRecord,
+    origin: (f32, f32),
+    offset: (f32, f32),
+    scale120: u32,
+) -> (f32, f32) {
+    if record.committed_maximized
+        || record.requested_maximized
+        || record.committed_fullscreen
+        || record.requested_fullscreen
+    {
+        return origin;
+    }
+    #[cfg(feature = "xwayland")]
+    if record.role.x11().is_some() {
+        return origin;
+    }
+    #[cfg(not(feature = "xwayland"))]
+    let _ = record;
+    let snap = |value: f32| crate::compositor_scene::snap_logical_to_physical_grid(value, scale120);
+    (
+        snap(origin.0 - offset.0) + offset.0,
+        snap(origin.1 - offset.1) + offset.1,
+    )
 }
 
 fn logical_surface_size(width: u32, height: u32, buffer_scale: i32) -> Result<(f32, f32), String> {
