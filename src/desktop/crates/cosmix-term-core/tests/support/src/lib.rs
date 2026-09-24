@@ -117,9 +117,14 @@ impl Broker {
     }
 
     fn boot(&mut self) {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let listen = probe.local_addr().unwrap().to_string();
-        drop(probe);
+        // Bound here and handed to noded as-is. Probing `:0`, dropping the
+        // socket and passing only the number let another socket (a parallel
+        // test's outbound connection, say) take the port first; noded's bind
+        // then failed, `run` returned before readiness, and the whole test
+        // binary aborted on the fallout — 3 first runs in 8 on cbc2/cbc3.
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let listen = tcp.local_addr().unwrap().to_string();
         self.url = format!("ws://{listen}/ws");
         let endpoint = self.endpoint.clone();
         let options = self.options();
@@ -137,7 +142,8 @@ impl Broker {
                 .unwrap();
             runtime.block_on(async {
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let broker = tokio::spawn(noded::run(
+                let tcp = tokio::net::TcpListener::from_std(tcp).unwrap();
+                let broker = tokio::spawn(noded::run_on(
                     noded::RunConfig {
                         unix_socket: Some(endpoint),
                         pending_grants_per_parent: grant_limit,
@@ -150,12 +156,28 @@ impl Broker {
                         admission_mode: cosmix_config::node::AdmissionMode::Off,
                         observe_allowed_services: vec!["term-policy-audit".into()],
                     },
+                    tcp,
                     tx,
                 ));
-                tokio::time::timeout(Duration::from_secs(5), rx)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                match tokio::time::timeout(Duration::from_secs(5), rx).await {
+                    Ok(Ok(())) => {}
+                    // run() returned before readiness: say why, instead of
+                    // leaving boot() to report only a closed channel.
+                    Ok(Err(_)) => {
+                        let reason = match broker.await {
+                            Ok(Err(error)) => format!("{error:#}"),
+                            Ok(Ok(())) => "returned Ok before readiness".into(),
+                            Err(error) => format!("task failed: {error}"),
+                        };
+                        let _ = ready_tx.send(Err(format!("embedded noded exited: {reason}")));
+                        return;
+                    }
+                    Err(_) => {
+                        broker.abort();
+                        let _ = ready_tx.send(Err("embedded noded not ready within 5s".into()));
+                        return;
+                    }
+                }
                 let probe = tokio::time::timeout(
                     Duration::from_secs(5),
                     cosmix_client::NodedClient::connect_unix("", &url, &options, None),
@@ -167,7 +189,7 @@ impl Broker {
                     panic!("native fixture must not fall back to TCP");
                 };
                 probe.client().close().await;
-                ready_tx.send(()).unwrap();
+                let _ = ready_tx.send(Ok(()));
                 loop {
                     tokio::select! {
                         _ = &mut stop_rx => break,
@@ -186,15 +208,24 @@ impl Broker {
             // Dropping the whole runtime also closes accepted sockets, timers
             // and spawned routing tasks. Aborting only run() is not a bounce.
         }));
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => panic!("test broker failed to start: {reason}"),
+            Err(error) => panic!("test broker failed to start: worker gave no readiness ({error})"),
+        }
     }
 
+    /// Never panics: `Drop` calls it, and a destructor panic while a failing
+    /// test is already unwinding aborts the whole test binary. A worker panic
+    /// has printed its own message by the time it is joined here.
     pub fn stop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            eprintln!("test broker worker panicked; its message is above");
         }
     }
 
