@@ -6,7 +6,7 @@
 //! only way to know that is to compare them against the same encoder.
 
 use cosmix_term_core::panes::{Direction, SplitDir};
-use cosmix_term_core::terminal::Key as TerminalKey;
+use cosmix_term_core::terminal::{Key as TerminalKey, ScrollRequest};
 use iced::keyboard::key::{Code, Named, Physical};
 use iced::keyboard::{Key, Modifiers};
 use iced::mouse::ScrollDelta;
@@ -27,6 +27,7 @@ pub enum Action {
     FontIncrease,
     FontDecrease,
     FontReset,
+    Scroll(ScrollRequest),
 }
 
 impl Action {
@@ -37,7 +38,7 @@ impl Action {
     pub fn repeats(self) -> bool {
         matches!(
             self,
-            Self::FontIncrease | Self::FontDecrease | Self::FontReset
+            Self::FontIncrease | Self::FontDecrease | Self::FontReset | Self::Scroll(_)
         )
     }
 }
@@ -72,8 +73,15 @@ pub fn action_for(
     physical: Physical,
     modifiers: Modifiers,
 ) -> Option<Action> {
-    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+    if modifiers.alt() || modifiers.logo() {
         return None;
+    }
+    if !modifiers.control() {
+        return if modifiers.shift() {
+            scroll_request(key).map(Action::Scroll)
+        } else {
+            None
+        };
     }
     let shift = modifiers.shift();
     let is = |candidate: &Key, text: &str| matches!(candidate.as_ref(), Key::Character(c) if c == text);
@@ -107,6 +115,33 @@ pub fn action_for(
         Key::Named(Named::PageUp) => Some(Action::Cycle { forward: false }),
         _ => None,
     }
+}
+
+fn scroll_request(key: &Key) -> Option<ScrollRequest> {
+    Some(match key {
+        Key::Named(Named::PageUp) => ScrollRequest::PageUp,
+        Key::Named(Named::PageDown) => ScrollRequest::PageDown,
+        Key::Named(Named::Home) => ScrollRequest::Top,
+        Key::Named(Named::End) => ScrollRequest::Bottom,
+        _ => return None,
+    })
+}
+
+/// Mouse-area positions are relative to the pane's outer border, in logical
+/// pixels. Clamp the border and spare right/bottom pixels to the nearest cell.
+pub fn pointer_cell(
+    position: iced::Point,
+    border: f32,
+    cell: (f32, f32),
+    grid: (u16, u16),
+) -> (u16, u16) {
+    let index = |value: f32, size: f32, count: u16| {
+        (((value - border).max(0.0) / size) as u16).min(count.saturating_sub(1))
+    };
+    (
+        index(position.x, cell.0, grid.0),
+        index(position.y, cell.1, grid.1),
+    )
 }
 
 /// The lowercase Latin letter a chord key stands for: the layout's own
@@ -155,7 +190,7 @@ fn is_latin(c: char) -> bool {
     )
 }
 
-/// Logical pixels of smooth (touchpad) scrolling that make one font step.
+/// Logical pixels of smooth (touchpad) scrolling that make one wheel step.
 /// A notched wheel reports whole lines and steps once per notch.
 pub const PIXELS_PER_STEP: f32 = 40.0;
 
@@ -429,6 +464,34 @@ mod tests {
 
     fn ctrl_shift() -> Modifiers {
         Modifiers::CTRL | Modifiers::SHIFT
+    }
+
+    #[test]
+    fn shift_navigation_scrolls_plain_navigation_is_shell_input_and_ctrl_cycles() {
+        for (key, request, shell) in [
+            (Named::PageUp, ScrollRequest::PageUp, b"\x1b[5~".as_slice()),
+            (Named::PageDown, ScrollRequest::PageDown, b"\x1b[6~".as_slice()),
+            (Named::Home, ScrollRequest::Top, b"\x1b[H".as_slice()),
+            (Named::End, ScrollRequest::Bottom, b"\x1b[F".as_slice()),
+        ] {
+            let key = named(key);
+            assert_eq!(act(&key, &key, Modifiers::SHIFT), Some(Action::Scroll(request)));
+            assert!(Action::Scroll(request).repeats());
+            assert_eq!(act(&key, &key, Modifiers::empty()), None);
+            assert_eq!(bytes(&key, None, Modifiers::empty()), shell);
+            assert_eq!(act(&key, &key, Modifiers::SHIFT | Modifiers::ALT), None);
+        }
+        let up = named(Named::PageUp);
+        assert_eq!(act(&up, &up, Modifiers::CTRL), Some(Action::Cycle { forward: false }));
+    }
+
+    #[test]
+    fn pointer_coordinates_exclude_the_border_and_clamp_spare_pixels() {
+        let cell = (8.0, 16.0);
+        assert_eq!(pointer_cell(iced::Point::new(1.2, 1.2), 1.2, cell, (80, 24)), (0, 0));
+        assert_eq!(pointer_cell(iced::Point::new(25.3, 33.3), 1.2, cell, (80, 24)), (3, 2));
+        assert_eq!(pointer_cell(iced::Point::ORIGIN, 1.2, cell, (80, 24)), (0, 0));
+        assert_eq!(pointer_cell(iced::Point::new(900.0, 500.0), 1.2, cell, (80, 24)), (79, 23));
     }
 
     /// bterm's chords, one for one: T3 parity is the same keys doing the same

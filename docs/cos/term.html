@@ -472,7 +472,7 @@ closes the tab, and closing the last tab quits. A shell that exits on its own
 raises a desktop notification, as in bterm. Set <code>TERM_NOTIFY=0</code> to turn that
 off.</p>
 <h2 id="keys">Keys</h2>
-<p>The chords are bterm's. They need Ctrl and Shift, or Ctrl alone where shown.
+<p>Tab and pane chords match bterm. They need Ctrl and Shift, or Ctrl alone where shown.
 Any chord that also holds Alt or Super is left alone.</p>
 <table><thead><tr><th>Keys</th><th>Action</th></tr></thead><tbody>
 <tr><td>Ctrl+Shift+T</td><td>new tab</td></tr>
@@ -489,6 +489,21 @@ the repeats are dropped rather than sent to the shell.</p>
 <p>Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.</p>
+<h2 id="scrollback">Scrollback</h2>
+<table><thead><tr><th>Input</th><th>Action</th></tr></thead><tbody>
+<tr><td>Wheel up / down</td><td>scroll the pane under the pointer</td></tr>
+<tr><td>Shift+wheel</td><td>force local history instead of application mouse reporting</td></tr>
+<tr><td>Shift+PageUp / Shift+PageDown</td><td>scroll the focused pane by one page (rows minus one)</td></tr>
+<tr><td>Shift+Home / Shift+End</td><td>jump to the top / bottom of the focused pane's history</td></tr>
+</tbody></table>
+<p>Scrollback keys repeat when held and never reach the shell. Plain PageUp and
+PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
+Sending a key to the shell returns the viewport to the live bottom.</p>
+<p>Each wheel notch scrolls one line. Touchpad travel accumulates at 40 logical
+pixels per line. Applications that enable mouse reporting receive the wheel
+first; otherwise the alternate screen can translate it to cursor keys (for
+example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
+to change the font size. The <code>scrollback</code> setting controls history depth.</p>
 <h2 id="font-size">Font size</h2>
 <p>Font sizing follows foot. The window keeps its size and the grid gains or
 loses cells. Every pane is re-rasterised, and every shell is told its new

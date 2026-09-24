@@ -33,7 +33,7 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
     term.damage_event_in_flight = false;
 }
 
-/// Rows changed since the last `rearm_damage`, plus the cursor's row (rio's
+/// Rows changed since the last `rearm_damage`, plus a changed cursor's row (rio's
 /// damage covers where the cursor was, not where it is). Scrolled-back views
 /// are repainted whole: rio reports their damage in scrollback coordinates.
 ///
@@ -41,15 +41,17 @@ fn rearm_damage(term: &mut Crosswords<Listener>) {
 /// `mark_fully_damaged`, which after a rearm emits `RenderRoute`, which
 /// `Listener` turns into a fresh damage token and wake: every snapshot would
 /// schedule the next. Insert mode repaints whole anyway, so skip the call.
-fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
+fn dirty_rows(term: &mut Crosswords<Listener>, previous_offset: usize) -> Vec<bool> {
     let mut dirty = vec![false; term.screen_lines()];
     let cursor = term.grid.cursor.pos.row.0.max(0) as usize;
-    if term.display_offset() != 0
+    if term.display_offset() != previous_offset
+        || term.display_offset() != 0
         || term.mode().contains(rio_vt::crosswords::Mode::INSERT)
     {
         dirty.fill(true);
         return dirty;
     }
+    let changed = term.peek_damage_event().is_some();
     match term.damage() {
         TermDamage::Partial(lines) => {
             for line in lines {
@@ -60,7 +62,9 @@ fn dirty_rows(term: &mut Crosswords<Listener>) -> Vec<bool> {
         }
         _ => dirty.fill(true),
     }
-    if let Some(row) = dirty.get_mut(cursor) {
+    if changed
+        && let Some(row) = dirty.get_mut(cursor)
+    {
         *row = true;
     }
     dirty
@@ -472,10 +476,19 @@ pub struct Screen {
 pub struct GridSnapshot {
     pub screen: Screen,
     /// One flag per visible row: true when that row may differ from the
-    /// previous consuming read. All true after a resize, a scroll-back, a
+    /// previous consuming read. All true after a resize, a viewport change, a
     /// full-screen mode change or on the first read.
     pub dirty_rows: Vec<bool>,
 }
+/// Frontend-neutral requests to move the history viewport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollRequest {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
 pub struct Terminal {
     #[cfg(test)]
     pub before_pty_cleanup: Option<Box<dyn FnMut() + Send>>,
@@ -483,6 +496,8 @@ pub struct Terminal {
     pub listener: Listener,
     pub stats: Stats,
     grid: Grid,
+    /// Updated only by consuming captures, under the grid lock.
+    captured_offset: Mutex<usize>,
     damage: Mutex<Receiver<()>>,
     pub pid: i32,
     thread: Option<JoinHandle<(Machine<MeteredPty, Listener>, rio_vt::performer::State)>>,
@@ -737,6 +752,7 @@ impl Terminal {
             listener,
             stats,
             grid,
+            captured_offset: Mutex::new(0),
             damage: Mutex::new(rx),
             pid,
             thread: Some(thread),
@@ -754,6 +770,35 @@ impl Terminal {
     }
     pub fn screen(&self, consume: bool) -> Screen {
         self.capture(consume, None)
+    }
+    pub fn scroll_view(&self, request: ScrollRequest) {
+        use rio_vt::crosswords::grid::Scroll;
+        let mut term = self.grid.lock();
+        // Rio's PageUp/PageDown move by rows, but terminal pages overlap by
+        // one row. Delta also preserves that contract at either history edge.
+        let page = term.screen_lines().saturating_sub(1) as i32;
+        let scroll = match request {
+            ScrollRequest::PageUp => Scroll::Delta(page),
+            ScrollRequest::PageDown => Scroll::Delta(-page),
+            ScrollRequest::Top => Scroll::Top,
+            ScrollRequest::Bottom => Scroll::Bottom,
+        };
+        let before = term.display_offset();
+        term.scroll_display(scroll);
+        if term.display_offset() != before {
+            self.listener.dirty();
+        }
+    }
+
+    /// Human key input follows the live output once bytes reach the queue.
+    /// VT replies use Listener directly and must not move the viewport.
+    pub fn key(&self, key: Key, at: Instant) -> Result<(), String> {
+        let sends_bytes = !encode(key).is_empty();
+        self.listener.key(key, at)?;
+        if sends_bytes {
+            self.scroll_view(ScrollRequest::Bottom);
+        }
+        Ok(())
     }
     /// Like `screen(true)`, and also reports which rows changed since the
     /// previous consuming read (by either method).
@@ -810,9 +855,10 @@ impl Terminal {
         let cursor = (pos.col.0, pos.row.0.max(0) as usize);
         let cursor_visible = term.mode().contains(rio_vt::crosswords::Mode::SHOW_CURSOR);
         if let Some(dirty) = dirty {
-            *dirty = dirty_rows(&mut term);
+            *dirty = dirty_rows(&mut term, *self.captured_offset.lock().unwrap());
         }
         if consume {
+            *self.captured_offset.lock().unwrap() = term.display_offset();
             // Both operations must remain under this same grid lock. reset_damage
             // alone does not re-arm Machine's damage notification latch.
             rearm_damage(&mut term);
@@ -1139,6 +1185,7 @@ mod tests {
                 listener,
                 stats,
                 grid,
+                captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 pid: 0,
                 thread: None,
@@ -1225,8 +1272,8 @@ mod tests {
         assert_eq!(first.screen.cells[0].c, 'A');
         assert_eq!(
             f.quiet_snapshot().dirty_rows.iter().positions(),
-            vec![0],
-            "an idle grid marks only the cursor row"
+            Vec::<usize>::new(),
+            "an idle grid has no dirty rows"
         );
         f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
         assert_eq!(
@@ -1246,13 +1293,13 @@ mod tests {
         assert_eq!(resized.dirty_rows.len(), 30);
         assert_eq!(resized.screen.cols, 100);
         assert!(all(&resized.dirty_rows), "resize");
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
 
         f.feed(b"\x1b[?1049hB", |t| {
             t.mode().contains(Mode::ALT_SCREEN) && cell(t, 0, 1) == 'B'
         });
         assert!(all(&f.settled_snapshot().dirty_rows), "alt-screen entry");
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
         f.feed(b"\x1b[?1049l", |t| !t.mode().contains(Mode::ALT_SCREEN));
         assert!(all(&f.settled_snapshot().dirty_rows), "alt-screen exit");
 
@@ -1260,7 +1307,7 @@ mod tests {
             t.colors()[1].is_some_and(|c| c[0] == 1.0 && c[1] == 0.0 && c[2] == 0.0)
         });
         assert!(all(&f.settled_snapshot().dirty_rows), "palette change");
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![0]);
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
 
         let mut lines = b"\r\n".repeat(40);
         lines.push(b'Z');
@@ -1296,8 +1343,8 @@ mod tests {
         f.feed(b"\r\n\r\nC", |t| cell(t, 2, 0) == 'C');
         assert!(f.terminal.take_damage());
         let _ = f.terminal.screen(true);
-        // screen(true) consumed the row damage; only the cursor row remains.
-        assert_eq!(f.quiet_snapshot().dirty_rows.iter().positions(), vec![2]);
+        // screen(true) consumed the row and cursor damage.
+        assert!(f.quiet_snapshot().dirty_rows.iter().positions().is_empty());
     }
 
     trait Positions {

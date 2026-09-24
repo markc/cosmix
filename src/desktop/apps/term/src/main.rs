@@ -78,6 +78,8 @@ fn main() {
              \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\
              \x20     Ctrl+Shift+arrows move focus, Ctrl+Shift+Q quit,\n\
              \x20     Ctrl+plus/equal/minus/0 (and Ctrl+wheel) font size\n\
+             \x20     Wheel scrolls; Shift forces history; Shift+PageUp/PageDown page history\n\
+             \x20     Shift+Home/End history top/bottom; shell input returns to bottom\n\
              TERM_NOTIFY=0: no desktop notification when a pane's shell exits\n\
              --version: print version and build hash, and nothing else\n\
              --print-config: print resolved startup settings and exit\n\
@@ -177,6 +179,9 @@ fn run(settings: config::Settings) -> Result<(), String> {
         grids: HashMap::new(),
         modifiers: iced::keyboard::Modifiers::empty(),
         wheel: 0.0,
+        scroll_wheel: 0.0,
+        scroll_pane: None,
+        pointer: None,
     };
 
     // `BootFn` is `Fn`, not `FnOnce`, and the state is not cloneable — the
@@ -296,6 +301,11 @@ struct State {
     modifiers: iced::keyboard::Modifiers,
     /// Fractional Ctrl+wheel travel not yet worth a font step.
     wheel: f32,
+    /// History and zoom gestures never share fractional travel.
+    scroll_wheel: f32,
+    scroll_pane: Option<u64>,
+    /// Window coordinates survive a tab change beneath a stationary pointer.
+    pointer: Option<iced::Point>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,7 +321,8 @@ enum Message {
     Modifiers(iced::keyboard::Modifiers),
     SelectTab(u64),
     FocusPane(u64),
-    Wheel(iced::mouse::ScrollDelta),
+    Wheel(u64, iced::mouse::ScrollDelta),
+    Pointer(iced::Point),
     Window(iced::window::Event),
     /// The window's device-pixel ratio, answered by the runtime.
     Scale(f32),
@@ -428,6 +439,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Keys(keys) => state.send_keys(keys),
         Message::Action(action) => return state.act(action),
         Message::Modifiers(modifiers) => {
+            if modifiers != state.modifiers {
+                state.scroll_wheel = 0.0;
+            }
             // Letting go of Ctrl ends a Ctrl+wheel gesture: travel short of a
             // step must not carry into the next one and zoom early.
             if !modifiers.control() {
@@ -445,14 +459,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             tabs.user_activity();
             tabs.focus(id);
         }
-        Message::Wheel(delta) => {
-            // Ctrl+wheel is font size (T4). A bare wheel is not handled yet:
-            // mouse reporting and scrollback are not part of this frontend.
+        Message::Pointer(position) => state.pointer = Some(position),
+        Message::Wheel(id, delta) => {
             if state.modifiers.control() {
                 let steps = input::wheel_steps(&mut state.wheel, delta);
                 if steps != 0 {
                     state.zoom(|font| font.step_by(steps));
                 }
+            } else {
+                state.scroll(id, delta);
             }
         }
         Message::Window(event) => match event {
@@ -474,6 +489,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             iced::window::Event::Unfocused => {
                 state.modifiers = iced::keyboard::Modifiers::empty();
                 state.wheel = 0.0;
+                state.scroll_wheel = 0.0;
             }
             iced::window::Event::CloseRequested => return iced::exit(),
             _ => {}
@@ -629,7 +645,10 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
         });
     mouse_area(outer)
         .on_press(Message::FocusPane(id))
-        .on_scroll(Message::Wheel)
+        .on_move(move |position| {
+            Message::Pointer(iced::Point::new(bounds.x + position.x, bounds.y + position.y))
+        })
+        .on_scroll(move |delta| Message::Wheel(id, delta))
         .into()
 }
 
@@ -700,11 +719,67 @@ fn apply(tabs: &mut TabSet, action: Action) -> Vec<Removed> {
             tabs.cycle(forward);
             Vec::new()
         }
+        Action::Scroll(request) => {
+            tabs.active_terminal()
+                .lock()
+                .expect("terminal")
+                .scroll_view(request);
+            Vec::new()
+        }
         Action::FontIncrease | Action::FontDecrease | Action::FontReset => Vec::new(),
     }
 }
 
 impl State {
+    fn scroll(&mut self, id: u64, delta: iced::mouse::ScrollDelta) {
+        if self.scroll_pane != Some(id) {
+            self.scroll_wheel = 0.0;
+            self.scroll_pane = Some(id);
+        }
+        let Some(position) = self.pointer else {
+            return;
+        };
+        let Some(tree) = &self.shape.tree else {
+            return;
+        };
+        let scale = self.painter.scale();
+        let bounds = layout::content(self.window.width, self.window.height, scale);
+        let Some((_, pane)) = layout::panes(tree, bounds, scale)
+            .into_iter()
+            .find(|(pane, _)| *pane == id)
+        else {
+            return;
+        };
+        let Some(&grid) = self.grids.get(&id) else {
+            return;
+        };
+        let lines = input::wheel_steps(&mut self.scroll_wheel, delta);
+        if lines == 0 {
+            return;
+        }
+        let (col, row) = input::pointer_cell(
+            iced::Point::new(position.x - pane.x, position.y - pane.y),
+            layout::border(scale),
+            self.painter.logical_cell(),
+            grid,
+        );
+        let tabs = self.tabs.lock().expect("tabs");
+        let Some(terminal) = tabs.pane_by_id(id) else {
+            return;
+        };
+        tabs.user_activity();
+        drop(tabs);
+        let terminal = terminal.lock().expect("terminal");
+        let mods = cosmix_term_core::terminal::MouseModifiers {
+            shift: self.modifiers.shift(),
+            alt: self.modifiers.alt(),
+            ctrl: self.modifiers.control(),
+        };
+        if !terminal.mouse_scroll(col, row, lines, mods) {
+            terminal.scroll_wheel(lines, mods);
+        }
+    }
+
     /// Everything a wake can mean, in one place: reap exited shells, follow
     /// the tab set's shape (a Bus verb may have changed it), size any pane
     /// that needs it, and repaint each visible pane by its damaged rows.
@@ -894,7 +969,7 @@ impl State {
         let terminal = terminal.lock().expect("terminal");
         let at = Instant::now();
         for key in keys {
-            if let Err(error) = terminal.listener.key(key, at) {
+            if let Err(error) = terminal.key(key, at) {
                 eprintln!("term input: {error}");
             }
         }
@@ -945,6 +1020,29 @@ mod tests {
 
     fn character(c: &str) -> iced::keyboard::Key {
         iced::keyboard::Key::Character(c.into())
+    }
+
+    #[test]
+    fn scroll_chords_and_repeats_never_reach_the_shell() {
+        use cosmix_term_core::terminal::ScrollRequest;
+        use iced::keyboard::{Key, Modifiers, key::Named};
+        for (named, request) in [
+            (Named::PageUp, ScrollRequest::PageUp),
+            (Named::PageDown, ScrollRequest::PageDown),
+            (Named::Home, ScrollRequest::Top),
+            (Named::End, ScrollRequest::Bottom),
+        ] {
+            for repeat in [false, true] {
+                assert!(matches!(
+                    on_key(&press(Key::Named(named), Key::Named(named), Modifiers::SHIFT, None, repeat)),
+                    Some(Message::Action(Action::Scroll(actual))) if actual == request
+                ));
+                assert!(matches!(
+                    on_key(&press(Key::Named(named), Key::Named(named), Modifiers::empty(), None, repeat)),
+                    Some(Message::Keys(_))
+                ));
+            }
+        }
     }
 
     /// `on_key` is the dispatcher that decides chord versus shell and
@@ -1032,6 +1130,9 @@ mod tests {
             grids: HashMap::new(),
             modifiers: iced::keyboard::Modifiers::empty(),
             wheel: 0.0,
+            scroll_wheel: 0.0,
+            scroll_pane: None,
+            pointer: None,
         };
         (state, reaper)
     }
@@ -1079,7 +1180,7 @@ mod tests {
         let _ = state.sync();
         let start = state.painter.font().current();
         let travel = |fraction: f32| {
-            Message::Wheel(ScrollDelta::Pixels {
+            Message::Wheel(0, ScrollDelta::Pixels {
                 x: 0.0,
                 y: input::PIXELS_PER_STEP * fraction,
             })
@@ -1099,6 +1200,42 @@ mod tests {
         let _ = update(&mut state, travel(0.5));
         assert_ne!(state.painter.font().current(), start, "a whole step within one gesture zooms");
 
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    #[test]
+    fn wheel_targets_the_hovered_pane_without_focus_or_zoom_travel_leaking() {
+        use iced::keyboard::Modifiers;
+        use iced::mouse::ScrollDelta;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let left = state.shape.active_pane;
+        let _ = state.act(Action::Split(SplitDir::Vertical));
+        let _ = state.sync();
+        let right = state.shape.active_pane;
+        assert_ne!(left, right);
+        let _ = update(&mut state, Message::Pointer(iced::Point::new(10.0, 40.0)));
+        let half = ScrollDelta::Pixels { x: 0.0, y: input::PIXELS_PER_STEP / 2.0 };
+        let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(state.scroll_pane, Some(left));
+        assert_eq!(state.scroll_wheel, 0.5);
+        assert_eq!(active_pane(&state.tabs.lock().unwrap()), right);
+        let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
+        let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(state.wheel, 0.5);
+        assert_eq!(state.scroll_wheel, 0.0);
+        let _ = update(&mut state, Message::Modifiers(Modifiers::empty()));
+        let _ = update(&mut state, Message::Wheel(left, half));
+        assert_eq!(state.wheel, 0.0);
+        assert_eq!(state.scroll_wheel, 0.5);
+        // A different pane starts a new accumulation, even without movement
+        // (for example a tab change beneath the pointer).
+        let _ = update(&mut state, Message::Wheel(right, half));
+        assert_eq!(state.scroll_pane, Some(right));
+        assert_eq!(state.scroll_wheel, 0.5);
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
         drop(state);

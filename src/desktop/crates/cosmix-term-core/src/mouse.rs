@@ -209,6 +209,7 @@ mod tests {
                 listener,
                 stats,
                 grid: Arc::new(FairMutex::new(grid)),
+                captured_offset: Mutex::new(0),
                 damage: Mutex::new(rx),
                 pid: 0,
                 thread: None,
@@ -222,6 +223,91 @@ mod tests {
             Msg::Input(bytes) => bytes.into_owned(),
             _ => panic!("expected PTY input"),
         }
+    }
+
+    fn history() -> (Terminal, channel::Receiver<Msg>) {
+        let mut bytes = Vec::new();
+        for line in 0..80 {
+            bytes.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        fixture(&bytes)
+    }
+
+    #[test]
+    fn viewport_changes_repaint_all_rows_including_return_to_bottom() {
+        let (term, _rx) = history();
+        let live = term.grid_snapshot().screen;
+        term.scroll_wheel(5, MouseModifiers::default());
+        assert_eq!(term.grid.lock().display_offset(), 5);
+        assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| *dirty));
+        term.scroll_wheel(-5, MouseModifiers::default());
+        // A read-only snapshot must not consume the viewport transition.
+        let _ = term.screen(false);
+        let bottom = term.grid_snapshot();
+        assert_eq!(term.grid.lock().display_offset(), 0);
+        assert!(bottom.dirty_rows.iter().all(|dirty| *dirty));
+        assert_eq!(
+            bottom.screen.cells.iter().map(|cell| cell.c).collect::<String>(),
+            live.cells.iter().map(|cell| cell.c).collect::<String>(),
+        );
+        assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| !dirty));
+    }
+
+    #[test]
+    fn scroll_view_pages_overlap_and_top_bottom_reach_history_edges() {
+        let (term, _rx) = history();
+        term.scroll_view(ScrollRequest::PageUp);
+        assert_eq!(term.grid.lock().display_offset(), 23);
+        term.scroll_view(ScrollRequest::PageUp);
+        assert_eq!(term.grid.lock().display_offset(), 46);
+        term.scroll_view(ScrollRequest::PageDown);
+        assert_eq!(term.grid.lock().display_offset(), 23);
+        term.scroll_view(ScrollRequest::Top);
+        assert_eq!(term.grid.lock().display_offset(), 57);
+        term.scroll_view(ScrollRequest::PageUp);
+        assert_eq!(term.grid.lock().display_offset(), 57);
+        term.scroll_view(ScrollRequest::Bottom);
+        assert_eq!(term.grid.lock().display_offset(), 0);
+        term.scroll_view(ScrollRequest::PageDown);
+        assert_eq!(term.grid.lock().display_offset(), 0);
+    }
+
+    #[test]
+    fn shell_keys_snap_to_bottom_but_empty_keys_and_vt_replies_do_not() {
+        let (term, rx) = history();
+        for key in [Key::Char('x'), Key::Enter, Key::PageUp, Key::Control('c')] {
+            term.scroll_view(ScrollRequest::Top);
+            term.grid_snapshot();
+            term.key(key, Instant::now()).unwrap();
+            assert_eq!(input(&rx), encode(key));
+            assert_eq!(term.grid.lock().display_offset(), 0);
+            assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| *dirty));
+            assert!(term.grid_snapshot().dirty_rows.iter().all(|dirty| !dirty));
+        }
+        term.scroll_view(ScrollRequest::Top);
+        term.key(Key::Char('é'), Instant::now()).unwrap();
+        assert_eq!(term.grid.lock().display_offset(), 57);
+        assert!(rx.try_recv().is_err());
+        term.listener.write(b"reply".to_vec(), None).unwrap();
+        assert_eq!(input(&rx), b"reply");
+        assert_eq!(term.grid.lock().display_offset(), 57);
+    }
+
+    #[test]
+    fn shift_wheel_bypasses_reporting_and_alternate_scroll_uses_cursor_keys() {
+        let (term, rx) = history();
+        Processor::default().advance(&mut *term.grid.lock(), b"\x1b[?1000;1006h");
+        let shift = MouseModifiers { shift: true, ..Default::default() };
+        assert!(!term.mouse_scroll(2, 3, 4, shift));
+        term.scroll_wheel(4, shift);
+        assert_eq!(term.grid.lock().display_offset(), 4);
+        assert!(rx.try_recv().is_err());
+        Processor::default().advance(&mut *term.grid.lock(), b"\x1b[?1000l\x1b[?1049;1007h");
+        assert!(!term.mouse_scroll(2, 3, 1, MouseModifiers::default()));
+        term.scroll_wheel(1, MouseModifiers::default());
+        assert_eq!(input(&rx), b"\x1b[A");
+        term.scroll_wheel(1, shift);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

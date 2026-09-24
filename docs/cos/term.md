@@ -39,7 +39,7 @@ off.
 
 ## Keys
 
-The chords are bterm's. They need Ctrl and Shift, or Ctrl alone where shown.
+Tab and pane chords match bterm. They need Ctrl and Shift, or Ctrl alone where shown.
 Any chord that also holds Alt or Super is left alone.
 
 | Keys | Action |
@@ -59,6 +59,25 @@ the repeats are dropped rather than sent to the shell.
 Everything else goes to the focused pane's shell. That means printable text
 in any keyboard layout, Enter, Backspace, Tab, Escape, the arrows, Home, End,
 Delete, PageUp, PageDown and Ctrl+A through Ctrl+Z.
+
+## Scrollback
+
+| Input | Action |
+|---|---|
+| Wheel up / down | scroll the pane under the pointer |
+| Shift+wheel | force local history instead of application mouse reporting |
+| Shift+PageUp / Shift+PageDown | scroll the focused pane by one page (rows minus one) |
+| Shift+Home / Shift+End | jump to the top / bottom of the focused pane's history |
+
+Scrollback keys repeat when held and never reach the shell. Plain PageUp and
+PageDown still go to the shell; Ctrl+PageUp and Ctrl+PageDown still change tabs.
+Sending a key to the shell returns the viewport to the live bottom.
+
+Each wheel notch scrolls one line. Touchpad travel accumulates at 40 logical
+pixels per line. Applications that enable mouse reporting receive the wheel
+first; otherwise the alternate screen can translate it to cursor keys (for
+example in less or vim). Shift bypasses both behaviours. Ctrl+wheel continues
+to change the font size. The `scrollback` setting controls history depth.
 
 ## Font size
 
