@@ -270,6 +270,10 @@ impl CompositorHandler for WaylandState {
         // Read the just-applied assignment before anything below consumes it
         // out of `current`: `get_xdg_surface` must know whether the surface's
         // committed state still holds a buffer (see `surface_has_buffer`).
+        // Wontfix (review round 2): a commit held back by an acquire-gate
+        // blocker enters the set only when it applies. Between the client's
+        // commit and that point its buffer is neither pending nor current,
+        // so a get_xdg_surface in that window is not refused.
         match compositor::with_states(surface, |states| {
             match states
                 .cached_state
