@@ -767,7 +767,6 @@ mod tests {
     };
     use cosmix_config::node::{NodeConfig, WebdListenerConfig};
     use crate::tls_status::{AcmeStatusSnapshot, AcmeVhostStateSnapshot, TlsStatusSnapshot};
-    use crate::vhosts_namespace::register_vhosts_namespace;
     use arc_swap::ArcSwap;
     use cosmix_props::sqlite::SqliteStore;
     use cosmix_props::{AuthPolicy, PropsRouter};
@@ -1887,7 +1886,13 @@ mod tests {
         let unnamed = "unnamed.example.org";
         let cfg = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[named])], &[]);
         let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg).await;
-        let row = |fqdn: &str| format!(r#"{{"fqdn":"{fqdn}","www_dir":"/srv/x","enabled":true}}"#);
+        let row = |fqdn: &str| {
+            format!(
+                r#"{{"fqdn":"{fqdn}","www_dir":"/srv/x","enabled":true,
+                    "acme_provider":"letsencrypt_staging","acme_challenge":"http01",
+                    "acme_contact_email":"ops@example.com"}}"#
+            )
+        };
 
         // Unnamed host through props.set: refused, nothing written.
         let set = props_cmd(
@@ -1930,15 +1935,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn writes_to_an_already_enabled_row_are_not_rechecked() {
         let host = "drift.example.org";
-        // Seed under a permissive (no node config) namespace, then
-        // re-register the SAME store under a config that no longer names
-        // the host — i.e. the operator edited node.conf.mix afterwards.
-        let conn = Connection::open_in_memory().expect("sqlite");
-        let store = Arc::new(SqliteStore::new("webd", conn).expect("store"));
+        // Seed under a permissive (no node config) namespace, then open
+        // the SAME database again under a config that no longer names the
+        // host — a restart after the operator edited node.conf.mix.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("web.db");
+        let open = || {
+            let conn = Connection::open(&db).expect("sqlite");
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                .expect("pragmas");
+            Arc::new(SqliteStore::new("webd", conn).expect("store"))
+        };
+        let store1 = open();
         let mut r1 = PropsRouter::new("webd");
         let (rt1, _rx1) = register_vhosts_namespace_with_listener_config(
             &mut r1,
-            &store,
+            &store1,
             ListenerConfigSource::Fixed(None),
         )
         .expect("register");
@@ -1948,6 +1960,13 @@ mod tests {
         body.insert("www_dir".to_string(), PropValue::String("/srv/x".into()));
         body.insert("enabled".to_string(), PropValue::Bool(true));
         body.insert("source".to_string(), PropValue::String("bus_runtime".into()));
+        for (k, v) in [
+            ("acme_provider", "letsencrypt_staging"),
+            ("acme_challenge", "http01"),
+            ("acme_contact_email", "ops@example.com"),
+        ] {
+            body.insert(k.to_string(), PropValue::String(v.into()));
+        }
         rt1.set_with_origin(
             key.clone(),
             PropValue::Object(body),
@@ -1964,10 +1983,11 @@ mod tests {
         .expect("seed");
 
         let drifted = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[])], &[]);
+        let store2 = open();
         let mut r2 = PropsRouter::new("webd");
         let (rt2, _rx2) = register_vhosts_namespace_with_listener_config(
             &mut r2,
-            &store,
+            &store2,
             ListenerConfigSource::Fixed(Some(Arc::new(drifted))),
         )
         .expect("re-register");

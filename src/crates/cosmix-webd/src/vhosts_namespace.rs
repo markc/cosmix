@@ -746,6 +746,7 @@ pub enum ListenerConfigSource {
     Disk,
     /// A fixed config: test fixtures. `None` = no node config, i.e. the
     /// implicit single `wg` listener that serves every host.
+    #[cfg(test)]
     Fixed(Option<Arc<NodeConfig>>),
 }
 
@@ -755,6 +756,7 @@ impl ListenerConfigSource {
             Self::Disk => cosmix_config::node::load_node_config()
                 .map(|c| c.map(Arc::new))
                 .map_err(|e| format!("{e:#}")),
+            #[cfg(test)]
             Self::Fixed(cfg) => Ok(cfg.clone()),
         }
     }
@@ -1247,6 +1249,7 @@ impl HookHandler for VhostsNamespaceHooks {
 /// that lands, `webd.props.list namespace=vhosts` returns an empty
 /// list; the ergonomic `webd.routes.list` continues to project the
 /// runtime vhost map.
+#[cfg(test)]
 pub fn register_vhosts_namespace(
     router: &mut PropsRouter,
     store: &Arc<SqliteStore>,
