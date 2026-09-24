@@ -65,7 +65,7 @@ See [verbs.md](verbs.md) for the command arguments, results, retained topics, an
 
 ## Broker behaviour
 
-Connections may register one service name with `noded.register`. Registered names are unique. Re-registering the same connection under a different name removes its old binding, while a collision with another live connection is rejected.
+Connections may register one service name with `noded.register`. Registered names are unique. Re-registering the same connection under a different name removes its old binding, while a collision with another live connection is rejected. The broker's own name, `noded`, and the `noded-` namespace are reserved and refused as `reserved_name`, so a routed `from: noded` always means the broker.
 
 Requests addressed to a local registered service are forwarded over that service's WebSocket. Request identifiers are replaced with broker-local identifiers while in flight and restored on the response path, so independent callers may reuse their own local identifiers safely.
 

@@ -14,6 +14,8 @@ Arguments named as headers below are Bus headers. Commands that accept property 
 
 Registers the current WebSocket connection under the Bus `from` header. The name must not already belong to another connection.
 
+Two name families are reserved and refused with `rc: 10` and `error: reserved_name`, leaving any earlier registration on the connection in place: native-session names (`^[tc][0-9a-z]{1,7}-[a-z2-7]{22}$`), and the broker's own identity, `noded` and every `noded-` name. Consumers treat `from: noded` as the broker itself, so no client may hold it.
+
 The optional JSON body is registration provenance. Recognised provenance is stored in the service registry and returned by `noded.list`. An empty or malformed body still permits name-only registration.
 
 The result contains the registered name.
