@@ -1,10 +1,11 @@
--- cosmix-maild-rules default rule pack — v1.0.
+-- cosmix-maild-rules default rule pack — v1.1.
 --
 -- Spec: `_doc/2026-04-30-cosmix-maild-rules-spec.md`. Curated for the
 -- rules stage standalone gate ("no false-HardJunk on curated ham").
--- All weights are small positive integers; the `EngineConfig` defaults
--- (threshold=5.0, hard_junk_threshold=15.0) are calibrated against
--- this pack's worst-case multi-match score.
+-- All weights are small positive integers, except the campaign
+-- fingerprints, which are deliberately weighted to hard-junk alone; the
+-- `EngineConfig` defaults (threshold=5.0, hard_junk_threshold=15.0) are
+-- calibrated against the soft rules' worst-case multi-match score.
 --
 -- Operator overrides should live in `/etc/cosmix/maild-rules.conf.mix`,
 -- not here — this file is the v1 baseline shipped with the crate.
@@ -13,7 +14,7 @@
 -- `,` separators (newlines suppressed there); a literal `$` in a regex
 -- is written `\$`, and a literal backslash `\\`.
 
-pack_version: "v1.0"
+pack_version: "v1.1"
 
 rule: [
   -- ---- Header presence / absence ----
@@ -31,6 +32,19 @@ rule: [
     match: { kind: "header_regex", name: "Subject", regex: "[!?]{4,}" } },
   { id: "x_priority_high", description: "X-Priority claims high", weight: 1,
     match: { kind: "header_regex", name: "X-Priority", regex: "^[12]" } },
+
+  -- ---- Campaign fingerprints ----
+  -- The pending-account scam campaign (seen 2026-09-16, scored 0.07-0.16 by
+  -- Bayes while a sibling scored 1.00): "Pending Account Matter-<ref>",
+  -- "Account Settlement Follow-Up-<ref>", "Follow-Up on Account Status-<ref>".
+  -- The fingerprint is the account phrase glued by a bare hyphen to a random
+  -- reference of 5+ characters that mixes letters and digits (the four
+  -- alternatives place the first letter/digit boundary so that the length
+  -- floor holds; the regex crate has no lookahead). Weight 15 = the default
+  -- hard_junk_threshold, so it junks alone: a Continue score has no effect on
+  -- routing while rules_score_bias_k is 0, which is the shipped default.
+  { id: "scam_account_reference_subject", description: "Account-matter subject glued to a random alphanumeric reference (scam campaign)", weight: 15,
+    match: { kind: "header_regex", name: "Subject", regex: "(?i)\\baccount\\b[^-]{0,40}?\\b(?:matter|settlement|status|follow-up)-(?:(?:[a-z][0-9]|[0-9][a-z])[a-z0-9]{3,}|[a-z0-9](?:[a-z][0-9]|[0-9][a-z])[a-z0-9]{2,}|[a-z0-9]{2}(?:[a-z][0-9]|[0-9][a-z])[a-z0-9]+|[a-z0-9]{3,}(?:[a-z][0-9]|[0-9][a-z])[a-z0-9]*)\\s*\$" } },
 
   -- ---- Body content rules ----
   { id: "phishing_password_reset", description: "Password-reset phishing language in HTML body", weight: 4,

@@ -221,3 +221,86 @@ Send 0.1 BTC to my bitcoin wallet for payment.\r\n";
     };
     assert_eq!(reason, JunkReason::ScoreBreach);
 }
+
+fn with_subject(subject: &str) -> Vec<u8> {
+    format!(
+        "From: accounts@example.invalid\r\n\
+To: y@example.invalid\r\n\
+Subject: {subject}\r\n\
+Date: Mon, 27 Apr 2026 10:00:00 +0000\r\n\
+Message-ID: <c@example.invalid>\r\n\
+\r\n\
+Please review the outstanding balance on your account.\r\n"
+    )
+    .into_bytes()
+}
+
+/// The 2026-09-16 pending-account campaign scored 0.07-0.16 in Bayes. The
+/// subject fingerprint alone must hard-junk it under the DEFAULT engine
+/// config, because a Continue score cannot move routing while
+/// `rules_score_bias_k` is 0.
+#[tokio::test]
+async fn scam_account_reference_subject_hard_junks_the_campaign() {
+    let engine = engine_with_config(EngineConfig::default());
+    let auth = pass_verify_result();
+    let account = AccountId::new("test");
+    let rcpts: Vec<String> = vec!["y@example.invalid".into()];
+    let ov = AccountOverrides::default();
+    for subject in [
+        "Pending Account Matter-7G4K2Q",
+        "Account Settlement Follow-Up-X9B2KD7",
+        "Follow-Up on Account Status-ab12cd",
+    ] {
+        let msg = with_subject(subject);
+        let verdict = engine
+            .classify(&ctx(&msg, &auth, &account, &rcpts, &ov))
+            .await
+            .unwrap();
+        let RuleVerdict::HardJunk {
+            reason,
+            matched_rules,
+            ..
+        } = verdict
+        else {
+            panic!("{subject:?}: expected HardJunk, got {verdict:?}");
+        };
+        assert_eq!(reason, JunkReason::ScoreBreach, "{subject:?}");
+        assert!(
+            matched_rules
+                .iter()
+                .any(|r| r == "scam_account_reference_subject"),
+            "{subject:?}: {matched_rules:?}"
+        );
+    }
+}
+
+/// Legitimate account mail is spaced, digits-only, or a plain word after the
+/// hyphen; none of it may reach the rule.
+#[tokio::test]
+async fn scam_account_reference_subject_spares_ordinary_account_mail() {
+    let engine = engine_with_config(EngineConfig::default());
+    let auth = pass_verify_result();
+    let account = AccountId::new("test");
+    let rcpts: Vec<String> = vec!["y@example.invalid".into()];
+    let ov = AccountOverrides::default();
+    for subject in [
+        "Account status - ref 12345",
+        "Account Status-Update",
+        "Pending Account Matter-20260916",
+        "Your account statement for September",
+        "Account Status-Q3",
+        "Re: Account Status-Q3 review",
+    ] {
+        let msg = with_subject(subject);
+        let exp = engine
+            .explain(&ctx(&msg, &auth, &account, &rcpts, &ov))
+            .await
+            .unwrap();
+        let hit = exp
+            .rules
+            .iter()
+            .find(|r| r.id == "scam_account_reference_subject")
+            .expect("rule evaluated");
+        assert!(!hit.matched, "{subject:?} must not match");
+    }
+}

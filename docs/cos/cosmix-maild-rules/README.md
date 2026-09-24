@@ -66,7 +66,7 @@ Configured negative rule weights contribute `0`.
 | `preflight` | Parallel DNSBL preflight and its per-zone result. |
 | `glob_match::validate_sender_glob` | Validates account allowlist and blocklist patterns. |
 | `rules` | Public matcher data types and CIDR helpers. |
-| `default_pack_str` | Returns the embedded v1.0 default `.conf.mix` rule pack. |
+| `default_pack_str` | Returns the embedded v1.1 default `.conf.mix` rule pack. |
 | `error` | Crate-wide `Error` and `Result` types. |
 
 `RuleContext` borrows all classify-time data. It carries `peer_ip`,
