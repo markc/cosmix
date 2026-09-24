@@ -151,6 +151,17 @@ to retry. This is narrow on purpose: a peer that answers an error as plain text,
 or as JSON of some other shape, still produces exactly the string it always did.
 Only a body naming `error_code` takes the structured path. (0.87.0)
 
+**A wrong verb name answers at once.** A `mix --serve` citizen (or any script
+with `on` handlers) that receives a request for a command it has no handler
+for refuses it immediately with `rc 10` and a structured body —
+`$result.error_code == "UNKNOWN_COMMAND"`, `$result.command` the verb you sent,
+`$result.available` the citizen's declared handlers. (Before 0.92.0 the request
+was dropped: the caller waited out its full timeout and got `-2`, which read as
+a mesh problem.) So a `-2` from a citizen that answers its other verbs is no
+longer a typo symptom — look at the citizen's handler instead. Props paths such
+as `lifecycle.generation` are not verbs: read them with
+`send svc svc.props.get path="lifecycle.generation"`.
+
 ## `send` and the verified session lane
 
 A locally registered service can be addressed two ways, and only one of them

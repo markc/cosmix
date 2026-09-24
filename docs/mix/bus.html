@@ -557,6 +557,16 @@ refusal; flattened to prose it leaves a script parsing English to decide whether
 to retry. This is narrow on purpose: a peer that answers an error as plain text,
 or as JSON of some other shape, still produces exactly the string it always did.
 Only a body naming <code>error_code</code> takes the structured path. (0.87.0)</p>
+<p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
+with <code>on</code> handlers) that receives a request for a command it has no handler
+for refuses it immediately with <code>rc 10</code> and a structured body —
+<code>$result.error_code == "UNKNOWN_COMMAND"</code>, <code>$result.command</code> the verb you sent,
+<code>$result.available</code> the citizen's declared handlers. (Before 0.92.0 the request
+was dropped: the caller waited out its full timeout and got <code>-2</code>, which read as
+a mesh problem.) So a <code>-2</code> from a citizen that answers its other verbs is no
+longer a typo symptom — look at the citizen's handler instead. Props paths such
+as <code>lifecycle.generation</code> are not verbs: read them with
+<code>send svc svc.props.get path="lifecycle.generation"</code>.</p>
 <h2 id="send-and-the-verified-session-lane"><code>send</code> and the verified session lane</h2>
 <p>A locally registered service can be addressed two ways, and only one of them
 carries an identity. A TCP connection is known by a name the caller asserts

@@ -141,6 +141,26 @@ fn parse_event_args(_body: &str) -> Value {
     Value::Nil
 }
 
+/// A JSON string literal for `s`, without the optional `json` feature —
+/// the runtime's own refusal bodies must encode in every build.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// In-place `container[idx] = val`. Returns `Some(error_message)` to
 /// raise, or `None` on success. Shared by the async `IndexAssignment`
 /// arm and the for-loop fast path so signed-index and non-container
@@ -4698,6 +4718,48 @@ impl Evaluator {
     /// propagate. The handler stays registered, and subsequent events
     /// continue to be servable. Main-body errors still crash the script
     /// loudly — only handler errors are soft.
+    /// Answer a `type=request` naming a command this script has no `on`
+    /// handler for: rc 10 (the application-error band, as noded answers an
+    /// unknown verb) with an `error_code` body, so `send` hands the caller a
+    /// structured refusal — the verb and the declared set — immediately.
+    /// Anything that is not a correlated request is dropped as before.
+    async fn refuse_unknown_command(&self, event: &IncomingEvent) {
+        if event.headers.get("type").map(String::as_str) != Some("request") {
+            return;
+        }
+        let (handler, mut available) = {
+            let g = self.globals.borrow();
+            let available: Vec<String> = g
+                .handlers
+                .iter()
+                .filter(|(_, entries)| !entries.is_empty())
+                .map(|(cmd, _)| cmd.clone())
+                .collect();
+            (g.bus_handler.clone(), available)
+        };
+        let Some(handler) = handler else {
+            return;
+        };
+        available.sort();
+        let body = format!(
+            "{{\"error_code\":\"UNKNOWN_COMMAND\",\"message\":{},\"command\":{},\"available\":[{}]}}",
+            json_quote(&format!(
+                "unknown command '{}' (this citizen handles: {}; HELP lists them)",
+                event.command,
+                if available.is_empty() { "none".to_string() } else { available.join(", ") }
+            )),
+            json_quote(&event.command),
+            available.iter().map(|c| json_quote(c)).collect::<Vec<_>>().join(","),
+        );
+        let from = event.headers.get("from").cloned().unwrap_or_default();
+        if let Err(e) = handler
+            .reply(&from, &event.command, event.headers.get("id").map(String::as_str), 10, &body)
+            .await
+        {
+            tracing::error!(command = %event.command, error = %e, "UNKNOWN_COMMAND reply failed");
+        }
+    }
+
     pub async fn dispatch_event(&mut self, event: IncomingEvent) -> MixResult<()> {
         // Snapshot the handler chain for this command. An empty (or
         // missing) entry list is the fast no-handler path: drop the
@@ -4706,10 +4768,22 @@ impl Evaluator {
         // directive: do not store handles for commands with no
         // handlers). WS3-C.5 clone-out: scope the borrow inside a block
         // so the `Ref` does not survive the awaits below.
-        let entries: Vec<HandlerEntry> = match self.globals.borrow().handlers.get(&event.command) {
-            Some(v) if !v.is_empty() => v.clone(),
-            _ => return Ok(()),
-        };
+        //
+        // A correlated REQUEST for a command with no handler is refused
+        // at once (UNKNOWN_COMMAND) rather than dropped: dropping it left
+        // the caller waiting out its whole timeout and then blaming the
+        // mesh for a mistyped verb. Topic deliveries stay silent.
+        let entries: Vec<HandlerEntry> = self
+            .globals
+            .borrow()
+            .handlers
+            .get(&event.command)
+            .cloned()
+            .unwrap_or_default();
+        if entries.is_empty() {
+            self.refuse_unknown_command(&event).await;
+            return Ok(());
+        }
         let chain_class = ChainClass::from_entries(&entries);
         tracing::trace!(
             command = %event.command,

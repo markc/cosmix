@@ -2148,6 +2148,45 @@ async fn reply_without_inbound_id_omits_id() {
     assert_eq!(log.borrow()[0].2, None, "missing inbound id stays None");
 }
 
+/// A correlated request naming a command with NO handler is refused at
+/// once with UNKNOWN_COMMAND (TODO-mix, 2026-09-21: it used to be dropped,
+/// so the caller sat out its full timeout and was told "mesh unavailable").
+/// The reply being recorded by the time `dispatch_event` returns IS the
+/// timing: no timeout is involved anywhere on this path.
+#[tokio::test]
+async fn unknown_command_request_is_refused_immediately() {
+    let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+    let started = std::time::Instant::now();
+    run_then_dispatch(
+        "on q\n    reply(\"v\")\ndone\non b.verb\n    reply(\"w\")\ndone\n",
+        Some(Rc::new(ReplyRecorder(log.clone()))),
+        mk_event("nosuch.verb", "", &[("from", "c"), ("id", "5"), ("type", "request")]),
+    )
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "refusal must not wait");
+    let calls = log.borrow();
+    assert_eq!(calls.len(), 1, "an unknown-verb request must be answered exactly once");
+    let (to, cmd, id, rc, body) = &calls[0];
+    assert_eq!((to.as_str(), cmd.as_str(), id.as_deref(), *rc), ("c", "nosuch.verb", Some("5"), 10));
+    assert!(body.contains("\"error_code\":\"UNKNOWN_COMMAND\""), "body: {body}");
+    assert!(body.contains("\"command\":\"nosuch.verb\""), "body: {body}");
+    assert!(body.contains("\"available\":[\"b.verb\",\"q\"]"), "body: {body}");
+}
+
+/// A topic delivery (no `type=request`) for an unhandled command has no
+/// caller to answer and stays a silent drop.
+#[tokio::test]
+async fn unknown_command_emit_is_still_dropped() {
+    let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+    run_then_dispatch(
+        "on q\n    reply(\"v\")\ndone\n",
+        Some(Rc::new(ReplyRecorder(log.clone()))),
+        mk_event("nosuch.verb", "", &[("from", "c")]),
+    )
+    .await;
+    assert!(log.borrow().is_empty(), "an emit must never be replied to");
+}
+
 /// Wrong arity is a deterministic hard error — and because argument
 /// validation runs before the in-handler / Bus-present checks, it fires
 /// even from the main body with no handler and no Bus.
