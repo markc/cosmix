@@ -223,13 +223,11 @@ async fn handle_reload(state: &TlsReloadState) -> Result<JsonValue> {
     //    `webd.listeners` namespace, so an operator who flipped
     //    strict_sni at runtime gets the new posture instead of a
     //    startup-frozen value reverting it.
+    //    Same helper the ACME provisioner's republish uses — one source.
     let strict_by_id: HashMap<String, bool> =
-        listeners_namespace::snapshot_rows(&state.listeners_runtime)
+        listeners_namespace::live_strict_sni(&state.listeners_runtime)
             .await
-            .map_err(|e| anyhow!("snapshotting webd.listeners for live strict_sni: {e}"))?
-            .into_iter()
-            .map(|r| (r.id, r.strict_sni))
-            .collect();
+            .map_err(|e| anyhow!("snapshotting webd.listeners for live strict_sni: {e}"))?;
 
     // 4. Rebuild every listener's resolver from its manual-PEM bucket.
     //    `SniCertResolver::from_config` re-reads the PEM + key files and

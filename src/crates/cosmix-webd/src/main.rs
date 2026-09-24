@@ -7787,17 +7787,21 @@ async fn main() -> Result<()> {
                 // seeded from config + tunable at runtime; a strict
                 // resolver rejects no-SNI / unknown-SNI handshakes at
                 // the TLS layer (the handshake half of public-listener
-                // hardening). Renewals rebuild the resolver via the
-                // provisioner; a later strict_sni flip applies on the
-                // next renewal (documented).
+                // hardening). A later strict_sni flip applies on the next
+                // resolver rebuild of either kind — an ACME republish
+                // (renewal, issuance, runtime-cert adoption) or a manual-PEM
+                // `webd.tls.reload` — because both read the live row through
+                // `listeners_namespace::live_strict_sni`. It does not rebuild
+                // the resolver by itself.
                 let strict_sni = listener_rows.get(&l.id).is_some_and(|r| r.strict_sni);
                 let resolver = SniCertResolver::from_config(&bucket, strict_sni)
                     .with_context(|| format!("building TLS resolver for listener {:?}", l.id))?;
                 tls_listeners.insert(l.id.clone(), ListenerTls::new(Some(Arc::new(resolver))));
             }
-            // Each listener's boot-time strict_sni, handed to the ACME
-            // provisioner so its republishes (renewal, runtime-cert
-            // adoption) rebuild every resolver with the same policy.
+            // Each listener's boot-time strict_sni: seeds the empty
+            // runtime-cert handles below, and is the ACME provisioner's
+            // fallback if its live webd.listeners read fails (the live
+            // row is the source of truth for every republish).
             let listener_strict_sni: HashMap<String, bool> = resolved_listeners
                 .iter()
                 .map(|l| {
@@ -8015,6 +8019,7 @@ async fn main() -> Result<()> {
                         provisioner
                             .attach_tls_listeners(tls_listeners.clone(), fqdn_to_listener.clone());
                         provisioner.attach_listener_strict_sni(listener_strict_sni);
+                        provisioner.attach_listeners_runtime(listeners_runtime.clone());
                         let events_rx = vhosts_provisioner_events_rx_opt
                             .take()
                             .expect("vhosts_provisioner_events_rx_opt is Some on first match arm");

@@ -410,11 +410,14 @@ pub struct AcmeProvisioner {
     /// attached alongside [`Self::tls_listeners`].
     fqdn_to_listener: HashMap<String, String>,
     /// Per-listener `strict_sni` as the startup resolvers were built with
-    /// (the L1 `webd.listeners` value at boot). Every republish rebuilds
-    /// each listener's resolver with ITS policy — before this, republish
-    /// hard-coded `false`, so the first renewal or runtime-cert adoption
-    /// silently turned a strict listener lenient.
+    /// (the L1 `webd.listeners` value at boot). Only the fallback now:
+    /// republish reads the LIVE value through [`Self::listeners_runtime`].
     listener_strict_sni: HashMap<String, bool>,
+    /// The `webd.listeners` runtime. Each republish reads every
+    /// listener's live `strict_sni` from it — the same source
+    /// `webd.tls.reload` uses — so both rebuild paths agree and a
+    /// runtime `props.set strict_sni` applies on the next rebuild.
+    listeners_runtime: Option<Arc<Runtime>>,
 
     /// Interval between [`AcmeProvisioner::run_forever`] sweeps.
     /// Production callers pass [`DEFAULT_RENEWAL_TICK`]; tests pass
@@ -753,6 +756,7 @@ impl AcmeProvisioner {
             tls_listeners: HashMap::new(),
             fqdn_to_listener: HashMap::new(),
             listener_strict_sni: HashMap::new(),
+            listeners_runtime: None,
             renewal_tick,
             notify: Arc::new(Notify::new()),
             staging_client: None,
@@ -846,12 +850,39 @@ impl AcmeProvisioner {
         self.fqdn_to_listener = fqdn_to_listener;
     }
 
-    /// Attach each listener's startup `strict_sni` so republishes keep
-    /// it (see [`Self::listener_strict_sni`]). A listener absent from
-    /// the map keeps whatever policy its live resolver carries, else
-    /// lenient.
+    /// Attach each listener's boot `strict_sni` — the FALLBACK used when
+    /// the live `webd.listeners` read is unavailable (see
+    /// [`Self::live_strict_sni`]). A listener absent from both keeps
+    /// whatever policy its live resolver carries, else lenient.
     pub fn attach_listener_strict_sni(&mut self, strict_by_listener: HashMap<String, bool>) {
         self.listener_strict_sni = strict_by_listener;
+    }
+
+    /// Attach the `webd.listeners` runtime so every republish reads each
+    /// listener's LIVE `strict_sni` (see [`Self::live_strict_sni`]).
+    pub fn attach_listeners_runtime(&mut self, runtime: Arc<Runtime>) {
+        self.listeners_runtime = Some(runtime);
+    }
+
+    /// Per-listener `strict_sni` for a republish: the live
+    /// `webd.listeners` rows via
+    /// [`crate::listeners_namespace::live_strict_sni`] — the single
+    /// source `webd.tls.reload` also reads, so a runtime flip applies on
+    /// the next renewal / issuance / adoption. Without an attached
+    /// runtime (tests) or on a read failure (logged), the boot map
+    /// [`Self::listener_strict_sni`] stands in.
+    async fn live_strict_sni(&self) -> HashMap<String, bool> {
+        if let Some(rt) = &self.listeners_runtime {
+            match crate::listeners_namespace::live_strict_sni(rt).await {
+                Ok(map) => return map,
+                Err(e) => warn!(
+                    error = %format!("{e:#}"),
+                    "republish: reading live strict_sni from webd.listeners failed — \
+                     using the boot values"
+                ),
+            }
+        }
+        self.listener_strict_sni.clone()
     }
 
     /// Attach the `webd.vhosts` namespace event receiver + runtime
@@ -1740,7 +1771,7 @@ impl AcmeProvisioner {
             .filter(|p| p.fqdn != fqdn)
             .cloned()
             .collect();
-        self.republish_tls_config_for_plans(&plans_without)?;
+        self.republish_tls_config_for_plans(&plans_without).await?;
         self.republish_vhost_directory().await?;
 
         // Step 4b — POST-publish stale guard. A `vhost.add` that
@@ -2114,7 +2145,7 @@ impl AcmeProvisioner {
                 // namespace shape. Republish both arcs first; on
                 // either Err, skip the writeback so the next tick
                 // retries the whole sequence.
-                if let Err(e) = self.republish_tls_config() {
+                if let Err(e) = self.republish_tls_config().await {
                     warn!(
                         fqdn = %fqdn,
                         error = %e,
@@ -2166,7 +2197,7 @@ impl AcmeProvisioner {
         match self.classify_live(&plan, now, now_unix) {
             Ok(Some(identity)) => {
                 self.acme_identities.insert(plan.fqdn.clone(), identity);
-                if let Err(e) = self.republish_tls_config() {
+                if let Err(e) = self.republish_tls_config().await {
                     // Drop the identity again so the next reconcile
                     // retries the adopt instead of seeing it "covered".
                     self.acme_identities.remove(&plan.fqdn);
@@ -2242,7 +2273,7 @@ impl AcmeProvisioner {
                 // pre-publish; the coverage-split arm above retries
                 // both republishes + writeback on the next event /
                 // reconcile pass.
-                if let Err(e) = self.republish_tls_config() {
+                if let Err(e) = self.republish_tls_config().await {
                     warn!(
                         fqdn = %plan.fqdn,
                         error = %e,
@@ -2768,7 +2799,7 @@ impl AcmeProvisioner {
             // retry happens on the next tick via apply_vhost_row.
             // WARN-and-return preserves pre-publish state so the
             // retry has consistent inputs.
-            if let Err(e) = self.republish_tls_config() {
+            if let Err(e) = self.republish_tls_config().await {
                 warn!(error = ?e, "republish_tls_config failed in renewal tick — skipping vhost-directory republish, next tick retries");
                 return;
             }
@@ -2815,8 +2846,8 @@ impl AcmeProvisioner {
     /// at WARN and skip downstream namespace writes; the
     /// previous arc-swap snapshot keeps serving until the
     /// retry succeeds.
-    fn republish_tls_config(&self) -> Result<(), PublishError> {
-        self.republish_tls_config_for_plans(&self.plans)
+    async fn republish_tls_config(&self) -> Result<(), PublishError> {
+        self.republish_tls_config_for_plans(&self.plans).await
     }
 
     /// C4b — the worker behind `republish_tls_config`, with the
@@ -2834,13 +2865,20 @@ impl AcmeProvisioner {
     /// dropped) is therefore not republished — the next
     /// reconcile-cleanup pass purges it from
     /// `acme_identities` to align with this gate.
-    fn republish_tls_config_for_plans(&self, plans: &[AcmeVhostPlan]) -> Result<(), PublishError> {
+    async fn republish_tls_config_for_plans(
+        &self,
+        plans: &[AcmeVhostPlan],
+    ) -> Result<(), PublishError> {
         if self.tls_listeners.is_empty() {
             // Test paths without a TLS surface: no publish, no
             // sequence capture. Ok so the caller's `?` proceeds
             // (the listeners they'd protect don't exist).
             return Ok(());
         }
+        // strict_sni per listener, LIVE from webd.listeners — the same
+        // source `webd.tls.reload` reads — so a runtime flip applies on
+        // this republish. Read before any build; no lock is held.
+        let live_strict = self.live_strict_sni().await;
         // Build the live identity union (manual-PEM floor + ACME
         // identities for plans still present), then partition it by
         // owning listener so each listener's resolver carries only its
@@ -2896,10 +2934,10 @@ impl AcmeProvisioner {
             Vec::with_capacity(self.tls_listeners.len());
         for (lid, handle) in &self.tls_listeners {
             let bucket = by_listener.get(lid.as_str()).cloned().unwrap_or_default();
-            let strict_sni = self
-                .listener_strict_sni
+            let strict_sni = live_strict
                 .get(lid.as_str())
                 .copied()
+                .or_else(|| self.listener_strict_sni.get(lid.as_str()).copied())
                 .or_else(|| handle.current().map(|(r, _)| r.strict_sni()))
                 .unwrap_or(false);
             let resolver =
@@ -5169,7 +5207,7 @@ mod tests {
         // C4b: republish_tls_config now returns Result<(), PublishError>.
         // With no attached listeners the worker short-circuits to
         // Ok(()) so the next tick can still proceed.
-        assert!(p.republish_tls_config().is_ok());
+        assert!(p.republish_tls_config().await.is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -5693,6 +5731,87 @@ mod tests {
             Some(1),
             "the reconcile attempts issuance (fails hermetically: no ToS)"
         );
+    }
+
+    /// Write a `webd.listeners` row's caller-owned `strict_sni` (plus the
+    /// fields a fresh row needs) through the backend path.
+    async fn _set_listener_strict(runtime: &Runtime, id: &str, strict: bool) {
+        use crate::listeners_namespace::namespace_name as listeners_ns;
+        let key = RecordKey::collection(listeners_ns(), id.to_string());
+        let anchor = runtime
+            .store()
+            .version_anchor(&key)
+            .await
+            .unwrap()
+            .unwrap_or(Version::zero());
+        let mut body = std::collections::BTreeMap::new();
+        body.insert("id".to_string(), PropValue::String(id.to_string()));
+        body.insert("enabled".to_string(), PropValue::Bool(true));
+        body.insert("external".to_string(), PropValue::Bool(true));
+        body.insert("strict_sni".to_string(), PropValue::Bool(strict));
+        runtime
+            .set_with_origin(
+                key,
+                PropValue::Object(body),
+                SetOpts {
+                    expected_version: Some(anchor),
+                    merge: MergeMode::Patch,
+                    actor: Actor::service("webd-test").expect("actor"),
+                    cause: None,
+                    ts_ms: 0,
+                },
+                WriteOrigin::backend(),
+            )
+            .await
+            .expect("listener row write");
+    }
+
+    /// Round-2 R3: one source of truth for strict_sni. The provisioner's
+    /// republish reads the LIVE webd.listeners row (not the boot map), via
+    /// the same `live_strict_sni` helper `webd.tls.reload` uses — so a
+    /// runtime flip applies on the next republish and the two rebuild
+    /// paths always agree.
+    #[tokio::test]
+    async fn republish_follows_live_strict_sni_like_tls_reload() {
+        use crate::listeners_namespace::{live_strict_sni, register_listeners_namespace};
+        _install_crypto_provider();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let lstore = Arc::new(cosmix_props::sqlite::SqliteStore::new("webd", conn).unwrap());
+        let mut lrouter = cosmix_props::PropsRouter::new("webd");
+        let (lrt, _lrx) = register_listeners_namespace(&mut lrouter, &lstore, Vec::new()).unwrap();
+        _set_listener_strict(&lrt, "pub", true).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut p = _new_acme_provisioner(tmp.path().to_path_buf());
+        p.set_chain_validator(_accept_any_chain);
+        let handle = crate::empty_listener_tls(false).unwrap();
+        let mut tls = HashMap::new();
+        tls.insert("pub".to_string(), handle.clone());
+        let mut map = HashMap::new();
+        map.insert("live.example".to_string(), "pub".to_string());
+        p.attach_tls_listeners(tls, map);
+        // Boot map says lenient; the live row says strict — live wins.
+        let mut boot = HashMap::new();
+        boot.insert("pub".to_string(), false);
+        p.attach_listener_strict_sni(boot);
+        p.attach_listeners_runtime(lrt.clone());
+
+        _stage_real_live(tmp.path(), "live.example");
+        p.apply_vhost_row("live.example", _runtime_row_claiming_cert("live.example"))
+            .await
+            .unwrap();
+        let (r, _) = handle.current().expect("serving");
+        let reload_view = live_strict_sni(&lrt).await.unwrap();
+        assert!(r.strict_sni(), "republish used the live row, not the boot map");
+        assert_eq!(Some(&r.strict_sni()), reload_view.get("pub"), "paths agree");
+
+        // Runtime flip → the next republish picks it up.
+        _set_listener_strict(&lrt, "pub", false).await;
+        p.republish_tls_config().await.unwrap();
+        let (r, _) = handle.current().expect("serving");
+        let reload_view = live_strict_sni(&lrt).await.unwrap();
+        assert!(!r.strict_sni(), "flip applied on the next republish");
+        assert_eq!(Some(&r.strict_sni()), reload_view.get("pub"), "paths agree");
     }
 
     /// Round-2 R2: an in-memory identity whose PEMs were deleted after

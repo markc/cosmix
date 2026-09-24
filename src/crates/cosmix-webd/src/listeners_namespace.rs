@@ -39,7 +39,7 @@
 //! use to turn it back on. `external` is daemon-owned (seeded at
 //! bootstrap from config), so a caller can't flip it to bypass the rule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -626,6 +626,20 @@ pub fn register_listeners_namespace(
         .register(runtime.clone())
         .map_err(|e| anyhow::anyhow!("register listeners runtime on router: {e}"))?;
     Ok((runtime, events_rx))
+}
+
+/// Each listener's LIVE `strict_sni` from the L1-authoritative
+/// `webd.listeners` namespace. The single source of truth for every
+/// resolver rebuild — the manual-PEM `webd.tls.reload` path and the ACME
+/// provisioner's republish (renewal, issuance, runtime-cert adoption)
+/// both read it here, so a runtime `props.set strict_sni` applies on the
+/// next rebuild of either kind and the two can never disagree.
+pub async fn live_strict_sni(runtime: &Runtime) -> Result<HashMap<String, bool>> {
+    Ok(snapshot_rows(runtime)
+        .await?
+        .into_iter()
+        .map(|r| (r.id, r.strict_sni))
+        .collect())
 }
 
 /// Construct a `ListenerRow` from a substrate `PropValue::Object`.
