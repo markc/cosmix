@@ -7,8 +7,8 @@
 //! mesh-trust capability are a P3 refinement. Reads (`query`) are open.
 //! Key and pointer injection are also mesh-reachable, with no node-local gate.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cosmix_client::IncomingCommand;
 use cosmix_input_core::Resolver;
@@ -163,13 +163,30 @@ fn guard_local(cmd: &IncomingCommand, apply: impl FnOnce() -> (u8, String)) -> (
     }
 }
 
+/// Where THIS process moved an unusable keymap document at startup, if it did.
+static RECOVERED_FROM: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the startup recovery so `input.query` reports it. Set once, by main.
+pub fn set_recovered_from(backup: PathBuf) {
+    let _ = RECOVERED_FROM.set(backup);
+}
+
 fn query(resolver: &Shared) -> (u8, String) {
+    query_body(resolver, RECOVERED_FROM.get().map(PathBuf::as_path))
+}
+
+/// `input.query`'s body. `recovered_from` is present only when this process
+/// moved an unusable keymap aside at startup — additive, absent otherwise.
+fn query_body(resolver: &Shared, recovered_from: Option<&Path>) -> (u8, String) {
     let resolver = resolver.lock().expect("resolver poisoned");
-    let body = json!({
+    let mut body = json!({
         "mode": resolver.mode(),
         "generation": resolver.generation(),
         "physical": resolver.physical_rows(),
     });
+    if let Some(backup) = recovered_from {
+        body["recovered_from"] = json!(backup.to_string_lossy());
+    }
     (0, body.to_string())
 }
 
@@ -265,7 +282,7 @@ fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
         );
     };
     match keymap_file::load(path) {
-        Some(loaded) => {
+        Ok(loaded) => {
             let generation = resolver
                 .lock()
                 .expect("resolver poisoned")
@@ -276,7 +293,14 @@ fn reload(resolver: &Shared, keymap_path: Option<&Path>) -> (u8, String) {
                     .to_string(),
             )
         }
-        None => error(&format!("keymap file {} could not be read", path.display())),
+        // Reload never rewrites the file, so an unusable one is left in place
+        // and the live keymap is unchanged.
+        Err(keymap_file::LoadError::Absent) => {
+            error(&format!("keymap file {} could not be read: absent", path.display()))
+        }
+        Err(keymap_file::LoadError::Unreadable(reason)) => {
+            error(&format!("keymap file {} could not be read: {reason}", path.display()))
+        }
     }
 }
 
@@ -580,6 +604,24 @@ mod tests {
         let rows = resolver.lock().unwrap().physical_rows().to_vec();
         assert_eq!(rows.len(), 1, "only the good row is live");
         assert_eq!(rows[0].action.as_str(), "desktop.workspace.next");
+    }
+
+    #[test]
+    fn query_reports_recovered_from_only_after_a_recovery() {
+        let resolver = resolver();
+        let (rc, plain) = query_body(&resolver, None);
+        assert_eq!(rc, 0);
+        let plain: Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain.get("recovered_from").is_none(), "{plain}");
+        let backup = Path::new("/var/lib/example/keymap.json.bad-20260924-101112");
+        let (rc, recovered) = query_body(&resolver, Some(backup));
+        assert_eq!(rc, 0);
+        let recovered: Value = serde_json::from_str(&recovered).unwrap();
+        assert_eq!(recovered["recovered_from"], backup.to_str().unwrap());
+        // Additive: every other field is unchanged.
+        for key in ["mode", "generation", "physical"] {
+            assert_eq!(recovered[key], plain[key], "{key}");
+        }
     }
 
     #[test]

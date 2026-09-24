@@ -555,8 +555,24 @@ After rolling forward again, those rows must be rebound with <code>service</code
 <tr><td>RightCtrl+Down</td><td>108</td><td><code>desktop.clipboard.menu</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 <tr><td>RightCtrl+Up</td><td>103</td><td><code>desktop.clipboard.rotate</code></td><td><code>desktop-vt1</code></td><td>ignore</td></tr>
 </tbody></table>
-<p>The default keymap only seeds a missing keymap file. A host with an existing
-file keeps its rows, apart from the legacy clipboard migration above. Other
+<p>The default keymap only seeds a missing keymap file, or one whose whole
+document is unusable. A document is unusable when it cannot be read, is not
+JSON, is not a JSON object, lacks a <code>physical</code> list, or lacks an unsigned
+32-bit <code>version</code>. Since inputd 0.4.2, startup first renames such a file to
+<code>keymap.json.bad-YYYYmmdd-HHMMSS</code> in the same directory, then seeds the
+defaults. A second recovery in the same second appends <code>-1</code>, <code>-2</code> and so on,
+so no backup is overwritten. The file is never deleted. inputd logs one line
+naming the reason and the backup path, and <code>input.query</code> in that process
+carries the path:</p>
+<pre><code class="language-json">{"mode":"normal","generation":0,"physical":[...],
+ "recovered_from":"/var/lib/cosmix/inputd/keymap.json.bad-20260924-101112"}
+</code></pre>
+<p>The field is absent when no recovery happened. If the rename fails, inputd
+serves the defaults but never writes the keymap file for the rest of that run.
+<code>input.reload</code> of an unusable file returns rc 10 with the reason and leaves
+both the file and the live keymap unchanged.</p>
+<p>A host with a usable file keeps its rows, apart from the legacy clipboard
+migration above. Other
 rows change only when they are rebound with <code>input.bind</code>, or when the file is
 edited and <code>input.reload</code> is sent. The <code>desktop-vt1</code> target suits a host whose
 clipboard citizen runs under that name. On a host whose citizen has another

@@ -137,8 +137,28 @@ The shipped default keymap binds these right-Ctrl rows:
 | RightCtrl+Down | 108 | `desktop.clipboard.menu` | `desktop-vt1` | ignore |
 | RightCtrl+Up | 103 | `desktop.clipboard.rotate` | `desktop-vt1` | ignore |
 
-The default keymap only seeds a missing keymap file. A host with an existing
-file keeps its rows, apart from the legacy clipboard migration above. Other
+The default keymap only seeds a missing keymap file, or one whose whole
+document is unusable. A document is unusable when it cannot be read, is not
+JSON, is not a JSON object, lacks a `physical` list, or lacks an unsigned
+32-bit `version`. Since inputd 0.4.2, startup first renames such a file to
+`keymap.json.bad-YYYYmmdd-HHMMSS` in the same directory, then seeds the
+defaults. A second recovery in the same second appends `-1`, `-2` and so on,
+so no backup is overwritten. The file is never deleted. inputd logs one line
+naming the reason and the backup path, and `input.query` in that process
+carries the path:
+
+```json
+{"mode":"normal","generation":0,"physical":[...],
+ "recovered_from":"/var/lib/cosmix/inputd/keymap.json.bad-20260924-101112"}
+```
+
+The field is absent when no recovery happened. If the rename fails, inputd
+serves the defaults but never writes the keymap file for the rest of that run.
+`input.reload` of an unusable file returns rc 10 with the reason and leaves
+both the file and the live keymap unchanged.
+
+A host with a usable file keeps its rows, apart from the legacy clipboard
+migration above. Other
 rows change only when they are rebound with `input.bind`, or when the file is
 edited and `input.reload` is sent. The `desktop-vt1` target suits a host whose
 clipboard citizen runs under that name. On a host whose citizen has another

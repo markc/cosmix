@@ -67,35 +67,30 @@ fn main() -> anyhow::Result<()> {
 
     // Persistence: load the keymap file if present so rebinds are remembered;
     // otherwise seed it from the default so the file exists for next time.
-    let keymap_path: Option<PathBuf> = args
+    // An unusable document is moved aside (never deleted) before the defaults
+    // are seeded; see keymap_file::open. Dropped rows and the recovery were
+    // already logged there.
+    let mut keymap_path: Option<PathBuf> = args
         .keymap
         .map(PathBuf::from)
         .or_else(keymap_file::default_path);
-    let keymap = match keymap_path.as_deref().and_then(keymap_file::load) {
-        Some(loaded) => {
-            // Dropped rows were already logged one by one during the load.
-            eprintln!(
-                "cosmix-inputd: loaded keymap ({} rows, {} dropped) from file",
-                loaded.rows.len(),
-                loaded.dropped.len()
-            );
+    let keymap = match keymap_path.as_deref() {
+        Some(path) => {
+            let opened = keymap_file::open(path, &keymap_file::local_stamp());
+            if let Some(backup) = opened.recovered_from {
+                service::set_recovered_from(backup);
+            }
+            if !opened.persist {
+                // The unusable file could not be moved aside: never write over it.
+                keymap_path = None;
+            }
             InputKeymap {
                 version: KEYMAP_SCHEMA_VERSION,
                 semantic: cosmix_input_schema::Keymap::default(),
-                physical: loaded.rows,
+                physical: opened.rows,
             }
         }
-        None => {
-            let seeded = default_keymap();
-            if let Some(path) = keymap_path.as_deref() {
-                if let Err(error) = keymap_file::save(path, &seeded.physical) {
-                    eprintln!("cosmix-inputd: could not seed keymap {}: {error}", path.display());
-                } else {
-                    eprintln!("cosmix-inputd: seeded default keymap at {}", path.display());
-                }
-            }
-            seeded
-        }
+        None => default_keymap(),
     };
     let resolver: Shared = Arc::new(Mutex::new(Resolver::new(keymap)));
 

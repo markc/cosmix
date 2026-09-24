@@ -67,10 +67,150 @@ pub struct Loaded {
 const LEGACY_CLIPBOARD_PREFIX: &str = "desktop-vt1.desktop.clipboard.";
 const LEGACY_CLIPBOARD_SERVICE: &str = "desktop-vt1";
 
-/// Load persisted physical rows, or `None` if the file is absent or unreadable.
-pub fn load(path: &Path) -> Option<Loaded> {
-    let text = std::fs::read_to_string(path).ok()?;
-    parse(&text, path)
+/// Why a keymap document did not load.
+#[derive(Debug)]
+pub enum LoadError {
+    /// No file at the path: a first run, nothing of the user's to preserve.
+    Absent,
+    /// The file exists but the DOCUMENT is unusable (unreadable bytes, not
+    /// JSON, not an object, missing/non-array `physical`, missing/non-u32
+    /// `version`). The string is the reason, for the log and the backup line.
+    Unreadable(String),
+}
+
+/// Load persisted physical rows. Per-row problems drop one row (see
+/// [`Loaded::dropped`]); only a document-level problem is an error.
+pub fn load(path: &Path) -> Result<Loaded, LoadError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LoadError::Absent);
+        }
+        Err(error) => return Err(LoadError::Unreadable(format!("read failed: {error}"))),
+    };
+    parse(&text, path).map_err(LoadError::Unreadable)
+}
+
+/// What startup ended up with: the rows to serve, whether rebinds may be
+/// persisted to the path, and — when the user's file was unusable — where it
+/// was moved to.
+pub struct Opened {
+    pub rows: Vec<PhysicalBinding>,
+    /// Rows dropped at per-row admission (already logged).
+    pub dropped: usize,
+    /// The backup the unusable document was renamed to, if that happened.
+    pub recovered_from: Option<PathBuf>,
+    /// False only when an unusable document could NOT be moved aside: the
+    /// defaults are then served in memory but never written over it.
+    pub persist: bool,
+}
+
+/// Startup load: the file's rows if it loads; otherwise the defaults. An
+/// unusable document is first renamed to `<name>.bad-<stamp>` beside it (never
+/// deleted) so seeding cannot overwrite the user's keymap; if that rename
+/// fails, nothing is written and `persist` is false. `stamp` is
+/// `YYYYmmdd-HHMMSS` ([`local_stamp`]); a parameter so tests are deterministic.
+pub fn open(path: &Path, stamp: &str) -> Opened {
+    let reason = match load(path) {
+        Ok(loaded) => {
+            eprintln!(
+                "cosmix-inputd: loaded keymap ({} rows, {} dropped) from {}",
+                loaded.rows.len(),
+                loaded.dropped.len(),
+                path.display()
+            );
+            return Opened {
+                rows: loaded.rows,
+                dropped: loaded.dropped.len(),
+                recovered_from: None,
+                persist: true,
+            };
+        }
+        Err(LoadError::Absent) => None,
+        Err(LoadError::Unreadable(reason)) => Some(reason),
+    };
+    let rows = cosmix_input_core::default_keymap().physical;
+    let mut recovered_from = None;
+    if let Some(reason) = reason {
+        match backup_unusable(path, stamp) {
+            Ok(backup) => {
+                eprintln!(
+                    "cosmix-inputd: keymap {} unusable ({reason}); moved to {} and seeding defaults",
+                    path.display(),
+                    backup.display()
+                );
+                recovered_from = Some(backup);
+            }
+            Err(error) => {
+                eprintln!(
+                    "cosmix-inputd: keymap {} unusable ({reason}) and could not be moved aside ({error}); \
+                     serving defaults WITHOUT persisting so the file is not overwritten",
+                    path.display()
+                );
+                return Opened {
+                    rows,
+                    dropped: 0,
+                    recovered_from: None,
+                    persist: false,
+                };
+            }
+        }
+    }
+    match save(path, &rows) {
+        Ok(()) => eprintln!("cosmix-inputd: seeded default keymap at {}", path.display()),
+        Err(error) => eprintln!("cosmix-inputd: could not seed keymap {}: {error}", path.display()),
+    }
+    Opened {
+        rows,
+        dropped: 0,
+        recovered_from,
+        persist: true,
+    }
+}
+
+/// Rename an unusable keymap to `<file name>.bad-<stamp>` in the same
+/// directory. Never overwrites an earlier backup: a taken name gets `-1`,
+/// `-2`, … appended (checked with `symlink_metadata`, so a dangling link counts
+/// as taken).
+fn backup_unusable(path: &Path, stamp: &str) -> std::io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("keymap path has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let base = format!("{name}.bad-{stamp}");
+    for n in 0..1000u32 {
+        let candidate = if n == 0 {
+            path.with_file_name(&base)
+        } else {
+            path.with_file_name(format!("{base}-{n}"))
+        };
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            std::fs::rename(path, &candidate)?;
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::other("no free backup name"))
+}
+
+/// The current local time as `YYYYmmdd-HHMMSS`, for backup names.
+pub fn local_stamp() -> String {
+    // SAFETY: time(NULL) and localtime_r into a zeroed, caller-owned tm are
+    // both thread-safe; a failed conversion leaves the zeroed struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        libc::localtime_r(&now, &mut tm);
+    }
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 /// The identity of a raw row for a drop record / log line.
@@ -111,11 +251,18 @@ fn migrate_legacy_clipboard_row(row: &mut PhysicalBinding) -> bool {
     true
 }
 
-/// Parse and admit a keymap document (the pure half of [`load`]).
-fn parse(text: &str, path: &Path) -> Option<Loaded> {
-    let parsed: RawKeymap = serde_json::from_str(text)
-        .map_err(|error| eprintln!("cosmix-inputd: keymap {} unreadable: {error}", path.display()))
-        .ok()?;
+/// Parse and admit a keymap document (the pure half of [`load`]). `Err` is a
+/// document-level reason; per-row problems land in [`Loaded::dropped`].
+fn parse(text: &str, path: &Path) -> Result<Loaded, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
+    // serde's derived struct visitor also accepts a JSON ARRAY as a positional
+    // field list (`[1, []]` would load), so require the object shape first.
+    if !value.is_object() {
+        return Err("not a JSON object".to_string());
+    }
+    let parsed: RawKeymap =
+        serde_json::from_value(value).map_err(|error| format!("bad document: {error}"))?;
     let mut dropped = Vec::new();
     let mut drop_row = |raw: &serde_json::Value, reason: String| {
         let record = dropped_record(raw, &reason);
@@ -178,7 +325,7 @@ fn parse(text: &str, path: &Path) -> Option<Loaded> {
             row.args = None;
         }
     }
-    Some(Loaded {
+    Ok(Loaded {
         rows: physical,
         dropped,
     })
@@ -261,7 +408,7 @@ mod tests {
         for bad_value in ["42", "null", "[\"desktop-vt1\"]", "{}"] {
             let row = MENU_WITH.replace("\"desktop-vt1\"", bad_value);
             let loaded = parse(&doc(&format!("{row},{NEXT_WITHOUT}")), Path::new("t"))
-                .unwrap_or_else(|| panic!("service {bad_value} failed the whole file"));
+                .unwrap_or_else(|e| panic!("service {bad_value} failed the whole file: {e}"));
             if bad_value == "null" {
                 // `null` is an absent Option — a valid untargeted row.
                 assert_eq!(loaded.rows.len(), 2);
@@ -340,5 +487,116 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(back, rows);
         assert!(back.iter().any(|r| r.service.as_deref() == Some("desktop-vt1")));
+    }
+
+    /// A fresh, empty directory unique to one test.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "inputd-open-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn an_unusable_document_is_moved_aside_before_the_defaults_are_seeded() {
+        let defaults = cosmix_input_core::default_keymap().physical;
+        let version_string = doc("").replace("\"version\":1", "\"version\":\"1\"");
+        let version_negative = doc("").replace("\"version\":1", "\"version\":-1");
+        for (tag, text) in [
+            ("not-json", "this is { not json"),
+            // An array is the case serde's struct visitor would otherwise
+            // accept positionally.
+            ("non-object", r#"[1,[]]"#),
+            ("no-physical", r#"{"version":1}"#),
+            ("physical-not-array", r#"{"version":1,"physical":{}}"#),
+            ("version-string", version_string.as_str()),
+            ("version-negative", version_negative.as_str()),
+            ("no-version", r#"{"physical":[]}"#),
+        ] {
+            let dir = scratch(tag);
+            let path = dir.join("keymap.json");
+            std::fs::write(&path, text).unwrap();
+            let opened = open(&path, "20260924-101112");
+            let backup = dir.join("keymap.json.bad-20260924-101112");
+            assert_eq!(opened.recovered_from.as_deref(), Some(backup.as_path()), "{tag}");
+            assert!(opened.persist, "{tag}");
+            assert_eq!(opened.rows, defaults, "{tag}: defaults served");
+            // The user's bytes survive verbatim; the live path holds the defaults.
+            assert_eq!(std::fs::read_to_string(&backup).unwrap(), text, "{tag}");
+            assert_eq!(load(&path).unwrap().rows, defaults, "{tag}: defaults seeded");
+            assert_eq!(
+                dir_names(&dir),
+                vec!["keymap.json", "keymap.json.bad-20260924-101112"],
+                "{tag}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_second_recovery_in_the_same_second_keeps_the_first_backup() {
+        let dir = scratch("twice");
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, "first").unwrap();
+        let _ = open(&path, "20260924-101112");
+        std::fs::write(&path, "second").unwrap();
+        let opened = open(&path, "20260924-101112");
+        let second = dir.join("keymap.json.bad-20260924-101112-1");
+        assert_eq!(opened.recovered_from.as_deref(), Some(second.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keymap.json.bad-20260924-101112")).unwrap(),
+            "first"
+        );
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_good_or_absent_file_makes_no_backup() {
+        let dir = scratch("good");
+        let path = dir.join("keymap.json");
+        std::fs::write(&path, doc(NEXT_WITHOUT)).unwrap();
+        let opened = open(&path, "20260924-101112");
+        assert!(opened.recovered_from.is_none());
+        assert_eq!(opened.rows.len(), 1);
+        assert_eq!(opened.rows[0].action.as_str(), "desktop.workspace.next");
+        assert_eq!(dir_names(&dir), vec!["keymap.json"], "file untouched");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), doc(NEXT_WITHOUT));
+        // Absent: a first run seeds without any backup.
+        std::fs::remove_file(&path).unwrap();
+        let opened = open(&path, "20260924-101112");
+        assert!(opened.recovered_from.is_none());
+        assert_eq!(dir_names(&dir), vec!["keymap.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unmovable_document_is_never_overwritten() {
+        // "/" reads as unusable (EISDIR, not NotFound) and has no file name,
+        // so the move-aside fails: defaults are served but nothing is written.
+        let opened = open(Path::new("/"), "20260924-101112");
+        assert!(!opened.persist);
+        assert!(opened.recovered_from.is_none());
+        assert_eq!(opened.rows, cosmix_input_core::default_keymap().physical);
+    }
+
+    #[test]
+    fn local_stamp_has_the_backup_shape() {
+        let stamp = local_stamp();
+        assert_eq!(stamp.len(), 15, "{stamp}");
+        assert_eq!(stamp.as_bytes()[8], b'-');
+        assert!(stamp.bytes().enumerate().all(|(i, b)| i == 8 || b.is_ascii_digit()));
     }
 }
