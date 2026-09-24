@@ -765,11 +765,16 @@ impl ListenerConfigSource {
 /// One entry per `vhosts` allowlist slot in `cfg` that names `fqdn`
 /// (exact match — the startup check compares the namespace key
 /// byte-for-byte).
+///
+/// Per SLOT, not per listener: `synthesize_listeners` records an owner
+/// per allowlist entry, so one listener listing the host twice is
+/// already a "served by two listeners" boot failure and must count as
+/// two here.
 fn listeners_naming<'a>(cfg: &'a NodeConfig, fqdn: &str) -> Vec<&'a WebdListenerConfig> {
     cfg.webd
         .listener
         .iter()
-        .filter(|l| l.vhosts.iter().any(|h| h == fqdn))
+        .flat_map(|l| l.vhosts.iter().filter(move |h| *h == fqdn).map(move |_| l))
         .collect()
 }
 
@@ -797,6 +802,12 @@ pub fn listener_add_error(cfg: Option<&NodeConfig>, fqdn: &str) -> Option<String
             l.id,
         )),
         [_] => None,
+        [a, b, ..] if a.id == b.id => Some(format!(
+            "vhost {fqdn:?} is listed twice in listener {:?}'s `vhosts` in \
+             node.conf.mix; the next webd restart would refuse to start. List \
+             it once",
+            a.id,
+        )),
         [a, b, ..] => Some(format!(
             "vhost {fqdn:?} is named by two listeners ({:?} and {:?}) in \
              node.conf.mix; the next webd restart would refuse to start. A host \

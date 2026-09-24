@@ -1741,6 +1741,21 @@ mod tests {
         );
         let msg = listener_add_error(Some(&two), h).expect("double owner refused");
         assert!(msg.contains("two listeners"), "{msg}");
+        // Listed twice by ONE listener: startup counts slots, not
+        // listeners, so this aborts the boot — the check must agree.
+        let dup = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[h, h])], &[]);
+        assert!(
+            dup.synthesize_listeners(&[h.to_string()], &HashSet::new())
+                .is_err(),
+            "startup rejects a duplicate slot"
+        );
+        let msg = listener_add_error(Some(&dup), h).expect("duplicate slot refused");
+        assert!(msg.contains("listed twice"), "{msg}");
+        // And the admissible shape is admissible to the real synthesis.
+        assert!(
+            ok.synthesize_listeners(&[h.to_string()], &HashSet::new())
+                .is_ok()
+        );
         // Exact match, as at startup: a case-variant is not the same key.
         let upper = cfg_with(
             vec![listener("pub", "192.0.2.1:443", true, &["NEW.example.org"])],
