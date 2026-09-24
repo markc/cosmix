@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use bevy::app::{First, PreUpdate, Update};
+use bevy::app::{First, PostStartup, PreUpdate, Update};
 use bevy::camera::RenderTarget;
 use bevy::ecs::message::{Message, MessageReader, MessageWriter};
 use bevy::input::gamepad::GamepadButtonChangedEvent;
@@ -607,14 +607,16 @@ struct FocusAnchorInvariantWarned(bool);
 /// keyboard bridge as `KeyboardInput` messages and stopped there; the
 /// launcher search box took focus and typed nothing (2026-09-24).
 ///
-/// The anchor spawned here carries the marker and no `Window`. Bevy's
-/// consumers of `With<PrimaryWindow>` that look up the window behind it
-/// (default UI camera, render-target normalisation, the screenshot and
-/// surface probes) find none and skip, as they do today; quoin targets every
-/// camera and UI root at an explicit window so none of them asks. Picking's
-/// pointer-location normalisation no longer returns early, which is
-/// harmless for explicit window targets. Two things the anchor must do
-/// itself, because it is not a `Window`:
+/// The anchor carries the marker and no `Window`. Bevy's consumers of
+/// `With<PrimaryWindow>` that then look up a `Window` behind it (default UI
+/// camera, the screenshot and surface probes) find none and skip, as they
+/// do today. Render-target normalisation does not look: it resolves
+/// `WindowRef::Primary` to the anchor entity and only later fails to find a
+/// window to render into — quoin never triggers that, because every camera
+/// and UI root targets an explicit window. Picking's pointer-location
+/// normalisation no longer returns early, which is harmless for explicit
+/// window targets. Two things the anchor must do itself, because it is not
+/// a `Window`:
 ///
 /// - **End bubbling.** `WindowTraversal` sends a `FocusedInput` or
 ///   `AcquireFocus` that reaches an entity with neither `ChildOf` nor
@@ -630,9 +632,11 @@ struct FocusAnchorInvariantWarned(bool);
 ///   the keyboard.
 ///
 /// Call after `DefaultPlugins`. Idempotent for the plugin and the systems'
-/// resources; the anchor is spawned only when no `PrimaryWindow` exists,
-/// because two would silence the dispatcher again — `First` checks that
-/// invariant every frame and warns once if it breaks.
+/// resources; the anchor is spawned after `Startup` (see
+/// [`spawn_focus_anchor`]) and only when no `PrimaryWindow` exists, because
+/// two would silence the dispatcher again. Nothing enforces that afterwards:
+/// `First` checks the invariant every frame and warns once if it breaks,
+/// which is a diagnostic, not a repair.
 pub(crate) fn install_focus_dispatch(app: &mut App) {
     app.init_resource::<InputFocus>()
         .init_resource::<KeyboardWindow>()
@@ -647,25 +651,40 @@ pub(crate) fn install_focus_dispatch(app: &mut App) {
         PreUpdate,
         confine_input_focus_to_keyboard_window.before(InputFocusSystems::Dispatch),
     )
-    .add_systems(First, check_focus_anchor_invariant);
-    let world = app.world_mut();
-    let has_primary = world
-        .query_filtered::<Entity, With<PrimaryWindow>>()
-        .iter(world)
-        .next()
-        .is_some();
-    if !has_primary {
-        world
-            .spawn((
-                PrimaryWindow,
-                FocusDispatchAnchor,
-                Name::new("focus-dispatch-anchor"),
-            ))
-            .observe(stop_at_anchor::<KeyboardInput>)
-            .observe(stop_at_anchor::<MouseWheel>)
-            .observe(stop_at_anchor::<GamepadButtonChangedEvent>)
-            .observe(stop_acquire_at_anchor);
+    .add_systems(First, check_focus_anchor_invariant)
+    .add_systems(
+        PostStartup,
+        spawn_focus_anchor.after(bevy::input_focus::set_initial_focus),
+    );
+}
+
+/// Spawn the anchor once Startup is over, on purpose. Feathers'
+/// `TabNavigationPlugin` attaches `handle_tab_navigation` to every
+/// `PrimaryWindow` it finds during `Startup`; an anchor that exists by then
+/// would carry it, and a Tab bubbling out of any panel would move the focus
+/// to a widget in whichever panel holds the next `TabIndex` — a different
+/// window, with its `FocusGained` side effects landing before the
+/// confinement clears it. Spawning here means no Tab handler is ever
+/// attached: Tab navigation is off in the layer host until it has
+/// per-window tab groups. Ordered after `set_initial_focus` so that system
+/// (also `PostStartup`, skipped without a primary) never focuses the anchor.
+fn spawn_focus_anchor(
+    mut commands: bevy::prelude::Commands,
+    primaries: Query<Entity, With<PrimaryWindow>>,
+) {
+    if !primaries.is_empty() {
+        return;
     }
+    commands
+        .spawn((
+            PrimaryWindow,
+            FocusDispatchAnchor,
+            Name::new("focus-dispatch-anchor"),
+        ))
+        .observe(stop_at_anchor::<KeyboardInput>)
+        .observe(stop_at_anchor::<MouseWheel>)
+        .observe(stop_at_anchor::<GamepadButtonChangedEvent>)
+        .observe(stop_acquire_at_anchor);
 }
 
 fn stop_at_anchor<M: Message + Clone>(mut event: On<FocusedInput<M>>) {
@@ -1614,9 +1633,10 @@ mod tests {
             assert_eq!(app.world().resource::<FocusedKeys>().0, vec!["a".to_owned()]);
             assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
 
-            // A second install must not add a second anchor: two primary
+            // Spawning again must not add a second anchor: two primary
             // windows silence Bevy's dispatcher exactly as none does.
-            install_focus_dispatch(&mut app);
+            use bevy::ecs::system::RunSystemOnce;
+            app.world_mut().run_system_once(spawn_focus_anchor).unwrap();
             let mut anchors = app
                 .world_mut()
                 .query_filtered::<Entity, With<PrimaryWindow>>();
@@ -1627,17 +1647,35 @@ mod tests {
     /// With nothing focused the dispatcher falls back to the anchor, and a
     /// click on non-focusable space sends `AcquireFocus` there too. Both must
     /// end at the anchor rather than loop, and neither may move the focus.
+    /// Global observers stand in for the ones quoin has (ctk's, Feathers'):
+    /// Bevy skips traversal entirely when nothing observes an event, so
+    /// without them this test could not spin even with the stoppers gone,
+    /// and the watchdog would prove nothing.
+    #[derive(Resource, Default)]
+    struct Hops {
+        keys: usize,
+        acquires: usize,
+    }
+
     #[test]
     fn unfocused_key_and_acquire_focus_end_at_the_anchor() {
         run_within(Duration::from_secs(10), || {
             let (mut app, window) = dispatch_app();
+            app.init_resource::<Hops>();
+            app.add_observer(
+                |_: On<FocusedInput<KeyboardInput>>, mut hops: ResMut<Hops>| hops.keys += 1,
+            );
+            app.add_observer(|_: On<AcquireFocus>, mut hops: ResMut<Hops>| hops.acquires += 1);
             let loose = app.world_mut().spawn_empty().id();
             app.finish();
             app.cleanup();
+            // The first frame runs Startup, which spawns the anchor.
+            app.update();
             let mut anchors = app
                 .world_mut()
                 .query_filtered::<Entity, With<PrimaryWindow>>();
             let anchor = anchors.single(app.world()).unwrap();
+            assert_eq!(app.world().resource::<InputFocus>().get(), None);
 
             emit_keyboard(
                 &mut app,
@@ -1651,6 +1689,11 @@ mod tests {
                 window: anchor,
             });
             app.update();
+            let hops = app.world().resource::<Hops>();
+            // The key is dispatched to the anchor and stops there; the
+            // acquire is seen at the loose entity, bubbles to the anchor
+            // and stops there.
+            assert_eq!((hops.keys, hops.acquires), (1, 2));
             assert!(app.world().resource::<FocusedKeys>().0.is_empty());
             assert_eq!(app.world().resource::<InputFocus>().get(), None);
         });
