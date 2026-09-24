@@ -306,7 +306,7 @@ builtin_table! {
     ("run", CapabilityClass::Process,             "system",  "Run shell command via sh, return trimmed stdout as string. run(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; a timed-out child is PG-killed and run dies (catchable)", contract!((cmd: string, opts?: map) -> string; effects[blocking, shell]; failure[raises])),
     ("run_rc", CapabilityClass::Process,          "system",  "Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true", contract!((cmd: string, opts?: map) -> map("run_rc_result", {rc: number, stdout: string, stderr: string, timed_out: bool, interrupted: bool}); effects[must_use, blocking, shell]; failure[returns_result])),
     ("run_stream", CapabilityClass::Process,      "system",  "Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an `env` prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing", contract!((argv: list(string), opts?: map("run_stream_options", {env: map, clear_env: bool, cwd: any_of(string, nil)})) -> number; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; grace (seconds: at the deadline SIGTERM the process group, wait up to grace for it, then SIGKILL — default 0 = SIGKILL at once; refused with timeout:0); stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; grace (seconds: at the deadline SIGTERM the process group, wait up to grace for it, then SIGKILL — default 0 = SIGKILL at once; refused with timeout:0); stdin nil|string|bytes|buffer|{file}|{null:true}|{inherit:true} (only when mix's own stdin is not a terminal, else STDIN_TERMINAL — use run_stream); stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
     ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout, grace} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
     ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
     ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
@@ -5709,6 +5709,10 @@ struct RunArgvOpts {
 
 enum RunArgvStdin {
     Null,
+    /// `{inherit: true}` — the child reads the caller's own stdin (a pipe
+    /// or file into mix). Refused when that stdin is a terminal: see
+    /// [`stdin_inherit_route`].
+    Inherit,
     Data(Vec<u8>),
     File(String),
 }
@@ -5892,6 +5896,29 @@ fn parse_output_file(caller: &str, stream: &str, value: &Value) -> MixResult<Run
     Ok(RunArgvFile { path, append, mode })
 }
 
+/// `stdin: {inherit: true}` — accepted only when this process's stdin is NOT
+/// a terminal. A run_argv/run_pipeline child leads its own process group, so
+/// it is never the terminal's foreground group: a terminal read would stop
+/// it with SIGTTIN (or fail EIO), and the call would hang to its deadline.
+/// That is why the route was refused outright before; a pipe or file has no
+/// foreground concept, so inheriting one is safe. The terminal case raises
+/// STDIN_TERMINAL and names run_stream, the runner that hands a child the
+/// terminal. Checked when the options are parsed, before anything spawns.
+fn stdin_inherit_route(caller: &str) -> MixResult<RunArgvStdin> {
+    // SAFETY: isatty only inspects descriptor 0.
+    if unsafe { libc::isatty(0) } == 1 {
+        return Err(MixError::structured(
+            "STDIN_TERMINAL",
+            format!(
+                "{caller}: stdin {{inherit: true}} refused: this process's stdin is a terminal, \
+                 and the child runs in its own process group, so a terminal read would stop it \
+                 (SIGTTIN). Use run_stream(argv) to give a child the terminal"
+            ),
+        ));
+    }
+    Ok(RunArgvStdin::Inherit)
+}
+
 fn parse_stdin_route(caller: &str, value: &Value) -> MixResult<RunArgvStdin> {
     match value {
         Value::Nil => Ok(RunArgvStdin::Null),
@@ -5902,7 +5929,7 @@ fn parse_stdin_route(caller: &str, value: &Value) -> MixResult<RunArgvStdin> {
             if map.len() != 1 {
                 return Err(opt_invalid(
                     caller,
-                    "stdin routing map must be exactly {file: string} or {null: true}",
+                    "stdin routing map must be exactly {file: string}, {null: true} or {inherit: true}",
                 ));
             }
             match map.first() {
@@ -5910,16 +5937,17 @@ fn parse_stdin_route(caller: &str, value: &Value) -> MixResult<RunArgvStdin> {
                     caller, "stdin", value,
                 )?)),
                 Some((key, Value::Bool(true))) if key == "null" => Ok(RunArgvStdin::Null),
+                Some((key, Value::Bool(true))) if key == "inherit" => stdin_inherit_route(caller),
                 _ => Err(opt_invalid(
                     caller,
-                    "stdin routing map must be exactly {file: string} or {null: true}",
+                    "stdin routing map must be exactly {file: string}, {null: true} or {inherit: true}",
                 )),
             }
         }
         other => Err(opt_invalid(
             caller,
             format!(
-                "stdin must be nil, a string, bytes, buffer, {{file: string}}, or {{null: true}}, got {}",
+                "stdin must be nil, a string, bytes, buffer, {{file: string}}, {{null: true}}, or {{inherit: true}}, got {}",
                 other.type_name()
             ),
         )),
@@ -6423,6 +6451,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
         argv,
         stdin: match &opts.stdin {
             RunArgvStdin::Null => ProcStdin::Null,
+            RunArgvStdin::Inherit => ProcStdin::Inherit,
             RunArgvStdin::Data(data) => ProcStdin::Data(data),
             RunArgvStdin::File(path) => ProcStdin::File(path),
         },
@@ -7980,6 +8009,7 @@ fn ssh_result_map(host: &str, o: SshOutcome, elapsed: std::time::Duration) -> Va
 #[derive(Clone, Copy)]
 enum ProcStdin<'a> {
     Null,
+    Inherit,
     Data(&'a [u8]),
     File(&'a str),
 }
@@ -8969,6 +8999,9 @@ fn run_pipeline_processes(
                     RunArgvStdin::Null => {
                         command.stdin(Stdio::null());
                     }
+                    RunArgvStdin::Inherit => {
+                        command.stdin(Stdio::inherit());
+                    }
                     RunArgvStdin::Data(_) => {
                         command.stdin(Stdio::from(
                             stdin_data_reader
@@ -9147,7 +9180,7 @@ fn run_pipeline_processes(
                 writer.write_all(&data)
             }))
         }
-        RunArgvStdin::Null | RunArgvStdin::File(_) => None,
+        RunArgvStdin::Null | RunArgvStdin::Inherit | RunArgvStdin::File(_) => None,
     };
 
     let final_stdout_pipe: Option<Box<dyn std::io::Read + Send>> = final_stdout_reader
@@ -9746,6 +9779,10 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     let stdin_data = match stdin {
         ProcStdin::Null => {
             cmd.stdin(Stdio::null());
+            None
+        }
+        ProcStdin::Inherit => {
+            cmd.stdin(Stdio::inherit());
             None
         }
         ProcStdin::Data(data) => {

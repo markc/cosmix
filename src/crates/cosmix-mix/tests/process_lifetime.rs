@@ -11,6 +11,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::Write;
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -200,4 +201,101 @@ fn plain_spawn_child_survives_mix_exit() {
     kill_leftover(leader);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(alive, "a plain spawn child must not be ended by mix's exit");
+}
+
+fn run_with_stdin(label: &str, source: &str, stdin: Stdio, feed: Option<&[u8]>) -> (bool, String) {
+    let dir = scratch_dir(label);
+    let script = write_script(&dir, source);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mix"))
+        .arg(&script)
+        .env("MIX_STATS", "off")
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("mix binary must run");
+    if let Some(bytes) = feed {
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(bytes)
+            .expect("feed stdin");
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().expect("try_wait").is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("`{label}` wedged — a child blocked on inherited stdin?");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().expect("collect output");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// stdin {inherit: true} with a PIPE as mix's stdin: the child reads it.
+/// The default (nil) still gives the child nothing.
+#[test]
+fn stdin_inherit_reads_a_piped_stdin() {
+    let (ok, out) = run_with_stdin(
+        "stdin-pipe",
+        "print(run_argv([\"cat\"], {stdin: {inherit: true}}).stdout)\n\
+         print(\"[\" .. run_argv([\"cat\"]).stdout .. \"]\")\n",
+        Stdio::piped(),
+        Some(b"from-the-caller"),
+    );
+    assert!(ok, "script failed: {out}");
+    assert_eq!(out, "from-the-caller\n[]\n");
+
+    let (ok, out) = run_with_stdin(
+        "stdin-pipe-pipeline",
+        "print(run_pipeline([{argv: [\"cat\"], stdin: {inherit: true}}, [\"tr\", \"a-z\", \"A-Z\"]]).stdout)\n",
+        Stdio::piped(),
+        Some(b"piped"),
+    );
+    assert!(ok, "script failed: {out}");
+    assert_eq!(out, "PIPED\n");
+}
+
+/// stdin {inherit: true} with a TERMINAL as mix's stdin is refused before
+/// anything spawns: the child would lead a background process group and a
+/// terminal read would stop it with SIGTTIN. The error names run_stream.
+#[test]
+fn stdin_inherit_refuses_a_terminal_stdin() {
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty writes two fresh descriptors into the locals.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty");
+    // SAFETY: `slave` is a descriptor we own; Stdio takes ownership of it.
+    let stdin = unsafe { Stdio::from(std::os::fd::OwnedFd::from_raw_fd(slave)) };
+    let (ok, out) = run_with_stdin(
+        "stdin-tty",
+        "try\n  run_argv([\"cat\"], {stdin: {inherit: true}})\ncatch $m, $e\n  print($e.code .. \" \" .. contains($m, \"run_stream\"))\nend\n\
+         try\n  run_pipeline([{argv: [\"cat\"], stdin: {inherit: true}}])\ncatch $m, $e\n  print($e.code)\nend\n\
+         print(run_argv([\"true\"]).ok)\n",
+        stdin,
+        None,
+    );
+    // SAFETY: closing the master we opened.
+    unsafe {
+        libc::close(master);
+    }
+    assert!(ok, "script failed: {out}");
+    assert_eq!(out, "STDIN_TERMINAL true\nSTDIN_TERMINAL\ntrue\n");
 }

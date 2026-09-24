@@ -91,11 +91,24 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
   end
   ```
 - `stdin`: `nil` or `{null: true}` closes stdin; string/bytes/buffer supplies
-  those bytes; `{file: path}` opens a local file for the child to read. There is
-  deliberately no `stdin: "inherit"` route: run_argv puts its child in a new
-  process group, so it is not the terminal's foreground group and a terminal
-  read can receive `SIGTTIN`. The string `"inherit"` is ordinary stdin data.
-  Use `run_stream` when a child must own the terminal and inherited stdin. With
+  those bytes; `{file: path}` opens a local file for the child to read.
+  `{inherit: true}` hands the child mix's own stdin, but **only when that
+  stdin is not a terminal**, such as a pipe or a redirected file:
+
+  ```mix
+  -- producer | mix filter.mix
+  $r = run_argv(["sort", "-u"], {stdin: {inherit: true}})
+  ```
+
+  When mix's stdin is a terminal, `{inherit: true}` raises `STDIN_TERMINAL`
+  before anything spawns. run_argv puts its child in a new process group, so it
+  is not the terminal's foreground group, and a terminal read would stop it
+  with `SIGTTIN`. The call would then hang until its deadline. That is why
+  there is no string form either: `stdin: "inherit"` is ordinary stdin data,
+  the seven bytes `inherit`. Use `run_stream` when a child must own the
+  terminal and its stdin. The same rule applies to stage 0 of `run_pipeline`
+  and to `run_parallel` jobs. Parallel jobs that inherit one pipe share it,
+  and each reads whatever bytes it gets first. With
   `timeout: 0`, Mix also waits for a stdin-data writer to finish after the
   direct child exits. A descendant which retains the read end without consuming
   the data can therefore make the call wait indefinitely; that is the explicit

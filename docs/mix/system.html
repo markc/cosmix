@@ -524,11 +524,21 @@ end
 </li>
 <li>
 <p><code>stdin</code>: <code>nil</code> or <code>{null: true}</code> closes stdin; string/bytes/buffer supplies
-those bytes; <code>{file: path}</code> opens a local file for the child to read. There is
-deliberately no <code>stdin: "inherit"</code> route: run_argv puts its child in a new
-process group, so it is not the terminal's foreground group and a terminal
-read can receive <code>SIGTTIN</code>. The string <code>"inherit"</code> is ordinary stdin data.
-Use <code>run_stream</code> when a child must own the terminal and inherited stdin. With
+those bytes; <code>{file: path}</code> opens a local file for the child to read.
+<code>{inherit: true}</code> hands the child mix's own stdin, but <strong>only when that
+stdin is not a terminal</strong>, such as a pipe or a redirected file:</p>
+<pre><code class="language-mix">-- producer | mix filter.mix
+$r = run_argv(["sort", "-u"], {stdin: {inherit: true}})
+</code></pre>
+<p>When mix's stdin is a terminal, <code>{inherit: true}</code> raises <code>STDIN_TERMINAL</code>
+before anything spawns. run_argv puts its child in a new process group, so it
+is not the terminal's foreground group, and a terminal read would stop it
+with <code>SIGTTIN</code>. The call would then hang until its deadline. That is why
+there is no string form either: <code>stdin: "inherit"</code> is ordinary stdin data,
+the seven bytes <code>inherit</code>. Use <code>run_stream</code> when a child must own the
+terminal and its stdin. The same rule applies to stage 0 of <code>run_pipeline</code>
+and to <code>run_parallel</code> jobs. Parallel jobs that inherit one pipe share it,
+and each reads whatever bytes it gets first. With
 <code>timeout: 0</code>, Mix also waits for a stdin-data writer to finish after the
 direct child exits. A descendant which retains the read end without consuming
 the data can therefore make the call wait indefinitely; that is the explicit
