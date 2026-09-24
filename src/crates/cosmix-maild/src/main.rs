@@ -231,20 +231,20 @@ enum TlsAction {
 /// Read-only inspection verbs against the Bayesian classifier.
 #[derive(Subcommand)]
 enum BayesianAction {
-    /// Pretty-print `maild.bayesian.stats` for an account id. The
-    /// id is the maild.accounts PK (an integer); the daemon's
-    /// `parse_account_id` accepts either a JSON integer or an
-    /// all-ASCII-digit string, so this CLI passes it as the latter.
+    /// Pretty-print `maild.bayesian.stats` for an account. The
+    /// response echoes `account_id` and `email`, so `stats EMAIL` is
+    /// how an operator learns an account's numeric id.
     Stats {
-        /// Account id (maild.accounts PK). Passed to the daemon as
-        /// typed; the daemon's `parse_account_id` (bus/bayesian.rs)
-        /// is the digit-only trust boundary that prevents
-        /// corpus-tree path escape via the wire payload. This CLI
-        /// does NOT pre-validate — that would duplicate the daemon
-        /// check and would mangle the daemon's truthful error
-        /// message ("account_id must be a non-negative integer,
-        /// got …") for operator debugging.
-        account_id: String,
+        /// Account email, or its id (the maild.accounts PK). Anything
+        /// containing `@` is sent as `email`; everything else is sent
+        /// as `account_id` verbatim — the daemon's `parse_account_id`
+        /// (bus/bayesian.rs) is the digit-only trust boundary that
+        /// prevents corpus-tree path escape via the wire payload. This
+        /// CLI does NOT pre-validate — that would duplicate the daemon
+        /// check and would mangle the daemon's truthful error message
+        /// ("account_id must be a non-negative integer, got …") for
+        /// operator debugging.
+        account: String,
     },
 }
 
@@ -2076,6 +2076,17 @@ async fn run_dkim_cli(action: DkimAction) -> Result<()> {
     Ok(())
 }
 
+/// Bus selector for the per-account `maild.bayesian.*` verbs: an operator
+/// argument containing `@` is an address (`email`), anything else is the
+/// numeric PK (`account_id`), passed verbatim for the daemon to validate.
+fn account_selector(account: &str) -> serde_json::Value {
+    if account.contains('@') {
+        serde_json::json!({ "email": account })
+    } else {
+        serde_json::json!({ "account_id": account })
+    }
+}
+
 /// Shared CLI dispatch for operator-facing maild verbs that share
 /// four invariants:
 ///
@@ -2292,8 +2303,8 @@ async fn main() -> Result<()> {
         },
 
         Command::Bayesian { action } => {
-            let BayesianAction::Stats { account_id } = action;
-            let body = serde_json::json!({ "account_id": account_id }).to_string();
+            let BayesianAction::Stats { account } = action;
+            let body = account_selector(&account).to_string();
             run_inspection_verb_cli("bayesian stats", "maild.bayesian.stats", &body).await?;
         }
 
@@ -2689,12 +2700,28 @@ mod cli_parser_tests {
             .expect("bayesian stats <account-id> should parse");
         match cli.command {
             Command::Bayesian {
-                action: BayesianAction::Stats { account_id },
+                action: BayesianAction::Stats { account },
             } => {
-                assert_eq!(account_id, "42");
+                assert_eq!(account, "42");
             }
             _ => panic!("expected Bayesian::Stats"),
         }
+    }
+
+    #[test]
+    fn account_selector_sends_an_address_as_email_and_anything_else_as_id() {
+        assert_eq!(
+            super::account_selector("admin@example.com"),
+            serde_json::json!({"email": "admin@example.com"})
+        );
+        assert_eq!(
+            super::account_selector("13"),
+            serde_json::json!({"account_id": "13"})
+        );
+        assert_eq!(
+            super::account_selector("../../etc"),
+            serde_json::json!({"account_id": "../../etc"})
+        );
     }
 
     #[test]
@@ -2789,9 +2816,9 @@ mod cli_parser_tests {
             .expect("bayesian stats must accept the value at parse time");
         match cli.command {
             Command::Bayesian {
-                action: BayesianAction::Stats { account_id },
+                action: BayesianAction::Stats { account },
             } => {
-                assert_eq!(account_id, "not-a-number");
+                assert_eq!(account, "not-a-number");
             }
             _ => panic!("expected Bayesian::Stats"),
         }

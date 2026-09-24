@@ -374,7 +374,7 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
         ),
         VerbDescriptor::new(
             "maild.bayesian.stats",
-            &["account_id"],
+            &["account_id", "email"],
             "Read Bayesian classifier statistics",
             true,
         ),

@@ -164,14 +164,43 @@ fn rebuild_authorised(cmd: &IncomingCommand, state: &BayesianBusState) -> bool {
     state.operators.is_empty() || state.operators.iter().any(|operator| operator == &cmd.from)
 }
 
+/// Account selector shared by the per-account inspection and training
+/// verbs: exactly one of `account_id` (the `maild.accounts` PK) or `email`.
+/// The email form exists because no CLI or props surface prints the PK.
 #[derive(serde::Deserialize)]
-struct StatsRequest {
+struct AccountSelector {
     /// Wire form for the account id. Must be a non-negative integer,
     /// either as a JSON number or an all-digits string — see
     /// `parse_account_id`. Anything else is rejected so a peer can't
     /// steer the on-disk `<base>/<id>/bayes.db` path outside the
     /// corpus tree.
-    account_id: serde_json::Value,
+    #[serde(default)]
+    account_id: Option<serde_json::Value>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+/// Resolve an [`AccountSelector`] to an existing account row. An id or
+/// address with no row is refused: inspection and training must never be a
+/// way to mint corpus directories (a 1–10 stats scan once created six).
+async fn resolve_account(
+    database: &db::Db,
+    selector: &AccountSelector,
+) -> Result<db::account::Account, String> {
+    let found = match (&selector.account_id, &selector.email) {
+        (Some(_), Some(_)) => return Err("pass account_id or email, not both".to_string()),
+        (None, None) => return Err("missing account_id or email".to_string()),
+        (Some(raw), None) => {
+            let id = parse_account_id(raw)?;
+            db::account::get_by_id(&database.conn, id).await
+        }
+        (None, Some(email)) => db::account::get_by_email(&database.conn, email).await,
+    };
+    match found {
+        Ok(Some(account)) => Ok(account),
+        Ok(None) => Err("account not found".to_string()),
+        Err(e) => Err(format!("account lookup failed: {e}")),
+    }
 }
 
 async fn handle_stats(
@@ -179,27 +208,26 @@ async fn handle_stats(
     database: &db::Db,
     args: &serde_json::Value,
 ) -> (u8, String) {
-    let req: StatsRequest = match serde_json::from_value(args.clone()) {
+    let req: AccountSelector = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
         Err(e) => return (RC_ERROR, err_body(&format!("malformed stats request: {e}"))),
     };
-    let account_i32 = match parse_account_id(&req.account_id) {
-        Ok(id) => id,
+    let row = match resolve_account(database, &req).await {
+        Ok(row) => row,
         Err(e) => return (RC_ERROR, err_body(&e)),
     };
-    // Refuse ids that name no account: inspection must not be a way to
-    // mint corpus directories (a 1–10 scan once created six empty ones).
-    match db::account::get_by_id(&database.conn, account_i32).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return (RC_ERROR, err_body("account not found")),
-        Err(e) => return (RC_ERROR, err_body(&format!("account lookup failed: {e}"))),
-    }
-    let account = AccountId::new(account_i32.to_string());
+    let account = AccountId::new(row.id.to_string());
     match classifier.peek_stats(&account).await {
-        Ok(stats) => match serde_json::to_string(&stats) {
-            Ok(body) => (0, body),
-            Err(e) => (RC_ERROR, err_body(&format!("serialize AccountStats: {e}"))),
-        },
+        Ok(stats) => {
+            let mut body = match serde_json::to_value(&stats) {
+                Ok(v) => v,
+                Err(e) => return (RC_ERROR, err_body(&format!("serialize AccountStats: {e}"))),
+            };
+            // Echo the resolved identity so an email lookup reveals the PK.
+            body["account_id"] = serde_json::json!(row.id);
+            body["email"] = serde_json::json!(row.email);
+            (0, body.to_string())
+        }
         Err(e) => (RC_ERROR, err_body(&format!("stats failed: {e}"))),
     }
 }
@@ -1671,7 +1699,36 @@ mod tests {
         let (rc, body) = handle_stats(&cls, &database, &args).await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(v["error"].as_str().unwrap().contains("malformed"));
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing account_id or email"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_by_email_echoes_the_account_id() {
+        let cls = classifier_with_corpus(1, 2).await;
+        let database = database_with_accounts(&[5, 13]);
+        let args = serde_json::json!({"email": "account-13@example.com"});
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["account_id"], 13);
+        assert_eq!(v["email"], "account-13@example.com");
+        assert_eq!(v["ham_messages"], 2);
+
+        let args = serde_json::json!({"email": "nobody@example.com"});
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("account not found"), "{body}");
+
+        let args = serde_json::json!({"account_id": 5, "email": "account-5@example.com"});
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("not both"), "{body}");
     }
 
     #[tokio::test]

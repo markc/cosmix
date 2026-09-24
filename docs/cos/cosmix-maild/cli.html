@@ -532,7 +532,7 @@ cosmix-maild domain show example.com
 <tr><td><code>engine-config show</code></td><td>Show the <code>maild.engine_config</code> singleton</td></tr>
 <tr><td><code>rules stats [--top-n N]</code></td><td>Show pack metadata, verdict totals, and rule hits</td></tr>
 <tr><td><code>rules reload</code></td><td>Re-read and atomically swap the configured rule pack</td></tr>
-<tr><td><code>bayesian stats ACCOUNT_ID</code></td><td>Show corpus statistics for a numeric account id (read-only; unknown ids are refused)</td></tr>
+<tr><td><code>bayesian stats ACCOUNT</code></td><td>Show corpus statistics for an account email or numeric id (read-only; unknown accounts are refused). The output includes <code>account_id</code>, so <code>bayesian stats EMAIL</code> is how to learn an account id</td></tr>
 </tbody></table>
 <p><code>rules stats</code> defaults to 256 per-rule entries. The daemon caps the request at 4096. <code>--top-n 0</code> requests cardinality without cloning the per-rule map.</p>
 <p><code>rules reload</code> is a no-op when <code>rules_pack_path</code> is unset. On a load failure, the previous pack remains active.</p>

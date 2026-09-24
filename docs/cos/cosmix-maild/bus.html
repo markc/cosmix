@@ -469,7 +469,7 @@
 <tr><td><code>maild.rules.reload</code></td><td>None</td><td>Reload the configured pack and return load metadata</td></tr>
 <tr><td><code>maild.rules.stats</code></td><td>Optional <code>top_n</code></td><td>Return pack metadata and persistent verdict and rule-hit counters</td></tr>
 <tr><td><code>maild.rules.explain</code></td><td>Envelope and base64 message</td><td>Explain rule evaluation without delivering</td></tr>
-<tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code></td><td>Return per-account corpus statistics, read-only; an id with no account row is refused</td></tr>
+<tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code> or <code>email</code></td><td>Return per-account corpus statistics, read-only, echoing the resolved <code>account_id</code> and <code>email</code>; an account with no row is refused</td></tr>
 <tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code></td><td>Classify without recording a training label</td></tr>
 </tbody></table>
 <p><code>maild.rules.explain</code> accepts:</p>
