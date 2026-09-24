@@ -521,11 +521,11 @@ bterm. <code>send term HELP</code> lists the full surface. A verb and the matchi
 make the same change, and the window follows a verb straight away. Every body
 is a JSON object, and <code>{}</code> means no arguments.</p>
 <table><thead><tr><th>Verb</th><th>Body</th><th>Effect</th></tr></thead><tbody>
-<tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid</td></tr>
+<tr><td><code>term.tabs</code></td><td><code>{}</code></td><td>list tabs: id, active, title, cols, rows, child pid, revision</td></tr>
 <tr><td><code>term.tab.new</code></td><td><code>{}</code></td><td>open a tab and select it</td></tr>
 <tr><td><code>term.tab.select</code></td><td><code>{"id":N}</code></td><td>select tab N</td></tr>
 <tr><td><code>term.tab.close</code></td><td><code>{"id":N}</code></td><td>close tab N; closing the last tab quits</td></tr>
-<tr><td><code>term.panes</code></td><td><code>{}</code></td><td>list the active tab's panes: id, focus, cols, rows, child pid, geometry</td></tr>
+<tr><td><code>term.panes</code></td><td><code>{}</code></td><td>list the active tab's panes: id, focus, cols, rows, child pid, geometry, tab, revision</td></tr>
 <tr><td><code>term.pane.split</code></td><td><code>{"dir":"v"}</code> or <code>{"dir":"h"}</code></td><td>split the focused pane side by side (<code>v</code>) or top and bottom (<code>h</code>)</td></tr>
 <tr><td><code>term.pane.select</code></td><td><code>{"id":N}</code></td><td>focus pane N in the active tab</td></tr>
 <tr><td><code>term.pane.close</code></td><td><code>{}</code></td><td>close the focused pane; the last pane closes the tab</td></tr>

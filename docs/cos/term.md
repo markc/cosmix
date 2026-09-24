@@ -101,11 +101,11 @@ is a JSON object, and `{}` means no arguments.
 
 | Verb | Body | Effect |
 |---|---|---|
-| `term.tabs` | `{}` | list tabs: id, active, title, cols, rows, child pid |
+| `term.tabs` | `{}` | list tabs: id, active, title, cols, rows, child pid, revision |
 | `term.tab.new` | `{}` | open a tab and select it |
 | `term.tab.select` | `{"id":N}` | select tab N |
 | `term.tab.close` | `{"id":N}` | close tab N; closing the last tab quits |
-| `term.panes` | `{}` | list the active tab's panes: id, focus, cols, rows, child pid, geometry |
+| `term.panes` | `{}` | list the active tab's panes: id, focus, cols, rows, child pid, geometry, tab, revision |
 | `term.pane.split` | `{"dir":"v"}` or `{"dir":"h"}` | split the focused pane side by side (`v`) or top and bottom (`h`) |
 | `term.pane.select` | `{"id":N}` | focus pane N in the active tab |
 | `term.pane.close` | `{}` | close the focused pane; the last pane closes the tab |

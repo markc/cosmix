@@ -111,11 +111,24 @@ pub fn action_for(
 
 /// The lowercase Latin letter a chord key stands for: the layout's own
 /// letter when it has one, else the physical key's US position.
+///
+/// The fallback is only for layouts with NO Latin letter on the key. A Latin
+/// layout that puts an accented letter there — Turkish F has "ğ" where US
+/// has E and "ö" where US has X — has its own e and x elsewhere, and those
+/// are its chords. Falling back there too would bind both keys, and
+/// Ctrl+Shift+ö would close a pane (round-2 review finding).
 fn chord_letter(key: &Key, physical: Physical) -> Option<char> {
-    if let Key::Character(c) = key.as_ref()
-        && let Some(letter) = ascii_letter(c)
-    {
-        return Some(letter.to_ascii_lowercase());
+    if let Key::Character(c) = key.as_ref() {
+        if let Some(letter) = ascii_letter(c) {
+            return Some(letter.to_ascii_lowercase());
+        }
+        let mut chars = c.chars();
+        if let (Some(first), None) = (chars.next(), chars.next())
+            && first.is_alphabetic()
+            && is_latin(first)
+        {
+            return None;
+        }
     }
     let Physical::Code(code) = physical else {
         return None;
@@ -129,6 +142,17 @@ fn chord_letter(key: &Key, physical: Physical) -> Option<char> {
         Code::KeyX => 'x',
         _ => return None,
     })
+}
+
+/// Whether `c` is in a Latin-script block: Basic Latin, the Latin-1
+/// Supplement, Latin Extended-A and -B, and Latin Extended Additional.
+/// Callers check `is_alphabetic` too, so the symbols in those blocks (such as
+/// `×` and `÷`) never count as letters.
+fn is_latin(c: char) -> bool {
+    matches!(
+        u32::from(c),
+        0x0041..=0x005A | 0x0061..=0x007A | 0x00C0..=0x00FF | 0x0100..=0x024F | 0x1E00..=0x1EFF
+    )
 }
 
 /// Logical pixels of smooth (touchpad) scrolling that make one font step.
@@ -357,6 +381,42 @@ mod tests {
         // key labelled T sits where QWERTY has K.
         assert_eq!(
             action_for(&character("t"), &character("T"), Physical::Code(Code::KeyK), ctrl_shift()),
+            Some(Action::NewTab)
+        );
+        // Turkish F (round-2 finding): accented Latin letters sit on the US
+        // E and X positions, and the layout has its own e and x elsewhere.
+        // The accented keys must NOT fire; the layout's letters must.
+        assert_eq!(
+            action_for(&character("ğ"), &character("Ğ"), Physical::Code(Code::KeyE), ctrl_shift()),
+            None,
+            "Ctrl+Shift+ğ split a pane"
+        );
+        assert_eq!(
+            action_for(&character("ö"), &character("Ö"), Physical::Code(Code::KeyX), ctrl_shift()),
+            None,
+            "Ctrl+Shift+ö closed a pane"
+        );
+        for (letter, code, action) in [
+            ("e", Code::KeyQ, Action::Split(SplitDir::Vertical)),
+            ("x", Code::KeyB, Action::ClosePane),
+        ] {
+            assert_eq!(
+                action_for(&character(letter), &character(&letter.to_uppercase()), Physical::Code(code), ctrl_shift()),
+                Some(action),
+                "the layout's own {letter}"
+            );
+        }
+        // Other Latin blocks too: Extended-B (ǝ) and Extended Additional (ẽ).
+        for accented in ["ǝ", "ẽ"] {
+            assert_eq!(
+                action_for(&character(accented), &character(accented), Physical::Code(Code::KeyT), ctrl_shift()),
+                None,
+                "{accented}"
+            );
+        }
+        // Greek, like Cyrillic, has no Latin letter and still falls back.
+        assert_eq!(
+            action_for(&character("τ"), &character("Τ"), Physical::Code(Code::KeyT), ctrl_shift()),
             Some(Action::NewTab)
         );
         // A physical fallback must not invent chords: an unmapped position
