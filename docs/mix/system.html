@@ -498,39 +498,89 @@ child didn't exit normally), <code>stdout</code>, <code>stderr</code> (lossy UTF
 here and never raises).</p>
 <p>Options (unknown keys are a hard <code>OPTION_INVALID</code> error):</p>
 <ul>
-<li><code>timeout</code>: seconds, default <strong>30</strong>, <code>0</code> disables, fractional ok. The clock
+<li>
+<p><code>timeout</code>: seconds, default <strong>30</strong>, <code>0</code> disables, fractional ok. The clock
 starts before file routes are opened, so it bounds setup as well as the child
 and capture drains. With <code>timeout: 0</code>, Mix waits for every captured stream to
 reach EOF; it does not abandon a reader merely because the direct child has
-exited. Note <code>run</code>/<code>run_rc</code> default to no deadline.</li>
-<li><code>stdin</code>: <code>nil</code> or <code>{null: true}</code> closes stdin; string/bytes/buffer supplies
-those bytes; <code>{file: path}</code> opens a local file for the child to read. There is
-deliberately no <code>stdin: "inherit"</code> route: run_argv puts its child in a new
-process group, so it is not the terminal's foreground group and a terminal
-read can receive <code>SIGTTIN</code>. The string <code>"inherit"</code> is ordinary stdin data.
-Use <code>run_stream</code> when a child must own the terminal and inherited stdin. With
+exited. Note <code>run</code>/<code>run_rc</code> default to no deadline.</p>
+</li>
+<li>
+<p><code>grace</code>: seconds, default <strong>0</strong>, fractional ok — what happens AT the
+deadline. <code>0</code> SIGKILLs the child's process group at once (the historic hard
+kill). A positive grace sends SIGTERM to the group, then waits until the
+<strong>whole group</strong> is gone or <code>grace</code> runs out, then SIGKILLs whatever is
+left. The grace covers the group, not only the child. In
+<code>sh -c "pg_dump app | gzip &gt; f"</code>, <code>sh</code> may die at once, but <code>pg_dump</code> and
+<code>gzip</code> still get the full grace to finish. A descendant that ignores SIGTERM
+is killed at the grace deadline, never left running. The same escalation
+applies when the child has already exited but a descendant still holds a
+captured stream open at the deadline. The call can therefore take up to
+<code>timeout + grace</code>. The result still reports <code>timed_out: true</code>, and <code>signal</code>
+says how the child ended: <code>15</code> if it obeyed SIGTERM, <code>9</code> if it had to be
+killed. <code>grace</code> with <code>timeout: 0</code> raises
+<code>OPTION_INVALID</code>, because without a deadline it would do nothing.</p>
+<pre><code class="language-mix">$r = run_argv(["pg_dump", "app"], {timeout: 600, grace: 10,
+                                   stdout: {file: "/srv/app.sql"}})
+if $r.timed_out then
+  eprint("dump cut off at the deadline (signal " .. $r.signal .. ")")
+end
+</code></pre>
+</li>
+<li>
+<p><code>stdin</code>: <code>nil</code> or <code>{null: true}</code> closes stdin; string/bytes/buffer supplies
+those bytes; <code>{file: path}</code> opens a local file for the child to read.
+<code>{inherit: true}</code> hands the child mix's own stdin, but <strong>only when that
+stdin is not a terminal</strong>, such as a pipe or a redirected file:</p>
+<pre><code class="language-mix">-- producer | mix filter.mix
+$r = run_argv(["sort", "-u"], {stdin: {inherit: true}})
+</code></pre>
+<p>When mix's stdin is a terminal, <code>{inherit: true}</code> raises <code>STDIN_TERMINAL</code>
+before anything spawns. run_argv puts its child in a new process group, so it
+is not the terminal's foreground group, and a terminal read would stop it
+with <code>SIGTTIN</code>. The call would then hang until its deadline. That is why
+there is no string form either: <code>stdin: "inherit"</code> is ordinary stdin data,
+the seven bytes <code>inherit</code>. Use <code>run_stream</code> when a child must own the
+terminal and its stdin. The same rule applies to stage 0 of <code>run_pipeline</code>
+and to <code>run_parallel</code> jobs. At most one <code>run_parallel</code> job may inherit
+stdin. Inheriting stdin makes sense for a script run as <code>mix script.mix</code>
+or <code>mix -</code>, where stdin is data. A bare REPL fed through a pipe reads its
+own input lines from that same stdin, so an inheriting child there would
+compete with the REPL for the lines of the script. Two or more raise <code>OPTION_INVALID</code> before any job runs, because
+concurrent readers of one pipe would race for its bytes. With
 <code>timeout: 0</code>, Mix also waits for a stdin-data writer to finish after the
 direct child exits. A descendant which retains the read end without consuming
 the data can therefore make the call wait indefinitely; that is the explicit
-no-deadline contract, and the writer is not detached as a leaked thread.</li>
-<li><code>stdout</code>: <code>"capture"</code> (default), <code>"inherit"</code>, <code>"null"</code>, or
-<code>{file: path, append?: bool, mode?: number}</code>.</li>
-<li><code>stderr</code>: <code>"capture"</code> (default), <code>"inherit"</code>, <code>"null"</code>, <code>"stdout"</code>
-(the <code>2&gt;&amp;1</code> merge), or the same file map.</li>
-<li><code>cwd</code>, <code>env</code> (map overlaid on the inherited environment; keys
+no-deadline contract, and the writer is not detached as a leaked thread.</p>
+</li>
+<li>
+<p><code>stdout</code>: <code>"capture"</code> (default), <code>"inherit"</code>, <code>"null"</code>, or
+<code>{file: path, append?: bool, mode?: number}</code>.</p>
+</li>
+<li>
+<p><code>stderr</code>: <code>"capture"</code> (default), <code>"inherit"</code>, <code>"null"</code>, <code>"stdout"</code>
+(the <code>2&gt;&amp;1</code> merge), or the same file map.</p>
+</li>
+<li>
+<p><code>cwd</code>, <code>env</code> (map overlaid on the inherited environment; keys
 <code>[A-Za-z_][A-Za-z0-9_]*</code>, values string/number/bool), and <code>clear_env</code> (bool —
-start from an empty environment) retain their existing meanings.</li>
-<li><code>max_output</code>: bytes <strong>per captured stream</strong>, default 8 MiB, <code>0</code> disables.
+start from an empty environment) retain their existing meanings.</p>
+</li>
+<li>
+<p><code>max_output</code>: bytes <strong>per captured stream</strong>, default 8 MiB, <code>0</code> disables.
 Excess is drained and discarded — the child is never blocked or killed by the
 cap, and the captured stream's truncation flag is set. The same flag is true
 when a deadline forces Mix to abandon a capture before EOF; in that case the
-returned bytes are the partial prefix received before abandonment.</li>
-<li><code>stream</code>: bool, default <code>false</code>; when true, captured stdout chunks are also
+returned bytes are the partial prefix received before abandonment.</p>
+</li>
+<li>
+<p><code>stream</code>: bool, default <code>false</code>; when true, captured stdout chunks are also
 written to the parent's stdout and captured stderr chunks to the parent's
 stderr as they arrive, with a flush after each chunk. Streaming continues
 after <code>max_output</code> truncates capture. <code>stream: true</code> with
 <code>stdout: "inherit"</code> is rejected as <code>OPTION_INVALID</code>: the child already owns
-that stream, so teeing it is meaningless.</li>
+that stream, so teeing it is meaningless.</p>
+</li>
 </ul>
 <p>File output defaults to mode <code>0o600</code>, <code>append: false</code>, and therefore truncates an
 existing file. <code>mode</code> is the creation mode (subject to the process umask). All
@@ -614,7 +664,7 @@ execution and familiar result fields as <code>run_argv</code>, plus its one-elem
 <p>The distinct <code>pipeline_result</code> map always contains, in order:
 <code>ok</code>, <code>exit_code</code>, <code>stdout</code>, <code>stderr</code>, <code>timed_out</code>, <code>interrupted</code>, <code>signal</code>,
 <code>duration_ms</code>, <code>stdout_truncated</code>, <code>stderr_truncated</code>, <code>utf8_lossy</code>,
-<code>error_code</code>, <code>error</code>, <code>stages</code>.</p>
+<code>error_code</code>, <code>error</code>, <code>stages</code>, <code>status</code>, <code>failed_stage</code>, <code>summary</code>.</p>
 <ul>
 <li><code>exit_code</code> and <code>signal</code> describe the <strong>last</strong> stage. They do not alone decide
 overall success: a middle-stage failure makes <code>.ok</code> false even when the last
@@ -635,8 +685,49 @@ stderr is abandoned during emergency cleanup and marked truncated.</li>
 </ul>
 <p>Each <code>.stages[i]</code> map contains, in order: <code>index</code>, <code>argv</code>, <code>ok</code>, <code>exit_code</code>,
 <code>signal</code>, <code>duration_ms</code>, <code>stderr</code>, <code>stderr_truncated</code>, <code>utf8_lossy</code>,
-<code>accepted_signal</code>. Stage stderr is untrimmed. <code>accepted_signal</code> records the
-SIGPIPE policy below; it is false for ordinary exits and rejected signals.</p>
+<code>accepted_signal</code>, <code>status</code>, <code>broken_pipe</code>. Stage stderr is untrimmed.
+<code>accepted_signal</code> records the SIGPIPE policy below; it is false for ordinary
+exits and rejected signals.</p>
+<h4 id="why-each-stage-ended--status-failed_stage-summary">Why each stage ended — <code>status</code>, <code>failed_stage</code>, <code>summary</code></h4>
+<p>Gates branch on these fields, never on stderr or <code>summary</code> text. A stage's
+<code>status</code> is the first of these that applies:</p>
+<table><thead><tr><th>stage <code>status</code></th><th>meaning</th></tr></thead><tbody>
+<tr><td><code>ok</code></td><td>exited 0</td></tr>
+<tr><td><code>timeout</code> / <code>interrupted</code></td><td>still running when the deadline / Ctrl-C made Mix signal its group — the death is Mix's, not the stage's</td></tr>
+<tr><td><code>broken_pipe</code></td><td>killed by SIGPIPE: its reader closed (also set when <code>allow_signal</code> accepted it — <code>.ok</code> carries the acceptance, <code>status</code> the fact)</td></tr>
+<tr><td><code>signal</code></td><td>killed by any other signal (<code>.signal</code> names it)</td></tr>
+<tr><td><code>exit_nonzero</code></td><td>exited with a non-zero code (<code>.exit_code</code>)</td></tr>
+<tr><td><code>setup_error</code></td><td>started, then killed because a later stage could not be set up</td></tr>
+</tbody></table>
+<p><code>broken_pipe</code> (bool) is true whenever SIGPIPE killed the stage. SIGPIPE is the
+only evidence of a closed reader that a stage cannot forge: a program that
+ignores SIGPIPE and exits non-zero on <code>EPIPE</code> reports <code>exit_nonzero</code>.</p>
+<p>The pipeline's <code>status</code> is <code>setup_error</code> (with <code>error_code</code>), else
+<code>interrupted</code>, else <code>timeout</code>, else <code>ok</code> when <code>.ok</code> is true, else the status of
+<code>failed_stage</code>. <code>failed_stage</code> is the <strong>rightmost</strong> stage whose <code>ok</code> is false —
+<code>set -o pipefail</code>'s rule — or <code>nil</code>. Rightmost because a downstream stage that
+exits early leaves its writer with a broken pipe: in <code>yes | sh -c 'exit 3'</code> the
+cause is stage 1 (<code>exit_nonzero</code>) and stage 0's <code>broken_pipe</code> is the symptom.
+For <code>PIPELINE_SPAWN</code> it is the stage that could not start; other setup errors
+name no stage.</p>
+<p><code>summary</code> is a one-line human rendering with no durations, so it is stable
+across runs:</p>
+<pre><code>ok (2 stages)
+ok (2 stages; stage[0] yes broken pipe accepted)
+stage[1] sh exited 3
+stage[0] sh killed by signal 15
+stage[0] yes: broken pipe (its reader closed)
+timed out (deadline 300 ms); killed stage[1] sleep
+</code></pre>
+<p>A captured stream that truncated appends <code> [output truncated]</code>.</p>
+<pre><code class="language-mix">$r = run_pipeline([["producer"], ["filter"], ["consumer"]], {timeout: 60})
+if $r.status == "timeout" then
+  eprint("slow: " .. $r.summary)
+elif $r.status != "ok" then
+  $s = $r.stages[$r.failed_stage]
+  eprint("stage " .. $s.index .. " " .. $s.status .. ": " .. $s.stderr)
+end
+</code></pre>
 <p>Pipeline options (unknown keys raise <code>OPTION_INVALID</code>):</p>
 <ul>
 <li>
@@ -697,7 +788,12 @@ stdout unchanged only when the aggregate <code>.ok</code> is true and no capture
 was truncated. Otherwise it raises <code>PIPELINE_EXIT_NONZERO</code>, <code>PIPELINE_TIMEOUT</code>,
 <code>PIPELINE_SIGNAL</code>, <code>PIPELINE_INTERRUPTED</code>, <code>PIPELINE_OUTPUT_LIMIT</code>, or the
 setup/lifecycle code above. The complete pipeline_result is always available as
-<code>$err.details.result</code>.</p>
+<code>$err.details.result</code>. A stage failure is raised from that result's own
+<code>status</code> and <code>failed_stage</code>, so the raise and the result always agree. A
+<code>signal</code> or <code>broken_pipe</code> status gives <code>PIPELINE_SIGNAL</code>, anything else gives
+<code>PIPELINE_EXIT_NONZERO</code>, and the message names <code>failed_stage</code>. For
+<code>yes | sh -c 'exit 3'</code> that is <code>PIPELINE_EXIT_NONZERO</code> for stage 1, not
+stage 0's broken pipe.</p>
 <h3 id="run--stdout-string-fail-fast">run — stdout string, fail-fast</h3>
 <p><code>run(cmd)</code> runs <code>cmd</code> through <code>/bin/sh -c</code>, returns its stdout as a string with
 <strong>trailing</strong> whitespace stripped (leading whitespace is preserved), and on a
@@ -784,8 +880,17 @@ end
 <p>Kill mechanics (the same machinery as <a href="/mix/remote"><code>ssh_run</code></a>): the child is
 spawned in its <strong>own process group</strong>, so the kill reaches every descendant — an
 <code>ssh</code> helper or forked worker can't keep the pipes open past the deadline. A
-timeout SIGKILLs the group immediately; a Ctrl-C sends SIGTERM, waits a 2-second
-grace, then SIGKILLs. An interrupt that lands on the same poll as the deadline
+timeout SIGKILLs the group immediately (<code>run_argv</code> can opt into SIGTERM first
+with <code>grace</code>); a Ctrl-C sends SIGTERM, waits a 2-second grace, then SIGKILLs.
+Every SIGTERM path waits for the whole group to empty, bounded by its grace,
+then SIGKILLs the group. A descendant that honours SIGTERM can finish its
+cleanup; one that ignores it is killed at the deadline, not orphaned. On Linux
+the child is reaped only after that, so its zombie keeps the group id
+reserved and every signal reaches the right group. "The group has emptied"
+is read from <code>/proc</code>, and any record Mix cannot read counts as still alive.
+A member hidden from <code>/proc</code> entirely, by another pid namespace or
+<code>hidepid=2</code> for another user's processes, cannot be counted. There the grace
+may end early, but the SIGKILL still reaches the whole group. An interrupt that lands on the same poll as the deadline
 wins the tie — it's reported as the cause.</p>
 <p>The opts map is validated <strong>loudly</strong> — a mistake can't silently leave a call
 unbounded:</p>
@@ -989,7 +1094,7 @@ that dies on its first line looks exactly like one that worked. A non-string
 raises <code>TYPE_MISMATCH</code> at argument validation, before any stdio file is opened
 (so a NUL in <code>stderr_path</code> can no longer truncate the <code>stdout_path</code> file on the
 way to failing).</p>
-<p><strong>Argv form — <code>spawn(argv[, {detach, cwd, env, clear_env, stdout, stderr}])</code></strong>
+<p><strong>Argv form — <code>spawn(argv[, {detach, die_with_parent, cwd, env, clear_env, stdout, stderr}])</code></strong>
 (v0.89.0), a <strong>list</strong> of strings run <strong>directly, with no shell</strong> — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force <code>run("setsid app &amp;")</code> through <code>sh</code>.</p>
@@ -1001,7 +1106,8 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
                    stdout: {file: "/var/log/worker.log", append: true}})
 </code></pre>
 <ul>
-<li><code>detach: true</code> → the child is put in a <strong>new session</strong> (<code>setsid</code>): it has no
+<li>
+<p><code>detach: true</code> → the child is put in a <strong>new session</strong> (<code>setsid</code>): it has no
 controlling terminal and its own session, so a terminal hangup or the caller
 exiting does not take it down — the daemon shape, stronger than the shell
 form's <code>&amp;</code>. (Session separation, not immortality: a service-cgroup teardown
@@ -1018,16 +1124,77 @@ says no more — a stale one names whoever holds that pid now. To stop a
 detached daemon later, check a pidfile together with the process start time
 (field 22 of <code>/proc/&lt;pid&gt;/stat</code>, recorded when the pid was written), or ask a
 Bus verb the child itself answers, rather than trusting a bare pid. Default <code>false</code> (a plain child
-in the caller's session, which stays the caller's to reap).</li>
-<li><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
-(clear-then-layer: <code>{clear_env: true, env: {…}}</code> starts from empty).</li>
-<li><code>stdout</code> / <code>stderr</code> reuse <code>run_argv</code>'s routing, minus capture: <code>"null"</code>
+in the caller's session, which stays the caller's to reap).</p>
+</li>
+<li>
+<p><code>die_with_parent: true</code> (Linux) → the opposite slot. The child <strong>ends with
+this mix process</strong>, for a helper that must not outlive the script or
+<code>--serve</code> citizen that started it:</p>
+<pre><code class="language-mix">$pid = spawn(["goose", "serve", "--port", "7070"], {die_with_parent: true})
+</code></pre>
+<p>The child leads its own process group. Two mechanisms end it:</p>
+<ul>
+<li><strong>Graceful exit.</strong> This covers the script ending, <code>exit()</code>, a <code>--serve</code>
+citizen's QUIT or SIGTERM drain, and a REPL restart. Mix sends SIGTERM to
+the child's whole process group, waits up to 2 s for the group to empty,
+then SIGKILLs whatever is left. The child gets its chance to clean up, and its own
+children go too.</li>
+<li><strong><code>--serve</code> RELOAD.</strong> The old generation's owned children are ended the
+same way <em>before</em> the new script's init runs. An init that starts its
+helper again therefore never races a leftover one for the same port. If
+the reload then reverts, because the new init failed, the old script
+resumes without those children. Anything the failed init had already
+spawned with <code>die_with_parent</code> is ended too, so a failed reload leaks no
+helpers.</li>
+<li><strong>Hangup of the interactive shell.</strong> When the terminal goes away, the
+job-control shutdown sweeps owned children the same graceful way before
+it exits.</li>
+<li><strong>Crash, or a signal mix does not handle.</strong> If mix is SIGKILLed, panics
+or is OOM-killed, the kernel SIGKILLs the child (<code>PR_SET_PDEATHSIG</code>). The
+same happens when a plain <code>mix script.mix</code> or a non-interactive mix
+receives SIGTERM, SIGHUP or SIGQUIT, because those still end mix at once
+by default. That path reaches the child only, not its descendants, and
+gives it no chance to clean up. A <code>--serve</code> citizen is different: its
+SIGTERM is a graceful drain, so the sweep runs. A script that must clean
+up its helper's own children on SIGTERM should run as a <code>--serve</code>
+citizen or be stopped with Ctrl-C, which ends the evaluation normally and
+so reaches the sweep.</li>
+</ul>
+<p><code>detach</code> together with <code>die_with_parent</code> raises <code>OPTION_INVALID</code>, because
+they contradict each other. Mix itself is the only thing that reaps an
+owned child. <code>process_alive</code> answers for it without freeing its pid, so
+the group id cannot be recycled while it is registered. A finished child
+whose group has emptied is reaped at the next <code>process_alive</code> or <code>spawn</code>.
+One whose descendants are still running is kept as a zombie until the
+sweep ends them. PDEATHSIG is keyed to the thread that called
+<code>spawn</code>, and the ownership registry is process-wide. So the option works
+only on a thread whose host owns it. The <code>mix</code> binary evaluates on one
+thread that lives until exit and sweeps before it ends. Elsewhere, for
+example webd, cosmix-mcp or cosmix-claud evaluating on pooled <code>spawn_blocking</code>
+threads, <code>die_with_parent</code> raises <code>OPTION_INVALID</code>. An embedder that does
+own a long-lived evaluation thread opts in by calling
+<code>builtins::owned_spawns::enable()</code> on it. That call returns <code>false</code>, and
+changes nothing, if another thread enabled first; only the first thread is
+ever the host. The embedder must also call <code>sweep()</code> on that
+same thread before it exits. Off Linux the option raises
+<code>OPTION_INVALID</code>. Default <code>false</code>: a plain spawn child is untouched by mix's
+exit.</p>
+</li>
+<li>
+<p><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
+(clear-then-layer: <code>{clear_env: true, env: {…}}</code> starts from empty).</p>
+</li>
+<li>
+<p><code>stdout</code> / <code>stderr</code> reuse <code>run_argv</code>'s routing, minus capture: <code>"null"</code>
 (default), <code>"inherit"</code>, or a <code>{file, append?, mode?}</code> map — and
 <code>stderr: "stdout"</code> to merge. <strong><code>"capture"</code> is refused</strong>: capturing means
 waiting, which is <code>run_argv</code>'s job. A file-open failure means the child is
-<strong>not</strong> spawned.</li>
-<li>argv must be a non-empty list of strings, none coerced; a non-string element
-or an empty list raises <code>TYPE_MISMATCH</code>.</li>
+<strong>not</strong> spawned.</p>
+</li>
+<li>
+<p>argv must be a non-empty list of strings, none coerced; a non-string element
+or an empty list raises <code>TYPE_MISMATCH</code>.</p>
+</li>
 </ul>
 <pre><code class="language-text">spawn(["true"], {stdout: "capture"})  -&gt; OPTION_INVALID: stdout cannot be "capture"
 spawn(["echo", 42])                   -&gt; TYPE_MISMATCH: argv[1] must be a string

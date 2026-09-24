@@ -107,6 +107,9 @@ fn exec_restart(eval: &mut Evaluator, rl: &mut Editor, history_path: &std::path:
     // this, every task group the shell was supervising would be inherited by a
     // shell that has no record of it and cannot report or cancel it.
     crate::session_task::sweep();
+    // Same reason for spawn(argv, {die_with_parent: true}) children: exec
+    // keeps the pid, so nothing else would ever end them.
+    crate::owned_spawns_sweep();
     crate::native_session::before_exec_restart();
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(&mix_bin).exec();

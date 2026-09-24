@@ -534,9 +534,10 @@ with the explicit lossy escape hatch — <code>bytes_to_string($head, {lossy: tr
 non-executing twin of <a href="/mix/functions"><code>include</code></a> that parses bare-key <code>key: value</code>
 data without running it.</p>
 <h2 id="writing-files">Writing files</h2>
-<pre><code>write_file(path, content)        overwrite (or create); follows symlinks
-append_file(path, content)       create-if-missing, then append
-write_new(path, content, mode)   atomically create; FAILS if path exists
+<pre><code>write_file(path, content)            overwrite (or create); follows symlinks
+append_file(path, content)           create-if-missing, then append
+write_new(path, content, mode)       atomically create; FAILS if path exists
+write_atomic(path, data[, opts])     replace all-or-nothing: old OR new, never partial
 </code></pre>
 <pre><code class="language-mix">write_file("/tmp/io/log.txt", "first\n")
 append_file("/tmp/io/log.txt", "second\n")
@@ -569,6 +570,115 @@ second write_new: refused (exists)
 source spelling of the value 384. <code>stat</code>'s <code>perm</code> field is that same number;
 feed it straight back into <code>chmod</code>.</p>
 </blockquote>
+<h3 id="write_atomic--replace-a-file-all-or-nothing"><code>write_atomic</code> — replace a file all-or-nothing</h3>
+<p><code>write_file</code> truncates first and then writes. A crash, a kill, a full disk or a
+permission failure part-way leaves the target cut short, and a concurrent
+reader can see a half-written file at any time. <code>write_atomic</code> is the one call
+for "replace this file safely". Every reader and every crash sees either the
+<strong>old complete file</strong> or the <strong>new complete file</strong>:</p>
+<pre><code class="language-mix">write_atomic("/etc/myapp/config.json", json_encode($cfg, true))
+write_atomic("/srv/state.db", $bytes, {durability: "full"})
+write_atomic("/home/u/.ssh/authorized_keys", $keys, {mode: 0o600})
+</code></pre>
+<ol>
+<li>It claims a hidden temp name beside the target, <code>.NAME.mixtmp-…</code>, with
+<code>O_EXCL</code>, so it never follows a planted symlink. Being in the same
+directory keeps the final rename on one filesystem.</li>
+<li>It writes all the bytes to the temp and, if asked, <code>fsync</code>s it.</li>
+<li>It <code>rename</code>s the temp over the target. That is the atomic step.</li>
+</ol>
+<p><strong>Any failure before the rename removes the temp and leaves the target exactly
+as it was.</strong> That covers a short write, <code>ENOSPC</code>, a failed sync and a failed
+rename. If the process is <em>killed</em> mid-write, nothing can run to clean up. The
+target is still intact, but a stale <code>.NAME.mixtmp-*</code> file may be left beside
+it, and it is safe to delete.</p>
+<p>Durability is explicit, and the default claims none it did not request:</p>
+<table><thead><tr><th><code>durability</code></th><th>what is done</th><th>after a power loss or kernel crash</th></tr></thead><tbody>
+<tr><td><code>"none"</code> (default)</td><td>temp, write, rename</td><td>no promise: the data may still be in the page cache</td></tr>
+<tr><td><code>"file"</code></td><td><code>fsync</code> the temp before the rename</td><td>old complete file or new complete file</td></tr>
+<tr><td><code>"full"</code></td><td><code>"file"</code>, then <code>fsync</code> the directory after the rename</td><td>the new file, once the call has returned</td></tr>
+</tbody></table>
+<p><code>"none"</code> is still fully atomic against readers and against the <em>process</em>
+dying. Only the machine dying can lose the new content. With <code>"full"</code>, a
+failed directory sync raises even though the new file is already in place.
+It is the one failure that happens <em>after</em> the replace, so it has its own
+code, <code>WRITE_NOT_DURABLE</code>, with <code>$err.details.replaced == true</code>. Every other
+failure leaves the target untouched. A gate must never "roll back" on
+<code>WRITE_NOT_DURABLE</code>, because the new content is already the file. The
+details also carry <code>directory</code>. The same error covers a directory you may
+write and search but not read, mode <code>0300</code>: <code>write_atomic</code> works there at any
+level, but such a directory cannot be fsynced, so <code>"full"</code> reports that
+instead of claiming durability.</p>
+<p>Other rules:</p>
+<ul>
+<li><strong>data</strong> must be a string, bytes or a buffer. Nothing else is coerced. A
+wrong value written atomically is still a wrong value.</li>
+<li><strong>Mode.</strong> An existing target keeps its permission bits, including
+setuid/setgid. A new file gets <code>write_file</code>'s <code>0o666 &amp; ~umask</code>. <code>mode:</code>
+(octal number or string, as for <code>chmod</code>) sets it exactly, not masked by the
+umask. The mode is applied after the data is written, so the kernel's
+rule that a write clears setuid does not strip a requested setuid bit.</li>
+<li><strong>Access ACL.</strong> An existing target's POSIX access ACL is copied onto the
+new file exactly. Copying only the mode bits would widen access. For example,
+a file with <code>group::---</code> and a named-user entry has its group bits showing
+the ACL mask, and a plain file with those bits would grant the whole owning
+group that access. If the ACL cannot be set, the call raises and leaves the
+target untouched. If the old file had no ACL, one inherited from the
+directory's default ACL is removed, so the replacement matches the original.
+Owner, mode and ACL are all read from one handle on the old file, so they
+always describe the same file. Without <code>/proc</code> mounted the ACL is read by
+path instead. If the name has been swapped in between, the call raises
+<code>WRITE_NOT_ATOMIC</code> and writes nothing.</li>
+<li><strong>Owner.</strong> An existing target keeps its owner and group. The new file is a
+new inode, so root rewriting a user's file would otherwise hand it to root.
+If the owner cannot be kept, typically because you are not root, the call
+raises and leaves the target untouched. It never silently changes who owns
+a file.</li>
+<li><strong>It is a new inode.</strong> The replacement is a different file that takes over
+the name, and that has consequences <code>write_file</code> does not have:
+<ul>
+<li>A <strong>hard link</strong> to the old file keeps the old content. Only this name
+moves to the new file.</li>
+<li>A process that already has the file <strong>open</strong> keeps reading the old
+content. An <strong>inotify</strong> watch on the file itself follows the old inode;
+watch the directory for the rename instead.</li>
+<li>Only the owner, mode and POSIX access ACL are carried over. <strong>Other
+extended attributes are not</strong>: an SELinux label is re-derived from policy
+and may differ, and <code>security.capability</code> (<code>setcap</code> file capabilities) is
+dropped. For a <code>setcap</code> binary or an SELinux-labelled <code>/etc</code> config, run
+<code>setcap</code>, <code>restorecon</code> or <code>chcon</code> after the replace, or use <code>write_file</code>,
+which keeps the inode.</li>
+</ul>
+</li>
+<li><strong>Symlinks.</strong> A symlink path replaces the file the link names and keeps the
+link. That is <code>write_file</code>'s behaviour, and it avoids turning the link into
+a regular file. A dangling link raises.</li>
+<li><strong>Concurrent changes.</strong> The target's directory is opened once, at the
+start. Checking the target, creating the temp, the rename, cleanup and the
+directory fsync all happen relative to that open directory. Renaming or
+replacing the directory, or any parent, while the call runs cannot
+redirect the write elsewhere. If the resolved target has turned into a
+symlink by the time it is checked, the call raises and writes nothing. The
+final rename replaces whatever the name holds at that instant, and
+<code>rename</code> never follows the last component. So if another process swaps in
+a symlink between the check and the rename, the rename replaces the link
+itself: the last writer to the name wins, and the call never writes
+through the link.</li>
+<li><strong>max_bytes</strong> bounds the write. If the data is larger, the call raises
+<code>WRITE_TOO_LARGE</code> before anything touches the disk.</li>
+<li><strong>Refusals.</strong> A target that exists but is not a regular file, such as a
+directory, raises, and so does a path ending in <code>/</code>. A target that is a
+mount point, such as a bind-mounted file, cannot be replaced by <code>rename</code>,
+so it raises <code>WRITE_NOT_ATOMIC</code> and writes nothing. Use <code>write_file</code> there,
+which rewrites in place, non-atomically. Bad options raise <code>OPTION_INVALID</code>. A wrong argument type
+raises <code>TYPE_MISMATCH</code>.</li>
+</ul>
+<pre><code class="language-mix">write_atomic("/tmp/io/state", "v1\n")
+write_atomic("/tmp/io/state", "v2\n", {durability: "file"})
+print(read_file("/tmp/io/state"))
+</code></pre>
+<pre><code class="language-text">v2
+</code></pre>
 <h2 id="existence--type-tests">Existence &amp; type tests</h2>
 <pre><code>exists(path[, opts])  -&gt; bool   opts: {follow_symlinks: true|false}  (default true)
 access(path, mode)     -&gt; bool   mode: non-empty combination of r, w, x, f
@@ -890,6 +1000,10 @@ print("copied + cleaned")
 <h2 id="atomic-replace--rename">Atomic replace — <code>rename</code></h2>
 <pre><code>rename(src, dst)        rename(2) — moves src onto dst within one filesystem
 </code></pre>
+<p>For an ordinary safe file replacement, use
+<a href="/mix/io#write_atomic--replace-a-file-all-or-nothing"><code>write_atomic</code></a>. It is the
+sequence below packaged with temp claiming, cleanup and durability levels.
+<code>rename</code> remains the primitive when you need the steps yourself.</p>
 <p><code>rename</code> exists for the one guarantee <code>copy</code> cannot give: replacing an existing
 <code>dst</code> is <strong>atomic</strong>. A concurrent reader — or a <code>git</code> about to <code>exec</code> a hook, or a
 daemon re-reading its config — sees either the old file or the new one, never a

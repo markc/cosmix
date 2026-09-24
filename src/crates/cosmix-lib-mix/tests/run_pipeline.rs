@@ -358,3 +358,127 @@ async fn pipeline_spawn_failure_reports_already_started_stages() {
     .await;
     assert_eq!(output, "PIPELINE_SPAWN 1 0 true true\n");
 }
+
+/// TODO-mix P1 acceptance: one probe tells success, non-zero exit, timeout
+/// and downstream closure apart from `status` / `failed_stage` alone — no
+/// terminal text is parsed.
+#[tokio::test]
+async fn pipeline_status_distinguishes_every_outcome_without_parsing_text() {
+    let output = run_ok(
+        "$ok = run_pipeline([[\"printf\", \"x\"], [\"cat\"]])\n\
+         print(\"ok \" .. $ok.status .. \" \" .. $ok.failed_stage .. \" \" .. $ok.stages[0].status .. \" \" .. $ok.stages[1].status)\n\
+         $nz = run_pipeline([[\"printf\", \"x\"], [\"sh\", \"-c\", \"cat >/dev/null; exit 3\"]])\n\
+         print(\"nz \" .. $nz.status .. \" \" .. $nz.failed_stage .. \" \" .. $nz.stages[1].status .. \" \" .. $nz.stages[1].broken_pipe)\n\
+         $to = run_pipeline([[\"true\"], [\"sleep\", \"5\"]], {timeout: 0.3})\n\
+         print(\"to \" .. $to.status .. \" \" .. $to.failed_stage .. \" \" .. $to.stages[0].status .. \" \" .. $to.stages[1].status)\n\
+         $bp = run_pipeline([[\"yes\"], [\"head\", \"-n\", \"1\"]])\n\
+         print(\"bp \" .. $bp.status .. \" \" .. $bp.failed_stage .. \" \" .. $bp.stages[0].status .. \" \" .. $bp.stages[0].broken_pipe .. \" \" .. $bp.stages[1].status)\n\
+         $sg = run_pipeline([[\"sh\", \"-c\", \"kill -TERM $$\"], [\"cat\"]])\n\
+         print(\"sg \" .. $sg.status .. \" \" .. $sg.failed_stage .. \" \" .. $sg.stages[0].status .. \" \" .. $sg.stages[0].broken_pipe)\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "ok ok nil ok ok\n\
+         nz exit_nonzero 1 exit_nonzero false\n\
+         to timeout 1 ok timeout\n\
+         bp broken_pipe 0 broken_pipe true ok\n\
+         sg signal 0 signal false\n"
+    );
+}
+
+/// pipefail's rule: the RIGHTMOST failing stage names the failure. A
+/// downstream stage that exits early leaves its writer with a broken pipe —
+/// the symptom — and the pipeline status reports the cause.
+#[tokio::test]
+async fn pipeline_failed_stage_is_the_rightmost_cause_not_the_upstream_symptom() {
+    let output = run_ok(
+        "$r = run_pipeline([[\"yes\"], [\"sh\", \"-c\", \"exit 3\"]])\n\
+         print($r.status .. \" \" .. $r.failed_stage .. \" \" .. $r.stages[0].status .. \" \" .. $r.stages[1].status)\n\
+         print($r.summary)\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "exit_nonzero 1 broken_pipe exit_nonzero\nstage[1] sh exited 3\n"
+    );
+}
+
+/// An accepted SIGPIPE makes the pipeline ok but the stage status still says
+/// what happened: `ok` carries the acceptance, `status` carries the fact.
+#[tokio::test]
+async fn pipeline_accepted_broken_pipe_keeps_its_stage_status() {
+    let output = run_ok(
+        "$r = run_pipeline([[\"yes\"], [\"head\", \"-n\", \"1\"]], {allow_signal: true})\n\
+         print($r.ok .. \" \" .. $r.status .. \" \" .. $r.failed_stage .. \" \" .. $r.stages[0].ok .. \" \" .. $r.stages[0].status)\n\
+         print($r.summary)\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "true ok nil true broken_pipe\nok (2 stages; stage[0] yes broken pipe accepted)\n"
+    );
+}
+
+/// The one-line human rendering, one case per status. Stable: no durations.
+#[tokio::test]
+async fn pipeline_summary_is_a_concise_stable_rendering() {
+    let output = run_ok(
+        "print(run_pipeline([[\"printf\", \"x\"], [\"cat\"]]).summary)\n\
+         print(run_pipeline([[\"yes\"], [\"head\", \"-n\", \"1\"]]).summary)\n\
+         print(run_pipeline([[\"sh\", \"-c\", \"kill -TERM $$\"], [\"cat\"]]).summary)\n\
+         print(run_pipeline([[\"true\"], [\"/bin/sleep\", \"5\"]], {timeout: 0.3}).summary)\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "ok (2 stages)\n\
+         stage[0] yes: broken pipe (its reader closed)\n\
+         stage[0] sh killed by signal 15\n\
+         timed out (deadline 300 ms); killed stage[1] sleep\n"
+    );
+}
+
+/// Setup failures carry the same machine fields: `setup_error` at both
+/// levels, and PIPELINE_SPAWN names the stage that could not start.
+#[tokio::test]
+async fn pipeline_setup_error_carries_status_and_failed_stage() {
+    let output = run_ok(
+        "$r = run_pipeline([[\"true\"], [\"/definitely/no/such/mix-command\"]])\n\
+         print($r.status .. \" \" .. $r.failed_stage .. \" \" .. $r.stages[0].status .. \" \" .. $r.stages[0].broken_pipe)\n\
+         print(contains($r.summary, \"stage[1]\"))\n\
+         $s = run_pipeline([{argv: [\"true\"], stdin: {file: \"/definitely/no/such/input\"}}])\n\
+         print($s.error_code .. \" \" .. $s.status .. \" \" .. $s.failed_stage)\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "setup_error 1 setup_error false\ntrue\nPIPELINE_STDIO setup_error nil\n"
+    );
+}
+
+/// run_pipeline_must raises from the result's own status/failed_stage, so the
+/// raise and $err.details.result can never disagree. Stage 0's broken pipe is
+/// the symptom of stage 1's exit 3: the code is PIPELINE_EXIT_NONZERO and the
+/// message names stage[1], not the leftmost signalled stage.
+#[tokio::test]
+async fn pipeline_must_code_and_stage_agree_with_the_result() {
+    let output = run_ok(
+        "try\n\
+           run_pipeline_must([[\"yes\"], [\"sh\", \"-c\", \"exit 3\"]])\n\
+         catch $message, $error\n\
+           print($error.code .. \" \" .. contains($message, \"stage[1]\") .. \" \" .. contains($message, \"exit_code=3\"))\n\
+           print($error.details.result.status .. \" \" .. $error.details.result.failed_stage)\n\
+         end\n\
+         try\n\
+           run_pipeline_must([[\"sh\", \"-c\", \"kill -TERM $$\"], [\"cat\"]])\n\
+         catch $message, $error\n\
+           print($error.code .. \" \" .. contains($message, \"stage[0]\") .. \" \" .. contains($message, \"signal 15\"))\n\
+         end\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "PIPELINE_EXIT_NONZERO true true\nexit_nonzero 1\nPIPELINE_SIGNAL true true\n"
+    );
+}

@@ -239,6 +239,7 @@ fn sensitive_builtins_stay_categorized() {
         ("fcntl_lock", FsWrite),
         ("fcntl_unlock", FsWrite),
         ("write_new", FsWrite),
+        ("write_atomic", FsWrite),
         ("append_file", FsWrite),
         ("mkdir", FsWrite),
         ("chmod", FsWrite),

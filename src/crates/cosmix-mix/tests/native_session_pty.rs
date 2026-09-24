@@ -744,7 +744,7 @@ fn bootstrap_source_boundary_and_builtin_inventory_exclude_seed_state() {
     }
     let source = include_str!("../src/main.rs");
     let main = source.split("fn main() {").nth(1).unwrap();
-    assert!(main.find("native_session::start()").unwrap() < main.find("spawn(real_main)").unwrap());
+    assert!(main.find("native_session::start()").unwrap() < main.find("spawn(eval_thread_main)").unwrap());
     let output = std::process::Command::new(current_mix())
         .args(["builtins", "--json"])
         .env_remove(session_fd::MARKER)

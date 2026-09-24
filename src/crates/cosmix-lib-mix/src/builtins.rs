@@ -245,6 +245,7 @@ builtin_table! {
     ("load_data", CapabilityClass::FsRead,       "io",      "Read + parse a strict-data .mix file (bare-key `k: v`, the zones.mix/conf.mix form) into a Value — the non-executing twin of source/include, for substrate-internal data that must NOT run as code (v0.9.0)", contract!((path: string) -> any; failure[raises])),
     ("write_file", CapabilityClass::FsWrite,      "io",      "Write string or bytes to file (creates/overwrites). Bytes are written verbatim (v0.3.1).", contract!((path: string, data: any) -> nil; failure[raises])),
     ("write_new", CapabilityClass::FsWrite,       "io",      "Atomically create a new file with mode. write_new(path, content, 0o600) — mode as a value (octal literal) or octal string \"0600\"; fails if path exists; mode applied at creation (no umask race)", contract!((path: string, content: any, mode: any_of(number, string)) -> nil; failure[raises])),
+    ("write_atomic", CapabilityClass::FsWrite,    "io",      "Replace or create a file so every reader and every crash sees the old complete file or the new complete file, never a partial one: write_atomic(path, data[, {durability, mode, max_bytes}]). data is a string, bytes or buffer (nothing else is coerced). A temp is claimed O_EXCL beside the target (same filesystem), written, optionally synced, and renamed over the target; any failure before the rename removes the temp and leaves the target untouched. durability \"none\" (default: atomic, NOT durable across power loss) | \"file\" (fsync the file before the rename) | \"full\" (also fsync the directory after it). An existing target keeps its mode and owner (raises rather than silently change the owner); a new file gets 0o666 & ~umask; mode sets it exactly. A symlink path replaces the file it names and keeps the link. max_bytes raises WRITE_TOO_LARGE before touching disk. A killed process can leave a hidden .NAME.mixtmp-* temp beside the target, never a partial target", contract!((path: string, data: any_of(string, bytes, buffer), opts?: map("write_atomic_options", {durability: string, mode: any_of(number, string), max_bytes: number})) -> nil; failure[raises])),
     ("append_file", CapabilityClass::FsWrite,     "io",      "Append string to file", contract!((path: string, s: any) -> nil; failure[raises])),
     ("exists", CapabilityClass::FsRead,          "io",      "Test if path exists. FOLLOWS symlinks by default, so a dangling link reads as absent — that is the right answer for \"can I open something here\" and the wrong one for \"is this name taken\". exists(path, {follow_symlinks: false}) is the lstat form and sees the link itself (v0.39.0).", contract!((path: string, opts?: map) -> bool)),
     ("access", CapabilityClass::FsRead,          "io",      "Ask the kernel whether this process can access path using its effective uid/gid: mode is a non-empty, duplicate-free string of r/w/x/f letters (f = existence and is redundant when combined). Follows symlinks. Unlike inspecting stat().perm, this honours POSIX ACLs. Ordinary absence/denial returns false; malformed input or an unexpected syscall failure raises (v0.45.0).", contract!((path: string, mode: string) -> bool; failure[raises])),
@@ -305,12 +306,12 @@ builtin_table! {
     ("run", CapabilityClass::Process,             "system",  "Run shell command via sh, return trimmed stdout as string. run(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; a timed-out child is PG-killed and run dies (catchable)", contract!((cmd: string, opts?: map) -> string; effects[blocking, shell]; failure[raises])),
     ("run_rc", CapabilityClass::Process,          "system",  "Run shell command, return {rc, stdout, stderr, timed_out, interrupted} map. run_rc(cmd, [{timeout: seconds}]) — 0 (default) = no deadline; timeout → rc=-1 timed_out=true", contract!((cmd: string, opts?: map) -> map("run_rc_result", {rc: number, stdout: string, stderr: string, timed_out: bool, interrupted: bool}); effects[must_use, blocking, shell]; failure[returns_result])),
     ("run_stream", CapabilityClass::Process,      "system",  "Run an argv LIST directly (no sh), inheriting stdio so output streams live and the child can use the terminal (interactive when it has a pty, e.g. ssh -t); returns the exit code. run_stream(argv, [{env, clear_env, cwd}]) — same env/cwd semantics as run_argv, so an interactive child gets variables without an `env` prefix exposing them in its ps argv (v0.51.0). The run_argv-only opts (timeout, stdin, stdout, stderr, max_output, stream) are rejected by name: this runner blocks until the child exits and captures nothing", contract!((argv: list(string), opts?: map("run_stream_options", {env: map, clear_env: bool, cwd: any_of(string, nil)})) -> number; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; stdin nil|string|bytes|buffer|{file}|{null:true}; stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
-    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
-    ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
-    ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool}))}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_argv", CapabilityClass::Process,        "system",  "Run an argv list directly (no shell) with structured stdio routing and a whole-call deadline that starts before route opening. opts: timeout; grace (seconds: at the deadline SIGTERM the process group, wait up to grace for it, then SIGKILL — default 0 = SIGKILL at once; refused with timeout:0); stdin nil|string|bytes|buffer|{file}|{null:true}|{inherit:true} (only when mix's own stdin is not a terminal, else STDIN_TERMINAL — use run_stream); stdout capture|inherit|null|{file,append?,mode?}; stderr capture|inherit|null|stdout|{file,append?,mode?}; cwd/env/clear_env; max_output; stream. stdout/stderr default capture; output files default truncate, mode 0o600. Routed non-capture streams return \"\" with truncation false and are not capped. stderr:stdout merges into stdout. File-open failure or route-open deadline is a PROCESS_STDIO value and the child is not spawned. Captured output abandoned at a deadline is returned partially with its truncation flag true. stream:true + stdout:inherit and all bad options raise OPTION_INVALID before spawn. Ordinary command/setup failure is encoded in the VALUE; timeout default 30s; max_output default 8 MiB per captured stream", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any}); effects[must_use, blocking]; failure[returns_result])),
+    ("run_parallel", CapabilityClass::Process,    "system",  "Run many argv jobs concurrently with a bounded worker pool: run_parallel(jobs[, {max, timeout}]) -> list of process_result maps in INPUT order. Each job is an argv list (like run_argv's first arg) OR a {argv, stdin, cwd, env, clear_env, stdout, stderr, max_output, timeout, grace} map mirroring run_argv's options. max bounds concurrency (default 8, hard-capped at 256 live workers — excess jobs still run, drained by index); a top-level timeout (seconds) overrides every job's own. A job may NOT disable its deadline (timeout: 0 is refused) — one hung job would park the whole batch. Each result is EXACTLY run_argv's process_result map, so existing result-handling code ports unchanged; one job's ordinary failure (nonzero/timeout/spawn) is DATA in its map, never a raise. Process-level fan-out (std::thread over the run_argv engine), NOT in-language concurrency — the evaluator is single-threaded and Values never cross a thread; a job's `stream` flag is ignored (parallel tee would interleave). The killer use is ssh_mix fan-out: run_parallel of ssh argvs. A parse error in ANY job fails the whole call before spawning (v0.82.0)", contract!((jobs: list, opts?: map("run_parallel_options", {max: number, timeout: number})) -> list; effects[must_use, blocking]; failure[returns_result])),
+    ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, grace: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
+    ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Every stage carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error and broken_pipe (killed by SIGPIPE: its reader closed); the result carries status ok|exit_nonzero|signal|broken_pipe|timeout|interrupted|setup_error, failed_stage (the RIGHTMOST non-ok stage, pipefail's rule; nil when none) and a one-line human summary — gates branch on status, never on text. Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool, status: string, broken_pipe: bool})), status: string, failed_stage: any, summary: string}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
-    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
+    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, die_with_parent, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); die_with_parent:true (Linux) is the opposite slot — the child leads its own process group, is SIGKILLed by the kernel if this process dies (PR_SET_PDEATHSIG), and on a graceful mix exit (script end, --serve QUIT/SIGTERM, restart) its whole group gets SIGTERM, 2 s grace, then SIGKILL, so a helper server never outlives its citizen (refused together with detach); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
     ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
@@ -578,6 +579,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "load_data" => builtin_load_data(args),
         "write_file" => builtin_write_file(args),
         "write_new" => builtin_write_new(args),
+        "write_atomic" => builtin_write_atomic(args),
         "append_file" => builtin_append_file(args),
         "exists" => builtin_exists(args),
         "access" => builtin_access(args),
@@ -4045,6 +4047,7 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
 
     // Options.
     let mut detach = false;
+    let mut die_with_parent = false;
     let mut cwd: Option<String> = None;
     let mut env: Vec<(String, String)> = Vec::new();
     let mut clear_env = false;
@@ -4066,6 +4069,17 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
                             return Err(opt_invalid(
                                 caller,
                                 format!("detach must be a bool, got {}", other.type_name()),
+                            ));
+                        }
+                    };
+                }
+                "die_with_parent" => {
+                    die_with_parent = match val {
+                        Value::Bool(b) => *b,
+                        other => {
+                            return Err(opt_invalid(
+                                caller,
+                                format!("die_with_parent must be a bool, got {}", other.type_name()),
                             ));
                         }
                     };
@@ -4172,7 +4186,7 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
                     return Err(opt_invalid(
                         caller,
                         format!(
-                            "unknown option '{}' (supported: detach, cwd, env, clear_env, stdout, stderr)",
+                            "unknown option '{}' (supported: detach, die_with_parent, cwd, env, clear_env, stdout, stderr)",
                             sanitize_for_diag(other)
                         ),
                     ));
@@ -4181,8 +4195,45 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         }
     }
 
+    if detach && die_with_parent {
+        return Err(opt_invalid(
+            caller,
+            "detach and die_with_parent contradict each other: detach severs the child from \
+             this process, die_with_parent ties its lifetime to it",
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    if die_with_parent {
+        return Err(opt_invalid(
+            caller,
+            "die_with_parent needs Linux (PR_SET_PDEATHSIG)",
+        ));
+    }
+
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]).stdin(std::process::Stdio::null());
+    #[cfg(target_os = "linux")]
+    if die_with_parent && owned_spawns::hosted_elsewhere() {
+        return Err(opt_invalid(
+            caller,
+            "die_with_parent: another thread of this process is the owned-children host \
+             (builtins::owned_spawns::enable() was called there first); only that thread \
+             may create them",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if die_with_parent && !owned_spawns::enabled_here() {
+        return Err(opt_invalid(
+            caller,
+            "die_with_parent needs a host that owns the evaluator thread (the mix \
+             binary does; an embedder must call builtins::owned_spawns::enable() on its \
+             long-lived evaluation thread and sweep on it before that thread exits)",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if die_with_parent {
+        arm_die_with_parent(&mut command);
+    }
     if let Some(dir) = &cwd {
         command.current_dir(dir);
     }
@@ -4268,7 +4319,212 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         span: None,
         msg: format!("spawn failed: {e}"),
     })?;
+    #[cfg(target_os = "linux")]
+    if die_with_parent {
+        owned_spawns::register(child.id() as libc::pid_t);
+    }
     Ok(Some(Value::Number(child.id() as f64)))
+}
+
+/// `spawn(argv, {die_with_parent: true})`: the child leads a fresh process
+/// group (so its whole tree is addressable as `-pid`) and carries
+/// `PR_SET_PDEATHSIG(SIGKILL)`, so the kernel kills it if this process dies
+/// without running the graceful sweep (crash, SIGKILL, OOM). A failed
+/// `prctl` fails the spawn rather than returning a child that does not
+/// honour the option. The `getppid` check closes the fork→prctl race: a
+/// parent that died in between would never deliver the signal.
+#[cfg(target_os = "linux")]
+fn arm_die_with_parent(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let parent_pid = std::process::id() as libc::pid_t;
+    // SAFETY: setpgid, prctl, getppid and _exit are raw syscalls, safe in the
+    // post-fork pre-exec window: no locks, no allocation.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                libc::_exit(0);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Children started with `spawn(argv, {die_with_parent: true})`, ended with
+/// this process (TODO-mix P2).
+///
+/// Two layers, because neither alone is enough:
+///
+/// * `PR_SET_PDEATHSIG(SIGKILL)` (armed at spawn) is the crash path: the
+///   kernel kills the direct child when its creating thread dies, however it
+///   dies. It reaches the child only — not the child's own children — and it
+///   is SIGKILL, so the child gets no chance to clean up.
+/// * [`sweep`] is the graceful path, run by the interpreter on its way out
+///   (end of script, `mix --serve` QUIT/SIGTERM drain, REPL restart): SIGTERM
+///   to every owned child's whole process group, up to [`SWEEP_GRACE`] for
+///   every group to empty, then SIGKILL to the groups — so descendants go too.
+///
+/// PDEATHSIG is keyed to the THREAD that called spawn. The `mix` binary
+/// evaluates on one long-lived thread, [`enable`]s it, and sweeps on it
+/// before it exits, so a graceful exit always reaches the sweep first. On any
+/// thread that was not enabled, `die_with_parent` raises OPTION_INVALID.
+#[cfg(target_os = "linux")]
+pub mod owned_spawns {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// How long the graceful sweep waits between SIGTERM and SIGKILL.
+    pub const SWEEP_GRACE: Duration = Duration::from_secs(2);
+
+    static OWNED: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+    /// The one thread allowed to create owned children. PDEATHSIG is keyed to
+    /// the creating THREAD and the registry is process-wide, so the facility
+    /// is only sound when a host owns a long-lived evaluator thread and sweeps
+    /// on it. Embedders that evaluate on pooled threads (tokio
+    /// `spawn_blocking` in webd, cosmix-mcp, cosmix-claud) never call
+    /// [`enable`]; there a pool thread retiring would SIGKILL a helper while
+    /// the daemon lives, and one request's sweep would end another's helpers.
+    static HOST: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+    /// Opt this thread in as the host that owns `die_with_parent` children.
+    /// The first call wins; the host must sweep on this same thread before it
+    /// exits. The `mix` binary calls this on its evaluation thread. Returns
+    /// whether THIS thread is the host afterwards — `false` means another
+    /// thread enabled first and this call changed nothing (review R7).
+    #[must_use]
+    pub fn enable() -> bool {
+        let me = std::thread::current().id();
+        *HOST.get_or_init(|| me) == me
+    }
+
+    /// Is some OTHER thread the host?
+    pub(crate) fn hosted_elsewhere() -> bool {
+        HOST.get().is_some_and(|host| *host != std::thread::current().id())
+    }
+
+    /// May the current thread create an owned child?
+    pub(crate) fn enabled_here() -> bool {
+        HOST.get() == Some(&std::thread::current().id())
+    }
+
+    /// Register a new owned child, first retiring entries that are finished:
+    /// a leader that exited AND whose group has no live member is reaped and
+    /// dropped, so a long-lived citizen's registry stays bounded by the groups
+    /// that are actually alive. A dead leader whose group still has members is
+    /// KEPT unreaped — its zombie pins the pgid for the sweep.
+    pub(crate) fn register(pid: libc::pid_t) {
+        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+        owned.retain(|pid| retain_entry(*pid));
+        owned.push(pid);
+    }
+
+    /// Keep an entry? Reaps (and drops) a finished one. Call with the lock
+    /// held: the registry is the ONLY reaper of an owned pid.
+    fn retain_entry(pid: libc::pid_t) -> bool {
+        match leader_state(pid) {
+            Some(false) => true,
+            Some(true) if super::group_has_live_members(pid) => true,
+            Some(true) => {
+                let mut status = 0;
+                // SAFETY: reaping our own exited child.
+                unsafe {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// `process_alive` for an owned pid, answered WITHOUT an unowned reap
+    /// (review MAJOR-4): a plain waitpid there would free the pid while the
+    /// registration survived, and a recycled pid would then pass the sweep's
+    /// check and get its group signalled. `None` when `pid` is not owned.
+    pub(crate) fn observe(pid: libc::pid_t) -> Option<bool> {
+        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+        let index = owned.iter().position(|p| *p == pid)?;
+        let alive = leader_state(pid) == Some(false);
+        if !retain_entry(pid) {
+            owned.swap_remove(index);
+        }
+        Some(alive)
+    }
+
+    /// Leader state without reaping it: `Some(false)` running, `Some(true)`
+    /// exited but unreaped (a zombie — its pid, and so its pgid, is still
+    /// reserved), `None` no longer our unreaped child (someone reaped it —
+    /// `process_alive` does — so the pid may already belong to a stranger and
+    /// must not be signalled).
+    fn leader_state(pid: libc::pid_t) -> Option<bool> {
+        // SAFETY: waitid writes only into the zeroed local `info`.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == -1
+            {
+                return None;
+            }
+            Some(info.si_pid() != 0)
+        }
+    }
+
+    /// End every owned child and its process group; returns how many groups
+    /// were signalled. Idempotent: the registry is drained, so a second call
+    /// signals nothing. A group whose leader was already reaped elsewhere is
+    /// skipped — its pgid can no longer be proven ours.
+    pub fn sweep() -> usize {
+        // The lock is held for the whole sweep: no other path may reap an
+        // owned pid between the identity check below and the last signal.
+        let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+        let pids = std::mem::take(&mut *owned);
+        let live: Vec<libc::pid_t> = pids
+            .into_iter()
+            .filter(|pid| leader_state(*pid).is_some())
+            .collect();
+        for pid in &live {
+            // SAFETY: the leader is unreaped, so -pid names its own group.
+            // SIGCONT so a stopped member can act on the SIGTERM (review R6).
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+                libc::kill(-pid, libc::SIGCONT);
+            }
+        }
+        // Wait for every GROUP to empty (not just its leader), bounded by the
+        // grace: a helper's own TERM-honouring children finish cleanly.
+        let deadline = Instant::now() + SWEEP_GRACE;
+        while Instant::now() < deadline
+            && live.iter().any(|pid| super::group_has_live_members(*pid))
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for pid in &live {
+            // SAFETY: still unreaped (only this function reaps it, below),
+            // so the pgid is still reserved for this group.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(*pid, &mut status, 0);
+            }
+        }
+        live.len()
+    }
 }
 
 /// A `fork` inside a forked child: the second fork must not be `libc::fork`,
@@ -4574,6 +4830,12 @@ fn builtin_process_alive(args: Vec<Value>) -> MixResult<Option<Value>> {
         // non-blocking. We ignore the return value because we only care
         // about its side-effect (reaping a zombie child) — the kill(0)
         // below is the authoritative liveness check.
+        // An owned (die_with_parent) child is answered by its registry, which
+        // is the only thing allowed to reap it.
+        #[cfg(target_os = "linux")]
+        if let Some(alive) = owned_spawns::observe(pid as libc::pid_t) {
+            return Ok(Some(Value::Bool(alive)));
+        }
         let managed = MANAGED_PIDS.lock().unwrap();
         if !managed.contains(&pid) {
             unsafe {
@@ -5537,6 +5799,9 @@ fn builtin_run_rc(args: Vec<Value>) -> MixResult<Option<Value>> {
 /// as `TYPE_MISMATCH`, option problems as `OPTION_INVALID`.
 struct RunArgvOpts {
     timeout_ms: u64,
+    /// Deadline escalation window: 0 = SIGKILL the group at the deadline
+    /// (the historical hard kill); N = SIGTERM, wait up to N ms, then SIGKILL.
+    grace_ms: u64,
     stdin: RunArgvStdin,
     cwd: Option<String>,
     env: Vec<(String, String)>,
@@ -5549,6 +5814,10 @@ struct RunArgvOpts {
 
 enum RunArgvStdin {
     Null,
+    /// `{inherit: true}` — the child reads the caller's own stdin (a pipe
+    /// or file into mix). Refused when that stdin is a terminal: see
+    /// [`stdin_inherit_route`].
+    Inherit,
     Data(Vec<u8>),
     File(String),
 }
@@ -5577,6 +5846,7 @@ enum RunArgvStderr {
 
 const RUN_ARGV_OPT_KEYS: &[&str] = &[
     "timeout",
+    "grace",
     "stdin",
     "cwd",
     "env",
@@ -5731,6 +6001,29 @@ fn parse_output_file(caller: &str, stream: &str, value: &Value) -> MixResult<Run
     Ok(RunArgvFile { path, append, mode })
 }
 
+/// `stdin: {inherit: true}` — accepted only when this process's stdin is NOT
+/// a terminal. A run_argv/run_pipeline child leads its own process group, so
+/// it is never the terminal's foreground group: a terminal read would stop
+/// it with SIGTTIN (or fail EIO), and the call would hang to its deadline.
+/// That is why the route was refused outright before; a pipe or file has no
+/// foreground concept, so inheriting one is safe. The terminal case raises
+/// STDIN_TERMINAL and names run_stream, the runner that hands a child the
+/// terminal. Checked when the options are parsed, before anything spawns.
+fn stdin_inherit_route(caller: &str) -> MixResult<RunArgvStdin> {
+    // SAFETY: isatty only inspects descriptor 0.
+    if unsafe { libc::isatty(0) } == 1 {
+        return Err(MixError::structured(
+            "STDIN_TERMINAL",
+            format!(
+                "{caller}: stdin {{inherit: true}} refused: this process's stdin is a terminal, \
+                 and the child runs in its own process group, so a terminal read would stop it \
+                 (SIGTTIN). Use run_stream(argv) to give a child the terminal"
+            ),
+        ));
+    }
+    Ok(RunArgvStdin::Inherit)
+}
+
 fn parse_stdin_route(caller: &str, value: &Value) -> MixResult<RunArgvStdin> {
     match value {
         Value::Nil => Ok(RunArgvStdin::Null),
@@ -5741,7 +6034,7 @@ fn parse_stdin_route(caller: &str, value: &Value) -> MixResult<RunArgvStdin> {
             if map.len() != 1 {
                 return Err(opt_invalid(
                     caller,
-                    "stdin routing map must be exactly {file: string} or {null: true}",
+                    "stdin routing map must be exactly {file: string}, {null: true} or {inherit: true}",
                 ));
             }
             match map.first() {
@@ -5749,16 +6042,17 @@ fn parse_stdin_route(caller: &str, value: &Value) -> MixResult<RunArgvStdin> {
                     caller, "stdin", value,
                 )?)),
                 Some((key, Value::Bool(true))) if key == "null" => Ok(RunArgvStdin::Null),
+                Some((key, Value::Bool(true))) if key == "inherit" => stdin_inherit_route(caller),
                 _ => Err(opt_invalid(
                     caller,
-                    "stdin routing map must be exactly {file: string} or {null: true}",
+                    "stdin routing map must be exactly {file: string}, {null: true} or {inherit: true}",
                 )),
             }
         }
         other => Err(opt_invalid(
             caller,
             format!(
-                "stdin must be nil, a string, bytes, buffer, {{file: string}}, or {{null: true}}, got {}",
+                "stdin must be nil, a string, bytes, buffer, {{file: string}}, {{null: true}}, or {{inherit: true}}, got {}",
                 other.type_name()
             ),
         )),
@@ -5819,6 +6113,7 @@ fn parse_stderr_route(caller: &str, value: &Value) -> MixResult<RunArgvStderr> {
 fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts> {
     let mut opts = RunArgvOpts {
         timeout_ms: 30_000,
+        grace_ms: 0,
         stdin: RunArgvStdin::Null,
         cwd: None,
         env: Vec::new(),
@@ -5949,6 +6244,35 @@ fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts
                     }
                 };
             }
+            "grace" => {
+                let t = match extract_number(val, InputPolicy::NumberOnly) {
+                    Some(n) => n,
+                    None => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!("grace must be a number of seconds, got {}", val.type_name()),
+                        ));
+                    }
+                };
+                as_duration(&format!("{caller}: grace"), t).map_err(|_| {
+                    opt_invalid(
+                        caller,
+                        format!("grace must be a finite non-negative number, got {t}"),
+                    )
+                })?;
+                opts.grace_ms = if t > 0.0 {
+                    (as_count(
+                        &format!("{caller}: grace milliseconds"),
+                        (t * 1000.0).round(),
+                        usize::MAX,
+                    )
+                    .map_err(|_| opt_invalid(caller, format!("grace {t}s is out of range")))?
+                        as u64)
+                        .max(1)
+                } else {
+                    0
+                };
+            }
             "max_output" => {
                 let n = match extract_number(val, InputPolicy::NumberOnly) {
                     Some(n) => n,
@@ -6003,6 +6327,14 @@ fn parse_run_argv_opts(caller: &str, v: Option<&Value>) -> MixResult<RunArgvOpts
         return Err(opt_invalid(
             caller,
             "stream:true cannot be combined with stdout:\"inherit\"",
+        ));
+    }
+    // grace only shapes what happens AT a deadline; with the deadline
+    // disabled it would silently do nothing, so refuse the combination.
+    if opts.grace_ms > 0 && opts.timeout_ms == 0 {
+        return Err(opt_invalid(
+            caller,
+            "grace needs a deadline: it cannot be combined with timeout: 0",
         ));
     }
     Ok(opts)
@@ -6224,6 +6556,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
         argv,
         stdin: match &opts.stdin {
             RunArgvStdin::Null => ProcStdin::Null,
+            RunArgvStdin::Inherit => ProcStdin::Inherit,
             RunArgvStdin::Data(data) => ProcStdin::Data(data),
             RunArgvStdin::File(path) => ProcStdin::File(path),
         },
@@ -6241,6 +6574,7 @@ fn proc_spec_from<'a>(argv: &'a [String], opts: &'a RunArgvOpts, caller: &'a str
             RunArgvStderr::File(file) => ProcStderr::File(file),
         },
         timeout_ms: opts.timeout_ms,
+        grace_ms: opts.grace_ms,
         caller,
         cwd: opts.cwd.as_deref(),
         env: &opts.env,
@@ -6326,7 +6660,11 @@ struct ParsedJob {
 
 /// Parse one `run_parallel` job — an argv list, or a `{argv, …}` map mirroring
 /// run_argv's options — into owned config.
-fn parse_run_parallel_job(caller: &str, job: &Value) -> MixResult<ParsedJob> {
+fn parse_run_parallel_job(
+    caller: &str,
+    job: &Value,
+    timeout_overridden: bool,
+) -> MixResult<ParsedJob> {
     match job {
         Value::List(_) => Ok(ParsedJob {
             argv: parse_run_argv_argv(caller, job)?,
@@ -6350,6 +6688,12 @@ fn parse_run_parallel_job(caller: &str, job: &Value) -> MixResult<ParsedJob> {
             let mut cleaned = (**m).clone();
             cleaned.shift_remove("argv");
             cleaned.shift_remove("stream");
+            // A top-level timeout replaces this job's own, so the job's value
+            // must not take part in validation either: `{timeout: 0, grace: 1}`
+            // under a top-level timeout is a job WITH a deadline (review NIT).
+            if timeout_overridden {
+                cleaned.shift_remove("timeout");
+            }
             let opts = parse_run_argv_opts(caller, Some(&Value::map(cleaned)))?;
             Ok(ParsedJob { argv, opts })
         }
@@ -6389,7 +6733,7 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
     // exactly like run_argv validates before spawning.
     let mut parsed: Vec<ParsedJob> = Vec::with_capacity(jobs.len());
     for job in jobs.iter() {
-        let mut p = parse_run_parallel_job(caller, job)?;
+        let mut p = parse_run_parallel_job(caller, job, popts.timeout_ms.is_some())?;
         if let Some(t) = popts.timeout_ms {
             p.opts.timeout_ms = t;
         }
@@ -6408,6 +6752,20 @@ fn builtin_run_parallel(args: Vec<Value>) -> MixResult<Option<Value>> {
         // a list-form job never sets it, so this stays false.
         p.opts.stream = false;
         parsed.push(p);
+    }
+    // One shared stdin read by several concurrent jobs is a silent byte race
+    // (review MINOR-10): each would get an arbitrary interleaving of it. One
+    // inheriting job is well defined; more than one is refused.
+    if parsed
+        .iter()
+        .filter(|p| matches!(p.opts.stdin, RunArgvStdin::Inherit))
+        .count()
+        > 1
+    {
+        return Err(opt_invalid(
+            caller,
+            "at most one job may use stdin {inherit: true} — concurrent jobs would race for the same bytes",
+        ));
     }
 
     let n = parsed.len();
@@ -6680,10 +7038,23 @@ fn pipeline_error_map(code: &str, message: &str, stages: Option<Value>) -> Value
     map.insert("utf8_lossy".to_string(), Value::Bool(false));
     map.insert("error_code".to_string(), Value::String(code.to_string()));
     map.insert("error".to_string(), Value::String(message.to_string()));
+    // PIPELINE_SPAWN is the one setup failure tied to a stage: every stage
+    // before it started, so the failing one is the next index. The other
+    // setup codes fail before any stage runs and name no stage.
+    let failed_stage = match (&stages, code) {
+        (Some(Value::List(started)), "PIPELINE_SPAWN") => Value::Number(started.len() as f64),
+        _ => Value::Nil,
+    };
     map.insert(
         "stages".to_string(),
         stages.unwrap_or_else(|| Value::list(Vec::new())),
     );
+    map.insert(
+        "status".to_string(),
+        Value::String("setup_error".to_string()),
+    );
+    map.insert("failed_stage".to_string(), failed_stage);
+    map.insert("summary".to_string(), Value::String(message.to_string()));
     Value::map(map)
 }
 
@@ -6700,7 +7071,7 @@ fn builtin_run_pipeline_impl(caller: &str, args: &[Value]) -> MixResult<Value> {
     let stages = parse_run_pipeline_stages(caller, &args[0])?;
     let opts = parse_run_pipeline_opts(caller, args.get(1))?;
     match run_pipeline_processes(caller, &stages, &opts) {
-        Ok(outcome) => Ok(pipeline_result_map(&stages, outcome, opts.allow_signal)),
+        Ok(outcome) => Ok(pipeline_result_map(&stages, outcome, &opts)),
         Err(MixError::Structured(info))
             if matches!(
                 info.code.as_str(),
@@ -6754,52 +7125,51 @@ fn builtin_run_pipeline_must(args: Vec<Value>) -> MixResult<Option<Value>> {
             "run_pipeline_must: captured output exceeded max_output".to_string(),
         )
     } else if !get_bool("ok") {
-        let failed_signal = match map.get("stages") {
-            Some(Value::List(stages)) => stages.iter().enumerate().find_map(|(index, stage)| {
-                let stage = match stage {
-                    Value::Map(stage) => stage,
-                    _ => return None,
-                };
-                if matches!(stage.get("accepted_signal"), Some(Value::Bool(true))) {
-                    return None;
-                }
-                match stage.get("signal") {
-                    Some(Value::Number(signal)) => Some((index, *signal as i64)),
-                    _ => None,
-                }
-            }),
+        // The code and the named stage come from the SAME fields the value
+        // carries — `status` and `failed_stage` (pipefail's rightmost rule) —
+        // so the raise can never contradict $err.details.result. In
+        // `yes | sh -c 'exit 3'` stage 0's broken pipe is the symptom and
+        // stage 1's exit 3 the cause: this raises PIPELINE_EXIT_NONZERO for
+        // stage[1], exactly as the result's status/failed_stage say.
+        let failed_stage = match map.get("failed_stage") {
+            Some(Value::Number(index)) => Some(*index as usize),
             _ => None,
         };
-        if let Some((index, signal)) = failed_signal {
-            (
-                "PIPELINE_SIGNAL".to_string(),
-                format!("run_pipeline_must: stage[{index}] killed by signal {signal}"),
-            )
-        } else {
-            let failed_exit = match map.get("stages") {
-                Some(Value::List(stages)) => {
-                    stages.iter().enumerate().find_map(|(index, stage)| {
-                        let stage = match stage {
-                            Value::Map(stage) => stage,
-                            _ => return None,
-                        };
-                        match (stage.get("ok"), stage.get("exit_code")) {
-                            (Some(Value::Bool(false)), Some(Value::Number(code))) => {
-                                Some((index, *code as i64))
-                            }
-                            _ => None,
-                        }
-                    })
-                }
+        let stage = failed_stage.and_then(|index| match map.get("stages") {
+            Some(Value::List(stages)) => match stages.get(index) {
+                Some(Value::Map(stage)) => Some(stage.clone()),
                 _ => None,
-            };
-            let message = failed_exit.map_or_else(
-                || "run_pipeline_must: pipeline failed".to_string(),
-                |(index, code)| {
-                    format!("run_pipeline_must: stage[{index}] failed (exit_code={code})")
-                },
-            );
-            ("PIPELINE_EXIT_NONZERO".to_string(), message)
+            },
+            _ => None,
+        });
+        let status = match map.get("status") {
+            Some(Value::String(status)) => status.as_str(),
+            _ => "exit_nonzero",
+        };
+        let number = |key: &str| match stage.as_ref().and_then(|stage| stage.get(key)) {
+            Some(Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        };
+        match (status, failed_stage) {
+            ("signal" | "broken_pipe", Some(index)) => (
+                "PIPELINE_SIGNAL".to_string(),
+                format!(
+                    "run_pipeline_must: stage[{index}] killed by signal {}{}",
+                    number("signal").unwrap_or_default(),
+                    if status == "broken_pipe" { " (broken pipe: its reader closed)" } else { "" }
+                ),
+            ),
+            (_, Some(index)) => (
+                "PIPELINE_EXIT_NONZERO".to_string(),
+                format!(
+                    "run_pipeline_must: stage[{index}] failed (exit_code={})",
+                    number("exit_code").unwrap_or_default()
+                ),
+            ),
+            (_, None) => (
+                "PIPELINE_EXIT_NONZERO".to_string(),
+                "run_pipeline_must: pipeline failed".to_string(),
+            ),
         }
     } else {
         return Ok(Some(
@@ -7767,6 +8137,7 @@ fn ssh_result_map(host: &str, o: SshOutcome, elapsed: std::time::Duration) -> Va
 #[derive(Clone, Copy)]
 enum ProcStdin<'a> {
     Null,
+    Inherit,
     Data(&'a [u8]),
     File(&'a str),
 }
@@ -7799,6 +8170,9 @@ struct ProcSpec<'a> {
     stderr: ProcStderr<'a>,
     /// Wall-clock deadline in milliseconds; 0 disables.
     timeout_ms: u64,
+    /// At the deadline: 0 = SIGKILL the group at once; N = SIGTERM, wait up
+    /// to N ms for the leader, then SIGKILL the group.
+    grace_ms: u64,
     /// Builtin name for diagnostics (`run`, `ssh_run`, `run_argv`, ...).
     caller: &'a str,
     /// Working directory for the child; `None` inherits.
@@ -8440,6 +8814,10 @@ struct PipelineChildRuntime {
     started: std::time::Instant,
     status: Option<std::process::ExitStatus>,
     duration_ms: u128,
+    /// The runtime signalled this stage's group (deadline or interrupt)
+    /// while the stage was still unreaped, so a signal death is OURS, not
+    /// the stage's own. A stage that had already exited is never marked.
+    runtime_signalled: bool,
 }
 
 struct PipelineRawStageOutcome {
@@ -8448,6 +8826,29 @@ struct PipelineRawStageOutcome {
     duration_ms: u128,
     stderr: Vec<u8>,
     stderr_truncated: bool,
+    runtime_signalled: bool,
+}
+
+/// Signal every stage group on behalf of the runtime (deadline/interrupt),
+/// first recording which stages were still running: those are the stages
+/// whose outcome the result attributes to the timeout or interrupt.
+#[cfg(unix)]
+fn signal_pipeline_groups_for_runtime(children: &mut [PipelineChildRuntime], signal: i32) {
+    for child in children.iter_mut() {
+        if child.status.is_none() {
+            // A stage that exited on its own inside the last poll window is
+            // not the runtime's kill (review MINOR-9): collect it first, so
+            // only stages that are STILL running when the signal goes out
+            // are reported timeout/interrupted.
+            if let Ok(Some(status)) = child.child.try_wait() {
+                child.status = Some(status);
+                child.duration_ms = child.started.elapsed().as_millis();
+                continue;
+            }
+            child.runtime_signalled = true;
+        }
+    }
+    signal_pipeline_groups(children, signal);
 }
 
 struct PipelineProcessOutcome {
@@ -8553,6 +8954,13 @@ fn pipeline_started_stage_values(
             );
             map.insert("utf8_lossy".to_string(), Value::Bool(false));
             map.insert("accepted_signal".to_string(), Value::Bool(false));
+            // These stages started, then a LATER stage failed setup and the
+            // runtime killed them: their outcome is the setup failure's.
+            map.insert(
+                "status".to_string(),
+                Value::String("setup_error".to_string()),
+            );
+            map.insert("broken_pipe".to_string(), Value::Bool(false));
             Value::map(map)
         })
         .collect();
@@ -8728,6 +9136,9 @@ fn run_pipeline_processes(
                     RunArgvStdin::Null => {
                         command.stdin(Stdio::null());
                     }
+                    RunArgvStdin::Inherit => {
+                        command.stdin(Stdio::inherit());
+                    }
                     RunArgvStdin::Data(_) => {
                         command.stdin(Stdio::from(
                             stdin_data_reader
@@ -8881,6 +9292,7 @@ fn run_pipeline_processes(
                     started: Instant::now(),
                     status: None,
                     duration_ms: 0,
+                    runtime_signalled: false,
                 });
             }
             Err(error) => {
@@ -8905,7 +9317,7 @@ fn run_pipeline_processes(
                 writer.write_all(&data)
             }))
         }
-        RunArgvStdin::Null | RunArgvStdin::File(_) => None,
+        RunArgvStdin::Null | RunArgvStdin::Inherit | RunArgvStdin::File(_) => None,
     };
 
     let final_stdout_pipe: Option<Box<dyn std::io::Read + Send>> = final_stdout_reader
@@ -8981,7 +9393,7 @@ fn run_pipeline_processes(
 
     if interrupted {
         #[cfg(unix)]
-        signal_pipeline_groups(&children, libc::SIGTERM);
+        signal_pipeline_groups_for_runtime(&mut children, libc::SIGTERM);
         #[cfg(not(unix))]
         for runtime in &mut children {
             let _ = runtime.child.kill();
@@ -9006,8 +9418,15 @@ fn run_pipeline_processes(
             std::thread::sleep(poll_interval);
         }
         #[cfg(unix)]
-        signal_pipeline_groups(&children, libc::SIGKILL);
-    } else if timed_out || lifecycle_error.is_some() {
+        signal_pipeline_groups_for_runtime(&mut children, libc::SIGKILL);
+    } else if timed_out {
+        #[cfg(unix)]
+        signal_pipeline_groups_for_runtime(&mut children, libc::SIGKILL);
+        #[cfg(not(unix))]
+        for runtime in &mut children {
+            let _ = runtime.child.kill();
+        }
+    } else if lifecycle_error.is_some() {
         #[cfg(unix)]
         signal_pipeline_groups(&children, libc::SIGKILL);
         #[cfg(not(unix))]
@@ -9054,7 +9473,7 @@ fn run_pipeline_processes(
         {
             if start.elapsed() >= timeout {
                 #[cfg(unix)]
-                signal_pipeline_groups(&children, libc::SIGKILL);
+                signal_pipeline_groups_for_runtime(&mut children, libc::SIGKILL);
                 timed_out = true;
                 break;
             }
@@ -9152,6 +9571,7 @@ fn run_pipeline_processes(
             duration_ms: runtime.duration_ms,
             stderr,
             stderr_truncated,
+            runtime_signalled: runtime.runtime_signalled,
         });
     }
 
@@ -9165,11 +9585,126 @@ fn run_pipeline_processes(
     })
 }
 
+/// `SIGPIPE` on unix; a value no real signal number takes elsewhere, so the
+/// broken-pipe classification is simply never reached off unix.
+#[cfg(unix)]
+const PIPELINE_SIGPIPE: i32 = libc::SIGPIPE;
+#[cfg(not(unix))]
+const PIPELINE_SIGPIPE: i32 = -1;
+
+/// Why one stage ended — the machine-readable half of the TODO-mix P1
+/// contract. Precedence, first match wins:
+///
+/// 1. exit 0                                  → `ok`
+/// 2. the runtime signalled it while running  → `timeout` / `interrupted`
+///    (the death is the deadline's or the interrupt's, not the stage's)
+/// 3. killed by SIGPIPE                       → `broken_pipe` (its reader
+///    closed; reported even when `allow_signal` accepted it — `ok` carries
+///    the acceptance, `status` the fact)
+/// 4. killed by any other signal              → `signal`
+/// 5. non-zero exit                           → `exit_nonzero`
+///
+/// A stage that IGNORES SIGPIPE and exits non-zero on EPIPE is reported as
+/// `exit_nonzero`: the kernel's signal is the only evidence of a closed
+/// reader that cannot be forged by the stage's own exit code.
+fn pipeline_stage_status(raw: &PipelineRawStageOutcome, interrupted: bool) -> &'static str {
+    if raw.natural_code == Some(0) {
+        "ok"
+    } else if raw.runtime_signalled {
+        if interrupted { "interrupted" } else { "timeout" }
+    } else if raw.signal == Some(PIPELINE_SIGPIPE) {
+        "broken_pipe"
+    } else if raw.signal.is_some() {
+        "signal"
+    } else {
+        "exit_nonzero"
+    }
+}
+
+/// The concise human rendering of a pipeline outcome (`summary`). Gates read
+/// `status` / `failed_stage` / the stage maps; this line is for people and
+/// logs, and deliberately carries no duration so it is stable across runs.
+#[allow(clippy::too_many_arguments)]
+fn pipeline_summary(
+    status: &str,
+    failed_stage: Option<usize>,
+    stage_statuses: &[&str],
+    accepted: &[bool],
+    stages: &[PipelineStage],
+    raws: &[PipelineRawStageOutcome],
+    timeout_ms: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> String {
+    let name = |index: usize| {
+        let argv0 = stages[index].argv[0].as_str();
+        let base = argv0.rsplit('/').next().unwrap_or(argv0);
+        format!("stage[{index}] {}", sanitize_for_diag(base))
+    };
+    let mut line = match status {
+        "ok" => {
+            let accepted: Vec<String> = accepted
+                .iter()
+                .enumerate()
+                .filter(|(_, accepted)| **accepted)
+                .map(|(index, _)| format!("{} broken pipe accepted", name(index)))
+                .collect();
+            if accepted.is_empty() {
+                format!("ok ({} stage{})", stages.len(), if stages.len() == 1 { "" } else { "s" })
+            } else {
+                format!("ok ({} stages; {})", stages.len(), accepted.join(", "))
+            }
+        }
+        "timeout" | "interrupted" => {
+            let what = if status == "timeout" {
+                format!("timed out (deadline {timeout_ms} ms)")
+            } else {
+                "interrupted".to_string()
+            };
+            let killed: Vec<String> = stage_statuses
+                .iter()
+                .enumerate()
+                .filter(|(_, stage_status)| **stage_status == status)
+                .map(|(index, _)| name(index))
+                .collect();
+            if killed.is_empty() {
+                format!("{what}; every stage had exited, output was still open")
+            } else {
+                format!("{what}; killed {}", killed.join(", "))
+            }
+        }
+        _ => match failed_stage {
+            Some(index) => {
+                let raw = &raws[index];
+                match stage_statuses[index] {
+                    "broken_pipe" => format!("{}: broken pipe (its reader closed)", name(index)),
+                    "signal" => format!(
+                        "{} killed by signal {}",
+                        name(index),
+                        raw.signal.unwrap_or_default()
+                    ),
+                    _ => format!(
+                        "{} exited {}",
+                        name(index),
+                        raw.natural_code.unwrap_or_default()
+                    ),
+                }
+            }
+            None => "failed".to_string(),
+        },
+    };
+    if stdout_truncated || stderr_truncated {
+        line.push_str(" [output truncated]");
+    }
+    line
+}
+
 fn pipeline_result_map(
     stages: &[PipelineStage],
     outcome: PipelineProcessOutcome,
-    allow_signal: bool,
+    opts: &PipelineOpts,
 ) -> Value {
+    let allow_signal = opts.allow_signal;
     let stage_count = outcome.stages.len();
     let mut stage_ok = vec![false; stage_count];
     let mut accepted_signal = vec![false; stage_count];
@@ -9187,6 +9722,12 @@ fn pipeline_result_map(
         stage_ok[index] = raw.natural_code == Some(0) || accept;
         downstream_ok = stage_ok[index] && downstream_ok;
     }
+
+    let stage_statuses: Vec<&'static str> = outcome
+        .stages
+        .iter()
+        .map(|raw| pipeline_stage_status(raw, outcome.interrupted))
+        .collect();
 
     let mut aggregate_stderr = Vec::new();
     let mut stderr_truncated = false;
@@ -9232,12 +9773,45 @@ fn pipeline_result_map(
             "accepted_signal".to_string(),
             Value::Bool(accepted_signal[index]),
         );
+        map.insert(
+            "status".to_string(),
+            Value::String(stage_statuses[index].to_string()),
+        );
+        map.insert(
+            "broken_pipe".to_string(),
+            Value::Bool(raw.signal == Some(PIPELINE_SIGPIPE)),
+        );
         stage_values.push(Value::map(map));
     }
 
     let final_stage = outcome.stages.last().expect("pipeline is non-empty");
     let ok =
         !outcome.timed_out && !outcome.interrupted && stage_ok.iter().all(|stage_ok| *stage_ok);
+    // pipefail: the RIGHTMOST failing stage names the failure. Downstream
+    // closure makes upstream stages fail as a consequence (`cat big | grep
+    // --bad-flag` leaves cat with a broken pipe), so the rightmost failure is
+    // the cause and the ones to its left are the symptoms.
+    let failed_stage = (0..stage_count).rev().find(|index| !stage_ok[*index]);
+    let status: &str = if outcome.interrupted {
+        "interrupted"
+    } else if outcome.timed_out {
+        "timeout"
+    } else if ok {
+        "ok"
+    } else {
+        failed_stage.map_or("exit_nonzero", |index| stage_statuses[index])
+    };
+    let summary = pipeline_summary(
+        status,
+        failed_stage,
+        &stage_statuses,
+        &accepted_signal,
+        stages,
+        &outcome.stages,
+        opts.timeout_ms,
+        outcome.stdout_truncated,
+        stderr_truncated,
+    );
     let mut map = indexmap::IndexMap::new();
     map.insert("ok".to_string(), Value::Bool(ok));
     map.insert(
@@ -9278,7 +9852,157 @@ fn pipeline_result_map(
     map.insert("error_code".to_string(), Value::Nil);
     map.insert("error".to_string(), Value::Nil);
     map.insert("stages".to_string(), Value::list(stage_values));
+    map.insert("status".to_string(), Value::String(status.to_string()));
+    map.insert(
+        "failed_stage".to_string(),
+        failed_stage.map_or(Value::Nil, |index| Value::Number(index as f64)),
+    );
+    map.insert("summary".to_string(), Value::String(summary));
     Value::map(map)
+}
+
+/// Has direct child `pid` exited? Answers without reaping it (`WNOWAIT`), so
+/// the zombie keeps its pid — and therefore its process-group id — reserved
+/// while the caller signals the group. `Ok(false)` while it runs.
+#[cfg(target_os = "linux")]
+fn leader_exited_unreaped(pid: i32) -> std::io::Result<bool> {
+    // SAFETY: waitid writes only into `info`, which is a zeroed plain-data
+    // siginfo_t owned by this frame; si_pid() reads a field of that struct.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        if libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // WNOHANG with no state change leaves si_pid zero (POSIX; the
+        // struct was zeroed above for exactly this test).
+        Ok(info.si_pid() != 0)
+    }
+}
+
+/// Does process group `pgid` still have a member that is not a zombie?
+///
+/// `kill(-pgid, 0)` cannot answer this: an unreaped zombie leader — which
+/// Mix deliberately keeps so the pgid stays reserved — still counts as a
+/// member. So Linux scans `/proc/*/stat` for a live process whose pgrp is
+/// `pgid`. The answer errs toward "live" (review R4): whenever it cannot
+/// PROVE a pid is gone or outside the group it says `true`, and the grace
+/// deadline still bounds the wait — ending the grace early is the one
+/// mistake this must not make. Concretely: /proc unreadable → true; a stat
+/// that vanished (ENOENT/ESRCH: the pid exited) → not a member; any other
+/// read error (EACCES under hidepid) or an unparsable record → true; a
+/// zombie thread-group LEADER whose other threads still run (more than one
+/// /proc/N/task entry) → live. Processes hidden from this scan altogether
+/// (another pid namespace, hidepid=2 for other users) cannot be counted:
+/// there the grace may end early, but the SIGKILL still reaches the group.
+/// Elsewhere there is no /proc and the conservative `kill(-pgid, 0)` is
+/// used, which waits out the full grace.
+#[cfg(target_os = "linux")]
+pub(crate) fn group_has_live_members(pgid: i32) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true; // a readdir error hides pids: unknown → live
+        };
+        let name = entry.file_name();
+        if name.is_empty() || !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let dir = std::path::Path::new("/proc").join(&name);
+        let stat = match std::fs::read(dir.join("stat")) {
+            Ok(stat) => stat,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue; // exited between readdir and read: provably gone
+            }
+            Err(_) => return true, // EACCES etc.: unknown → live
+        };
+        let Some((state, pgrp)) = parse_proc_stat_state_pgrp(&stat) else {
+            return true; // unparsable record: unknown → live
+        };
+        if pgrp != pgid || state == b'X' {
+            continue;
+        }
+        if state != b'Z' {
+            return true;
+        }
+        // A zombie thread-group leader still has running threads if its
+        // task directory lists more than itself.
+        match std::fs::read_dir(dir.join("task")) {
+            Ok(tasks) => {
+                if tasks.take(2).count() > 1 {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// `(state, pgrp)` from a raw `/proc/N/stat` record, parsed as BYTES: `comm`
+/// is in parentheses and may contain spaces, ')' and non-UTF-8 bytes, so the
+/// fields are found after the LAST ')'. `None` when the record is malformed.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_state_pgrp(stat: &[u8]) -> Option<(u8, i32)> {
+    let close = stat.iter().rposition(|b| *b == b')')?;
+    let mut fields = stat[close + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty());
+    let state = *fields.next()?.first()?;
+    let _ppid = fields.next()?;
+    let pgrp = std::str::from_utf8(fields.next()?).ok()?.parse::<i32>().ok()?;
+    Some((state, pgrp))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn group_has_live_members(pgid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence.
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// End process group `pgid`: with a zero `grace`, SIGKILL at once; otherwise
+/// SIGTERM, then wait until the grace deadline OR until no live member is
+/// left, then SIGKILL whatever remains. Waiting on the whole GROUP, not just
+/// its leader, is the point: a TERM-honouring descendant (the `gzip` in
+/// `sh -c "pg_dump | gzip > f"`) gets the full grace to finish, and a
+/// TERM-ignoring one is killed at the deadline.
+///
+/// The caller must still hold the group's identity: on Linux every caller
+/// signals while the leader is running or an unreaped zombie, so `pgid`
+/// cannot have been recycled.
+#[cfg(unix)]
+pub(crate) fn terminate_process_group(pgid: i32, grace: std::time::Duration) {
+    use std::time::{Duration, Instant};
+    if !grace.is_zero() {
+        // SAFETY: kill(2) on a group whose id the caller holds. SIGCONT right
+        // after SIGTERM, as shells do (review R6): a STOPPED member never
+        // handles its SIGTERM, so without it the grace would be wasted on it.
+        unsafe {
+            libc::kill(-pgid, libc::SIGTERM);
+            libc::kill(-pgid, libc::SIGCONT);
+        }
+        let deadline = Instant::now() + grace;
+        while Instant::now() < deadline && group_has_live_members(pgid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // SAFETY: as above. A group that already emptied answers ESRCH, or — with
+    // a zombie leader still pinning it — reaches no live process.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
 }
 
 fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
@@ -9292,6 +10016,7 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         stdout,
         stderr,
         timeout_ms,
+        grace_ms,
         caller,
         cwd,
         env,
@@ -9299,8 +10024,8 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         max_output,
         stream,
     } = spec;
-    let (stdin, stdout, stderr, timeout_ms, caller, stream) =
-        (*stdin, *stdout, *stderr, *timeout_ms, *caller, *stream);
+    let (stdin, stdout, stderr, timeout_ms, grace_ms, caller, stream) =
+        (*stdin, *stdout, *stderr, *timeout_ms, *grace_ms, *caller, *stream);
     let start = Instant::now();
     let timeout = (timeout_ms != 0).then(|| Duration::from_millis(timeout_ms));
     let deadline = timeout.map(|timeout| start + timeout);
@@ -9311,6 +10036,10 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     let stdin_data = match stdin {
         ProcStdin::Null => {
             cmd.stdin(Stdio::null());
+            None
+        }
+        ProcStdin::Inherit => {
+            cmd.stdin(Stdio::inherit());
             None
         }
         ProcStdin::Data(data) => {
@@ -9569,13 +10298,30 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
     let mut natural_exit: Option<std::process::ExitStatus> = None;
     let mut try_wait_failed: Option<std::io::Error> = None;
 
+    // `leader_done`: the direct child has exited. On Linux it is observed
+    // WITHOUT being reaped (waitid WNOWAIT): the zombie keeps its pid, so the
+    // process-group id stays ours through every group signal below — the
+    // deadline, the grace wait and the capture-drain deadline — and is only
+    // released by the final `child.wait()` once all signalling is done.
+    // Elsewhere the historical reaping try_wait is kept.
+    let mut leader_done = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        #[cfg(target_os = "linux")]
+        let polled = leader_exited_unreaped(child_pid);
+        #[cfg(not(target_os = "linux"))]
+        let polled = child.try_wait().map(|status| match status {
+            Some(status) => {
                 natural_exit = Some(status);
+                true
+            }
+            None => false,
+        });
+        match polled {
+            Ok(true) => {
+                leader_done = true;
                 break;
             }
-            Ok(None) => {}
+            Ok(false) => {}
             // EINTR is expected when SIGINT fires during the syscall —
             // it does NOT mean the child is dead, just that the wait
             // was interrupted. Retry on the next poll, where the
@@ -9610,75 +10356,27 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         std::thread::sleep(poll_interval);
     }
 
-    // Kill if we exited the loop without a natural exit. The escalation
-    // differs by cause (see function docstring): timeout = SIGKILL to
-    // the process group immediately; interrupt = SIGTERM-grace-SIGKILL
-    // to the process group; try_wait_failed = SIGKILL to the process
-    // group (defensive, we can't trust the child's state).
-    if natural_exit.is_none() {
+    // Kill if we left the loop before the leader exited. The escalation
+    // differs by cause (see function docstring): timeout = SIGKILL to the
+    // process group at once, or SIGTERM → `grace` → SIGKILL when the caller
+    // asked for grace; interrupt = SIGTERM → 2 s → SIGKILL; try_wait failure
+    // = SIGKILL (defensive, the child's state is unknown). Every TERM path
+    // waits until the grace deadline OR until the group has no live member
+    // left — not merely until the leader exits — so a descendant that
+    // honours SIGTERM (`pg_dump | gzip` under an `sh -c` leader) gets the
+    // whole grace to finish, and one that ignores it is SIGKILLed at the
+    // deadline.
+    if !leader_done {
         #[cfg(unix)]
         {
-            // Negative pid → kill the whole process group. We placed the
-            // child in its own group via `setpgid(0, 0)` at spawn, so
-            // `child_pid` is also the PGID. This is the load-bearing
-            // change vs. signalling only the direct child: it reaches
-            // descendants (ssh helpers / orphaned children) that would
-            // otherwise keep our stdout/stderr pipe FDs open and block
-            // the drain threads past the timeout.
-            //
-            // SAFETY: `libc::kill` is async-signal-safe; signalling a
-            // stale pgid is not catastrophic (kernel returns ESRCH
-            // which we ignore).
-            let pgid = -child_pid;
-            if timed_out {
-                // Hard local deadline — no grace, no cooperation.
-                unsafe {
-                    libc::kill(pgid, libc::SIGKILL);
-                }
-            } else if try_wait_failed.is_some() {
-                // Defensive: state is unknown, escalate immediately.
-                unsafe {
-                    libc::kill(pgid, libc::SIGKILL);
-                }
+            let grace = if try_wait_failed.is_some() {
+                Duration::ZERO
+            } else if timed_out {
+                Duration::from_millis(grace_ms)
             } else {
-                // Interrupt path — cooperative SIGTERM, then SIGKILL
-                // if the group hasn't exited within the grace window.
-                unsafe {
-                    libc::kill(pgid, libc::SIGTERM);
-                }
-                let term_deadline = Instant::now() + Duration::from_secs(2);
-                let mut term_grace_failed = false;
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            natural_exit = Some(status);
-                            break;
-                        }
-                        Ok(None) => {}
-                        // EINTR: another SIGINT arrived during the wait —
-                        // retry the poll, don't give up on the grace period.
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        // Real failure: we can no longer trust try_wait.
-                        // Stop grace polling and fall through to SIGKILL.
-                        Err(_) => {
-                            term_grace_failed = true;
-                            break;
-                        }
-                    }
-                    if Instant::now() >= term_deadline || term_grace_failed {
-                        unsafe {
-                            libc::kill(pgid, libc::SIGKILL);
-                        }
-                        break;
-                    }
-                    std::thread::sleep(poll_interval);
-                }
-                if natural_exit.is_none() && term_grace_failed {
-                    unsafe {
-                        libc::kill(pgid, libc::SIGKILL);
-                    }
-                }
-            }
+                Duration::from_secs(2)
+            };
+            terminate_process_group(child_pid, grace);
         }
         #[cfg(not(unix))]
         {
@@ -9686,19 +10384,14 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
             // child only. Descendant cleanup is the OS's problem.
             let _ = child.kill();
         }
-        if natural_exit.is_none() {
-            // Final blocking wait so the OS releases the direct child's
-            // PID slot. The kill above guarantees we won't block forever
-            // on the leader; group-mates exit independently.
-            natural_exit = child.wait().ok();
-        }
     }
 
-    // The child is reaped, but capture completion can still block
-    // past the deadline when a DESCENDANT (same process group) inherited
-    // our pipe write ends and outlives the leader (`sh -c "sleep 9 &"`).
-    // Keep enforcing the deadline while the drains finish; on expiry,
-    // SIGKILL the group (closing those write ends) and report timed_out.
+    // The leader has exited (or been killed), but capture completion can
+    // still block past the deadline when a DESCENDANT (same process group)
+    // inherited our pipe write ends and outlives the leader (`sh -c "sleep 9
+    // &"`). Keep enforcing the deadline while the drains finish; on expiry,
+    // end the group with the same TERM → grace → KILL escalation and report
+    // timed_out.
     if !timed_out
         && !interrupted
         && let Some(t) = timeout
@@ -9714,14 +10407,20 @@ fn run_process(spec: &ProcSpec<'_>) -> MixResult<ProcOutcome> {
         {
             if start.elapsed() >= t {
                 #[cfg(unix)]
-                unsafe {
-                    libc::kill(-child_pid, libc::SIGKILL);
-                }
+                terminate_process_group(child_pid, Duration::from_millis(grace_ms));
                 timed_out = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    if natural_exit.is_none() {
+        // Final blocking wait so the OS releases the direct child's pid slot
+        // — only now, after every group signal above has been sent while the
+        // (possibly zombie) leader still reserved the pgid. The kills above
+        // guarantee this cannot block on a live leader.
+        natural_exit = child.wait().ok();
     }
 
     if timed_out || interrupted {
@@ -9845,6 +10544,7 @@ fn run_with_timeout(
         stdout: ProcOutput::Capture,
         stderr: ProcStderr::Capture,
         timeout_ms: timeout_s.saturating_mul(1000),
+        grace_ms: 0,
         caller,
         cwd: None,
         env: &[],
@@ -12457,6 +13157,672 @@ fn builtin_write_new(args: Vec<Value>) -> MixResult<Option<Value>> {
         msg: format!("write_new '{}': {}", path, e),
     })?;
     Ok(Some(Value::Nil))
+}
+
+/// How far `write_atomic` pushes the new content toward stable storage before
+/// it returns. Each level is exactly what it says and no more — the default
+/// claims no durability it did not ask the kernel for (TODO-mix P3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WriteDurability {
+    /// temp + write + rename. Atomic for every reader and against this
+    /// process dying at any point; NOT durable across a power loss or kernel
+    /// crash (the page cache may not have reached the disk).
+    None,
+    /// `fsync` the temp file before the rename: once the new name is visible,
+    /// its bytes are on disk. After a power loss the path holds the old
+    /// complete file or the new complete file.
+    File,
+    /// `File`, plus `fsync` of the parent directory after the rename: when
+    /// the call returns, the new content under the path survives a power loss.
+    Full,
+}
+
+struct WriteAtomicOpts {
+    durability: WriteDurability,
+    mode: Option<u32>,
+    max_bytes: Option<usize>,
+}
+
+/// Test-only fault injection for the crash-consistency tests: fail at a
+/// named point so the cleanup path runs exactly as it would on a real
+/// short write or a failed rename. Production passes `None`; the fault
+/// variants are constructed only by the unit tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum AtomicFault {
+    None,
+    /// Write half the bytes to the temp file, then fail (a short write / ENOSPC).
+    AfterPartialWrite,
+    /// Write and sync everything, then fail just before the rename.
+    BeforeRename,
+    /// Just before the rename, move the target's directory aside and put a
+    /// fresh directory at its old path (the review MINOR-12 race): the
+    /// rename must still land in the directory that was pinned.
+    SwapDirectoryBeforeRename,
+    /// Read the target's ACL by path, as when /proc is not mounted.
+    ForceAclPathFallback,
+    /// In the by-path fallback, replace the target by another file between
+    /// the ACL read and the identity re-check (review R2).
+    SwapTargetBetweenLookups,
+}
+
+const WRITE_ATOMIC_OPT_KEYS: &[&str] = &["durability", "mode", "max_bytes"];
+
+fn parse_write_atomic_opts(path: &str, v: Option<&Value>) -> MixResult<WriteAtomicOpts> {
+    let caller = "write_atomic";
+    let mut opts = WriteAtomicOpts {
+        durability: WriteDurability::None,
+        mode: None,
+        max_bytes: None,
+    };
+    let map = match v {
+        None | Some(Value::Nil) => return Ok(opts),
+        Some(Value::Map(m)) => m,
+        Some(other) => {
+            return Err(opt_invalid(
+                caller,
+                format!("options must be a map, got {}", other.type_name()),
+            ));
+        }
+    };
+    for (key, val) in map.iter() {
+        match key.as_str() {
+            "durability" => {
+                opts.durability = match val {
+                    Value::String(s) if s == "none" => WriteDurability::None,
+                    Value::String(s) if s == "file" => WriteDurability::File,
+                    Value::String(s) if s == "full" => WriteDurability::Full,
+                    other => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!(
+                                "durability must be \"none\", \"file\" or \"full\", got {}",
+                                match other {
+                                    Value::String(s) => format!("\"{}\"", sanitize_for_diag(s)),
+                                    other => other.type_name().to_string(),
+                                }
+                            ),
+                        ));
+                    }
+                };
+            }
+            "mode" => {
+                opts.mode = match val {
+                    Value::Nil => None,
+                    Value::Number(_) | Value::String(_) => Some(
+                        parse_octal_mode("write_atomic", path, val)
+                            .map_err(|e| opt_invalid(caller, format!("{e}")))?,
+                    ),
+                    other => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!(
+                                "mode must be an octal number or string, got {}",
+                                other.type_name()
+                            ),
+                        ));
+                    }
+                };
+            }
+            "max_bytes" => {
+                let n = match extract_number(val, InputPolicy::NumberOnly) {
+                    Some(n) => n,
+                    None => {
+                        return Err(opt_invalid(
+                            caller,
+                            format!("max_bytes must be a number, got {}", val.type_name()),
+                        ));
+                    }
+                };
+                opts.max_bytes = Some(as_count("write_atomic: max_bytes", n, usize::MAX).map_err(
+                    |_| {
+                        opt_invalid(
+                            caller,
+                            format!("max_bytes must be a non-negative whole number, got {n}"),
+                        )
+                    },
+                )?);
+            }
+            other => {
+                return Err(opt_invalid(
+                    caller,
+                    format!(
+                        "unknown option '{}' (supported: {})",
+                        sanitize_for_diag(other),
+                        WRITE_ATOMIC_OPT_KEYS.join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+/// `write_atomic(path, data[, {durability, mode, max_bytes}])` — replace (or
+/// create) a file so that every reader, and every crash, sees either the old
+/// complete file or the new complete file, never a partial one.
+///
+/// The standard primitive for the write-temp-beside-then-rename sequence
+/// io.md used to spell out by hand: the temp name is claimed `O_EXCL` in the
+/// target's own directory (so the rename is same-filesystem), the existing
+/// target's mode and owner carry over to the new inode, and ANY failure
+/// before the rename removes the temp and leaves the target untouched.
+fn builtin_write_atomic(args: Vec<Value>) -> MixResult<Option<Value>> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(MixError::structured(
+            "TYPE_MISMATCH",
+            format!(
+                "write_atomic: expected 2 or 3 args (path, data, [opts]), got {}",
+                args.len()
+            ),
+        ));
+    }
+    let path = match &args[0] {
+        Value::String(s) if !s.is_empty() && !s.contains('\0') => s.clone(),
+        Value::String(_) => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                "write_atomic: path must be a non-empty string without NUL bytes".to_string(),
+            ));
+        }
+        other => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!("write_atomic: path must be a string, got {}", other.type_name()),
+            ));
+        }
+    };
+    // Strict: a string, bytes or a buffer. write_file's "stringify anything"
+    // would write `<bytes:N>`-style renderings of a wrong value atomically —
+    // a perfectly durable wrong answer.
+    let data: Vec<u8> = match &args[1] {
+        Value::String(s) => s.as_bytes().to_vec(),
+        Value::Bytes(b) => b.as_slice().to_vec(),
+        Value::Buffer(b) => b.borrow().as_slice().to_vec(),
+        other => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!(
+                    "write_atomic: data must be a string, bytes or buffer, got {}",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    let opts = parse_write_atomic_opts(&path, args.get(2))?;
+    write_atomic_impl(&path, &data, &opts, AtomicFault::None)?;
+    Ok(Some(Value::Nil))
+}
+
+const ACL_ACCESS_XATTR: &std::ffi::CStr = c"system.posix_acl_access";
+
+/// The file's POSIX access ACL as its raw xattr, `None` when it has none or
+/// the filesystem does not support ACLs. `follow` picks getxattr (for
+/// write_atomic's /proc/self/fd/N magic link to the target's own O_PATH fd,
+/// which must be followed to reach the inode) or lgetxattr (the by-path
+/// fallback, where a name swapped for a symlink must not have its referent's
+/// ACL read).
+fn read_access_acl(path: &std::path::Path, follow: bool) -> std::io::Result<Option<Vec<u8>>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    loop {
+        // SAFETY: size query — a null buffer of length 0.
+        let size = unsafe {
+            if follow {
+                libc::getxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+            } else {
+                libc::lgetxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+            }
+        };
+        if size < 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::ENODATA) | Some(libc::EOPNOTSUPP) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` is exactly `size` writable bytes.
+        let got = unsafe {
+            if follow {
+                libc::getxattr(
+                    c_path.as_ptr(),
+                    ACL_ACCESS_XATTR.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            } else {
+                libc::lgetxattr(
+                    c_path.as_ptr(),
+                    ACL_ACCESS_XATTR.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            }
+        };
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(Some(buf));
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ERANGE) {
+            return Err(e);
+        }
+        // ERANGE: the ACL grew between the two calls — size it again.
+    }
+}
+
+/// Make `file`'s access ACL exactly `acl`: set it, or — when the old target
+/// had none — remove one the new inode may have inherited from a default ACL
+/// on the directory. A filesystem without ACL support has nothing to carry.
+fn set_access_acl(file: &std::fs::File, acl: Option<&[u8]>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is open for the call; `acl` is a valid byte slice.
+    let rc = unsafe {
+        match acl {
+            Some(acl) => {
+                libc::fsetxattr(fd, ACL_ACCESS_XATTR.as_ptr(), acl.as_ptr().cast(), acl.len(), 0)
+            }
+            None => libc::fremovexattr(fd, ACL_ACCESS_XATTR.as_ptr()),
+        }
+    };
+    if rc == -1 {
+        let e = std::io::Error::last_os_error();
+        if acl.is_none() && matches!(e.raw_os_error(), Some(libc::ENODATA) | Some(libc::EOPNOTSUPP)) {
+            return Ok(());
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The one failure AFTER the rename (review MINOR-8): the new content IS in
+/// place, only its durability is unconfirmed. A distinct code plus
+/// `details.replaced: true` lets a gate tell it from every other failure —
+/// which all leave the target untouched — so it never "rolls back" a file
+/// that was in fact replaced.
+fn write_atomic_not_durable(
+    path: &str,
+    dir: &std::path::Path,
+    error: &std::io::Error,
+) -> MixError {
+    let mut details = indexmap::IndexMap::new();
+    details.insert("replaced".to_string(), Value::Bool(true));
+    details.insert("path".to_string(), Value::String(path.to_string()));
+    details.insert(
+        "directory".to_string(),
+        Value::String(dir.to_string_lossy().into_owned()),
+    );
+    MixError::Structured(Box::new(
+        crate::error::ErrorInfo::new(
+            "WRITE_NOT_DURABLE",
+            format!(
+                "write_atomic '{path}': replaced, but syncing the directory failed \
+                 (the new content is in place and not yet known durable): {error}"
+            ),
+        )
+        .with_details(Value::map(details)),
+    ))
+}
+
+fn write_atomic_error(path: &str, what: &str, error: &std::io::Error) -> MixError {
+    MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': {what}: {error}"),
+    }
+}
+
+fn write_atomic_impl(
+    path: &str,
+    data: &[u8],
+    opts: &WriteAtomicOpts,
+    fault: AtomicFault,
+) -> MixResult<()> {
+    use std::ffi::CString;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    if let Some(max) = opts.max_bytes
+        && data.len() > max
+    {
+        return Err(MixError::structured(
+            "WRITE_TOO_LARGE",
+            format!(
+                "write_atomic '{path}': {} bytes exceeds max_bytes {max}; nothing was written",
+                data.len()
+            ),
+        ));
+    }
+    // "dir/file/" names a DIRECTORY `file`; open(2) would say ENOTDIR. Without
+    // this, Path::file_name() quietly drops the slash and a regular file is
+    // created (review NIT).
+    if path.ends_with('/') {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("write_atomic '{path}': a path ending in '/' names a directory"),
+        });
+    }
+
+    // A symlink is followed to the file it names, so the LINK survives and its
+    // target is what gets replaced — write_file's semantics. Renaming over the
+    // link itself would silently turn it into a regular file.
+    let target: PathBuf = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
+            .map_err(|e| write_atomic_error(path, "resolving symlink", &e))?,
+        _ => PathBuf::from(path),
+    };
+    let name = target.file_name().ok_or_else(|| MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': path names no file"),
+    })?;
+    let dir: PathBuf = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let name_c = CString::new(name.as_bytes()).map_err(|_| MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': path contains a NUL byte"),
+    })?;
+
+    // Pin the directory (review MINOR-12). Every later step — inspecting the
+    // target, creating the temp, the rename, cleanup, the directory fsync —
+    // is relative to THIS open directory, so renaming or replacing it (or
+    // any parent) mid-call cannot redirect the write somewhere else.
+    // O_PATH (review R3): pinning needs no READ permission on the directory,
+    // so a write+search-only directory (0300) works exactly as the path-based
+    // code did. Only the directory fsync needs a readable fd; see below.
+    let dir_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&dir)
+        .map_err(|e| write_atomic_error(path, "opening the target's directory", &e))?;
+    let dirfd = dir_fd.as_raw_fd();
+
+    // Inspect the final name WITHOUT following it, through ONE handle (review
+    // R2): open it O_PATH|O_NOFOLLOW and take type, owner and mode from
+    // fstat of that fd, and the ACL through the same fd — so the ACL can
+    // never come from a different inode than the owner and mode. A regular
+    // target resolved above that is now a symlink was swapped concurrently:
+    // refuse rather than replace a link the caller never named.
+    struct Existing {
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        dev: u64,
+        ino: u64,
+    }
+    let target_fd: Option<std::fs::File> = {
+        // SAFETY: openat with a valid dirfd and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name_c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd == -1 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(write_atomic_error(path, "opening target", &e));
+            }
+            None
+        } else {
+            // SAFETY: openat returned a fresh descriptor we now own.
+            Some(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+    };
+    let existing: Option<Existing> = match &target_fd {
+        None => None,
+        Some(tfd) => {
+            // SAFETY: fstat writes only into the zeroed local `st`.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(tfd.as_raw_fd(), &mut st) } == -1 {
+                return Err(write_atomic_error(
+                    path,
+                    "stat target",
+                    &std::io::Error::last_os_error(),
+                ));
+            }
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => Some(Existing {
+                    uid: st.st_uid,
+                    gid: st.st_gid,
+                    mode: st.st_mode & 0o7777,
+                    dev: st.st_dev,
+                    ino: st.st_ino,
+                }),
+                libc::S_IFLNK => {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "write_atomic '{path}': the target became a symlink while it was \
+                             being resolved (concurrent replacement); nothing was written"
+                        ),
+                    });
+                }
+                _ => {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "write_atomic '{path}': target exists and is not a regular file"
+                        ),
+                    });
+                }
+            }
+        }
+    };
+
+    // The existing target's POSIX access ACL. With /proc it is read through
+    // the target's own O_PATH fd (/proc/self/fd/N, followed to that inode).
+    // Without /proc (review R2: every overwrite used to raise ENOENT there)
+    // it is read by path, and the name is then re-checked: a dev/ino other
+    // than the one fstat saw means the name was swapped between the two
+    // lookups, and the call refuses rather than pair one inode's ACL with
+    // another's owner and mode.
+    let existing_acl = match (&existing, &target_fd) {
+        (Some(ex), Some(tfd)) => {
+            let proc_fd = PathBuf::from(format!("/proc/self/fd/{}", tfd.as_raw_fd()));
+            let use_proc = !matches!(
+                fault,
+                AtomicFault::ForceAclPathFallback | AtomicFault::SwapTargetBetweenLookups
+            )
+                && std::path::Path::new("/proc/self/fd").is_dir();
+            if use_proc {
+                read_access_acl(&proc_fd, true)
+                    .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?
+            } else {
+                let acl = read_access_acl(&dir.join(name), false)
+                    .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?;
+                if fault == AtomicFault::SwapTargetBetweenLookups {
+                    let impostor = dir.join(".write-atomic-test-impostor");
+                    let _ = std::fs::write(&impostor, "IMPOSTOR");
+                    let _ = std::fs::rename(&impostor, dir.join(name));
+                }
+                // SAFETY: fstatat writes only into the zeroed local `st`.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(dirfd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                };
+                if rc == -1 || st.st_dev != ex.dev || st.st_ino != ex.ino {
+                    return Err(MixError::structured(
+                        "WRITE_NOT_ATOMIC",
+                        format!(
+                            "write_atomic '{path}': the target was replaced while its metadata \
+                             was being read (no /proc to read it through one handle); nothing \
+                             was written"
+                        ),
+                    ));
+                }
+                acl
+            }
+        }
+        _ => None,
+    };
+    drop(target_fd);
+
+    // Final permissions: an explicit mode wins; otherwise an existing target
+    // keeps its own (including setuid/setgid/sticky); a brand-new file gets
+    // write_file's 0o666 & ~umask, by creating the temp with 0o666.
+    let final_mode = opts.mode.or_else(|| existing.as_ref().map(|ex| ex.mode));
+
+    // Claim a temp name in the pinned directory, O_EXCL, never following a
+    // symlink planted at that name. The visible name is kept short enough
+    // that the temp name cannot exceed NAME_MAX when the target's own name is
+    // long.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let stem = name.to_string_lossy();
+    let mut cut = stem.len().min(200);
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = &stem[..cut];
+    let create_mode: libc::c_uint = if final_mode.is_some() { 0o600 } else { 0o666 };
+    let mut claimed: Option<(CString, std::fs::File)> = None;
+    for _ in 0..16 {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let tmp_name = format!(
+            ".{stem}.mixtmp-{}-{}-{nonce:08x}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let tmp_c = CString::new(tmp_name).expect("temp name built from a NUL-free stem");
+        // SAFETY: openat with a valid dirfd and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                tmp_c.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                create_mode,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat returned a fresh descriptor we now own.
+            claimed = Some((tmp_c, unsafe { std::fs::File::from_raw_fd(fd) }));
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(write_atomic_error(path, "creating temp file", &e));
+    }
+    let (tmp_c, mut file) = claimed.ok_or_else(|| MixError::RuntimeError {
+        span: None,
+        msg: format!("write_atomic '{path}': could not claim a unique temp name"),
+    })?;
+
+    let staged = (|| -> Result<(), (&'static str, std::io::Error)> {
+        // Owner first; mode and ACL after the write (see below).
+        if let Some(ex) = &existing {
+            let mine = file.metadata().map_err(|e| ("stat temp file", e))?;
+            if mine.uid() != ex.uid || mine.gid() != ex.gid {
+                std::os::unix::fs::fchown(&file, Some(ex.uid), Some(ex.gid)).map_err(|e| {
+                    (
+                        "cannot keep the existing owner (write_atomic will not silently \
+                         change who owns a file)",
+                        e,
+                    )
+                })?;
+            }
+        }
+        if fault == AtomicFault::AfterPartialWrite {
+            file.write_all(&data[..data.len() / 2])
+                .map_err(|e| ("writing", e))?;
+            return Err(("writing", std::io::Error::other("injected short write")));
+        }
+        file.write_all(data).map_err(|e| ("writing", e))?;
+        // Permissions go on AFTER the write: a write by a process without
+        // CAP_FSETID clears setuid (and group-exec setgid), so a mode applied
+        // first would silently lose those bits. First the access ACL (review
+        // MAJOR-5): the new inode must not be WIDER than the old one, which it
+        // would be if an ACL's mask were dropped and only the mode bits copied.
+        if existing.is_some() {
+            set_access_acl(&file, existing_acl.as_deref()).map_err(|e| {
+                (
+                    "cannot carry the existing access ACL onto the new file \
+                     (write_atomic will not widen access by dropping it)",
+                    e,
+                )
+            })?;
+        }
+        if let Some(mode) = final_mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| ("setting mode", e))?;
+        }
+        if opts.durability != WriteDurability::None {
+            file.sync_all().map_err(|e| ("syncing temp file", e))?;
+        }
+        if fault == AtomicFault::BeforeRename {
+            return Err(("renaming", std::io::Error::other("injected rename failure")));
+        }
+        if fault == AtomicFault::SwapDirectoryBeforeRename {
+            let aside = dir.with_extension("moved");
+            std::fs::rename(&dir, &aside).map_err(|e| ("test: moving dir aside", e))?;
+            std::fs::create_dir(&dir).map_err(|e| ("test: recreating dir", e))?;
+        }
+        // renameat never follows the final component: if another process
+        // swapped the target for a symlink after the check above, THAT name
+        // is what gets replaced — last writer wins on the name.
+        // SAFETY: both names are NUL-terminated; dirfd is open.
+        if unsafe { libc::renameat(dirfd, tmp_c.as_ptr(), dirfd, name_c.as_ptr()) } == -1 {
+            return Err(("renaming over target", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    })();
+    drop(file);
+    if let Err((what, e)) = staged {
+        // SAFETY: removing our own temp name inside the pinned directory.
+        unsafe {
+            libc::unlinkat(dirfd, tmp_c.as_ptr(), 0);
+        }
+        // The temp is always beside the target, so EXDEV/EBUSY at the rename
+        // means the target is itself a mount point — a bind-mounted file
+        // (review NIT). That can never be replaced atomically; say so with a
+        // code, not a bare errno.
+        if what == "renaming over target"
+            && matches!(e.raw_os_error(), Some(libc::EXDEV) | Some(libc::EBUSY))
+        {
+            return Err(MixError::structured(
+                "WRITE_NOT_ATOMIC",
+                format!(
+                    "write_atomic '{path}': the target is a mount point (a bind-mounted \
+                     file?), which rename cannot replace; nothing was written — write_file \
+                     rewrites it in place, non-atomically ({e})"
+                ),
+            ));
+        }
+        return Err(write_atomic_error(path, what, &e));
+    }
+
+    if opts.durability == WriteDurability::Full {
+        // fsync needs a real (readable) fd; the pin is O_PATH. Reopen the SAME
+        // directory through it — openat(dirfd, ".") needs no /proc. A
+        // directory this process cannot read cannot be fsynced: that is
+        // WRITE_NOT_DURABLE, never a silent claim of durability.
+        // SAFETY: openat with a valid dirfd and a static NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(dirfd, c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        };
+        let synced = if fd == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a fresh descriptor we now own.
+            unsafe { std::fs::File::from_raw_fd(fd) }.sync_all()
+        };
+        if let Err(e) = synced {
+            return Err(write_atomic_not_durable(path, &dir, &e));
+        }
+    }
+    Ok(())
 }
 
 // --- JSON builtins (feature-gated) ---
@@ -22276,6 +23642,62 @@ mod ssh_helpers_tests {
         crate::interrupt::_test_clear();
     }
 
+    /// Review MINOR-13: Ctrl-C sweeps the whole group. The leader obeys
+    /// SIGTERM at once; its descendant ignores it, so the interrupt path waits
+    /// the 2 s grace for the GROUP and then SIGKILLs it — the descendant is
+    /// gone, not orphaned, and its pid (echoed before the interrupt) proves it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_with_timeout_interrupt_sweeps_a_term_ignoring_descendant() {
+        let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
+        crate::interrupt::_test_clear();
+        let f = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _ = crate::interrupt::init(f.clone());
+        let sidecar = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            crate::interrupt::INTERRUPT_FLAG
+                .get()
+                .expect("flag wired")
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let argv = sh("(trap '' TERM; exec sleep 60) & echo $!; wait");
+        let started = std::time::Instant::now();
+        let outcome = run_with_timeout(&argv, None, 0, "test", None).expect("spawn ok");
+        let elapsed = started.elapsed();
+        sidecar.join().unwrap();
+        crate::interrupt::_test_clear();
+        assert!(outcome.interrupted, "expected interrupted=true");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(2000),
+            "the grace must be waited for the group, not just the leader: {elapsed:?}"
+        );
+        let descendant: i32 = String::from_utf8_lossy(&outcome.stdout)
+            .trim()
+            .parse()
+            .expect("descendant pid on stdout");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let gone = loop {
+            let state = std::fs::read_to_string(format!("/proc/{descendant}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(')').map(|(_, r)| r.trim_start().starts_with('Z')));
+            if state.unwrap_or(true) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        if !gone {
+            // SAFETY: cleanup of a process this test created.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        assert!(gone, "Ctrl-C left the TERM-ignoring descendant {descendant} running");
+    }
+
+
     #[test]
     fn run_with_timeout_signal_killed_exit_code() {
         let _g = crate::interrupt::TEST_LOCK.lock().unwrap();
@@ -22920,6 +24342,584 @@ mod chmod_tests {
             Some("VALUE_OUT_OF_RANGE")
         );
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// Review R4: the /proc stat parser takes bytes, finds the fields after the
+/// LAST ')', and refuses malformed records (which the scan treats as live).
+#[cfg(all(test, target_os = "linux"))]
+mod proc_scan_tests {
+    use super::{group_has_live_members, parse_proc_stat_state_pgrp};
+
+    #[test]
+    fn stat_records_parse_as_bytes_after_the_last_paren() {
+        assert_eq!(
+            parse_proc_stat_state_pgrp(b"123 (sh) S 1 4242 4242 0 -1"),
+            Some((b'S', 4242))
+        );
+        // comm with spaces, a ')' and a non-UTF-8 byte.
+        assert_eq!(
+            parse_proc_stat_state_pgrp(b"7 (a b) \xff) Z 1 99 99 0"),
+            Some((b'Z', 99))
+        );
+        assert_eq!(parse_proc_stat_state_pgrp(b"7 (x) R 1"), None, "no pgrp field");
+        assert_eq!(parse_proc_stat_state_pgrp(b"7 x R 1 2 3"), None, "no parenthesis");
+        assert_eq!(parse_proc_stat_state_pgrp(b"7 (x) R 1 notanumber"), None);
+    }
+
+    #[test]
+    fn the_callers_own_group_is_live() {
+        // SAFETY: getpgrp has no preconditions.
+        let pgid = unsafe { libc::getpgrp() };
+        assert!(group_has_live_members(pgid));
+    }
+}
+
+/// Review MAJOR-4: the owned-spawn registry is the only reaper of an owned
+/// pid. These drive the registry directly (no host enable needed) and are the
+/// only unit tests that register, so the process-wide sweep sees only theirs;
+/// one mutex keeps them from sweeping each other.
+#[cfg(all(test, target_os = "linux"))]
+mod owned_spawns_tests {
+    use super::{builtin_process_alive, owned_spawns};
+    use crate::value::Value;
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn state(pid: i32) -> Option<char> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat.rsplit_once(')')?.1.trim_start().chars().next()
+    }
+
+    fn gone(pid: i32, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if matches!(state(pid), None | Some('Z')) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // The Child handle is deliberately never wait()ed: reaping an owned pid
+    // is the registry's job, and that is exactly what these tests check.
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn process_alive_on_a_dead_owned_child_retires_it_and_the_sweep_signals_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = owned_spawns::sweep();
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        owned_spawns::register(pid);
+        // SAFETY: killing our own child.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state(pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alive = builtin_process_alive(vec![Value::Number(pid as f64)])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(alive, Value::Bool(false)), "{alive:?}");
+        assert_eq!(state(pid), None, "the registry reaps its own finished child");
+        assert_eq!(owned_spawns::sweep(), 0, "a retired pid must never be signalled");
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn a_dead_leader_with_a_live_descendant_stays_pinned_and_is_swept() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = owned_spawns::sweep();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 60 & echo $!; exec sleep 0.1"])
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant: i32 = line.trim().parse().unwrap();
+        owned_spawns::register(pid);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state(pid) != Some('Z') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let alive = builtin_process_alive(vec![Value::Number(pid as f64)])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(alive, Value::Bool(false)), "the leader itself is dead: {alive:?}");
+        assert_eq!(state(pid), Some('Z'), "kept unreaped: it pins the live group");
+        assert_eq!(owned_spawns::sweep(), 1);
+        let swept = gone(descendant, Duration::from_secs(5));
+        if !swept {
+            // SAFETY: cleanup of a process this test created.
+            unsafe {
+                libc::kill(descendant, libc::SIGKILL);
+            }
+        }
+        assert!(swept, "the sweep must end the pinned group's descendant");
+        assert_eq!(state(pid), None, "the sweep reaps the leader");
+    }
+}
+
+/// TODO-mix P3 crash consistency: whatever fails, and wherever, the target
+/// is the old complete file or the new complete file and no temp is left.
+/// Faults are injected at the two points a real short write (ENOSPC, EIO)
+/// or a failed rename would strike.
+#[cfg(test)]
+mod write_atomic_tests {
+    use super::{
+        AtomicFault, WriteAtomicOpts, WriteDurability, builtin_write_atomic, write_atomic_impl,
+    };
+    use crate::error::MixError;
+    use crate::value::Value;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tmpdir(suffix: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "cosmix-mix-write-atomic-{}-{}",
+            std::process::id(),
+            suffix
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn leftovers(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".mixtmp-"))
+            .collect()
+    }
+
+    fn opts(durability: WriteDurability) -> WriteAtomicOpts {
+        WriteAtomicOpts {
+            durability,
+            mode: None,
+            max_bytes: None,
+        }
+    }
+
+    fn s(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn short_write_leaves_the_old_complete_file_and_no_temp() {
+        let d = tmpdir("short");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD-COMPLETE").unwrap();
+        for durability in [WriteDurability::None, WriteDurability::File, WriteDurability::Full] {
+            let err = write_atomic_impl(
+                &s(&target),
+                b"NEW-CONTENT-THAT-IS-LONGER",
+                &opts(durability),
+                AtomicFault::AfterPartialWrite,
+            )
+            .expect_err("an injected short write must fail the call");
+            assert!(format!("{err}").contains("writing"), "{err}");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD-COMPLETE");
+            assert_eq!(leftovers(&d), Vec::<String>::new(), "{durability:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_rename_leaves_the_old_complete_file_and_no_temp() {
+        let d = tmpdir("rename");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD-COMPLETE").unwrap();
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::File),
+            AtomicFault::BeforeRename,
+        )
+        .expect_err("an injected rename failure must fail the call");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD-COMPLETE");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review MINOR-12: the directory is pinned when the call starts. Moving
+    /// it aside and putting a fresh directory at its old path just before the
+    /// rename must not redirect the rename: the new content lands in the
+    /// directory that was opened, and nothing appears in the impostor.
+    #[test]
+    fn a_directory_swapped_mid_call_cannot_redirect_the_rename() {
+        let d = tmpdir("pin");
+        let sub = d.join("conf");
+        std::fs::create_dir(&sub).unwrap();
+        let target = sub.join("app.conf");
+        std::fs::write(&target, "OLD").unwrap();
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::Full),
+            AtomicFault::SwapDirectoryBeforeRename,
+        )
+        .expect("the rename lands in the pinned directory");
+        let moved = d.join("conf.moved").join("app.conf");
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "NEW");
+        assert!(!target.exists(), "nothing may be written into the impostor directory");
+        assert_eq!(leftovers(&d.join("conf.moved")), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review R2: with no /proc the ACL is read by path and the target's
+    /// identity re-checked; an ordinary overwrite must still succeed there
+    /// (it used to raise ENOENT on every existing file).
+    #[test]
+    fn the_no_proc_fallback_still_overwrites() {
+        let d = tmpdir("noproc");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::None),
+            AtomicFault::ForceAclPathFallback,
+        )
+        .expect("the by-path fallback overwrites");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review R2: in the by-path fallback, a target swapped between the
+    /// metadata read and the ACL read is detected by dev/ino and refused
+    /// with WRITE_NOT_ATOMIC — one inode's ACL is never paired with
+    /// another's owner and mode. Nothing is written, no temp is left.
+    #[test]
+    fn a_target_swapped_between_lookups_is_refused() {
+        let d = tmpdir("swap");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        let e = write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::None),
+            AtomicFault::SwapTargetBetweenLookups,
+        )
+        .expect_err("a swap between the lookups must be refused");
+        match e {
+            MixError::Structured(info) => assert_eq!(info.code, "WRITE_NOT_ATOMIC"),
+            other => panic!("expected WRITE_NOT_ATOMIC, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "IMPOSTOR",
+            "the call wrote nothing over the swapped-in file"
+        );
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_first_write_leaves_no_file_at_all() {
+        let d = tmpdir("fresh");
+        let target = d.join("new-file");
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::None),
+            AtomicFault::AfterPartialWrite,
+        )
+        .expect_err("injected");
+        assert!(!target.exists(), "a failed create must not leave a partial file");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn success_replaces_completely_and_keeps_the_existing_mode() {
+        let d = tmpdir("ok");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        for durability in ["none", "file", "full"] {
+            let mut o = indexmap::IndexMap::new();
+            o.insert("durability".to_string(), Value::String(durability.to_string()));
+            builtin_write_atomic(vec![
+                Value::String(s(&target)),
+                Value::String(format!("NEW-{durability}")),
+                Value::map(o),
+            ])
+            .expect("write_atomic succeeds");
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), format!("NEW-{durability}"));
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o640, "the existing mode must carry over ({durability})");
+        }
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn explicit_mode_is_exact_and_bytes_are_verbatim() {
+        let d = tmpdir("mode");
+        let target = d.join("secret");
+        let mut o = indexmap::IndexMap::new();
+        o.insert("mode".to_string(), Value::Number(0o600 as f64));
+        builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::Bytes(std::rc::Rc::new(vec![0xff, 0x00, 0x80])),
+            Value::map(o),
+        ])
+        .expect("write_atomic with mode");
+        assert_eq!(std::fs::read(&target).unwrap(), vec![0xff, 0x00, 0x80]);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_symlink_keeps_being_a_link_and_its_target_is_replaced() {
+        let d = tmpdir("link");
+        let real = d.join("real");
+        let link = d.join("link");
+        std::fs::write(&real, "OLD").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        builtin_write_atomic(vec![Value::String(s(&link)), Value::String("NEW".into())])
+            .expect("write through a symlink");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link itself must survive"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "NEW");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review MAJOR-5: a target whose access ACL narrows the group (group::---
+    /// with a named user and mask r--) keeps that exact ACL after the
+    /// replace — copying only the mode bits onto a fresh inode would widen
+    /// group access. Built from the raw xattr so no setfacl is needed; skips
+    /// (loudly) where the filesystem has no ACL support.
+    #[test]
+    fn the_access_acl_is_carried_not_widened() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmpdir("acl");
+        let target = d.join("guarded");
+        std::fs::write(&target, "OLD").unwrap();
+        // posix_acl_xattr v2: {tag u16, perm u16, id u32}, sorted by tag.
+        let entry = |tag: u16, perm: u16, id: u32| {
+            let mut e = tag.to_le_bytes().to_vec();
+            e.extend_from_slice(&perm.to_le_bytes());
+            e.extend_from_slice(&id.to_le_bytes());
+            e
+        };
+        let mut acl = 2u32.to_le_bytes().to_vec();
+        acl.extend(entry(0x01, 6, u32::MAX)); // user::rw-
+        acl.extend(entry(0x02, 6, 65534)); // user:65534:rw-
+        acl.extend(entry(0x04, 0, u32::MAX)); // group::---
+        acl.extend(entry(0x10, 4, u32::MAX)); // mask::r--
+        acl.extend(entry(0x20, 0, u32::MAX)); // other::---
+        let c_path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid path and buffer.
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                super::ACL_ACCESS_XATTR.as_ptr(),
+                acl.as_ptr().cast(),
+                acl.len(),
+                0,
+            )
+        };
+        if rc == -1 {
+            eprintln!(
+                "SKIP the_access_acl_is_carried_not_widened: setxattr: {}",
+                std::io::Error::last_os_error()
+            );
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let before = super::read_access_acl(&target, false).unwrap().expect("ACL was set");
+        let mode_before = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        builtin_write_atomic(vec![Value::String(s(&target)), Value::String("NEW".into())])
+            .expect("write_atomic over an ACL'd file");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        let after = super::read_access_acl(&target, false).unwrap();
+        assert_eq!(after.as_deref(), Some(before.as_slice()), "the access ACL must carry over");
+        let mode_after = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode_after, mode_before);
+        assert_eq!(mode_after & 0o070, 0o040, "group bits show the r-- mask, not wider");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The final mode is applied after the write, so a requested setuid bit
+    /// is not cleared by the kernel's write-clears-setuid rule for writers
+    /// without CAP_FSETID. As root the kernel keeps the bit either way, so
+    /// this only pins the result; the test that bites is
+    /// cosmix-mix/tests/write_atomic_unprivileged.rs, which writes as uid
+    /// 65534 (review R5).
+    #[test]
+    fn a_requested_setuid_bit_survives_the_write() {
+        let d = tmpdir("suid");
+        let target = d.join("tool");
+        let mut o = indexmap::IndexMap::new();
+        o.insert("mode".to_string(), Value::Number(0o4755 as f64));
+        builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::String("#!/bin/sh\n".into()),
+            Value::map(o),
+        ])
+        .expect("write_atomic with setuid mode");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4755);
+        // A later replace keeps it too (carried from the existing target).
+        builtin_write_atomic(vec![Value::String(s(&target)), Value::String("#!/bin/sh\n# v2\n".into())])
+            .expect("second write");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o4755);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The post-rename durability failure is distinguishable by code and by
+    /// `details.replaced`, not only by message text. (A failing directory
+    /// fsync cannot be provoked portably in a test, so the error's shape is
+    /// pinned at its single construction site.)
+    #[test]
+    fn a_post_rename_sync_failure_says_the_file_was_replaced() {
+        let e = super::write_atomic_not_durable(
+            "/x/y",
+            std::path::Path::new("/x"),
+            &std::io::Error::from_raw_os_error(libc::EIO),
+        );
+        match e {
+            MixError::Structured(info) => {
+                assert_eq!(info.code, "WRITE_NOT_DURABLE");
+                let Value::Map(details) = &info.details else {
+                    panic!("details must be a map: {:?}", info.details);
+                };
+                assert!(matches!(details.get("replaced"), Some(Value::Bool(true))));
+                assert!(matches!(details.get("directory"), Some(Value::String(d)) if d == "/x"));
+                assert!(info.message.contains("in place"), "{}", info.message);
+            }
+            other => panic!("expected a structured error, got {other:?}"),
+        }
+    }
+
+    /// Owner and group carry over to the new inode. Needs root to create a
+    /// target owned by someone else; an unprivileged run can own nothing but
+    /// its own files, which is also why the EPERM refusal branch cannot be
+    /// staged here — it is covered by reading: fchown's error aborts before
+    /// the rename, like every other staged failure (see the fault tests).
+    #[test]
+    fn the_owner_is_kept_when_replacing_another_users_file() {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP the_owner_is_kept_when_replacing_another_users_file: not root");
+            return;
+        }
+        let d = tmpdir("owner");
+        let target = d.join("users-file");
+        std::fs::write(&target, "OLD").unwrap();
+        std::os::unix::fs::chown(&target, Some(65534), Some(65534)).unwrap();
+        builtin_write_atomic(vec![Value::String(s(&target)), Value::String("NEW".into())])
+            .expect("root keeps the owner");
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (65534, 65534), "owner must carry over");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A dangling symlink raises (nothing to resolve to) and a symlink whose
+    /// referent is a directory raises "not a regular file" — both touching
+    /// nothing, the link included.
+    #[test]
+    fn dangling_and_directory_symlinks_are_refused() {
+        let d = tmpdir("links");
+        let dangling = d.join("dangling");
+        std::os::unix::fs::symlink(d.join("absent"), &dangling).unwrap();
+        let e = builtin_write_atomic(vec![Value::String(s(&dangling)), Value::String("X".into())])
+            .unwrap_err();
+        assert!(format!("{e}").contains("resolving symlink"), "{e}");
+        assert!(std::fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert!(!d.join("absent").exists());
+
+        let sub = d.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let to_dir = d.join("to-dir");
+        std::os::unix::fs::symlink(&sub, &to_dir).unwrap();
+        let e = builtin_write_atomic(vec![Value::String(s(&to_dir)), Value::String("X".into())])
+            .unwrap_err();
+        assert!(format!("{e}").contains("not a regular file"), "{e}");
+        assert!(std::fs::symlink_metadata(&to_dir).unwrap().file_type().is_symlink());
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+
+        let e = builtin_write_atomic(vec![
+            Value::String(format!("{}/", s(&d.join("file")))),
+            Value::String("X".into()),
+        ])
+        .unwrap_err();
+        assert!(format!("{e}").contains("names a directory"), "{e}");
+        assert!(!d.join("file").exists(), "a trailing slash must not create a file");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refusals_touch_nothing() {
+        let d = tmpdir("refuse");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        let code = |e: MixError| match e {
+            MixError::Structured(info) => info.code,
+            other => format!("{other}"),
+        };
+
+        let mut o = indexmap::IndexMap::new();
+        o.insert("max_bytes".to_string(), Value::Number(2.0));
+        let e = builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::String("TOO-LONG".into()),
+            Value::map(o),
+        ])
+        .unwrap_err();
+        assert_eq!(code(e), "WRITE_TOO_LARGE");
+
+        let mut o = indexmap::IndexMap::new();
+        o.insert("durability".to_string(), Value::String("fsync".into()));
+        let e = builtin_write_atomic(vec![
+            Value::String(s(&target)),
+            Value::String("X".into()),
+            Value::map(o),
+        ])
+        .unwrap_err();
+        assert_eq!(code(e), "OPTION_INVALID");
+
+        let e = builtin_write_atomic(vec![Value::String(s(&target)), Value::Number(1.0)])
+            .unwrap_err();
+        assert_eq!(code(e), "TYPE_MISMATCH");
+
+        let e = builtin_write_atomic(vec![Value::String(s(&d)), Value::String("X".into())])
+            .unwrap_err();
+        assert!(format!("{e}").contains("not a regular file"), "{e}");
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "OLD");
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

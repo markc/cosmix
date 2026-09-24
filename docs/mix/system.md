@@ -73,12 +73,51 @@ Options (unknown keys are a hard `OPTION_INVALID` error):
   and capture drains. With `timeout: 0`, Mix waits for every captured stream to
   reach EOF; it does not abandon a reader merely because the direct child has
   exited. Note `run`/`run_rc` default to no deadline.
+- `grace`: seconds, default **0**, fractional ok — what happens AT the
+  deadline. `0` SIGKILLs the child's process group at once (the historic hard
+  kill). A positive grace sends SIGTERM to the group, then waits until the
+  **whole group** is gone or `grace` runs out, then SIGKILLs whatever is
+  left. The grace covers the group, not only the child. In
+  `sh -c "pg_dump app | gzip > f"`, `sh` may die at once, but `pg_dump` and
+  `gzip` still get the full grace to finish. A descendant that ignores SIGTERM
+  is killed at the grace deadline, never left running. The same escalation
+  applies when the child has already exited but a descendant still holds a
+  captured stream open at the deadline. The call can therefore take up to
+  `timeout + grace`. The result still reports `timed_out: true`, and `signal`
+  says how the child ended: `15` if it obeyed SIGTERM, `9` if it had to be
+  killed. `grace` with `timeout: 0` raises
+  `OPTION_INVALID`, because without a deadline it would do nothing.
+
+  ```mix
+  $r = run_argv(["pg_dump", "app"], {timeout: 600, grace: 10,
+                                     stdout: {file: "/srv/app.sql"}})
+  if $r.timed_out then
+    eprint("dump cut off at the deadline (signal " .. $r.signal .. ")")
+  end
+  ```
 - `stdin`: `nil` or `{null: true}` closes stdin; string/bytes/buffer supplies
-  those bytes; `{file: path}` opens a local file for the child to read. There is
-  deliberately no `stdin: "inherit"` route: run_argv puts its child in a new
-  process group, so it is not the terminal's foreground group and a terminal
-  read can receive `SIGTTIN`. The string `"inherit"` is ordinary stdin data.
-  Use `run_stream` when a child must own the terminal and inherited stdin. With
+  those bytes; `{file: path}` opens a local file for the child to read.
+  `{inherit: true}` hands the child mix's own stdin, but **only when that
+  stdin is not a terminal**, such as a pipe or a redirected file:
+
+  ```mix
+  -- producer | mix filter.mix
+  $r = run_argv(["sort", "-u"], {stdin: {inherit: true}})
+  ```
+
+  When mix's stdin is a terminal, `{inherit: true}` raises `STDIN_TERMINAL`
+  before anything spawns. run_argv puts its child in a new process group, so it
+  is not the terminal's foreground group, and a terminal read would stop it
+  with `SIGTTIN`. The call would then hang until its deadline. That is why
+  there is no string form either: `stdin: "inherit"` is ordinary stdin data,
+  the seven bytes `inherit`. Use `run_stream` when a child must own the
+  terminal and its stdin. The same rule applies to stage 0 of `run_pipeline`
+  and to `run_parallel` jobs. At most one `run_parallel` job may inherit
+  stdin. Inheriting stdin makes sense for a script run as `mix script.mix`
+  or `mix -`, where stdin is data. A bare REPL fed through a pipe reads its
+  own input lines from that same stdin, so an inheriting child there would
+  compete with the REPL for the lines of the script. Two or more raise `OPTION_INVALID` before any job runs, because
+  concurrent readers of one pipe would race for its bytes. With
   `timeout: 0`, Mix also waits for a stdin-data writer to finish after the
   direct child exits. A descendant which retains the read end without consuming
   the data can therefore make the call wait indefinitely; that is the explicit
@@ -199,7 +238,7 @@ execution and familiar result fields as `run_argv`, plus its one-element
 The distinct `pipeline_result` map always contains, in order:
 `ok`, `exit_code`, `stdout`, `stderr`, `timed_out`, `interrupted`, `signal`,
 `duration_ms`, `stdout_truncated`, `stderr_truncated`, `utf8_lossy`,
-`error_code`, `error`, `stages`.
+`error_code`, `error`, `stages`, `status`, `failed_stage`, `summary`.
 
 - `exit_code` and `signal` describe the **last** stage. They do not alone decide
   overall success: a middle-stage failure makes `.ok` false even when the last
@@ -220,8 +259,60 @@ The distinct `pipeline_result` map always contains, in order:
 
 Each `.stages[i]` map contains, in order: `index`, `argv`, `ok`, `exit_code`,
 `signal`, `duration_ms`, `stderr`, `stderr_truncated`, `utf8_lossy`,
-`accepted_signal`. Stage stderr is untrimmed. `accepted_signal` records the
-SIGPIPE policy below; it is false for ordinary exits and rejected signals.
+`accepted_signal`, `status`, `broken_pipe`. Stage stderr is untrimmed.
+`accepted_signal` records the SIGPIPE policy below; it is false for ordinary
+exits and rejected signals.
+
+#### Why each stage ended — `status`, `failed_stage`, `summary`
+
+Gates branch on these fields, never on stderr or `summary` text. A stage's
+`status` is the first of these that applies:
+
+| stage `status` | meaning |
+|---|---|
+| `ok` | exited 0 |
+| `timeout` / `interrupted` | still running when the deadline / Ctrl-C made Mix signal its group — the death is Mix's, not the stage's |
+| `broken_pipe` | killed by SIGPIPE: its reader closed (also set when `allow_signal` accepted it — `.ok` carries the acceptance, `status` the fact) |
+| `signal` | killed by any other signal (`.signal` names it) |
+| `exit_nonzero` | exited with a non-zero code (`.exit_code`) |
+| `setup_error` | started, then killed because a later stage could not be set up |
+
+`broken_pipe` (bool) is true whenever SIGPIPE killed the stage. SIGPIPE is the
+only evidence of a closed reader that a stage cannot forge: a program that
+ignores SIGPIPE and exits non-zero on `EPIPE` reports `exit_nonzero`.
+
+The pipeline's `status` is `setup_error` (with `error_code`), else
+`interrupted`, else `timeout`, else `ok` when `.ok` is true, else the status of
+`failed_stage`. `failed_stage` is the **rightmost** stage whose `ok` is false —
+`set -o pipefail`'s rule — or `nil`. Rightmost because a downstream stage that
+exits early leaves its writer with a broken pipe: in `yes | sh -c 'exit 3'` the
+cause is stage 1 (`exit_nonzero`) and stage 0's `broken_pipe` is the symptom.
+For `PIPELINE_SPAWN` it is the stage that could not start; other setup errors
+name no stage.
+
+`summary` is a one-line human rendering with no durations, so it is stable
+across runs:
+
+```
+ok (2 stages)
+ok (2 stages; stage[0] yes broken pipe accepted)
+stage[1] sh exited 3
+stage[0] sh killed by signal 15
+stage[0] yes: broken pipe (its reader closed)
+timed out (deadline 300 ms); killed stage[1] sleep
+```
+
+A captured stream that truncated appends ` [output truncated]`.
+
+```mix
+$r = run_pipeline([["producer"], ["filter"], ["consumer"]], {timeout: 60})
+if $r.status == "timeout" then
+  eprint("slow: " .. $r.summary)
+elif $r.status != "ok" then
+  $s = $r.stages[$r.failed_stage]
+  eprint("stage " .. $s.index .. " " .. $s.status .. ": " .. $s.stderr)
+end
+```
 
 Pipeline options (unknown keys raise `OPTION_INVALID`):
 
@@ -286,7 +377,12 @@ stdout unchanged only when the aggregate `.ok` is true and no captured stream
 was truncated. Otherwise it raises `PIPELINE_EXIT_NONZERO`, `PIPELINE_TIMEOUT`,
 `PIPELINE_SIGNAL`, `PIPELINE_INTERRUPTED`, `PIPELINE_OUTPUT_LIMIT`, or the
 setup/lifecycle code above. The complete pipeline_result is always available as
-`$err.details.result`.
+`$err.details.result`. A stage failure is raised from that result's own
+`status` and `failed_stage`, so the raise and the result always agree. A
+`signal` or `broken_pipe` status gives `PIPELINE_SIGNAL`, anything else gives
+`PIPELINE_EXIT_NONZERO`, and the message names `failed_stage`. For
+`yes | sh -c 'exit 3'` that is `PIPELINE_EXIT_NONZERO` for stage 1, not
+stage 0's broken pipe.
 
 ### run — stdout string, fail-fast
 
@@ -407,8 +503,17 @@ The full status contract:
 Kill mechanics (the same machinery as [`ssh_run`](remote.md)): the child is
 spawned in its **own process group**, so the kill reaches every descendant — an
 `ssh` helper or forked worker can't keep the pipes open past the deadline. A
-timeout SIGKILLs the group immediately; a Ctrl-C sends SIGTERM, waits a 2-second
-grace, then SIGKILLs. An interrupt that lands on the same poll as the deadline
+timeout SIGKILLs the group immediately (`run_argv` can opt into SIGTERM first
+with `grace`); a Ctrl-C sends SIGTERM, waits a 2-second grace, then SIGKILLs.
+Every SIGTERM path waits for the whole group to empty, bounded by its grace,
+then SIGKILLs the group. A descendant that honours SIGTERM can finish its
+cleanup; one that ignores it is killed at the deadline, not orphaned. On Linux
+the child is reaped only after that, so its zombie keeps the group id
+reserved and every signal reaches the right group. "The group has emptied"
+is read from `/proc`, and any record Mix cannot read counts as still alive.
+A member hidden from `/proc` entirely, by another pid namespace or
+`hidepid=2` for another user's processes, cannot be counted. There the grace
+may end early, but the SIGKILL still reaches the whole group. An interrupt that lands on the same poll as the deadline
 wins the tie — it's reported as the cause.
 
 The opts map is validated **loudly** — a mistake can't silently leave a call
@@ -660,7 +765,7 @@ raises `TYPE_MISMATCH` at argument validation, before any stdio file is opened
 (so a NUL in `stderr_path` can no longer truncate the `stdout_path` file on the
 way to failing).
 
-**Argv form — `spawn(argv[, {detach, cwd, env, clear_env, stdout, stderr}])`**
+**Argv form — `spawn(argv[, {detach, die_with_parent, cwd, env, clear_env, stdout, stderr}])`**
 (v0.89.0), a **list** of strings run **directly, with no shell** — so no
 word-splitting, glob expansion, or quoting surprises. This is the launcher /
 daemon slot: the job that used to force `run("setsid app &")` through `sh`.
@@ -692,6 +797,60 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   (field 22 of `/proc/<pid>/stat`, recorded when the pid was written), or ask a
   Bus verb the child itself answers, rather than trusting a bare pid. Default `false` (a plain child
   in the caller's session, which stays the caller's to reap).
+- `die_with_parent: true` (Linux) → the opposite slot. The child **ends with
+  this mix process**, for a helper that must not outlive the script or
+  `--serve` citizen that started it:
+
+  ```mix
+  $pid = spawn(["goose", "serve", "--port", "7070"], {die_with_parent: true})
+  ```
+
+  The child leads its own process group. Two mechanisms end it:
+  - **Graceful exit.** This covers the script ending, `exit()`, a `--serve`
+    citizen's QUIT or SIGTERM drain, and a REPL restart. Mix sends SIGTERM to
+    the child's whole process group, waits up to 2 s for the group to empty,
+    then SIGKILLs whatever is left. The child gets its chance to clean up, and its own
+    children go too.
+  - **`--serve` RELOAD.** The old generation's owned children are ended the
+    same way *before* the new script's init runs. An init that starts its
+    helper again therefore never races a leftover one for the same port. If
+    the reload then reverts, because the new init failed, the old script
+    resumes without those children. Anything the failed init had already
+    spawned with `die_with_parent` is ended too, so a failed reload leaks no
+    helpers.
+  - **Hangup of the interactive shell.** When the terminal goes away, the
+    job-control shutdown sweeps owned children the same graceful way before
+    it exits.
+  - **Crash, or a signal mix does not handle.** If mix is SIGKILLed, panics
+    or is OOM-killed, the kernel SIGKILLs the child (`PR_SET_PDEATHSIG`). The
+    same happens when a plain `mix script.mix` or a non-interactive mix
+    receives SIGTERM, SIGHUP or SIGQUIT, because those still end mix at once
+    by default. That path reaches the child only, not its descendants, and
+    gives it no chance to clean up. A `--serve` citizen is different: its
+    SIGTERM is a graceful drain, so the sweep runs. A script that must clean
+    up its helper's own children on SIGTERM should run as a `--serve`
+    citizen or be stopped with Ctrl-C, which ends the evaluation normally and
+    so reaches the sweep.
+
+  `detach` together with `die_with_parent` raises `OPTION_INVALID`, because
+  they contradict each other. Mix itself is the only thing that reaps an
+  owned child. `process_alive` answers for it without freeing its pid, so
+  the group id cannot be recycled while it is registered. A finished child
+  whose group has emptied is reaped at the next `process_alive` or `spawn`.
+  One whose descendants are still running is kept as a zombie until the
+  sweep ends them. PDEATHSIG is keyed to the thread that called
+  `spawn`, and the ownership registry is process-wide. So the option works
+  only on a thread whose host owns it. The `mix` binary evaluates on one
+  thread that lives until exit and sweeps before it ends. Elsewhere, for
+  example webd, cosmix-mcp or cosmix-claud evaluating on pooled `spawn_blocking`
+  threads, `die_with_parent` raises `OPTION_INVALID`. An embedder that does
+  own a long-lived evaluation thread opts in by calling
+  `builtins::owned_spawns::enable()` on it. That call returns `false`, and
+  changes nothing, if another thread enabled first; only the first thread is
+  ever the host. The embedder must also call `sweep()` on that
+  same thread before it exits. Off Linux the option raises
+  `OPTION_INVALID`. Default `false`: a plain spawn child is untouched by mix's
+  exit.
 - `cwd` / `env` / `clear_env` behave exactly as in [`run_argv`](#run_argv)
   (clear-then-layer: `{clear_env: true, env: {…}}` starts from empty).
 - `stdout` / `stderr` reuse `run_argv`'s routing, minus capture: `"null"`

@@ -391,6 +391,11 @@ impl Controller {
                             monitor_tty.as_raw_fd(),
                             &monitor.shell_modes.lock().unwrap(),
                         );
+                        // End spawn(argv, {die_with_parent: true}) children
+                        // gracefully too: this exit bypasses the evaluation
+                        // thread's own sweep (review MINOR-7). A no-op when
+                        // nothing is owned.
+                        crate::owned_spawns_sweep();
                         // HUP is a session shutdown, not evaluator cancellation.
                         std::process::exit(128 + libc::SIGHUP);
                     }

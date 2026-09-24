@@ -1474,6 +1474,19 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
             // keeps working after any number of reloads.
             new_eval.set_interrupt_flag(eval.interrupt_flag());
 
+            // End the OLD generation's spawn(argv, {die_with_parent: true})
+            // children BEFORE the new init runs (review MINOR-6): an init that
+            // spawns its helper again would otherwise get a second one beside
+            // the old (the goose case — two servers, one port). The registry
+            // is process-wide, so sweeping after the commit would also end
+            // the helper the new init just started. Cost, documented: a
+            // reload that then REVERTS resumes the old script without them.
+            let swept = owned_spawns_sweep_count();
+            if swept > 0 {
+                tracing::info!(service = %service_name, swept,
+                    "serve: RELOAD ended the old generation's owned children");
+            }
+
             // Execute the new init body RACED against shutdown: a new script
             // whose top-level sleeps/hangs must still yield to SIGTERM. A
             // top-level `sleep()` dispatches events, so the new (not-yet-
@@ -1526,8 +1539,12 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // the discarded evaluator leaves nothing replying behind
                     // the resumed old one.
                     let drained = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                    // The old generation's owned children were swept before
+                    // this init ran, so the registry now holds ONLY what the
+                    // failed init spawned: sweeping here is exact (review R1).
+                    let swept = owned_spawns_sweep_count();
                     tracing::error!(service = %service_name, error = %format!("{e}"),
-                        aborted = drained.aborted, synth_sent = drained.synth_sent,
+                        aborted = drained.aborted, synth_sent = drained.synth_sent, swept,
                         "serve: reload REVERTED — new init body failed; old script resumes with state intact");
                 }
             }
@@ -1784,14 +1801,48 @@ fn main() {
     let handle = std::thread::Builder::new()
         .name("mix-eval".into())
         .stack_size(MAIN_STACK_SIZE)
-        .spawn(real_main)
+        .spawn(eval_thread_main)
         .expect("spawn mix evaluation thread");
     let code = handle.join().unwrap_or(101);
+    // A panicked evaluation thread never reached its sweep; PDEATHSIG has
+    // already killed the direct children, this reaches their groups.
+    owned_spawns_sweep();
     // Kill-on-drop: pdeathsig reaches each task LEADER when its supervisor
     // thread goes, but nothing would reach the leader's own children. This is
     // the only point every invocation mode passes through on the way out.
     session_task::sweep();
     std::process::exit(code);
+}
+
+/// End `spawn(argv, {die_with_parent: true})` children with this process.
+/// Idempotent — the registry drains on the first call.
+pub(crate) fn owned_spawns_sweep() {
+    owned_spawns_sweep_count();
+}
+
+/// [`owned_spawns_sweep`], reporting how many groups it ended.
+#[cfg(target_os = "linux")]
+pub(crate) fn owned_spawns_sweep_count() -> usize {
+    cosmix_mix::builtins::owned_spawns::sweep()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn owned_spawns_sweep_count() -> usize {
+    0
+}
+
+/// The evaluation thread's body: run, then end `spawn(argv, {die_with_parent:
+/// true})` children — SIGTERM their groups, grace, SIGKILL — on THIS thread,
+/// before it exits, because their PDEATHSIG is keyed to it and would otherwise
+/// SIGKILL them first with no chance to clean up (TODO-mix P2).
+fn eval_thread_main() -> i32 {
+    // This thread lives until exit and sweeps before it ends, so it is the
+    // one host allowed to create owned children.
+    #[cfg(target_os = "linux")]
+    let _ = cosmix_mix::builtins::owned_spawns::enable();
+    let code = real_main();
+    owned_spawns_sweep();
+    code
 }
 
 fn real_main() -> i32 {
