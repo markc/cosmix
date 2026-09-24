@@ -125,9 +125,15 @@ The default DKIM algorithm is `rsa-sha256`; `ed25519-sha256` is also accepted. `
 | `engine-config show` | Show the `maild.engine_config` singleton |
 | `rules stats [--top-n N]` | Show pack metadata, verdict totals, and rule hits |
 | `rules reload` | Re-read and atomically swap the configured rule pack |
-| `bayesian stats ACCOUNT_ID` | Show corpus statistics for a numeric account id |
+| `bayesian stats ACCOUNT` | Show corpus statistics for an account email or numeric id (read-only; unknown accounts are refused). The output includes `account_id`, so `bayesian stats EMAIL` is how to learn an account id |
+| `bayesian train ACCOUNT (--email-id ID \| --message-id MID) --class spam\|ham` | Train one stored message as spam or ham |
+| `bayesian untrain ACCOUNT (--email-id ID \| --message-id MID)` | Remove one message's training label and reverse its counts |
 
 `rules stats` defaults to 256 per-rule entries. The daemon caps the request at 4096. `--top-n 0` requests cardinality without cloning the per-rule map.
+
+`bayesian train` uses the same code path and the same per-message stamp as a user moving the message into or out of Junk. A later move of that message therefore flips the label rather than counting the message twice, and training it again with the same class reports `already_labeled`. `--message-id` is refused when it matches more than one message in the account; the error lists their Email ids so you can retry with `--email-id`.
+
+`train` labels the message but does not move it. `maild.bayesian.rebuild` derives every label from folder state, so a rebuild relabels a message that was trained as spam but left outside Junk as ham. To make a correction survive a rebuild, file the message in the matching folder as well.
 
 `rules reload` is a no-op when `rules_pack_path` is unset. On a load failure, the previous pack remains active.
 

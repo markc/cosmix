@@ -38,8 +38,14 @@ An unknown account and a wrong password both produce `valid: false` from `verify
 | `maild.rules.reload` | None | Reload the configured pack and return load metadata |
 | `maild.rules.stats` | Optional `top_n` | Return pack metadata and persistent verdict and rule-hit counters |
 | `maild.rules.explain` | Envelope and base64 message | Explain rule evaluation without delivering |
-| `maild.bayesian.stats` | `account_id` | Return per-account corpus statistics |
+| `maild.bayesian.stats` | `account_id` or `email` | Return per-account corpus statistics, read-only, echoing the resolved `account_id` and `email`; an account with no row is refused |
 | `maild.bayesian.classify` | `account_id`, `message_b64` | Classify without recording a training label |
+| `maild.bayesian.train` | `account_id` or `email`; `email_id` or `message_id`; `class` (`spam` / `ham`) | Train one stored message through the Junk-move path; returns `result` (`applied` / `already_labeled`) |
+| `maild.bayesian.untrain` | `account_id` or `email`; `email_id` or `message_id` | Remove the message's training label and reverse its counts; returns `removed` (`spam`, `ham`, or null) |
+
+`maild.bayesian.stats`, `train` and `untrain` accept `account_id`, `email` or `account` (`rebuild` and `rebuild_status` take only `account_id`); `account` is the name the `maild.stats.*` verbs use. The address match is exact and case-sensitive, with no alias or `+tag` expansion, so an unmatched address fails closed. An unknown account is reported as `account not found`, the same text `maild.bayesian.rebuild` uses. The `maild.stats.*` verbs report `no such account: <address>` instead.
+
+`train` and `untrain` refuse any key outside those listed (for example `dry_run`) with `rc=10` rather than ignoring it.
 
 `maild.rules.explain` accepts:
 

@@ -532,9 +532,13 @@ cosmix-maild domain show example.com
 <tr><td><code>engine-config show</code></td><td>Show the <code>maild.engine_config</code> singleton</td></tr>
 <tr><td><code>rules stats [--top-n N]</code></td><td>Show pack metadata, verdict totals, and rule hits</td></tr>
 <tr><td><code>rules reload</code></td><td>Re-read and atomically swap the configured rule pack</td></tr>
-<tr><td><code>bayesian stats ACCOUNT_ID</code></td><td>Show corpus statistics for a numeric account id</td></tr>
+<tr><td><code>bayesian stats ACCOUNT</code></td><td>Show corpus statistics for an account email or numeric id (read-only; unknown accounts are refused). The output includes <code>account_id</code>, so <code>bayesian stats EMAIL</code> is how to learn an account id</td></tr>
+<tr><td><code>bayesian train ACCOUNT (--email-id ID | --message-id MID) --class spam|ham</code></td><td>Train one stored message as spam or ham</td></tr>
+<tr><td><code>bayesian untrain ACCOUNT (--email-id ID | --message-id MID)</code></td><td>Remove one message's training label and reverse its counts</td></tr>
 </tbody></table>
 <p><code>rules stats</code> defaults to 256 per-rule entries. The daemon caps the request at 4096. <code>--top-n 0</code> requests cardinality without cloning the per-rule map.</p>
+<p><code>bayesian train</code> uses the same code path and the same per-message stamp as a user moving the message into or out of Junk. A later move of that message therefore flips the label rather than counting the message twice, and training it again with the same class reports <code>already_labeled</code>. <code>--message-id</code> is refused when it matches more than one message in the account; the error lists their Email ids so you can retry with <code>--email-id</code>.</p>
+<p><code>train</code> labels the message but does not move it. <code>maild.bayesian.rebuild</code> derives every label from folder state, so a rebuild relabels a message that was trained as spam but left outside Junk as ham. To make a correction survive a rebuild, file the message in the matching folder as well.</p>
 <p><code>rules reload</code> is a no-op when <code>rules_pack_path</code> is unset. On a load failure, the previous pack remains active.</p>
 <p>The CLI does not expose <code>maild.rules.explain</code> or <code>maild.bayesian.classify</code>; their base64 message and envelope payloads are intended for direct Bus callers.</p>
 <h2 id="configuration-selection">Configuration selection</h2>

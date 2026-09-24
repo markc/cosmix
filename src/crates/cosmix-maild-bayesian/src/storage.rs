@@ -27,6 +27,14 @@ pub trait StorageBackend: Send + Sync {
     /// responsible for cold-start seeding from `default-bayesian.db`
     /// when the account has no prior database.
     async fn open_account(&self, account: &AccountId) -> Result<Arc<dyn AccountConnection>>;
+
+    /// Corpus statistics for inspection. Unlike [`Self::open_account`] this
+    /// must not create, seed or promote anything: an operator reading stats
+    /// is not a first delivery. The default opens the account, which is right
+    /// for backends with no on-disk side effect; [`SqliteBackend`] overrides it.
+    async fn peek_stats(&self, account: &AccountId) -> Result<AccountStats> {
+        self.open_account(account).await?.stats().await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +235,125 @@ impl StorageBackend for SqliteBackend {
         cache.insert(key, arc.clone());
         Ok(arc as Arc<dyn AccountConnection>)
     }
+
+    /// Read-only stats. A cached live connection answers directly. Otherwise
+    /// the first file that `open_account` WOULD start from is opened
+    /// read-only — `bayes.db`, else a legacy `db.sqlite`, else the global
+    /// seed (reported through `seeded_from`, opened `immutable=1`) — and an
+    /// account with none of them reads as an empty cold-start corpus. No
+    /// account directory or database is created; only a live WAL database's
+    /// own -shm/-wal sidecars can appear.
+    async fn peek_stats(&self, account: &AccountId) -> Result<AccountStats> {
+        {
+            let cache = self.cache.lock().await;
+            if let Some(c) = cache.get(account.as_str()) {
+                return c.stats().await;
+            }
+        }
+
+        let path = self.account_path(account);
+        let seed = self.default_seed.clone();
+        let cold_floor = self.cold_floor;
+        tokio::task::spawn_blocking(move || -> Result<AccountStats> {
+            let legacy = path.with_file_name("db.sqlite");
+            // (file to open, SQLite name to open it by, seed label). The live
+            // databases are opened by plain path, read-only: they may be in
+            // use, so they must not be treated as immutable. The seed is a
+            // static file in a directory maild may not own, so it is opened
+            // `immutable=1`: no -wal/-shm sidecar is created next to it, and
+            // a root-owned seed directory cannot fail the open.
+            let (source, open_name, seeded_from) = if path.exists() {
+                let name = path.display().to_string();
+                (path, name, None)
+            } else if legacy.exists() {
+                let name = legacy.display().to_string();
+                (legacy, name, None)
+            } else if let Some(s) = seed.filter(|p| p.exists()) {
+                let label = s.display().to_string();
+                let name = immutable_uri(&s);
+                (s, name, Some(label))
+            } else {
+                return Ok(AccountStats {
+                    cold_start: true,
+                    ..AccountStats::default()
+                });
+            };
+            let conn = Connection::open_with_flags(
+                &open_name,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .map_err(|e| Error::Storage(format!("open {} read-only: {e}", source.display())))?;
+            let mut stats = stats_from(&conn, cold_floor)?;
+            stats.seeded_from = seeded_from;
+            Ok(stats)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("spawn_blocking: {e}")))?
+    }
+}
+
+/// SQLite URI that opens `path` as an immutable file (no locking, no
+/// sidecars). Characters that are special in a URI are percent-encoded.
+fn immutable_uri(path: &Path) -> String {
+    let mut out = String::from("file:");
+    for b in path.to_string_lossy().bytes() {
+        match b {
+            b'%' | b'?' | b'#' | 0x80.. => out.push_str(&format!("%{b:02X}")),
+            _ => out.push(b as char),
+        }
+    }
+    out.push_str("?immutable=1");
+    out
+}
+
+/// Corpus statistics from an open spamlite database.
+fn stats_from(c: &Connection, cold_floor: u32) -> Result<AccountStats> {
+    let counts = spamlite::storage::ops::counts(c)?;
+    let version: String =
+        c.query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
+            row.get(0)
+        })?;
+    // Training labels, as opposed to corpus totals (which also count seeded
+    // and imported messages). A pre-labels legacy database has no table.
+    let has_labels: bool = c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'labels')",
+        [],
+        |row| row.get(0),
+    )?;
+    let (mut labelled_spam, mut labelled_ham, mut last_trained_at) = (0u64, 0u64, None);
+    if has_labels {
+        let mut stmt = c.prepare("SELECT label, COUNT(*), MAX(ts) FROM labels GROUP BY label")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (label, n, ts) = row?;
+            if label == label_int(Label::Spam) {
+                labelled_spam = n as u64;
+            } else {
+                labelled_ham = n as u64;
+            }
+            last_trained_at = last_trained_at.max(ts);
+        }
+    }
+    Ok(AccountStats {
+        labelled_spam,
+        labelled_ham,
+        last_trained_at,
+        spam_messages: counts.total_spam as u32,
+        ham_messages: counts.total_good as u32,
+        spam_tokens: counts.unique_tokens,
+        ham_tokens: counts.unique_tokens,
+        cold_start: counts.total_good + counts.total_spam < cold_floor as u64,
+        seeded_from: None,
+        model_version: version.parse().unwrap_or(0),
+    })
 }
 
 pub struct SqliteAccountConnection {
@@ -409,20 +536,7 @@ impl AccountConnection for SqliteAccountConnection {
         let cold_floor = self.cold_floor;
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let counts = spamlite::storage::ops::counts(&c)?;
-            let version: String =
-                c.query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
-                    row.get(0)
-                })?;
-            Ok(AccountStats {
-                spam_messages: counts.total_spam as u32,
-                ham_messages: counts.total_good as u32,
-                spam_tokens: counts.unique_tokens,
-                ham_tokens: counts.unique_tokens,
-                cold_start: counts.total_good + counts.total_spam < cold_floor as u64,
-                seeded_from: None,
-                model_version: version.parse().unwrap_or(0),
-            })
+            stats_from(&c, cold_floor)
         })
         .await
         .map_err(|e| Error::Storage(format!("spawn_blocking: {e}")))?
@@ -808,6 +922,134 @@ mod tests {
 
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn peek_stats_reads_without_creating_anything() {
+        let base = std::env::temp_dir().join(format!(
+            "bayes-peek-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // No corpus, no seed: empty cold-start stats and no `<id>/` dir.
+        let backend = SqliteBackend::new(&base, None, 100);
+        let ghost = AccountId::new("9");
+        let stats = backend.peek_stats(&ghost).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.ham_messages), (0, 0));
+        assert!(stats.cold_start);
+        assert!(!base.join("9").exists(), "peek_stats created a corpus dir");
+
+        // A seed is reported, not copied.
+        let seed = base.join("seed.db");
+        let seed_conn = SqliteAccountConnection::open_path(&seed, 0).unwrap();
+        seed_conn
+            .record_label("seed-1", &toks(&["alpha"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        drop(seed_conn);
+        let sidecars = [base.join("seed.db-wal"), base.join("seed.db-shm")];
+        for s in &sidecars {
+            let _ = std::fs::remove_file(s);
+        }
+        let seeded = SqliteBackend::new(&base, Some(seed.clone()), 100);
+        let stats = seeded.peek_stats(&ghost).await.unwrap();
+        assert_eq!(stats.spam_messages, 1);
+        assert_eq!(stats.seeded_from, Some(seed.display().to_string()));
+        assert!(!base.join("9").exists(), "peek_stats seeded a corpus");
+        for s in &sidecars {
+            assert!(
+                !s.exists(),
+                "peek_stats created {} next to the seed",
+                s.display()
+            );
+        }
+
+        // An existing corpus is read as it stands.
+        let real_path = base.join("4").join("bayes.db");
+        let real = SqliteAccountConnection::open_path(&real_path, 0).unwrap();
+        real.record_label("m-1", &toks(&["beta"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        drop(real);
+        let stats = backend.peek_stats(&AccountId::new("4")).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.ham_messages), (0, 1));
+        assert_eq!(stats.seeded_from, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Review MINOR-8: the legacy `db.sqlite` branch is read in place (not
+    /// promoted), and a database with no `labels` table reports zero label
+    /// counters instead of failing.
+    #[tokio::test]
+    async fn peek_stats_reads_legacy_db_and_tolerates_a_missing_labels_table() {
+        let base = std::env::temp_dir().join(format!(
+            "bayes-peek-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let legacy_path = base.join("5").join("db.sqlite");
+        let legacy = SqliteAccountConnection::open_path(&legacy_path, 0).unwrap();
+        legacy
+            .record_label("l-1", &toks(&["alpha"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        drop(legacy);
+        let backend = SqliteBackend::new(&base, None, 100);
+        let stats = backend.peek_stats(&AccountId::new("5")).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.labelled_spam), (1, 1));
+        assert!(
+            !base.join("5").join("bayes.db").exists(),
+            "peek_stats promoted the legacy database"
+        );
+
+        let bare_path = base.join("6").join("bayes.db");
+        let bare = SqliteAccountConnection::open_path(&bare_path, 0).unwrap();
+        bare.record_label("b-1", &toks(&["beta"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        drop(bare);
+        let raw = Connection::open(&bare_path).unwrap();
+        raw.execute_batch("DROP TABLE labels;").unwrap();
+        drop(raw);
+        let stats = backend.peek_stats(&AccountId::new("6")).await.unwrap();
+        assert_eq!(stats.ham_messages, 1);
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 0));
+        assert_eq!(stats.last_trained_at, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn stats_report_label_counters_and_last_trained_at() {
+        let conn = SqliteAccountConnection::open_path(Path::new(":memory:"), 0).unwrap();
+        let before = conn.stats().await.unwrap();
+        assert_eq!((before.labelled_spam, before.labelled_ham), (0, 0));
+        assert_eq!(before.last_trained_at, None);
+
+        conn.record_label("s-1", &toks(&["alpha"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        conn.record_label("s-2", &toks(&["beta"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        conn.record_label("h-1", &toks(&["gamma"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        // A correction moves the counters with it.
+        conn.record_label("s-2", &toks(&["beta"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        let after = conn.stats().await.unwrap();
+        assert_eq!((after.labelled_spam, after.labelled_ham), (1, 2));
+        let ts = after.last_trained_at.expect("trained");
+        assert!(ts >= unix_secs() - 60, "last_trained_at {ts} is not recent");
     }
 
     #[tokio::test]

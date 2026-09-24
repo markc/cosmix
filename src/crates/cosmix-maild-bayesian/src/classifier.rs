@@ -60,6 +60,13 @@ impl DefaultClassifier {
         self.storage.open_account(account).await
     }
 
+    /// Read-only corpus statistics for inspection verbs: never creates,
+    /// seeds or promotes an account database (see
+    /// [`StorageBackend::peek_stats`]). Live paths use [`Classifier::stats`].
+    pub async fn peek_stats(&self, account: &AccountId) -> Result<AccountStats> {
+        self.storage.peek_stats(account).await
+    }
+
     /// Train one message into the supplied connection using exactly the same
     /// tokenisation and cap policy as live retraining.
     pub async fn train_into(

@@ -181,8 +181,8 @@ fn manifest_bytes(set_uuid: uuid::Uuid, item_count: u64, blob_count: u64) -> Vec
         "format": "cosmix-mds-set-export",
         "format_version": 1,
         "set_id": set_uuid.to_string(),
-        // Matches a fresh export's user_version (DATA_LATEST, now v9).
-        "schema_version": 9,
+        // Matches a fresh export's user_version (DATA_LATEST, now v10).
+        "schema_version": 10,
         "exported_at": "2026-05-03T00:00:00Z",
         "item_count": item_count,
         "blob_count": blob_count,
@@ -523,7 +523,7 @@ fn import_accepts_legacy_v1_tarball_and_upgrades_to_latest() {
     let v: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 9, "legacy v1 import must auto-upgrade to DATA_LATEST");
+    assert_eq!(v, 10, "legacy v1 import must auto-upgrade to DATA_LATEST");
     // v1.1 / v1.2 tables landed.
     for tbl in [
         "set_state",
@@ -585,7 +585,7 @@ fn import_accepts_v1_1_tarball_and_upgrades_to_latest() {
     let v: u32 = conn
         .query_row("PRAGMA user_version;", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 9, "v1.1 import must auto-upgrade to DATA_LATEST");
+    assert_eq!(v, 10, "v1.1 import must auto-upgrade to DATA_LATEST");
     // mail_envelopes (only v1.2 table) must be present after the
     // 2 → 3 step ran.
     let n: i64 = conn

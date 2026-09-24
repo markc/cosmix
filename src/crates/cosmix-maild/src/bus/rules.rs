@@ -544,7 +544,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["verdicts_total"], 0);
         assert_eq!(v["shadow_mode"], false);
-        assert_eq!(v["pack_version"].as_str().unwrap(), "v1.0");
+        assert_eq!(v["pack_version"].as_str().unwrap(), "v1.1");
         assert!(v["rules_loaded"].as_u64().unwrap() >= 1);
         assert_eq!(v["verdicts_by_kind"]["hard_accept"], 0);
         assert_eq!(v["verdicts_by_kind"]["hard_junk"], 0);
@@ -720,7 +720,7 @@ mod tests {
         let (rc, body) = handle_reload(&e).await;
         assert_eq!(rc, 0);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(v["pack_version"].as_str().unwrap(), "v1.0");
+        assert_eq!(v["pack_version"].as_str().unwrap(), "v1.1");
         assert!(v["rules_loaded"].as_u64().unwrap() >= 1);
         assert!(v["rules_failed"].as_array().unwrap().is_empty());
     }

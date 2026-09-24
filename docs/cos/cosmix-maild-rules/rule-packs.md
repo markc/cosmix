@@ -155,9 +155,22 @@ its data, but classification never matches it.
 
 ## Bundled pack
 
-The embedded pack declares `pack_version: "v1.0"` and contains 17 rules. It
+The embedded pack declares `pack_version: "v1.1"` and contains 18 rules. It
 covers missing and patterned headers, body patterns, URL and recipient counts,
 executable attachments, message structure, and soft SPF and DKIM failures.
+
+One rule is a campaign fingerprint rather than a soft signal.
+`scam_account_reference_subject` matches only the three subjects of the
+pending-account scam campaign: `Pending Account Matter-`,
+`Account Settlement Follow-Up-` and `Follow-Up on Account Status-`. Each must
+start the subject and be glued with a bare hyphen to a random reference of five
+or more characters that mixes letters and digits, as in
+`Pending Account Matter-7G4K2Q`. The rule has weight 15, equal to the default
+`hard_junk_threshold`, so it junks on its own. A rules verdict short-circuits
+Bayes, so moving a match back to Inbox never trains the rule away. The only
+escapes are the sender allowlist and the account's `disabled_rules`. That is
+why the rule matches the campaign phrases exactly and does not match
+`account` subjects in general.
 
 The default engine thresholds are calibrated separately in `EngineConfig`.
 Callers can load the embedded text without locating a file:

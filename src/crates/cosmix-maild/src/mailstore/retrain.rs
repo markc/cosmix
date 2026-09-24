@@ -61,7 +61,7 @@ use anyhow::Result;
 use cosmix_maild_bayesian::{
     DefaultClassifier,
     classifier::Classifier,
-    types::{Label, RetrainRequest},
+    types::{Label, RetrainOutcome, RetrainRequest},
 };
 use cosmix_maild_rules::AccountId;
 use cosmix_mds::{ItemId, Mds, SetId, SqliteCasMds};
@@ -84,6 +84,292 @@ pub const MAX_ATTEMPTS: i64 = 5;
 /// Rows claimed per set per tick. Bounds the per-tick work and the
 /// claim transaction's hold time.
 pub const BATCH: i64 = 64;
+
+/// Which surface asked for a training event. Logged on every train line
+/// so an operator can tell a user's IMAP drag from a JMAP move or an
+/// explicit `maild.bayesian.train`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainVia {
+    Imap,
+    Jmap,
+    Bus,
+}
+
+impl TrainVia {
+    fn as_str(self) -> &'static str {
+        match self {
+            TrainVia::Imap => "imap",
+            TrainVia::Jmap => "jmap",
+            TrainVia::Bus => "bus",
+        }
+    }
+}
+
+/// The structured record of one training attempt — what
+/// [`retrain_logged`] writes to the log under target
+/// `maild::bayesian::train`. Split out so the fields are testable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TrainEvent {
+    pub account: String,
+    /// `spam` or `ham`.
+    pub direction: &'static str,
+    /// Classifier stamp (the MDS item id).
+    pub stamp: String,
+    /// RFC 5322 `Message-ID` of the trained message, when it has one.
+    pub message_id: Option<String>,
+    /// `applied`, `already_labeled`, `no_stamp`, or `error`.
+    pub result: &'static str,
+    pub via: TrainVia,
+}
+
+impl TrainEvent {
+    pub fn new(
+        req: &RetrainRequest<'_>,
+        result: &cosmix_maild_bayesian::Result<RetrainOutcome>,
+        via: TrainVia,
+    ) -> Self {
+        Self {
+            account: req.account.as_str().to_string(),
+            direction: match req.label {
+                Label::Spam => "spam",
+                Label::Ham => "ham",
+            },
+            stamp: req.stamp_id.to_string(),
+            message_id: mail_parser::MessageParser::default()
+                .parse_headers(req.message)
+                .and_then(|m| m.message_id().map(str::to_string)),
+            result: match result {
+                Ok(RetrainOutcome::Applied) => "applied",
+                Ok(RetrainOutcome::AlreadyLabeled) => "already_labeled",
+                Ok(RetrainOutcome::NoStamp) => "no_stamp",
+                Err(_) => "error",
+            },
+            via,
+        }
+    }
+}
+
+// Test-only record of which surfaces reached `retrain_logged` on this
+// thread, so a test can prove a path trains THROUGH it and not around it.
+// `#[tokio::test]` runs on a current-thread runtime, so the thread is the test.
+#[cfg(test)]
+thread_local! {
+    static TRAINED_VIA: std::cell::RefCell<Vec<TrainVia>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Test-only record of claimed rowids the drain skipped as superseded.
+#[cfg(test)]
+thread_local! {
+    static SKIPPED_SUPERSEDED: std::cell::RefCell<Vec<i64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain this thread's record of superseded skips (test only).
+#[cfg(test)]
+pub(crate) fn take_skipped_superseded() -> Vec<i64> {
+    SKIPPED_SUPERSEDED.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Drain this thread's record of `retrain_logged` calls (test only).
+#[cfg(test)]
+pub(crate) fn take_trained_via() -> Vec<TrainVia> {
+    TRAINED_VIA.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// Apply one retrain through the classifier and log it. Every
+/// single-message training surface (the IMAP outbox drain, JMAP moves,
+/// `maild.bayesian.train`) goes through here. `maild.bayesian.rebuild` does
+/// not: it trains a shadow corpus in bulk and reports counts in its job body.
+pub async fn retrain_logged(
+    classifier: &DefaultClassifier,
+    req: &RetrainRequest<'_>,
+    via: TrainVia,
+) -> cosmix_maild_bayesian::Result<RetrainOutcome> {
+    let result = classifier.retrain(req).await;
+    #[cfg(test)]
+    TRAINED_VIA.with(|v| v.borrow_mut().push(via));
+    let ev = TrainEvent::new(req, &result, via);
+    let message_id = ev.message_id.as_deref().unwrap_or("-");
+    match &result {
+        Ok(_) => info!(
+            target: "maild::bayesian::train",
+            account = %ev.account,
+            direction = ev.direction,
+            stamp = %ev.stamp,
+            message_id = %message_id,
+            result = ev.result,
+            via = ev.via.as_str(),
+            "trained {} as {}: {} (account {}, via {})",
+            message_id, ev.direction, ev.result, ev.account, ev.via.as_str(),
+        ),
+        Err(e) => warn!(
+            target: "maild::bayesian::train",
+            account = %ev.account,
+            direction = ev.direction,
+            stamp = %ev.stamp,
+            message_id = %message_id,
+            result = ev.result,
+            via = ev.via.as_str(),
+            error = %e,
+            "training {} as {} failed (account {}, via {}): {e}",
+            message_id, ev.direction, ev.account, ev.via.as_str(),
+        ),
+    }
+    result
+}
+
+/// Orders inline training (JMAP moves, `maild.bayesian.train`/`untrain`)
+/// against the outbox drain. An inline label is newer than the stamp's
+/// pending outbox rows (older IMAP events), so once it has been written it
+/// cancels them. The drain re-checks that its row still exists before
+/// applying it. Both steps run under this lock, so a stale row can never be applied
+/// after the label that superseded it. Training is rare; one process-wide
+/// lock is cheaper than any finer scheme.
+fn train_order_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Microseconds since the Unix epoch, strictly increasing within this
+/// process. Every outbox row records one (`created_us`), and every inline
+/// training event takes one at its start. Two events can therefore always be
+/// ordered, even inside the same wall-clock microsecond or across a clock
+/// step backwards.
+pub fn event_us() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp_micros();
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev + 1);
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => prev = seen,
+        }
+    }
+}
+
+/// Delete the pending (undrained or dead-lettered) outbox rows for `stamp`
+/// in `set` that were queued at or before `cutoff_us`, the start of the
+/// inline event that supersedes them. A row queued after the event began is
+/// a newer user action; it survives and drains after the inline label. A
+/// NULL `created_us` (a row from before schema v10) counts as older, and so
+/// does equality. Returns how many were cancelled.
+async fn cancel_pending_rows(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    stamp: &str,
+    cutoff_us: i64,
+) -> Result<usize> {
+    let mds = Arc::clone(mds);
+    let stamp = stamp.to_string();
+    let n = tokio::task::spawn_blocking(move || {
+        mds.with_set_tx(&set, |tx| {
+            tx.tx()
+                .execute(
+                    "DELETE FROM mail_retrain_outbox \
+                     WHERE stamp_id = ?1 AND (created_us IS NULL OR created_us <= ?2)",
+                    params![stamp, cutoff_us],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(format!("cancel outbox rows: {e}")))
+        })
+    })
+    .await?;
+    match n {
+        Ok(n) => Ok(n),
+        // No MDS state for the account means nothing can be pending.
+        Err(cosmix_mds::Error::SetNotFound(_)) => Ok(0),
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
+fn log_superseded(account: &str, stamp: &str, cancelled: usize, via: TrainVia) {
+    if cancelled > 0 {
+        info!(
+            target: "maild::bayesian::train",
+            account = %account,
+            stamp = %stamp,
+            result = "superseded",
+            cancelled,
+            via = via.as_str(),
+            "cancelled {cancelled} pending outbox row(s) for {stamp}: superseded by a newer {} label",
+            via.as_str(),
+        );
+    }
+}
+
+/// Train one message inline — the JMAP move and `maild.bayesian.train`
+/// path. `event_us` is [`event_us`] taken when the inline event BEGAN,
+/// before any await: only outbox rows queued up to that instant are
+/// superseded, because the lock order is not the event order. Applies through [`retrain_logged`] first, and only on success
+/// supersedes the stamp's pending outbox rows (see [`train_order_lock`]).
+///
+/// Train-then-cancel, not cancel-then-train: if the classifier fails, the
+/// queued correction must survive, because nothing replaced it. A crash
+/// between a successful train and the cancel leaves a stale row that the
+/// next drain re-applies over this label. That is the exposure this path
+/// had before superseding existed, and it is strictly better than losing
+/// the correction.
+pub async fn train_inline(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    classifier: &DefaultClassifier,
+    req: &RetrainRequest<'_>,
+    via: TrainVia,
+    event_us: i64,
+) -> anyhow::Result<RetrainOutcome> {
+    let _order = train_order_lock().lock().await;
+    let outcome = retrain_logged(classifier, req, via).await?;
+    supersede_after_success(mds, set, req.account.as_str(), req.stamp_id, via, event_us).await;
+    Ok(outcome)
+}
+
+/// Cancel the stamp's pending rows once an inline write has succeeded. A
+/// failure here is logged, not returned: the label is already written, and
+/// the worst case is the stale-row re-apply described on [`train_inline`].
+async fn supersede_after_success(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    account: &str,
+    stamp: &str,
+    via: TrainVia,
+    event_us: i64,
+) {
+    match cancel_pending_rows(mds, set, stamp, event_us).await {
+        Ok(cancelled) => log_superseded(account, stamp, cancelled, via),
+        Err(e) => warn!(
+            target: "maild::bayesian::train",
+            account = %account,
+            stamp = %stamp,
+            via = via.as_str(),
+            error = %e,
+            "label written but pending outbox rows for {stamp} not cancelled: {e:#}"
+        ),
+    }
+}
+
+/// Remove one message's label inline (`maild.bayesian.untrain`), then
+/// cancel its pending outbox rows so a queued move cannot resurrect it. The
+/// order matches [`train_inline`] for the same reason. Returns the label
+/// that was reversed, if any.
+pub async fn untrain_inline(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    classifier: &DefaultClassifier,
+    account: &AccountId,
+    stamp: &str,
+    message: &[u8],
+    event_us: i64,
+) -> anyhow::Result<Option<Label>> {
+    let _order = train_order_lock().lock().await;
+    let conn = classifier.open_account_connection(account).await?;
+    let removed = classifier
+        .forget_from(conn.as_ref(), stamp, message)
+        .await?;
+    supersede_after_success(mds, set, account.as_str(), stamp, TrainVia::Bus, event_us).await;
+    Ok(removed)
+}
 
 /// One row claimed from `mail_retrain_outbox`, carrying the exact
 /// `rowid` so finalise can target it precisely (the re-drag guard).
@@ -198,7 +484,13 @@ impl RetrainOutboxWorker {
             let mds = Arc::clone(&self.mds);
             tokio::task::spawn_blocking(move || mds.with_set_tx(&set, claim_batch)).await??
         };
+        self.apply_claimed(set, rows).await
+    }
 
+    /// Apply one claimed batch in rowid order. Split from [`Self::drain_set`]
+    /// so a white-box test can supersede a row between the claim and the
+    /// apply, which is the window the existence re-check guards.
+    pub(crate) async fn apply_claimed(&self, set: SetId, rows: Vec<ClaimedRow>) -> Result<u64> {
         let mut applied = 0u64;
         // Strictly sequential: `record_label` is latest-wins per
         // stamp, so the rows that *do* get applied for a stamp must
@@ -219,6 +511,26 @@ impl RetrainOutboxWorker {
         // whole set for a tick — but transient failures are rare and
         // correctness outranks per-tick throughput here.)
         for row in rows {
+            // Hold the train-order lock from the existence check through
+            // finalise. An inline label (JMAP move, Bus train/untrain) may
+            // have cancelled this row since the claim; applying it anyway
+            // would overwrite the newer label with this older event.
+            let _order = train_order_lock().lock().await;
+            if !self.row_still_pending(set, row.rowid).await? {
+                info!(
+                    target: "maild::bayesian::train",
+                    account = row.account_id,
+                    stamp = %row.stamp_id,
+                    result = "superseded",
+                    via = TrainVia::Imap.as_str(),
+                    "skipped outbox row {} for {}: superseded before drain",
+                    row.rowid,
+                    row.stamp_id,
+                );
+                #[cfg(test)]
+                SKIPPED_SUPERSEDED.with(|v| v.borrow_mut().push(row.rowid));
+                continue;
+            }
             let outcome = self.process_row(&set, &row).await;
             let success = matches!(outcome, Finalise::Done);
             let halt = matches!(outcome, Finalise::Retry(_));
@@ -238,6 +550,25 @@ impl RetrainOutboxWorker {
             }
         }
         Ok(applied)
+    }
+
+    /// Is the claimed row still in the outbox? A row can vanish after the
+    /// claim when an inline label cancels it or a re-drag replaces it.
+    async fn row_still_pending(&self, set: SetId, rowid: i64) -> Result<bool> {
+        let mds = Arc::clone(&self.mds);
+        let present = tokio::task::spawn_blocking(move || {
+            mds.with_set_tx(&set, |tx| {
+                tx.tx()
+                    .query_row(
+                        "SELECT EXISTS (SELECT 1 FROM mail_retrain_outbox WHERE rowid = ?1)",
+                        params![rowid],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(|e| cosmix_mds::Error::Other(format!("outbox row check: {e}")))
+            })
+        })
+        .await??;
+        Ok(present)
     }
 
     /// Resolve the message bytes for one claimed row and apply the
@@ -301,7 +632,7 @@ impl RetrainOutboxWorker {
         // The exact call JMAP's `retrain_for_move` makes: shared
         // tokenize + `max_tokens_per_message` cap + `record_label`
         // reversal. This is the parity guarantee.
-        match self.classifier.retrain(&req).await {
+        match retrain_logged(&self.classifier, &req, TrainVia::Imap).await {
             Ok(_) => Finalise::Done,
             Err(e) => Finalise::Retry(format!("classifier.retrain: {e}")),
         }
@@ -378,4 +709,49 @@ pub(crate) fn finalise(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn train_event_carries_account_direction_message_id_and_result() {
+        let account = AccountId::new("13");
+        let message = b"Message-ID: <scam-1@example.invalid>\r\nSubject: x\r\n\r\nbody\r\n";
+        let req = RetrainRequest {
+            stamp_id: "0b7c0000-0000-4000-8000-000000000001",
+            account: &account,
+            message,
+            label: Label::Spam,
+        };
+        let ev = TrainEvent::new(&req, &Ok(RetrainOutcome::Applied), TrainVia::Bus);
+        assert_eq!(
+            ev,
+            TrainEvent {
+                account: "13".into(),
+                direction: "spam",
+                stamp: "0b7c0000-0000-4000-8000-000000000001".into(),
+                message_id: Some("scam-1@example.invalid".into()),
+                result: "applied",
+                via: TrainVia::Bus,
+            }
+        );
+
+        let req = RetrainRequest {
+            label: Label::Ham,
+            message: b"Subject: no id\r\n\r\nbody\r\n",
+            ..req
+        };
+        let err: cosmix_maild_bayesian::Result<RetrainOutcome> =
+            Err(cosmix_maild_bayesian::Error::Storage("disk full".into()));
+        let ev = TrainEvent::new(&req, &err, TrainVia::Imap);
+        assert_eq!(ev.direction, "ham");
+        assert_eq!(ev.message_id, None);
+        assert_eq!(ev.result, "error");
+        assert_eq!(
+            TrainEvent::new(&req, &Ok(RetrainOutcome::AlreadyLabeled), TrainVia::Jmap).result,
+            "already_labeled"
+        );
+    }
 }

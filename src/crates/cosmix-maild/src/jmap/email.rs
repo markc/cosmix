@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use cosmix_maild_bayesian::{
     DefaultClassifier,
-    classifier::Classifier,
     types::{Label, RetrainRequest},
 };
 use cosmix_maild_rules::AccountId;
@@ -1952,6 +1951,10 @@ pub async fn set(
             if patch_failed.is_none()
                 && let Some((dest, blob_hash, retrain_label)) = planned_move
             {
+                // The move's event instant, taken before any await: an IMAP
+                // move of this message queued after this point is a newer
+                // user action and must survive the retrain below.
+                let move_event_us = crate::mailstore::retrain::event_us();
                 let ms = mailstore.clone();
                 match tokio::task::spawn_blocking(move || ms.move_email(account_id, item_id, dest))
                     .await?
@@ -1966,7 +1969,13 @@ pub async fn set(
                         // (matching legacy semantics).
                         if let Some(label) = retrain_label
                             && let Err(e) = retrain_for_move(
-                                mailstore, classifier, account_id, item_id, blob_hash, label,
+                                mailstore,
+                                classifier,
+                                account_id,
+                                item_id,
+                                blob_hash,
+                                label,
+                                move_event_us,
                             )
                             .await
                         {
@@ -2176,6 +2185,7 @@ async fn retrain_for_move(
     item_id: ItemId,
     blob_hash: cosmix_mds::BlobHash,
     label: Label,
+    event_us: i64,
 ) -> Result<()> {
     let ms = mailstore.clone();
     let blob_data = tokio::task::spawn_blocking(move || ms.mds().get_blob(&blob_hash)).await??;
@@ -2187,7 +2197,15 @@ async fn retrain_for_move(
         message: &blob_data,
         label,
     };
-    classifier.retrain(&req).await?;
+    crate::mailstore::retrain::train_inline(
+        mailstore.mds(),
+        crate::mailstore::account_id_to_setid(account_id),
+        classifier,
+        &req,
+        crate::mailstore::retrain::TrainVia::Jmap,
+        event_us,
+    )
+    .await?;
     Ok(())
 }
 
@@ -2716,6 +2734,98 @@ mod tests {
     use cosmix_mds::{BlobHash, ContainerId, Flags, ItemId, Tags};
 
     use crate::mailstore::{EmailEnvelope, EmailRecord};
+
+    /// Review MINOR-8: a JMAP move across Junk must train through the
+    /// logged, superseding inline path — not call the classifier directly.
+    #[tokio::test]
+    async fn retrain_for_move_trains_through_the_logged_inline_path() {
+        use crate::mailstore::retrain::{TrainVia, take_trained_via};
+        use cosmix_maild_bayesian::{ClassifierConfig, storage::SqliteBackend};
+        use cosmix_mds::{ContainerAttrs, Membership, SqliteCasMds};
+
+        let mds_dir = tempfile::tempdir().unwrap();
+        let mds = Arc::new(SqliteCasMds::open(mds_dir.path()).unwrap());
+        let mailstore = Arc::new(SqliteMailStore::new(Arc::clone(&mds)));
+        let set = mailstore.ensure_account_set(7).unwrap();
+        let inbox = mds
+            .create_container(
+                &set,
+                None,
+                "Inbox",
+                ContainerAttrs {
+                    special_use: Some("\\Inbox".into()),
+                    subscribed: false,
+                    extra: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        let hash = mds.put_blob(b"Subject: move me\r\n\r\nbody\r\n").unwrap();
+        let item = mds
+            .add_item(
+                &set,
+                &hash,
+                &[Membership {
+                    container: inbox,
+                    flags: Flags(0),
+                    added_at: 0,
+                }],
+            )
+            .unwrap()
+            .item_id;
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(SqliteBackend::new(corpus_dir.path(), None, 0));
+        let classifier = Arc::new(DefaultClassifier::new(ClassifierConfig::default(), backend));
+
+        take_trained_via();
+        let started = crate::mailstore::retrain::event_us();
+        retrain_for_move(&mailstore, &classifier, 7, item, hash, Label::Spam, started)
+            .await
+            .unwrap();
+        assert_eq!(take_trained_via(), vec![TrainVia::Jmap]);
+        let stats = classifier.peek_stats(&AccountId::new("7")).await.unwrap();
+        assert_eq!(stats.labelled_spam, 1);
+
+        // Review R2: event order is not lock order. A JMAP move that began
+        // BEFORE an IMAP move of the same message was queued must not
+        // cancel that newer row: it survives, drains after the JMAP label,
+        // and the user's later IMAP action decides the final label.
+        let move_began = crate::mailstore::retrain::event_us();
+        mds.with_set_tx(&set, |tx| {
+            tx.tx()
+                .execute(
+                    "INSERT OR REPLACE INTO mail_retrain_outbox \
+                     (stamp_id, account_id, item_id, label, attempts, last_error, created_at, \
+                      created_us) \
+                     VALUES (?1, 7, ?1, 'ham', 0, NULL, 0, ?2)",
+                    rusqlite::params![item.0.to_string(), crate::mailstore::retrain::event_us()],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        retrain_for_move(
+            &mailstore,
+            &classifier,
+            7,
+            item,
+            hash,
+            Label::Spam,
+            move_began,
+        )
+        .await
+        .unwrap();
+        let worker = crate::mailstore::retrain::RetrainOutboxWorker::new(
+            Arc::clone(&mds),
+            Arc::clone(&classifier),
+        );
+        assert_eq!(
+            worker.drain_once().await.unwrap(),
+            1,
+            "newer IMAP row was cancelled"
+        );
+        let stats = classifier.peek_stats(&AccountId::new("7")).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 1));
+    }
 
     fn sample_record() -> EmailRecord {
         EmailRecord {

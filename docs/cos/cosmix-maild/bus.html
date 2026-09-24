@@ -469,9 +469,13 @@
 <tr><td><code>maild.rules.reload</code></td><td>None</td><td>Reload the configured pack and return load metadata</td></tr>
 <tr><td><code>maild.rules.stats</code></td><td>Optional <code>top_n</code></td><td>Return pack metadata and persistent verdict and rule-hit counters</td></tr>
 <tr><td><code>maild.rules.explain</code></td><td>Envelope and base64 message</td><td>Explain rule evaluation without delivering</td></tr>
-<tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code></td><td>Return per-account corpus statistics</td></tr>
+<tr><td><code>maild.bayesian.stats</code></td><td><code>account_id</code> or <code>email</code></td><td>Return per-account corpus statistics, read-only, echoing the resolved <code>account_id</code> and <code>email</code>; an account with no row is refused</td></tr>
 <tr><td><code>maild.bayesian.classify</code></td><td><code>account_id</code>, <code>message_b64</code></td><td>Classify without recording a training label</td></tr>
+<tr><td><code>maild.bayesian.train</code></td><td><code>account_id</code> or <code>email</code>; <code>email_id</code> or <code>message_id</code>; <code>class</code> (<code>spam</code> / <code>ham</code>)</td><td>Train one stored message through the Junk-move path; returns <code>result</code> (<code>applied</code> / <code>already_labeled</code>)</td></tr>
+<tr><td><code>maild.bayesian.untrain</code></td><td><code>account_id</code> or <code>email</code>; <code>email_id</code> or <code>message_id</code></td><td>Remove the message's training label and reverse its counts; returns <code>removed</code> (<code>spam</code>, <code>ham</code>, or null)</td></tr>
 </tbody></table>
+<p><code>maild.bayesian.stats</code>, <code>train</code> and <code>untrain</code> accept <code>account_id</code>, <code>email</code> or <code>account</code> (<code>rebuild</code> and <code>rebuild_status</code> take only <code>account_id</code>); <code>account</code> is the name the <code>maild.stats.*</code> verbs use. The address match is exact and case-sensitive, with no alias or <code>+tag</code> expansion, so an unmatched address fails closed. An unknown account is reported as <code>account not found</code>, the same text <code>maild.bayesian.rebuild</code> uses. The <code>maild.stats.*</code> verbs report <code>no such account: &lt;address&gt;</code> instead.</p>
+<p><code>train</code> and <code>untrain</code> refuse any key outside those listed (for example <code>dry_run</code>) with <code>rc=10</code> rather than ignoring it.</p>
 <p><code>maild.rules.explain</code> accepts:</p>
 <pre><code class="language-json">{
   "account_id": 42,

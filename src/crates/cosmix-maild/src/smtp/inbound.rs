@@ -10,7 +10,8 @@ use cosmix_maild_auth::{
 };
 use cosmix_maild_bayesian::{classifier::Classifier, types::ClassifyContext};
 use cosmix_maild_rules::{
-    AccountId, AccountOverrides, RuleContext, RuleEngine, RuleId, RuleVerdict, VerdictShape,
+    AcceptReason, AccountId, AccountOverrides, JunkReason, RuleContext, RuleEngine, RuleId,
+    RuleVerdict, VerdictShape,
 };
 use cosmix_mds::{Flags, Mds, Tags};
 use mail_parser::{HeaderValue, MessageParser};
@@ -100,6 +101,36 @@ struct ClassifyDetails {
     matched_rules: Vec<RuleId>,
     bayes_score: Option<f32>,
     cold_start: Option<bool>,
+    /// Which stage decided the verdict, for the delivery log line — see
+    /// [`verdict_source`].
+    source: String,
+}
+
+/// Name the stage that decided a verdict: `rules:<why>` when the rules
+/// engine short-circuited, `bayes` when the message continued to the
+/// classifier. A hard verdict with a single disqualifying signal names that
+/// signal (`rules:mail_auth_hard_fail`, `rules:blocklist_sender`, …); a score
+/// breach names the rules whose weights summed past the threshold
+/// (`rules:a+b`), since no one of them decided it alone.
+fn verdict_source(verdict: &RuleVerdict) -> String {
+    match verdict {
+        RuleVerdict::HardAccept { reason, .. } => match reason {
+            AcceptReason::AllowlistSender => "rules:allowlist_sender".to_string(),
+            AcceptReason::Future => "rules:hard_accept".to_string(),
+        },
+        RuleVerdict::HardJunk {
+            reason,
+            matched_rules,
+            ..
+        } => match reason {
+            JunkReason::BlocklistSender => "rules:blocklist_sender".to_string(),
+            JunkReason::MailAuthHardFail => "rules:mail_auth_hard_fail".to_string(),
+            JunkReason::StructuralAnomaly => "rules:structural_anomaly".to_string(),
+            JunkReason::ScoreBreach if matched_rules.is_empty() => "rules:score_breach".to_string(),
+            JunkReason::ScoreBreach => format!("rules:{}", matched_rules.join("+")),
+        },
+        RuleVerdict::Continue { .. } => "bayes".to_string(),
+    }
 }
 
 /// Deliver a received message to the appropriate mailboxes.
@@ -479,11 +510,13 @@ pub async fn deliver(
             .await
             {
                 Ok((v, s, details)) => {
+                    let source = details.source.as_str();
                     tracing::info!(
                         to = %rcpt,
                         verdict = %v,
                         score = s,
-                        "Spam classification: {v} (score {s:.2}) for <{rcpt}>"
+                        source = %source,
+                        "Spam classification: {v} (score {s:.2}, source={source}) for <{rcpt}>"
                     );
                     (Some(v), Some(s), Some(details))
                 }
@@ -1176,6 +1209,7 @@ async fn classify_inbound(
         .await
         .map_err(|e| anyhow::anyhow!("rules classify: {e}"))?;
     state.rule_stats.record(&rule_verdict);
+    let source = verdict_source(&rule_verdict);
 
     let (rules_score, matched_rules) = match &rule_verdict {
         RuleVerdict::HardAccept { matched_rules, .. } => {
@@ -1185,6 +1219,7 @@ async fn classify_inbound(
                 matched_rules: matched_rules.clone(),
                 bayes_score: None,
                 cold_start: None,
+                source,
             };
             return Ok(("HAM".to_string(), 0.0, details));
         }
@@ -1199,6 +1234,7 @@ async fn classify_inbound(
                 matched_rules: matched_rules.clone(),
                 bayes_score: None,
                 cold_start: None,
+                source,
             };
             return Ok(("SPAM".to_string(), *score as f64, details));
         }
@@ -1258,6 +1294,7 @@ async fn classify_inbound(
         matched_rules,
         bayes_score: Some(bayes_verdict.score),
         cold_start: Some(bayes_verdict.cold_start),
+        source,
     };
     Ok((label.to_string(), score_f64, details))
 }
@@ -1380,7 +1417,43 @@ fn is_auto_submitted(message: &mail_parser::Message<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_single_from, header_value_safe};
+    use super::{canonical_single_from, header_value_safe, verdict_source};
+    use cosmix_maild_rules::{AcceptReason, JunkReason, RuleVerdict};
+
+    #[test]
+    fn verdict_source_names_the_deciding_stage() {
+        let continued = RuleVerdict::Continue {
+            score: 3.0,
+            matched_rules: vec!["missing_date".into()],
+            would_junk: false,
+        };
+        assert_eq!(verdict_source(&continued), "bayes");
+
+        // A single disqualifying signal is named by its reason, not by the
+        // soft rules that happened to match alongside it.
+        let auth_fail = RuleVerdict::HardJunk {
+            reason: JunkReason::MailAuthHardFail,
+            matched_rules: vec!["spf_fail_soft".into()],
+            score: 4.0,
+        };
+        assert_eq!(verdict_source(&auth_fail), "rules:mail_auth_hard_fail");
+
+        let breach = RuleVerdict::HardJunk {
+            reason: JunkReason::ScoreBreach,
+            matched_rules: vec!["url_count_extreme".into(), "spf_fail_soft".into()],
+            score: 15.0,
+        };
+        assert_eq!(
+            verdict_source(&breach),
+            "rules:url_count_extreme+spf_fail_soft"
+        );
+
+        let allow = RuleVerdict::HardAccept {
+            reason: AcceptReason::AllowlistSender,
+            matched_rules: Vec::new(),
+        };
+        assert_eq!(verdict_source(&allow), "rules:allowlist_sender");
+    }
 
     fn from_header(raw: &str) -> Option<String> {
         let msg = format!("From: {raw}\r\nTo: x@y.com\r\nSubject: t\r\n\r\nbody\r\n");

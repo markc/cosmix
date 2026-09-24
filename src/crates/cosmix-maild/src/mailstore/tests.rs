@@ -8776,8 +8776,14 @@ mod retrain_drain {
 
         let cls = mk_classifier();
         let worker = RetrainOutboxWorker::new(Arc::clone(&mds), Arc::clone(&cls));
+        retrain::take_trained_via();
         let applied = worker.drain_once().await.unwrap();
         assert_eq!(applied, 2);
+        // Both rows went through the logged training path.
+        assert_eq!(
+            retrain::take_trained_via(),
+            vec![retrain::TrainVia::Imap, retrain::TrainVia::Imap]
+        );
 
         let (spam, ham) = corpus_counts(&cls).await;
         assert_eq!(
@@ -8786,6 +8792,61 @@ mod retrain_drain {
             "message ends in Junk → corpus must be Spam (JMAP parity)"
         );
         assert_eq!(count_outbox(&mds, &set), 0, "rows drained");
+    }
+
+    // Review R3: exercise the drain's skip branch. A row claimed by the
+    // drain, then superseded by an inline label before the drain applies
+    // it, must be skipped (and recorded as such), not replayed over the
+    // newer label.
+    #[tokio::test]
+    async fn claimed_row_superseded_before_apply_is_skipped() {
+        let (_d, mds, store) = open_mailstore();
+        let set = provision(&store);
+        let inbox = mk_container(&mds, &set, "Inbox", Some("\\Inbox"));
+        let junk = mk_container(&mds, &set, "Junk", Some("\\Junk"));
+        let message = b"superseded-msg";
+        let item = add_item_in(&mds, &set, inbox, message);
+        store
+            .move_message(TEST_ACCOUNT, item, inbox, junk, Flags(0), "s1")
+            .unwrap();
+        let rows = mds.with_set_tx(&set, retrain::claim_batch).unwrap();
+        assert_eq!(rows.len(), 1);
+        let claimed_rowid = rows[0].rowid;
+
+        let cls = mk_classifier();
+        let account = RetrainAccountId::new(TEST_ACCOUNT.to_string());
+        let req = cosmix_maild_bayesian::types::RetrainRequest {
+            stamp_id: "s1",
+            account: &account,
+            message,
+            label: cosmix_maild_bayesian::types::Label::Ham,
+        };
+        retrain::train_inline(
+            &mds,
+            set,
+            &cls,
+            &req,
+            retrain::TrainVia::Bus,
+            retrain::event_us(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_outbox(&mds, &set),
+            0,
+            "inline label cancelled the row"
+        );
+
+        let worker = RetrainOutboxWorker::new(Arc::clone(&mds), Arc::clone(&cls));
+        retrain::take_skipped_superseded();
+        let applied = worker.apply_claimed(set, rows).await.unwrap();
+        assert_eq!(applied, 0, "superseded row was applied");
+        assert_eq!(retrain::take_skipped_superseded(), vec![claimed_rowid]);
+        assert_eq!(
+            corpus_counts(&cls).await,
+            (0, 1),
+            "operator's ham must stand"
+        );
     }
 
     // A re-drag pair (out then in) after a successful drain must

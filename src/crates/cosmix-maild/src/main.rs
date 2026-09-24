@@ -103,15 +103,15 @@ enum Command {
         #[command(subcommand)]
         action: RulesAction,
     },
-    /// Read-only inspection of the Bayesian classifier. Wraps the
-    /// `maild.bayesian.stats` Bus verb. The diagnostic
-    /// `maild.bayesian.classify` verb takes a base64 message body
-    /// and is not exposed by this CLI for the same reason as
-    /// `rules.explain` — ops scripts that need it call Bus directly.
-    /// Corpus replacement is likewise agent-operated through
+    /// Bayesian classifier: `stats`, plus single-message `train` /
+    /// `untrain`. Wraps the `maild.bayesian.stats`, `.train` and
+    /// `.untrain` Bus verbs. The diagnostic `maild.bayesian.classify`
+    /// verb takes a base64 message body and is not exposed by this CLI
+    /// for the same reason as `rules.explain` — ops scripts that need it
+    /// call Bus directly. Corpus replacement is agent-operated through
     /// `maild.bayesian.rebuild` and observed through
-    /// `maild.bayesian.rebuild_status`; neither mutating/job verb is
-    /// duplicated as a local CLI subcommand.
+    /// `maild.bayesian.rebuild_status`; that job verb is not duplicated
+    /// as a local CLI subcommand.
     Bayesian {
         #[command(subcommand)]
         action: BayesianAction,
@@ -228,23 +228,54 @@ enum TlsAction {
     Reload,
 }
 
-/// Read-only inspection verbs against the Bayesian classifier.
+/// Bayesian classifier verbs: inspection plus single-message training.
 #[derive(Subcommand)]
 enum BayesianAction {
-    /// Pretty-print `maild.bayesian.stats` for an account id. The
-    /// id is the maild.accounts PK (an integer); the daemon's
-    /// `parse_account_id` accepts either a JSON integer or an
-    /// all-ASCII-digit string, so this CLI passes it as the latter.
+    /// Pretty-print `maild.bayesian.stats` for an account. The
+    /// response echoes `account_id` and `email`, so `stats EMAIL` is
+    /// how an operator learns an account's numeric id.
     Stats {
-        /// Account id (maild.accounts PK). Passed to the daemon as
-        /// typed; the daemon's `parse_account_id` (bus/bayesian.rs)
-        /// is the digit-only trust boundary that prevents
-        /// corpus-tree path escape via the wire payload. This CLI
-        /// does NOT pre-validate — that would duplicate the daemon
-        /// check and would mangle the daemon's truthful error
-        /// message ("account_id must be a non-negative integer,
-        /// got …") for operator debugging.
-        account_id: String,
+        /// Account email, or its id (the maild.accounts PK). Anything
+        /// containing `@` is sent as `email`; everything else is sent
+        /// as `account_id` verbatim — the daemon's `parse_account_id`
+        /// (bus/bayesian.rs) is the digit-only trust boundary that
+        /// prevents corpus-tree path escape via the wire payload. This
+        /// CLI does NOT pre-validate — that would duplicate the daemon
+        /// check and would mangle the daemon's truthful error message
+        /// ("account_id must be a non-negative integer, got …") for
+        /// operator debugging.
+        account: String,
+    },
+    /// Train one stored message as spam or ham (`maild.bayesian.train`) —
+    /// the same code path, and the same stamp, as the user moving it into or
+    /// out of Junk, so a later move of that message flips this label.
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["email_id", "message_id"])))]
+    Train {
+        /// Account email, or its numeric id.
+        account: String,
+        /// JMAP Email id of the message.
+        #[arg(long)]
+        email_id: Option<String>,
+        /// RFC 5322 Message-ID of the message (angle brackets optional).
+        /// Refused when it names more than one message; use --email-id.
+        #[arg(long)]
+        message_id: Option<String>,
+        /// `spam` or `ham`.
+        #[arg(long, value_parser = ["spam", "ham"])]
+        class: String,
+    },
+    /// Remove one stored message's training label and reverse its counts
+    /// (`maild.bayesian.untrain`).
+    #[command(group(clap::ArgGroup::new("target").required(true).args(["email_id", "message_id"])))]
+    Untrain {
+        /// Account email, or its numeric id.
+        account: String,
+        /// JMAP Email id of the message.
+        #[arg(long)]
+        email_id: Option<String>,
+        /// RFC 5322 Message-ID of the message (angle brackets optional).
+        #[arg(long)]
+        message_id: Option<String>,
     },
 }
 
@@ -2076,6 +2107,17 @@ async fn run_dkim_cli(action: DkimAction) -> Result<()> {
     Ok(())
 }
 
+/// Bus selector for the per-account `maild.bayesian.*` verbs: an operator
+/// argument containing `@` is an address (`email`), anything else is the
+/// numeric PK (`account_id`), passed verbatim for the daemon to validate.
+fn account_selector(account: &str) -> serde_json::Value {
+    if account.contains('@') {
+        serde_json::json!({ "email": account })
+    } else {
+        serde_json::json!({ "account_id": account })
+    }
+}
+
 /// Shared CLI dispatch for operator-facing maild verbs that share
 /// four invariants:
 ///
@@ -2291,11 +2333,44 @@ async fn main() -> Result<()> {
             }
         },
 
-        Command::Bayesian { action } => {
-            let BayesianAction::Stats { account_id } = action;
-            let body = serde_json::json!({ "account_id": account_id }).to_string();
-            run_inspection_verb_cli("bayesian stats", "maild.bayesian.stats", &body).await?;
-        }
+        Command::Bayesian { action } => match action {
+            BayesianAction::Stats { account } => {
+                let body = account_selector(&account).to_string();
+                run_inspection_verb_cli("bayesian stats", "maild.bayesian.stats", &body).await?;
+            }
+            BayesianAction::Train {
+                account,
+                email_id,
+                message_id,
+                class,
+            } => {
+                let mut body = account_selector(&account);
+                body["email_id"] = serde_json::json!(email_id);
+                body["message_id"] = serde_json::json!(message_id);
+                body["class"] = serde_json::json!(class);
+                run_inspection_verb_cli(
+                    "bayesian train",
+                    "maild.bayesian.train",
+                    &body.to_string(),
+                )
+                .await?;
+            }
+            BayesianAction::Untrain {
+                account,
+                email_id,
+                message_id,
+            } => {
+                let mut body = account_selector(&account);
+                body["email_id"] = serde_json::json!(email_id);
+                body["message_id"] = serde_json::json!(message_id);
+                run_inspection_verb_cli(
+                    "bayesian untrain",
+                    "maild.bayesian.untrain",
+                    &body.to_string(),
+                )
+                .await?;
+            }
+        },
 
         Command::Tls { action } => {
             let TlsAction::Reload = action;
@@ -2689,12 +2764,109 @@ mod cli_parser_tests {
             .expect("bayesian stats <account-id> should parse");
         match cli.command {
             Command::Bayesian {
-                action: BayesianAction::Stats { account_id },
+                action: BayesianAction::Stats { account },
             } => {
-                assert_eq!(account_id, "42");
+                assert_eq!(account, "42");
             }
             _ => panic!("expected Bayesian::Stats"),
         }
+    }
+
+    #[test]
+    fn account_selector_sends_an_address_as_email_and_anything_else_as_id() {
+        assert_eq!(
+            super::account_selector("admin@example.com"),
+            serde_json::json!({"email": "admin@example.com"})
+        );
+        assert_eq!(
+            super::account_selector("13"),
+            serde_json::json!({"account_id": "13"})
+        );
+        assert_eq!(
+            super::account_selector("../../etc"),
+            serde_json::json!({"account_id": "../../etc"})
+        );
+    }
+
+    #[test]
+    fn bayesian_train_parses_with_message_id_and_class() {
+        let cli = parse(&[
+            "cosmix-maild",
+            "bayesian",
+            "train",
+            "ai@example.com",
+            "--message-id",
+            "<scam-1@example.com>",
+            "--class",
+            "spam",
+        ])
+        .expect("bayesian train should parse");
+        match cli.command {
+            Command::Bayesian {
+                action:
+                    BayesianAction::Train {
+                        account,
+                        email_id,
+                        message_id,
+                        class,
+                    },
+            } => {
+                assert_eq!(account, "ai@example.com");
+                assert_eq!(email_id, None);
+                assert_eq!(message_id.as_deref(), Some("<scam-1@example.com>"));
+                assert_eq!(class, "spam");
+            }
+            _ => panic!("expected Bayesian::Train"),
+        }
+    }
+
+    #[test]
+    fn bayesian_train_requires_exactly_one_target_and_a_known_class() {
+        // No target.
+        assert!(parse(&["cosmix-maild", "bayesian", "train", "3", "--class", "ham"]).is_err());
+        // Both targets.
+        assert!(
+            parse(&[
+                "cosmix-maild",
+                "bayesian",
+                "train",
+                "3",
+                "--email-id",
+                "x",
+                "--message-id",
+                "y",
+                "--class",
+                "ham",
+            ])
+            .is_err()
+        );
+        // Unknown class.
+        assert!(
+            parse(&[
+                "cosmix-maild",
+                "bayesian",
+                "train",
+                "3",
+                "--email-id",
+                "x",
+                "--class",
+                "junk",
+            ])
+            .is_err()
+        );
+        // Untrain needs a target but no class.
+        assert!(
+            parse(&[
+                "cosmix-maild",
+                "bayesian",
+                "untrain",
+                "3",
+                "--email-id",
+                "x"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["cosmix-maild", "bayesian", "untrain", "3"]).is_err());
     }
 
     #[test]
@@ -2789,9 +2961,9 @@ mod cli_parser_tests {
             .expect("bayesian stats must accept the value at parse time");
         match cli.command {
             Command::Bayesian {
-                action: BayesianAction::Stats { account_id },
+                action: BayesianAction::Stats { account },
             } => {
-                assert_eq!(account_id, "not-a-number");
+                assert_eq!(account, "not-a-number");
             }
             _ => panic!("expected Bayesian::Stats"),
         }
