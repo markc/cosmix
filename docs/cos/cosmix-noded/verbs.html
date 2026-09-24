@@ -449,6 +449,7 @@
 <h2 id="node-service">Node service</h2>
 <h3 id="nodedregister"><code>noded.register</code></h3>
 <p>Registers the current WebSocket connection under the Bus <code>from</code> header. The name must not already belong to another connection.</p>
+<p>Two name families are reserved and refused with <code>rc: 10</code> and <code>error: reserved_name</code>, leaving any earlier registration on the connection in place: native-session names (<code>^[tc][0-9a-z]{1,7}-[a-z2-7]{22}$</code>), and the broker's own identity, <code>noded</code> and any otherwise-valid <code>noded-</code> name (syntax validation runs first, so a name that fails <code>^[a-z][a-z0-9-]{1,30}$</code> gets that error, not <code>reserved_name</code>). Consumers treat <code>from: noded</code> as the broker itself, so no client may hold it.</p>
 <p>The optional JSON body is registration provenance. Recognised provenance is stored in the service registry and returned by <code>noded.list</code>. An empty or malformed body still permits name-only registration.</p>
 <p>The result contains the registered name.</p>
 <h3 id="nodedderegister"><code>noded.deregister</code></h3>

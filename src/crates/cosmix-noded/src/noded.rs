@@ -3850,7 +3850,9 @@ async fn handle_noded_command(
             // BROKER-017 reserves the SHAPE, including unissued names and
             // non-canonical UID lookalikes. This precedes provenance parsing
             // and registry mutation on every ingress, even without Unix.
-            if reserved_session_name(&from) {
+            // The broker's own identity is reserved the same way: consumers
+            // trust `from: noded` as the broker, so no client may hold it.
+            if reserved_session_name(&from) || reserved_broker_name(&from) {
                 let mut resp = respond("10");
                 resp.set("error", "reserved_name");
                 resp.body = r#"{"error":"reserved_name"}"#.into();
@@ -4845,6 +4847,13 @@ fn reserved_session_name(name: &str) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+}
+
+/// The broker publishes and answers as `noded`, and mints `noded-<n>`
+/// correlators; consumers treat `from: noded` as the broker itself, so the
+/// name and its whole `noded-` namespace are never a client's to register.
+fn reserved_broker_name(name: &str) -> bool {
+    name == "noded" || name.starts_with("noded-")
 }
 
 fn valid_service_name(name: &str) -> bool {
@@ -7545,6 +7554,96 @@ mod tests {
         );
 
         raw_register(&mut sink, &mut stream, "valid-after-refusal").await;
+    }
+
+    /// Consumers treat `from: noded` as the broker (comp's port gates
+    /// props.changed publishing on its topic notices), so a client that could
+    /// register `noded` could impersonate it. The name and the `noded-`
+    /// namespace are refused like session-shaped names, a refused connection's
+    /// routed `from` is never `noded`, and a prior registration survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noded_register_refuses_broker_name() {
+        let Some(url) = spawn_broker().await else {
+            return;
+        };
+        let (mut s_recv, mut r_recv) = raw_connect(&url).await;
+        raw_register(&mut s_recv, &mut r_recv, "receiver").await;
+
+        // `anon` never holds a name; `held` is registered before its attempt.
+        let (mut s_anon, mut r_anon) = raw_connect(&url).await;
+        let (mut s_held, mut r_held) = raw_connect(&url).await;
+        raw_register(&mut s_held, &mut r_held, "held-name").await;
+
+        for (sink, stream, who) in [
+            (&mut s_anon, &mut r_anon, "anon"),
+            (&mut s_held, &mut r_held, "held"),
+        ] {
+            for name in ["noded", "noded-7", "noded-anything"] {
+                let id = format!("reserved-{who}-{name}");
+                let request = BusMessage::new()
+                    .with_header("command", "noded.register")
+                    .with_header("from", name)
+                    .with_header("to", "noded")
+                    .with_header("type", "request")
+                    .with_header("id", &id);
+                let response = raw_call(sink, stream, request, &id).await;
+                assert_eq!(response.get("rc"), Some("10"), "{who} took {name}");
+                assert_eq!(response.get("error"), Some("reserved_name"), "{who} {name}");
+            }
+        }
+
+        // Neighbouring names are still ordinary service names.
+        let (mut s_near, mut r_near) = raw_connect(&url).await;
+        raw_register(&mut s_near, &mut r_near, "noded2").await;
+        raw_register(&mut s_near, &mut r_near, "my-noded").await;
+
+        for (sink, expected, tag) in [
+            (&mut s_anon, None, "anon"),
+            (&mut s_held, Some("held-name"), "held"),
+        ] {
+            let claim = BusMessage::new()
+                .with_header("command", "receiver.probe")
+                .with_header("from", "noded")
+                .with_header("to", "receiver")
+                .with_header("type", "request")
+                .with_header("id", "claim")
+                .with_header("tag", tag);
+            sink.send(WsMessage::Text(claim.to_wire().into()))
+                .await
+                .expect("send claim");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let frame = tokio::time::timeout(remaining, r_recv.next())
+                    .await
+                    .expect("inbound timeout at receiver");
+                let text = match frame {
+                    Some(Ok(WsMessage::Text(t))) => t.to_string(),
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => panic!("ws error: {e}"),
+                    None => panic!("stream closed before inbound"),
+                };
+                let Ok(parsed) = bus_mod::parse(&text) else {
+                    continue;
+                };
+                if parsed.get("command") != Some("receiver.probe") || parsed.get("tag") != Some(tag)
+                {
+                    continue;
+                }
+                assert_eq!(parsed.get("from"), expected, "{tag} routed as the broker");
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_broker_name_covers_the_broker_namespace_only() {
+        for name in ["noded", "noded-", "noded-1", "noded-x"] {
+            assert!(super::reserved_broker_name(name), "{name}");
+        }
+        for name in ["noded2", "nodedx", "my-noded", "mix-noded-1", "node"] {
+            assert!(!super::reserved_broker_name(name), "{name}");
+        }
     }
 
     /// Anonymous connections must NOT be able to set ANY `from`
