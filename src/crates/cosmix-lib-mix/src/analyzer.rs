@@ -2431,7 +2431,8 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
 
 /// For every string node that ships as an `ssh_mix` body: the names that
 /// are the REMOTE program's own — its injected `bindings`/`env` keys, and
-/// for a literal body also what it binds itself plus the runtime-injected
+/// for a literal body also everything it binds itself (its functions'
+/// parameters and locals included) plus the runtime-injected
 /// names. A bare `$name` for one of these in a heredoc body is remote Mix
 /// code, correctly bare, so MIX-W2402 ("did you mean `${name}`?") must not
 /// fire for it: following that advice would splice the LOCAL value in, the
@@ -2446,7 +2447,11 @@ fn remote_body_names(stmts: &[Stmt]) -> HashMap<usize, HashSet<String>> {
                 if let Ok(tokens) = lexer.tokenize()
                     && let Ok(inner) = crate::parser::Parser::new(tokens, src).parse_program()
                 {
-                    collect_bound_names(&inner, false, &mut own);
+                    // EVERY binder of the remote program, at every depth —
+                    // a remote fn's own `$x` parameter or local is as much
+                    // remote code as a top-level one, and advising `${x}`
+                    // there would splice the local value into its body.
+                    own.extend(binder_frames(&inner).into_keys());
                     own.extend(INJECTED_VARS.iter().map(|v| (*v).to_string()));
                 }
                 (*origin, own)

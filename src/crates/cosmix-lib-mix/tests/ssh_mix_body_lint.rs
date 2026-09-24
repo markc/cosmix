@@ -253,6 +253,16 @@ fn w2402_is_silenced_for_bindings_names_only() {
 }
 
 #[test]
+fn w2402_is_silent_for_a_remote_functions_params_and_locals() {
+    // `$x` and `$y` are bound locally too, but inside the body they are a
+    // remote fn's parameter and local. Advising `${x}` would splice the
+    // local value into the remote function.
+    let src = "$x = 1\n$y = 2\n$probe = <<END\nfn identity($x)\n  $y = $x\n  return $y\nend\nprint(identity(3))\nEND\n$r = ssh_mix(\"a\", $probe)\n";
+    let d = diags(src);
+    assert!(!d.iter().any(|(c, ..)| c == "MIX-W2402"), "{d:?}");
+}
+
+#[test]
 fn env_keys_are_bound_inside_the_body_too() {
     // `env` ships as prepended `export KEY = "value"` lines.
     let src = "$r = ssh_mix(\"a\", '\nprint($FOO)\n', {env: {FOO: \"1\"}})\n";
