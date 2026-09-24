@@ -122,7 +122,7 @@ Desktop compositor, shell, widgets and applications (separate workspace).
 | `cosmix-shell-host` | 0.7.2 |
 | `cosmix-studio` | 0.4.7 |
 | `cosmix-term` | 0.1.0 |
-| `cosmix-term-core` | 0.3.0 |
+| `cosmix-term-core` | 0.4.0 |
 | `cosmix-tower` | 0.5.4 |
 | `cosmix-tray` | 0.3.1 |
 | `cosmix-trayd` | 0.6.2 |
