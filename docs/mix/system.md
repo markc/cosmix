@@ -809,7 +809,9 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
     same way *before* the new script's init runs. An init that starts its
     helper again therefore never races a leftover one for the same port. If
     the reload then reverts, because the new init failed, the old script
-    resumes without those children.
+    resumes without those children. Anything the failed init had already
+    spawned with `die_with_parent` is ended too, so a failed reload leaks no
+    helpers.
   - **Hangup of the interactive shell.** When the terminal goes away, the
     job-control shutdown sweeps owned children the same graceful way before
     it exits.

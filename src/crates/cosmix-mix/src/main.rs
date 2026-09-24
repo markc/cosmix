@@ -1539,8 +1539,12 @@ fn run_serve(script_path: &str, service_name: &str, no_prelude: bool) -> i32 {
                     // the discarded evaluator leaves nothing replying behind
                     // the resumed old one.
                     let drained = new_eval.drain_class_c_for_shutdown(reload_drain, true).await;
+                    // The old generation's owned children were swept before
+                    // this init ran, so the registry now holds ONLY what the
+                    // failed init spawned: sweeping here is exact (review R1).
+                    let swept = owned_spawns_sweep_count();
                     tracing::error!(service = %service_name, error = %format!("{e}"),
-                        aborted = drained.aborted, synth_sent = drained.synth_sent,
+                        aborted = drained.aborted, synth_sent = drained.synth_sent, swept,
                         "serve: reload REVERTED — new init body failed; old script resumes with state intact");
                 }
             }

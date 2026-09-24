@@ -1137,7 +1137,9 @@ children go too.</li>
 same way <em>before</em> the new script's init runs. An init that starts its
 helper again therefore never races a leftover one for the same port. If
 the reload then reverts, because the new init failed, the old script
-resumes without those children.</li>
+resumes without those children. Anything the failed init had already
+spawned with <code>die_with_parent</code> is ended too, so a failed reload leaks no
+helpers.</li>
 <li><strong>Hangup of the interactive shell.</strong> When the terminal goes away, the
 job-control shutdown sweeps owned children the same graceful way before
 it exits.</li>
