@@ -539,9 +539,10 @@ starts with <code>desktop-vt1.desktop.clipboard.</code> is rewritten to service
 modifiers, old action and new target. No other action is rewritten, so a row
 such as <code>foo-bar.baz.qux</code> keeps first-segment routing.</p>
 <p>The clipboard rows work with no <code>args</code> because the clipboard citizen accepts an
-empty body for <code>desktop.clipboard.menu</code> and <code>desktop.clipboard.rotate</code> from a
-local caller. Since citizen 0.3.5, <code>instance</code> is optional on those two verbs.
-When a caller sends it, a stale value is still refused with rc 12.</p>
+empty body for <code>desktop.clipboard.menu</code> and <code>desktop.clipboard.rotate</code>. Since
+citizen 0.3.5, <code>instance</code> is optional on those two verbs. When a caller sends
+it, a stale value is still refused with rc 12. Since citizen 0.3.6, mesh
+callers reach both verbs too, like every other verb of the citizen.</p>
 <p>Rolling back to an inputd without this field is lossy. The older binary ignores
 <code>service</code> and routes by first segment, so the clipboard rows go to <code>desktop</code>,
 which has no such verb, and nothing is logged. Under the older binary, the next successful <code>input.bind</code>, or an

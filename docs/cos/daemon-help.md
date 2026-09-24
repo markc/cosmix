@@ -117,9 +117,10 @@ modifiers, old action and new target. No other action is rewritten, so a row
 such as `foo-bar.baz.qux` keeps first-segment routing.
 
 The clipboard rows work with no `args` because the clipboard citizen accepts an
-empty body for `desktop.clipboard.menu` and `desktop.clipboard.rotate` from a
-local caller. Since citizen 0.3.5, `instance` is optional on those two verbs.
-When a caller sends it, a stale value is still refused with rc 12.
+empty body for `desktop.clipboard.menu` and `desktop.clipboard.rotate`. Since
+citizen 0.3.5, `instance` is optional on those two verbs. When a caller sends
+it, a stale value is still refused with rc 12. Since citizen 0.3.6, mesh
+callers reach both verbs too, like every other verb of the citizen.
 
 Rolling back to an inputd without this field is lossy. The older binary ignores
 `service` and routes by first segment, so the clipboard rows go to `desktop`,

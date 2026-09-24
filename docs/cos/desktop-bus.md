@@ -46,10 +46,12 @@ mix /path/to/cosmix/src/desktop/scripts/desktop-cli.mix open desktop-b https://e
 
 Targets may be local services or `service.node.bus` addresses. Cross-node
 messages use the existing noded ABP transport, without an alternative relay.
-To grant clipboard access to registered local citizens of node `alpha`, add
+By default every verb is open to mesh callers (see below). The grant lists
+apply only when the provider runs with `COSMIX_MESH_OPEN=0`. In that mode, add
 `mesh_clipboard_nodes:["alpha"]` to the trusted provider configuration and
-restart it. The default grant list is empty. This grants capabilities/read/write;
-HTTP(S) opening remains local-only. Cross-mesh `@` addresses are refused.
+restart it to grant capabilities, read and write to node `alpha`'s registered
+local citizens. The default grant list is empty, and every other verb stays
+local-only. Cross-mesh `@` addresses are refused.
 
 Both nodes need protected WireGuard endpoints, verified signed membership and
 D2 identities. The receiving noded must enforce admission. A provider grant
@@ -85,7 +87,17 @@ rejected; 20 timeout with ambiguous outcome. Transport errors remain separate.
 ## Trust and privacy boundary
 
 Local calls require broker-stamped `broker_origin=local` and a canonical
-registered `from`. An opted-in mesh clipboard call requires `broker_origin=mesh`,
+registered `from`. A call stamped `broker_origin=mesh` reaches every verb,
+including `desktop.open`, `desktop.clipboard.menu` and
+`desktop.clipboard.rotate`, with no per-peer grant (citizen 0.3.6 and later).
+noded sets `broker_origin` from the source address, so the WireGuard mesh is
+the trust boundary. The `instance` fence still applies to mesh callers: a stale
+`instance` is refused with rc 12. Refusal with rc 13 is then reserved for a
+call with no recognised broker origin, or a local call without a canonical
+registered `from`.
+
+Setting `COSMIX_MESH_OPEN=0` in the provider's environment re-arms the strict
+opt-in lock. A mesh call then requires a verb covered by a grant list,
 an allowed `broker_peer`, a canonical `broker_service`, and `from=bridge-<peer>`.
 noded supplies these only for a direct registered source received on a proven,
 currently authorised bridge connection. Anonymous sources and multi-hop relays
