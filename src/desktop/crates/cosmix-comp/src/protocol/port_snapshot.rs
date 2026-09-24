@@ -2007,12 +2007,14 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("maximized")],
         Bool,
-        "Committed maximized state"
+        "Committed maximized state; writes request a configure",
+        mutable
     ),
     descriptor!(
         &[L("windows"), S, L("fullscreen")],
         Bool,
-        "Committed Wayland fullscreen state"
+        "Committed fullscreen state; writes request a configure",
+        mutable
     ),
     descriptor!(
         &[L("windows"), S, L("minimized")],
@@ -3379,9 +3381,9 @@ mod tests {
         // Chunk 19 adds the two affordance leaves, `input.corners.affordance`
         // and `input.corners.discovery`.
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 14);
+        assert_eq!(mutable.len(), 16);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 13);
+        assert_eq!(mutable.len(), 15);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
@@ -3392,6 +3394,8 @@ mod tests {
             "input.host.passthrough",
             "windows.s2.band",
             "windows.s2.minimized",
+            "windows.s2.maximized",
+            "windows.s2.fullscreen",
             "windows.s2.workspace",
             "workspaces.count",
             "workspaces.current",

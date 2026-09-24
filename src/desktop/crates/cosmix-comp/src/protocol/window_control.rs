@@ -16,7 +16,7 @@ use super::workspaces::{WorkspaceRefusal, WorkspaceTarget};
 use super::*;
 use crate::port::{
     ControlReply, PlaceSpec, StatsTarget, WaitSpec, WaitUntil, WindowMatch, WindowOp,
-    WorkspaceIndex,
+    WorkspaceIndex, WindowState,
 };
 
 impl From<WorkspaceIndex> for WorkspaceTarget {
@@ -114,6 +114,82 @@ impl WaylandState {
         }
         let after = self.surfaces.get(object)?.minimized;
         Some((before, after))
+    }
+
+    /// Request state through the same configure machinery as client/chrome
+    /// requests. The returned booleans describe requested state; observation
+    /// and waits continue to report committed state after the client's ack.
+    pub(super) fn set_window_state(
+        &mut self,
+        object: &ObjectId,
+        state: WindowState,
+        enabled: bool,
+        output: Option<&str>,
+        cause: &'static str,
+    ) -> Result<(bool, bool), ControlReply> {
+        let record = &self.surfaces[object];
+        let id = record.id;
+        let surface = record.role.wl_surface().clone();
+        let before = match state {
+            WindowState::Maximized => record.requested_maximized,
+            WindowState::Fullscreen => record.requested_fullscreen,
+        };
+        let (min, max) = self.managed_size_constraints(&surface);
+        if enabled && ((max.0 > 0 && min.0 >= max.0) || (max.1 > 0 && min.1 >= max.1)) {
+            return Err(ControlReply::refused("unsupported_state", json!({
+                "id": id.0, "reason": "fixed_size",
+            })));
+        }
+        let selected = if let Some(name) = output {
+            let projection = port_snapshot::project_outputs(self).ok_or(ControlReply::Busy)?;
+            let key = projection.rows.iter()
+                .find(|(key, row)| key.as_str() == name || row.name == name)
+                .map(|(key, _)| key);
+            let selected = projection.keys.iter()
+                .find(|(_, candidate)| Some(candidate) == key)
+                .map(|(output, _)| output.clone())
+                .ok_or_else(|| ControlReply::refused("unknown_output", json!({"output": name})))?;
+            Some(selected)
+        } else { None };
+        if !matches!(&record.role, SurfaceRole::Toplevel(_)) {
+            #[cfg(feature = "xwayland")]
+            let supported = matches!(&record.role, SurfaceRole::X11(_));
+            #[cfg(not(feature = "xwayland"))]
+            let supported = false;
+            if !supported {
+                return Err(ControlReply::refused("unsupported_state", json!({"id": id.0})));
+            }
+        }
+        let previous_selection = record.fullscreen_output.clone();
+        self.mark_surface_dirty(id, cause);
+        if state == WindowState::Fullscreen && (output.is_some() || !enabled) {
+            self.surfaces.get_mut(object).expect("resolved window").fullscreen_output = selected;
+        }
+        match &self.surfaces[object].role {
+            SurfaceRole::Toplevel(_) => match state {
+                WindowState::Maximized => self.request_maximized_state(&surface, enabled),
+                WindowState::Fullscreen => self.request_fullscreen_state(&surface, enabled),
+            },
+            #[cfg(feature = "xwayland")]
+            SurfaceRole::X11(role) => {
+                let window = role.surface.clone();
+                match state {
+                    WindowState::Maximized => self.request_x11_maximized(&window, enabled),
+                    WindowState::Fullscreen => self.request_x11_fullscreen(&window, enabled),
+                }
+            }
+            _ => return Err(ControlReply::refused("unsupported_state", json!({"id": id.0}))),
+        }
+        let record = &self.surfaces[object];
+        let after = match state {
+            WindowState::Maximized => record.requested_maximized,
+            WindowState::Fullscreen => record.requested_fullscreen,
+        };
+        if after != enabled {
+            self.surfaces.get_mut(object).expect("resolved window").fullscreen_output = previous_selection;
+            return Err(ControlReply::refused("unsupported_state", json!({"id": id.0, "reason": "configure_refused"})));
+        }
+        Ok((before, after))
     }
 
     fn window_reply(&self, object: &ObjectId, id: u64, changed: bool) -> ControlReply {
@@ -279,6 +355,7 @@ impl WaylandState {
             return ControlReply::Locked;
         }
         let (code, id, generation) = match op {
+            WindowOp::State { id, generation, .. } => (11, *id, *generation),
             WindowOp::Minimize { id, generation } => (1, *id, *generation),
             WindowOp::Restore { target } => {
                 let (id, generation) = target.unwrap_or_default();
@@ -301,6 +378,25 @@ impl WaylandState {
         };
         crate::frame_trace::event("comp_window_control", || (id, code, generation));
         match op {
+            WindowOp::State { id, generation, state, enabled, output } => {
+                let object = match self.resolve_window_target(*id, Some(*generation)) {
+                    Ok(object) => object,
+                    Err(error) => return ControlReply::WindowTarget { id: *id, error },
+                };
+                let previous_output = self.surfaces[&object].fullscreen_output.clone();
+                match self.set_window_state(&object, *state, *enabled, output.as_deref(), "comp.window") {
+                    Ok((before, after)) => {
+                        let record = &self.surfaces[&object];
+                        let changed = before != after || previous_output != record.fullscreen_output;
+                        ControlReply::Body(merged(self.window_reply(&object, *id, changed).wire_json(), json!({
+                            "maximized": record.committed_maximized,
+                            "fullscreen": record.committed_fullscreen,
+                            "configure_pending": record.pending_window_state.is_some(),
+                        })))
+                    }
+                    Err(reply) => reply,
+                }
+            }
             WindowOp::Minimize { .. } | WindowOp::Restore { .. } => self.service_minimize_op(op),
             WindowOp::Focus {
                 id,
@@ -526,7 +622,8 @@ impl WaylandState {
                     }
                 };
             }
-            WindowOp::Focus { .. }
+            WindowOp::State { .. }
+            | WindowOp::Focus { .. }
             | WindowOp::Raise { .. }
             | WindowOp::Close { .. }
             | WindowOp::Place(_)
@@ -637,7 +734,7 @@ fn millis(duration: Duration) -> u64 {
 }
 
 impl WaylandState {
-    fn service_window_focus(&mut self, id: u64, generation: u64, raise: bool) -> ControlReply {
+    pub(super) fn service_window_focus(&mut self, id: u64, generation: u64, raise: bool) -> ControlReply {
         let object = match self.resolve_window_target(id, Some(generation)) {
             Ok(object) => object,
             Err(error) => return ControlReply::WindowTarget { id, error },
@@ -1239,6 +1336,10 @@ impl WaylandState {
             }
             WaitUntil::Size { width, height } => geometry_size(record) == (width, height),
             WaitUntil::Focused => record.focused,
+            WaitUntil::Maximized => record.pending_window_state.is_none() && record.committed_maximized,
+            WaitUntil::Unmaximized => record.pending_window_state.is_none() && !record.committed_maximized,
+            WaitUntil::Fullscreen => record.pending_window_state.is_none() && record.committed_fullscreen,
+            WaitUntil::Unfullscreen => record.pending_window_state.is_none() && !record.committed_fullscreen,
             WaitUntil::Unmapped | WaitUntil::Gone => false,
         };
         let live = |record: &SurfaceRecord| {

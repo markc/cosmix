@@ -5129,6 +5129,8 @@ struct SurfaceRecord {
     committed_decoration: SceneDecorationMode,
     requested_maximized: bool,
     requested_fullscreen: bool,
+    /// Explicit fullscreen output, retained across subsequent configures.
+    fullscreen_output: Option<Output>,
     fullscreen_restore_band: Option<StackBand>,
     committed_maximized: bool,
     pub(crate) committed_fullscreen: bool,
@@ -11906,6 +11908,13 @@ impl WaylandState {
             self.titlebar_click_candidate = None;
             return;
         }
+        #[cfg(feature = "bus")]
+        if let Some((id, generation)) = self.injection.targeted_button {
+            // All modal, quarantine and delivery gates have already run in
+            // handle_host_input. Only device hit-testing/raising is replaced.
+            self.targeted_pointer_button(id, generation, button, state, time);
+            return;
+        }
         #[cfg(feature = "embedded-quoin")]
         if let Some(bridge) = &self.embedded_shell
             && bridge.button(
@@ -12356,6 +12365,20 @@ impl WaylandState {
                     } else {
                         state.bindings.dispatch(keycode, pressed, keysym, modifiers)
                     };
+                    #[cfg(feature = "bus")]
+                    {
+                        let forwarded = matches!(&disposition, KeyDisposition::Forward);
+                        state.injection.key_handled = !forwarded
+                            || state.keyboard.current_focus().is_some()
+                            // Bare modifiers are prefixes for a later binding,
+                            // even when there is no focused client yet.
+                            || keysym.is_some_and(|sym| sym.is_modifier_key());
+                        state.injection.key_delivery = if forwarded {
+                            state.delivery_target(true)
+                        } else {
+                            None
+                        };
+                    }
                     binding_filter_result(disposition)
                 },
             )
@@ -14152,6 +14175,26 @@ impl WaylandState {
         )
     }
 
+    fn fullscreen_rect_for(&self, surface: &WlSurface) -> LogicalOutputRect {
+        let selected = self.surfaces.get(&surface.id())
+            .and_then(|record| record.fullscreen_output.as_ref());
+        let selected = selected.filter(|output| self.backend.output_is_registered(output));
+        if let Some(output) = selected && let Some(mode) = output.current_mode() {
+            let size = mode.size.to_f64()
+                .to_logical(output.current_scale().fractional_scale())
+                .to_i32_round::<i32>();
+            let size = output.current_transform().transform_size(size);
+            let origin = output.current_location();
+            return LogicalOutputRect {
+                x: origin.x as f32,
+                y: origin.y as f32,
+                width: size.w.max(1) as f32,
+                height: size.h.max(1) as f32,
+            };
+        }
+        self.logical_output_rect()
+    }
+
     fn request_maximized_state(&mut self, surface: &WlSurface, maximized: bool) {
         let fullscreen = self
             .surfaces
@@ -14161,6 +14204,9 @@ impl WaylandState {
     }
 
     fn request_fullscreen_state(&mut self, surface: &WlSurface, fullscreen: bool) {
+        if !fullscreen && let Some(record) = self.surfaces.get_mut(&surface.id()) {
+            record.fullscreen_output = None;
+        }
         let maximized = self
             .surfaces
             .get(&surface.id())
@@ -14177,7 +14223,7 @@ impl WaylandState {
         }
         self.titlebar_click_candidate = None;
         let output = self.usable_output_rect();
-        let full_output = self.logical_output_rect();
+        let full_output = self.fullscreen_rect_for(surface);
         let extents = DecoExtents::of(&self.decoration.theme);
         let theme = self.decoration.theme.clone();
         let configured_server_side = compositor::with_states(surface, |states| {
@@ -14298,6 +14344,17 @@ impl WaylandState {
     }
 
     fn reconfigure_window_states_for_output(&mut self) {
+        // A retired Output clone must not keep a fullscreen selection alive.
+        // Reconcile before both protocol families calculate their next rect.
+        for record in self.surfaces.values_mut() {
+            if record
+                .fullscreen_output
+                .as_ref()
+                .is_some_and(|output| !self.backend.output_is_registered(output))
+            {
+                record.fullscreen_output = None;
+            }
+        }
         #[cfg(feature = "xwayland")]
         self.reconfigure_x11_for_output();
         let window_states = self
@@ -14326,6 +14383,10 @@ impl WaylandState {
     ) {
         if self.logical_output_rect() != previous_output
             || self.usable_output_rect() != previous_usable
+            || self
+                .surfaces
+                .values()
+                .any(|record| record.fullscreen_output.is_some())
         {
             self.reconcile_output_geometry_after_topology_change();
         }

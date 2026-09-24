@@ -182,6 +182,7 @@ impl CompositorHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.fullscreen_output = None;
             record.requested_fullscreen = false;
             record.committed_fullscreen = false;
             record.fullscreen_restore_band = None;
@@ -225,6 +226,7 @@ impl CompositorHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    fullscreen_output: None,
                     requested_fullscreen: false,
                     fullscreen_restore_band: None,
                     committed_maximized: false,
@@ -859,6 +861,7 @@ impl WlrLayerShellHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.fullscreen_output = None;
             record.requested_fullscreen = false;
             record.committed_fullscreen = false;
             record.fullscreen_restore_band = None;
@@ -899,6 +902,7 @@ impl WlrLayerShellHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    fullscreen_output: None,
                     requested_fullscreen: false,
                     fullscreen_restore_band: None,
                     committed_maximized: false,
@@ -1089,6 +1093,7 @@ impl XdgShellHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.fullscreen_output = None;
             record.requested_fullscreen = false;
             record.committed_fullscreen = false;
             record.fullscreen_restore_band = None;
@@ -1129,6 +1134,7 @@ impl XdgShellHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    fullscreen_output: None,
                     requested_fullscreen: false,
                     fullscreen_restore_band: None,
                     committed_maximized: false,
@@ -1315,6 +1321,7 @@ impl XdgShellHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.fullscreen_output = None;
             record.requested_fullscreen = false;
             record.committed_fullscreen = false;
             record.fullscreen_restore_band = None;
@@ -1355,6 +1362,7 @@ impl XdgShellHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    fullscreen_output: None,
                     requested_fullscreen: false,
                     fullscreen_restore_band: None,
                     committed_maximized: false,
@@ -1830,6 +1838,7 @@ impl SessionLockHandler for WaylandState {
             record.decoration_object_bound = false;
             record.committed_decoration = SceneDecorationMode::Unbound;
             record.requested_maximized = false;
+            record.fullscreen_output = None;
             record.requested_fullscreen = false;
             record.committed_fullscreen = false;
             record.fullscreen_restore_band = None;
@@ -1870,6 +1879,7 @@ impl SessionLockHandler for WaylandState {
                     decoration_object_bound: false,
                     committed_decoration: SceneDecorationMode::Unbound,
                     requested_maximized: false,
+                    fullscreen_output: None,
                     requested_fullscreen: false,
                     fullscreen_restore_band: None,
                     committed_maximized: false,
@@ -2396,6 +2406,7 @@ impl InputMethodHandler for WaylandState {
                 decoration_object_bound: false,
                 committed_decoration: SceneDecorationMode::Unbound,
                 requested_maximized: false,
+                fullscreen_output: None,
                 requested_fullscreen: false,
                 fullscreen_restore_band: None,
                 committed_maximized: false,

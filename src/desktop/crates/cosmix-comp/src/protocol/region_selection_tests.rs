@@ -51,6 +51,50 @@ fn body(rx: &mut tokio::sync::oneshot::Receiver<ControlReply>) -> serde_json::Va
 }
 
 #[test]
+fn injected_escape_without_client_focus_cancels_region_and_releases() {
+    use crate::port::{InputOp, KeySpec, PressAction};
+    let mut h = KeybindingHarness::new(true);
+    let mut rx = begin(&mut h);
+    assert!(h.server.state.keyboard.current_focus().is_none());
+    let reply = h.server.state.service_input_op(&InputOp::Key {
+        key: KeySpec::Name("Escape".into()),
+        action: PressAction::Both,
+        modifiers: vec![],
+    });
+    assert!(matches!(reply, ControlReply::Body(_)), "{reply:?}");
+    clean_frame(&mut h);
+    assert_eq!(body(&mut rx)["status"], "cancelled");
+    assert!(h.server.state.injection.held.is_empty());
+    assert!(h.server.state.keyboard.pressed_keys().is_empty());
+}
+
+#[test]
+fn targeted_button_during_region_selection_refuses_before_focus_or_input() {
+    use crate::port::{BTN_LEFT, InputOp, PressAction};
+    let mut h = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut h);
+    let record = test_toplevel_record(&h);
+    let (id, generation, z) = (record.id.0, record.generation, record.layout.z);
+    let _rx = begin(&mut h);
+    let before = h.server.state.injection.events;
+    let reply = h.server.state.service_input_op(&InputOp::Targeted {
+        id,
+        generation,
+        raise: true,
+        op: Box::new(InputOp::PointerButton {
+            button: BTN_LEFT,
+            action: PressAction::Both,
+        }),
+    });
+    assert_eq!(reply.wire_json()["reason"], "region_select");
+    assert_eq!(h.server.state.injection.events, before);
+    assert!(h.server.state.keyboard.current_focus().is_none());
+    assert_eq!(test_toplevel_record(&h).layout.z, z);
+    assert!(h.server.state.pointer.current_pressed().is_empty());
+    assert!(h.server.state.region.suspended);
+}
+
+#[test]
 fn region_touch_only_device_removal_admits_next_selection() {
     for direct_recovery in [true, false] {
         let mut h = KeybindingHarness::new(true);

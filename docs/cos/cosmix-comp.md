@@ -385,6 +385,7 @@ The control plane exposes these verbs:
   remains subscribed.
 - `comp.props.set {path,value,generation?}` mutates the six corner
   properties, `windows.s<id>.band`, `windows.s<id>.minimized`,
+  `windows.s<id>.maximized`, `windows.s<id>.fullscreen`,
   `windows.s<id>.workspace`, `workspaces.count`, `workspaces.current`,
   `workspaces.o_<slug>.current`, `input.host.passthrough`, or
   `xwayland.enabled` and returns `{path,old,new}`; for the file-persisted
@@ -401,6 +402,9 @@ The control plane exposes these verbs:
   compositor furniture. See Region selection below.
 - `comp.window.minimize {id,generation}` minimises one window, like its
   title-bar button. Both fields are required.
+- `comp.window.maximize {id,generation}`, `comp.window.unmaximize {id,generation}`,
+  `comp.window.fullscreen {id,generation,output?}` and
+  `comp.window.unfullscreen {id,generation}` request window state (below).
 - `comp.window.restore {id?,generation?}` with no arguments restores the most
   recently minimised window, exactly like the `Super+Shift+M` binding; with
   `{id,generation}` (both required together) it restores that window. If the
@@ -650,12 +654,44 @@ pointer motion out of the corner.
 
 ### Window control
 
+`comp.window.maximize {id,generation}` and
+`comp.window.unmaximize {id,generation}` use the compositor's native maximize
+configure path, including XWayland. `comp.window.fullscreen {id,generation,output?}`
+and `comp.window.unfullscreen {id,generation}` use its fullscreen path.
+`output` accepts an output key or name; an unknown name is `unknown_output`.
+Without it, fullscreen retains an existing explicit selection or uses the default
+output. The selection survives later configures and output reflows. A change to
+the selected output reconfigures the window even when the default output is
+unchanged; removing the selected output clears the selection and reconfigures
+fullscreen on the default output. Leaving fullscreen clears the selection.
+Fullscreen geometry takes precedence over maximize in both protocol families;
+changing maximize underneath fullscreen preserves the original restore rectangle.
+Fixed size constraints on either axis refuse entry with
+rc 10 `unsupported_state`, `reason:"fixed_size"`. Target failures use the existing
+`unknown_window`, `not_managed`, `not_mapped` and `stale_target` replies.
+
+Success is rc 0 `{id,generation,title,app_id,minimized,changed,maximized,fullscreen,configure_pending}`.
+`changed` reports a change in requested state or fullscreen output selection.
+`maximized` and `fullscreen` report committed state. Wayland clients must ack
+and commit the configure before those fields change; `configure_pending` reports
+that outstanding configure. Use `comp.window.wait` with `until:maximized`,
+`unmaximized`, `fullscreen` or `unfullscreen` to wait for the committed state
+with no outstanding window-state configure, including opposite requests issued
+before an earlier configure was acknowledged.
+The same transitions publish `props.changed` through the normal window-row diff.
+
+`windows.s<id>.maximized` and `windows.s<id>.fullscreen` are writable booleans
+through `comp.props.set {path,value,generation?}`, fenced like `.minimized`.
+Their `{path,old,new}` reply describes requested state; reads and changed events
+describe committed state. These writes use the same refusal and configure paths
+as the verbs. All four verbs and both properties are available to mesh callers.
+
 Every verb here names its window with `{id, generation}`, refuses a stale or
 missing target as described under Window identity, and replies
 `{"error":"locked"}` while a session lock is active. Each is recorded in the
 frame trace as `comp_window_control` (subject the id; detail 1 minimize,
 2 restore, 3 focus, 4 raise, 5 close, 6 place, 7 wait, 8 forced close,
-9 workspace switch, 10 send to workspace; `comp.window.stats` and
+9 workspace switch, 10 send to workspace, 11 window state; `comp.window.stats` and
 `.stats.reset` reuse 7 and 8, a collision kept until 0.60 renumbers them).
 
 Every mapped window is on one workspace and each output has a current one;
@@ -795,7 +831,9 @@ restores it. Two verbs drive the workspaces:
     counts. A late report of an earlier frame does not. The window must
     also be unminimised and on the current workspace when the wait
     resolves), `size` (needs `width` and `height`, compared with the
-    window-geometry size), `focused`, `unmapped` or `gone`. For a match
+    window-geometry size), `focused`, `maximized`, `unmaximized`,
+    `fullscreen`, `unfullscreen`, `unmapped` or `gone`. State waits require
+    a mapped window and test committed state. For a match
     without `id`, `unmapped` and `gone` mean no mapped window matches.
     `mapped` is workspace-blind; `visible` and `presented` need the
     window's workspace to be the current one, so a wait on a window that
@@ -909,6 +947,57 @@ rounds half away from zero on both sides of the origin.
 
 ### Input injection
 
+`comp.input.key` (including its `{text}` form) and `comp.input.pointer.button`
+accept `window:{id,generation}` and `raise?:bool` (default true). Both identity
+fields are required; `raise` requires `window`. The compositor focuses the window
+using the focus verb's path, applies the requested raise policy, then injects
+within the same compositor-thread operation. The input reply includes
+`{input_seq,injected_at_us,pointer,target,targeted,completed_events}`.
+`targeted:{id,generation}` records the requested window; `target` records client
+delivery of the key/text payload or button (null for a compositor-consumed
+binding). Modifier setup and release cleanup do not claim payload delivery.
+Target continuity is checked before every generated key press. A binding that
+changes focus stops subsequent presses with rc 10 `target_changed`, reporting
+`completed_events` and releasing this operation's new holds. Completed events
+are not rolled back. Sequence steps accept exactly the same arguments.
+
+The focus-and-inject ordering guarantee applies to Wayland seat delivery.
+For Xwayland, Smithay sends X focus requests (`SetInputFocus` / `WM_TAKE_FOCUS`)
+without waiting for X focus confirmation; keys travel over the Wayland
+connection. A successful reply therefore does not guarantee that the X client
+has taken focus before the first key, especially with client-driven focus.
+Use client-side acknowledgement when X client focus ordering matters.
+
+Targeted buttons direct the seat pointer to the named window at the current
+cursor position, expressed relative to its buffer origin; they do not warp the
+cursor. The ordinary device-click focus/raise policy is skipped because the
+targeted operation has already applied it, including `raise:false`. Buttons
+still pass through region, corner-release, KMS quarantine and delivery gates.
+After delivery, pointer focus is reconciled with the cursor position (respecting
+an ongoing implicit grab), so the next device click uses the ordinary target.
+An unmapped, minimised, off-workspace or non-presentable window, a session lock,
+an exclusive layer, an active region-selection run (`reason:"region_select"`),
+or an interfering grab returns rc 10
+`target_unfocusable` with `reason`, `id` and `generation`, and injects no key or
+button. Unlike the standalone focus verb, targeted input never switches workspace
+or restores a window. Unknown or stale identities retain the existing target errors.
+If focus arbitration itself returns `focus_refused`, focus/stacking changes made
+by that arbitration may remain; no payload key or button was injected.
+Targeted key releases still validate the window identity, but do not require
+focus eligibility or refocus/raise the window; the seat's modal and lock gates
+continue to handle those releases.
+
+Without `window`, `no_keyboard_target` is returned only after the seat finds no
+client/native focus, compositor binding or modal owner for a non-modifier payload press.
+Bare modifier presses are accepted and held as prefixes for later bindings;
+an engaged hot corner alone does not consume keyboard input.
+Releases and keys already held by injection are always processed; generated new
+holds are cleaned up on refusal. Modifier setup can advance XKB before the
+payload is refused. Empty workspaces still accept compositor chords, and Escape
+still cancels region selection. Untargeted buttons retain their existing
+behaviour: a null pointer delivery target can also mean chrome, a panel or a hot
+corner, so it is not a reliable empty-space refusal.
+
 The `comp.input.*` verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply
 unchanged: bindings (an injected `Super+Shift+M` restores a window, and the
@@ -924,24 +1013,27 @@ uses the same clock.
 | Verb | Arguments |
 | --- | --- |
 | `comp.input.pointer.move` | One of three forms. `{x,y,output?}`: output-local absolute; `output` is an `outputs` key or output name, and defaults to the default output. `{dx,dy}`: relative. `{window:{id,generation},x,y,require_hit?}`: relative to the window-geometry origin. Any form takes `corners?` (default `true`); `false` keeps the move from arming a hot corner. |
-| `comp.input.pointer.button` | `{button?,action?}`. `button`: `left` (default), `right`, `middle`, or an evdev code `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
+| `comp.input.pointer.button` | `{button?,action?,window?,raise?}`. `button`: `left` (default), `right`, `middle`, or an evdev code `0x100..=0x2ff`. `action`: `press`, `release` or `click` (default). |
 | `comp.input.pointer.scroll` | `{dx?,dy?,source?,v120?}`. At least one axis is required; an omitted axis stays absent. Positive `dy` scrolls down. `source`: `wheel` (default), `finger` or `continuous`; a zero on `finger` or `continuous` is an axis stop. `v120:{dx?,dy?}` sets wheel detents; without it, a wheel derives 120 per 15 units. |
-| `comp.input.key` | `{key,action?,modifiers?}`. `key`: an XKB keysym name (`Return`, `a`, `F5`, `Super_L`) or an evdev code. `action`: `press`, `release` or `tap` (default). `modifiers`: any of `shift`, `ctrl`, `alt`, `super`, `altgr`, held around the key. A keysym that needs Shift gets Shift added. **Or** `{text}`, at most 256 characters. |
+| `comp.input.key` | `{key,action?,modifiers?,window?,raise?}`. `key`: an XKB keysym name (`Return`, `a`, `F5`, `Super_L`) or an evdev code. `action`: `press`, `release` or `tap` (default). `modifiers`: any of `shift`, `ctrl`, `alt`, `super`, `altgr`, held around the key. A keysym that needs Shift gets Shift added. **Or** `{text,window?,raise?}`, at most 256 characters. |
 | `comp.input.release_all` | `{}` |
 | `comp.input.sequence` | `{steps:[{verb,args?,delay_ms?}],interval_ms?}` |
 
 Each single verb replies:
 
 ```text
-{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null}
+{input_seq, injected_at_us, pointer:{output,x,y}|null, target:{id,generation}|null, targeted:{id,generation}|null, completed_events}
 ```
 
 - `input_seq` increases by one per verb.
 - `injected_at_us` is CLOCK_MONOTONIC microseconds.
 - `pointer` is the cursor after the verb, in output-local coordinates.
-- `target` is the root surface the seat now delivers to: pointer focus for
-  pointer verbs, keyboard focus for key verbs. It can be a layer or lock
-  surface, not only a window.
+- `targeted` is the requested window, or null for untargeted input.
+- `target` records client delivery of the payload for keys and targeted buttons,
+  not the keyboard focus after a binding runs. It is null when a binding consumes
+  the payload. Untargeted pointer verbs retain their pointer-focus fallback.
+  A delivery target can be a layer or lock surface, not only a window.
+- `completed_events` counts generated key events processed before completion or refusal.
 
 `text` maps each character through the live seat keymap, honouring Caps Lock
 and the active layout. Only characters on the first two shift levels map; each
@@ -973,8 +1065,8 @@ Every refusal is decided before anything is sent:
 - `unknown_output`;
 - `out_of_bounds`, with the output size, for a point outside the output.
 
-The verbs are not refused while the session is locked; the seat decides where
-the input goes.
+Untargeted input is not refused while the session is locked; the seat decides
+where it goes. Targeted input refuses the locked window as described above.
 
 `release_all` releases the keys and buttons that injection pressed and has not
 released. It never releases anything a physical device holds. Taps and clicks
@@ -1466,7 +1558,8 @@ mixed-scale, multi-output correctness depends on the renderer's multi-output
 camera model, not on the affordance.
 
 The mutable leaves are the six corner leaves, `windows.s<id>.band`,
-`windows.s<id>.minimized`, `windows.s<id>.workspace`, `workspaces.count`,
+`windows.s<id>.minimized`, `windows.s<id>.maximized`, `windows.s<id>.fullscreen`,
+`windows.s<id>.workspace`, `workspaces.count`,
 `workspaces.current`, `workspaces.o_<slug>.current`, `input.host.passthrough`
 (nested only) and `xwayland.enabled`. The corner, window and workspace
 descriptors say `mutable:true` and

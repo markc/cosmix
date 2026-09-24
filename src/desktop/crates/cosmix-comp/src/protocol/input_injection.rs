@@ -1,9 +1,9 @@
 //! `comp.input.*`: Bus-injected input, delivered through the real seat path.
 //!
-//! Every injected event enters [`WaylandState::handle_host_input`] with user
-//! activity on, exactly like a device event, so bindings, grabs, pointer
-//! constraints, focus arbitration, idle notification and the KMS lock gate
-//! all apply unchanged. Nothing here talks to a client directly.
+//! Ordinary injection enters [`WaylandState::handle_host_input`] like a
+//! device event. Targeted buttons use the same seat's motion/button path
+//! after focus arbitration, avoiding a second hit-test or unconditional
+//! raise. Nothing here talks to a client directly.
 
 use std::collections::VecDeque;
 
@@ -99,6 +99,13 @@ impl Holds {
 }
 
 pub(crate) struct InjectionState {
+    /// Result of the last event through the shared seat path. Modal owners
+    /// consume events without a client target; the keyboard filter refines it.
+    pub(super) key_handled: bool,
+    pub(super) key_delivery: Option<(u64, u64)>,
+    /// Preserve the explicit button focus/raise policy after the host gates.
+    pub(super) targeted_button: Option<(u64, u64)>,
+    pub(super) button_delivery: Option<(u64, u64)>,
     next_seq: u64,
     /// Everything injection holds, by owner; `release_all` releases all.
     pub(super) held: Holds,
@@ -120,6 +127,10 @@ pub(crate) struct InjectionState {
 impl Default for InjectionState {
     fn default() -> Self {
         Self {
+            key_handled: false,
+            key_delivery: None,
+            targeted_button: None,
+            button_delivery: None,
             next_seq: 0,
             held: Holds::default(),
             current_run: None,
@@ -243,6 +254,8 @@ impl WaylandState {
     }
 
     fn inject_key(&mut self, keycode: Keycode, state: HostButtonState, time: u32) {
+        self.injection.key_handled = true;
+        self.injection.key_delivery = None;
         self.inject(HostInput::Key {
             keycode,
             state,
@@ -250,12 +263,198 @@ impl WaylandState {
         });
     }
 
-    /// `comp.input.*` (one verb). Refusals are decided before any event is
-    /// sent, so a refused verb leaves the seat untouched.
+    /// Called only after the shared host gates and corner consumption.
+    pub(super) fn targeted_pointer_button(
+        &mut self,
+        id: u64,
+        generation: u64,
+        button: u32,
+        state: HostButtonState,
+        time: u32,
+    ) {
+        if !self.pointer.is_grabbed() {
+            let Ok(object) = self.resolve_window_target(id, Some(generation)) else {
+                return;
+            };
+            let record = &self.surfaces[&object];
+            let surface = record.role.wl_surface().clone();
+            let origin = (f64::from(record.layout.x), f64::from(record.layout.y)).into();
+            let focus = Some((self.seat_focus_target_for(&surface), origin));
+            let pointer = self.pointer.clone();
+            let location = self.cursor_position;
+            pointer.motion(
+                self,
+                focus.clone(),
+                &MotionEvent {
+                    location: location.into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            pointer.frame(self);
+            self.record_pointer_focus_local_position(focus.as_ref(), location);
+        }
+        let pointer = self.pointer.clone();
+        self.injection.button_delivery = self.delivery_target(false);
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+                button,
+                state: smithay_button_state(state),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Check continuity before every generated press. Releases must still
+    /// reconcile XKB and binding/hold bookkeeping after focus changes.
+    fn inject_keys(
+        &mut self,
+        events: Vec<(Keycode, HostButtonState, bool)>,
+        target: Option<(u64, u64)>,
+        time: u32,
+    ) -> (Option<&'static str>, usize, Option<(u64, u64)>) {
+        let mut pressed_here = BTreeSet::new();
+        let mut completed = 0;
+        let mut delivery = None;
+        let mut payload_seen = false;
+        let mut failure = None;
+        for (keycode, state, required) in events {
+            if state == HostButtonState::Pressed
+                && target.is_some()
+                && self.delivery_target(true) != target
+            {
+                failure = Some("target_changed");
+                break;
+            }
+            let was_held = self
+                .injection
+                .held
+                .owners
+                .contains_key(&Hold::Key(keycode.raw()));
+            self.inject_key(keycode, state, time);
+            completed += 1;
+            if required && (state == HostButtonState::Pressed || !payload_seen) {
+                if self.injection.key_delivery.is_some() {
+                    delivery = self.injection.key_delivery;
+                }
+                payload_seen = true;
+            }
+            if state == HostButtonState::Pressed {
+                if !was_held {
+                    pressed_here.insert(keycode.raw());
+                }
+                if required && !was_held && !self.injection.key_handled {
+                    failure = Some("no_keyboard_target");
+                    break;
+                }
+            } else {
+                pressed_here.remove(&keycode.raw());
+            }
+        }
+        if failure.is_some() {
+            self.release_holds(pressed_here.into_iter().map(Hold::Key).collect(), time);
+        }
+        (failure, completed, delivery)
+    }
+
+    /// `comp.input.*` (one verb). Target candidacy is checked before focus;
+    /// a refused target injects no key or button.
     pub(crate) fn service_input_op(&mut self, op: &InputOp) -> ControlReply {
+        self.service_input_payload(op, None)
+    }
+
+    fn service_targeted_input(
+        &mut self,
+        id: u64,
+        generation: u64,
+        raise: bool,
+        op: &InputOp,
+    ) -> ControlReply {
+        let refusal = |reason| {
+            ControlReply::refused(
+                "target_unfocusable",
+                json!({
+                    "id": id, "generation": generation, "reason": reason,
+                }),
+            )
+        };
+        let object = match self.resolve_window_target(id, Some(generation)) {
+            Ok(object) => object,
+            Err(window_control::WindowTargetError::NotMapped) => return refusal("unmapped"),
+            Err(error) => return ControlReply::WindowTarget { id, error },
+        };
+        if matches!(
+            op,
+            InputOp::Key {
+                action: PressAction::Release,
+                ..
+            }
+        ) {
+            // A release reconciles the seat that owns the hold, even when
+            // its original window can no longer take focus. Never refocus it.
+            return self.service_input_payload(op, Some((id, generation)));
+        }
+        let record = &self.surfaces[&object];
+        let reason = if self.region_selection_active() {
+            Some("region_select")
+        } else if self.session_lock_active() {
+            Some("session_lock")
+        } else if self.highest_exclusive_layer().is_some() {
+            Some("exclusive_layer")
+        } else if record.minimized {
+            Some("minimized")
+        } else if !workspaces::on_workspace(record, self.workspace_current()) {
+            Some("other_workspace")
+        } else if !self.surface_is_input_presentable(record) {
+            Some("not_presentable")
+        } else if !record.layout.visible {
+            Some("not_visible")
+        } else if self.keyboard.is_grabbed() || self.seat.input_method().keyboard_grabbed() {
+            Some("keyboard_grab")
+        } else if matches!(op, InputOp::PointerButton { .. })
+            && (self.chrome_pointer_grab.is_some()
+                || self.interactive_pointer.is_some()
+                || (self.pointer.is_grabbed()
+                    && self.delivery_target(false) != Some((id, generation))))
+        {
+            Some("pointer_grab")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return refusal(reason);
+        }
+        let reply = self.service_window_focus(id, generation, raise);
+        if !matches!(&reply, ControlReply::Body(body) if body["focused"] == true)
+            || self.delivery_target(true) != Some((id, generation))
+        {
+            return refusal("focus_refused");
+        }
+        // There is no event-loop yield between the fence, focus and injection.
+        self.service_input_payload(op, Some((id, generation)))
+    }
+
+    fn service_input_payload(
+        &mut self,
+        op: &InputOp,
+        target_window: Option<(u64, u64)>,
+    ) -> ControlReply {
         let injected_at_us = monotonic_micros();
         let time = (injected_at_us / 1_000) as u32;
+        let mut key_result = (None, 0, None);
+        let mut button_delivery = None;
         let (kind, keyboard) = match op {
+            InputOp::Targeted {
+                id,
+                generation,
+                raise,
+                op,
+            } => {
+                return self.service_targeted_input(*id, *generation, *raise, op);
+            }
             InputOp::PointerMove { target, corners } => {
                 let input = match self.pointer_move_input(target, time) {
                     Ok(input) => input,
@@ -268,11 +467,26 @@ impl WaylandState {
             }
             InputOp::PointerButton { button, action } => {
                 for state in press_states(*action) {
-                    self.inject(HostInput::PointerButton {
+                    let input = HostInput::PointerButton {
                         button: *button,
                         state: *state,
                         time,
-                    });
+                    };
+                    if target_window.is_some() {
+                        // The focus verb has already applied the requested
+                        // raise policy. A device click would hit-test again
+                        // and unconditionally raise, defeating raise:false.
+                        self.injection.targeted_button = target_window;
+                        self.injection.button_delivery = None;
+                        self.inject(input);
+                        button_delivery = self.injection.button_delivery;
+                        self.injection.targeted_button = None;
+                    } else {
+                        self.inject(input);
+                    }
+                }
+                if target_window.is_some() && button_delivery.is_some() {
+                    self.retarget_pointer_after_visibility_change();
                 }
                 (InjectedKind::PointerButton, false)
             }
@@ -326,19 +540,21 @@ impl WaylandState {
                         held.push(shift);
                     }
                 }
+                let mut events = Vec::new();
                 if *action != PressAction::Release {
                     for modifier in &held {
-                        self.inject_key(*modifier, HostButtonState::Pressed, time);
+                        events.push((*modifier, HostButtonState::Pressed, false));
                     }
                 }
                 for state in press_states(*action) {
-                    self.inject_key(keycode, *state, time);
+                    events.push((keycode, *state, true));
                 }
                 if *action != PressAction::Press {
                     for modifier in held.iter().rev() {
-                        self.inject_key(*modifier, HostButtonState::Released, time);
+                        events.push((*modifier, HostButtonState::Released, false));
                     }
                 }
+                key_result = self.inject_keys(events, target_window, time);
                 (InjectedKind::Key, true)
             }
             InputOp::Text(text) => {
@@ -366,16 +582,18 @@ impl WaylandState {
                         }
                     }
                 }
+                let mut events = Vec::new();
                 for (keycode, shift) in keys {
                     if let Some(shift) = shift {
-                        self.inject_key(shift, HostButtonState::Pressed, time);
+                        events.push((shift, HostButtonState::Pressed, false));
                     }
-                    self.inject_key(keycode, HostButtonState::Pressed, time);
-                    self.inject_key(keycode, HostButtonState::Released, time);
+                    events.push((keycode, HostButtonState::Pressed, true));
+                    events.push((keycode, HostButtonState::Released, true));
                     if let Some(shift) = shift {
-                        self.inject_key(shift, HostButtonState::Released, time);
+                        events.push((shift, HostButtonState::Released, false));
                     }
                 }
+                key_result = self.inject_keys(events, target_window, time);
                 (InjectedKind::Text, true)
             }
             InputOp::ReleaseAll => {
@@ -387,7 +605,13 @@ impl WaylandState {
         // stats registry's strictly-increasing rule holds by construction.
         let input_seq = self.injection.next_seq.saturating_add(1);
         self.injection.next_seq = input_seq;
-        let target = self.delivery_target(keyboard);
+        let target = if keyboard {
+            key_result.2
+        } else if target_window.is_some() {
+            button_delivery
+        } else {
+            button_delivery.or_else(|| self.delivery_target(false))
+        };
         self.note_injected_input(
             target.map(|(id, _)| SurfaceId(id)),
             InputMark {
@@ -399,12 +623,19 @@ impl WaylandState {
             (input_seq, kind as u64, target.map_or(0, |(id, _)| id))
         });
         let pointer = self.pointer_output_position();
-        ControlReply::Body(json!({
+        let body = json!({
             "input_seq": input_seq,
             "injected_at_us": injected_at_us,
             "pointer": pointer.map(|(output, x, y)| json!({"output": output, "x": x, "y": y})),
             "target": target.map(|(id, generation)| json!({"id": id, "generation": generation})),
-        }))
+            "targeted": target_window.map(|(id, generation)| json!({"id": id, "generation": generation})),
+            "completed_events": key_result.1,
+        });
+        if let Some(reason) = key_result.0 {
+            ControlReply::refused(reason, body)
+        } else {
+            ControlReply::Body(body)
+        }
     }
 
     /// `release_all`: release everything injection holds, and only that.
@@ -547,7 +778,7 @@ impl WaylandState {
 
     /// `{id, generation}` of the root of whatever the seat now delivers to:
     /// keyboard focus for key verbs, pointer focus otherwise.
-    fn delivery_target(&self, keyboard: bool) -> Option<(u64, u64)> {
+    pub(super) fn delivery_target(&self, keyboard: bool) -> Option<(u64, u64)> {
         let surface = if keyboard {
             self.keyboard
                 .current_focus()
