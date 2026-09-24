@@ -2074,13 +2074,27 @@ fn check_ssh_mix_bodies(
     // One heredoc bound once and shipped by several calls with the same
     // injected names would otherwise report every finding once per call.
     let mut analysed: HashSet<(usize, Option<Vec<String>>)> = HashSet::new();
+    let openers = cfg.source.as_deref().map(literal_openers).unwrap_or_default();
     for site in collect_remote_sites(stmts) {
         match site.body {
             RemoteBody::Literal {
                 src,
                 first_line,
                 origin,
+                heredoc,
+                stmt_line,
             } => {
+                // The opener's REAL line, when the source text is at hand:
+                // `ssh_mix(` / `$h,` / `<<EOF` over three lines puts the body
+                // two lines below where the statement line alone would say.
+                let first_line = openers
+                    .iter()
+                    .find(|(line, is_heredoc, text)| {
+                        *is_heredoc == heredoc && *line >= stmt_line && *text == src
+                    })
+                    .map_or(first_line, |(line, is_heredoc, _)| {
+                        if *is_heredoc { line + 1 } else { *line }
+                    });
                 let key = site.injected.as_ref().map(|names| {
                     let mut v: Vec<String> = names.iter().cloned().collect();
                     v.sort_unstable();
@@ -2135,8 +2149,13 @@ enum RemoteBody {
     /// once, and so MIX-W2402 can recognise it as a remote body.
     Literal {
         src: String,
+        /// Best line estimate from the AST alone (see [`literal_openers`]).
         first_line: usize,
         origin: usize,
+        heredoc: bool,
+        /// Line of the statement holding the literal — its opener is on or
+        /// after this line.
+        stmt_line: usize,
     },
     /// A string or heredoc with local `${…}`/`$(…)`/`~` substitutions —
     /// `locals` names them, spelled as written.
@@ -2172,11 +2191,13 @@ fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
                 src: src.clone(),
                 first_line: line,
                 origin,
+                heredoc: false,
+                stmt_line: line,
             });
         }
-        // A heredoc's text starts on the line AFTER its `<<TAG` opener,
-        // which is the statement's own line in every shape the manual
-        // shows (`$p = <<END`, `ssh_mix("h", <<EOF`).
+        // A heredoc's text starts on the line AFTER its `<<TAG` opener.
+        // The statement's own line is the estimate; with the source text
+        // at hand, `literal_openers` supplies the real one.
         Expr::Heredoc(parts) => (parts, line + 1),
         Expr::InterpolatedString(parts) => (parts, line),
         _ => return None,
@@ -2196,10 +2217,43 @@ fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
             src,
             first_line,
             origin,
+            heredoc: matches!(expr, Expr::Heredoc(_)),
+            stmt_line: line,
         }
     } else {
         RemoteBody::Interpolated { locals, origin }
     })
+}
+
+/// Where each string and all-literal heredoc in `source` opens: (line of
+/// the opening quote or `<<TAG`, is-heredoc, text). The AST keeps only the
+/// statement line, which is exact for `$x = ssh_mix($h, '` and
+/// `$p = <<END` but not for an opener further down a multi-line call.
+/// Empty when the source does not lex — the statement-line estimate stands.
+fn literal_openers(source: &str) -> Vec<(usize, bool, String)> {
+    let Ok(tokens) = crate::lexer::Lexer::new(source).tokenize() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in tokens {
+        match t.token {
+            crate::token::Token::String(s) => out.push((t.line, false, s)),
+            crate::token::Token::HeredocString(parts) => {
+                let mut text = String::new();
+                if parts.iter().all(|p| match p {
+                    StringPart::Literal(s) => {
+                        text.push_str(s);
+                        true
+                    }
+                    _ => false,
+                }) {
+                    out.push((t.line, true, text));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Names an `ssh_mix` call injects into its remote program: the keys of
@@ -2476,12 +2530,10 @@ fn remote_body_names(stmts: &[Stmt]) -> HashMap<usize, HashSet<String>> {
 /// the enclosing file's, with lines mapped: inner line N reports at
 /// `first_line + N - 1`.
 ///
-/// That is exact for the universal shapes — `$x = ssh_mix($HOST, '` with
-/// the opening quote on the statement's first line, and a heredoc whose
-/// `<<TAG` opener ends its statement's first line. A body opened further
-/// down a multi-line call reports offset by the same amount for every
-/// diagnostic, which still points into the right region; nothing here
-/// silently claims a precision it does not have.
+/// `first_line` comes from the opener's own token when the caller supplied
+/// the source text (`mix lint` does), so a body opened further down a
+/// multi-line call maps exactly. Without the source it is the statement
+/// line estimate, exact for `$x = ssh_mix($HOST, '` and `$p = <<END`.
 ///
 /// `injected` is the call's static `bindings`/`env` key set; `None` (not
 /// knowable) suppresses the body's undefined-name checks instead.

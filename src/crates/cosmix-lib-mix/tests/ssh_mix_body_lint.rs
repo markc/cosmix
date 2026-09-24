@@ -374,6 +374,36 @@ fn a_file_with_source_or_include_resolves_nothing() {
     assert!(codes(src).iter().any(|c| c == "MIX-D3012"), "{:?}", codes(src));
 }
 
+/// As `diags`, with the source text supplied the way `mix lint` does.
+fn diags_with_source(source: &str) -> Vec<(String, Severity, Option<usize>, String)> {
+    let tokens = Lexer::new(source).tokenize().expect("lex");
+    let stmts = Parser::new(tokens, source).parse_program().expect("parse");
+    let cfg = AnalyzerConfig {
+        source: Some(source.to_string()),
+        ..AnalyzerConfig::default()
+    };
+    analyze(&stmts, None, &cfg)
+        .diagnostics
+        .into_iter()
+        .map(|d| (d.code.to_string(), d.severity, d.line, d.message))
+        .collect()
+}
+
+#[test]
+fn a_body_opened_below_the_statement_line_maps_to_its_real_lines() {
+    // The opener sits on line 3, so `push` is on file line 5 — not the
+    // line 3 (heredoc) or 3 (string) the statement line alone would give.
+    for src in [
+        "$r = ssh_mix(\n  \"alpha\",\n  <<EOF\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEOF\n)\n",
+        "$r = ssh_mix(\n  \"alpha\",\n  '\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\n')\n",
+    ] {
+        assert_eq!(src.lines().nth(4).unwrap(), "push($m[\"a\"], 1)");
+        let d = diags_with_source(src);
+        let hit = d.iter().find(|(c, ..)| c == "MIX-E1501").expect("analysed");
+        assert_eq!(hit.2, Some(5), "{src:?}: {d:?}");
+    }
+}
+
 #[test]
 fn an_inline_heredoc_body_is_analysed() {
     // The manual's headline idiom writes the heredoc inline; it used to
