@@ -98,7 +98,6 @@ fn coalesce(mut bands: Vec<DamageBand>) -> Vec<DamageBand> {
 pub struct Painter {
     raster: Raster,
     font: FontSize,
-    cursor: Cursor,
     frames: HashMap<u64, Arc<Mutex<Frame>>>,
 }
 
@@ -107,7 +106,6 @@ impl Painter {
         Ok(Self {
             raster: Raster::new(scale, font.current(), cursor)?,
             font,
-            cursor,
             frames: HashMap::new(),
         })
     }
@@ -157,7 +155,7 @@ impl Painter {
         if (scale - self.raster.scale).abs() < 0.01 {
             return Ok(false);
         }
-        self.replace_raster(Raster::new(scale, self.font.current(), self.cursor)?);
+        self.replace_raster(self.raster.resized(scale, self.font.current())?);
         Ok(true)
     }
 
@@ -170,7 +168,7 @@ impl Painter {
         if !change(&mut font) {
             return Ok(false);
         }
-        let raster = Raster::new(self.raster.scale, font.current(), self.cursor)?;
+        let raster = self.raster.resized(self.raster.scale, font.current())?;
         self.font = font;
         self.replace_raster(raster);
         Ok(true)
