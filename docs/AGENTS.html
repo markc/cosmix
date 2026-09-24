@@ -467,10 +467,21 @@ non-Mix script and exists solely because <code>mix</code> does not yet.</li>
 </ul>
 <h2 id="build-and-verify">Build and verify</h2>
 <pre><code class="language-sh">cd $COSMIX/src &amp;&amp; cargo build --workspace --release     # or: mix $COSMIX/setup.mix
-cd $COSMIX/src &amp;&amp; cargo test --workspace
+cd $COSMIX/src &amp;&amp; cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
+cd $COSMIX/src/desktop &amp;&amp; cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
+cd $COSMIX/src/desktop &amp;&amp; cargo test -p ctk --lib --features bus,theme app_control::
+#   must report "N passed" with N &gt; 0; "0 passed" means the bus feature was
+#   compiled out and ctk's authorization tests did not run
 cd $COSMIX/src &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
+cd $COSMIX/src/desktop &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p &lt;crate&gt;          # never a repo-wide fmt from a task
 </code></pre>
+<p>On a machine without a real GPU the desktop run fails exactly two llvmpipe
+pixel tests in <code>cosmix-comp</code> (<code>client_surface_material::…_on_a_real_gpu</code> and
+<code>capture::…kms_overlay_equivalence_…</code>); any other failure blocks. The
+<code>app_control::</code> filter exists because a bare <code>ctk</code> run still reports ~267
+passed without the <code>bus</code> feature — <code>app_control</code> is <code>#[cfg(feature = "bus")]</code>,
+so only the filtered count drops to 0 when the feature is compiled out.</p>
 <p><code>src/rust-toolchain.toml</code> pins the compiler; rustup honours it.</p>
 <h2 id="paths">Paths</h2>
 <p>Everything derives from <code>$COSMIX</code>. The rule lives in

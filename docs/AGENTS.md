@@ -29,10 +29,22 @@ names, addresses, domains, keys, operator home paths) anywhere in it.
 
 ```sh
 cd $COSMIX/src && cargo build --workspace --release     # or: mix $COSMIX/setup.mix
-cd $COSMIX/src && cargo test --workspace
+cd $COSMIX/src && cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
+cd $COSMIX/src/desktop && cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
+cd $COSMIX/src/desktop && cargo test -p ctk --lib --features bus,theme app_control::
+#   must report "N passed" with N > 0; "0 passed" means the bus feature was
+#   compiled out and ctk's authorization tests did not run
 cd $COSMIX/src && cargo clippy --workspace --all-targets -- -D warnings
+cd $COSMIX/src/desktop && cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p <crate>          # never a repo-wide fmt from a task
 ```
+
+On a machine without a real GPU the desktop run fails exactly two llvmpipe
+pixel tests in `cosmix-comp` (`client_surface_material::…_on_a_real_gpu` and
+`capture::…kms_overlay_equivalence_…`); any other failure blocks. The
+`app_control::` filter exists because a bare `ctk` run still reports ~267
+passed without the `bus` feature — `app_control` is `#[cfg(feature = "bus")]`,
+so only the filtered count drops to 0 when the feature is compiled out.
 
 `src/rust-toolchain.toml` pins the compiler; rustup honours it.
 
