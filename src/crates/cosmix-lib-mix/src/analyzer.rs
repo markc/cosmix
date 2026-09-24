@@ -3420,8 +3420,9 @@ mod instructional_error_tests {
 
     #[test]
     fn a_synonym_beats_a_closer_lexical_neighbour() {
-        // `json_encode` is ONE edit from `json_decode` and is its opposite.
-        assert_eq!(edit_distance("json_decode", "json_encode"), 1);
+        // `json_encode` is within the lexical threshold (2 edits for a long
+        // name) of `json_decode` and is its opposite — the pre-table answer.
+        assert_eq!(edit_distance("json_decode", "json_encode"), 2);
         assert_eq!(
             undefined_function_hint("json_decode", &fns(&[])),
             Some(" — did you mean 'json_parse'?".to_string())
