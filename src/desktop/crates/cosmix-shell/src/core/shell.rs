@@ -31,6 +31,9 @@ pub struct ShellModel {
     focus_directive: FocusDirective,
     /// When an ungranted cycle request gives up (see [`FOCUS_GRANT_TIMEOUT`]).
     focus_grant_deadline: Option<Duration>,
+    /// The pending request came from a named activation that revealed a
+    /// hidden edge: if it lapses ungranted, that reveal ends with it.
+    focus_request_revealed: bool,
     last_update: Duration,
 }
 
@@ -71,6 +74,7 @@ impl ShellModel {
             focus_reported: false,
             focus_directive: FocusDirective::Follow,
             focus_grant_deadline: None,
+            focus_request_revealed: false,
             last_update: start_at,
         })
     }
@@ -365,17 +369,41 @@ impl ShellModel {
             })
             .collect();
         let stop = next_focus_stop(&stops, current);
-        self.focus_directive = match stop {
-            FocusStop::Panel(edge) => FocusDirective::Panel(edge),
-            FocusStop::Application => self.release_directive(),
-        };
-        self.focus_grant_deadline = match stop {
-            FocusStop::Panel(edge) if self.keyboard_focus != Some(edge) => {
-                Some(at + FOCUS_GRANT_TIMEOUT)
+        match stop {
+            FocusStop::Panel(edge) => self.request_keyboard_focus(edge, at),
+            FocusStop::Application => {
+                self.focus_directive = self.release_directive();
+                self.focus_grant_deadline = None;
             }
-            _ => None,
-        };
+        }
         stop
+    }
+
+    /// Ask for the keyboard in `edge`'s panel: the focus cycle's stops and
+    /// named activation (panel doc §6, whose hidden edge is revealed first)
+    /// both come here. The request lapses unless comp grants it by `at` +
+    /// [`FOCUS_GRANT_TIMEOUT`], and ends once focus has landed there and
+    /// then left, on Escape, or at the next cycle stop. An unmapped panel has
+    /// no surface to focus and is not asked for. Never changes a mode.
+    pub fn request_keyboard_focus(&mut self, edge: Edge, at: Duration) {
+        if !self.panel(edge).mapped {
+            return;
+        }
+        self.focus_directive = FocusDirective::Panel(edge);
+        self.focus_grant_deadline =
+            (self.keyboard_focus != Some(edge)).then_some(at + FOCUS_GRANT_TIMEOUT);
+        self.focus_request_revealed = false;
+    }
+
+    /// A named activation's request ([`Self::request_keyboard_focus`]).
+    /// `revealed`: the activation revealed a hidden edge for it. Should comp
+    /// never grant the keyboard (a session lock, a higher exclusive layer),
+    /// that reveal ends when the request lapses — an open panel without the
+    /// keyboard is one Escape cannot reach, since Escape goes to the
+    /// application.
+    pub fn request_activation_focus(&mut self, edge: Edge, at: Duration, revealed: bool) {
+        self.request_keyboard_focus(edge, at);
+        self.focus_request_revealed = revealed && self.focus_grant_deadline.is_some();
     }
 
     /// Escape from a focused panel (shell doc §4.3). A transient reveal hides
@@ -419,7 +447,7 @@ impl ShellModel {
     pub fn tick(&mut self, at: Duration) -> Result<[PanelUpdate; 4], PanelTimeError> {
         self.ensure_monotonic(at)?;
         let [left, bottom, right, top] = &mut self.panels;
-        let updates = [
+        let mut updates = [
             left.tick(at)?,
             bottom.tick(at)?,
             right.tick(at)?,
@@ -432,8 +460,22 @@ impl ShellModel {
             && (!self.panel(edge).mapped
                 || self.focus_grant_deadline.is_some_and(|deadline| deadline <= at))
         {
+            let lapsed = self.focus_grant_deadline.is_some_and(|deadline| deadline <= at);
             self.focus_directive = FocusDirective::Follow;
             self.focus_grant_deadline = None;
+            // An activation's reveal that never got the keyboard ends too.
+            if lapsed && std::mem::take(&mut self.focus_request_revealed) {
+                let panel = self.panel(edge);
+                if panel.mode == PanelMode::Hidden && panel.transient_revealed {
+                    let update = self.panels[edge.index()].apply(at, PanelInput::Hide)?;
+                    let ticked = updates[edge.index()];
+                    updates[edge.index()] = PanelUpdate {
+                        changed: ticked.changed || update.changed,
+                        snapshot: update.snapshot,
+                        effect: update.effect.or(ticked.effect),
+                    };
+                }
+            }
         }
         self.last_update = at;
         Ok(updates)

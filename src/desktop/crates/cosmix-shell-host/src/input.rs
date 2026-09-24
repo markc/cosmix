@@ -724,6 +724,7 @@ fn shell_command_kind(kind: &ShellCommandKind) -> &'static str {
         ShellCommandKind::Keyboard(_) => "keyboard",
         ShellCommandKind::SubPanelRegister { .. } => "sub-register",
         ShellCommandKind::SubPanelRemove { .. } => "sub-remove",
+        ShellCommandKind::SubPanelActivate { .. } => "sub-activate",
     }
 }
 

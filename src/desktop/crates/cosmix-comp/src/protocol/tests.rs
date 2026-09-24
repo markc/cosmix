@@ -29152,6 +29152,68 @@ fn focused_on_demand_layer_committing_none_falls_back_to_the_toplevel() {
     assert!(test_toplevel_record(&harness).focused);
 }
 
+/// A layer granted the keyboard by its Exclusive request that then commits
+/// OnDemand keeps the keyboard (the grab ends, the focus stays), and from
+/// then on a click on a window takes focus away — the click-away Quoin's
+/// named activation and focus cycle rely on.
+#[test]
+fn exclusive_layer_demoted_to_on_demand_keeps_focus_until_clicked_away() {
+    const TOP_LEFT: u32 = 1 | 4;
+    let mut harness = KeybindingHarness::new(true);
+    map_initial_test_toplevel(&mut harness);
+    let (layer, _) = map_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec {
+            anchor: TOP_LEFT,
+            keyboard_interactivity: zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive as u32,
+            ..TestLayerSpec::default()
+        },
+    );
+    let _ = harness.sync();
+    let layer_surface = test_layer_record(&harness, layer.surface)
+        .role
+        .wl_surface()
+        .clone();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(layer_surface.clone())
+    );
+    assert!(harness.server.state.exclusive_keyboard_focus.is_some());
+
+    send_request(
+        &mut harness.client,
+        layer.layer_surface,
+        4,
+        &words(&[zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand as u32]),
+    );
+    send_request(&mut harness.client, layer.surface, 6, &[]);
+    let _ = harness.sync();
+    assert_eq!(harness.server.state.exclusive_keyboard_focus, None);
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(layer_surface),
+        "the demoted layer keeps the keyboard it was granted"
+    );
+    assert!(!test_toplevel_record(&harness).focused);
+
+    let layout = test_toplevel_record(&harness).layout;
+    route_pointer_to(
+        &mut harness,
+        f64::from(layout.x + layout.width / 2.0),
+        f64::from(layout.y + layout.height / 2.0),
+    );
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+    route_pointer_button(&mut harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+    let _ = harness.sync();
+    assert_eq!(
+        focused_surface(harness.server.state.keyboard.current_focus()),
+        Some(test_toplevel_record(&harness).role.wl_surface().clone()),
+        "a click on a window now takes focus away"
+    );
+    assert!(test_toplevel_record(&harness).focused);
+}
+
 #[test]
 fn exclusive_layer_latch_survives_toplevel_click_then_releases_on_unmap() {
     const TOP_LEFT: u32 = 1 | 4;

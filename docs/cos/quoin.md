@@ -138,8 +138,9 @@ reserve zero and slide with their edge protocol margin. Pinning a transient
 reveal changes neither layer nor reservation. Docking from hidden claims the full zone at
 fraction zero while chrome supplies the only visual translation. Keyboard
 policy is `OnDemand` for a mapped panel and `None` otherwise. Two keyboard
-actions change it (see Keyboard below): the focus cycle requests `Exclusive`
-on the one panel it moves focus into, and handing focus back sets every panel
+actions change it (see Keyboard below): the focus cycle and a named activation
+request `Exclusive` on the one panel they move focus into, until the keyboard
+lands there (then `OnDemand` again), and handing focus back sets every panel
 to `None` until no panel holds the keyboard.
 Chrome selects its translation owner from the last successfully committed
 protocol mode, not the model's next desired mode. The host advances that latch
@@ -290,6 +291,60 @@ a side effect of another verb. `shell.panel.mode` takes `edge` and
 legacy verbs it never leaves a transient reveal behind, and `mode=hidden`
 conceals at once with no grace delay, because it is a deliberate action. Read
 back `shell.props.get path="panels.<edge>.mode"` to verify the applied mode.
+
+Sub-panels are addressed by their stable name, unique across every edge and
+output. `shell.sub.register` takes `edge` and `name` (the owner is the
+broker-attested caller) and fills a carousel slot without revealing or
+selecting it; `shell.sub.remove` takes `name` and lands per the removal rule.
+
+`shell.sub.activate` takes `name` and an optional `focus` (`true` or `false`,
+a JSON boolean or the string; default `true`) and reveals, shows and focuses
+that sub-panel (panel design §6). The carousel jumps to the page (no slide);
+activation never changes the persisted mode.
+
+- **Hidden edge, `focus=true`:** a transient reveal, and the panel asks for
+  the keyboard exactly as a focus-cycle stop does — its layer requests
+  exclusive keyboard interactivity until comp grants it, then drops back to
+  on-demand. Until the keyboard lands Quoin holds the reveal with a `focus`
+  hold on the panel's layer; once it lands Quoin releases that hold and comp's
+  own focus holder keeps the panel. It ends when focus leaves the panel —
+  including a click elsewhere, which works as soon as the keyboard has landed
+  — on Escape, at the next focus-cycle stop, or on a hide, a corner action or
+  a mode change. If comp never grants the keyboard (a session lock, a higher
+  exclusive layer) the request lapses after 500 ms and the reveal it made
+  ends with it (its hold is released and the panel hides): an open panel
+  without the keyboard is one Escape cannot reach, since Escape goes to the
+  application. An edge that was already showing when activated is left as
+  it was.
+- **Pinned or docked edge, `focus=true`:** the page switch, then the same
+  keyboard request (and the same exits); the panel keeps the page when focus
+  leaves.
+- **`focus=false`:** the reveal or page switch alone — no keyboard request and
+  no focus hold — for a caller that wants attention without taking the
+  keyboard (a notification). A hidden edge's reveal then behaves like
+  `shell.panel.show`: it stays until the pointer has come and gone or the
+  panel is hidden.
+
+The reply is
+`{"accepted":true,"name":…,"edge":…,"output":…,"target":…,"focus":…}`:
+`output` is where the sub-panel lives, and `target` the output the user is at
+(the focused surface's, else the pointer's, as comp last reported them; `null`
+when unknown). The pointer's output is refreshed only when keyboard focus
+changes (or Quoin reconnects), so after the pointer alone crosses to another
+output it can be stale. This Quoin runs one output, so `target` is reported
+only: the sub-panel still shows on its own output. `accepted` is an
+acceptance, not an application receipt: a name removed or replaced in the same
+frame, after the reply, applies nothing (Quoin logs it). Refusals: an
+unregistered name is refused exactly like `sub.remove`
+(`sub-panel name 'NAME' is not registered`) — activation never creates; a
+`focus` that is not a boolean is `focus must be true or false`. While the
+compositor does not report its holder plane (below) nothing could hold the
+reveal, so the verb is refused rather than shown and left to vanish:
+`{"error_code":"ACTIVATION_UNAVAILABLE","error":"named activation unavailable: compositor holder plane not available","reason":"compositor holder plane not available","name":…}`.
+That is the answer from a comp without the plane — every build before the one
+that turns `input.corners.holders` true (restart C) — and from the embedded
+host, which has no holder client; callers get the error, never a silent no-op.
+When the leaf turns true Quoin re-reads it and the next activation is accepted.
 
 Quoin 0.10.1 also accepts `shell.corner.{show,hide,toggle,pin,unpin}` with a
 `corner` argument. These use the same panel state machine and caller checks:
@@ -485,8 +540,17 @@ client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present
 keeps the gate open and re-reads and replays in the background, since comp may
 have re-registered in between. Actual mode reports precede popup acquisitions
-from the corner-menu call sites. Pointer and focus are also accepted holder
-kinds; named activation integration belongs to its later slice.
+from the corner-menu call sites. A focusing activation of a hidden edge
+acquires a `focus` hold naming the panel's own layer token once that layer
+maps (an acquisition that overtakes the mapping is refused and resent on the
+next `surface.mapped`), and releases it when the keyboard lands on the panel
+(comp's focus holder then holds it), when the keyboard request ends without
+landing, when the reveal ends or when the edge goes persistent. All of these
+are read from Quoin's own model, never from comp's focus events, so the order
+in which comp's events and replies arrive cannot end the hold early. Comp's
+`focus.changed` topic drives activation targeting only: each change starts
+one `comp.props.get path=focus` read, then the `surfaces.s<id>.output` of the
+focused surface and of the one under the pointer. No pointer lease is held.
 
 A refused request is resent only on the event that can change the answer: a
 layer mapping for surface and output refusals, a session-lock change for
@@ -724,8 +788,11 @@ triggered by the chord that moved focus there.
   panel on this output, in left, bottom, right, top order. After the last
   panel, focus goes back to the application. Transient reveals are not stops.
   A Wayland client cannot focus its own layer surface, so the cycle requests
-  `Exclusive` interactivity on the target panel. The panel keeps the keyboard
-  until Escape or the next cycle stop, or until it unmaps. Comp grants the
+  `Exclusive` interactivity on the target panel until the keyboard lands, then
+  drops back to `OnDemand` (comp lets a demoted layer keep the keyboard it was
+  granted). The panel keeps the keyboard until focus leaves it — a click
+  elsewhere included — Escape, the next cycle stop, or until it unmaps. Named
+  activation (`shell.sub.activate`) makes the same request. Comp grants the
   request only for a panel it is actually showing. If the keyboard has not
   arrived within 500 ms, the request is withdrawn, so a panel shown later
   never takes the keyboard on its own.
@@ -752,9 +819,10 @@ output when no window has focus. The keys Quoin receives always come from its
 own focused panel, so they target that panel's output. The pointer fallback
 applies only to the future compositor-grabbed route.
 
-While `Exclusive`, a panel keeps the keyboard even if another window is
-clicked. Escape or the cycle key releases it. Click-away release waits for
-the compositor focus holder.
+Only while a request is still waiting for the keyboard is the panel
+`Exclusive`, and a click elsewhere cannot take the keyboard then. Once the
+keyboard has landed, a click elsewhere moves it away like from any
+`OnDemand` panel, which ends the request.
 
 The latch described above is the local one, used while comp does not report
 the holder plane. A hide latches in the same way when the pointer is inside:

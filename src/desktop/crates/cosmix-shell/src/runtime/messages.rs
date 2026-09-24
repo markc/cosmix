@@ -84,6 +84,24 @@ pub enum ShellCommandKind {
         owner: String,
         accepted_at: u64,
     },
+    /// Named activation (panel doc §6): show the registered sub-panel `name`
+    /// on its edge. Addressed like [`Self::SubPanelRemove`] — `edge`, `owner`
+    /// and `accepted_at` are the seat's own values resolved at dispatch, and
+    /// the Model stage applies only while that exact registration stands.
+    /// The carousel jumps to the page (a named change, never animated); a
+    /// `Hidden` edge also gets a transient reveal, which the host holds with
+    /// a compositor focus hold. A pinned or docked edge only switches pages:
+    /// activation never changes a mode. With `focus` (the default) the
+    /// panel then asks for the keyboard, exactly as a focus-cycle stop does;
+    /// without it the activation only reveals or switches — the shape a
+    /// notification that wants attention but not the keyboard uses.
+    SubPanelActivate {
+        edge: Edge,
+        name: String,
+        owner: String,
+        accepted_at: u64,
+        focus: bool,
+    },
 }
 
 #[cfg_attr(feature = "chrome-core", derive(bevy::prelude::Message))]
@@ -154,9 +172,10 @@ pub enum PageChange {
 pub enum KeyboardInteractivity {
     None,
     OnDemand,
-    /// Only while the focus cycle has moved the keyboard into this panel:
-    /// a client cannot focus its own layer on demand, so the cycle asks for
-    /// the grab and gives it back on Escape or the next cycle stop.
+    /// Only while the focus cycle or a named activation is moving the
+    /// keyboard into this panel: a client cannot focus its own layer on
+    /// demand, so they ask for the grab, and drop it to on-demand once comp
+    /// grants it (so a click elsewhere can still take focus away).
     Exclusive,
 }
 
@@ -174,6 +193,11 @@ pub struct PanelPresentation {
     pub settled_thickness_px: f32,
     pub exclusive_zone_px: f32,
     pub keyboard_interactivity: KeyboardInteractivity,
+    /// The shell asks for the keyboard in this panel (a focus-cycle stop or
+    /// a named activation), until the request ends.
+    pub keyboard_requested: bool,
+    /// The host reports this panel's surface holds the keyboard.
+    pub keyboard_focused: bool,
     pub page_ids: Arc<[String]>,
     pub active_page_id: Option<String>,
     /// Marker for the change that produced `active_page_id` this update, if
@@ -220,11 +244,18 @@ impl ShellFrame {
                     // Refusing focus on every panel hands it back to the
                     // application until the host reports it has left.
                     FocusDirective::Release => KeyboardInteractivity::None,
-                    FocusDirective::Panel(target) if target == edge => {
+                    // Exclusive only until comp grants the request: once
+                    // the panel holds the keyboard the grab has done its job,
+                    // and on-demand lets a click elsewhere take focus away.
+                    FocusDirective::Panel(target)
+                        if target == edge && model.keyboard_focus() != Some(edge) =>
+                    {
                         KeyboardInteractivity::Exclusive
                     }
                     _ => KeyboardInteractivity::OnDemand,
                 },
+                keyboard_requested: model.focus_directive() == FocusDirective::Panel(edge),
+                keyboard_focused: model.keyboard_focus() == Some(edge),
                 page_ids: model.carousel(edge).shared_page_ids(),
                 active_page_id: model.carousel(edge).active_id().map(str::to_owned),
                 page_change: PageChange::None,

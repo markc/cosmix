@@ -12,7 +12,7 @@ use bevy::time::Real;
 use std::time::{Duration, SystemTime};
 
 use crate::chrome::QuoinCommittedMotionModes;
-use crate::core::{Edge, PanelInput, ShellModel, SubPanelRegistry, SubPanelSeat};
+use crate::core::{Edge, PanelInput, PanelMode, ShellModel, SubPanelRegistry, SubPanelSeat};
 use crate::runtime::{
     CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellEffect,
     ShellFrame, WakePolicy,
@@ -409,6 +409,64 @@ fn update_model(
                 }
                 continue;
             }
+            ShellCommandKind::SubPanelActivate {
+                edge,
+                name,
+                owner,
+                accepted_at,
+                focus,
+            } => {
+                // Addressed like a removal: only that exact registration,
+                // and only on the model that carries its seat — an
+                // activation whose name was removed, replaced or migrated
+                // away since dispatch has nothing to show here. The verb was
+                // acked at dispatch, so that one-frame race answers accepted
+                // and applies nothing (logged below).
+                let exact = registry.0.seat(name).is_some_and(|seat| {
+                    seat.owner == *owner
+                        && seat.accepted_at == *accepted_at
+                        && seat.edge == *edge
+                        && seat.output == *runtime.model.output()
+                });
+                let carousel = runtime.model.carousel_mut(*edge);
+                let before = carousel.active_index();
+                if !exact || !carousel.select_id(name) {
+                    bevy::log::warn!(
+                        "sub-panel activation of '{name}' no longer matches its registration"
+                    );
+                    continue;
+                }
+                if carousel.active_index() != before {
+                    effects.1.push(*edge);
+                }
+                // A named target is a direct jump, never a slide (panel doc
+                // §5) — including onto a page already sliding in.
+                runtime.page_changes[edge.index()] = PageChange::Named;
+                // Hidden: a transient reveal, never a mode change (panel doc
+                // §6); a focusing one is held by a compositor focus hold
+                // until the keyboard lands. Pinned or docked: a page switch,
+                // no mode change. With `focus` the panel then asks for the
+                // keyboard exactly as a focus-cycle stop does (exclusive until
+                // granted, then on-demand; ends when focus leaves, on Escape
+                // or when the grant times out).
+                let at = command.at.clamp(runtime.model.last_update(), now);
+                let before = runtime.model.panel(*edge);
+                // This activation made the reveal (it was not already shown).
+                let revealed = before.mode == PanelMode::Hidden && !before.transient_revealed;
+                if before.mode == PanelMode::Hidden
+                    && let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
+                    && let Some(effect) = update.effect
+                {
+                    effects.0.push(ShellEffect {
+                        edge: *edge,
+                        effect,
+                    });
+                }
+                if *focus {
+                    runtime.model.request_activation_focus(*edge, at, revealed);
+                }
+                continue;
+            }
             ShellCommandKind::HolderPlane(available) => {
                 let at = command.at.clamp(runtime.model.last_update(), now);
                 if let Ok(updates) = runtime.model.set_holder_plane(*available, at) {
@@ -447,6 +505,7 @@ fn update_model(
             // `continue`d) above the output gate.
             ShellCommandKind::SubPanelRegister { .. }
             | ShellCommandKind::SubPanelRemove { .. }
+            | ShellCommandKind::SubPanelActivate { .. }
             | ShellCommandKind::HolderPlane(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
                 let thickness_px = if thickness_px.is_finite() {

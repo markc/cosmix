@@ -113,6 +113,15 @@ pub(crate) struct HolderClient {
     backoff: Duration,
     popup: BTreeMap<(String, String), bool>,
     popup_surfaces: BTreeMap<(String, String), String>,
+    /// Named activation's focus holds by `(output, edge)`: the bridge from a
+    /// focusing activation of a hidden edge to the keyboard landing there.
+    /// Wanted while that reveal lasts and its keyboard request is pending;
+    /// released once the keyboard lands (comp's own focus holder then holds
+    /// the edge, and releases it when focus leaves) or when the request ends
+    /// without landing (grant timeout, Escape, another cycle stop), after
+    /// which comp's ordinary holders decide. Derived from Quoin's own frame,
+    /// never from comp's focus events, so no event ordering can end it early.
+    focus: BTreeSet<(String, Edge)>,
 }
 
 pub(crate) fn install(app: &mut App, bus: &mut BusBridgeConfig, service: String) {
@@ -159,7 +168,7 @@ impl HolderClient {
             maybe_held: BTreeMap::new(), pending: None, pending_superseded: false,
             retry_wanted: false, retry_read: false,
             retry_at: None, backoff: RETRY_FIRST, popup: BTreeMap::new(),
-            popup_surfaces: BTreeMap::new(),
+            popup_surfaces: BTreeMap::new(), focus: BTreeSet::new(),
         }
     }
 
@@ -178,6 +187,12 @@ impl HolderClient {
         self.retry_read = false;
         self.retry_at = None;
         self.backoff = RETRY_FIRST;
+    }
+
+    /// The activation focus holds Quoin currently wants.
+    #[cfg(test)]
+    pub(crate) fn focus_holds(&self) -> usize {
+        self.focus.len()
     }
 
     /// The capability to hand the model when it differs from what the model
@@ -471,11 +486,35 @@ pub(crate) fn report_holders(
             client.mode_changed(output.as_str(), edge_name(effect.edge));
         }
     }
+    let mut activated = Vec::new();
     for command in commands.read() {
-        if let ShellCommandKind::Panel { edge, input: cosmix_shell::core::PanelInput::MenuHold(open) } = &command.kind {
-            client.popup.insert((command.output.as_str().into(), edge_name(*edge).into()), *open);
+        match &command.kind {
+            ShellCommandKind::Panel { edge, input: cosmix_shell::core::PanelInput::MenuHold(open) } => {
+                client.popup.insert((command.output.as_str().into(), edge_name(*edge).into()), *open);
+            }
+            ShellCommandKind::SubPanelActivate { edge, name, focus: true, .. } => {
+                activated.push((command.output.clone(), *edge, name.clone()));
+            }
+            _ => {}
         }
     }
+    // A focusing activation holds only the reveal it made (the Model stage
+    // applied it: the edge is hidden, revealed and on that page), and only
+    // while that reveal lasts on this output and its keyboard request is
+    // still waiting for the keyboard.
+    let pending = |edge: Edge| {
+        let panel = frame.0.panel(edge);
+        panel.mode == PanelMode::Hidden && panel.transient_revealed
+            && panel.keyboard_requested && !panel.keyboard_focused
+    };
+    for (activated_output, edge, name) in activated {
+        if client.capable && activated_output == *output && pending(edge)
+            && frame.0.panel(edge).active_page_id.as_deref() == Some(name.as_str())
+        {
+            client.focus.insert((output.as_str().into(), edge));
+        }
+    }
+    client.focus.retain(|(focus_output, edge)| focus_output == output.as_str() && pending(*edge));
     if let Some(identity) = &popup_identity {
         client.popup_surfaces.insert((identity.output.as_str().into(), edge_name(identity.edge).into()),
             identity.surface.clone());
@@ -488,6 +527,15 @@ pub(crate) fn report_holders(
             client.desired.insert((surface.into(), "panel.mode".into()), json!({
                 "output":output.as_str(),"edge":edge_name(edge),"surface":surface,"mode":mode.as_str(),
             }));
+            // The activation's focus hold names the panel's own layer, which
+            // maps with the reveal: an acquisition that overtakes the mapping
+            // is refused and resent on the next `surface.mapped`.
+            if client.focus.contains(&(output.as_str().to_owned(), edge)) {
+                client.desired.insert((surface.into(), "panel.hold".into()), json!({
+                    "output":output.as_str(),"edge":edge_name(edge),"surface":surface,
+                    "holder":"focus","acquire":true,
+                }));
+            }
             let popup_key = (output.as_str().into(), edge_name(edge).into());
             let Some(popup_surface) = client.popup_surfaces.get(&popup_key).cloned() else { continue; };
             let acquire = mode == PanelMode::Hidden

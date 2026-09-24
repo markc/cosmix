@@ -68,6 +68,17 @@ pub enum ShellSemanticVerb {
         owner: String,
         accepted_at: u64,
     },
+    /// Named activation (panel doc §6), addressed exactly like
+    /// [`Self::SubRemove`]: the name's seat supplies the edge, owner and
+    /// receipt at dispatch. Routed like [`Self::SubRegister`].
+    SubActivate {
+        name: String,
+        owner: String,
+        accepted_at: u64,
+        /// Ask for the keyboard too (the §6 default); `false` reveals or
+        /// switches without it.
+        focus: bool,
+    },
 }
 
 /// Produce the same [`ShellCommand`] used by pointer and keyboard input.
@@ -141,6 +152,18 @@ pub fn semantic_shell_command(
             name,
             owner,
             accepted_at,
+        },
+        ShellSemanticVerb::SubActivate {
+            name,
+            owner,
+            accepted_at,
+            focus,
+        } => ShellCommandKind::SubPanelActivate {
+            edge,
+            name,
+            owner,
+            accepted_at,
+            focus,
         },
     };
     ShellCommand { output, at, kind }
