@@ -474,7 +474,17 @@ fn handle(
 ) -> Result<String, String> {
     // VERIFY: every term.* verb validates its JSON contract before locking/mutation.
     let args = parse_args(verb, body)?;
+    // Test-only verbs that drive the panic boundary through the real
+    // serve() path: one panics before the set lock, one while holding it.
+    #[cfg(test)]
+    if verb == "term.test.panic" {
+        panic!("test verb: panic outside the tab-set lock");
+    }
     let mut tabs = set.lock().unwrap();
+    #[cfg(test)]
+    if verb == "term.test.panic_locked" {
+        panic!("test verb: panic holding the tab-set lock");
+    }
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
             "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)",
@@ -660,6 +670,8 @@ fn parse_args(verb: &str, body: &str) -> Result<serde_json::Value, String> {
     let field = match verb {
         "term.snapshot" | "term.tabs" | "term.tab.new" | "term.panes" | "term.pane.close"
         | "term.session" => None,
+        #[cfg(test)]
+        "term.test.panic" | "term.test.panic_locked" => None,
         "term.type" => Some("text"),
         "term.tab.select" | "term.tab.close" | "term.pane.select" => Some("id"),
         "term.pane.split" => Some("dir"),
@@ -919,6 +931,128 @@ mod tests {
         assert_eq!(turns, 0);
         drop(cleanup);
         worker.join().unwrap();
+    }
+
+    struct Recorder(std::sync::mpsc::Sender<(String, u8, String)>);
+    impl Peer for Recorder {
+        async fn reply(&self, command: &IncomingCommand, rc: u8, body: &str) {
+            let _ = self.0.send((command.command.clone(), rc, body.into()));
+        }
+        fn completed(&self, _: CompletionNote) -> impl std::future::Future<Output = ()> + Send + 'static {
+            std::future::ready(())
+        }
+    }
+
+    fn command(verb: &str, body: &str) -> BoundedIncomingEvent {
+        BoundedIncomingEvent::Command(IncomingCommand {
+            from: "test".into(),
+            command: verb.into(),
+            id: None,
+            args: serde_json::Value::Null,
+            body: body.into(),
+            headers: Default::default(),
+        })
+    }
+
+    /// Run serve() on its own thread with a recording peer; the caller feeds
+    /// commands and reads replies.
+    fn serving(
+        set: &Arc<Mutex<TabSet>>,
+        cleanup: &Cleanup,
+    ) -> (
+        tokio::sync::mpsc::Sender<BoundedIncomingEvent>,
+        std::sync::mpsc::Receiver<(String, u8, String)>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (commands_tx, commands) = tokio::sync::mpsc::channel(4);
+        let (replies_tx, replies) = std::sync::mpsc::channel();
+        let (set, cleanup) = (set.clone(), cleanup.clone());
+        let thread = std::thread::spawn(move || {
+            let (_notes, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut tasks = tokio::task::JoinSet::new();
+                    let mut incoming = Quiet(commands);
+                    serve(CANONICAL, &set, &cleanup, &mut notify_rx, &mut tasks, &mut incoming, &Recorder(replies_tx)).await;
+                });
+        });
+        (commands_tx, replies, thread)
+    }
+
+    /// Through the real serve() path: a verb that panics outside the set
+    /// lock answers rc 10 with the fixed message, and the NEXT command is
+    /// still served. Removing the boundary kills the Bus thread and the
+    /// second reply never comes.
+    #[test]
+    fn a_panicking_verb_is_answered_and_the_lane_keeps_serving() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP panic continuation test: Mix unavailable");
+            return;
+        }
+        let set = Arc::new(Mutex::new(TabSet::new().unwrap()));
+        let (cleanup, worker) = Cleanup::start().unwrap();
+        let (commands, replies, serving) = serving(&set, &cleanup);
+        commands.blocking_send(command("term.test.panic", "")).unwrap();
+        commands.blocking_send(command("term.tabs", "")).unwrap();
+        let wait = Duration::from_secs(5);
+        assert_eq!(
+            replies.recv_timeout(wait).unwrap(),
+            ("term.test.panic".into(), 10, HANDLER_PANICKED.into())
+        );
+        let (verb, rc, body) = replies.recv_timeout(wait).expect("lane stopped serving after a panic");
+        assert_eq!((verb.as_str(), rc), ("term.tabs", 0));
+        assert!(body.starts_with("id=1 "), "{body}");
+        assert!(!set.is_poisoned());
+        cleanup.submit(set.lock().unwrap().shutdown());
+        serving.join().unwrap();
+        drop(cleanup);
+        worker.join().unwrap();
+    }
+
+    const ABORT_CHILD: &str = "COSMIX_TERM_TEST_ABORT_CHILD";
+
+    /// A verb that panics while holding the tab-set lock must take the whole
+    /// process down by SIGABRT, not carry on over torn state. Runs itself in
+    /// a child process (the abort would otherwise kill the test binary).
+    #[test]
+    fn a_verb_that_poisons_the_tab_set_aborts_the_process() {
+        if !std::path::Path::new("/opt/cosmix/bin/mix").is_file() {
+            eprintln!("SKIP poison abort test: Mix unavailable");
+            return;
+        }
+        if std::env::var_os(ABORT_CHILD).is_some() {
+            // The abort is the expected outcome here; never leave a core
+            // file in the caller's working directory for it.
+            let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            // SAFETY: setrlimit reads one live rlimit.
+            unsafe { libc::setrlimit(libc::RLIMIT_CORE, &none) };
+            let set = Arc::new(Mutex::new(TabSet::new().unwrap()));
+            let (cleanup, _worker) = Cleanup::start().unwrap();
+            let (commands, replies, _serving) = serving(&set, &cleanup);
+            commands.blocking_send(command("term.test.panic_locked", "")).unwrap();
+            let reply = replies.recv_timeout(Duration::from_secs(10));
+            eprintln!("CHILD SURVIVED the poisoning verb; reply: {reply:?}");
+            std::process::exit(3);
+        }
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "bus::tests::a_verb_that_poisons_the_tab_set_aborts_the_process",
+                "--nocapture",
+            ])
+            .env(ABORT_CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{:?}\n{stderr}", output.status);
+        assert!(
+            stderr.contains("\"term.test.panic_locked\" panicked while holding the tab set; aborting"),
+            "{stderr}"
+        );
     }
 
     /// A handler panic outside the shared lock is an ordinary error reply and
