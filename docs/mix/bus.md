@@ -194,7 +194,11 @@ was dropped: the caller waited out its full timeout and got `-2`, which read as
 a mesh problem.) So a `-2` from a citizen that answers its other verbs is no
 longer a typo symptom — look at the citizen's handler instead. Props paths such
 as `lifecycle.generation` are not verbs: read them with
-`send svc svc.props.get path="lifecycle.generation"`.
+`send svc svc.props.get path="lifecycle.generation"`. The code is a Mix
+citizen's: other daemons name the same refusal differently — comp answers
+`unknown_verb`, noded its own rc 10 message — so a script that must work
+against any service should test `$rc >= 10` and read the code from `$reply`
+rather than match one spelling.
 
 ## `send` and the verified session lane
 

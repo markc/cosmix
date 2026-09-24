@@ -595,7 +595,11 @@ was dropped: the caller waited out its full timeout and got <code>-2</code>, whi
 a mesh problem.) So a <code>-2</code> from a citizen that answers its other verbs is no
 longer a typo symptom — look at the citizen's handler instead. Props paths such
 as <code>lifecycle.generation</code> are not verbs: read them with
-<code>send svc svc.props.get path="lifecycle.generation"</code>.</p>
+<code>send svc svc.props.get path="lifecycle.generation"</code>. The code is a Mix
+citizen's: other daemons name the same refusal differently — comp answers
+<code>unknown_verb</code>, noded its own rc 10 message — so a script that must work
+against any service should test <code>$rc &gt;= 10</code> and read the code from <code>$reply</code>
+rather than match one spelling.</p>
 <h2 id="send-and-the-verified-session-lane"><code>send</code> and the verified session lane</h2>
 <p>A locally registered service can be addressed two ways, and only one of them
 carries an identity. A TCP connection is known by a name the caller asserts
