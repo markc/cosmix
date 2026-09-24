@@ -667,9 +667,82 @@ threads: `run_parallel` parses every job to plain owned data first, and the
 worker threads touch only process plumbing (argv, pipes, exit codes), marshalling
 results back on the caller's thread. There is deliberately **no** `parallel(list,
 fn)` that runs Mix functions concurrently — that would mean rebuilding the value
-model, and it is not planned. The killer use is `ssh_mix` fan-out: a fleet sweep
-that walked N nodes serially becomes one `run_parallel` of N ssh jobs. A job's
+model, and it is not planned. A fleet sweep that walked N nodes serially becomes
+one `run_parallel` of N ssh jobs; for Mix source, [`ssh_mix_many`](remote.md#ssh_mix_manyhosts-source-opts--map-host--result)
+is the same pool with `ssh_mix`'s `bindings`, `decode` and result shape kept. A job's
 `stream` flag is ignored (a parallel live tee would interleave into garbage).
+
+### send_mail — report mail through the local MTA
+
+`send_mail(msg [, {host, sendmail, timeout}])` is the last step of every nightly
+report: render a plain-text message and hand it to the MTA. It replaces the
+hand-written `.eml` file, the `run_argv(["/usr/sbin/sendmail", "-t", "-f", $from],
+{stdin: {file: …}})` and the cleanup.
+
+```mix
+$r = send_mail({
+  to: ["ops@example.com", "Audit <audit@example.com>"],
+  from: "Reports <reports@example.com>",
+  subject: "Weekly spam report",
+  body: $report
+})
+if !$r.ok then
+  eprint("mail failed: " .. $r.exit_code .. " " .. $r.stderr)
+end
+```
+
+- **`msg`** needs `to` (a string or a list of strings), `from`, `subject` and
+  `body`. `headers` is an optional map of extra headers. Any other key raises.
+  There is no `cc` or `bcc` key: put `Cc` and `Bcc` in `headers`.
+- **The message is built for you**: `From`, `To`, `Subject`, `Date` (UTC),
+  `Message-ID`, `MIME-Version: 1.0` and `Content-Type: text/plain;
+  charset=utf-8`. A CRLF body is normalised to LF.
+- **Line limits are kept.** A long header (a long subject, forty recipients)
+  is folded at whitespace so lines stay within 78 characters; a header with
+  an unbreakable run over 998 characters raises. An ASCII body whose lines
+  all fit in 998 bytes goes as `7bit`. A non-ASCII body, or one with a longer
+  line (a JSON or CSV dump), goes as `quoted-printable`, so no MTA can split
+  or mangle it.
+- **A non-ASCII subject is RFC 2047-encoded** (as [`rfc2047_encode`](strings.md)
+  does it). Every other header value must be ASCII, and a CR, LF or NUL in
+  any header raises. There is no way to inject a second header through a
+  value.
+- **`headers` adds headers, or replaces a generated `Date`, `Message-ID` or
+  `MIME-Version`.** `From`, `To` and `Subject` come only from `msg`, and
+  `Content-Type` and `Content-Transfer-Encoding` only from `send_mail`, which
+  encodes the body itself. Naming any of those five in `headers` raises. A
+  label of your own would describe other bytes than the ones sent: a
+  quoted-printable body labelled `8bit` reads as literal `=C3=BC`. The body is
+  always `text/plain; charset=utf-8`.
+- **Delivery is `sendmail -t -i -f <envelope>`** with the message on stdin,
+  never a network SMTP client. `-t` takes the recipients from the headers, so
+  a `Bcc` header works and is stripped by the MTA. `-i` keeps a line holding
+  a lone `.` as body text.
+- **`from` is exactly one mailbox**: `a@example.com` or
+  `Display Name <a@example.com>`, where the display name is plain words or one
+  `"quoted string"`. The envelope sender is that address. A comment, a second
+  mailbox and the null sender `<>` raise rather than guess. An address
+  without `@` (a local user such as `root`) is sent as it is, and the
+  `Message-ID` domain then falls back to `localhost`.
+- **Which sendmail**: the first `sendmail` on `PATH`, then `/usr/sbin/sendmail`,
+  then `/usr/lib/sendmail`. The `sendmail` option names one explicitly.
+- **`host` sends from another host** — the one with a working MTA — through
+  [`ssh_exec`](remote.md). The message is still built locally; only the
+  sendmail run is remote, with `/usr/sbin/sendmail` as the default there. The
+  result carries `host` as `ssh_exec`'s does, and only then.
+- **The result is `run_argv`'s `process_result` plus `message_id`**. `ok`
+  means the MTA accepted the message for submission, not that it was
+  delivered. An MTA that refuses the message, or a sendmail that is not
+  there, is DATA: `ok: false` with `exit_code`, `stderr` and `error_code`.
+- **Bad input raises before anything runs**: `OPTION_INVALID` for a bad
+  `msg` field or option, `TYPE_MISMATCH` for a `msg` that is not a map or the
+  wrong number of arguments, and with `host`, `ssh_exec`'s own validation
+  errors.
+- **`timeout`** is in seconds, as for `run_argv` (default 30).
+
+Mail that a filter must recognise should use one fixed `from` for every
+report, with the envelope matching it, which `send_mail` does by
+construction.
 
 ### Which runner?
 

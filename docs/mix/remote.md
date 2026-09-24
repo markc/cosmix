@@ -349,6 +349,69 @@ ssh_mix("example.com", "print(1)", { bindings: {"bad-name": 1} })
 
 ---
 
+## `ssh_mix_many(hosts, source[, opts])` → map host → result
+
+`ssh_mix` on many hosts at once, through a bounded worker pool. Every host gets
+the same `source`, `bindings`, `env` and `decode`. The result is a **map keyed
+by host, in input order**, and each value is **exactly** the map `ssh_mix`
+would have returned for that host, so per-host handling code ports unchanged.
+
+```mix
+$hosts = ["alpha", "beta", "gamma"]
+$r = ssh_mix_many($hosts, <<EOF
+print(data_encode({host: hostname(), files: length(ls($path))}))
+EOF
+, {bindings: {path: "/srv"}, decode: "data", timeout: 10, max: 8})
+for each $h, $res in $r
+  if $res.ok then
+    print($h .. ": " .. $res.value.files .. " entries")
+  else
+    print($h .. ": FAILED " .. ($res.decode_error ?? $res.stderr))
+  end
+end
+```
+
+- **opts are `ssh_mix`'s opts plus `max`** — concurrency, default 8, at most
+  256 live workers (a larger `max` still runs every host, just no more than
+  256 at once). These are the same numbers as `run_parallel`; the loop is its
+  own, with per-host error semantics.
+- **Everything is validated before anything runs.** The options go through
+  `ssh_mix`'s own checks once, even for an empty host list, and every host is
+  checked, so a bad option, a bad binding or a bad host (empty, leading `-`,
+  NUL) raises locally with no ssh spawned. Only a host error names the host.
+  A wrong argument type (hosts not a list, source not a string, opts not a
+  map, wrong arity) raises `TYPE_MISMATCH`.
+- **After that, one host's failure is data in its own map, never a raise.**
+  An unreachable host, a nonzero exit and a timeout come back as `ok: false`
+  exactly as `ssh_mix` reports them. A local failure to run ssh for one host
+  (a spawn or pipe error, such as running out of file descriptors at a high
+  `max`) comes back as `ok: false` with `error_code` (`PROCESS_SPAWN`,
+  `PROCESS_STDIO`, …) and `error`, and the other hosts keep their answers.
+- **Ctrl-C stops the batch.** Workers check for an interrupt before taking a
+  host and again before starting ssh, so no new host starts after it. Hosts
+  already running end as `interrupted: true`, as with `ssh_mix`. Hosts never
+  started come back as `ok: false, interrupted: true` with nothing run.
+- **There is no whole-call deadline.** `timeout` bounds each host. The worst
+  case for the call is about `ceil(hosts / max)` × (`timeout` +
+  `connect_timeout`).
+- **`decode` is judged per host.** Where `ssh_mix` *raises* — a stdout
+  truncated by `max_output`, or stdout that does not parse — the fan-out
+  records the refusal on that host alone: `ok: false`, a `decode_error`
+  string, and no `value`. `exit_code` still shows what the remote did. A raise
+  here would throw away every other host's answer, which is the failure a
+  fan-out exists to avoid.
+- **`hosts` must be unique strings.** Results are keyed by host, so a
+  duplicate raises rather than silently overwriting the first answer.
+- **`timeout: 0` is refused.** With no deadline one hung host would hold the
+  whole batch, because the call waits for every worker.
+- **`mix lint` reads the body** exactly as it does for `ssh_mix`, including
+  the `bindings`/`env` names.
+
+This is the sugar over `run_parallel` + hand-built `["ssh", host, "/opt/cosmix/bin/mix", "-"]`
+jobs: those lose `bindings`, `decode` and the `host`/`ok` result shape.
+
+---
+
 ## `ssh_exec(host, argv[, opts])` → map (v0.30.0)
 
 The remote analogue of [`run_argv`](system.md): run an **argv list** on a remote
@@ -652,6 +715,11 @@ print("remote line count: " .. $r.stdout)
 
 ### Fan out across a host list, collect results
 
+For Mix source on many nodes at once, use
+[`ssh_mix_many`](#ssh_mix_manyhosts-source-opts--map-host--result): one
+concurrent call, results keyed by host. The serial form below still suits a
+shell command per host.
+
 A multi-statement lambda must be **bound to a var** before it's passed to a HOF (it won't parse inline) — see [functions](functions.md). For a large sweep, add `multiplex: true` to reuse connections per host — accepting the softer timeout bound.
 
 ```mix
@@ -711,6 +779,7 @@ end
 | run on a **remote** host, branch on outcome | **`ssh_run`** → result map |
 | run on a **remote** host, raise on failure | **`ssh_must`** → stdout string |
 | run Mix **source** on a remote node, no quoting | **`ssh_mix`** → result map (+ `.value` with `decode:`) |
+| run the same Mix **source** on **many** nodes concurrently | **`ssh_mix_many`** → map host → `ssh_mix` result |
 | message a **meshed** node's broker (no shell) | [`send` / `address`](bus.md) |
 
 ---

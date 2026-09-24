@@ -1012,9 +1012,76 @@ single-threaded by construction and Mix <code>Value</code>s are never shared acr
 threads: <code>run_parallel</code> parses every job to plain owned data first, and the
 worker threads touch only process plumbing (argv, pipes, exit codes), marshalling
 results back on the caller's thread. There is deliberately <strong>no</strong> <code>parallel(list, fn)</code> that runs Mix functions concurrently — that would mean rebuilding the value
-model, and it is not planned. The killer use is <code>ssh_mix</code> fan-out: a fleet sweep
-that walked N nodes serially becomes one <code>run_parallel</code> of N ssh jobs. A job's
+model, and it is not planned. A fleet sweep that walked N nodes serially becomes
+one <code>run_parallel</code> of N ssh jobs; for Mix source, <a href="/mix/remote#ssh_mix_manyhosts-source-opts--map-host--result"><code>ssh_mix_many</code></a>
+is the same pool with <code>ssh_mix</code>'s <code>bindings</code>, <code>decode</code> and result shape kept. A job's
 <code>stream</code> flag is ignored (a parallel live tee would interleave into garbage).</p>
+<h3 id="send_mail--report-mail-through-the-local-mta">send_mail — report mail through the local MTA</h3>
+<p><code>send_mail(msg [, {host, sendmail, timeout}])</code> is the last step of every nightly
+report: render a plain-text message and hand it to the MTA. It replaces the
+hand-written <code>.eml</code> file, the <code>run_argv(["/usr/sbin/sendmail", "-t", "-f", $from], {stdin: {file: …}})</code> and the cleanup.</p>
+<pre><code class="language-mix">$r = send_mail({
+  to: ["ops@example.com", "Audit &lt;audit@example.com&gt;"],
+  from: "Reports &lt;reports@example.com&gt;",
+  subject: "Weekly spam report",
+  body: $report
+})
+if !$r.ok then
+  eprint("mail failed: " .. $r.exit_code .. " " .. $r.stderr)
+end
+</code></pre>
+<ul>
+<li><strong><code>msg</code></strong> needs <code>to</code> (a string or a list of strings), <code>from</code>, <code>subject</code> and
+<code>body</code>. <code>headers</code> is an optional map of extra headers. Any other key raises.
+There is no <code>cc</code> or <code>bcc</code> key: put <code>Cc</code> and <code>Bcc</code> in <code>headers</code>.</li>
+<li><strong>The message is built for you</strong>: <code>From</code>, <code>To</code>, <code>Subject</code>, <code>Date</code> (UTC),
+<code>Message-ID</code>, <code>MIME-Version: 1.0</code> and <code>Content-Type: text/plain; charset=utf-8</code>. A CRLF body is normalised to LF.</li>
+<li><strong>Line limits are kept.</strong> A long header (a long subject, forty recipients)
+is folded at whitespace so lines stay within 78 characters; a header with
+an unbreakable run over 998 characters raises. An ASCII body whose lines
+all fit in 998 bytes goes as <code>7bit</code>. A non-ASCII body, or one with a longer
+line (a JSON or CSV dump), goes as <code>quoted-printable</code>, so no MTA can split
+or mangle it.</li>
+<li><strong>A non-ASCII subject is RFC 2047-encoded</strong> (as <a href="/mix/strings"><code>rfc2047_encode</code></a>
+does it). Every other header value must be ASCII, and a CR, LF or NUL in
+any header raises. There is no way to inject a second header through a
+value.</li>
+<li><strong><code>headers</code> adds headers, or replaces a generated <code>Date</code>, <code>Message-ID</code> or
+<code>MIME-Version</code>.</strong> <code>From</code>, <code>To</code> and <code>Subject</code> come only from <code>msg</code>, and
+<code>Content-Type</code> and <code>Content-Transfer-Encoding</code> only from <code>send_mail</code>, which
+encodes the body itself. Naming any of those five in <code>headers</code> raises. A
+label of your own would describe other bytes than the ones sent: a
+quoted-printable body labelled <code>8bit</code> reads as literal <code>=C3=BC</code>. The body is
+always <code>text/plain; charset=utf-8</code>.</li>
+<li><strong>Delivery is <code>sendmail -t -i -f &lt;envelope&gt;</code></strong> with the message on stdin,
+never a network SMTP client. <code>-t</code> takes the recipients from the headers, so
+a <code>Bcc</code> header works and is stripped by the MTA. <code>-i</code> keeps a line holding
+a lone <code>.</code> as body text.</li>
+<li><strong><code>from</code> is exactly one mailbox</strong>: <code>a@example.com</code> or
+<code>Display Name &lt;a@example.com&gt;</code>, where the display name is plain words or one
+<code>"quoted string"</code>. The envelope sender is that address. A comment, a second
+mailbox and the null sender <code>&lt;&gt;</code> raise rather than guess. An address
+without <code>@</code> (a local user such as <code>root</code>) is sent as it is, and the
+<code>Message-ID</code> domain then falls back to <code>localhost</code>.</li>
+<li><strong>Which sendmail</strong>: the first <code>sendmail</code> on <code>PATH</code>, then <code>/usr/sbin/sendmail</code>,
+then <code>/usr/lib/sendmail</code>. The <code>sendmail</code> option names one explicitly.</li>
+<li><strong><code>host</code> sends from another host</strong> — the one with a working MTA — through
+<a href="/mix/remote"><code>ssh_exec</code></a>. The message is still built locally; only the
+sendmail run is remote, with <code>/usr/sbin/sendmail</code> as the default there. The
+result carries <code>host</code> as <code>ssh_exec</code>'s does, and only then.</li>
+<li><strong>The result is <code>run_argv</code>'s <code>process_result</code> plus <code>message_id</code></strong>. <code>ok</code>
+means the MTA accepted the message for submission, not that it was
+delivered. An MTA that refuses the message, or a sendmail that is not
+there, is DATA: <code>ok: false</code> with <code>exit_code</code>, <code>stderr</code> and <code>error_code</code>.</li>
+<li><strong>Bad input raises before anything runs</strong>: <code>OPTION_INVALID</code> for a bad
+<code>msg</code> field or option, <code>TYPE_MISMATCH</code> for a <code>msg</code> that is not a map or the
+wrong number of arguments, and with <code>host</code>, <code>ssh_exec</code>'s own validation
+errors.</li>
+<li><strong><code>timeout</code></strong> is in seconds, as for <code>run_argv</code> (default 30).</li>
+</ul>
+<p>Mail that a filter must recognise should use one fixed <code>from</code> for every
+report, with the envelope matching it, which <code>send_mail</code> does by
+construction.</p>
 <h3 id="which-runner">Which runner?</h3>
 <table><thead><tr><th>Need</th><th>Use</th></tr></thead><tbody>
 <tr><td>stdout string, abort on failure</td><td><code>run</code></td></tr>

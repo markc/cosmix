@@ -511,3 +511,30 @@ fn an_inline_heredoc_body_is_analysed() {
     assert_eq!(hit.2, Some(3), "{d:?}");
     assert!(!d.iter().any(|(c, ..)| c == "MIX-D3012"), "{d:?}");
 }
+
+#[test]
+fn an_ssh_mix_many_body_is_analysed_like_an_ssh_mix_body() {
+    // `ssh_mix_many(hosts, source[, opts])` ships its second argument to
+    // every host. Unlinted, a fan-out's whole remote half would be the blind
+    // spot this file exists to close — for N hosts at once.
+    let src = "$r = ssh_mix_many([\"alpha\", \"beta\"], '\nprint(regex_match(\"^a\", \"abc\"))\n')\n";
+    let d = diags(src);
+    let hit = d
+        .iter()
+        .find(|(c, ..)| c == "MIX-D3001")
+        .expect("legacy regex name inside an ssh_mix_many body must be reported");
+    assert!(hit.3.contains("inside ssh_mix body"), "{}", hit.3);
+    assert_eq!(hit.2, Some(2), "{d:?}");
+
+    // Its bindings are the remote program's names exactly as for ssh_mix:
+    // `$base` is bound, `$target` is not.
+    let src = "$base = \"/srv\"\n$target = \"x\"\n$probe = <<END\nprint($base .. $target)\nEND\n$r = ssh_mix_many([\"a\", \"b\"], $probe, {bindings: {base: $base}, max: 2})\n";
+    let d = diags(src);
+    let w: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-W2402").collect();
+    assert_eq!(w.len(), 1, "{d:?}");
+    assert!(w[0].3.contains("$target"), "{}", w[0].3);
+
+    // And an unreadable body is reported, not silently clean.
+    let c = codes("$r = ssh_mix_many([\"a\"], $a .. $b)\n");
+    assert!(c.iter().any(|x| x == "MIX-D3012"), "{c:?}");
+}
