@@ -771,7 +771,7 @@ fn occlusion_trickle_completes_one_callback_per_second_per_occluded_root() {
     assert_eq!(
         completed_among(&mut h, &callbacks),
         callbacks[..1],
-        "exactly one, the oldest, per window however many opportunities"
+        "exactly one, the oldest, for this one surface however many opportunities"
     );
     assert!(h.server.state.occlusion.is_occluded(id));
 
@@ -808,4 +808,33 @@ fn unoccluded_roots_get_every_frame_callback_regardless_of_the_trickle() {
         assert_eq!(done(&mut h, callback), 1);
     }
     assert!(h.server.state.occlusion.trickle_at.is_empty());
+}
+
+/// A callback releases only its own surface's present. A root that requeues
+/// every interval must not starve a FIFO-blocked subsurface: each trickle
+/// completes the oldest retained callback of every surface in the tree.
+#[test]
+fn occlusion_trickle_serves_every_surface_while_the_root_requeues() {
+    let (mut h, victim, cover) = fixture();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    let id = h.server.state.surfaces[&victim].id;
+    assert!(h.server.state.occlusion.is_occluded(id));
+    h.server.state.occlusion.trickle_clock_ms = 5_000;
+    h.server.state.limit_occluded_callbacks();
+    for tick in 1..=3u32 {
+        // The child's synchronized callback lands with the root's commit,
+        // which queues the root's own fresh callback at the same time.
+        let child = request(&mut h, TEST_SUBSURFACE_SURFACE_ID);
+        let root = request(&mut h, victim.protocol_id());
+        assert!(completed_among(&mut h, &[child, root]).is_empty());
+        h.server.state.occlusion.trickle_clock_ms = 5_000 + 1_000 * tick;
+        h.frame(Vec::new());
+        let mut completed = completed_among(&mut h, &[child, root]);
+        completed.sort_unstable();
+        let mut expected = vec![child, root];
+        expected.sort_unstable();
+        assert_eq!(completed, expected, "tick {tick}: both surfaces served");
+        assert!(h.server.state.occlusion.is_occluded(id));
+    }
 }

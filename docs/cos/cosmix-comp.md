@@ -59,8 +59,10 @@ callbacks before the first buffer are never withheld by occlusion.
 
 Withholding is a throttle, not a stop. A client on Mesa's default FIFO present
 mode blocks inside present until its frame callback completes, so a covered one
-could not even answer a configure. Once per second, each occluded root has its
-oldest retained callback completed. This matches the ~1 Hz KWin and Mutter give
+could not even answer a configure. Once per second, every surface of an
+occluded tree that retains a callback has its oldest one completed. It is per
+surface because a callback releases only its own surface's present, so a root
+that requests again every second cannot starve a subsurface. This matches the ~1 Hz KWin and Mutter give
 hidden windows. The trickle is paced by the existing frame opportunities, with
 no timer of its own, and the window restarts whenever a root becomes occluded
 again. At most 64 callbacks are retained per occluded root. Excess older ones

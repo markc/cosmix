@@ -39,7 +39,8 @@ pub(super) struct OcclusionRuntime {
 
 /// A covered FIFO client (Mesa's default present mode) blocks in present until
 /// its frame callback completes and so cannot even answer a configure while
-/// withheld. Complete one retained callback per occluded root this often — the
+/// withheld. Complete the oldest retained callback of each surface in an
+/// occluded tree this often — the
 /// ~1 Hz KWin/Mutter give hidden windows — instead of starving it outright.
 pub(super) const OCCLUDED_TRICKLE_MS: u32 = 1_000;
 impl OcclusionRuntime {
@@ -346,8 +347,8 @@ impl WaylandState {
     }
 
     /// Complete excess older callbacks fail-open; never silently drop them.
-    /// Then trickle: at most one retained callback per occluded root per
-    /// [`OCCLUDED_TRICKLE_MS`], paced by this existing frame opportunity (no
+    /// Then trickle: at most one retained callback per surface of each
+    /// occluded tree per [`OCCLUDED_TRICKLE_MS`], paced by this existing frame opportunity (no
     /// timer of its own), so a covered FIFO client keeps making progress.
     pub(super) fn limit_occluded_callbacks(&mut self) {
         if self.session_lock_active()
@@ -385,16 +386,22 @@ impl WaylandState {
                     .or_insert(trickle_now);
                 if !batch.retained.is_empty()
                     && trickle_now.wrapping_sub(since) >= OCCLUDED_TRICKLE_MS
-                    && let Some(completed) = complete_oldest_frame_callback(
+                {
+                    let completed = complete_oldest_frame_callback_per_surface(
                         record.role.wl_surface(),
                         frame_time,
                         &self.surfaces,
-                    )
-                {
-                    batch.retained.remove(&completed);
+                    );
+                    for id in &completed {
+                        batch.retained.remove(id);
+                    }
                     self.occlusion.trickle_at.insert(record.id, trickle_now);
                     crate::frame_trace::event("comp_occluded_callback_trickle", || {
-                        (record.id.0, batch.retained.len() as u64, 0)
+                        (
+                            record.id.0,
+                            completed.len() as u64,
+                            batch.retained.len() as u64,
+                        )
                     });
                 }
                 if !batch.retained.is_empty() {
