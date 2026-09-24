@@ -194,17 +194,26 @@ if $want_desktop then
   end
   $applications = $data_home .. "/applications"
   mkdir($applications)
-  $qexec = replace($bin .. "/" .. $qship.bin, "\\", "\\\\\\\\")
-  $qexec = replace($qexec, "\"", "\\\\\"")
-  $qexec = replace($qexec, "`", "\\\\`")
-  $qexec = replace($qexec, "$", "\\\\$")
-  $qexec = replace($qexec, "%", "%%")
-  $entry = read_file($desktop .. "/apps/quoin/dev.cosmix.quoin.desktop")
-  $entry = replace($entry, "Exec=cosmix-quoin", "Exec=\"" .. $qexec .. "\"")
-  $entry_path = $applications .. "/dev.cosmix.quoin.desktop"
-  write_file($entry_path .. ".new", $entry)
-  rename($entry_path .. ".new", $entry_path)
-  print(">> installed " .. $entry_path)
+  -- One launcher entry per GUI app the `apps` citizen should list. The
+  -- checked-in entry carries a bare `Exec=<name>`; the installed copy gets the
+  -- absolute installed path, quoted per the Desktop Entry spec.
+  $launchers = []
+  push($launchers, {dir: "quoin", bin: $qship.bin, exec: "cosmix-quoin", id: "dev.cosmix.quoin"})
+  push($launchers, {dir: "term", bin: "term", exec: "term", id: "dev.cosmix.term"})
+  push($launchers, {dir: "bterm", bin: "bterm", exec: "bterm", id: "dev.cosmix.bterm"})
+  for each $launcher in $launchers
+    $qexec = replace($bin .. "/" .. $launcher.bin, "\\", "\\\\\\\\")
+    $qexec = replace($qexec, "\"", "\\\\\"")
+    $qexec = replace($qexec, "`", "\\\\`")
+    $qexec = replace($qexec, "$", "\\\\$")
+    $qexec = replace($qexec, "%", "%%")
+    $entry = read_file($desktop .. "/apps/" .. $launcher.dir .. "/" .. $launcher.id .. ".desktop")
+    $entry = replace($entry, "Exec=" .. $launcher.exec .. "\n", "Exec=\"" .. $qexec .. "\"\n")
+    $entry_path = $applications .. "/" .. $launcher.id .. ".desktop"
+    write_file($entry_path .. ".new", $entry)
+    rename($entry_path .. ".new", $entry_path)
+    print(">> installed " .. $entry_path)
+  end
 end
 
 -- 4. optional system install (sudo). Binaries only — see the header.

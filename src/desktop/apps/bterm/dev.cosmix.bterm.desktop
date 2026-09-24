@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=BTerm
+GenericName=Terminal
+Comment=CosMix BTerm — Bevy reference terminal, Bus service `bterm`
+Exec=bterm
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;mix;console;bevy;
+StartupWMClass=dev.cosmix.bterm
+StartupNotify=false

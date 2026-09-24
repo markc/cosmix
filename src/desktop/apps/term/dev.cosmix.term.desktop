@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Term
+GenericName=Terminal
+Comment=CosMix Term — lightweight iced + wgpu terminal, Bus service `term`
+Exec=term
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;mix;console;
+StartupWMClass=dev.cosmix.term
+StartupNotify=false
