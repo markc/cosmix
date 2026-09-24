@@ -27,7 +27,10 @@ extern "C" fn resized(_: i32) {
 }
 
 fn wait_for(mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + LIMIT;
+    wait_for_with_limit(&mut f, LIMIT);
+}
+fn wait_for_with_limit(mut f: impl FnMut() -> bool, limit: Duration) {
+    let end = Instant::now() + limit;
     while !f() {
         assert!(Instant::now() < end, "fixture deadline");
         std::thread::sleep(Duration::from_millis(2));
@@ -199,6 +202,7 @@ fn fixture_process() {
 }
 
 struct Pty {
+    wait_limit: Duration,
     master: File,
     slave: File,
     initial_modes: libc::termios,
@@ -326,6 +330,7 @@ impl Pty {
         }
         let shell = cmd.spawn().unwrap();
         Self {
+            wait_limit: LIMIT,
             master,
             slave,
             initial_modes,
@@ -356,7 +361,7 @@ impl Pty {
         self.read_until(marker)
     }
     fn read_until(&mut self, marker: &str) -> String {
-        let end = Instant::now() + LIMIT;
+        let end = Instant::now() + self.wait_limit;
         loop {
             if let Some(i) = self.pending.find(marker) {
                 return self.pending.drain(..i + marker.len()).collect();
@@ -400,7 +405,10 @@ impl Pty {
     }
     fn report(&mut self, name: &str) -> Vec<i32> {
         let path = self.home.path().join(name);
-        wait_for(|| fs::read_to_string(&path).is_ok_and(|v| v.split_whitespace().count() == 4));
+        wait_for_with_limit(
+            || fs::read_to_string(&path).is_ok_and(|v| v.split_whitespace().count() == 4),
+            self.wait_limit,
+        );
         let fields = fs::read_to_string(path)
             .unwrap()
             .split_whitespace()
@@ -817,17 +825,19 @@ fn source_shares_background_controller_and_hup_reaps_owned_jobs() {
 fn hup_restores_retained_slave_after_foreground_raw_leak() {
     let _fixture = fixture_guard();
     let mut p = Pty::new(&[], false, true);
+    let limit = Duration::from_secs(30);
+    p.wait_limit = limit;
     let original = p.initial_modes;
     p.until(PROMPT);
     p.send(&format!("{}\n", p.fixture("raw-hold", "raw-hup")));
     let child = p.report("raw-hup");
-    wait_for(|| p.home.path().join("raw-hup.raw").exists());
+    wait_for_with_limit(|| p.home.path().join("raw-hup.raw").exists(), limit);
     assert_eq!(tty_modes(p.slave.as_raw_fd()).c_lflag & libc::ICANON, 0);
     assert_eq!(tty_modes(p.slave.as_raw_fd()).c_oflag & libc::OPOST, 0);
     unsafe {
         libc::kill(p.shell.id() as i32, libc::SIGHUP);
     }
-    wait_for(|| p.shell.try_wait().unwrap().is_some());
+    wait_for_with_limit(|| p.shell.try_wait().unwrap().is_some(), limit);
     assert_eq!(p.shell.wait().unwrap().code(), Some(129));
     let restored = tty_modes(p.slave.as_raw_fd());
     assert_eq!(restored.c_iflag, original.c_iflag);

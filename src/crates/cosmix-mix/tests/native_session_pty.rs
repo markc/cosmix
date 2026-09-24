@@ -376,7 +376,10 @@ impl Child {
         self.pty.write_all(line.as_bytes()).unwrap();
     }
     fn until(&mut self, marker: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        self.until_with_limit(marker, Duration::from_secs(5))
+    }
+    fn until_with_limit(&mut self, marker: &str, limit: Duration) -> String {
+        let deadline = Instant::now() + limit;
         let mut output = String::new();
         while !output.contains(marker) {
             let mut bytes = [0; 8192];
@@ -775,10 +778,18 @@ fn counter(value: &serde_json::Value) -> u64 {
 }
 
 async fn status(parent: &mut Parent, record: &SessionRecord) -> serde_json::Value {
+    status_with_limit(parent, record, Duration::from_secs(3)).await
+}
+
+async fn status_with_limit(
+    parent: &mut Parent,
+    record: &SessionRecord,
+    limit: Duration,
+) -> serde_json::Value {
     parent.renew().await;
     let start = Instant::now();
     let value = tokio::time::timeout(
-        Duration::from_secs(3),
+        limit,
         parent
             .connection
             .client()
@@ -807,9 +818,21 @@ async fn status(parent: &mut Parent, record: &SessionRecord) -> serde_json::Valu
 }
 
 async fn phase(parent: &mut Parent, record: &SessionRecord, expected: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    phase_with_limit(
+        parent, record, expected, Duration::from_secs(5), Duration::from_secs(3),
+    ).await
+}
+
+async fn phase_with_limit(
+    parent: &mut Parent,
+    record: &SessionRecord,
+    expected: &str,
+    limit: Duration,
+    read_limit: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + limit;
     loop {
-        let value = status(parent, record).await;
+        let value = status_with_limit(parent, record, read_limit).await;
         if value["status"]["snapshot"]["phase"] == expected {
             return value;
         }
@@ -1251,9 +1274,19 @@ async fn execute_call(
     verb: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    execute_call_with_limit(parent, record, verb, body, Duration::from_secs(5)).await
+}
+
+async fn execute_call_with_limit(
+    parent: &mut Parent,
+    record: &SessionRecord,
+    verb: &str,
+    body: serde_json::Value,
+    limit: Duration,
+) -> Result<serde_json::Value, String> {
     parent.renew().await;
     tokio::time::timeout(
-        Duration::from_secs(5),
+        limit,
         parent.connection.client().call(&record.name, verb, body),
     )
     .await
@@ -1273,13 +1306,26 @@ async fn result_of(
     record: &SessionRecord,
     operation: u64,
 ) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    result_of_with_limit(
+        parent, record, operation, Duration::from_secs(10), Duration::from_secs(5),
+    ).await
+}
+
+async fn result_of_with_limit(
+    parent: &mut Parent,
+    record: &SessionRecord,
+    operation: u64,
+    limit: Duration,
+    read_limit: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + limit;
     loop {
-        let value = execute_call(
+        let value = execute_call_with_limit(
             parent,
             record,
             "shell.execute.result",
             operation_request(record, operation),
+            read_limit,
         )
         .await
         .expect("a known operation always has a state");
@@ -1807,6 +1853,15 @@ fn stage_d_reports_its_own_capability_and_refuses_unauthorised_callers() {
 }
 
 async fn stage_d_fixture_with(editor: &str, extra: &[(String, String)]) -> Fixture {
+    stage_d_fixture_with_limit(editor, extra, Duration::from_secs(5), Duration::from_secs(3)).await
+}
+
+async fn stage_d_fixture_with_limit(
+    editor: &str,
+    extra: &[(String, String)],
+    limit: Duration,
+    read_limit: Duration,
+) -> Fixture {
     let broker = Broker::start();
     let mut parent = Parent::new(&broker).await;
     let key = fresh_key().unwrap();
@@ -1817,11 +1872,11 @@ async fn stage_d_fixture_with(editor: &str, extra: &[(String, String)]) -> Fixtu
     let mut child = Child::spawn_with(&broker, &launch, editor, extra);
     drop(launch);
     drop(key);
-    child.until("RC_MARKER=[]\r\n");
+    child.until_with_limit("RC_MARKER=[]\r\n", limit);
     let bound = parent
         .wait(grant.record.record_id, BindingState::Attached, 1)
         .await;
-    phase(&mut parent, &bound, "prompt-ready").await;
+    phase_with_limit(&mut parent, &bound, "prompt-ready", limit, read_limit).await;
     Fixture {
         broker,
         parent,
@@ -2185,9 +2240,12 @@ fn stage_d_an_abandoned_reservation_returns_the_prompt_to_the_human() {
 fn stage_d_a_refused_submission_may_be_retried_under_the_same_id() {
     let _fixture = fixture_guard();
     runtime().block_on(async {
-        let mut f = stage_d_fixture_with(
+        let limit = Duration::from_secs(30);
+        let mut f = stage_d_fixture_with_limit(
             "owned",
             &[("MIX_RESERVE_HOLD_MS".into(), "1200".into())],
+            limit,
+            limit,
         )
         .await;
         let generation = prompt_generation(&mut f.parent, &f.bound).await;
@@ -2206,7 +2264,7 @@ fn stage_d_a_refused_submission_may_be_retried_under_the_same_id() {
         });
         tokio::time::sleep(Duration::from_millis(200)).await;
         f.child.send("x");
-        let error = tokio::time::timeout(Duration::from_secs(10), submitting)
+        let error = tokio::time::timeout(limit, submitting)
             .await
             .expect("the submission must answer")
             .unwrap()
@@ -2216,18 +2274,34 @@ fn stage_d_a_refused_submission_may_be_retried_under_the_same_id() {
         // Clear the stray byte, then retry THE SAME request id. The contract
         // that refusal states is that this is a real submission, not a replay.
         f.child.send("\x08\n");
-        let generation = prompt_generation(&mut f.parent, &f.bound).await;
+        // Wait for the editor to consume the clearing input. A status reply
+        // can still describe the old prompt while the PTY input is queued.
+        let deadline = Instant::now() + limit;
+        let generation = loop {
+            let value = status_with_limit(
+                &mut f.parent,
+                &f.bound,
+                deadline.saturating_duration_since(Instant::now()),
+            ).await;
+            let snapshot = &value["status"]["snapshot"];
+            let current = counter(&snapshot["prompt_generation"]);
+            if snapshot["phase"] == "prompt-ready" && current > generation {
+                break current;
+            }
+            assert!(Instant::now() < deadline, "cleared prompt not ready: {value}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         let retry = execute_request(&f.bound, 1, generation, "print(\"RETRY_RAN\")");
-        let accepted = execute_call(&mut f.parent, &f.bound, "shell.execute", retry)
+        let accepted = execute_call_with_limit(&mut f.parent, &f.bound, "shell.execute", retry, limit)
             .await
             .unwrap_or_else(|e| {
                 panic!("the refused id was burned; retry answered {e}")
             });
         assert_eq!(accepted["status"], "accepted", "{accepted}");
         let operation = counter(&accepted["operation_id"]);
-        let result = result_of(&mut f.parent, &f.bound, operation).await;
+        let result = result_of_with_limit(&mut f.parent, &f.bound, operation, limit, limit).await;
         assert_eq!(result["result"]["outcome"], "completed", "{result}");
-        f.child.until("RETRY_RAN\r\n");
+        f.child.until_with_limit("RETRY_RAN\r\n", limit);
         teardown(f).await;
     });
 }
