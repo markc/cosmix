@@ -1032,11 +1032,16 @@ end
 </code></pre>
 <ul>
 <li><strong><code>msg</code></strong> needs <code>to</code> (a string or a list of strings), <code>from</code>, <code>subject</code> and
-<code>body</code>. <code>headers</code> is an optional map of extra headers. Any other key raises.</li>
+<code>body</code>. <code>headers</code> is an optional map of extra headers. Any other key raises.
+There is no <code>cc</code> or <code>bcc</code> key: put <code>Cc</code> and <code>Bcc</code> in <code>headers</code>.</li>
 <li><strong>The message is built for you</strong>: <code>From</code>, <code>To</code>, <code>Subject</code>, <code>Date</code> (UTC),
-<code>Message-ID</code>, <code>MIME-Version: 1.0</code>, <code>Content-Type: text/plain; charset=utf-8</code>
-and a <code>Content-Transfer-Encoding</code> of <code>7bit</code> or <code>8bit</code> to match the body. A
-CRLF body is normalised to LF, and a final newline is added.</li>
+<code>Message-ID</code>, <code>MIME-Version: 1.0</code> and <code>Content-Type: text/plain; charset=utf-8</code>. A CRLF body is normalised to LF.</li>
+<li><strong>Line limits are kept.</strong> A long header (a long subject, forty recipients)
+is folded at whitespace so lines stay within 78 characters; a header with
+an unbreakable run over 998 characters raises. An ASCII body whose lines
+all fit in 998 bytes goes as <code>7bit</code>. A non-ASCII body, or one with a longer
+line (a JSON or CSV dump), goes as <code>quoted-printable</code>, so no MTA can split
+or mangle it.</li>
 <li><strong>A non-ASCII subject is RFC 2047-encoded</strong> (as <a href="/mix/strings"><code>rfc2047_encode</code></a>
 does it). Every other header value must be ASCII, and a CR, LF or NUL in
 any header raises. There is no way to inject a second header through a
@@ -1048,18 +1053,27 @@ value.</li>
 <li><strong>Delivery is <code>sendmail -t -i -f &lt;envelope&gt;</code></strong> with the message on stdin,
 never a network SMTP client. <code>-t</code> takes the recipients from the headers, so
 a <code>Bcc</code> header works and is stripped by the MTA. <code>-i</code> keeps a line holding
-a lone <code>.</code> as body text. The envelope sender is the address in <code>from</code>: the
-part inside <code>&lt;…&gt;</code> when there is a display name.</li>
+a lone <code>.</code> as body text.</li>
+<li><strong><code>from</code> is exactly one mailbox</strong>: <code>a@example.com</code> or
+<code>Display Name &lt;a@example.com&gt;</code>, where the display name is plain words or one
+<code>"quoted string"</code>. The envelope sender is that address. A comment, a second
+mailbox and the null sender <code>&lt;&gt;</code> raise rather than guess. An address
+without <code>@</code> (a local user such as <code>root</code>) is sent as it is, and the
+<code>Message-ID</code> domain then falls back to <code>localhost</code>.</li>
 <li><strong>Which sendmail</strong>: the first <code>sendmail</code> on <code>PATH</code>, then <code>/usr/sbin/sendmail</code>,
 then <code>/usr/lib/sendmail</code>. The <code>sendmail</code> option names one explicitly.</li>
 <li><strong><code>host</code> sends from another host</strong> — the one with a working MTA — through
 <a href="/mix/remote"><code>ssh_exec</code></a>. The message is still built locally; only the
 sendmail run is remote, with <code>/usr/sbin/sendmail</code> as the default there. The
-result carries <code>host</code> as <code>ssh_exec</code>'s does.</li>
-<li><strong>The result is <code>run_argv</code>'s <code>process_result</code> plus <code>message_id</code></strong>. An MTA
-that refuses the message, or a sendmail that is not there, is DATA:
-<code>ok: false</code> with <code>exit_code</code>, <code>stderr</code> and <code>error_code</code>. A bad <code>msg</code> or
-option raises <code>OPTION_INVALID</code> before anything runs.</li>
+result carries <code>host</code> as <code>ssh_exec</code>'s does, and only then.</li>
+<li><strong>The result is <code>run_argv</code>'s <code>process_result</code> plus <code>message_id</code></strong>. <code>ok</code>
+means the MTA accepted the message for submission, not that it was
+delivered. An MTA that refuses the message, or a sendmail that is not
+there, is DATA: <code>ok: false</code> with <code>exit_code</code>, <code>stderr</code> and <code>error_code</code>.</li>
+<li><strong>Bad input raises before anything runs</strong>: <code>OPTION_INVALID</code> for a bad
+<code>msg</code> field or option, <code>TYPE_MISMATCH</code> for a <code>msg</code> that is not a map or the
+wrong number of arguments, and with <code>host</code>, <code>ssh_exec</code>'s own validation
+errors.</li>
 <li><strong><code>timeout</code></strong> is in seconds, as for <code>run_argv</code> (default 30).</li>
 </ul>
 <p>Mail that a filter must recognise should use one fixed <code>from</code> for every

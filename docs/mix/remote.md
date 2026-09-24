@@ -373,14 +373,27 @@ end
 
 - **opts are `ssh_mix`'s opts plus `max`** — concurrency, default 8, at most
   256 live workers (a larger `max` still runs every host, just no more than
-  256 at once). These are `run_parallel`'s numbers; it is the same pool.
-- **Everything is validated before anything runs.** Every host is planned
-  through `ssh_mix`'s own argument checks first, so a bad option, a bad
-  binding or a bad host (empty, leading `-`, NUL) raises locally with no ssh
-  spawned, and the message names the host.
-- **One host's failure is data in its own map, never a raise.** An
-  unreachable host, a nonzero exit and a timeout all come back as `ok: false`
-  exactly as `ssh_mix` reports them.
+  256 at once). These are the same numbers as `run_parallel`; the loop is its
+  own, with per-host error semantics.
+- **Everything is validated before anything runs.** The options go through
+  `ssh_mix`'s own checks once, even for an empty host list, and every host is
+  checked, so a bad option, a bad binding or a bad host (empty, leading `-`,
+  NUL) raises locally with no ssh spawned. Only a host error names the host.
+  A wrong argument type (hosts not a list, source not a string, opts not a
+  map, wrong arity) raises `TYPE_MISMATCH`.
+- **After that, one host's failure is data in its own map, never a raise.**
+  An unreachable host, a nonzero exit and a timeout come back as `ok: false`
+  exactly as `ssh_mix` reports them. A local failure to run ssh for one host
+  (a spawn or pipe error, such as running out of file descriptors at a high
+  `max`) comes back as `ok: false` with `error_code` (`PROCESS_SPAWN`,
+  `PROCESS_STDIO`, …) and `error`, and the other hosts keep their answers.
+- **Ctrl-C stops the batch.** Workers check for an interrupt before taking a
+  host and again before starting ssh, so no new host starts after it. Hosts
+  already running end as `interrupted: true`, as with `ssh_mix`. Hosts never
+  started come back as `ok: false, interrupted: true` with nothing run.
+- **There is no whole-call deadline.** `timeout` bounds each host. The worst
+  case for the call is about `ceil(hosts / max)` × (`timeout` +
+  `connect_timeout`).
 - **`decode` is judged per host.** Where `ssh_mix` *raises* — a stdout
   truncated by `max_output`, or stdout that does not parse — the fan-out
   records the refusal on that host alone: `ok: false`, a `decode_error`

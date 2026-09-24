@@ -43,7 +43,10 @@ impl Bed {
     /// Run `program` under the mix being tested with the fake ssh first on
     /// PATH; returns (stdout, stderr, exit status success).
     fn run(&self, program: &str) -> (String, String, bool) {
-        let path = format!("{}:/usr/bin:/bin", self.dir.path().display());
+        self.run_with_path(program, &format!("{}:/usr/bin:/bin", self.dir.path().display()))
+    }
+
+    fn run_with_path(&self, program: &str, path: &str) -> (String, String, bool) {
         let out = Command::new(env!("CARGO_BIN_EXE_mix"))
             .arg("-c")
             .arg(program)
@@ -141,6 +144,44 @@ end
     );
     assert!(ok, "stdout={out} stderr={err}");
     assert_eq!(out.trim(), "raised true", "{out}");
+}
+
+#[test]
+fn a_local_spawn_failure_is_per_host_data_with_its_code() {
+    // No `ssh` anywhere on PATH: every spawn fails locally. Each host must
+    // get ok:false with the engine's PROCESS_SPAWN code, and the call must
+    // not raise — the same path an EMFILE on one host of many takes.
+    let bed = Bed::new();
+    let empty = tempfile::tempdir().expect("tempdir");
+    let (out, err, ok) = bed.run_with_path(
+        r#"$r = ssh_mix_many(["alpha", "beta"], 'print(1)', {timeout: 20})
+for each $h in ["alpha", "beta"]
+  print($h .. " ok=" .. $r[$h].ok .. " code=" .. $r[$h].error_code .. " has_error=" .. (length($r[$h].error) > 0))
+end
+"#,
+        &empty.path().display().to_string(),
+    );
+    assert!(ok, "the call must not raise: stdout={out} stderr={err}");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "alpha ok=false code=PROCESS_SPAWN has_error=true", "{out}");
+    assert_eq!(lines[1], "beta ok=false code=PROCESS_SPAWN has_error=true", "{out}");
+}
+
+#[test]
+fn max_is_an_upper_bound_on_concurrency() {
+    let bed = Bed::new();
+    // Two hosts sleeping 1.5 s each with max: 1 must run one after the
+    // other: at least 3 s. A pool that ignored max would take ~1.5 s.
+    let (out, err, ok) = bed.run(
+        r#"$t0 = monotonic()
+$r = ssh_mix_many(["a", "b"], 'sleep(1.5)
+print("done")', {max: 1, timeout: 30})
+$el = monotonic() - $t0
+print("ok=" .. ($r["a"].ok and $r["b"].ok) .. " serial=" .. ($el >= 2.9))
+"#,
+    );
+    assert!(ok, "stdout={out} stderr={err}");
+    assert_eq!(out.trim(), "ok=true serial=true", "{out}");
 }
 
 #[test]

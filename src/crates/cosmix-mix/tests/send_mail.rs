@@ -24,12 +24,26 @@ fi
 exit 0
 "#;
 
+/// Records its own argv, then runs the shipped driver under the mix being
+/// tested. With REMOTE_SENDMAIL_STANDIN set it first rewrites the driver's
+/// `/usr/sbin/sendmail` to the fake, and refuses outright (exit 99) if the
+/// real path survives the rewrite — a test must never reach a real MTA.
 const FAKE_SSH: &str = r#"#!/bin/sh
+printf '%s\n' "$0" "$@" > "$SENDMAIL_CAPTURE.ssh-argv"
 host=
 while [ $# -gt 0 ]; do
   if [ "$1" = "--" ]; then shift; host=$1; break; fi
   shift
 done
+if [ -n "$REMOTE_SENDMAIL_STANDIN" ]; then
+  cat > "$SENDMAIL_CAPTURE.driver"
+  sed "s#/usr/sbin/sendmail#$REMOTE_SENDMAIL_STANDIN#g" "$SENDMAIL_CAPTURE.driver" > "$SENDMAIL_CAPTURE.rewritten"
+  if grep -q /usr/sbin/sendmail "$SENDMAIL_CAPTURE.rewritten"; then
+    echo "fake ssh: refusing to run a real sendmail" >&2
+    exit 99
+  fi
+  FAKE_HOST=$host exec "$MIX_UNDER_TEST" - < "$SENDMAIL_CAPTURE.rewritten"
+fi
 FAKE_HOST=$host exec "$MIX_UNDER_TEST" -
 "#;
 
@@ -57,13 +71,21 @@ impl Bed {
     }
 
     fn run(&self, program: &str, fail: bool) -> (String, String, bool) {
+        self.run_env(program, fail, &[])
+    }
+
+    fn run_env(&self, program: &str, fail: bool, extra: &[(&str, &str)]) -> (String, String, bool) {
         let path = format!("{}:/usr/bin:/bin", self.dir.path().display());
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mix"));
         cmd.arg("-c")
             .arg(program)
             .env("PATH", path)
             .env("MIX_UNDER_TEST", env!("CARGO_BIN_EXE_mix"))
-            .env("SENDMAIL_CAPTURE", self.capture());
+            .env("SENDMAIL_CAPTURE", self.capture())
+            .env_remove("REMOTE_SENDMAIL_STANDIN");
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
         if fail {
             cmd.env("SENDMAIL_FAIL", "1");
         } else {
@@ -179,4 +201,77 @@ fn host_sends_through_ssh_exec_on_that_host() {
         "{}",
         bed.eml()
     );
+    bed.assert_ssh_argv("alpha");
+}
+
+#[test]
+fn host_without_the_sendmail_option_runs_usr_sbin_sendmail_remotely() {
+    // The remote default must be /usr/sbin/sendmail. The fake ssh swaps that
+    // path for the fake in the shipped driver (and refuses if the swap
+    // missed), so the default is proven without a real MTA in reach.
+    let bed = Bed::new();
+    let standin = bed.sendmail();
+    let (out, err, ok) = bed.run_env(
+        &format!(
+            "$r = send_mail({MSG}, {{host: \"beta\", timeout: 20}})\nprint($r.ok .. \" \" .. $r.exit_code .. \" \" .. $r.host)\n"
+        ),
+        false,
+        &[("REMOTE_SENDMAIL_STANDIN", standin.as_str())],
+    );
+    assert!(ok, "stdout={out} stderr={err}");
+    assert_eq!(out.trim(), "true 0 beta", "stdout={out} stderr={err}");
+    let driver = fs::read_to_string(bed.capture().with_extension("driver")).expect("driver captured");
+    assert!(
+        driver.contains("/usr/sbin/sendmail"),
+        "the remote argv[0] must default to /usr/sbin/sendmail: {driver}"
+    );
+    assert_eq!(bed.args(), ["-t", "-i", "-f", "reports@example.com"]);
+    bed.assert_ssh_argv("beta");
+}
+
+#[test]
+fn a_long_line_body_arrives_quoted_printable_and_decodes_exactly() {
+    let bed = Bed::new();
+    let (out, err, ok) = bed.run(
+        "$line = \"\"\nfor each $i in range(0, 300)\n  $line = $line .. \"a=b; \"\nend\n$r = send_mail({to: \"ops@example.com\", from: \"r@example.com\", subject: \"csv\", body: \"head\\n\" .. $line .. \"\\ntail\"})\nprint($r.ok .. \" \" .. length($line))\n",
+        false,
+    );
+    assert!(ok, "stdout={out} stderr={err}");
+    assert_eq!(out.trim(), "true 1500", "{out}");
+    let eml = bed.eml();
+    let (head, encoded) = eml.split_once("\n\n").unwrap();
+    assert!(head.contains("Content-Transfer-Encoding: quoted-printable"), "{head}");
+    assert!(encoded.lines().all(|l| l.len() <= 76), "{encoded}");
+    let joined = encoded.replace("=\n", "");
+    let mut decoded = Vec::new();
+    let b = joined.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'=' {
+            decoded.push(u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap(), 16).unwrap());
+            i += 3;
+        } else {
+            decoded.push(b[i]);
+            i += 1;
+        }
+    }
+    let expected = format!("head\n{}\ntail\n", "a=b; ".repeat(300));
+    assert_eq!(String::from_utf8(decoded).unwrap(), expected);
+}
+
+impl Bed {
+    /// The fake ssh's recorded argv: the real transport shape, not just
+    /// "some ssh ran".
+    fn assert_ssh_argv(&self, host: &str) {
+        let argv: Vec<String> = fs::read_to_string(self.capture().with_extension("ssh-argv"))
+            .expect("fake ssh ran")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(argv[0].ends_with("/ssh"), "{argv:?}");
+        assert!(argv.iter().any(|a| a == "BatchMode=yes"), "{argv:?}");
+        assert!(argv.iter().any(|a| a.starts_with("ConnectTimeout=")), "{argv:?}");
+        let n = argv.len();
+        assert_eq!(&argv[n - 3..], ["--", host, "/opt/cosmix/bin/mix -"], "{argv:?}");
+    }
 }

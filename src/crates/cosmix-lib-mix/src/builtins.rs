@@ -319,8 +319,8 @@ builtin_table! {
     ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy, stdout_truncated, stderr_truncated}; max_output optionally caps local capture bytes per stream (omitted: unbounded; 0 is REJECTED — unlike run_argv, where 0 means unbounded — omit the key instead). A cap that cuts mid-UTF-8-sequence makes the lossy decode insert U+FFFD, so utf8_lossy: true beside stdout_truncated: true may be local truncation damage, not remote garbage", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
     ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
-    ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers). Every host is validated before any ssh spawns, so a bad option or host raises locally with nothing run. One host's failure is DATA in its own map, never a raise: unreachable, nonzero exit and timeout arrive as ok:false. decode is per host too: where ssh_mix raises (truncated stdout, unparseable stdout), that host alone gets ok:false, decode_error and no value. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch)", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
-    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id. Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client. to is a string or list of strings; the envelope sender is from's address (the part in <…> when it has a display name). A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL anywhere in a header raises (no header injection). headers adds headers or replaces the generated Date/Message-ID/MIME-Version/Content-Type/Content-Transfer-Encoding; From/To/Subject there raise (set them in msg). sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host instead, via ssh_exec (remote default /usr/sbin/sendmail; the result carries host). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); a bad msg or option raises OPTION_INVALID before anything runs", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: map("send_mail_options", {host: string, sendmail: string, timeout: number})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
+    ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers — run_parallel's numbers, its own loop). Options are validated once (even for an empty host list) and every host is checked before any ssh spawns; a wrong argument type raises TYPE_MISMATCH. After that nothing raises — one host's failure is DATA in its own map: unreachable, nonzero exit and timeout arrive as ok:false; a local spawn/pipe failure as ok:false with error_code (PROCESS_*) and error; a decode refusal (truncated or unparseable stdout, where ssh_mix raises) as ok:false, decode_error and no value; a host never started because of Ctrl-C as ok:false, interrupted:true. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch); there is no whole-call deadline", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
+    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id (+ host, only with the host opt). Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client; ok means the MTA accepted it, not that it was delivered. to is a string or list of strings; Cc/Bcc go in headers. from is exactly one mailbox, addr or Name <addr> (a comment, a second mailbox or <> raises); its address is the envelope sender. Long headers are folded within 78 columns (an unbreakable run over 998 raises); a non-ASCII body or one with a line over 998 bytes goes quoted-printable, else 7bit. A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL in any header raises. headers adds headers or replaces the generated Date/Message-ID/MIME-Version/Content-Type/Content-Transfer-Encoding; From/To/Subject there raise. sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host via ssh_exec (remote default /usr/sbin/sendmail). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); bad input raises before anything runs: OPTION_INVALID (msg fields, options), TYPE_MISMATCH (msg not a map, arity), or ssh_exec's own validation errors with host", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: map("send_mail_options", {host: string, sendmail: string, timeout: number})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
@@ -10542,6 +10542,39 @@ fn run_with_timeout(
     caller: &str,
     max_output: Option<usize>,
 ) -> MixResult<SshOutcome> {
+    run_ssh_process(argv, stdin, timeout_s, caller, max_output).map_err(legacy_process_error)
+}
+
+/// Legacy compatibility: pre-0.29 the engine raised plain RuntimeErrors for
+/// lifecycle failures; run/run_rc/ssh_* consumers (and their $err.code view)
+/// must not observe the new PROCESS_* codes through the serial adapter.
+/// `ssh_mix_many` does NOT apply this: it keeps the code and records the
+/// failure as that host's DATA.
+fn legacy_process_error(e: MixError) -> MixError {
+    match e {
+        MixError::Structured(info)
+            if matches!(
+                info.code.as_str(),
+                "PROCESS_SPAWN" | "PROCESS_IO" | "PROCESS_INTERNAL"
+            ) =>
+        {
+            MixError::RuntimeError {
+                span: info.span,
+                msg: info.message,
+            }
+        }
+        other => other,
+    }
+}
+
+/// The ssh process run with the engine's structured PROCESS_* codes intact.
+fn run_ssh_process(
+    argv: &[String],
+    stdin: Option<&str>,
+    timeout_s: u64,
+    caller: &str,
+    max_output: Option<usize>,
+) -> MixResult<SshOutcome> {
     let outcome = run_process(&ProcSpec {
         argv,
         stdin: stdin.map_or(ProcStdin::Null, |data| ProcStdin::Data(data.as_bytes())),
@@ -10555,24 +10588,6 @@ fn run_with_timeout(
         clear_env: false,
         max_output,
         stream: false,
-    })
-    .map_err(|e| match e {
-        // Legacy compatibility: pre-0.29 the engine raised plain
-        // RuntimeErrors for lifecycle failures; run/run_rc/ssh_*
-        // consumers (and their $err.code view) must not observe the
-        // new PROCESS_* codes through this adapter.
-        MixError::Structured(info)
-            if matches!(
-                info.code.as_str(),
-                "PROCESS_SPAWN" | "PROCESS_IO" | "PROCESS_INTERNAL"
-            ) =>
-        {
-            MixError::RuntimeError {
-                span: info.span,
-                msg: info.message,
-            }
-        }
-        other => other,
     })?;
     Ok(SshOutcome {
         stdout: outcome.stdout,
@@ -10603,8 +10618,14 @@ struct SshCall {
 /// no `Value` and no evaluator state (the process engine checks the global
 /// interrupt flag itself).
 fn exec_ssh_call(call: &SshCall) -> MixResult<(SshOutcome, std::time::Duration)> {
+    exec_ssh_call_structured(call).map_err(legacy_process_error)
+}
+
+/// [`exec_ssh_call`] without the legacy flattening — the PROCESS_* code of
+/// a spawn/IO failure survives, so the fan-out can record it per host.
+fn exec_ssh_call_structured(call: &SshCall) -> MixResult<(SshOutcome, std::time::Duration)> {
     let started = std::time::Instant::now();
-    let outcome = run_with_timeout(
+    let outcome = run_ssh_process(
         &call.argv,
         call.stdin.as_deref(),
         call.timeout,
@@ -10974,17 +10995,48 @@ fn send_mail_header_value(field: &str, v: &Value) -> MixResult<String> {
     Ok(s.clone())
 }
 
-/// The envelope sender for `sendmail -f`: the address inside `<…>` when
-/// the From value has a display name, else the whole value.
+/// The envelope sender for `sendmail -f`, from a `from` holding exactly ONE
+/// mailbox in a deliberately small grammar: `addr`, or `Display Name <addr>`
+/// with the `<addr>` last. The display name is plain words (no `<>()",;:@[]`)
+/// or one `"quoted string"` without inner quotes or backslashes. Anything
+/// else — a comment, a second mailbox, the null sender `<>` — raises rather
+/// than guess which address was meant: guessing picked an address out of a
+/// comment. An address without `@` is passed through as-is.
 fn send_mail_envelope(from: &str) -> MixResult<String> {
-    let addr = match (from.rfind('<'), from.rfind('>')) {
-        (Some(l), Some(r)) if l < r => from[l + 1..r].trim(),
-        _ => from.trim(),
+    let bad = |why: &str| {
+        send_mail_invalid(format!(
+            "from must be exactly one mailbox, \"a@example.com\" or \"Name <a@example.com>\": {why} (got {from:?})"
+        ))
     };
-    if addr.is_empty() || addr.starts_with('-') || addr.contains(char::is_whitespace) {
-        return Err(send_mail_invalid(format!(
-            "from must hold one address (\"a@example.com\" or \"Name <a@example.com>\"), got {from:?}"
-        )));
+    let from = from.trim();
+    let addr = match from.find('<') {
+        None => from,
+        Some(lt) => {
+            if !from.ends_with('>') {
+                return Err(bad("nothing may follow the closing '>'"));
+            }
+            let display = from[..lt].trim();
+            let plain = !display.contains(['<', '>', '(', ')', '"', ',', ';', ':', '@', '[', ']']);
+            let quoted = display.len() >= 2
+                && display.starts_with('"')
+                && display.ends_with('"')
+                && !display[1..display.len() - 1].contains(['"', '\\']);
+            if !(plain || quoted) {
+                return Err(bad(
+                    "the display name must be plain words or one \"quoted string\"",
+                ));
+            }
+            &from[lt + 1..from.len() - 1]
+        }
+    };
+    if addr.is_empty() {
+        return Err(bad("the null sender <> is refused"));
+    }
+    if addr.contains(|c: char| c.is_whitespace() || "<>()\",;:[]\\".contains(c)) {
+        return Err(bad("the address holds a space, a comment or a second mailbox"));
+    }
+    if addr.starts_with('-') {
+        return Err(bad("an address may not begin with '-'"));
     }
     Ok(addr.to_string())
 }
@@ -11019,9 +11071,9 @@ fn send_mail_date(unix: i64) -> String {
     )
 }
 
-/// Encode a subject: unchanged when plain ASCII, else RFC 2047 words
-/// folded one per line (each continuation starts with a space — valid
-/// folding whitespace, and it keeps every line short).
+/// Encode a subject: unchanged when plain ASCII, else RFC 2047 words (each
+/// ≤ 75 characters, space-separated, so [`send_mail_fold`] can break
+/// between them).
 fn send_mail_subject(subject: &str) -> MixResult<String> {
     if subject.is_ascii() && !subject.contains("=?") {
         return Ok(subject.to_string());
@@ -11029,10 +11081,95 @@ fn send_mail_subject(subject: &str) -> MixResult<String> {
     send_mail_rfc2047(subject)
 }
 
+/// RFC 5322 §2.1.1 line limits for one header: fold `Name: value` before
+/// whitespace so lines stay within 78 characters where a break exists, and
+/// raise when an unbreakable run would still exceed the 998 hard limit.
+/// Unfolding (removing each `\n` before its whitespace) restores the value.
+/// Values are ASCII by the time they get here.
+fn send_mail_fold(name: &str, value: &str) -> MixResult<String> {
+    const SOFT: usize = 78;
+    const HARD: usize = 998;
+    let line = format!("{name}: {value}");
+    if line.len() <= SOFT {
+        return Ok(line);
+    }
+    // Break points: every space/tab after "Name: ".
+    let first_break = name.len() + 2;
+    let mut segments: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for (i, c) in line.char_indices() {
+        if i > first_break && (c == ' ' || c == '\t') {
+            segments.push(&line[start..i]);
+            start = i;
+        }
+    }
+    segments.push(&line[start..]);
+    let mut lines: Vec<String> = vec![String::new()];
+    for seg in segments {
+        let cur = lines.last_mut().expect("never empty");
+        if !cur.is_empty() && cur.len() + seg.len() > SOFT {
+            lines.push(seg.to_string());
+        } else {
+            cur.push_str(seg);
+        }
+    }
+    if lines.iter().any(|l| l.len() > HARD) {
+        return Err(send_mail_invalid(format!(
+            "header {name} holds an unbreakable run longer than {HARD} characters (RFC 5322 §2.1.1)"
+        )));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// The body with its transfer encoding. ASCII with every line within the
+/// RFC 5322 998-byte limit goes as 7bit; anything else — non-ASCII, or one
+/// long line (a JSON/CSV dump) that an MTA would otherwise split mid-data —
+/// goes as quoted-printable, which survives any transport byte for byte.
+fn send_mail_body(body: &str) -> (String, &'static str) {
+    let mut body = body.replace("\r\n", "\n");
+    if body.is_ascii() && body.split('\n').all(|l| l.len() <= 998) {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        return (body, "7bit");
+    }
+    (send_mail_qp(&body), "quoted-printable")
+}
+
+/// RFC 2045 §6.7 quoted-printable, lines ≤ 76 including the soft-break `=`.
+/// Hard line breaks stay LF (sendmail reads local line endings); a trailing
+/// space or tab is encoded so no transport can strip it.
+fn send_mail_qp(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    for line in body.split('\n') {
+        let bytes = line.as_bytes();
+        let mut cur = String::new();
+        for (j, &b) in bytes.iter().enumerate() {
+            let last = j + 1 == bytes.len();
+            let literal = ((33..=126).contains(&b) && b != b'=') || ((b == b' ' || b == b'\t') && !last);
+            let tok = if literal {
+                (b as char).to_string()
+            } else {
+                format!("={b:02X}")
+            };
+            if cur.len() + tok.len() > 75 {
+                out.push_str(&cur);
+                out.push_str("=\n");
+                cur.clear();
+            }
+            cur.push_str(&tok);
+        }
+        out.push_str(&cur);
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(feature = "crypto")]
 fn send_mail_rfc2047(subject: &str) -> MixResult<String> {
     match builtin_rfc2047_encode(vec![Value::String(subject.to_string())])? {
-        Some(Value::String(ref s)) => Ok(s.replace(" =?", "\n =?")),
+        Some(Value::String(ref s)) => Ok(s.clone()),
         _ => Err(MixError::RuntimeError {
             span: None,
             msg: "send_mail: rfc2047_encode returned a non-string".into(),
@@ -11107,8 +11244,8 @@ fn send_mail_render(msg: &Value) -> MixResult<RenderedMail> {
             )));
         }
     };
-    let body = match required("body")? {
-        Value::String(s) => s.clone(),
+    let (body, body_encoding) = match required("body")? {
+        Value::String(s) => send_mail_body(s),
         other => {
             return Err(send_mail_invalid(format!(
                 "msg.body must be a string, got {}",
@@ -11144,7 +11281,7 @@ fn send_mail_render(msg: &Value) -> MixResult<RenderedMail> {
         ("Content-Type".into(), "text/plain; charset=utf-8".into()),
         (
             "Content-Transfer-Encoding".into(),
-            if body.is_ascii() { "7bit" } else { "8bit" }.into(),
+            body_encoding.into(),
         ),
     ];
     match m.get("headers") {
@@ -11190,17 +11327,11 @@ fn send_mail_render(msg: &Value) -> MixResult<RenderedMail> {
 
     let mut text = String::with_capacity(body.len() + 512);
     for (n, v) in &headers {
-        text.push_str(n);
-        text.push_str(": ");
-        text.push_str(v);
+        text.push_str(&send_mail_fold(n, v)?);
         text.push('\n');
     }
     text.push('\n');
-    // sendmail reads local line endings; a CRLF body would gain stray CRs.
-    text.push_str(&body.replace("\r\n", "\n"));
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
+    text.push_str(&body);
     Ok(RenderedMail {
         text,
         envelope_from,
@@ -11317,90 +11448,171 @@ fn bare_error_message(e: &MixError) -> String {
 }
 
 /// Concurrency default and live-worker cap for `ssh_mix_many` — the same
-/// numbers as `run_parallel`, whose worker pool this mirrors.
+/// numbers as `run_parallel` (its own loop, with per-host error semantics).
 const SSH_MIX_MANY_DEFAULT_MAX: usize = 8;
 const SSH_MIX_MANY_MAX_WORKERS: usize = 256;
 
+/// What one host's worker slot ends up holding. Owned primitives only, so
+/// it crosses the worker-thread boundary.
+enum ManySlot {
+    /// Never started: the interrupt flag was set before this host's turn.
+    NotStarted,
+    Ran(std::time::Duration, SshOutcome),
+    /// The engine could not run ssh at all (spawn/stdio/IO): code + message.
+    Failed(String, String),
+}
+
+fn ssh_mix_many_type_err(msg: impl std::fmt::Display) -> MixError {
+    MixError::structured("TYPE_MISMATCH", format!("ssh_mix_many: {msg}"))
+}
+
+/// Re-attribute a delegated ssh_run/ssh_mix validation error to
+/// ssh_mix_many (a structured error keeps its code).
+fn ssh_mix_many_rename(e: MixError) -> MixError {
+    let fix = |m: &str| -> String {
+        let rest = m
+            .strip_prefix("ssh_run: ")
+            .or_else(|| m.strip_prefix("ssh_mix: "))
+            .unwrap_or(m);
+        format!("ssh_mix_many: {rest}")
+    };
+    match e {
+        MixError::RuntimeError { span, msg } => MixError::RuntimeError {
+            span,
+            msg: fix(&msg),
+        },
+        MixError::Structured(info) => MixError::structured(&info.code, fix(&info.message)),
+        other => other,
+    }
+}
+
+/// The host-shaped refusals `ssh_run` applies, attributed to the host.
+fn ssh_mix_many_check_host(host: &str) -> MixResult<()> {
+    let why = if host.is_empty() {
+        "must not be empty"
+    } else if host.starts_with('-') {
+        "must not begin with '-' (it would be parsed as an ssh option)"
+    } else if host.contains('\0') {
+        "contains a NUL byte"
+    } else {
+        return Ok(());
+    };
+    Err(MixError::RuntimeError {
+        span: None,
+        msg: format!("ssh_mix_many: host {host:?} {why}"),
+    })
+}
+
+/// One host's slot as its result map. Never raises: whatever happened to
+/// one host is that host's DATA.
+fn ssh_mix_many_slot_value(host: &str, slot: ManySlot, decode: Option<&str>) -> Value {
+    let blank = |exit_code: i32, interrupted: bool| SshOutcome {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        exit_code,
+        timed_out: false,
+        interrupted,
+    };
+    match slot {
+        // -2 / -3 are the ssh family's legacy sentinels for "interrupted"
+        // and "no natural exit".
+        ManySlot::NotStarted => {
+            ssh_result_map(host, blank(-2, true), std::time::Duration::ZERO)
+        }
+        ManySlot::Failed(code, message) => {
+            let mut v = ssh_result_map(host, blank(-3, false), std::time::Duration::ZERO);
+            if let Value::Map(m) = &mut v {
+                let m = Rc::make_mut(m);
+                m.insert("error_code".into(), Value::String(code));
+                m.insert("error".into(), Value::String(message));
+            }
+            v
+        }
+        ManySlot::Ran(elapsed, outcome) => {
+            let mut v = ssh_result_map(host, outcome, elapsed);
+            if let (Some(mode), Value::Map(m)) = (decode, &mut v) {
+                let m = Rc::make_mut(m);
+                if let Err(e) = decode_ssh_stdout(m, mode) {
+                    m.insert("ok".into(), Value::Bool(false));
+                    m.insert("decode_error".into(), Value::String(bare_error_message(&e)));
+                }
+            }
+            v
+        }
+    }
+}
+
 /// `ssh_mix_many(hosts, source[, opts]) -> map host → ssh_result`
 ///
-/// `ssh_mix` over many hosts at once. Every host is planned through
-/// [`plan_ssh_mix`] on this thread first — any argument/option error raises
-/// before a single ssh spawns, exactly as `ssh_mix` would — then the plans
-/// run on a bounded worker pool through the same [`exec_ssh_call`], and each
-/// outcome becomes the same `ssh_result` map `ssh_mix` returns. Results are
-/// keyed by host in INPUT order.
+/// `ssh_mix` over many hosts at once. The options are validated ONCE through
+/// [`plan_ssh_mix`] (with no host in play, so an option error never blames a
+/// host), every host is checked, and only then does anything spawn. Each
+/// host's argv is the validated plan with its own host substituted; the
+/// shipped stdin (bindings + env + source) is built once and shared.
 ///
-/// One host's failure is DATA in its own map (unreachable, nonzero exit,
-/// timeout), never a raise that would discard the others. That includes
-/// `decode`: where `ssh_mix` raises (truncated stdout, unparseable stdout),
-/// the fan-out records the refusal on that host alone — `ok: false`,
-/// `decode_error` set, no `value` — so one bad host cannot cost the caller
-/// every other host's answer.
+/// After planning nothing raises. Each host's outcome is DATA in its own
+/// map: an ssh exit/timeout exactly as `ssh_mix` reports it; a local spawn
+/// or IO failure as `ok:false` + `error_code`/`error`; a `decode` refusal as
+/// `ok:false` + `decode_error`; a host never started because of Ctrl-C as
+/// `ok:false, interrupted:true`. Workers check the interrupt flag before
+/// taking a host and again before spawning, so an interrupt stops the batch.
 fn builtin_ssh_mix_many(args: Vec<Value>) -> MixResult<Option<Value>> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let caller = "ssh_mix_many";
     if !(2..=3).contains(&args.len()) {
-        return Err(MixError::RuntimeError {
-            span: None,
-            msg: format!(
-                "{caller}: expected 2 or 3 args (hosts, source, [opts]), got {}",
-                args.len()
-            ),
-        });
+        return Err(ssh_mix_many_type_err(format!(
+            "expected 2 or 3 args (hosts, source, [opts]), got {}",
+            args.len()
+        )));
     }
     let hosts: Vec<String> = match &args[0] {
         Value::List(l) => {
-            let mut out = Vec::with_capacity(l.len());
+            let mut out: Vec<String> = Vec::with_capacity(l.len());
             for (i, h) in l.iter().enumerate() {
-                match h {
-                    Value::String(s) => {
-                        if out.contains(s) {
-                            return Err(MixError::RuntimeError {
-                                span: None,
-                                msg: format!(
-                                    "{caller}: host {s:?} is listed twice — results are keyed by host"
-                                ),
-                            });
-                        }
-                        out.push(s.clone());
-                    }
-                    other => {
-                        return Err(MixError::RuntimeError {
-                            span: None,
-                            msg: format!(
-                                "{caller}: hosts[{i}] must be a string, got {}",
-                                other.type_name()
-                            ),
-                        });
-                    }
+                let Value::String(s) = h else {
+                    return Err(ssh_mix_many_type_err(format!(
+                        "hosts[{i}] must be a string, got {}",
+                        h.type_name()
+                    )));
+                };
+                if out.contains(s) {
+                    return Err(MixError::RuntimeError {
+                        span: None,
+                        msg: format!(
+                            "{caller}: host {s:?} is listed twice — results are keyed by host"
+                        ),
+                    });
                 }
+                out.push(s.clone());
             }
             out
         }
         other => {
-            return Err(MixError::RuntimeError {
-                span: None,
-                msg: format!("{caller}: hosts must be a list of strings, got {}", other.type_name()),
-            });
+            return Err(ssh_mix_many_type_err(format!(
+                "hosts must be a list of strings, got {}",
+                other.type_name()
+            )));
         }
     };
     if !matches!(&args[1], Value::String(_)) {
-        return Err(MixError::RuntimeError {
-            span: None,
-            msg: format!("{caller}: source must be a string"),
-        });
+        return Err(ssh_mix_many_type_err(format!(
+            "source must be a string, got {}",
+            args[1].type_name()
+        )));
     }
     // Pull our one extra key (`max`) out; every other key goes to ssh_mix
     // unchanged, so the option surface is ssh_mix's by construction.
     let mut opts_map = match args.get(2) {
         None => indexmap::IndexMap::new(),
         Some(Value::Map(m)) => (**m).clone(),
-        Some(_) => {
-            return Err(MixError::RuntimeError {
-                span: None,
-                msg: format!("{caller}: opts must be a map"),
-            });
+        Some(other) => {
+            return Err(ssh_mix_many_type_err(format!(
+                "opts must be a map, got {}",
+                other.type_name()
+            )));
         }
     };
     let max = match opts_map.shift_remove("max") {
@@ -11420,78 +11632,82 @@ fn builtin_ssh_mix_many(args: Vec<Value>) -> MixResult<Option<Value>> {
             "timeout: 0 (no deadline) is refused — one hung host would park the whole batch",
         ));
     }
-    let opts_value = Value::map(opts_map);
 
-    let mut plans: Vec<SshCall> = Vec::with_capacity(hosts.len());
-    let mut decode_mode: Option<String> = None;
+    // Validate every host-independent option once, even for an empty host
+    // list, with a placeholder host that passes ssh_run's host guards.
+    let (template, decode_mode) = plan_ssh_mix(vec![
+        Value::String("ssh-mix-many".into()),
+        args[1].clone(),
+        Value::map(opts_map),
+    ])
+    .map_err(ssh_mix_many_rename)?;
+    // build_ssh_argv always ends `…, "--", host, remote`.
+    let host_at = template.argv.len().checked_sub(2).filter(|i| {
+        *i >= 1 && template.argv[*i - 1] == "--"
+    });
+    let Some(host_at) = host_at else {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("{caller}: internal: unexpected ssh argv shape"),
+        });
+    };
+    let mut argvs: Vec<Vec<String>> = Vec::with_capacity(hosts.len());
     for host in &hosts {
-        let (call, mode) = plan_ssh_mix(vec![
-            Value::String(host.clone()),
-            args[1].clone(),
-            opts_value.clone(),
-        ])
-        .map_err(|e| match e {
-            // Say WHICH host a host-specific refusal (empty, leading '-',
-            // NUL) belongs to; structured errors keep their code untouched.
-            MixError::RuntimeError { span, msg } => MixError::RuntimeError {
-                span,
-                msg: format!("{caller}: host {host:?}: {msg}"),
-            },
-            other => other,
-        })?;
-        decode_mode = mode;
-        plans.push(call);
+        ssh_mix_many_check_host(host)?;
+        let mut argv = template.argv.clone();
+        argv[host_at] = host.clone();
+        argvs.push(argv);
     }
 
-    let n = plans.len();
+    let n = argvs.len();
     let mut out = indexmap::IndexMap::with_capacity(n);
     if n == 0 {
         return Ok(Some(Value::map(out)));
     }
-    // Worker pool — the run_parallel shape: workers pull the next index,
-    // write into a per-index slot, and MixError (!Send, it can carry a
-    // Value) is flattened to owned strings across the thread boundary.
-    #[allow(clippy::type_complexity)]
-    let slots: Vec<Mutex<Option<Result<(SshOutcome, std::time::Duration), (Option<String>, String)>>>> =
-        (0..n).map(|_| Mutex::new(None)).collect();
+    let slots: Vec<Mutex<ManySlot>> = (0..n).map(|_| Mutex::new(ManySlot::NotStarted)).collect();
     let next = AtomicUsize::new(0);
     let workers = max.min(n).min(SSH_MIX_MANY_MAX_WORKERS);
     std::thread::scope(|s| {
         for _ in 0..workers {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= n {
-                    break;
+            s.spawn(|| {
+                loop {
+                    // Before taking a host AND before spawning: after Ctrl-C
+                    // no further ssh starts; untaken hosts stay NotStarted.
+                    if crate::interrupt::is_interrupted() {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n || crate::interrupt::is_interrupted() {
+                        break;
+                    }
+                    let started = std::time::Instant::now();
+                    let slot = match run_ssh_process(
+                        &argvs[i],
+                        template.stdin.as_deref(),
+                        template.timeout,
+                        "ssh_run",
+                        template.max_output,
+                    ) {
+                        Ok(o) => ManySlot::Ran(started.elapsed(), o),
+                        Err(MixError::Structured(info)) => {
+                            ManySlot::Failed(info.code.clone(), info.message.clone())
+                        }
+                        Err(other) => {
+                            ManySlot::Failed("RUNTIME_ERROR".into(), bare_error_message(&other))
+                        }
+                    };
+                    *slots[i].lock().expect("ssh_mix_many slot poisoned") = slot;
                 }
-                let r = exec_ssh_call(&plans[i]).map_err(|e| match e {
-                    MixError::Structured(info) => (Some(info.code.clone()), info.message.clone()),
-                    other => (None, bare_error_message(&other)),
-                });
-                *slots[i].lock().expect("ssh_mix_many slot poisoned") = Some(r);
             });
         }
     });
 
-    for (plan, slot) in plans.iter().zip(slots) {
-        let r = slot
-            .into_inner()
-            .expect("ssh_mix_many slot poisoned")
-            .expect("every host index is assigned exactly once");
-        // A local engine failure (no `ssh` binary, spawn/IO error) is the
-        // same for every host and is what ssh_mix raises too.
-        let (outcome, elapsed) = r.map_err(|(code, msg)| match code {
-            Some(code) => MixError::structured(&code, msg),
-            None => MixError::RuntimeError { span: None, msg },
-        })?;
-        let mut result = ssh_result_map(&plan.host, outcome, elapsed);
-        if let (Some(mode), Value::Map(m)) = (decode_mode.as_deref(), &mut result) {
-            let m = Rc::make_mut(m);
-            if let Err(e) = decode_ssh_stdout(m, mode) {
-                m.insert("ok".into(), Value::Bool(false));
-                m.insert("decode_error".into(), Value::String(bare_error_message(&e)));
-            }
-        }
-        out.insert(plan.host.clone(), result);
+    for (host, slot) in hosts.iter().zip(slots) {
+        let slot = slot.into_inner().expect("ssh_mix_many slot poisoned");
+        out.insert(
+            host.clone(),
+            ssh_mix_many_slot_value(host, slot, decode_mode.as_deref()),
+        );
     }
     Ok(Some(Value::map(out)))
 }
@@ -22953,7 +23169,8 @@ mod ssh_helpers_tests {
 
     // ---- ssh_run helpers --------------------------------------------------
     use super::{
-        SshOpts, build_remote_command, build_ssh_argv, builtin_send_mail, builtin_ssh_mix,
+        ManySlot, SshOpts, SshOutcome, send_mail_envelope, ssh_mix_many_slot_value,
+        build_remote_command, build_ssh_argv, builtin_send_mail, builtin_ssh_mix,
         builtin_ssh_mix_many, builtin_ssh_run, conditional_cap_engaged, is_valid_env_key,
         parse_env_opt, parse_ssh_opts, send_mail_date, send_mail_render,
     };
@@ -23312,7 +23529,12 @@ mod ssh_helpers_tests {
             .join("\n");
         assert!(subject.starts_with("Subject: =?UTF-8?B?"), "{subject}");
         assert!(subject.is_ascii(), "{subject}");
-        assert!(r.text.contains("Content-Transfer-Encoding: 8bit"), "{}", r.text);
+        assert!(
+            r.text.contains("Content-Transfer-Encoding: quoted-printable"),
+            "{}",
+            r.text
+        );
+        assert!(r.text.ends_with("gr=C3=BC=C3=9Fe\n"), "{}", r.text);
     }
 
     #[test]
@@ -23356,9 +23578,12 @@ mod ssh_helpers_tests {
             ),
             (
                 mail_msg(&[("from", Value::String("-oQ/tmp x@example.com".into()))]),
-                "one address",
+                "exactly one mailbox",
             ),
-            (mail_msg(&[("from", Value::String("-x@example.com".into()))]), "one address"),
+            (
+                mail_msg(&[("from", Value::String("-x@example.com".into()))]),
+                "may not begin with '-'",
+            ),
             (mail_msg(&[("cc", Value::String("x@example.com".into()))]), "unknown msg key"),
             (
                 mail_msg(&[("headers", map_of(&[("Bad Name", Value::String("v".into()))]))]),
@@ -23382,6 +23607,107 @@ mod ssh_helpers_tests {
         ]);
         assert_eq!(code.as_deref(), Some("OPTION_INVALID"), "{text}");
         assert!(text.contains("unknown option 'via'"), "{text}");
+    }
+
+    /// Undo RFC 5322 folding and RFC 2045 quoted-printable, for round trips.
+    fn unfold(s: &str) -> String {
+        s.replace("\n ", " ").replace("\n\t", "\t")
+    }
+
+    fn qp_decode(s: &str) -> Vec<u8> {
+        let joined = s.replace("=\n", "");
+        let b = joined.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'=' {
+                let hex = std::str::from_utf8(&b[i + 1..i + 3]).unwrap();
+                out.push(u8::from_str_radix(hex, 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn send_mail_folds_long_headers_within_the_line_limits() {
+        let subject: String = (0..240).map(|i| format!("w{i:03}")).collect::<Vec<_>>().join(" ");
+        assert!(subject.len() > 1200);
+        let to: Vec<Value> = (0..40)
+            .map(|i| Value::String(format!("Recipient {i} <r{i}@example.com>")))
+            .collect();
+        let r = send_mail_render(&mail_msg(&[
+            ("subject", Value::String(subject.clone())),
+            ("to", Value::list(to)),
+        ]))
+        .expect("render");
+        let head = r.text.split_once("\n\n").unwrap().0;
+        for line in head.lines() {
+            assert!(line.len() <= 78, "line over 78: {line:?}");
+        }
+        let unfolded = unfold(head);
+        assert!(unfolded.contains(&format!("Subject: {subject}\n")), "{head}");
+        assert!(
+            unfolded.contains("To: Recipient 0 <r0@example.com>, Recipient 1 <r1@example.com>, "),
+            "{head}"
+        );
+        assert!(unfolded.contains("Recipient 39 <r39@example.com>\n"), "{head}");
+
+        // An unbreakable run past 998 cannot be folded: refused, not sent.
+        let e = send_mail_render(&mail_msg(&[(
+            "headers",
+            map_of(&[("X-Blob", Value::String("x".repeat(1200)))]),
+        )]))
+        .err()
+        .expect("an unfoldable header must raise");
+        assert!(e.to_string().contains("998"), "{e}");
+    }
+
+    #[test]
+    fn send_mail_sends_a_long_line_body_as_quoted_printable_that_round_trips() {
+        let long = format!("{{\"data\": \"{}\", \"end\": \"a = b \"}}", "x".repeat(1500));
+        let body = format!("head\n{long}\ntrailing space \n");
+        let r = send_mail_render(&mail_msg(&[("body", Value::String(body.clone()))])).expect("render");
+        let (head, encoded) = r.text.split_once("\n\n").unwrap();
+        assert!(head.contains("Content-Transfer-Encoding: quoted-printable"), "{head}");
+        for line in encoded.lines() {
+            assert!(line.len() <= 76, "QP line over 76: {line:?}");
+        }
+        assert_eq!(String::from_utf8(qp_decode(encoded)).unwrap(), body);
+        // A short ASCII body stays 7bit and untouched.
+        let r = send_mail_render(&mail_msg(&[])).expect("render");
+        assert!(r.text.contains("Content-Transfer-Encoding: 7bit"), "{}", r.text);
+    }
+
+    #[test]
+    fn send_mail_envelope_accepts_exactly_one_mailbox() {
+        for (from, want) in [
+            ("a@example.com", "a@example.com"),
+            ("  a@example.com ", "a@example.com"),
+            ("Reports <r@example.com>", "r@example.com"),
+            ("J. Smith <j@example.com>", "j@example.com"),
+            ("\"Smith, John\" <j@example.com>", "j@example.com"),
+            ("root", "root"),
+        ] {
+            assert_eq!(send_mail_envelope(from).expect(from), want, "{from}");
+        }
+        for (from, why) in [
+            ("Alice <a@example.com> (billing <b@example.net>)", "follow the closing"),
+            ("a@example.com (billing)", "comment"),
+            ("A <a@example.com>, B <b@example.com>", "second mailbox"),
+            ("a@example.com, b@example.com", "second mailbox"),
+            ("Smith, John <j@example.com>", "display name"),
+            ("<>", "null sender"),
+            ("Name <>", "null sender"),
+            ("-f@example.com", "may not begin"),
+        ] {
+            let e = send_mail_envelope(from).err().unwrap_or_else(|| panic!("{from} accepted"));
+            assert!(e.to_string().contains(why), "{from}: {e}");
+            assert_eq!(e.info().map(|i| i.code.as_str()), Some("OPTION_INVALID"), "{from}");
+        }
     }
 
     #[test]
@@ -23455,6 +23781,75 @@ mod ssh_helpers_tests {
             map_of(&[("timeout", Value::Number(0.0))]),
         ]);
         assert!(e.to_string().contains("timeout: 0"), "{e}");
+    }
+
+    #[test]
+    fn ssh_mix_many_validates_options_once_and_blames_no_host_for_them() {
+        let src = Value::String("print(1)".into());
+        // An empty host list still validates the options.
+        let e = ssh_mix_many_err(vec![
+            Value::list(vec![]),
+            src.clone(),
+            map_of(&[("decode", Value::String("bogus".into()))]),
+        ]);
+        assert!(e.to_string().contains("decode must be"), "{e}");
+        // An option error names neither a host nor ssh_run/ssh_mix.
+        let e = ssh_mix_many_err(vec![
+            Value::list(vec![Value::String("alpha".into())]),
+            src.clone(),
+            map_of(&[("bogus", Value::Number(1.0))]),
+        ]);
+        let msg = e.to_string();
+        assert!(msg.contains("ssh_mix_many: unknown opts key"), "{msg}");
+        assert!(!msg.contains("alpha") && !msg.contains("ssh_run"), "{msg}");
+        // Shape errors are TYPE_MISMATCH.
+        for args in [
+            vec![Value::String("alpha".into()), src.clone()],
+            vec![Value::list(vec![]), Value::Number(1.0)],
+            vec![Value::list(vec![]), src.clone(), Value::Bool(true)],
+            vec![Value::list(vec![])],
+        ] {
+            let e = ssh_mix_many_err(args);
+            assert_eq!(e.info().map(|i| i.code.as_str()), Some("TYPE_MISMATCH"), "{e}");
+        }
+    }
+
+    #[test]
+    fn ssh_mix_many_records_a_local_failure_on_that_host_only() {
+        let ok = SshOutcome {
+            stdout: b"{v: 1}\n".to_vec(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            exit_code: 0,
+            timed_out: false,
+            interrupted: false,
+        };
+        let good = ssh_mix_many_slot_value(
+            "alpha",
+            ManySlot::Ran(std::time::Duration::from_millis(5), ok),
+            Some("data"),
+        );
+        let bad = ssh_mix_many_slot_value(
+            "beta",
+            ManySlot::Failed("PROCESS_SPAWN".into(), "ssh_run: failed to spawn `ssh`: EMFILE".into()),
+            Some("data"),
+        );
+        let idle = ssh_mix_many_slot_value("gamma", ManySlot::NotStarted, Some("data"));
+        let (Value::Map(g), Value::Map(b), Value::Map(i)) = (&good, &bad, &idle) else {
+            panic!("maps expected");
+        };
+        assert!(matches!(g.get("ok"), Some(Value::Bool(true))), "{good:?}");
+        assert!(matches!(g.get("value"), Some(Value::Map(_))), "{good:?}");
+        assert!(matches!(b.get("ok"), Some(Value::Bool(false))), "{bad:?}");
+        assert!(
+            matches!(b.get("error_code"), Some(Value::String(c)) if c == "PROCESS_SPAWN"),
+            "{bad:?}"
+        );
+        assert!(matches!(b.get("host"), Some(Value::String(h)) if h == "beta"));
+        assert!(!b.contains_key("value"), "{bad:?}");
+        assert!(matches!(i.get("interrupted"), Some(Value::Bool(true))), "{idle:?}");
+        assert!(matches!(i.get("ok"), Some(Value::Bool(false))), "{idle:?}");
     }
 
     #[test]
