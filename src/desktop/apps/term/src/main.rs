@@ -431,7 +431,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Scale(scale) => state.rescale(scale),
         Message::Keys(keys) => state.send_keys(keys),
         Message::Action(action) => return state.act(action),
-        Message::Modifiers(modifiers) => state.modifiers = modifiers,
+        Message::Modifiers(modifiers) => {
+            // Letting go of Ctrl ends a Ctrl+wheel gesture: travel short of a
+            // step must not carry into the next one and zoom early.
+            if !modifiers.control() {
+                state.wheel = 0.0;
+            }
+            state.modifiers = modifiers;
+        }
         Message::SelectTab(id) => {
             let mut tabs = state.tabs.lock().expect("tabs");
             tabs.user_activity();
@@ -470,6 +477,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // into a zoom.
             iced::window::Event::Unfocused => {
                 state.modifiers = iced::keyboard::Modifiers::empty();
+                state.wheel = 0.0;
             }
             iced::window::Event::CloseRequested => return iced::exit(),
             _ => {}
@@ -1064,6 +1072,42 @@ mod tests {
                 "pane {id} still holds the pre-zoom surface"
             );
         }
+
+        let removed = state.tabs.lock().unwrap().shutdown();
+        state.cleanup.submit(removed);
+        drop(state);
+        reaper.join().unwrap();
+    }
+
+    /// Review finding: wheel travel short of a step survived letting go of
+    /// Ctrl, so the next Ctrl+wheel gesture zoomed early.
+    #[test]
+    fn releasing_ctrl_forgets_partial_wheel_travel() {
+        use iced::keyboard::Modifiers;
+        use iced::mouse::ScrollDelta;
+        let (mut state, reaper) = test_state();
+        let _ = state.sync();
+        let start = state.painter.font().current();
+        let travel = |fraction: f32| {
+            Message::Wheel(ScrollDelta::Pixels {
+                x: 0.0,
+                y: input::PIXELS_PER_STEP * fraction,
+            })
+        };
+
+        let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
+        let _ = update(&mut state, travel(0.75));
+        assert_eq!(state.painter.font().current(), start, "three quarters is not a step");
+        let _ = update(&mut state, Message::Modifiers(Modifiers::empty()));
+        let _ = update(&mut state, Message::Modifiers(Modifiers::CTRL));
+        let _ = update(&mut state, travel(0.5));
+        assert_eq!(
+            state.painter.font().current(),
+            start,
+            "a new gesture of half a step zoomed: the old three quarters carried over"
+        );
+        let _ = update(&mut state, travel(0.5));
+        assert_ne!(state.painter.font().current(), start, "a whole step within one gesture zooms");
 
         let removed = state.tabs.lock().unwrap().shutdown();
         state.cleanup.submit(removed);
