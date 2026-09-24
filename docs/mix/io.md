@@ -226,6 +226,19 @@ Other rules:
   If the owner cannot be kept, typically because you are not root, the call
   raises and leaves the target untouched. It never silently changes who owns
   a file.
+- **It is a new inode.** The replacement is a different file that takes over
+  the name, and that has consequences `write_file` does not have:
+  - A **hard link** to the old file keeps the old content. Only this name
+    moves to the new file.
+  - A process that already has the file **open** keeps reading the old
+    content. An **inotify** watch on the file itself follows the old inode;
+    watch the directory for the rename instead.
+  - Only the owner, mode and POSIX access ACL are carried over. **Other
+    extended attributes are not**: an SELinux label is re-derived from policy
+    and may differ, and `security.capability` (`setcap` file capabilities) is
+    dropped. For a `setcap` binary or an SELinux-labelled `/etc` config, run
+    `setcap`, `restorecon` or `chcon` after the replace, or use `write_file`,
+    which keeps the inode.
 - **Symlinks.** A symlink path replaces the file the link names and keeps the
   link. That is `write_file`'s behaviour, and it avoids turning the link into
   a regular file. A dangling link raises.

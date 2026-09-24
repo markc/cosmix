@@ -626,6 +626,22 @@ new inode, so root rewriting a user's file would otherwise hand it to root.
 If the owner cannot be kept, typically because you are not root, the call
 raises and leaves the target untouched. It never silently changes who owns
 a file.</li>
+<li><strong>It is a new inode.</strong> The replacement is a different file that takes over
+the name, and that has consequences <code>write_file</code> does not have:
+<ul>
+<li>A <strong>hard link</strong> to the old file keeps the old content. Only this name
+moves to the new file.</li>
+<li>A process that already has the file <strong>open</strong> keeps reading the old
+content. An <strong>inotify</strong> watch on the file itself follows the old inode;
+watch the directory for the rename instead.</li>
+<li>Only the owner, mode and POSIX access ACL are carried over. <strong>Other
+extended attributes are not</strong>: an SELinux label is re-derived from policy
+and may differ, and <code>security.capability</code> (<code>setcap</code> file capabilities) is
+dropped. For a <code>setcap</code> binary or an SELinux-labelled <code>/etc</code> config, run
+<code>setcap</code>, <code>restorecon</code> or <code>chcon</code> after the replace, or use <code>write_file</code>,
+which keeps the inode.</li>
+</ul>
+</li>
 <li><strong>Symlinks.</strong> A symlink path replaces the file the link names and keeps the
 link. That is <code>write_file</code>'s behaviour, and it avoids turning the link into
 a regular file. A dangling link raises.</li>
