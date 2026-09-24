@@ -18,6 +18,8 @@
 #   wrongname    FAIL  names neither its crate nor an allowlisted alias
 #   jsonbad      FAIL  --json disagrees with the text line
 #   jsonmissing  FAIL  --json lacks a required key
+#   nomarker     FAIL  conforming answers, but no embedded provenance marker
+#   markerbad    FAIL  the embedded marker disagrees with --version --json
 #   forker       FAIL  forks, so fails under the thread-starvation probe
 #                      (PASS when the gate reports the probe as skipped)
 #   mix          PASS  the allowlisted alias mix -> cosmix-mix
@@ -66,7 +68,8 @@ fn script($path, $body)
 end
 
 # A binary that prints $line for --version/-V and $json for --version --json,
-# after running $prelude.
+# after running $prelude. Passing fakes also carry an embedded marker line
+# (mark()), which the gate reads from the file's bytes without executing it.
 fn standard($path, $prelude, $line, $json)
     script($path, $prelude + "\ncase \"$*\" in\n  *--json*) printf '%s\\n' '" + $json + "' ;;\n  *) printf '%s\\n' '" + $line + "' ;;\nesac\n")
 end
@@ -75,7 +78,13 @@ fn obj($name, $version, $sha, $dirty, $built)
     return "{\"component\":\"" + $name + "\",\"version\":\"" + $version + "\",\"git_sha\":\"" + $sha + "\",\"git_dirty\":" + $dirty + ",\"build_time\":\"" + $built + "\"}"
 end
 
-$members = ["okbin", "badsemver", "stale", "unknownsha", "noclose", "nobuilt", "wsstderr", "hang", "extra", "wrongname", "jsonbad", "jsonmissing", "forker", "cosmix-mix", "optional"]
+# Append the embedded provenance marker cosmix-lib-buildinfo puts in a real
+# binary (as a shell comment, so the fake still runs).
+fn mark($path, $json)
+    write_file($path, read_file($path) + "# COSMIX-BUILD" + "INFO:1:" + $json + "\n")
+end
+
+$members = ["okbin", "badsemver", "stale", "unknownsha", "noclose", "nobuilt", "wsstderr", "hang", "extra", "wrongname", "jsonbad", "jsonmissing", "nomarker", "markerbad", "forker", "cosmix-mix", "optional"]
 for $m in $members
     manifest($root, $m, "")
 end
@@ -105,9 +114,16 @@ script($R + "extra", "printf '%s\\n' 'extra 1.2.3 (" + $SHA + ", built " + $T + 
 standard($R + "wrongname", "", "other 1.2.3 (" + $SHA + ", built " + $T + ")", obj("other", "1.2.3", $SHA, "false", $T))
 standard($R + "jsonbad", "", "jsonbad 1.2.3 (" + $SHA + ", built " + $T + ")", obj("jsonbad", "9.9.9", $SHA, "false", $T))
 standard($R + "jsonmissing", "", "jsonmissing 1.2.3 (" + $SHA + ", built " + $T + ")", "{\"component\":\"jsonmissing\"}")
+standard($R + "nomarker", "", "nomarker 1.2.3 (" + $SHA + ", built " + $T + ")", obj("nomarker", "1.2.3", $SHA, "false", $T))
+standard($R + "markerbad", "", "markerbad 1.2.3 (" + $SHA + ", built " + $T + ")", obj("markerbad", "1.2.3", $SHA, "false", $T))
+mark($R + "markerbad", obj("markerbad", "1.2.3", "0000000000aa", "false", $T))
 standard($R + "forker", "/bin/true & wait", "forker 1.2.3 (" + $SHA + ", built " + $T + ")", obj("forker", "1.2.3", $SHA, "false", $T))
+mark($R + "forker", obj("forker", "1.2.3", $SHA, "false", $T))
 standard($R + "mix", "", "mix 1.2.3 (" + $SHA + ", built " + $T + ")", obj("mix", "1.2.3", $SHA, "false", $T))
+mark($R + "mix", obj("cosmix-mix", "1.2.3", $SHA, "false", $T))
+mark($R + "okbin", obj("okbin", "1.2.3", $SHA, "true", $T))
 script($root + "/desktop/target/release/comp4", "case \"$*\" in\n  *--json*) printf '%s\\n' '" + obj("comp4", "1.2.3", $SHA, "false", $T) + "' ;;\n  *) printf '%s\\n' 'comp4 1.2.3 (" + $SHA + ", built " + $T + ")' 'commit: x' 'features: bus' 'profile: release' ;;\nesac\n")
+mark($root + "/desktop/target/release/comp4", obj("comp4", "1.2.3", $SHA, "false", $T))
 
 $r = run_argv([$mix, $gate, "--src", $root, "--expect-sha", $SHA], {timeout: 180})
 $out = $r.stdout
@@ -116,11 +132,11 @@ print(rtrim($out))
 $probe_ran = contains($out, "\nPROBE thread-starvation arm: ") or starts_with($out, "PROBE thread-starvation arm: ")
 $forker_want = "FAIL|under "
 $want_pass = 3
-$want_fail = 12
+$want_fail = 14
 if !$probe_ran then
     $forker_want = "PASS|"
     $want_pass = 4
-    $want_fail = 11
+    $want_fail = 13
     print("selftest: the gate reported the starvation probe as skipped, so forker is expected to PASS")
 end
 
@@ -138,6 +154,8 @@ $expect = {
     "wrongname (wrongname)": "FAIL|name 'other' is not crate 'wrongname'",
     "jsonbad (jsonbad)": "FAIL|--version --json disagrees with the text line",
     "jsonmissing (jsonmissing)": "FAIL|--version --json lacks 'version'",
+    "nomarker (nomarker)": "FAIL|no embedded provenance marker",
+    "markerbad (markerbad)": "FAIL|embedded marker 'git_sha' disagrees",
     "forker (forker)": $forker_want,
     "mix (cosmix-mix)": "PASS|",
     "optional (optional)": "SKIP|required-features outside default",

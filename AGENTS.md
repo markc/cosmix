@@ -90,7 +90,10 @@ defaults. Never hardcode an install path.
   `--flag=-V` form also works); binaries whose options take free strings
   with no `--` escape use `exit_on_version!(leading)`, which reads argv[1]
   for the flag and argv[2] for `--json`. The crate's `build.rs` calls `cosmix_buildinfo::emit()` so the sha
-  is real. A new binary is covered by `src/tools/version_flag_gate.mix`
+  is real. `emit()` + `build_info!()` also embed the same provenance in the
+  file as bytes (`COSMIX-BUILDINFO:1:{json}`, component = the crate), so an
+  inventory reads it with `cosmix_buildinfo::find_markers` instead of
+  executing a binary; the gate asserts marker and answer agree. A new binary is covered by `src/tools/version_flag_gate.mix`
   automatically; it fails until the binary conforms.
 - Public-safe architecture specifications belong in `docs/spec/`. Read their
   status and evidence labels: draft publication is not normative acceptance.

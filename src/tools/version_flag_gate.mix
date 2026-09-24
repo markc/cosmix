@@ -25,6 +25,10 @@
 #   * `-V` prints exactly what `--version` printed;
 #   * `--version --json` parses, and its component/version/git_sha/
 #     build_time/git_dirty equal the text line's;
+#   * the file carries exactly one embedded provenance marker naming the
+#     crate (`COSMIX-BUILDINFO:1:{json}`, cosmix-lib-buildinfo), read from
+#     its bytes, whose fields equal the `--version --json` answer's — what
+#     a fleet inventory reads instead of executing a binary;
 #   * with no thread or process creatable, the answer is unchanged: proof that
 #     it precedes runtime construction. Non-root runs under
 #     `prlimit --nproc=1`; root (RLIMIT_NPROC does not bind it) runs in a
@@ -197,6 +201,42 @@ fn run_once($argv_list, $label)
     return {why: nil, out: $r.stdout}
 end
 
+# The embedded provenance marker(s) naming `crate` in the file at `path`
+# (cosmix-lib-buildinfo find_markers): `COSMIX-BUILDINFO:1:{flat json}`.
+# Read as bytes, never executed. Returns {obj: map|nil, why: string|nil}.
+fn marker_for($path, $crate)
+    $bytes = read_file_bytes($path)
+    $prefix = "COSMIX-BUILD" + "INFO:1:"
+    $found = []
+    $seen = {}
+    $at = bytes_find($bytes, $prefix)
+    while $at >= 0
+        $start = $at + len($prefix)
+        $close = bytes_find($bytes, "}", $start)
+        if $close > $start and $close - $start < 4096 then
+            $txt = bytes_to_string(slice($bytes, $start, $close + 1), {lossy: true})
+            $o = nil
+            try
+                $o = json_parse($txt)
+            catch $msg
+                $o = nil
+            end
+            if type($o) == "map" and $o["component"] == $crate and !has_key($seen, $txt) then
+                $seen[$txt] = true
+                push($found, $o)
+            end
+        end
+        $at = bytes_find($bytes, $prefix, $start)
+    end
+    if len($found) == 0 then
+        return {obj: nil, why: "no embedded provenance marker for '${crate}' (build_info!() not expanded, or build.rs emit() missing)"}
+    end
+    if len($found) > 1 then
+        return {obj: nil, why: "more than one distinct embedded marker for '${crate}'"}
+    end
+    return {obj: $found[0], why: nil}
+end
+
 $pass = 0
 $fail = 0
 $skip = 0
@@ -344,6 +384,26 @@ for $ws in $workspaces
                         $jd = $obj["git_dirty"]
                         if $jc != $name or $jv != $semver or $jsha != $sha or $jb != $built or $jd != $dirty then
                             $why = "--version --json disagrees with the text line: " + trim($js.out)
+                        end
+                    end
+                end
+            end
+
+            # The embedded marker must carry the same provenance as the
+            # --version --json answer, so a fleet inventory can read it from
+            # the file without executing anything. Its component is always
+            # the crate (mix's marker says cosmix-mix); every other field the
+            # answer has must match.
+            if $why == nil then
+                $mk = marker_for($path, $p.name)
+                $why = $mk.why
+                if $why == nil then
+                    for $key in ["version", "git_sha", "git_sha_full", "git_dirty", "build_time"]
+                        if $why == nil and has_key($obj, $key) then
+                            $mo = $mk.obj
+                            if !has_key($mo, $key) or $mo[$key] != $obj[$key] then
+                                $why = "embedded marker '${key}' disagrees with --version --json"
+                            end
                         end
                     end
                 end
