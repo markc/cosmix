@@ -490,7 +490,11 @@ have left it half-changed, so the terminal logs the verb and aborts rather
 than serve over torn state. With
 <code>COSMIX_MESH_OPEN=0</code> the strict diagnostic-only lane returns: <code>INFO</code>/<code>HELP</code>
 only, everything else refused with <code>FORBIDDEN</code>, including when
-native-session bootstrap fails.</p>
+native-session bootstrap fails. The posture is reported, not left to
+inference: the global lane's <code>term.session</code> carries <code>"posture":"mesh-open"</code>,
+the strict lane's <code>INFO</code>/<code>HELP</code> reply says <code>posture=strict</code>, and the
+native-session lane's <code>term.session</code> carries <code>"posture"</code> as <code>mesh-open</code> or
+<code>strict</code> in either posture.</p>
 <p>Target-bound protected controls belong on the broker-allocated, verified Unix
 Term identity. BROKER-023 defines their policy; a service name is never proof
 of authority, which is why the global lane's verbs stay targetless — a caller

@@ -2027,6 +2027,8 @@ fn p4_task_forwards_to_the_pane_shell_and_scopes_by_actor_and_kind() {
         )
         .await;
         assert_eq!(session.0, 0, "{session:?}");
+        // This gate runs under COSMIX_MESH_OPEN=0 (in_posture above).
+        assert_eq!(session.1["posture"], "strict", "{session:?}");
         let epoch = session.1["request_epoch"].clone();
         assert!(epoch.is_string(), "no request_epoch to submit with: {session:?}");
 

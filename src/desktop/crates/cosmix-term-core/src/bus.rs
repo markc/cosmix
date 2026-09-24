@@ -450,7 +450,7 @@ fn dispatch(
 fn diagnostic(service: &str, verb: &str) -> Result<String, String> {
     match verb {
         "INFO" | "HELP" | "info" | "help" => Ok(format!(
-            "{service}: diagnostic discovery only; protected controls require the allocated native-session route"
+            "{service}: diagnostic discovery only (posture=strict, COSMIX_MESH_OPEN=0); protected controls require the allocated native-session route"
         )),
         _ => Err("{\"error_code\":\"FORBIDDEN\"}".into()),
     }
@@ -471,7 +471,13 @@ fn handle(
             "{}\n{service}.session {{}}: native identity and per-pane binding diagnostics (not live authority)",
             help(service)
         )),
-        "term.session" => Ok(tabs.session_status().to_string()),
+        "term.session" => {
+            let mut status = tabs.session_status();
+            // dispatch() refuses every verb but INFO/HELP under the strict
+            // posture before reaching here, so a handler reply is mesh-open.
+            status["posture"] = crate::control::posture(true).into();
+            Ok(status.to_string())
+        }
         "term.tabs" => Ok(tabs
             .list()
             .iter()
@@ -1027,9 +1033,19 @@ mod tests {
             dispatch(false, &set, &cleanup, &mut replies, "term.tabs", "").unwrap_err(),
             "{\"error_code\":\"FORBIDDEN\"}"
         );
-        assert!(dispatch(false, &set, &cleanup, &mut replies, "HELP", "").is_ok());
-        // Open posture: the full verb set answers on the global name.
+        assert!(
+            dispatch(false, &set, &cleanup, &mut replies, "HELP", "")
+                .unwrap()
+                .contains("posture=strict")
+        );
+        // Open posture: the full verb set answers on the global name, and
+        // term.session names the posture instead of leaving it to inference.
         assert!(dispatch(true, &set, &cleanup, &mut replies, "term.tabs", "").is_ok());
+        let session: serde_json::Value = serde_json::from_str(
+            &dispatch(true, &set, &cleanup, &mut replies, "term.session", "").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session["posture"], "mesh-open");
         // A retried mutation with the same request_id replays the recorded
         // reply and must NOT re-execute: still two panes after the retry.
         let body = r#"{"dir":"v","request_id":"r1"}"#;
