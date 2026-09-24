@@ -28,7 +28,15 @@ use it on every mutation that might be resent after a lost reply. A reused
 id with a different verb or arguments is refused as a conflict, never
 answered with another request's reply; the replay is the recorded outcome
 of the original attempt, so retrying after changing state needs a fresh id.
-Reads never consult the cache and always answer current state. A verb whose
+Reads never consult the cache and always answer current state. Replies echo
+the identity the targetless verb acted on as trailing `key=value` tokens —
+`tab=<id> pane=<id> revision=<tab-set revision>` on `tab.new`, `tab.select`,
+`pane.split`, `pane.select` and `type`, and at the head of the `snapshot`
+header line; `tab.close` adds `revision=`, `pane.close` adds `tab=` and
+`revision=`; each `tabs` line adds `revision=` and each `panes` line
+`tab=` and `revision=`. This lets a caller detect drift after the fact; it
+is detection, not binding (e.g. `split id=2 dir=v tab=1 pane=2 revision=2`).
+A verb whose
 handler panics answers `internal error: verb handler panicked` (rc 10) and
 the lane keeps serving; a panic that unwinds while the tab set is locked may
 have left it half-changed, so the terminal logs the verb and aborts rather

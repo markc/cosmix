@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
+pub const HELP: &str = "term: tabbed Wayland Mix terminal\nMesh-open surface (2026-09-15 law): under the default posture (COSMIX_MESH_OPEN unset or != \"0\") this global name serves every verb below to any mesh or local caller, no grant required. Verbs are TARGETLESS — they act on the active tab/pane of the instance holding this name at delivery time; target-bound control (instance/incarnation/pane_generation) stays on the allocated native-session route. COSMIX_MESH_OPEN=0 restores the strict diagnostic-only lane (INFO/HELP; everything else FORBIDDEN).\nINFO / HELP\nterm.tabs {}: list id, active, title, cols, rows, child_pid\nterm.tab.new {}: open and activate a tab\nterm.tab.select {\"id\":<integer>}: select tab\nterm.tab.close {\"id\":<integer>}: close tab; last tab quits\nterm.panes {}: list active tab pane ids, focus, dimensions, child pids and logical geometry\nterm.pane.split {\"dir\":\"h|horizontal|v|vertical\"}\nterm.pane.close {}: close active pane; last pane closes tab\nterm.pane.select {\"id\":<integer>}: select pane in active tab\nterm.snapshot {}: read-only active screen, dimensions, cursor, child pid, byte counters and DIAGNOSTIC timings\nterm.type {\"text\":\"<string>\"}: ASCII synthetic keys to the active pane through the keyboard encoder, max 8192 bytes including JSON envelope; newline=Enter, tab, backspace, Ctrl+C/D supported; revokes any delegated control writer like real keys.\nEmpty body is {} for no-arg verbs; all term.* bodies must be JSON objects.\nAny MUTATING verb's body (tab.*, pane.*, type) may add \"request_id\":\"<string>\": a resend of the same request (same verb and arguments, key order free) replays the recorded reply instead of re-executing (last 128 remembered) — use it on every mutation you might resend. A reused id with a different verb or arguments is refused as a conflict. The replay is the recorded outcome of the ORIGINAL attempt; retrying after changing state (e.g. after freeing the tab limit) needs a fresh id. Reads never consult the cache and always answer current state.\nReplies echo the identity acted on as key=value tokens — tab=<id> pane=<id> revision=<tab-set revision> (tab.close: revision only; pane.close: tab and revision; list lines: revision, panes also tab) — so a caller can detect drift after the fact; it is detection, not binding.\nDIAGNOSTIC timings are process-side, never presented-frame evidence.";
 /// The one spelling the handlers in this crate are written in.
 ///
 /// D1 (TODO-term, 2026-09-21): two binaries cannot both own the global Bus
@@ -477,13 +477,15 @@ fn handle(
             .iter()
             .map(|tab| {
                 format!(
-                    "id={} active={} title={} cols={} rows={} child_pid={}",
-                    tab.id, tab.active, tab.title, tab.cols, tab.rows, tab.child_pid
+                    "id={} active={} title={} cols={} rows={} child_pid={} revision={}",
+                    tab.id, tab.active, tab.title, tab.cols, tab.rows, tab.child_pid, tabs.revision
                 )
             })
             .collect::<Vec<_>>()
             .join("\n")),
-        "term.tab.new" => tabs.open().map(|id| format!("opened id={id}")),
+        "term.tab.new" => tabs
+            .open()
+            .map(|id| format!("opened id={id} {}", identity(&tabs))),
         "term.tab.select" => {
             let id = args["id"]
                 .as_u64()
@@ -491,7 +493,7 @@ fn handle(
             // select wakes the event loop; refresh compares View.rendered_id
             // with active_id and uploads even without a PTY damage event.
             if tabs.select(id) {
-                Ok(format!("selected id={id}"))
+                Ok(format!("selected id={id} {}", identity(&tabs)))
             } else {
                 Err(format!("unknown tab id={id}"))
             }
@@ -501,12 +503,15 @@ fn handle(
                 .as_u64()
                 .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             let (outcome, removed) = tabs.close(id);
+            let revision = tabs.revision;
             drop(tabs);
             cleanup.submit(removed.into_iter().collect());
             match outcome {
                 Outcome::Unknown => Err(format!("unknown tab id={id}")),
-                Outcome::Remaining(count) => Ok(format!("closed id={id} remaining={count}")),
-                Outcome::Empty => Ok(format!("closed id={id} last")),
+                Outcome::Remaining(count) => {
+                    Ok(format!("closed id={id} remaining={count} revision={revision}"))
+                }
+                Outcome::Empty => Ok(format!("closed id={id} last revision={revision}")),
             }
         }
         "term.panes" => Ok(tabs
@@ -515,8 +520,18 @@ fn handle(
             .map(|pane| {
                 let g = pane.geometry;
                 format!(
-                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={}",
-                    pane.id, pane.active, pane.cols, pane.rows, pane.child_pid, g.x, g.y, g.w, g.h
+                    "id={} active={} cols={} rows={} child_pid={} x={} y={} w={} h={} tab={} revision={}",
+                    pane.id,
+                    pane.active,
+                    pane.cols,
+                    pane.rows,
+                    pane.child_pid,
+                    g.x,
+                    g.y,
+                    g.w,
+                    g.h,
+                    tabs.active_id(),
+                    tabs.revision
                 )
             })
             .collect::<Vec<_>>()
@@ -530,12 +545,13 @@ fn handle(
             )?;
             tabs.split_active(dir).map(|id| {
                 format!(
-                    "split id={id} dir={}",
+                    "split id={id} dir={} {}",
                     if dir == crate::panes::SplitDir::Horizontal {
                         "h"
                     } else {
                         "v"
-                    }
+                    },
+                    identity(&tabs)
                 )
             })
         }
@@ -544,7 +560,7 @@ fn handle(
                 .as_u64()
                 .ok_or_else(|| "internal: term verb/args desync (id)".to_string())?;
             if tabs.focus(id) {
-                Ok(format!("selected id={id}"))
+                Ok(format!("selected id={id} {}", identity(&tabs)))
             } else {
                 Err(format!("unknown pane in active tab id={id}"))
             }
@@ -554,15 +570,17 @@ fn handle(
                 return Err("application closing".into());
             }
             let id = tabs.active_tab().active_pane;
+            let tab = tabs.active_id();
             let tab_closed = tabs.leaves().len() == 1;
             let (_, removed) = tabs.close_active();
             let count = tabs.leaves().len();
+            let revision = tabs.revision;
             drop(tabs);
             cleanup.submit(removed.into_iter().collect());
             if tab_closed {
-                Ok(format!("closed id={id} tab-closed"))
+                Ok(format!("closed id={id} tab-closed tab={tab} revision={revision}"))
             } else {
-                Ok(format!("closed id={id} panes={count}"))
+                Ok(format!("closed id={id} panes={count} tab={tab} revision={revision}"))
             }
         }
         // VERIFY: active-pane snapshot/type — selection stays under the set lock.
@@ -571,9 +589,11 @@ fn handle(
                 return Err("application closing".into());
             }
             let active = tabs.active_terminal();
+            let identity = identity(&tabs);
             let terminal = active.lock().unwrap();
             if verb == "term.snapshot" {
-                Ok(terminal.snapshot())
+                // Onto the snapshot's own key=value header line.
+                Ok(format!("{identity} {}", terminal.snapshot()))
             } else {
                 // VERIFY: term.type extracts validated text, never the JSON envelope.
                 terminal
@@ -584,13 +604,26 @@ fn handle(
                             .ok_or_else(|| "internal: term verb/args desync (text)".to_string())?,
                     )
                     .map(|_| {
-                        "DIAGNOSTIC synthetic keys queued; inspect input_written for actual writes"
-                            .into()
+                        format!(
+                            "DIAGNOSTIC synthetic keys queued; inspect input_written for actual writes {identity}"
+                        )
                     })
             }
         }
         _ => Err("unknown verb; use HELP".into()),
     }
+}
+
+/// The identity a targetless verb acted on, echoed so a caller can detect
+/// drift after the fact (detection, not binding): the active tab and pane
+/// after the verb, and the tab-set revision. Requires a non-empty set.
+fn identity(tabs: &TabSet) -> String {
+    format!(
+        "tab={} pane={} revision={}",
+        tabs.active_id(),
+        tabs.active_tab().active_pane,
+        tabs.revision
+    )
 }
 
 fn parse_dir(body: &str) -> Result<crate::panes::SplitDir, String> {
@@ -912,16 +945,29 @@ mod tests {
         let set = Mutex::new(TabSet::new().unwrap());
         let (cleanup, worker) = Cleanup::start().unwrap();
         let original = set.lock().unwrap().active_tab().active_pane;
+        let revision = || set.lock().unwrap().revision;
+        // Every reply echoes the identity it acted on (tab, pane, revision).
         assert_eq!(
             handle(&set, &cleanup, "term.pane.split", r#"{"dir":"v"}"#).unwrap(),
-            "split id=2 dir=v"
+            format!("split id=2 dir=v tab=1 pane=2 revision={}", revision())
         );
-        assert_eq!(
-            handle(&set, &cleanup, "term.panes", "")
+        let panes = handle(&set, &cleanup, "term.panes", "").unwrap();
+        assert_eq!(panes.lines().count(), 2);
+        for line in panes.lines() {
+            assert!(
+                line.ends_with(&format!(" tab=1 revision={}", revision())),
+                "{line}"
+            );
+        }
+        assert!(
+            handle(&set, &cleanup, "term.snapshot", "")
                 .unwrap()
-                .lines()
-                .count(),
-            2
+                .starts_with(&format!("tab=1 pane=2 revision={} cols=", revision()))
+        );
+        assert!(
+            handle(&set, &cleanup, "term.type", r#"{"text":""}"#)
+                .unwrap()
+                .ends_with(&format!(" tab=1 pane=2 revision={}", revision()))
         );
         let pid = set
             .lock()
@@ -942,9 +988,10 @@ mod tests {
         assert!(handle(&set, &cleanup, "term.snapshot", "").is_ok());
         drop(held);
         assert!(handle(&set, &cleanup, "term.pane.select", r#"{"id":999}"#).is_err());
+        let closed = handle(&set, &cleanup, "term.pane.close", "").unwrap();
         assert_eq!(
-            handle(&set, &cleanup, "term.pane.close", "").unwrap(),
-            "closed id=2 panes=1"
+            closed,
+            format!("closed id=2 panes=1 tab=1 revision={}", revision())
         );
         assert_eq!(
             handle(
@@ -954,11 +1001,12 @@ mod tests {
                 &format!(r#"{{"id":{original}}}"#)
             )
             .unwrap(),
-            format!("selected id={original}")
+            format!("selected id={original} tab=1 pane={original} revision={}", revision())
         );
+        let closed = handle(&set, &cleanup, "term.pane.close", "").unwrap();
         assert_eq!(
-            handle(&set, &cleanup, "term.pane.close", "").unwrap(),
-            format!("closed id={original} tab-closed")
+            closed,
+            format!("closed id={original} tab-closed tab=1 revision={}", revision())
         );
         assert!(set.lock().unwrap().is_empty());
         drop(cleanup);
