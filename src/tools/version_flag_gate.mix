@@ -1,3 +1,4 @@
+-- version: 0.1.0
 # version_flag_gate.mix — every cosmix Rust binary answers `--version`.
 #
 # Contract (AGENTS.md "Conventions"): `<bin> --version` and `<bin> -V` exit 0
@@ -200,6 +201,10 @@ end
 $pass = 0
 $fail = 0
 $skip = 0
+fn report_skip($label, $reason)
+    print("SKIP ${label}: ${reason}")
+    return 1
+end
 $failures = []
 $seen_foreman = false
 $line_re = "^(\\S+) (\\d+\\.\\d+\\.\\d+(?:[-+][0-9A-Za-z.+-]+)?) \\(([0-9a-f]{12})(?:-dirty)?(?:, features: [^()]+?)?, built (\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z)\\)$"
@@ -215,8 +220,7 @@ for $ws in $workspaces
     $bindir = $m.target_directory + "/" + $profile_dir
     for $p in $m.packages
         if $p.name == "cosmix-foreman" then
-            print("SKIP cosmix-foreman: decommissioned (Mark, 2026-08-30)")
-            $skip = $skip + 1
+            $skip = $skip + report_skip("cosmix-foreman (cosmix-foreman)", "decommissioned (2026-08-30)")
             $seen_foreman = true
             continue
         end
@@ -238,8 +242,7 @@ for $ws in $workspaces
                     end
                 end
                 if $optional then
-                    print("SKIP ${label}: not built (required-features outside default)")
-                    $skip = $skip + 1
+                    $skip = $skip + report_skip($label, "not built (required-features outside default)")
                 else
                     print("FAIL ${label}: ${path} missing — build the workspace first")
                     push($failures, $label)
@@ -364,8 +367,7 @@ end
 # Not a workspace member (excluded in src/Cargo.toml), so metadata never
 # lists it; say so, so the counts are honest about what was not checked.
 if !$seen_foreman and exists($src + "/crates/cosmix-foreman") then
-    print("SKIP cosmix-foreman: decommissioned (Mark, 2026-08-30), not a workspace member")
-    $skip = $skip + 1
+    $skip = $skip + report_skip("cosmix-foreman (cosmix-foreman)", "decommissioned (2026-08-30), not a workspace member")
 end
 
 print("version_flag_gate: ${pass} pass, ${fail} fail, ${skip} skipped (expected sha ${expect}, profile ${profile})")

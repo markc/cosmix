@@ -1,3 +1,4 @@
+-- version: 0.1.0
 # version_flag_gate_selftest.mix — prove version_flag_gate.mix still fails.
 #
 # A gate nobody has watched fail is not yet a gate. This builds a fake pair of
@@ -142,11 +143,26 @@ $expect = {
     "mix (cosmix-mix)": "PASS|",
     "optional (optional)": "SKIP|required-features outside default",
     "comp4 (comp4)": "PASS|",
-    "cosmix-foreman": "SKIP|decommissioned"
+    "cosmix-foreman (cosmix-foreman)": "SKIP|decommissioned"
 }
 
 $bad = []
 $lines = split($out, "\n")
+$named_skips = 0
+for $line in $lines
+    if starts_with($line, "SKIP ") then
+        $named_skips = $named_skips + 1
+        if !re_match($line, "^SKIP [^ ]+ \\([^)]+\\): .+$") then
+            push($bad, "skip lacks binary, crate or reason: " + $line)
+        end
+    end
+end
+$skip_summary = re_find($out, "version_flag_gate: [0-9]+ pass, [0-9]+ fail, ([0-9]+) skipped")
+if len($skip_summary) != 1 then
+    push($bad, "missing or duplicate skip summary")
+elif to_string($named_skips) != $skip_summary[0].groups[0] then
+    push($bad, "named SKIP lines disagree with summary: " + to_string($named_skips))
+end
 for $label in keys($expect)
     $spec = split($expect[$label], "|")
     $verdict = $spec[0]
