@@ -94,7 +94,7 @@ $kv_re = "^[a-z][a-z_-]*: \\S"
 for $ws in $workspaces
     $meta = run_argv(["cargo", "metadata", "--offline", "--no-deps", "--format-version", "1", "--manifest-path", $ws], {timeout: 120})
     if !$meta.ok then
-        print("FAIL cargo metadata ${ws}: ${trim($meta.stderr)}")
+        print("FAIL cargo metadata ${ws}: " + trim($meta.stderr))
         exit(1)
     end
     $m = json_parse($meta.stdout)
@@ -134,12 +134,16 @@ for $ws in $workspaces
             $outs = []
             for $flag in ["--version", "-V"]
                 $r = run_argv([$path, $flag], {timeout: 5, clear_env: true, env: $scrubbed, stdin: {null: true}})
+                # Interpolation takes plain names and fields only, never a
+                # call or an index, so computed values are bound first.
+                $err = trim($r.stderr)
+                $err1 = split($err, "\n")[0]
                 if $r.timed_out then
                     $why = "${flag} timed out after 5 s"
                 elif $r.exit_code != 0 then
-                    $why = "${flag} exit ${r.exit_code}, stderr: ${trim($r.stderr)}"
-                elif trim($r.stderr) != "" then
-                    $why = "${flag} wrote to stderr: ${trim($r.stderr)}"
+                    $why = "${flag} exit ${r.exit_code}, stderr: " + $err1
+                elif $err != "" then
+                    $why = "${flag} wrote to stderr: " + $err1
                 end
                 if $why != nil then
                     break
@@ -158,16 +162,19 @@ for $ws in $workspaces
                     $why = "first line not '<name> <semver> (<sha12>': ${first}"
                 else
                     $g = $hit[0].groups
-                    if $g[0] != $p.name and $g[0] != $bin then
-                        $why = "name '${g[0]}' is neither crate '${p.name}' nor binary '${bin}'"
-                    elif $g[1] != $p.version then
-                        $why = "semver ${g[1]} != Cargo.toml ${p.version} (stale binary?)"
+                    $name = $g[0]
+                    $semver = $g[1]
+                    if $name != $p.name and $name != $bin then
+                        $why = "name '${name}' is neither crate '${p.name}' nor binary '${bin}'"
+                    elif $semver != $p.version then
+                        $why = "semver ${semver} != Cargo.toml ${p.version} (stale binary?)"
                     end
                 end
                 $n = 1
                 while $why == nil and $n < len($lines)
-                    if !re_match($lines[$n], $kv_re) then
-                        $why = "extra stdout line is not 'key: value': ${lines[$n]}"
+                    $extra = $lines[$n]
+                    if !re_match($extra, $kv_re) then
+                        $why = "extra stdout line is not 'key: value': ${extra}"
                     end
                     $n = $n + 1
                 end
