@@ -2931,14 +2931,15 @@ impl MailStore for SqliteMailStore {
                         tx.tx()
                             .execute(
                                 "INSERT OR REPLACE INTO mail_retrain_outbox \
-                                 (stamp_id, account_id, item_id, label, attempts, last_error, created_at) \
-                                 VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5)",
+                                 (stamp_id, account_id, item_id, label, attempts, last_error, created_at, created_us) \
+                                 VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6)",
                                 params![
                                     stamp_id,
                                     account,
                                     item_id.0.to_string(),
                                     label,
                                     now,
+                                    retrain::event_us(),
                                 ],
                             )
                             .map_err(|e| {
@@ -3053,14 +3054,15 @@ impl MailStore for SqliteMailStore {
                     tx.tx()
                         .execute(
                             "INSERT OR REPLACE INTO mail_retrain_outbox \
-                             (stamp_id, account_id, item_id, label, attempts, last_error, created_at) \
-                             VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5)",
+                             (stamp_id, account_id, item_id, label, attempts, last_error, created_at, created_us) \
+                             VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6)",
                             params![
                                 stamp_id,
                                 account,
                                 item_id.0.to_string(),
                                 label,
                                 now,
+                                retrain::event_us(),
                             ],
                         )
                         .map_err(|e| {

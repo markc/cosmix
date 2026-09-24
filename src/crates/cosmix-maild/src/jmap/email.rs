@@ -1951,6 +1951,10 @@ pub async fn set(
             if patch_failed.is_none()
                 && let Some((dest, blob_hash, retrain_label)) = planned_move
             {
+                // The move's event instant, taken before any await: an IMAP
+                // move of this message queued after this point is a newer
+                // user action and must survive the retrain below.
+                let move_event_us = crate::mailstore::retrain::event_us();
                 let ms = mailstore.clone();
                 match tokio::task::spawn_blocking(move || ms.move_email(account_id, item_id, dest))
                     .await?
@@ -1965,7 +1969,13 @@ pub async fn set(
                         // (matching legacy semantics).
                         if let Some(label) = retrain_label
                             && let Err(e) = retrain_for_move(
-                                mailstore, classifier, account_id, item_id, blob_hash, label,
+                                mailstore,
+                                classifier,
+                                account_id,
+                                item_id,
+                                blob_hash,
+                                label,
+                                move_event_us,
                             )
                             .await
                         {
@@ -2175,6 +2185,7 @@ async fn retrain_for_move(
     item_id: ItemId,
     blob_hash: cosmix_mds::BlobHash,
     label: Label,
+    event_us: i64,
 ) -> Result<()> {
     let ms = mailstore.clone();
     let blob_data = tokio::task::spawn_blocking(move || ms.mds().get_blob(&blob_hash)).await??;
@@ -2192,6 +2203,7 @@ async fn retrain_for_move(
         classifier,
         &req,
         crate::mailstore::retrain::TrainVia::Jmap,
+        event_us,
     )
     .await?;
     Ok(())
@@ -2765,12 +2777,45 @@ mod tests {
         let classifier = Arc::new(DefaultClassifier::new(ClassifierConfig::default(), backend));
 
         take_trained_via();
-        retrain_for_move(&mailstore, &classifier, 7, item, hash, Label::Spam)
+        let started = crate::mailstore::retrain::event_us();
+        retrain_for_move(&mailstore, &classifier, 7, item, hash, Label::Spam, started)
             .await
             .unwrap();
         assert_eq!(take_trained_via(), vec![TrainVia::Jmap]);
         let stats = classifier.peek_stats(&AccountId::new("7")).await.unwrap();
         assert_eq!(stats.labelled_spam, 1);
+
+        // Review R2: event order is not lock order. A JMAP move that began
+        // BEFORE an IMAP move of the same message was queued must not
+        // cancel that newer row: it survives, drains after the JMAP label,
+        // and the user's later IMAP action decides the final label.
+        let move_began = crate::mailstore::retrain::event_us();
+        mds.with_set_tx(&set, |tx| {
+            tx.tx()
+                .execute(
+                    "INSERT OR REPLACE INTO mail_retrain_outbox \
+                     (stamp_id, account_id, item_id, label, attempts, last_error, created_at, \
+                      created_us) \
+                     VALUES (?1, 7, ?1, 'ham', 0, NULL, 0, ?2)",
+                    rusqlite::params![
+                        item.0.to_string(),
+                        crate::mailstore::retrain::event_us()
+                    ],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+        retrain_for_move(&mailstore, &classifier, 7, item, hash, Label::Spam, move_began)
+            .await
+            .unwrap();
+        let worker = crate::mailstore::retrain::RetrainOutboxWorker::new(
+            Arc::clone(&mds),
+            Arc::clone(&classifier),
+        );
+        assert_eq!(worker.drain_once().await.unwrap(), 1, "newer IMAP row was cancelled");
+        let stats = classifier.peek_stats(&AccountId::new("7")).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 1));
     }
 
     fn sample_record() -> EmailRecord {

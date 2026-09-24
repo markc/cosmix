@@ -93,9 +93,9 @@ fn export_writes_manifest_data_and_referenced_blobs() {
     assert_eq!(v["format"], "cosmix-mds-set-export");
     assert_eq!(v["format_version"], 1);
     assert_eq!(v["set_id"], s.0.to_string());
-    // Fresh DB exports at the latest schema (DATA_LATEST, now v9 after
-    // the v1.8 item-keyed sidecar FK-cascade migration).
-    assert_eq!(v["schema_version"], 9);
+    // Fresh DB exports at the latest schema (DATA_LATEST, now v10 after
+    // the v1.9 mail_retrain_outbox.created_us migration).
+    assert_eq!(v["schema_version"], 10);
     assert_eq!(v["item_count"], 2);
     assert_eq!(v["blob_count"], 2);
     assert!(v["exported_at"].as_str().unwrap().contains("T"));

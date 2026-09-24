@@ -103,12 +103,12 @@ const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// `staged user_version == manifest.schema_version`, so a tampered
 /// archive whose manifest disagrees with its DB is still rejected.
 ///
-/// MUST track `schema::DATA_LATEST` (currently 9 after the v1.8
-/// item-keyed sidecar FK-cascade migration): a fresh export records
+/// MUST track `schema::DATA_LATEST` (currently 10 after the v1.9
+/// mail_retrain_outbox.created_us migration): a fresh export records
 /// the live `PRAGMA user_version`, so import has to accept tarballs up
 /// to the newest schema this build can produce, or a round-trip of a
 /// freshly-exported set is rejected.
-const CURRENT_SCHEMA_VERSION: u32 = 9;
+const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Deserialize)]
 struct Manifest {

@@ -31,6 +31,7 @@ const DATA_V1_5_SQL: &str = include_str!("v1_5.sql");
 const DATA_V1_6_SQL: &str = include_str!("v1_6.sql");
 const DATA_V1_7_SQL: &str = include_str!("v1_7.sql");
 const DATA_V1_8_SQL: &str = include_str!("v1_8.sql");
+const DATA_V1_9_SQL: &str = include_str!("v1_9.sql");
 const BLOBS_V1_SQL: &str = include_str!("blobs_v1.sql");
 
 /// Latest per-set `data.sqlite` schema version.
@@ -58,7 +59,10 @@ const BLOBS_V1_SQL: &str = include_str!("blobs_v1.sql");
 ///        an AFTER DELETE ON item trigger — closes the maild
 ///        item-keyed sidecar reap gap on the last-membership item
 ///        delete path in container.rs).
-const DATA_LATEST: u32 = 9;
+///   v10 — v1.9 (mail_retrain_outbox.created_us: microsecond enqueue
+///        instant so maild can supersede only the queued rows OLDER than
+///        an inline training event; NULL on pre-existing rows).
+const DATA_LATEST: u32 = 10;
 const BLOBS_LATEST: u32 = 1;
 
 pub fn apply_data_migrations(conn: &mut Connection) -> Result<()> {
@@ -78,6 +82,7 @@ pub fn apply_data_migrations(conn: &mut Connection) -> Result<()> {
             7 => Some(DATA_V1_6_SQL),
             8 => Some(DATA_V1_7_SQL),
             9 => Some(DATA_V1_8_SQL),
+            10 => Some(DATA_V1_9_SQL),
             _ => None,
         },
     )
@@ -813,9 +818,11 @@ mod tests {
                 "label",
                 "attempts",
                 "last_error",
-                "created_at"
+                "created_at",
+                // v1.9 appends created_us after the v1.8 rebuild.
+                "created_us"
             ],
-            "mail_retrain_outbox columns must match v1.1 shape"
+            "mail_retrain_outbox columns must match v1.1 shape plus v1.9 created_us"
         );
         // PRIMARY KEY (stamp_id, label) preserved.
         let pk: Vec<&str> = cols
@@ -1006,6 +1013,64 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{tbl} must be reaped when item is deleted");
         }
+    }
+
+    /// v9→v10 adds a nullable `created_us`; rows queued before the
+    /// migration keep NULL (read by maild as "older than any event").
+    #[test]
+    fn data_v9_to_10_adds_nullable_created_us() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        set_pragmas(&conn).unwrap();
+        for (sql, ver) in [
+            (DATA_V1_SQL, 1u32),
+            (DATA_V1_1_SQL, 2),
+            (DATA_V1_2_SQL, 3),
+            (DATA_V1_3_SQL, 4),
+            (DATA_V1_4_SQL, 5),
+            (DATA_V1_5_SQL, 6),
+            (DATA_V1_6_SQL, 7),
+            (DATA_V1_7_SQL, 8),
+            (DATA_V1_8_SQL, 9),
+        ] {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", ver).unwrap();
+        }
+        conn.pragma_update(None, "application_id", DATA_APPLICATION_ID)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO item (id, blob_hash, size_bytes, received_at) \
+             VALUES ('i1', 'deadbeef', 1, 0);",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mail_retrain_outbox \
+             (stamp_id, account_id, item_id, label, created_at) \
+             VALUES ('s1', 1, 'i1', 'junk', 0);",
+            [],
+        )
+        .unwrap();
+
+        apply_data_migrations(&mut conn).unwrap();
+        let v: u32 = conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 10);
+        let old: Option<i64> = conn
+            .query_row(
+                "SELECT created_us FROM mail_retrain_outbox WHERE stamp_id = 's1';",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, None, "pre-existing row must read NULL");
+        conn.execute(
+            "INSERT INTO mail_retrain_outbox \
+             (stamp_id, account_id, item_id, label, created_at, created_us) \
+             VALUES ('s2', 1, 'i1', 'ham', 0, 42);",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

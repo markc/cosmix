@@ -218,17 +218,46 @@ fn train_order_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-/// Delete every pending (undrained or dead-lettered) outbox row for
-/// `stamp` in `set`. Returns how many were cancelled.
-async fn cancel_pending_rows(mds: &Arc<SqliteCasMds>, set: SetId, stamp: &str) -> Result<usize> {
+/// Microseconds since the Unix epoch, strictly increasing within this
+/// process. Every outbox row records one (`created_us`), and every inline
+/// training event takes one at its start. Two events can therefore always be
+/// ordered, even inside the same wall-clock microsecond or across a clock
+/// step backwards.
+pub fn event_us() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = chrono::Utc::now().timestamp_micros();
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev + 1);
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => prev = seen,
+        }
+    }
+}
+
+/// Delete the pending (undrained or dead-lettered) outbox rows for `stamp`
+/// in `set` that were queued at or before `cutoff_us`, the start of the
+/// inline event that supersedes them. A row queued after the event began is
+/// a newer user action; it survives and drains after the inline label. A
+/// NULL `created_us` (a row from before schema v10) counts as older, and so
+/// does equality. Returns how many were cancelled.
+async fn cancel_pending_rows(
+    mds: &Arc<SqliteCasMds>,
+    set: SetId,
+    stamp: &str,
+    cutoff_us: i64,
+) -> Result<usize> {
     let mds = Arc::clone(mds);
     let stamp = stamp.to_string();
     let n = tokio::task::spawn_blocking(move || {
         mds.with_set_tx(&set, |tx| {
             tx.tx()
                 .execute(
-                    "DELETE FROM mail_retrain_outbox WHERE stamp_id = ?1",
-                    params![stamp],
+                    "DELETE FROM mail_retrain_outbox \
+                     WHERE stamp_id = ?1 AND (created_us IS NULL OR created_us <= ?2)",
+                    params![stamp, cutoff_us],
                 )
                 .map_err(|e| cosmix_mds::Error::Other(format!("cancel outbox rows: {e}")))
         })
@@ -258,7 +287,9 @@ fn log_superseded(account: &str, stamp: &str, cancelled: usize, via: TrainVia) {
 }
 
 /// Train one message inline — the JMAP move and `maild.bayesian.train`
-/// path. Applies through [`retrain_logged`] first, and only on success
+/// path. `event_us` is [`event_us`] taken when the inline event BEGAN,
+/// before any await: only outbox rows queued up to that instant are
+/// superseded, because the lock order is not the event order. Applies through [`retrain_logged`] first, and only on success
 /// supersedes the stamp's pending outbox rows (see [`train_order_lock`]).
 ///
 /// Train-then-cancel, not cancel-then-train: if the classifier fails, the
@@ -273,10 +304,11 @@ pub async fn train_inline(
     classifier: &DefaultClassifier,
     req: &RetrainRequest<'_>,
     via: TrainVia,
+    event_us: i64,
 ) -> anyhow::Result<RetrainOutcome> {
     let _order = train_order_lock().lock().await;
     let outcome = retrain_logged(classifier, req, via).await?;
-    supersede_after_success(mds, set, req.account.as_str(), req.stamp_id, via).await;
+    supersede_after_success(mds, set, req.account.as_str(), req.stamp_id, via, event_us).await;
     Ok(outcome)
 }
 
@@ -289,8 +321,9 @@ async fn supersede_after_success(
     account: &str,
     stamp: &str,
     via: TrainVia,
+    event_us: i64,
 ) {
-    match cancel_pending_rows(mds, set, stamp).await {
+    match cancel_pending_rows(mds, set, stamp, event_us).await {
         Ok(cancelled) => log_superseded(account, stamp, cancelled, via),
         Err(e) => warn!(
             target: "maild::bayesian::train",
@@ -314,13 +347,14 @@ pub async fn untrain_inline(
     account: &AccountId,
     stamp: &str,
     message: &[u8],
+    event_us: i64,
 ) -> anyhow::Result<Option<Label>> {
     let _order = train_order_lock().lock().await;
     let conn = classifier.open_account_connection(account).await?;
     let removed = classifier
         .forget_from(conn.as_ref(), stamp, message)
         .await?;
-    supersede_after_success(mds, set, account.as_str(), stamp, TrainVia::Bus).await;
+    supersede_after_success(mds, set, account.as_str(), stamp, TrainVia::Bus, event_us).await;
     Ok(removed)
 }
 

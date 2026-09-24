@@ -377,6 +377,8 @@ async fn handle_train(
     mailstore: &Arc<SqliteMailStore>,
     args: &serde_json::Value,
 ) -> (u8, String) {
+    // This event's instant, taken before any await (see train_inline).
+    let event_us = crate::mailstore::retrain::event_us();
     if let Err(e) = reject_unknown_keys(args, TRAIN_KEYS) {
         return (RC_ERROR, err_body(&format!("malformed train request: {e}")));
     }
@@ -411,7 +413,16 @@ async fn handle_train(
         label,
     };
     let set = account_id_to_setid(row.id);
-    match train_inline(mailstore.mds(), set, classifier, &retrain, TrainVia::Bus).await {
+    match train_inline(
+        mailstore.mds(),
+        set,
+        classifier,
+        &retrain,
+        TrainVia::Bus,
+        event_us,
+    )
+    .await
+    {
         Ok(outcome) => {
             let result = match outcome {
                 RetrainOutcome::Applied => "applied",
@@ -441,6 +452,8 @@ async fn handle_untrain(
     mailstore: &Arc<SqliteMailStore>,
     args: &serde_json::Value,
 ) -> (u8, String) {
+    // This event's instant, taken before any await (see train_inline).
+    let event_us = crate::mailstore::retrain::event_us();
     if let Err(e) = reject_unknown_keys(args, UNTRAIN_KEYS) {
         return (
             RC_ERROR,
@@ -467,7 +480,17 @@ async fn handle_untrain(
     let account = AccountId::new(row.id.to_string());
     let stamp = item.0.to_string();
     let set = account_id_to_setid(row.id);
-    match untrain_inline(mailstore.mds(), set, classifier, &account, &stamp, &message).await {
+    match untrain_inline(
+        mailstore.mds(),
+        set,
+        classifier,
+        &account,
+        &stamp,
+        &message,
+        event_us,
+    )
+    .await
+    {
         Ok(removed) => {
             let removed = removed.map(|l| match l {
                 Label::Spam => "spam",
@@ -1947,9 +1970,15 @@ mod tests {
             tx.tx()
                 .execute(
                     "INSERT OR REPLACE INTO mail_retrain_outbox \
-                     (stamp_id, account_id, item_id, label, attempts, last_error, created_at) \
-                     VALUES (?1, ?2, ?1, ?3, 0, NULL, 0)",
-                    rusqlite::params![item.0.to_string(), account, label],
+                     (stamp_id, account_id, item_id, label, attempts, last_error, created_at, \
+                      created_us) \
+                     VALUES (?1, ?2, ?1, ?3, 0, NULL, 0, ?4)",
+                    rusqlite::params![
+                        item.0.to_string(),
+                        account,
+                        label,
+                        crate::mailstore::retrain::event_us()
+                    ],
                 )
                 .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
             Ok(())
