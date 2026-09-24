@@ -209,18 +209,26 @@ impl Default for DemoState {
 }
 impl DemoState {
     /// Record the page's visibility from `present`. Opening the page makes
-    /// both status reads due now (nothing refreshed them while hidden) and
-    /// arms an immediate host wake so the next update sends them.
-    fn set_visible(&mut self, visible: bool, deadline: &mut LayerHostDeadline) {
+    /// each idle lane's status read due now (nothing refreshed it while
+    /// hidden). Returns true when a read became due; the caller requests a
+    /// redraw so the next update sends it. A lane with a read in flight is
+    /// answered by that reply instead.
+    ///
+    /// Hiding does not disarm a deadline already merged into the shared
+    /// host deadline (a backoff or `VISIBLE_REFRESH`): it fires once as a
+    /// no-op wake, then nothing is armed while hidden.
+    fn set_visible(&mut self, visible: bool) -> bool {
+        let mut due = false;
         if visible && !self.visible && self.connected {
             for lane in [&mut self.background, &mut self.capture] {
                 if lane.pending.is_none() {
                     lane.refresh = Some(Duration::ZERO);
+                    due = true;
                 }
             }
-            arm(deadline, Duration::ZERO);
         }
         self.visible = visible;
+        due
     }
     pub(crate) fn event(&mut self, event: &BusBridgeEvent, now: Duration) {
         match event {
@@ -439,14 +447,15 @@ fn activate(
 fn present(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    (mut state, mut deadline): (ResMut<DemoState>, ResMut<LayerHostDeadline>),
+    (mut state, mut redraw): (ResMut<DemoState>, MessageWriter<bevy::window::RequestRedraw>),
     mut focus: ResMut<InputFocus>,
     mut buttons: Query<(Entity, &Action, &mut TabIndex, Has<InteractionDisabled>)>,
     mut labels: Query<(&ActionLabel, &mut Text), Without<Feedback>>,
     mut feedback: Query<(&Feedback, &mut Text), Without<ActionLabel>>,
 ) {
-    if state.visible != visible(&frame) {
-        state.set_visible(visible(&frame), &mut deadline);
+    if state.visible != visible(&frame) && state.set_visible(visible(&frame)) {
+        // Captured in `Last` this update: an immediate re-update sends it.
+        redraw.write(bevy::window::RequestRedraw);
     }
     for (entity, &action, mut tab, disabled) in &mut buttons {
         let enabled = visible(&frame) && allowed(&state, action);
@@ -649,10 +658,10 @@ mod tests {
             assert!(peer.drain_calls().is_empty(), "hidden poll at {secs}s");
             assert_eq!(deadline.0, None, "hidden wake at {secs}s");
         }
-        // Opening the page reads both lanes on an immediate wake.
+        // Opening the page makes both lanes due now (the caller redraws).
         let mut deadline = LayerHostDeadline::default();
-        state.set_visible(true, &mut deadline);
-        assert_eq!(deadline.0, Some(Duration::ZERO));
+        assert!(state.set_visible(true));
+        assert_eq!(state.capture.refresh, Some(Duration::ZERO));
         let now = Duration::from_secs(61);
         state.tick(&bridge, now, &mut deadline);
         let calls = peer.drain_calls();

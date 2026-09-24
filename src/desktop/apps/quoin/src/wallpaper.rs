@@ -260,14 +260,21 @@ impl WallpaperState {
     /// Record the page's visibility from `present` (after the model update,
     /// so a page opened this update is seen now). Opening the page re-reads
     /// once — notifications are best-effort hints and nothing reconciled
-    /// while it was hidden — on an immediate host wake so the next update
-    /// sends it.
-    fn set_visible(&mut self, visible: bool, deadline: &mut LayerHostDeadline) {
-        if visible && !self.visible && self.generation.is_some() && self.pending.is_none() {
+    /// while it was hidden. Returns true when that read is now due; the
+    /// caller requests a redraw so the next update sends it. (A zero
+    /// deadline would do the same but the runner reports a deadline still
+    /// due after an update as `quoin_wake_deadline_unconsumed`.)
+    ///
+    /// Hiding does not disarm a deadline already merged into the shared
+    /// host deadline (a backoff or the reconcile backstop): it fires once as
+    /// a no-op wake, then nothing is armed while hidden.
+    fn set_visible(&mut self, visible: bool) -> bool {
+        let open = visible && !self.visible && self.generation.is_some() && self.pending.is_none();
+        if open {
             self.refresh = Some(Duration::ZERO);
-            arm(deadline, Duration::ZERO);
         }
         self.visible = visible;
+        open
     }
 
     /// Whether a due read may be sent now: only while the page is visible,
@@ -497,14 +504,18 @@ fn activate(
 fn present(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    (mut state, mut deadline): (ResMut<WallpaperState>, ResMut<LayerHostDeadline>),
+    (mut state, mut redraw): (
+        ResMut<WallpaperState>,
+        MessageWriter<bevy::window::RequestRedraw>,
+    ),
     mut focus: ResMut<InputFocus>,
     mut buttons: Query<(Entity, &mut TabIndex, Has<InteractionDisabled>), With<SettingButton>>,
     mut labels: Query<(&SettingLabel, &mut Text), Without<Feedback>>,
     mut feedback: Query<&mut Text, (With<Feedback>, Without<SettingLabel>)>,
 ) {
-    if state.visible != visible(&frame) {
-        state.set_visible(visible(&frame), &mut deadline);
+    if state.visible != visible(&frame) && state.set_visible(visible(&frame)) {
+        // Captured in `Last` this update: an immediate re-update sends it.
+        redraw.write(bevy::window::RequestRedraw);
     }
     let enabled = visible(&frame) && state.available();
     let keep_focus = visible(&frame)
@@ -662,9 +673,10 @@ mod tests {
         state.tick(&bridge, Duration::from_secs(62), &mut deadline);
         assert!(peer.drain_calls().is_empty());
         assert_eq!(deadline.0, None);
-        // Opening the page arms an immediate wake; the next tick reads once.
-        state.set_visible(true, &mut deadline);
-        assert_eq!(deadline.0, Some(Duration::ZERO));
+        // Opening the page makes a read due now (the caller requests a
+        // redraw); the next tick reads once.
+        assert!(state.set_visible(true));
+        assert_eq!(state.refresh, Some(Duration::ZERO));
         state.tick(&bridge, Duration::from_secs(63), &mut deadline);
         let get = peer.drain_calls().remove(0);
         assert_eq!(get.command, "wallpaper.props.get");
