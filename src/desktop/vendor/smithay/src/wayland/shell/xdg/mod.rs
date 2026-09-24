@@ -1111,7 +1111,9 @@ pub trait XdgShellHandler {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState;
 
     /// Whether `surface` has a buffer attached (pending) or committed, which
-    /// makes `xdg_wm_base.get_xdg_surface` on it a client error.
+    /// makes `xdg_wm_base.get_xdg_surface` on it a client error. A pending,
+    /// uncommitted NULL attach does not clear a committed buffer; only a
+    /// committed NULL does. Overrides must keep that rule.
     ///
     /// The default reads Smithay's own surface state
     /// ([`surface_has_attached_or_committed_buffer`]). A compositor that

@@ -119,8 +119,10 @@ on "apps.launch" desc "launch an application by id, detached (uris optional)"
         reply(11, json_encode({error: "spawn_failed", id: $id}))
       else
         $x = $a.launch_display(env("XDG_RUNTIME_DIR"), env("WAYLAND_DISPLAY"))
+        -- Wontfix (review round 2): on a comp without XWayland this logs on
+        -- every launch; one line per launch is the intended cost.
         if $x.display == nil then eprint("apps.launch " .. $id .. ": DISPLAY unset: " .. $x.why) end
-        $launch = $a.launch_spawn($argv, $x.display)
+        $launch = $a.launch_spawn($argv, $exe, $x.display)
         if len(keys($launch.env)) > 0 then $opts.env = $launch.env end
         try
           $pid = spawn($launch.argv, $opts)

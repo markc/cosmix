@@ -226,11 +226,21 @@ try
   check($a.resolve_exec("bin/runnable", $tmp) == $tmp .. "/bin/runnable", "resolve_exec ignored the launch cwd")
   check($a.resolve_exec("", "") == nil, "resolve_exec accepted an empty argv[0]")
   -- With a display it is set; without one it is REMOVED via env -u, never inherited.
-  $s = $a.launch_spawn(["xapp", "--flag"], ":4")
+  $s = $a.launch_spawn(["xapp", "--flag"], "/usr/bin/xapp", ":4")
   check(deep_eq($s.argv, ["xapp", "--flag"]) and $s.env.DISPLAY == ":4", "launch_spawn with a display wrong")
-  $s = $a.launch_spawn(["xapp", "--flag"], nil)
-  check(deep_eq($s.argv, ["env", "-u", "DISPLAY", "--", "xapp", "--flag"]) and len(keys($s.env)) == 0,
-    "launch_spawn without a display must unset DISPLAY")
+  -- Unset path: absolute /usr/bin/env and the RESOLVED absolute program,
+  -- so env does not search PATH.
+  $s = $a.launch_spawn(["xapp", "--flag"], "/usr/bin/xapp", nil)
+  check(deep_eq($s.argv, ["/usr/bin/env", "-u", "DISPLAY", "--", "/usr/bin/xapp", "--flag"]) and len(keys($s.env)) == 0,
+    "launch_spawn without a display must unset DISPLAY via /usr/bin/env and the resolved path")
+  -- End to end: a program whose name has '=' runs, instead of env treating
+  -- it as an assignment (which would run the NEXT word as the program).
+  fixture("bin/A=b", "#!/bin/sh\necho ran-A=b\n")
+  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/A=b"])
+  $s = $a.launch_spawn(["A=b"], $a.resolve_exec("bin/A=b", $tmp), nil)
+  $r = run_argv($s.argv, {cwd: $tmp})
+  -- (No stdout in the message: a misparse makes env print the whole environment.)
+  check($r.ok and trim($r.stdout) == "ran-A=b", "an '='-named program was misparsed by env")
 
   print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache, XWayland launch DISPLAY")
 finally

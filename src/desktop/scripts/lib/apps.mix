@@ -486,13 +486,20 @@ fn resolve_exec($cmd, $cwd)
   return nil
 end
 
-fn launch_spawn($argv, $display)
-  -- The argv and env for one launch. With a display the child gets
-  -- DISPLAY=:N over its inherited environment; without one DISPLAY is
-  -- REMOVED. Mix's spawn env option cannot unset a variable (a nil value
-  -- is OPTION_INVALID), so the unset goes through env(1) -u.
+fn launch_spawn($argv, $exe, $display)
+  -- The argv and env for one launch; $exe is resolve_exec's absolute path
+  -- for $argv[0]. With a display the child gets DISPLAY=:N over its
+  -- inherited environment; without one DISPLAY is REMOVED. Mix's spawn env
+  -- option cannot unset a variable (a nil value is OPTION_INVALID), so the
+  -- unset goes through /usr/bin/env -u, given the ABSOLUTE program path so
+  -- env does no PATH lookup. GNU env reads ANY operand containing '=' as a
+  -- NAME=VALUE assignment, even an absolute path after -- (probed), so such
+  -- a path is handed to /bin/sh's `exec "$@"` as a positional argument:
+  -- data, never shell text, and exec keeps the pid.
   if $display == nil then
-    return {argv: concat(["env", "-u", "DISPLAY", "--"], $argv), env: {}}
+    $head = ["/usr/bin/env", "-u", "DISPLAY", "--"]
+    if contains($exe, "=") then $head = concat($head, ["/bin/sh", "-c", 'exec "$@"', "sh"]) end
+    return {argv: concat(concat($head, [$exe]), slice($argv, 1)), env: {}}
   end
   return {argv: $argv, env: {DISPLAY: $display}}
 end
