@@ -1,20 +1,25 @@
 //! CosMix Term — the lightweight frontend: iced 0.14 on its own winit/Wayland
 //! backend (D2/D3), drawing `cosmix-term-core`'s grid through one persistent
-//! wgpu texture (D7).
+//! wgpu texture per visible pane (D7).
 //!
-//! T2 scope, and no more: one window, one tab, PTY in, keys out. Tabs and
-//! panes are T3, the `term.*` verb surface is T6, runtime font sizing is T4.
-//! The Bus name `term` is reserved for this binary and not yet registered —
-//! nothing here dials a broker.
+//! Tabs and split panes at parity with bterm (T3): the same tab and pane
+//! model (`cosmix_term_core::tabs`), the same chords, and the same `term.*`
+//! verbs — this binary registers the Bus name `term` and serves the core's
+//! surface through `cosmix_term_core::bus`, so a `term.pane.split` from
+//! another node and a Ctrl+Shift+E at the keyboard produce the same tree.
+//! Runtime font sizing is foot's (T4): Ctrl +/-/0 and Ctrl+wheel, keeping the
+//! window and changing the cell count.
 //!
 //! The two things that are requirements rather than optimisations, because
 //! they are what the whole lane is for: the grid is re-rasterised **by damaged
-//! row**, and it is rasterised **into one buffer that lives for the pane's
-//! life**. See `frame.rs` and `cosmix_term_core::raster::render_into`.
+//! row**, and it is rasterised **into one buffer per pane that lives while
+//! the pane is on screen**. See `frame.rs` and
+//! `cosmix_term_core::raster::render_into`.
 
 mod frame;
 mod input;
 mod keys;
+mod layout;
 mod theme;
 
 #[cfg(feature = "wgpu")]
@@ -27,31 +32,29 @@ mod cpu_grid;
 compile_error!("term needs a renderer: enable the `wgpu` (default) or `tiny-skia` feature");
 
 use cosmix_term_core::{
-    config, raster, session_fd,
-    tabs::{self, TabSet},
+    bus, config,
+    font::FontSize,
+    panes::{Geometry, SplitDir},
+    session_fd,
+    tabs::{self, CompletionNote, Removed, TabSet},
     version::version_request,
     wake::WakeFd,
 };
-use frame::{Frame, Painter};
-use iced::widget::container;
-use iced::{Element, Length, Size, Subscription, Task};
+use frame::Painter;
+use iced::widget::{Row, button, column, container, mouse_area, row, space, text};
+use iced::{Background, Border, Element, Length, Size, Subscription, Task};
+use input::Action;
+use layout::{Node, Shape};
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 const DISPLAY_NAME: &str = "CosMix Term";
-/// The Bus name and verb namespace this frontend owns (D1). Not registered in
-/// T2 — it is here so the two frontends' identities are declared in the same
-/// shape and a future T6 cannot quietly pick a different one.
+/// The Bus name and verb namespace this frontend owns (D1). The Bevy frontend
+/// is `bterm` / `bterm.*`, so both can run at once — which T5's A/B needs.
 const SERVICE: &str = "term";
-
-/// Same clamps as the Bevy frontend, and for the same reason: a grid wider
-/// than 4096 physical pixels exceeds the texture size every GPU is guaranteed
-/// to support, and a PTY is not obliged to cope with 10,000 columns.
-const MAX_COLS: u16 = 240;
-const MAX_ROWS: u16 = 100;
-const MAX_TEXTURE: u32 = 4096;
 
 fn main() {
     // FIRST, before the inherited-fd quarantine, the config read, the Wayland
@@ -69,11 +72,16 @@ fn main() {
     session_fd::quarantine_inherited();
     if std::env::args().any(|arg| arg == "--help") {
         println!(
-            "{DISPLAY_NAME}: Wayland Mix terminal (iced + wgpu frontend)\n\
+            "{DISPLAY_NAME}: tabbed Wayland Mix terminal (iced + wgpu frontend)\n\
              Font: TERM_SPIKE_FONT=/path/to/font.ttf, TERM_FONT_PX=<6..48>\n\
+             Keys: Ctrl+Shift+T/W new/close tab, Ctrl+PageUp/PageDown change tab,\n\
+             \x20     Ctrl+Shift+E/O split side by side/stacked, Ctrl+Shift+X close pane,\n\
+             \x20     Ctrl+Shift+arrows move focus, Ctrl+Shift+Q quit,\n\
+             \x20     Ctrl+plus/equal/minus/0 (and Ctrl+wheel) font size\n\
+             TERM_NOTIFY=0: no desktop notification when a pane's shell exits\n\
              --version: print version and build hash, and nothing else\n\
              --print-config: print resolved startup settings and exit\n\
-             Bus: `{SERVICE}` / `{SERVICE}.*` is reserved for this frontend and not yet served (T6)"
+             Bus: serves `{SERVICE}` / `{SERVICE}.*`; the Bevy frontend is `bterm`"
         );
         return;
     }
@@ -123,16 +131,17 @@ fn run(settings: config::Settings) -> Result<(), String> {
     // Scale 1.0 to start; the raster is rebuilt at the surface's real
     // fractional scale on the first `Rescaled`, so glyphs are rasterised at
     // physical resolution and the compositor never upscales them.
-    let painter = Painter::new(raster::Raster::new(
+    let painter = Painter::new(
         1.0,
-        settings.config.font_px,
+        FontSize::new(settings.config.font_px),
         settings.config.cursor,
-    )?);
+    )?;
     let tabs = Arc::new(Mutex::new(TabSet::with_session(settings, None)?));
     let (cleanup, reaper) = tabs::Cleanup::start().map_err(|e| format!("cleanup worker: {e}"))?;
 
-    // One eventfd for the whole frontend: every PTY, resize and pane exit
-    // coalesces onto it, and the UI thread learns of all of them in one poll.
+    // One eventfd for the whole frontend: every PTY, resize, pane exit and
+    // Bus mutation coalesces onto it, and the UI thread learns of all of them
+    // in one poll.
     let waker = Arc::new(Waker {
         fd: WakeFd::new().map_err(|e| format!("wake descriptor: {e}"))?,
         pending: AtomicBool::new(false),
@@ -144,25 +153,39 @@ fn run(settings: config::Settings) -> Result<(), String> {
         .set(waker.clone())
         .map_err(|_| "wake descriptor installed twice".to_owned())?;
 
+    // Completion notifications, exactly as bterm: a pane whose shell exits on
+    // its own is reaped on the UI thread and handed to the Bus thread, which
+    // emits interact.notify. TERM_NOTIFY=0 drops the sender, so notes are
+    // never queued and the Bus task retires its receive branch.
+    let notify_enabled = std::env::var("TERM_NOTIFY")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    let (notify_tx, notify_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The `term.*` surface (D1). With no broker the thread says so once and
+    // returns; the terminal works either way.
+    let bus = bus::start(SERVICE, tabs.clone(), cleanup.clone(), notify_rx);
+
     let state = State {
-        frame: painter.frame(),
         painter,
         tabs: tabs.clone(),
         cleanup: cleanup.clone(),
-        settings,
+        notify: notify_enabled.then_some(notify_tx),
         tokens: theme::tokens(),
         waker,
         window: Size::new(900.0, 560.0),
-        grid: (0, 0),
+        shape: Shape::default(),
+        grids: HashMap::new(),
+        modifiers: iced::keyboard::Modifiers::empty(),
+        wheel: 0.0,
         #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-        cached: None,
+        cached: HashMap::new(),
     };
 
     // `BootFn` is `Fn`, not `FnOnce`, and the state is not cloneable — the
-    // PTY, the eventfd and the glyph cache each exist exactly once. iced calls
-    // boot a single time, so handing it over through a take-once cell is
-    // exact rather than defensive; a second call would panic loudly instead of
-    // silently booting a second terminal.
+    // PTYs, the eventfd and the glyph cache each exist exactly once. iced
+    // calls boot a single time, so handing it over through a take-once cell
+    // is exact rather than defensive; a second call would panic loudly
+    // instead of silently booting a second terminal.
     let state = std::cell::RefCell::new(Some(state));
     let result = iced::application(
         move || {
@@ -192,11 +215,13 @@ fn run(settings: config::Settings) -> Result<(), String> {
         })
         .run();
 
-    // Same teardown ordering constraint as the Bevy frontend: the reaper's
-    // loop ends only when the LAST Cleanup sender is dropped, so every clone
-    // must go before the join or it hangs forever.
+    // Same teardown ordering as bterm: shut the tabs (which releases the Bus
+    // loop through `emptied`), let the Bus thread finish its bounded replies,
+    // and only then drop the last Cleanup — the reaper's loop ends only when
+    // EVERY sender is gone, and the Bus thread owns one.
     let removed = tabs.lock().expect("tabs").shutdown();
     cleanup.submit(removed);
+    let _ = bus.join();
     drop(cleanup);
     let _ = reaper.join();
     result.map_err(|error| error.to_string())
@@ -208,8 +233,8 @@ fn run(settings: config::Settings) -> Result<(), String> {
 /// sizes itself to `num_cpus` — 18 threads on this workstation, measured, and
 /// the whole of T5's thread-budget miss (30 threads against a gate of 24).
 /// They are all parked: this frontend's only tasks are `window::scale_factor`
-/// at boot and `exit`. A terminal's concurrency is one PTY, and it is already
-/// handled by the `poll(2)` thread and the reaper.
+/// at boot and `exit`. A terminal's concurrency is one PTY per pane, and it is
+/// already handled by the `poll(2)` thread and the reaper.
 ///
 /// A pool rather than a `LocalPool` because `Executor::spawn` takes `&self`
 /// and must not block the UI thread; pool_size(1) is the smallest thing that
@@ -258,26 +283,39 @@ static WAKER: OnceLock<Arc<Waker>> = OnceLock::new();
 struct State {
     tabs: Arc<Mutex<TabSet>>,
     cleanup: tabs::Cleanup,
+    notify: Option<tokio::sync::mpsc::UnboundedSender<CompletionNote>>,
     painter: Painter,
-    frame: Arc<Mutex<Frame>>,
-    settings: config::Settings,
     tokens: cosmix_iced_widgets::Tokens,
     waker: Arc<Waker>,
     /// Logical inner size of the window, as the compositor last reported it.
     window: Size,
-    /// Columns and rows the PTY has been told about.
-    grid: (u16, u16),
+    /// Tabs and the active pane tree as of the last wake — what `view` draws.
+    shape: Shape,
+    /// Columns and rows each visible pane's PTY has been told about. A pane
+    /// missing here has not been sized yet, which forces its first resize.
+    grids: HashMap<u64, (u16, u16)>,
+    /// Tracked for Ctrl+wheel: a mouse event carries no modifier state.
+    modifiers: iced::keyboard::Modifiers,
+    /// Fractional Ctrl+wheel travel not yet worth a font step.
+    wheel: f32,
     #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-    cached: Option<(u64, iced::widget::image::Handle)>,
+    cached: HashMap<u64, (u64, iced::widget::image::Handle)>,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    /// Something in the core changed: PTY output, a resize, a pane exit.
+    /// Something in the core changed: PTY output, a resize, a pane exit, a
+    /// Bus mutation.
     Wake,
     /// Keys to put on the PTY, from the widget tree — NOT from an event
     /// subscription, which drops them under load (see `keys.rs`).
     Keys(Vec<cosmix_term_core::terminal::Key>),
+    /// A chord the terminal answers itself (tabs, panes, font size).
+    Action(Action),
+    Modifiers(iced::keyboard::Modifiers),
+    SelectTab(u64),
+    FocusPane(u64),
+    Wheel(iced::mouse::ScrollDelta),
     Window(iced::window::Event),
     /// The window's device-pixel ratio, answered by the runtime.
     Scale(f32),
@@ -388,13 +426,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     match message {
         Message::Wake => {
             state.waker.pending.store(false, Ordering::Release);
-            state.repaint();
-            if state.tabs.lock().expect("tabs").is_empty() {
-                return iced::exit();
-            }
+            return state.sync();
         }
         Message::Scale(scale) => state.rescale(scale),
         Message::Keys(keys) => state.send_keys(keys),
+        Message::Action(action) => return state.act(action),
+        Message::Modifiers(modifiers) => state.modifiers = modifiers,
+        Message::SelectTab(id) => {
+            let mut tabs = state.tabs.lock().expect("tabs");
+            tabs.user_activity();
+            tabs.select(id);
+        }
+        Message::FocusPane(id) => {
+            let mut tabs = state.tabs.lock().expect("tabs");
+            tabs.user_activity();
+            tabs.focus(id);
+        }
+        Message::Wheel(delta) => {
+            // Ctrl+wheel is font size (T4). A bare wheel is not handled yet:
+            // mouse reporting and scrollback are not part of this frontend.
+            if state.modifiers.control() {
+                let steps = input::wheel_steps(&mut state.wheel, delta);
+                if steps != 0 {
+                    state.zoom(|font| font.step_by(steps));
+                }
+            }
+        }
         Message::Window(event) => match event {
             iced::window::Event::Opened { size, .. } => {
                 state.resize(size);
@@ -408,6 +465,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
             iced::window::Event::Resized(size) => state.resize(size),
             iced::window::Event::Rescaled(scale) => state.rescale(scale),
+            // A release that happens while another window has the keyboard
+            // is never delivered; a latched Ctrl would turn every later wheel
+            // into a zoom.
+            iced::window::Event::Unfocused => {
+                state.modifiers = iced::keyboard::Modifiers::empty();
+            }
             iced::window::Event::CloseRequested => return iced::exit(),
             _ => {}
         },
@@ -415,30 +478,45 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
     Task::none()
 }
 
-fn view(state: &State) -> Element<'_, Message> {
-    let (cell_width, cell_height) = state.painter.logical_cell();
-    let (cols, rows) = state.grid;
-    let tokens = state.tokens;
-    // Sized to the grid exactly, so the texture maps 1:1 to physical pixels
-    // and the nearest sampler never resamples a glyph. The leftover strip is
-    // the themed surface, which is what a partial cell would otherwise show.
-    let grid = renderer(state)
-        .width(Length::Fixed(f32::from(cols) * cell_width))
-        .height(Length::Fixed(f32::from(rows) * cell_height));
-    // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
-    let grid = keys::keys(grid, |event| match event {
+/// The keyboard, routed from the widget tree. A terminal chord wins over the
+/// shell encoder — without that order, Ctrl+Shift+T would reach the PTY as a
+/// Ctrl-T (`input::tests::a_tab_chord_would_otherwise_reach_the_shell_as_a_control_code`).
+fn on_key(event: &iced::keyboard::Event) -> Option<Message> {
+    match event {
         iced::keyboard::Event::KeyPressed {
             key,
+            modified_key,
             text,
             modifiers,
+            repeat,
             ..
         } => {
+            if let Some(action) = input::action_for(key, modified_key, *modifiers) {
+                // A repeat of a non-repeating chord is swallowed, not passed
+                // through: it must not turn into a control code either.
+                return (!*repeat || action.repeats()).then_some(Message::Action(action));
+            }
             let keys = input::keys_for(key, text.as_deref(), *modifiers);
             (!keys.is_empty()).then_some(Message::Keys(keys))
         }
+        iced::keyboard::Event::ModifiersChanged(modifiers) => Some(Message::Modifiers(*modifiers)),
         _ => None,
-    });
-    container(grid)
+    }
+}
+
+fn view(state: &State) -> Element<'_, Message> {
+    let tokens = state.tokens;
+    let scale = state.painter.scale();
+    let bounds = layout::content(state.window.width, state.window.height, scale);
+    let panes: Element<'_, Message> = match &state.shape.tree {
+        Some(tree) => pane_tree(state, tree, bounds, scale),
+        None => space().into(),
+    };
+    // The keyboard rides the widget tree, not a subscription: see `keys.rs`.
+    // It wraps the strip as well, so a key pressed while the pointer is over
+    // a tab still reaches the terminal.
+    let content = keys::keys(column![tab_strip(state, scale), panes], on_key);
+    container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_theme| container::Style {
@@ -448,51 +526,258 @@ fn view(state: &State) -> Element<'_, Message> {
         .into()
 }
 
+/// One button per tab and a `+`, as bterm. Every colour is a design token.
+fn tab_strip(state: &State, scale: f32) -> Element<'_, Message> {
+    let tokens = state.tokens;
+    let tab = |label: String, active: bool| {
+        button(text(label).size(13.0))
+            .padding([3.0, 12.0])
+            .style(move |_theme: &iced::Theme, status: button::Status| {
+                let (background, text_color) = if active {
+                    (tokens.primary, tokens.primary_text)
+                } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    (tokens.muted_surface, tokens.text)
+                } else {
+                    (tokens.card, tokens.muted_text)
+                };
+                button::Style {
+                    background: Some(Background::Color(background)),
+                    text_color,
+                    border: Border {
+                        radius: tokens.radius.into(),
+                        ..Border::default()
+                    },
+                    ..button::Style::default()
+                }
+            })
+    };
+    let mut strip: Row<'_, Message> = Row::new().spacing(4.0).padding([3.0, 6.0]);
+    for label in &state.shape.tabs {
+        strip = strip.push(tab(label.title.clone(), label.active).on_press(Message::SelectTab(label.id)));
+    }
+    strip = strip.push(tab("+".into(), false).on_press(Message::Action(Action::NewTab)));
+    container(strip)
+        .width(Length::Fill)
+        .height(Length::Fixed(layout::strip_height(scale)))
+        .style(move |_theme| container::Style {
+            background: Some(tokens.card.into()),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// The active tab's panes as nested rows and columns, split with the same
+/// function that sized their PTYs (`layout::split`), so a pane's widget and
+/// its grid always agree on its rectangle.
+fn pane_tree<'a>(state: &'a State, node: &Node, bounds: Geometry, scale: f32) -> Element<'a, Message> {
+    match node {
+        Node::Leaf(id) => pane(state, *id, bounds, scale),
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            let (a, b) = layout::split(*dir, *ratio, bounds, scale);
+            let first = pane_tree(state, first, a, scale);
+            let second = pane_tree(state, second, b, scale);
+            match dir {
+                SplitDir::Vertical => row![first, second].into(),
+                SplitDir::Horizontal => column![first, second].into(),
+            }
+        }
+    }
+}
+
+/// One pane: a border in the focus colour, the themed surface, and the grid
+/// sized to its cells exactly, so the texture maps 1:1 to physical pixels and
+/// the nearest sampler never resamples a glyph.
+fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Message> {
+    let tokens = state.tokens;
+    let (cell_width, cell_height) = state.painter.logical_cell();
+    let grid: Element<'_, Message> = match (state.painter.existing(id), state.grids.get(&id)) {
+        (Some(frame), Some(&(cols, rows))) => renderer(state, id, frame)
+            .width(Length::Fixed(f32::from(cols) * cell_width))
+            .height(Length::Fixed(f32::from(rows) * cell_height))
+            .into(),
+        // Not sized or not painted yet: the next wake does both.
+        _ => space().into(),
+    };
+    let frame_colour = if id == state.shape.active_pane {
+        tokens.ring
+    } else {
+        tokens.border
+    };
+    let inner = container(grid)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        // A pane smaller than two columns still gets a two-column PTY; its
+        // texture must not paint over the neighbour.
+        .clip(true)
+        .style(move |_theme| container::Style {
+            background: Some(tokens.surface.into()),
+            ..container::Style::default()
+        });
+    let outer = container(inner)
+        .padding(layout::border(scale))
+        .width(Length::Fixed(bounds.w))
+        .height(Length::Fixed(bounds.h))
+        .style(move |_theme| container::Style {
+            background: Some(frame_colour.into()),
+            ..container::Style::default()
+        });
+    mouse_area(outer)
+        .on_press(Message::FocusPane(id))
+        .on_scroll(Message::Wheel)
+        .into()
+}
+
 #[cfg(feature = "wgpu")]
-fn renderer(state: &State) -> iced::widget::Shader<Message, wgpu_grid::GridProgram> {
-    iced::widget::shader(wgpu_grid::GridProgram::new(state.frame.clone()))
+fn renderer(
+    _state: &State,
+    _id: u64,
+    frame: Arc<Mutex<frame::Frame>>,
+) -> iced::widget::Shader<Message, wgpu_grid::GridProgram> {
+    iced::widget::shader(wgpu_grid::GridProgram::new(frame))
 }
 
 #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-fn renderer(state: &State) -> iced::widget::Image<iced::widget::image::Handle> {
-    cpu_grid::view(state.cached.as_ref().map(|(_, handle)| handle))
+fn renderer(
+    state: &State,
+    id: u64,
+    _frame: Arc<Mutex<frame::Frame>>,
+) -> iced::widget::Image<iced::widget::image::Handle> {
+    cpu_grid::view(state.cached.get(&id).map(|(_, handle)| handle))
+}
+
+/// Apply a tab or pane chord to the tab set, returning what to tear down.
+///
+/// The same `TabSet` calls bterm's keyboard handler makes, so the two
+/// frontends do the same thing for the same chord. Font chords are not tab
+/// operations and never reach here.
+fn apply(tabs: &mut TabSet, action: Action) -> Vec<Removed> {
+    if tabs.is_empty() {
+        return Vec::new();
+    }
+    tabs.user_activity();
+    match action {
+        Action::NewTab => {
+            if let Err(error) = tabs.open() {
+                eprintln!("new tab: {error}");
+            }
+            Vec::new()
+        }
+        Action::CloseTab => {
+            let id = tabs.active_id();
+            tabs.close(id).1.into_iter().collect()
+        }
+        Action::Quit => tabs.shutdown(),
+        Action::Split(dir) => {
+            if let Err(error) = tabs.split_active(dir) {
+                eprintln!("split pane: {error}");
+            }
+            Vec::new()
+        }
+        Action::ClosePane => tabs.close_active().1.into_iter().collect(),
+        Action::Focus(direction) => {
+            tabs.focus_dir(direction);
+            Vec::new()
+        }
+        Action::Cycle { forward } => {
+            tabs.cycle(forward);
+            Vec::new()
+        }
+        Action::FontIncrease | Action::FontDecrease | Action::FontReset => Vec::new(),
+    }
 }
 
 impl State {
-    /// One PTY read, one damage-bounded raster, and nothing at all when the
-    /// grid did not change — which is the case a `Wake` usually is, because a
-    /// wake is also fired for resizes and Bus mutations.
-    fn repaint(&mut self) {
-        let (removed, _notes) = self.tabs.lock().expect("tabs").reap_exited();
+    /// Everything a wake can mean, in one place: reap exited shells, follow
+    /// the tab set's shape (a Bus verb may have changed it), size any pane
+    /// that needs it, and repaint each visible pane by its damaged rows.
+    fn sync(&mut self) -> Task<Message> {
+        let (removed, notes) = self.tabs.lock().expect("tabs").reap_exited();
         self.cleanup.submit(removed);
-        let tabs = self.tabs.lock().expect("tabs");
-        if tabs.is_empty() {
-            return;
+        if let Some(notify) = &self.notify {
+            for note in notes {
+                let _ = notify.send(note);
+            }
         }
-        let terminal = tabs.active_terminal();
-        drop(tabs);
-        let terminal = terminal.lock().expect("terminal");
-        let snapshot = terminal.grid_snapshot();
-        drop(terminal);
-        #[allow(unused_variables)]
-        let painted = self
-            .painter
-            .repaint(&snapshot.screen, &snapshot.dirty_rows);
+        let (shape, terminals) = {
+            let tabs = self.tabs.lock().expect("tabs");
+            if tabs.is_empty() {
+                return iced::exit();
+            }
+            let shape = Shape::of(&tabs);
+            let terminals: Vec<_> = shape
+                .visible()
+                .into_iter()
+                .filter_map(|id| tabs.pane_by_id(id).map(|terminal| (id, terminal)))
+                .collect();
+            (shape, terminals)
+        };
+        let visible = shape.visible();
+        self.painter.retain(&visible);
+        self.grids.retain(|id, _| visible.contains(id));
         #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
-        if painted {
-            self.cached = cpu_grid::refresh(self.cached.take(), &self.frame);
+        self.cached.retain(|id, _| visible.contains(id));
+        self.shape = shape;
+        self.relayout();
+        for (id, terminal) in terminals {
+            let snapshot = terminal.lock().expect("terminal").grid_snapshot();
+            #[allow(unused_variables)]
+            let painted = self
+                .painter
+                .repaint(id, &snapshot.screen, &snapshot.dirty_rows);
+            #[cfg(all(feature = "tiny-skia", not(feature = "wgpu")))]
+            if painted {
+                let frame = self.painter.frame(id);
+                if let Some(cached) = cpu_grid::refresh(self.cached.remove(&id), &frame) {
+                    self.cached.insert(id, cached);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    fn act(&mut self, action: Action) -> Task<Message> {
+        match action {
+            Action::FontIncrease => self.zoom(FontSize::increase),
+            Action::FontDecrease => self.zoom(FontSize::decrease),
+            Action::FontReset => self.zoom(FontSize::reset),
+            _ => {
+                let removed = apply(&mut self.tabs.lock().expect("tabs"), action);
+                self.cleanup.submit(removed);
+                if action == Action::Quit {
+                    return iced::exit();
+                }
+                // Every other mutation notifies the wake, and the next
+                // `sync` picks up the new shape.
+            }
+        }
+        Task::none()
+    }
+
+    /// foot's behaviour: the window keeps its size and the grid reflows to
+    /// the new cell. Every visible pane is re-rasterised (they share the
+    /// glyph cache) and every PTY is told its new size.
+    fn zoom(&mut self, change: impl FnOnce(&mut FontSize) -> bool) {
+        match self.painter.zoom(change) {
+            Ok(true) => self.reflow(),
+            Ok(false) => {}
+            // Keep the old raster: a terminal at the old size is legible, and
+            // a terminal with no raster is not a terminal.
+            Err(error) => eprintln!("term: font resize: {error}"),
         }
     }
 
     fn resize(&mut self, window: Size) {
-        // `self.grid == (0, 0)` means no layout has happened yet, and it must
-        // force one even when the size is unchanged. Otherwise a compositor
-        // that grants exactly the requested 900x560 on a scale-1 output takes
-        // BOTH early returns — this one and `rescale`'s — and the grid stays
-        // zero-sized: a terminal window with nothing in it, forever
-        // (cold-review finding, 2026-09-21; invisible here only because the
-        // nested harness tiles and never grants the requested size).
-        if self.window == window && self.grid != (0, 0) {
+        // An unsized grid must force a layout even when the size is
+        // unchanged. Otherwise a compositor that grants exactly the requested
+        // 900x560 on a scale-1 output takes BOTH early returns — this one and
+        // `rescale`'s — and no pane is ever sized: a terminal window with
+        // nothing in it, forever (cold-review finding, 2026-09-21).
+        if self.window == window && !self.grids.is_empty() {
             return;
         }
         self.window = window;
@@ -500,62 +785,79 @@ impl State {
     }
 
     fn rescale(&mut self, scale: f32) {
-        if (scale - self.painter.scale()).abs() < 0.01 {
-            return;
-        }
-        match raster::Raster::new(scale, self.settings.config.font_px, self.settings.config.cursor)
-        {
-            Ok(raster) => self.painter.replace_raster(raster),
+        match self.painter.set_scale(scale) {
+            Ok(true) => self.reflow(),
+            Ok(false) => {}
             // Keep the old raster: a terminal at the wrong scale is legible,
             // and a terminal with no raster is not a terminal.
-            Err(error) => {
-                eprintln!("term: raster rebuild at scale {scale}: {error}");
-                return;
-            }
+            Err(error) => eprintln!("term: raster rebuild at scale {scale}: {error}"),
         }
-        // The cell size changed under the same window, so the column count
-        // did too; `relayout` forces the PTY resize that repaints everything.
-        self.grid = (0, 0);
-        self.relayout();
     }
 
-    /// Recompute the grid from the window and tell the PTY, if it moved.
+    /// The cell size changed under the same window: forget every pane's
+    /// grid so `relayout` resizes them all, and ask for a repaint — the
+    /// frames were invalidated, and a PTY told the size it already had need
+    /// not fire a wake of its own.
+    fn reflow(&mut self) {
+        self.grids.clear();
+        self.relayout();
+        self.waker.fd.waker()();
+    }
+
+    /// Size every visible pane from the window and tell each PTY that moved.
     fn relayout(&mut self) {
-        let (logical_width, logical_height) = self.painter.logical_cell();
-        let (cell_width, cell_height) = self.painter.cell();
-        if cell_width == 0 || cell_height == 0 {
+        let Some(tree) = &self.shape.tree else {
+            return; // Nothing synced yet; the first wake lays out.
+        };
+        let scale = self.painter.scale();
+        let cell = self.painter.cell();
+        if cell.0 == 0 || cell.1 == 0 {
             return;
         }
-        let cols = ((self.window.width / logical_width.max(1.0)) as u16)
-            .clamp(2, MAX_COLS.min((MAX_TEXTURE / cell_width) as u16));
-        let rows = ((self.window.height / logical_height.max(1.0)) as u16)
-            .clamp(1, MAX_ROWS.min((MAX_TEXTURE / cell_height) as u16));
-        if (cols, rows) == self.grid {
-            return;
+        let bounds = layout::content(self.window.width, self.window.height, scale);
+        let placed = layout::panes(tree, bounds, scale);
+        let mut resize = Vec::new();
+        {
+            let mut tabs = self.tabs.lock().expect("tabs");
+            if tabs.is_empty() {
+                return;
+            }
+            for (id, geometry) in &placed {
+                // Logical px relative to the pane area — the frame bterm
+                // reports through `term.panes`, and what `focus_dir` reads.
+                tabs.geometry(
+                    *id,
+                    Geometry {
+                        x: geometry.x - bounds.x,
+                        y: geometry.y - bounds.y,
+                        ..*geometry
+                    },
+                );
+                let grid = layout::grid(*geometry, cell, scale);
+                if self.grids.get(id) != Some(&grid)
+                    && let Some(terminal) = tabs.pane_by_id(*id)
+                {
+                    resize.push((*id, grid, terminal));
+                }
+            }
         }
-        let tabs = self.tabs.lock().expect("tabs");
-        // Record the new grid only once it has reached a PTY. Recording it
-        // first and then bailing on an empty tab set would leave `self.grid`
-        // describing a resize nothing was told about, and the equality guard
-        // above would suppress the retry.
-        if tabs.is_empty() {
-            return;
+        // Record a grid only once it has reached its PTY: recording first and
+        // then failing to find the pane would leave `grids` describing a
+        // resize nothing was told about, and the equality check would
+        // suppress the retry. Terminal locks are taken without the set lock,
+        // as everywhere else in this frontend.
+        for (id, (cols, rows), terminal) in resize {
+            // Physical pixels to the PTY: ioctl TIOCSWINSZ's ws_xpixel is
+            // what a full-screen program asks for when it wants real geometry.
+            terminal.lock().expect("terminal").resize(
+                cols,
+                rows,
+                cols * cell.0 as u16,
+                rows * cell.1 as u16,
+            );
+            self.tabs.lock().expect("tabs").resized(id, cols, rows);
+            self.grids.insert(id, (cols, rows));
         }
-        self.grid = (cols, rows);
-        let id = tabs.active_tab().active_pane;
-        let terminal = tabs.active_terminal();
-        drop(tabs);
-        // Physical pixels to the PTY: ioctl TIOCSWINSZ's ws_xpixel is what a
-        // full-screen program asks for when it wants real geometry.
-        terminal.lock().expect("terminal").resize(
-            cols,
-            rows,
-            cols * cell_width as u16,
-            rows * cell_height as u16,
-        );
-        self.tabs.lock().expect("tabs").resized(id, cols, rows);
-        // `Terminal::resize` fires the wake, so the repaint arrives as the
-        // next `Message::Wake` rather than being duplicated here.
     }
 
     fn send_keys(&mut self, keys: Vec<cosmix_term_core::terminal::Key>) {
@@ -567,6 +869,7 @@ impl State {
             return;
         }
         tabs.user_activity();
+        // The focused pane of the active tab.
         let terminal = tabs.active_terminal();
         drop(tabs);
         let terminal = terminal.lock().expect("terminal");
@@ -582,6 +885,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmix_term_core::panes::Direction;
 
     #[test]
     fn an_env_font_size_overrides_the_config_only_when_it_is_valid() {
@@ -598,5 +902,52 @@ mod tests {
             );
         }
         assert_eq!(resolve_config(base, None, "xterm").config.font_px, 13.0);
+    }
+
+    fn active_pane(tabs: &TabSet) -> u64 {
+        tabs.active_tab().active_pane
+    }
+
+    /// T3 parity at the model: each chord drives the tab set the way bterm's
+    /// keyboard handler does, on a real PTY-backed `TabSet`.
+    #[test]
+    fn chords_drive_the_tab_set_like_bterm() {
+        let mut tabs = TabSet::new().expect("a PTY");
+        let first_tab = tabs.active_id();
+        let left = active_pane(&tabs);
+
+        assert!(apply(&mut tabs, Action::Split(SplitDir::Vertical)).is_empty());
+        assert_eq!(tabs.leaves().len(), 2);
+        let right = active_pane(&tabs);
+        assert_ne!(right, left, "a split focuses the new pane");
+
+        apply(&mut tabs, Action::Focus(Direction::Left));
+        assert_eq!(active_pane(&tabs), left);
+        apply(&mut tabs, Action::Focus(Direction::Right));
+        assert_eq!(active_pane(&tabs), right);
+
+        apply(&mut tabs, Action::NewTab);
+        assert_eq!(tabs.list().len(), 2);
+        assert_ne!(tabs.active_id(), first_tab, "a new tab is selected");
+        apply(&mut tabs, Action::Cycle { forward: true });
+        assert_eq!(tabs.active_id(), first_tab, "cycling wraps back to the first tab");
+
+        let removed = apply(&mut tabs, Action::ClosePane);
+        assert_eq!(removed.len(), 1, "the closed pane's terminal is torn down");
+        assert_eq!(tabs.leaves().len(), 1);
+        assert_eq!(active_pane(&tabs), left, "focus falls to the sibling");
+
+        let removed = apply(&mut tabs, Action::CloseTab);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(tabs.list().len(), 1);
+
+        assert!(apply(&mut tabs, Action::FontIncrease).is_empty(), "not a tab operation");
+        assert_eq!(tabs.list().len(), 1);
+
+        let removed = apply(&mut tabs, Action::Quit);
+        assert!(!removed.is_empty());
+        assert!(tabs.is_empty());
+        assert!(apply(&mut tabs, Action::NewTab).is_empty(), "nothing opens after quit");
+        assert!(tabs.is_empty());
     }
 }

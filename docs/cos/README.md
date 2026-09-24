@@ -27,6 +27,7 @@ exhaustive manpages. For the language that drives these daemons, see the
 - **[indexd](indexd.md)** — vector knowledge base / indexer.
 - **[desktop](desktop.md)** — the CosMix desktop: `cosmix-comp` (Smithay + Bevy Wayland compositor), the `ctk` toolkit and the native apps.
 - **[cosmix-comp](cosmix-comp.md)** — Wayland compositor and supported protocol globals.
+- **[term](term.md)** — the lightweight iced + wgpu terminal: tabs, split panes, foot-style font sizing, the `term.*` Bus surface.
 - **[quoin](quoin.md)** — corner-driven desktop panels with standalone SCTK and experimental compositor hosts.
 - **[quoin-panel](quoin-panel.md)** — the Plasma-style bottom panel, launcher, calendar and notifications as Mix Scenes.
 - **[cosmix-bg-showcase](cosmix-bg-showcase.md)** — shared Bloom, Shapes, Boing and Boids demos with native Bus controls.
