@@ -598,9 +598,7 @@ impl BusHandler for MixBusHandler {
                     .await
                 {
                     Ok((rc, reply_body, error_header)) => {
-                        let reply = parse_reply_body(&reply_body);
-                        let (rc, result) = headers_reply_to_result(rc, reply_body, error_header);
-                        Ok((rc, result, reply))
+                        Ok(headers_reply(rc, reply_body, error_header))
                     }
                     // A TRANSPORT failure (broker close, send error, 60s
                     // timeout) → mark Lost (if our Arc is still the cached
@@ -628,16 +626,14 @@ impl BusHandler for MixBusHandler {
             // Sent through `call_with_headers_raw` with no extra headers —
             // the same wire request `call_typed` builds — because `$reply`
             // needs the raw body that `call_typed` reduces to a message.
-            // `typed_reply_to_result` reproduces `call_typed`'s `$result`.
+            // `typed_reply` reproduces `call_typed`'s `$result`.
             let body = rpc_body(&json_args);
             match client
                 .call_with_headers_raw(target, command, &BTreeMap::new(), &body)
                 .await
             {
                 Ok((rc, reply_body, error_header)) => {
-                    let reply = parse_reply_body(&reply_body);
-                    let (rc, result) = typed_reply_to_result(rc, reply_body, error_header);
-                    Ok((rc, result, reply))
+                    Ok(typed_reply(rc, reply_body, error_header))
                 }
                 Err(e) => {
                     self.mark_lost_if_current(&client).await;
@@ -1233,9 +1229,7 @@ impl BusHandler for MixServeHandler {
                     .await
                 {
                     Ok((rc, reply_body, error_header)) => {
-                        let reply = parse_reply_body(&reply_body);
-                        let (rc, result) = headers_reply_to_result(rc, reply_body, error_header);
-                        Ok((rc, result, reply))
+                        Ok(headers_reply(rc, reply_body, error_header))
                     }
                     Err(e) => Err(mesh_unavailable(&format!(
                         "serve call_with_headers({target}, {command}) transport failure: {e}"
@@ -1255,9 +1249,7 @@ impl BusHandler for MixServeHandler {
                 .await
             {
                 Ok((rc, reply_body, error_header)) => {
-                    let reply = parse_reply_body(&reply_body);
-                    let (rc, result) = typed_reply_to_result(rc, reply_body, error_header);
-                    Ok((rc, result, reply))
+                    Ok(typed_reply(rc, reply_body, error_header))
                 }
                 Err(e) => Err(mesh_unavailable(&format!(
                     "serve call({target}, {command}) transport failure: {e}"
@@ -1620,16 +1612,28 @@ pub(crate) fn json_to_value(val: &serde_json::Value) -> Value {
     }
 }
 
-/// `$reply` (0.92.0): the reply body JSON-parsed, for every response —
-/// success or refusal, whatever its dialect — and `Nil` when the body is
-/// empty or not JSON. `$result` keeps its own, deliberately reduced shape.
-fn parse_reply_body(body: &str) -> Value {
+/// A reply body parsed ONCE: `None` when empty or not JSON. `$result` and
+/// `$reply` are both derived from this one parse — a props body can be
+/// megabytes, and parsing it twice doubled time and peak memory.
+fn parse_body_json(body: &str) -> Option<serde_json::Value> {
     if body.is_empty() {
-        return Value::Nil;
+        None
+    } else {
+        serde_json::from_str(body).ok()
     }
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(j) => json_to_value(&j),
-        Err(_) => Value::Nil,
+}
+
+/// The success half shared by both routes: the parsed body (empty → Nil,
+/// non-JSON → the verbatim String) as `$result`, and the same value as
+/// `$reply` when it parsed (Nil otherwise). One conversion, one Rc clone.
+fn success_reply(rc: u8, body: String, parsed: Option<serde_json::Value>) -> (i32, Value, Value) {
+    match parsed {
+        Some(j) => {
+            let v = json_to_value(&j);
+            (i32::from(rc), v.clone(), v)
+        }
+        None if body.is_empty() => (i32::from(rc), Value::Nil, Value::Nil),
+        None => (i32::from(rc), Value::String(body), Value::Nil),
     }
 }
 
@@ -1643,8 +1647,8 @@ fn rpc_body(args: &serde_json::Value) -> String {
     }
 }
 
-/// `$rc`/`$result` for a JSON-body RPC from its raw `(rc, body,
-/// error_header)` — a byte-for-byte reproduction of what
+/// `($rc, $result, $reply)` for a JSON-body RPC from its raw `(rc, body,
+/// error_header)`. `$result` is a byte-for-byte reproduction of what
 /// `NodedClient::call_typed` + `BusMessage::error_message` produced before
 /// `send` switched to the raw call to recover the body for `$reply`:
 ///
@@ -1652,34 +1656,33 @@ fn rpc_body(args: &serde_json::Value) -> String {
 ///   body's `error` string, else the trimmed body verbatim, else
 ///   `"unknown error"`.
 /// * `rc < 10` — the JSON-parsed body (empty → Nil, non-JSON → the String).
-fn typed_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
-    if rc >= 10 {
-        let message = error_header.unwrap_or_else(|| {
-            let trimmed = body.trim();
-            if trimmed.is_empty() {
-                return "unknown error".to_string();
-            }
-            serde_json::from_str::<serde_json::Value>(trimmed)
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
-                .unwrap_or_else(|| trimmed.to_string())
-        });
-        return (i32::from(rc), Value::String(message));
+///
+/// `$reply` (0.92.0) is the parsed body for every response — success or
+/// refusal, whatever its dialect — and Nil when it is empty or not JSON.
+fn typed_reply(rc: u8, body: String, error_header: Option<String>) -> (i32, Value, Value) {
+    // serde_json ignores surrounding whitespace, so parsing the untrimmed
+    // body gives what call_typed's parse of the trimmed one did.
+    let parsed = parse_body_json(&body);
+    if rc < 10 {
+        return success_reply(rc, body, parsed);
     }
-    let value = if body.is_empty() {
-        Value::Nil
-    } else {
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(j) => json_to_value(&j),
-            Err(_) => Value::String(body),
+    let reply = parsed.as_ref().map(json_to_value).unwrap_or(Value::Nil);
+    let message = error_header.unwrap_or_else(|| {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return "unknown error".to_string();
         }
-    };
-    (i32::from(rc), value)
+        parsed
+            .as_ref()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_else(|| trimmed.to_string())
+    });
+    (i32::from(rc), Value::String(message), reply)
 }
 
 /// Map a reply-awaiting `call_with_headers_raw` triple `(rc, body,
-/// error_header)` into the `(i32, Value)` result the `send` keyword yields,
-/// applying the SAME rc-band contract as the JSON-body `call_typed` path so a
+/// error_header)` into the `($rc, $result, $reply)` the `send` keyword
+/// yields, applying the SAME rc-band contract as the JSON-body path so a
 /// `body=`-bearing send round-trips its reply exactly like a positional or
 /// scalar-header send:
 ///
@@ -1690,49 +1693,58 @@ fn typed_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> 
 /// * `rc < 10` — success or a warning: `$rc` keeps the rc and `$result` is the
 ///   JSON-parsed body (empty → Nil; non-JSON → the verbatim String), matching
 ///   `call_typed`'s body handling.
-fn headers_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
-    if rc >= 10 {
-        let parsed: Option<serde_json::Value> = if body.is_empty() {
-            None
-        } else {
-            serde_json::from_str(&body).ok()
-        };
-        // A STRUCTURED refusal is handed back whole. These carry `error_code`
-        // and often `reason`/`retry_requires`, and branching on them is the
-        // entire job of a driver; reducing one to prose leaves the caller
-        // parsing English to decide whether to retry.
-        //
-        // Deliberately narrow: only a body that parses AND names an
-        // `error_code` takes this path. A peer that answers an error as plain
-        // text, or as JSON of some other shape, still produces exactly the
-        // string it produced before — so no existing caller's `$result`
-        // changes unless the peer was already speaking the structured dialect.
-        if let Some(object) = parsed.as_ref().filter(|v| v.get("error_code").is_some()) {
-            return (i32::from(rc), json_to_value(object));
-        }
-        let from_body = parsed
-            .as_ref()
-            .and_then(|v| v.get("message").or_else(|| v.get("error")))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let message = from_body.or(error_header).unwrap_or_else(|| {
-            if body.is_empty() {
-                format!("rc={rc} (no error body)")
-            } else {
-                body
-            }
-        });
-        return (i32::from(rc), Value::String(message));
+///
+/// `$reply` is the parsed body, as for [`typed_reply`].
+fn headers_reply(rc: u8, body: String, error_header: Option<String>) -> (i32, Value, Value) {
+    let parsed = parse_body_json(&body);
+    if rc < 10 {
+        return success_reply(rc, body, parsed);
     }
-    let value = if body.is_empty() {
-        Value::Nil
-    } else {
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(j) => json_to_value(&j),
-            Err(_) => Value::String(body),
+    let reply = parsed.as_ref().map(json_to_value).unwrap_or(Value::Nil);
+    // A STRUCTURED refusal is handed back whole. These carry `error_code`
+    // and often `reason`/`retry_requires`, and branching on them is the
+    // entire job of a driver; reducing one to prose leaves the caller
+    // parsing English to decide whether to retry.
+    //
+    // Deliberately narrow: only a body that parses AND names an
+    // `error_code` takes this path. A peer that answers an error as plain
+    // text, or as JSON of some other shape, still produces exactly the
+    // string it produced before — so no existing caller's `$result`
+    // changes unless the peer was already speaking the structured dialect.
+    if parsed.as_ref().is_some_and(|v| v.get("error_code").is_some()) {
+        return (i32::from(rc), reply.clone(), reply);
+    }
+    let from_body = parsed
+        .as_ref()
+        .and_then(|v| v.get("message").or_else(|| v.get("error")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let message = from_body.or(error_header).unwrap_or_else(|| {
+        if body.is_empty() {
+            format!("rc={rc} (no error body)")
+        } else {
+            body
         }
-    };
-    (i32::from(rc), value)
+    });
+    (i32::from(rc), Value::String(message), reply)
+}
+
+/// Test views of the two mappings: `($rc, $result)` alone, and `$reply`.
+#[cfg(test)]
+fn typed_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
+    let (rc, result, _) = typed_reply(rc, body, error_header);
+    (rc, result)
+}
+
+#[cfg(test)]
+fn headers_reply_to_result(rc: u8, body: String, error_header: Option<String>) -> (i32, Value) {
+    let (rc, result, _) = headers_reply(rc, body, error_header);
+    (rc, result)
+}
+
+#[cfg(test)]
+fn parse_reply_body(body: &str) -> Value {
+    parse_body_json(body).as_ref().map(json_to_value).unwrap_or(Value::Nil)
 }
 
 #[cfg(test)]
@@ -1902,6 +1914,26 @@ mod tests {
         let reply = parse_reply_body(body);
         assert_eq!(field(&reply, "error_code"), Value::String("UNKNOWN_COMMAND".into()));
         assert_eq!(field(&reply, "command"), Value::String("x.y".into()));
+    }
+
+    /// One parse, one conversion: a success body's `$result` and `$reply` are
+    /// the SAME map allocation (an Rc clone), on both routes, and so is a
+    /// header-route `error_code` refusal's.
+    #[test]
+    fn result_and_reply_share_one_conversion() {
+        let body = r#"{"pong":true,"n":2}"#;
+        for (_, result, reply) in [typed_reply(0, body.into(), None), headers_reply(0, body.into(), None)] {
+            let (Value::Map(a), Value::Map(b)) = (&result, &reply) else {
+                panic!("expected maps, got {result:?} / {reply:?}");
+            };
+            assert!(std::rc::Rc::ptr_eq(a, b), "success body converted twice");
+        }
+        let coded = r#"{"error_code":"not_found","message":"m"}"#;
+        let (_, result, reply) = headers_reply(10, coded.into(), None);
+        let (Value::Map(a), Value::Map(b)) = (&result, &reply) else {
+            panic!("expected maps");
+        };
+        assert!(std::rc::Rc::ptr_eq(a, b), "error_code body converted twice");
     }
 
     /// A success body is identical in `$result` and `$reply`; a non-JSON or
