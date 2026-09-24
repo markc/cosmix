@@ -58,7 +58,7 @@ CoS — substrate libraries and daemon family
 | `cosmix-indexd` | 0.9.1 |
 | `cosmix-input-core` | 0.1.3 |
 | `cosmix-input-schema` | 0.1.4 |
-| `cosmix-inputd` | 0.4.1 |
+| `cosmix-inputd` | 0.4.2 |
 | `cosmix-interactd` | 0.5.1 |
 | `cosmix-interaction-broker` | 0.5.0 |
 | `cosmix-interaction-schema` | 0.6.0 |
