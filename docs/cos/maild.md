@@ -25,6 +25,7 @@ onto the same store. It is built from a small family of crates:
 ## What it does
 
 - **Inbound SMTP** on port 25 with opportunistic (or required) STARTTLS. Each message runs the three-stage DATA filter: `cosmix-maild-auth` verifies SPF / DKIM / DMARC / ARC / iprev and prepends an `Authentication-Results` header → `cosmix-maild-rules` returns `HardAccept`, `HardJunk`, or `Continue` → `cosmix-maild-bayesian` scores anything that continued and routes it to Inbox or Junk.
+- **Delivery log.** Each classified recipient logs one line, `Spam classification: SPAM (score 0.00, source=rules:mail_auth_hard_fail) for <rcpt>`, with `source` also emitted as a structured field. `source=bayes` means the rules engine continued and the Bayesian score decided. `source=rules:<why>` means the rules engine short-circuited. A single deciding signal is named by its reason (`allowlist_sender`, `blocklist_sender`, `mail_auth_hard_fail`, `structural_anomaly`). A score breach names the rules whose weights summed past `hard_junk_threshold`, joined with `+`. The score shown for a rules verdict is the rules score, not a Bayesian probability.
 - **Submission** on SMTPS (465), signing outbound mail with DKIM and sealing forwards with ARC.
 - **Client access** via IMAPS (993) and JMAP over HTTP, plus CalDAV/CardDAV for calendars and contacts — all backed by the same `cosmix-mds` store.
 - **Spam training** and classification that live and update per account.
