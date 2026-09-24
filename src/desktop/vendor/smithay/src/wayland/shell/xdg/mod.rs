@@ -1087,16 +1087,15 @@ impl Cacheable for SurfaceCachedState {
 }
 
 /// Whether a non-null buffer is pending on `surface` (attached, not yet
-/// committed) or still in its committed state. A pending null attach counts
-/// as no buffer.
+/// committed) or still in its committed state. Only a COMMITTED null attach
+/// clears the committed half: a pending, uncommitted null attach leaves the
+/// committed buffer in place, so it still counts.
 pub fn surface_has_attached_or_committed_buffer(surface: &wl_surface::WlSurface) -> bool {
     use crate::wayland::compositor::{BufferAssignment, SurfaceAttributes};
     compositor::with_states(surface, |states| {
         let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-        match attributes.pending().buffer {
-            Some(BufferAssignment::NewBuffer(_)) => return true,
-            Some(BufferAssignment::Removed) => return false,
-            None => {}
+        if matches!(attributes.pending().buffer, Some(BufferAssignment::NewBuffer(_))) {
+            return true;
         }
         matches!(
             attributes.current().buffer,

@@ -27617,6 +27617,51 @@ fn a_fresh_xdg_surface_on_a_surface_with_a_committed_buffer_is_refused() {
     assert_eq!(message, "wl_surface has a buffer attached or committed");
 }
 
+/// Smithay's DEFAULT `surface_has_buffer` (the helper any other user of the
+/// hook gets): an uncommitted NULL attach does not clear a committed buffer;
+/// only committing the NULL does. A roleless surface is used because comp
+/// leaves a roleless commit's buffer in `SurfaceAttributes::current`, which
+/// is exactly the state the default reads.
+#[test]
+fn smithay_default_buffer_check_ignores_an_uncommitted_null_attach() {
+    use smithay::wayland::shell::xdg::surface_has_attached_or_committed_buffer as has_buffer;
+    let mut harness = KeybindingHarness::new(false);
+    let surface_id = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_COMPOSITOR_ID,
+        0,
+        &words(&[surface_id]),
+    ); // wl_compositor.create_surface
+    harness.dispatch_client();
+    let surface = test_toplevel_record(&harness)
+        .role
+        .wl_surface()
+        .client()
+        .expect("in-process client is live")
+        .object_from_protocol_id::<WlSurface>(&harness.server.state.display_handle, surface_id)
+        .expect("roleless wl_surface exists");
+    assert!(!has_buffer(&surface), "a fresh surface has no buffer");
+
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(&mut harness.client, surface_id, 1, &words(&[buffer, 0, 0])); // attach
+    harness.dispatch_client();
+    assert!(has_buffer(&surface), "a pending buffer counts");
+    send_request(&mut harness.client, surface_id, 6, &[]); // commit
+    harness.dispatch_client();
+    assert!(has_buffer(&surface), "a committed buffer counts");
+
+    send_request(&mut harness.client, surface_id, 1, &words(&[0, 0, 0])); // attach(NULL)
+    harness.dispatch_client();
+    assert!(
+        has_buffer(&surface),
+        "an UNCOMMITTED NULL attach must not hide the committed buffer"
+    );
+    send_request(&mut harness.client, surface_id, 6, &[]); // commit the NULL
+    harness.dispatch_client();
+    assert!(!has_buffer(&surface), "only a committed NULL clears it");
+}
+
 /// The ATTACHED half: the committed state is empty (NULL attach + commit),
 /// but a new buffer is attached and not yet committed when the client asks
 /// for the wrapper.
