@@ -9865,34 +9865,80 @@ fn leader_exited_unreaped(pid: i32) -> std::io::Result<bool> {
 /// `kill(-pgid, 0)` cannot answer this: an unreaped zombie leader — which
 /// Mix deliberately keeps so the pgid stays reserved — still counts as a
 /// member. So Linux scans `/proc/*/stat` for a live process whose pgrp is
-/// `pgid`. Any failure to read /proc answers `true` (keep waiting; the
-/// grace deadline still bounds it). Elsewhere there is no /proc and the
-/// conservative `kill(-pgid, 0)` is used, which waits out the full grace.
+/// `pgid`. The answer errs toward "live" (review R4): whenever it cannot
+/// PROVE a pid is gone or outside the group it says `true`, and the grace
+/// deadline still bounds the wait — ending the grace early is the one
+/// mistake this must not make. Concretely: /proc unreadable → true; a stat
+/// that vanished (ENOENT/ESRCH: the pid exited) → not a member; any other
+/// read error (EACCES under hidepid) or an unparsable record → true; a
+/// zombie thread-group LEADER whose other threads still run (more than one
+/// /proc/N/task entry) → live. Processes hidden from this scan altogether
+/// (another pid namespace, hidepid=2 for other users) cannot be counted:
+/// there the grace may end early, but the SIGKILL still reaches the group.
+/// Elsewhere there is no /proc and the conservative `kill(-pgid, 0)` is
+/// used, which waits out the full grace.
 #[cfg(target_os = "linux")]
 pub(crate) fn group_has_live_members(pgid: i32) -> bool {
+    use std::os::unix::ffi::OsStrExt;
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return true;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true; // a readdir error hides pids: unknown → live
+        };
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.bytes().all(|b| b.is_ascii_digit()) {
+        if name.is_empty() || !name.as_bytes().iter().all(u8::is_ascii_digit) {
             continue;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) else {
-            continue; // exited between readdir and read
+        let dir = std::path::Path::new("/proc").join(&name);
+        let stat = match std::fs::read(dir.join("stat")) {
+            Ok(stat) => stat,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue; // exited between readdir and read: provably gone
+            }
+            Err(_) => return true, // EACCES etc.: unknown → live
         };
-        // Fields after the parenthesised comm: state ppid pgrp ...
-        let Some((_, rest)) = stat.rsplit_once(')') else { continue };
-        let mut fields = rest.split_whitespace();
-        let state = fields.next().unwrap_or("");
-        let _ppid = fields.next();
-        let pgrp = fields.next().and_then(|p| p.parse::<i32>().ok());
-        if pgrp == Some(pgid) && state != "Z" && state != "X" {
+        let Some((state, pgrp)) = parse_proc_stat_state_pgrp(&stat) else {
+            return true; // unparsable record: unknown → live
+        };
+        if pgrp != pgid || state == b'X' {
+            continue;
+        }
+        if state != b'Z' {
             return true;
+        }
+        // A zombie thread-group leader still has running threads if its
+        // task directory lists more than itself.
+        match std::fs::read_dir(dir.join("task")) {
+            Ok(tasks) => {
+                if tasks.take(2).count() > 1 {
+                    return true;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
         }
     }
     false
+}
+
+/// `(state, pgrp)` from a raw `/proc/N/stat` record, parsed as BYTES: `comm`
+/// is in parentheses and may contain spaces, ')' and non-UTF-8 bytes, so the
+/// fields are found after the LAST ')'. `None` when the record is malformed.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat_state_pgrp(stat: &[u8]) -> Option<(u8, i32)> {
+    let close = stat.iter().rposition(|b| *b == b')')?;
+    let mut fields = stat[close + 1..]
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty());
+    let state = *fields.next()?.first()?;
+    let _ppid = fields.next()?;
+    let pgrp = std::str::from_utf8(fields.next()?).ok()?.parse::<i32>().ok()?;
+    Some((state, pgrp))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -24268,6 +24314,36 @@ mod chmod_tests {
             Some("VALUE_OUT_OF_RANGE")
         );
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+/// Review R4: the /proc stat parser takes bytes, finds the fields after the
+/// LAST ')', and refuses malformed records (which the scan treats as live).
+#[cfg(all(test, target_os = "linux"))]
+mod proc_scan_tests {
+    use super::{group_has_live_members, parse_proc_stat_state_pgrp};
+
+    #[test]
+    fn stat_records_parse_as_bytes_after_the_last_paren() {
+        assert_eq!(
+            parse_proc_stat_state_pgrp(b"123 (sh) S 1 4242 4242 0 -1"),
+            Some((b'S', 4242))
+        );
+        // comm with spaces, a ')' and a non-UTF-8 byte.
+        assert_eq!(
+            parse_proc_stat_state_pgrp(b"7 (a b) \xff) Z 1 99 99 0"),
+            Some((b'Z', 99))
+        );
+        assert_eq!(parse_proc_stat_state_pgrp(b"7 (x) R 1"), None, "no pgrp field");
+        assert_eq!(parse_proc_stat_state_pgrp(b"7 x R 1 2 3"), None, "no parenthesis");
+        assert_eq!(parse_proc_stat_state_pgrp(b"7 (x) R 1 notanumber"), None);
+    }
+
+    #[test]
+    fn the_callers_own_group_is_live() {
+        // SAFETY: getpgrp has no preconditions.
+        let pgid = unsafe { libc::getpgrp() };
+        assert!(group_has_live_members(pgid));
     }
 }
 

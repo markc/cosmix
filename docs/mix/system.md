@@ -509,7 +509,11 @@ Every SIGTERM path waits for the whole group to empty, bounded by its grace,
 then SIGKILLs the group. A descendant that honours SIGTERM can finish its
 cleanup; one that ignores it is killed at the deadline, not orphaned. On Linux
 the child is reaped only after that, so its zombie keeps the group id
-reserved and every signal reaches the right group. An interrupt that lands on the same poll as the deadline
+reserved and every signal reaches the right group. "The group has emptied"
+is read from `/proc`, and any record Mix cannot read counts as still alive.
+A member hidden from `/proc` entirely, by another pid namespace or
+`hidepid=2` for another user's processes, cannot be counted. There the grace
+may end early, but the SIGKILL still reaches the whole group. An interrupt that lands on the same poll as the deadline
 wins the tie — it's reported as the cause.
 
 The opts map is validated **loudly** — a mistake can't silently leave a call
