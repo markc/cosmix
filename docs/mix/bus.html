@@ -658,18 +658,20 @@ runtime one, because the word is taken as the target and the <code>..</code> is 
 nowhere to go. It could never have been a working concat — the left operand of
 <code>..</code> there is a bareword, which is a string, so the subtraction ahead of it
 always failed first.</p>
-<p><strong>Quote a name the bare form cannot reach.</strong> Three shapes fall outside it, and
-quoting is the answer to all three:</p>
+<p><strong>Quote a name the bare form cannot reach.</strong> Two shapes fall outside it, and
+quoting is the answer to both:</p>
 <table><thead><tr><th>name</th><th>why</th><th>write</th></tr></thead><tbody>
 <tr><td><code>a--b</code></td><td><code>--</code> opens a <strong>comment</strong>, so the bare word stops there and the shape is refused</td><td><code>send "a--b" …</code></td></tr>
-<tr><td><code>svc-01</code>, <code>node-007</code>, <code>a-1.2.3</code></td><td>a segment that is <strong>all digits</strong> is lexed as a NUMBER, and the lexer rejects a leading zero or a second dot before the parser ever sees the line</td><td><code>send "svc-01" …</code></td></tr>
 <tr><td><code>fn-svc</code></td><td><code>fn</code> starts a lambda</td><td><code>send "fn-svc" …</code></td></tr>
 </tbody></table>
-<p>Only an all-digit segment is affected, and only a malformed one: <code>svc-1</code>,
-<code>svc-10</code>, <code>bterm-bevy-3164175</code> and <code>desktop-vt01</code> are all fine bare — <code>vt01</code>
-begins with a letter, so it is an identifier, not a number. The trap is
-<code>node-007</code>, whose error (<code>ambiguous leading-zero number '007'</code>) does not
-mention <code>send</code> at all.</p>
+<p>All-digit segments are fine bare, including malformed-looking ones: <code>svc-1</code>,
+<code>svc-10</code>, <code>bterm-bevy-3164175</code>, <code>desktop-vt01</code>, and since 0.92.0 also <code>svc-01</code>,
+<code>node-007</code> and <code>a-1.2.3</code>. Before 0.92.0 the lexer read a leading-zero or
+multi-dot segment as a bad NUMBER and refused the line
+(<code>ambiguous leading-zero number '007'</code>, an error that never mentioned <code>send</code>);
+it now lexes such a segment as part of the word when it sits in the bare target
+right after <code>send</code>/<code>emit</code>/<code>address</code>. Everywhere else — <code>$x = 007</code>, a
+<code>$var-007</code> target, a hyphenated command — the refusal is unchanged.</p>
 <p>Nothing that worked before changed meaning: the shape <em>requires</em> a hyphen, so
 every target that already resolved still takes the expression path, and a
 bareword is a string, so <code>a - b</code> on two barewords was always the runtime type

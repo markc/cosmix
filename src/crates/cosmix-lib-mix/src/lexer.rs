@@ -370,6 +370,39 @@ impl Lexer {
         }
     }
 
+    /// Is the number starting at `token_start` a tight `-`-joined segment of
+    /// the bare word right after `send` / `emit` / `address` — the target
+    /// position the parser's `take_hyphenated_service_word` reads whole?
+    /// Mirrors that scan's shape: the word starts with an ASCII letter or
+    /// `_` and runs over alphanumerics, `_`, `-` and `.`, and the keyword
+    /// before it is a whole word. Anything else keeps the number refusal.
+    fn in_bare_send_target(&self) -> bool {
+        let src = &self.source;
+        let mut i = self.token_start;
+        if i == 0 || src[i - 1] != '-' {
+            return false;
+        }
+        while i > 0 && (src[i - 1].is_ascii_alphanumeric() || matches!(src[i - 1], '_' | '-' | '.')) {
+            i -= 1;
+        }
+        if !(src[i].is_ascii_alphabetic() || src[i] == '_') {
+            return false;
+        }
+        let mut j = i;
+        while j > 0 && matches!(src[j - 1], ' ' | '\t') {
+            j -= 1;
+        }
+        if j == i {
+            return false;
+        }
+        let kw_end = j;
+        while j > 0 && (src[j - 1].is_ascii_alphanumeric() || matches!(src[j - 1], '_' | '$' | '.')) {
+            j -= 1;
+        }
+        let keyword: String = src[j..kw_end].iter().collect();
+        matches!(keyword.as_str(), "send" | "emit" | "address")
+    }
+
     fn lex_number(&mut self, line: usize, col: usize) -> MixResult<SpannedToken> {
         // Radix integer literals: 0x.. (hex), 0o.. (octal), 0b.. (binary).
         // Mix has a single f64 numeric type, so these are sugar yielding the
@@ -407,6 +440,15 @@ impl Lexer {
         // fraction like `0.5` / `0.0`, have a single-char integer part and
         // are unaffected.)
         let int_part = s.split('.').next().unwrap_or(s.as_str());
+        let malformed = (int_part.len() > 1 && int_part.starts_with('0'))
+            || s.parse::<f64>().is_err();
+        if malformed && self.in_bare_send_target() {
+            // `send node-007 …` / `send a-1.2.3 …`: a segment of a bare
+            // hyphenated service name, not a number. The parser's hyphen
+            // scan re-reads the whole word from source, so the token's
+            // own value never matters — it only must not be an error.
+            return Ok(self.spanned(Token::String(s), line, col));
+        }
         if int_part.len() > 1 && int_part.starts_with('0') {
             return Err(MixError::LexerError {
                 msg: format!(
