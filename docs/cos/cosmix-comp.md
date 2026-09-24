@@ -967,8 +967,8 @@ click topic reports `button: "left"|"right"` and `kind: "brief"`.
 Both buttons emit on release, with no hold timer or hold action. `modifiers`
 contains the active `shift`, `ctrl`, `alt` and `super` names captured at press
 time in the compositor input path, even if they change before release. The field
-is always present, including `modifiers: []`; its presence selects the new
-mapping in Quoin. Other buttons are consumed without an action.
+is always present, including `modifiers: []`; Quoin refuses a v2 body without
+it. Other buttons are consumed without an action.
 Movement further than `input.corners.deadzone_px` from the press position cancels
 the pending action, even within the hotspot. Leaving the corner or resetting
 engagement (including output changes, lock, or config changes) also cancels it.
@@ -978,19 +978,28 @@ the action.
 The original `corner.clicked` topic retains its exact JSON body and emits only
 successful unmodified LMB brief actions, on release. Every modified click,
 including Ctrl/Alt/Super+LMB, emits only v2. V2 consumers should subscribe only
-to `corner.clicked.v2` to avoid handling LMB twice. Consumers retaining an old-comp
-fallback must deduplicate: each unmodified LMB emits legacy at sequence N immediately followed
-by v2 at N+1, with the same output, corner and engagement dwell. Quoin uses this
-pair to admit the first click once in either delivery order, then ignores legacy
-after observing v2. The legacy sibling is required even with `modifiers: []`:
-Quoin canonicalises the v2 sequence to N. Modified clicks keep their own sequence.
-This versioning preserves old
-shell-hosts with strict JSON decoding, but only partly. A host that predates v2
-entirely sees legacy LMB and nothing else. A v2-aware host from before
-`modifiers` existed is worse: its strict decoder rejects every v2 body, so it
-never marks v2 as seen and acts only on legacy. On that skew RMB and every
-Shift/Ctrl/Alt/Super+LMB click is lost silently; only unmodified LMB works.
-Upgrade the shell-host before, or together with, the compositor.
+to `corner.clicked.v2` to avoid handling LMB twice. Consumers that also take
+legacy, as a fallback while their v2 subscription settles, must deduplicate:
+each unmodified LMB emits legacy at sequence N immediately followed by v2 at
+N+1, with the same output, corner and engagement dwell. Quoin uses this pair to
+admit the first click once in either delivery order, then ignores legacy after
+observing v2. The legacy sibling is required even with `modifiers: []`: Quoin
+canonicalises the v2 sequence to N. Modified clicks keep their own sequence.
+
+Compositor and shell-host must be upgraded together; neither skew is clean. A
+host that predates v2 entirely sees legacy LMB and nothing else. A v2-aware host
+from before `modifiers` existed rejects every v2 body, never marks v2 as seen
+and acts only on legacy, so RMB and every Shift/Ctrl/Alt/Super+LMB click is lost
+silently. The reverse skew — a compositor from before `modifiers` against the
+current Quoin — is louder but no better: Quoin refuses every v2 body from it
+(ERROR `quoin_corner_old_format_rejected`, `field=modifiers`), so RMB does
+nothing and the corner menu is unreachable from the corner. That compositor
+also emitted legacy for every LMB, modified or not, so unmodified LMB still
+pins and Shift+LMB pins instead of docking — but only on a fresh Quoin
+connection. Rolling the compositor back in place while Quoin stays connected
+is worse still: Quoin has already seen v2, so it ignores legacy, and the
+rewound sequences drop as stale, so no corner click acts until Quoin
+reconnects.
 Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
 to overlay pinning, Shift+LMB to docking, and RMB to the corner menu.
 Ctrl/Alt/Super without Shift retain LMB pinning. LMB from docked becomes pinned;
