@@ -731,3 +731,81 @@ fn occlusion_refused_content_cannot_lend_opacity_to_retained_texture() {
     h.frame(Vec::new());
     assert_eq!(done(&mut h, callback), 1);
 }
+
+fn completed_among(h: &mut KeybindingHarness, callbacks: &[u32]) -> Vec<u32> {
+    h.sync()
+        .iter()
+        .filter(|(id, op, _)| callbacks.contains(id) && *op == 0)
+        .map(|(id, _, _)| *id)
+        .collect()
+}
+
+/// A covered FIFO client blocks in present until a frame callback completes.
+/// The trickle hands one retained callback per occluded root per second —
+/// the oldest — off the existing frame opportunity, and no more.
+#[test]
+fn occlusion_trickle_completes_one_callback_per_second_per_occluded_root() {
+    let (mut h, victim, cover) = fixture();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    let id = h.server.state.surfaces[&victim].id;
+    assert!(h.server.state.occlusion.is_occluded(id));
+    // Set the trickle clock before any callback is queued: the root's pacing
+    // window starts the first time it is seen occluded.
+    h.server.state.occlusion.trickle_clock_ms = 5_000;
+    let callbacks = (0..3)
+        .map(|_| request(&mut h, victim.protocol_id()))
+        .collect::<Vec<_>>();
+    h.server.state.limit_occluded_callbacks();
+    assert!(completed_among(&mut h, &callbacks).is_empty());
+    assert_eq!(h.server.state.occlusion.trickle_at.get(&id), Some(&5_000));
+
+    h.server.state.occlusion.trickle_clock_ms = 5_999;
+    h.frame(Vec::new());
+    assert!(completed_among(&mut h, &callbacks).is_empty(), "not before 1 s");
+
+    h.server.state.occlusion.trickle_clock_ms = 6_000;
+    h.frame(Vec::new());
+    h.frame(Vec::new());
+    h.server.state.limit_occluded_callbacks();
+    assert_eq!(
+        completed_among(&mut h, &callbacks),
+        callbacks[..1],
+        "exactly one, the oldest, per window however many opportunities"
+    );
+    assert!(h.server.state.occlusion.is_occluded(id));
+
+    h.server.state.occlusion.trickle_clock_ms = 6_999;
+    h.frame(Vec::new());
+    assert!(completed_among(&mut h, &callbacks).is_empty());
+    h.server.state.occlusion.trickle_clock_ms = 7_000;
+    h.frame(Vec::new());
+    assert_eq!(completed_among(&mut h, &callbacks), callbacks[1..2]);
+    assert_eq!(
+        h.server.state.occlusion.withheld[&id].len(),
+        1,
+        "the trickled callbacks leave the withheld set"
+    );
+
+    // Exposure still drains the rest at once and ends the pacing entry.
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.frame(Vec::new());
+    assert_eq!(completed_among(&mut h, &callbacks), callbacks[2..]);
+    assert!(h.server.state.occlusion.trickle_at.is_empty());
+}
+
+/// The trickle only ever touches occluded roots: an exposed surface gets its
+/// callback at every frame opportunity, with the trickle clock frozen.
+#[test]
+fn unoccluded_roots_get_every_frame_callback_regardless_of_the_trickle() {
+    let (mut h, victim, _cover) = fixture();
+    h.server.state.refresh_occlusion();
+    let id = h.server.state.surfaces[&victim].id;
+    assert!(!h.server.state.occlusion.is_occluded(id));
+    for _ in 0..4 {
+        let callback = request(&mut h, victim.protocol_id());
+        h.frame(Vec::new());
+        assert_eq!(done(&mut h, callback), 1);
+    }
+    assert!(h.server.state.occlusion.trickle_at.is_empty());
+}

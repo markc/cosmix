@@ -17299,6 +17299,43 @@ fn send_frames_surface_tree_limited(
     batch
 }
 
+/// Complete exactly one queued frame callback in the tree — the oldest on the
+/// first surface (root first, downward) that has any — and return its id.
+fn complete_oldest_frame_callback(
+    surface: &WlSurface,
+    time: u32,
+    surfaces: &HashMap<ObjectId, SurfaceRecord>,
+) -> Option<ObjectId> {
+    let mut completed = None;
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, states, &()| {
+            if completed.is_some() {
+                return;
+            }
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let callbacks = &mut attributes.current().frame_callbacks;
+            if callbacks.is_empty() {
+                return;
+            }
+            let callback = callbacks.remove(0);
+            callback.done(time);
+            crate::frame_trace::event("comp_callback_done_queued", || {
+                (
+                    surfaces.get(&surface.id()).map_or(0, |record| record.id.0),
+                    u64::from(callback.id().protocol_id()),
+                    u64::from(surface.id().protocol_id()),
+                )
+            });
+            completed = Some(callback.id());
+        },
+        |_, _, &()| true,
+    );
+    completed
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DamageCapAction {
     Accept,

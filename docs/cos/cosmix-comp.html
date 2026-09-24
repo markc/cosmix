@@ -488,6 +488,14 @@ keep their family running whenever any member is exposed. This applies to
 layer-shell backgrounds, ordinary toplevels and XWayland surface trees.
 Minimised/off-workspace and session-lock gates retain their existing precedence;
 callbacks before the first buffer are never withheld by occlusion.</p>
+<p>Withholding is a throttle, not a stop. A client on Mesa's default FIFO present
+mode blocks inside present until its frame callback completes, so a covered one
+could not even answer a configure. Once per second, each occluded root has its
+oldest retained callback completed. This matches the ~1 Hz KWin and Mutter give
+hidden windows. The trickle is paced by the existing frame opportunities, with
+no timer of its own, and the window restarts whenever a root becomes occluded
+again. At most 64 callbacks are retained per occluded root. Excess older ones
+complete at once rather than being dropped.</p>
 <p>Coverage uses applied opaque-region transactions and renderer-confirmed installed
 content. A pending DMA-BUF replacement cannot lend its opaque region to an older
 texture. Candidate bounds round outwards and occluders round inwards in output

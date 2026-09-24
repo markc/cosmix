@@ -26,9 +26,22 @@ pub(super) struct OcclusionRuntime {
     refused_opacity: HashSet<SurfaceId>,
     scene_indices: HashMap<SurfaceId, usize>,
     pub withheld: HashMap<SurfaceId, HashSet<ObjectId>>,
+    /// Per occluded root: when its throttled trickle last fired (or when it
+    /// was first seen occluded). Entries leave with the occlusion.
+    pub trickle_at: HashMap<SurfaceId, u32>,
+    /// Tests drive the trickle clock by hand; it stays frozen unless a test
+    /// advances it, so wall-clock time in a slow run cannot fire a trickle.
+    #[cfg(test)]
+    pub trickle_clock_ms: u32,
     #[cfg(test)]
     pub scene_rebuilds: usize,
 }
+
+/// A covered FIFO client (Mesa's default present mode) blocks in present until
+/// its frame callback completes and so cannot even answer a configure while
+/// withheld. Complete one retained callback per occluded root this often — the
+/// ~1 Hz KWin/Mutter give hidden windows — instead of starving it outright.
+pub(super) const OCCLUDED_TRICKLE_MS: u32 = 1_000;
 impl OcclusionRuntime {
     pub fn is_occluded(&self, id: SurfaceId) -> bool {
         self.decisions.get(&id) == Some(&TreeVisibility::Occluded)
@@ -333,6 +346,9 @@ impl WaylandState {
     }
 
     /// Complete excess older callbacks fail-open; never silently drop them.
+    /// Then trickle: at most one retained callback per occluded root per
+    /// [`OCCLUDED_TRICKLE_MS`], paced by this existing frame opportunity (no
+    /// timer of its own), so a covered FIFO client keeps making progress.
     pub(super) fn limit_occluded_callbacks(&mut self) {
         if self.session_lock_active()
             || self
@@ -343,19 +359,44 @@ impl WaylandState {
         }
         let workspace = self.workspace_current();
         let frame_time = monotonic_millis();
+        #[cfg(not(test))]
+        let trickle_now = frame_time;
+        #[cfg(test)]
+        let trickle_now = self.occlusion.trickle_clock_ms;
+        let mut occluded_roots = HashSet::new();
         for record in self.surfaces.values() {
             if self.occlusion.is_occluded(record.id)
                 && record.role.parent_surface().is_none()
                 && self.surface_is_session_presentable(record)
                 && !self.surface_belongs_to_hidden_toplevel(record.role.wl_surface(), workspace)
             {
-                let batch = send_frames_surface_tree_limited(
+                occluded_roots.insert(record.id);
+                let mut batch = send_frames_surface_tree_limited(
                     record.role.wl_surface(),
                     frame_time,
                     &self.surfaces,
                     64,
                     &HashSet::new(),
                 );
+                let since = *self
+                    .occlusion
+                    .trickle_at
+                    .entry(record.id)
+                    .or_insert(trickle_now);
+                if !batch.retained.is_empty()
+                    && trickle_now.wrapping_sub(since) >= OCCLUDED_TRICKLE_MS
+                    && let Some(completed) = complete_oldest_frame_callback(
+                        record.role.wl_surface(),
+                        frame_time,
+                        &self.surfaces,
+                    )
+                {
+                    batch.retained.remove(&completed);
+                    self.occlusion.trickle_at.insert(record.id, trickle_now);
+                    crate::frame_trace::event("comp_occluded_callback_trickle", || {
+                        (record.id.0, batch.retained.len() as u64, 0)
+                    });
+                }
                 if !batch.retained.is_empty() {
                     self.occlusion.withheld.insert(record.id, batch.retained);
                 } else {
@@ -363,5 +404,10 @@ impl WaylandState {
                 }
             }
         }
+        // Leaving occlusion resets the pacing: a root covered again later
+        // waits a full interval before its first trickle.
+        self.occlusion
+            .trickle_at
+            .retain(|id, _| occluded_roots.contains(id));
     }
 }
