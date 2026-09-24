@@ -91,9 +91,13 @@ fn note($line)
 end
 
 -- ── Bus helpers ─────────────────────────────────────────────────────────
+fn rc_ok($code)
+  return $code >= 0 and $code < 10
+end
+
 fn rpc($target, $verb, $payload)
   send $target $verb body=json_encode($payload) timeout=3
-  if $rc < 0 or $rc >= 10 then return nil end
+  if not rc_ok($rc) then return nil end
   if type($result) == "string" then
     try
       return json_parse($result)
@@ -110,7 +114,7 @@ end
 -- revision 1 of the panel is how the panel notices a Quoin restart.
 fn load_scene($doc)
   send $HOST shell.scene.load body=$doc timeout=5
-  if $rc != 0 then
+  if not rc_ok($rc) then
     note("scene.load rc=" .. to_string($rc) .. " " .. to_string($result))
     return 0
   end
@@ -131,7 +135,7 @@ fn panel_verb($verb, $edge, $id)
   else
     send $HOST $verb edge=$edge id=$id timeout=3
   end
-  return $rc
+  return rc_ok($rc)
 end
 
 -- Select a scene page on its edge; true once the host accepted it. scene.load
@@ -141,7 +145,7 @@ end
 fn select_page($edge, $page)
   $tries = 0
   while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then return true end
+    if panel_verb("shell.panel.page.set", $edge, $page) then return true end
     $tries = $tries + 1
     sleep(0.05)
   end
@@ -155,7 +159,7 @@ end
 -- actually pinned.
 fn show_page($edge, $page)
   if not select_page($edge, $page) then return false end
-  if panel_verb("shell.panel.pin", $edge, nil) != 0 then
+  if not panel_verb("shell.panel.pin", $edge, nil) then
     note("pin " .. $edge .. " refused after selecting " .. $page)
     return false
   end
@@ -169,7 +173,7 @@ end
 -- return a single applied snapshot only after BOTH persistence and visibility
 -- are clear. Failure leaves the record for the existing recovery pass.
 fn hide_edge($edge)
-  if panel_verb("shell.panel.unpin", $edge, nil) != 0 then return nil end
+  if not panel_verb("shell.panel.unpin", $edge, nil) then return nil end
   $tries = 0
   while $tries < 20
     if edge_in_use($edge) then return nil end
@@ -819,7 +823,7 @@ fn show_popup($edge, $page, $flag, $gen)
   $selected = false
   $tries = 0
   while $tries < 20
-    if panel_verb("shell.panel.page.set", $edge, $page) == 0 then
+    if panel_verb("shell.panel.page.set", $edge, $page) then
       $selected = true
       break
     end
@@ -839,9 +843,9 @@ fn show_popup($edge, $page, $flag, $gen)
     push($pins, $edge)
     write_pins($pins)
   end
-  if panel_verb("shell.panel.show", $edge, nil) != 0 then return false end
+  if not panel_verb("shell.panel.show", $edge, nil) then return false end
   if not popup_live($flag, $gen) then return false end
-  $pinned = panel_verb("shell.panel.pin", $edge, nil) == 0
+  $pinned = panel_verb("shell.panel.pin", $edge, nil)
   if not popup_live($flag, $gen) and not edge_in_use($edge) then hide_popup($edge) end
   return $pinned and popup_live($flag, $gen)
 end
@@ -858,6 +862,13 @@ end
 -- only after props confirms application, never after just an enqueue ack.
 fn hide_popup($edge)
   if edge_in_use($edge) then return false end
+  -- Scene actions can dismiss shell-revealed pages with no citizen pin.
+  -- Record their release too, so a refusal remains retryable by close.
+  $pins = read_pins()
+  if index_of($pins, $edge) < 0 then
+    push($pins, $edge)
+    write_pins($pins)
+  end
   $confirmed = hide_edge($edge)
   if edge_in_use($edge) or not $p.popup_release_confirmed($confirmed) then return false end
   $kept = $p.released_popup_pins(read_pins(), $edge, $confirmed)
@@ -880,28 +891,37 @@ end
 
 -- One popup at a time, like Plasma: opening any closes the others.
 fn close_popups()
-  if $state.launcher_open then close_launcher() end
-  if $state.calendar_open then close_calendar() end
-  if $state.notes_open then close_notes() end
+  if not close_launcher() then return "left" end
+  if not close_calendar() then return "right" end
+  if not close_notes() then return "right" end
+  return nil
 end
 
-fn close_launcher()
+fn agent_close_popups()
+  $edge = close_popups()
+  if $edge == nil then return true end
+  render_panel()
+  reply(22, json_encode({error: "release_failed", open: false, edge: $edge}))
+  return false
+end
+
+fn close_launcher($scene_action = false)
   $was_open = $state.launcher_open
   $state.launcher_open = false
   $state.launcher_shown = false
   if $was_open then bump_popups() end
   if edge_in_use("left") then return true end
-  if not $was_open and index_of(read_pins(), "left") < 0 then return true end
+  if not $scene_action and not $was_open and index_of(read_pins(), "left") < 0 then return true end
   return hide_popup("left")
 end
 
-fn close_calendar()
+fn close_calendar($scene_action = false)
   $was_open = $state.calendar_open
   $state.calendar_open = false
   $state.calendar_shown = false
   if $was_open then bump_popups() end
   if edge_in_use("right") then return true end
-  if not $was_open and index_of(read_pins(), "right") < 0 then return true end
+  if not $scene_action and not $was_open and index_of(read_pins(), "right") < 0 then return true end
   return hide_popup("right")
 end
 
@@ -990,7 +1010,7 @@ on launcher.open desc "open launcher idempotently {query?, category?}; return la
     agent_invalid("category must name a launcher chip"); return
   end
   if not $state.launcher_open then
-    close_popups()
+    if not agent_close_popups() then return end
     $state.launcher_open = true
     bump_popups()
     $state.query = ""
@@ -1031,7 +1051,7 @@ on launcher.search desc "search without UI changes {query,category?,limit?=50}; 
   if not has_key($a, "query") then agent_invalid("query is required"); return end
   $category = $a.category ?? ""
   send $APPS apps.list body=json_encode({query: $a.query, category: $category}) timeout=3
-  if $rc < 0 or $rc >= 10 then
+  if not rc_ok($rc) then
     reply($rc < 0 ? 20 : 21, json_encode({error: $rc < 0 ? "apps_transport" : "apps_refused", rc: $rc, reply: $reply}))
     return
   end
@@ -1056,11 +1076,16 @@ on launcher.launch desc "launch {id}; close launcher on success; return {launche
   $id = $v.args.id ?? ""
   if $id == "" then agent_invalid("id must be a non-empty string"); return end
   send $APPS apps.launch body=json_encode({id: $id}) timeout=3
-  if $rc < 0 or $rc >= 10 then
+  if not rc_ok($rc) then
     reply($rc < 0 ? 20 : 21, json_encode({error: $rc < 0 ? "apps_transport" : "apps_refused", rc: $rc, reply: $reply}))
     return
   end
-  if $state.launcher_open then close_launcher(); render_panel() end
+  $released = close_launcher()
+  render_panel()
+  if not $released then
+    reply(22, json_encode({error: "release_failed", open: false, edge: "left", launched: $id}))
+    return
+  end
   reply(0, json_encode({launched: $id}))
 end
 
@@ -1068,7 +1093,7 @@ on calendar.open desc "open calendar idempotently {}; return {open,shown,month,y
   $v = agent_args($event, [])
   if $v.error != nil then agent_invalid($v.error); return end
   if not $state.calendar_open then
-    close_popups()
+    if not agent_close_popups() then return end
     $state.calendar_open = true
     bump_popups()
     $state.cal_offset = 0
@@ -1100,7 +1125,7 @@ on notes.open desc "open notifications idempotently {}; return {open,shown,count
   $v = agent_args($event, [])
   if $v.error != nil then agent_invalid($v.error); return end
   if not $state.notes_open then
-    close_popups()
+    if not agent_close_popups() then return end
     $state.notes_open = true
     bump_popups()
   end
@@ -1138,7 +1163,7 @@ on launcher desc "toggle the application launcher"
   if $state.launcher_open then
     close_launcher()
   else
-    close_popups()
+    if close_popups() != nil then return end
     $state.launcher_open = true
     bump_popups()
     $state.query = ""
@@ -1170,7 +1195,7 @@ on launch desc "launch the clicked application"
   $id = $a.item.id
   if $id != nil then
     rpc($APPS, "apps.launch", {id: $id})
-    close_launcher()
+    close_launcher(true)
     render_panel()
   end
 end
@@ -1179,7 +1204,7 @@ on launch_first desc "launch the first search match (Enter in the search field)"
   reply(0, "")
   if length($state.apps) > 0 then
     rpc($APPS, "apps.launch", {id: $state.apps[0].id})
-    close_launcher()
+    close_launcher(true)
     render_panel()
   end
 end
@@ -1231,7 +1256,7 @@ on calendar desc "toggle the calendar"
   if $state.calendar_open then
     close_calendar()
   else
-    close_popups()
+    if close_popups() != nil then return end
     $state.calendar_open = true
     bump_popups()
     $state.cal_offset = 0
@@ -1268,7 +1293,7 @@ on open_calendar desc "open the desktop's calendar application"
   elif which("thunderbird") != nil then
     spawn(["thunderbird", "-calendar"], {detach: true})
   end
-  close_calendar()
+  close_calendar(true)
   render_panel()
 end
 
@@ -1277,7 +1302,7 @@ on notes desc "toggle the notifications popup"
   if $state.notes_open then
     close_notes()
   else
-    close_popups()
+    if close_popups() != nil then return end
     $state.notes_open = true
     bump_popups()
     render_notes()

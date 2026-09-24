@@ -120,10 +120,12 @@ try
 
   -- Refused reveals stay retryable, including repeat opens of calendar/notes.
   for each $kind in ["launcher", "calendar", "notes"]
-    for each $mode in [{page_refused: true}, {load_refused: true}]
+    for each $mode in [{page_refused: true}, {load_refused: true}, {show_refused: true}]
       call("panel-fixture", "fixture.mode", json_encode($mode))
+      $pins = fixture().pins
       $refused = panel($kind .. ".open", {})
       check($refused.open and not $refused.shown, $kind .. " claimed a refused reveal")
+      check(fixture().pins == $pins, $kind .. " pinned a refused reveal")
       call("panel-fixture", "fixture.mode", "{}")
       check(panel($kind .. ".open", {}).shown, $kind .. " did not retry reveal")
       panel($kind .. ".close", {})
@@ -140,6 +142,30 @@ try
       call("panel-fixture", "fixture.mode", "{}")
       panel($kind .. ".close", {})
       check(length(json_parse(read_file($tmp .. "/cosmix/quoin-panel-pins.json"))) == 0, "retry kept released pin")
+    end
+  end
+  -- Launch succeeded even when cleanup did not: retry close, never launch.
+  for each $mode in [{release_refused: true}, {hide_refused: true}]
+    panel("launcher.open", {})
+    call("panel-fixture", "fixture.mode", json_encode($mode))
+    $launches = length(fixture().launches)
+    $failed = call("quoin-panel", "launcher.launch", json_encode({id: "app-1"}))
+    check($failed.rc == 22 and $failed.reply.error == "release_failed" and $failed.reply.launched == "app-1", "launch concealed release failure")
+    check(call("quoin-panel", "launcher.close", "{}").rc == 22, "launch lost pending release")
+    call("panel-fixture", "fixture.mode", "{}")
+    panel("launcher.close", {})
+    check(length(fixture().launches) == $launches + 1 and not fixture().edges.left.visible, "close retry relaunched or failed to hide")
+    for each $pair in [["launcher", "calendar"], ["calendar", "notes"], ["notes", "launcher"]]
+      panel($pair[0] .. ".open", {})
+      call("panel-fixture", "fixture.mode", json_encode($mode))
+      for each $attempt in range(1, 2)
+        $failed = call("quoin-panel", $pair[1] .. ".open", "{}")
+        check($failed.rc == 22 and $failed.reply.error == "release_failed", "popup switch concealed release failure")
+        check(not panel("popups.state", {})[$pair[1]], "failed switch opened destination")
+      end
+      call("panel-fixture", "fixture.mode", "{}")
+      check(panel($pair[1] .. ".open", {}).shown, "popup switch did not retry release")
+      panel($pair[1] .. ".close", {})
     end
   end
   check(panel("launcher.search", {query: 123}).query == "123", "numeric query")
@@ -165,9 +191,9 @@ try
   check($recovered.count == 60 and $recovered.shown and fixture().lists > $lists, "open state did not recover apps")
   check(fixture().loads > $loads, "recovery never loaded a scene")
   for each $code in range(1, 9)
-    call("panel-fixture", "fixture.mode", json_encode({rc: $code}))
+    call("panel-fixture", "fixture.mode", json_encode({rc: $code, host_rc: $code}))
     check(panel("launcher.search", {query: "success"}).count == 60, "nonzero success search")
-    panel("launcher.open", {})
+    check(panel("launcher.open", {}).shown, "nonzero success host reveal")
     panel("launcher.launch", {id: "app-1"})
     check(not panel("launcher.state", {}).open, "nonzero success launch")
   end
@@ -184,6 +210,26 @@ try
   check(deep_eq(panel("popups.state", {}), {launcher: false, calendar: false, notes: true}), "click exclusivity")
   panel("notes", {})
 
+  for each $kind in ["launcher", "calendar", "notes"]
+    call("panel-fixture", "fixture.mode", json_encode({show_refused: true}))
+    $pins = fixture().pins
+    panel($kind, {})
+    $refused = panel($kind .. ".state", {})
+    check($refused.open and not $refused.shown and fixture().pins == $pins, "click pinned refused show")
+    call("panel-fixture", "fixture.mode", "{}")
+    check(panel($kind .. ".open", {}).shown, "click reveal was not retryable")
+    panel($kind .. ".close", {})
+  end
+  -- Registered pages can be revealed directly by the shell, without flags
+  -- or pin records in the citizen. Their scene actions must still dismiss.
+  for each $action in ["launch", "launch_first", "open_calendar"]
+    $edge = $action == "open_calendar" ? "right" : "left"
+    call("panel-fixture", "shell.panel.show", json_encode({edge: $edge}))
+    check(fixture().edges[$edge].visible and length(json_parse(read_file($tmp .. "/cosmix/quoin-panel-pins.json"))) == 0, "shell reveal setup")
+    check(deep_eq(panel("popups.state", {}), {launcher: false, calendar: false, notes: false}), "shell reveal changed flags")
+    panel($action, {item: {id: "app-1"}})
+    check(not fixture().edges[$edge].visible, $action .. " left shell-revealed popup visible")
+  end
   -- A registration retry starts an old query in an async panel rebuild.
   -- Change both filters while that apps.list reply is delayed on the Bus.
   panel("launcher.open", {query: "old", category: "Utility"})
@@ -196,12 +242,16 @@ try
   end
   check($pending, "registration fetch did not enter delayed reply")
   panel("launcher.open", {query: "new", category: "Development"})
+  $notes_loads = fixture().notes_loads
+  $lists = fixture().lists
   for each $i in range(1, 60)
-    if not fixture().pending then break end
+    if not fixture().pending and fixture().notes_loads > $notes_loads then break end
     sleep(0.05)
   end
-  check(not fixture().pending, "delayed reply never completed")
+  check(not fixture().pending and fixture().notes_loads > $notes_loads, "registration never completed after delayed reply")
+  check(contains(fixture().launcher_scene, "Fixture new") and not contains(fixture().launcher_scene, "Fixture old"), "obsolete reply replaced scene before state read")
   $fresh = panel("launcher.state", {})
+  check(fixture().lists == $lists, "state repaired an obsolete cache with a refetch")
   check($fresh.query == "new" and $fresh.category == "Development" and $fresh.items[0].name == "Fixture new" and $fresh.items[0].categories[0] == "Development", "old reply overwrote current filter cache")
   call("panel-fixture", "fixture.mode", "{}")
   panel("launcher.close", {})

@@ -131,6 +131,11 @@ its load, page selection, reveal and pin accepted, not a compositor frame
 confirmation. A failed close returns rc 22 with
 `{error: "release_failed", open: false, edge}`. Repeated closes retry pending
 pin records, without releasing an edge another popup is using.
+Popup switches also return rc 22 if releasing the previous popup fails;
+the destination stays closed and another open retries the release.
+Scene launch/calendar actions dismiss shell-revealed popups even when the
+citizen has no open flag or pin record. A refused reveal is never pinned;
+both clicks and agent opens leave it retryable.
 
 Launcher items contain only `{id, name, generic_name, comment, icon, categories}`.
 `count` is the full matching count, before truncation; state includes at most
@@ -141,7 +146,9 @@ Search always calls `apps.list`, changes no UI or cached state,
 and defaults category to `""` and limit to 50. Limit is a non-negative integer;
 zero returns only the count. There is no additional search limit cap.
 Launch requires a non-empty string id and closes the launcher only on success.
-Apps rc 0–9 counts as success. Transport failures return rc 20 and
+If launch succeeds but release fails, rc 22 includes `launched: id` alongside
+the release error: retry `launcher.close`, not the launch.
+Apps and shell rc 0–9 count as success. Transport failures return rc 20 and
 `{error: "apps_transport", rc, reply}`; apps/broker refusals return rc 21 and
 `{error: "apps_refused", rc, reply}` (including nested rc 14 `not_found`).
 A non-list or malformed search reply returns rc 23 `apps_invalid_reply`.

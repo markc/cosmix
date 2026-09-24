@@ -5,6 +5,9 @@ $loads = 0
 $launches = []
 $mode = {}
 $pending = false
+$launcher_scene = ""
+$notes_loads = 0
+$pins = 0
 
 on fixture.mode
   $mode = $event.args
@@ -18,37 +21,41 @@ end
 
 on "shell.scene.load"
   if $mode.load_refused ?? false then reply(14, "{}"); return end
+  if contains($event.body, "name: launcher\n") then $launcher_scene = $event.body end
+  if contains($event.body, "name: notes\n") then $notes_loads = $notes_loads + 1 end
   if $mode.restart_once ?? false then
     $mode.restart_once = false
-    reply(0, json_encode({revision: 1})); return
+    reply($mode.host_rc ?? 0, json_encode({revision: 1})); return
   end
   $loads = $loads + 1
-  reply(0, json_encode({revision: $loads}))
+  reply($mode.host_rc ?? 0, json_encode({revision: $loads}))
 end
 on "shell.panel.page.set"
   if $mode.page_refused ?? false then reply(14, "{}"); return end
-  reply(0, "{}")
+  reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.show"
+  if $mode.show_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].visible = true
-  reply(0, "{}")
+  reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.pin"
+  $pins = $pins + 1
   $edges[$event.args.edge].pinned = true
-  reply(0, "{}")
+  reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.unpin"
   if $mode.release_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].pinned = false
-  reply(0, "{}")
+  reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.panel.hide"
   if $mode.hide_refused ?? false then reply(14, "{}"); return end
   $edges[$event.args.edge].visible = false
-  reply(0, "{}")
+  reply($mode.host_rc ?? 0, "{}")
 end
 on "shell.props.get"
-  reply(0, json_encode($edges[after($event.args.path, "panels.")]))
+  reply($mode.host_rc ?? 0, json_encode($edges[after($event.args.path, "panels.")]))
 end
 on "comp.windows.list"
   reply(0, json_encode({windows: []}))
@@ -93,5 +100,6 @@ on "apps.launch"
   end
 end
 on fixture.state
-  reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches, pending: $pending, loads: $loads}))
+  reply(0, json_encode({edges: $edges, lists: $lists, launches: $launches, pending: $pending, loads: $loads,
+    launcher_scene: $launcher_scene, notes_loads: $notes_loads, pins: $pins}))
 end
