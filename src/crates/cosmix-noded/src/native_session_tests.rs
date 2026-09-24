@@ -35,9 +35,12 @@ impl Broker {
         node: String,
         pending_grants_per_parent: usize,
     ) -> Self {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let listen = probe.local_addr().unwrap().to_string();
-        drop(probe);
+        // Held from bind to serve (run_on): a probe-and-drop port can be taken
+        // by an outbound ephemeral connection before noded rebinds it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         let root =
             std::env::temp_dir().join(format!("cosmix-native-{:032x}", rand::random::<u128>()));
         if unavailable {
@@ -47,7 +50,7 @@ impl Broker {
         }
         let (ready_tx, ready_rx) = oneshot::channel();
         let (probe_tx, probe_rx) = oneshot::channel();
-        let task = tokio::spawn(run(
+        let task = tokio::spawn(run_on(
             RunConfig {
                 session_probe: Some(probe_tx),
                 listen: listen.clone(),
@@ -61,6 +64,7 @@ impl Broker {
                 unix_socket: unix.then(|| root.join("bus.sock")),
                 pending_grants_per_parent,
             },
+            listener,
             ready_tx,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
