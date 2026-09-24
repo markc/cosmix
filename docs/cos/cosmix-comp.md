@@ -2002,7 +2002,28 @@ capture feed and completion path while ignoring client scene content; every
 changed animation frame marks full-output damage, so `copy_with_damage` wakes.
 The wlr protocol is a compatibility surface; the planned
 `ext-image-copy-capture-v1` implementation will become another consumer of the
-same capture service. The automated nested acceptance gate uses `grim`; the
+same capture service.
+
+**Frames are physical pixels, on nested too.** A whole-output screencopy frame
+is the output's physical buffer: at scale 2.5 a 320x240 logical output
+advertises and delivers 800x600, and a logical region is projected to
+physical pixels. On nested, the extent is the host window's own swapchain
+size, not the truncated logical size times the scale (a 2762-pixel-wide host
+at 2.5 is 1104.8 logical, reported as 1104). What a client does with the frame
+is its own business. grim composes its image at the output's integer
+`wl_output.scale`, which is 1 on nested and `ceil(scale)` on KMS, so by
+default it downsamples a nested frame to the logical size and upsamples a KMS
+one. A pixel gate that must see what the panel shows runs
+`grim -s <exact scale>`, for example `grim -s 2.5`, which composes at 1:1.
+
+An earlier note held that nested screencopy returned a LOGICAL-size frame and
+that nested pixel gates were therefore vacuous. That premise was wrong. The
+1105x622 images it cited were grim's default composition. comp itself has no
+Bus capture verb: `capture.screenshot` belongs to the separate
+`cosmix-capture` screencopy client, and a native `comp.capture.frame` is
+still a proposal.
+
+The automated nested acceptance gate uses `grim`; the
 `cosmix-screencopy-probe` binary is a deadline-bounded manual diagnostic for the
 advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
 `--dmabuf --drm-node PATH` mode waits for `buffer_done`, allocates an advertised

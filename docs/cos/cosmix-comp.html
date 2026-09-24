@@ -2301,7 +2301,25 @@ capture feed and completion path while ignoring client scene content; every
 changed animation frame marks full-output damage, so <code>copy_with_damage</code> wakes.
 The wlr protocol is a compatibility surface; the planned
 <code>ext-image-copy-capture-v1</code> implementation will become another consumer of the
-same capture service. The automated nested acceptance gate uses <code>grim</code>; the
+same capture service.</p>
+<p><strong>Frames are physical pixels, on nested too.</strong> A whole-output screencopy frame
+is the output's physical buffer: at scale 2.5 a 320x240 logical output
+advertises and delivers 800x600, and a logical region is projected to
+physical pixels. On nested, the extent is the host window's own swapchain
+size, not the truncated logical size times the scale (a 2762-pixel-wide host
+at 2.5 is 1104.8 logical, reported as 1104). What a client does with the frame
+is its own business. grim composes its image at the output's integer
+<code>wl_output.scale</code>, which is 1 on nested and <code>ceil(scale)</code> on KMS, so by
+default it downsamples a nested frame to the logical size and upsamples a KMS
+one. A pixel gate that must see what the panel shows runs
+<code>grim -s &lt;exact scale&gt;</code>, for example <code>grim -s 2.5</code>, which composes at 1:1.</p>
+<p>An earlier note held that nested screencopy returned a LOGICAL-size frame and
+that nested pixel gates were therefore vacuous. That premise was wrong. The
+1105x622 images it cited were grim's default composition. comp itself has no
+Bus capture verb: <code>capture.screenshot</code> belongs to the separate
+<code>cosmix-capture</code> screencopy client, and a native <code>comp.capture.frame</code> is
+still a proposal.</p>
+<p>The automated nested acceptance gate uses <code>grim</code>; the
 <code>cosmix-screencopy-probe</code> binary is a deadline-bounded manual diagnostic for the
 advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
 <code>--dmabuf --drm-node PATH</code> mode waits for <code>buffer_done</code>, allocates an advertised
