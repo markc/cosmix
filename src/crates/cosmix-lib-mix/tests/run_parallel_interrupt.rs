@@ -43,7 +43,7 @@ fn preset_interrupt_spawns_no_jobs_and_marks_every_result_interrupted() {
     )
     .expect("interruption is data")
     .expect("result");
-    let Value::List(results) = result else { panic!("expected list") };
+    let Value::List(results) = &result else { panic!("expected list") };
     assert_eq!(results.len(), 6);
     for result in results.iter() {
         let Value::Map(result) = result else { panic!("expected map") };
