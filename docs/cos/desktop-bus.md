@@ -203,7 +203,18 @@ the author properties ride the SPEC-12 fall-through verbs instead.
 ## Verification
 
 `tests/desktop-test.mix` exercises production request validation and result
-handling without desktop effects. `tests/desktop-bus-test.mix` uses a real,
+handling without desktop effects. Run it with `COSMIX_MESH_OPEN=0` in the
+environment:
+
+```text
+env COSMIX_MESH_OPEN=0 mix src/desktop/scripts/tests/desktop-test.mix
+```
+
+Most of the file tests the locked posture, and without that setting it fails
+early, at the first grant check. The test opens the default posture itself for
+its full-mesh-access block and restores the setting afterwards. The locked
+checks for menu, rotate and capabilities run only when the setting is `0`.
+`tests/desktop-bus-test.mix` uses a real,
 isolated noded and two production citizens with synthetic helper programs;
 it requires a user systemd manager and the installed Mix/noded binaries.
 It does not read or replace the user's clipboard or open a real browser.

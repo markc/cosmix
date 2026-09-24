@@ -160,6 +160,13 @@ file was replaced in between, it renames the replacement back and loads that
 instead. The defaults are only created at a vacant path. If a file appears
 there before they are written, that file is left untouched.
 
+On a filesystem without an exclusive rename, inputd moves the file by linking
+the backup name and then unlinking the original. If the original changed in
+between, it drops the new link, leaves the file alone and does not seed.
+
+A keymap path that is a symlink to an unusable file is never recovered. The
+link and its target are left untouched, and the target must be fixed by hand.
+
 A file that cannot be read at all is never moved, because it may be valid.
 This covers a permission error, an I/O error, or a directory at the path.
 
@@ -167,7 +174,8 @@ In these cases inputd serves the defaults in memory and does not write the
 keymap file:
 
 - the file cannot be read;
-- the unusable file cannot be renamed;
+- the unusable file cannot be renamed, or changed while being moved;
+- the keymap path is a symlink to an unusable file;
 - a file appears at the path while the defaults are being written.
 
 `input.query` then carries `persist_disabled`, naming the path and the reason.

@@ -608,7 +608,15 @@ malformed requests rc 10.</p>
 the author properties ride the SPEC-12 fall-through verbs instead.</p>
 <h2 id="verification">Verification</h2>
 <p><code>tests/desktop-test.mix</code> exercises production request validation and result
-handling without desktop effects. <code>tests/desktop-bus-test.mix</code> uses a real,
+handling without desktop effects. Run it with <code>COSMIX_MESH_OPEN=0</code> in the
+environment:</p>
+<pre><code class="language-text">env COSMIX_MESH_OPEN=0 mix src/desktop/scripts/tests/desktop-test.mix
+</code></pre>
+<p>Most of the file tests the locked posture, and without that setting it fails
+early, at the first grant check. The test opens the default posture itself for
+its full-mesh-access block and restores the setting afterwards. The locked
+checks for menu, rotate and capabilities run only when the setting is <code>0</code>.
+<code>tests/desktop-bus-test.mix</code> uses a real,
 isolated noded and two production citizens with synthetic helper programs;
 it requires a user systemd manager and the installed Mix/noded binaries.
 It does not read or replace the user's clipboard or open a real browser.

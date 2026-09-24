@@ -408,8 +408,8 @@ fn target_ok($target)
 end
 
 -- The effective mesh posture: open (the default) unless the provider runs
--- with COSMIX_MESH_OPEN=0, the opt-in lock. One reading, shared by the caller
--- gate and desktop.capabilities so the two can never disagree.
+-- with COSMIX_MESH_OPEN=0, the opt-in lock. One definition, used by both the
+-- caller gate and desktop.capabilities, so the two can never disagree.
 fn mesh_open()
   return env("COSMIX_MESH_OPEN", "1") != "0"
 end
