@@ -701,7 +701,28 @@ print(chr(0x27))         -- the runtime twin of "\u{27}"
 <p><code>ord("")</code> raises: <code>0</code> is NUL, a real codepoint that <code>chr</code> round-trips, so it cannot
 also mean "absent". <code>chr</code> takes the <code>\u{…}</code> validity rule exactly — a surrogate
 (<code>chr(0xD800)</code>), anything above <code>0x10FFFF</code>, and a fractional or negative argument
-all raise rather than saturate to a plausible wrong character.
+all raise rather than saturate to a plausible wrong character.</p>
+<h3 id="normalize--canonical-equivalence-0920"><code>normalize</code> — canonical equivalence (0.92.0)</h3>
+<p>Two strings can display identically and still differ: <code>é</code> is either one
+codepoint (precomposed, U+00E9) or two (<code>e</code> + COMBINING ACUTE, U+0301). macOS
+filenames arrive decomposed (NFD), most typed text is composed (NFC), so <code>==</code>,
+hashes and dedup keys disagree. <code>normalize(s[, form])</code> brings both to one form —
+<code>"NFC"</code> (the default), <code>"NFD"</code>, <code>"NFKC"</code> or <code>"NFKD"</code>, case-insensitive; any other
+form raises <code>VALUE_ERROR</code>.</p>
+<pre><code class="language-mix">$d = "e" .. chr(769)          -- decomposed: e + combining acute
+$c = chr(233)                 -- precomposed é
+print($d == $c)
+print(normalize($d) == $c)
+print(normalize(chr(64257), "NFKC"))   -- the ﬁ ligature, compatibility-folded
+</code></pre>
+<pre><code class="language-text">false
+true
+fi
+</code></pre>
+<p>The <code>K</code> forms also fold <em>compatibility</em> characters — ligatures, fullwidth
+letters, superscripts — so they lose information; use them for search and
+matching keys, and plain NFC for storage. Emoji, skin-tone modifiers, flags and
+ZWJ sequences pass through every form unchanged.
 A plain <code>substr</code>/<code>reverse</code> is codepoint-based and <strong>splits</strong> an emoji ZWJ sequence or
 combining cluster; the <code>grapheme_*</code> ops keep it whole:</p>
 <pre><code class="language-mix">print(reverse("a👍🏽b"))          -- codepoint reverse splits the skin-tone modifier

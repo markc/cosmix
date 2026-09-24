@@ -119,3 +119,39 @@ fn subtraction_keeps_its_meaning_outside_the_target_shape() {
     assert_eq!(as_string_literal(left), "a");
     assert_eq!(as_string_literal(right), "b");
 }
+
+/// A malformed-number segment (`007`, `1.2.3`) in the bare target used to
+/// be refused by the LEXER (`ambiguous leading-zero number '007'`) before
+/// the parser's hyphen scan could read the word — an error naming neither
+/// `send` nor the service. It now lexes as a word segment in that position
+/// only, for all three keywords.
+#[test]
+fn malformed_number_segments_in_the_bare_target_parse_whole() {
+    for (src, want) in [
+        ("send node-007 ping", "node-007"),
+        ("send node-7-x ping", "node-7-x"),
+        ("send svc-01 ping", "svc-01"),
+        ("send a-1.2.3 ping", "a-1.2.3"),
+    ] {
+        let stmt = parse_first_statement(src);
+        let StmtKind::Send { target, command, .. } = &stmt.kind else {
+            panic!("expected a Send statement for {src:?}, got {:?}", stmt.kind);
+        };
+        assert_eq!(as_string_literal(target), want);
+        assert_eq!(as_string_literal(command), "ping");
+    }
+    let stmt = parse_first_statement("emit node-007 ping");
+    let StmtKind::Emit { target, .. } = &stmt.kind else {
+        panic!("expected an Emit statement, got {:?}", stmt.kind);
+    };
+    assert_eq!(as_string_literal(target), "node-007");
+    let stmt = parse_first_statement("address node-007\n  ping\nend");
+    let StmtKind::Address { target, .. } = &stmt.kind else {
+        panic!("expected an Address statement, got {:?}", stmt.kind);
+    };
+    assert_eq!(as_string_literal(target), "node-007");
+
+    // Outside the bare target the refusal is unchanged.
+    let err = Lexer::new("$x = 007").tokenize().expect_err("007 is still refused");
+    assert!(format!("{err}").contains("ambiguous leading-zero number '007'"), "{err}");
+}

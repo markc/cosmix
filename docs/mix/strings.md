@@ -346,6 +346,33 @@ print(chr(0x27))         -- the runtime twin of "\u{27}"
 also mean "absent". `chr` takes the `\u{…}` validity rule exactly — a surrogate
 (`chr(0xD800)`), anything above `0x10FFFF`, and a fractional or negative argument
 all raise rather than saturate to a plausible wrong character.
+
+### `normalize` — canonical equivalence (0.92.0)
+
+Two strings can display identically and still differ: `é` is either one
+codepoint (precomposed, U+00E9) or two (`e` + COMBINING ACUTE, U+0301). macOS
+filenames arrive decomposed (NFD), most typed text is composed (NFC), so `==`,
+hashes and dedup keys disagree. `normalize(s[, form])` brings both to one form —
+`"NFC"` (the default), `"NFD"`, `"NFKC"` or `"NFKD"`, case-insensitive; any other
+form raises `VALUE_ERROR`.
+
+```mix
+$d = "e" .. chr(769)          -- decomposed: e + combining acute
+$c = chr(233)                 -- precomposed é
+print($d == $c)
+print(normalize($d) == $c)
+print(normalize(chr(64257), "NFKC"))   -- the ﬁ ligature, compatibility-folded
+```
+```text
+false
+true
+fi
+```
+
+The `K` forms also fold *compatibility* characters — ligatures, fullwidth
+letters, superscripts — so they lose information; use them for search and
+matching keys, and plain NFC for storage. Emoji, skin-tone modifiers, flags and
+ZWJ sequences pass through every form unchanged.
 A plain `substr`/`reverse` is codepoint-based and **splits** an emoji ZWJ sequence or
 combining cluster; the `grapheme_*` ops keep it whole:
 

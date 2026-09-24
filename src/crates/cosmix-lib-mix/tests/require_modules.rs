@@ -731,3 +731,23 @@ async fn module_fn_shadowing_prelude_name_still_exports() {
     .unwrap();
     assert_eq!(out, "[sum]\n-1\n-1\n");
 }
+
+// A module whose top level runs a `send` (no Bus here → the non-fatal
+// RC_UNAVAILABLE path) binds `$rc`, `$result` and `$reply`; none of the
+// three is part of its exports.
+#[tokio::test]
+async fn send_bound_vars_are_not_exported() {
+    let dir = test_dir("send_vars_excl");
+    write_module(&dir, "m.mix", "send svc ping\n$kept = 1\n");
+    let out = run_in_dir(
+        &dir,
+        "$m = require(\"m.mix\")\n\
+         print(contains(keys($m), \"kept\"))\n\
+         print(contains(keys($m), \"rc\"))\n\
+         print(contains(keys($m), \"result\"))\n\
+         print(contains(keys($m), \"reply\"))\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(out, "true\nfalse\nfalse\nfalse\n");
+}

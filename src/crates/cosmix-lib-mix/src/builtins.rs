@@ -108,6 +108,7 @@ builtin_table! {
     // UTF-8 bytes, not codepoints.
     ("ord", CapabilityClass::Pure,             "string",  "Unicode codepoint of the FIRST character: ord(\"A\") -> 65, ord(\"é\") -> 233. Empty string raises. Inverse: chr()", contract!((s: string) -> number; failure[raises])),
     ("chr", CapabilityClass::Pure,             "string",  "The 1-character string for a Unicode codepoint: chr(65) -> \"A\", chr(10084) -> \"❤\". Surrogates (D800-DFFF) and >0x10FFFF raise, same rule as \\u{...}. Inverse: ord()", contract!((n: number) -> string; failure[raises])),
+    ("normalize", CapabilityClass::Pure,       "string",  "Unicode normalisation (UAX #15): normalize(s[, form]) with form \"NFC\" (default), \"NFD\", \"NFKC\" or \"NFKD\" (case-insensitive; anything else raises VALUE_ERROR). Makes canonically-equivalent text compare equal: a decomposed e + combining acute (macOS filenames, NFD) equals the precomposed é after normalize(); NFKC also folds compatibility forms (fullwidth letters, ligatures: normalize(\"ﬁ\", \"NFKC\") -> \"fi\"). Emoji and ZWJ sequences pass through unchanged (v0.92.0)", contract!((s: string, form?: string) -> string; failure[raises])),
     // --- Subject-first string helpers (0.63.0). Tier 1 (delimiter family):
     // absent delimiter/marker -> nil, "" is a REAL result (delimiter at the
     // edge), empty delimiter raises — nil and "" never blur. Tier 2
@@ -309,7 +310,7 @@ builtin_table! {
     ("run_argv_must", CapabilityClass::Process,   "system",  "Fail-fast run_argv with the same structured stdio opts: returns captured stdout unchanged when ok and no captured stream truncated (\"\" when stdout is routed), else raises PROCESS_EXIT_NONZERO / PROCESS_TIMEOUT / PROCESS_SIGNAL / PROCESS_INTERRUPTED / PROCESS_OUTPUT_LIMIT or the result's setup/lifecycle error_code (PROCESS_STDIO / PROCESS_SPAWN / PROCESS_IO / PROCESS_INTERNAL) with the complete result map in $err.details.result", contract!((argv: list(string), opts?: map("run_argv_options", {timeout: number, stdin: any_of(string, bytes, buffer, map, nil), stdout: any_of(string, map), stderr: any_of(string, map), cwd: any_of(string, nil), env: map, clear_env: bool, max_output: number, stream: bool})) -> string; effects[blocking]; failure[raises])),
     ("run_pipeline", CapabilityClass::Process,    "system",  "Run one or more argv stages without a shell, connecting each stdout to the next stdin. Stage maps accept argv/cwd/env/clear_env/stderr, plus stdin on the first stage and stdout on the last, using run_argv's stdio grammar. Every route and pipe is prepared before any stage runs, so PIPELINE_STDIO means no stage ran. Returns a distinct pipeline_result with final stdout/exit fields and per-stage outcomes. One whole-call deadline starts before route opening; captured output abandoned at that deadline is partial with its truncation flag true. Non-final SIGPIPE is NOT accepted by default: any stage killed by a signal makes the pipeline not-ok, matching `set -o pipefail`. Pass allow_signal:true to accept a non-final SIGPIPE when every downstream stage succeeded (the `yes | head -1` idiom). Ordinary failure is encoded in the VALUE — never raises", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> map("pipeline_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, stages: list(map("pipeline_stage_result", {index: number, argv: list(string), ok: bool, exit_code: any, signal: any, duration_ms: number, stderr: string, stderr_truncated: bool, utf8_lossy: bool, accepted_signal: bool}))}); effects[must_use, blocking]; failure[returns_result])),
     ("run_pipeline_must", CapabilityClass::Process, "system", "Fail-fast run_pipeline twin: returns final stdout unchanged when the pipeline is ok and no captured output truncated; otherwise raises PIPELINE_* with the complete pipeline_result in $err.details.result", contract!((stages: list, opts?: map("run_pipeline_options", {timeout: number, max_output: number, allow_signal: bool})) -> string; effects[blocking]; failure[raises])),
-    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal, so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
+    ("spawn", CapabilityClass::Process,           "system",  "Start a background process, return its PID (never a result map — spawn is fire-and-forget, owns nothing after it returns). TWO forms, dispatched on the first arg. STRING → /bin/sh -c shell form: spawn(cmd[, stdout][, stderr]); every arg must be a STRING, none coerced (a non-string raises TYPE_MISMATCH rather than a doomed sh command). LIST → argv form (v0.89.0, no shell): spawn(argv, [{detach, cwd, env, clear_env, stdout, stderr}]) — argv is a non-empty list of strings run directly; detach:true puts the child in a NEW SESSION (setsid) with no controlling terminal AND double-forks it so it is reparented to init (the caller never holds a zombie — v0.92.0), so a hangup or the caller exiting won't take it down (the daemon/launcher slot; session separation, not immortality); cwd/env/clear_env mirror run_argv; stdout/stderr take \"null\"(default)/\"inherit\"/{file,append?,mode?} (and stderr:\"stdout\" to merge), but NOT \"capture\" (capturing means waiting — use run_argv). File-open failure means the child is not spawned. No wait/reap/supervision (a NON-detached child is still the caller's to reap) — that is run_argv's / a supervisor's job", contract!((cmd: any_of(string, list), stdout?: any, stderr?: any) -> number; effects[shell]; failure[raises])),
     ("kill", CapabilityClass::Process,            "system",  "Send signal to process (default SIGTERM); returns false when the signal could not be delivered. Both arguments must be whole NUMBERS and neither is coerced — a bool/string pid raises TYPE_MISMATCH rather than becoming 0 (which signals this process's whole group), and an unrecognised signal raises rather than silently defaulting to SIGTERM (strict since v0.52.0)", contract!((pid: number, signal?: number) -> bool; effects[must_use]; failure[returns_result])),
     ("shell_quote", CapabilityClass::Pure,     "system",  "Single-quote-wrap a string for safe interpolation into a POSIX shell command", contract!((s: string) -> string)),
     ("sql_quote", CapabilityClass::Pure,       "system",  "Escape a string for SQL string literals: doubles ' and escapes \\ (MySQL/MariaDB-safe — the documented target; also safe for SQLite, where a literal backslash arrives doubled — use sqlexec binds for exact bytes); NUL bytes stripped", contract!((s: string) -> string)),
@@ -443,6 +444,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "word" => builtin_word(args),
         "ord" => builtin_ord(args),
         "chr" => builtin_chr(args),
+        "normalize" => builtin_normalize(args),
         // Char-aware string ops (P0) — see the registry block above.
         "byte_length" => builtin_byte_length(args),
         "byte_pos" => builtin_byte_pos(args),
@@ -2263,6 +2265,41 @@ fn builtin_ord(args: Vec<Value>) -> MixResult<Option<Value>> {
     Ok(Some(Value::Number(c as u32 as f64)))
 }
 
+/// `normalize(s[, form])` — UAX #15 normalisation. The subject is taken with
+/// `to_mix_string` like `ord`/`upper`; the form is a category string and is
+/// NOT coerced — a typo must raise, not silently pick a default.
+fn builtin_normalize(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use unicode_normalization::UnicodeNormalization;
+    expect_args_between("normalize", &args, 1, 2)?;
+    let s = args[0].to_mix_string();
+    let form = match args.get(1) {
+        None | Some(Value::Nil) => "NFC".to_string(),
+        Some(Value::String(f)) => f.to_ascii_uppercase(),
+        Some(other) => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!("normalize(): form must be a string, got {}", other.type_name()),
+            ));
+        }
+    };
+    let out: String = match form.as_str() {
+        "NFC" => s.nfc().collect(),
+        "NFD" => s.nfd().collect(),
+        "NFKC" => s.nfkc().collect(),
+        "NFKD" => s.nfkd().collect(),
+        _ => {
+            return Err(MixError::structured(
+                "VALUE_ERROR",
+                format!(
+                    "normalize(): unknown form '{}' — use \"NFC\" (default), \"NFD\", \"NFKC\" or \"NFKD\"",
+                    sanitize_for_diag(&form)
+                ),
+            ));
+        }
+    };
+    Ok(Some(Value::String(out)))
+}
+
 fn builtin_chr(args: Vec<Value>) -> MixResult<Option<Value>> {
     expect_args("chr", &args, 1)?;
     let n = number_arg("chr", &args, 0)?;
@@ -3955,6 +3992,8 @@ fn builtin_spawn(args: Vec<Value>) -> MixResult<Option<Value>> {
 ///   controlling terminal and its own session, so a terminal hangup or the
 ///   caller exiting does not take it down (session separation, not
 ///   immortality — a cgroup teardown or explicit signal still reaches it).
+///   It is also double-forked (see `spawn_detached`): the child is
+///   reparented to init, so a long-lived caller never collects zombies.
 /// - `cwd`/`env`/`clear_env` mirror run_argv exactly.
 /// - `stdout`/`stderr` reuse run_argv's routing, restricted to what makes
 ///   sense for a process whose output nobody waits on: `"null"` (default),
@@ -4221,24 +4260,8 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         RunArgvStderr::Capture => unreachable!("rejected above"),
     }
 
-    #[cfg(unix)]
     if detach {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid() is a thin, async-signal-safe syscall wrapper —
-        // no allocation, no locks, no global state — safe in the post-fork
-        // pre-exec window. A new session gives the child no controlling
-        // terminal and its own session, so a terminal hangup or the caller
-        // exiting does not take it down. (This is session separation, not
-        // immortality: a service cgroup teardown or an explicit signal to
-        // the child still reaches it.)
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        return spawn_detached(command);
     }
 
     let child = command.spawn().map_err(|e| MixError::RuntimeError {
@@ -4246,6 +4269,132 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
         msg: format!("spawn failed: {e}"),
     })?;
     Ok(Some(Value::Number(child.id() as f64)))
+}
+
+/// A `fork` inside a forked child: the second fork must not be `libc::fork`,
+/// which runs every registered `pthread_atfork` handler. The intermediate is
+/// single-threaded, so a prepare handler that waits on another thread (an
+/// embedder's, or any linked crate's) deadlocks it — and POSIX.1-2024 no
+/// longer lists `fork` as async-signal-safe for exactly that reason. The raw
+/// `clone(SIGCHLD)` syscall is fork without the handlers. (glibc's `_Fork`
+/// is the same thing but the libc crate does not bind it.) The intermediate
+/// then only calls `write` and `_exit`, and the grandchild only `setsid`
+/// before std's exec, so the stale thread-id glibc keeps in their TLS is
+/// never consulted.
+///
+/// # Safety
+/// Call only in a post-fork child (the pre_exec window).
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")
+))]
+unsafe fn raw_fork() -> libc::pid_t {
+    // On these three arches clone(2) takes (flags, newsp, parent_tid,
+    // child_tid, tls). Every argument after the flags is 0: no new stack
+    // (copy-on-write, as fork), no tid pointers, no TLS. Not every arch
+    // agrees — s390x swaps the first two (CLONE_BACKWARDS2) — so the raw
+    // path is limited to arches whose order is known.
+    unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_long, 0, 0, 0, 0) as libc::pid_t }
+}
+
+/// Elsewhere (other unix, other Linux arches): fall back to fork; the
+/// atfork caveat above applies there.
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")
+)))]
+unsafe fn raw_fork() -> libc::pid_t {
+    unsafe { libc::fork() }
+}
+
+/// `detach: true`: double-fork, so the caller owns nothing after it returns.
+///
+/// A plain `setsid` child stays the caller's child: when it exits it is a
+/// zombie until the caller reaps it, and a long-lived caller (a `mix --serve`
+/// launcher citizen) never does — TODO-mix P8, five zombies on apps.mix after
+/// a day of ordinary use. So the forked child (the "intermediate") forks
+/// again in the pre-exec window, reports the grandchild's pid down a pipe and
+/// `_exit`s; we reap the intermediate at once and the grandchild is
+/// reparented to init (or the nearest subreaper), which reaps it. The
+/// grandchild calls `setsid`, so it still leads its own session with no
+/// controlling terminal (the 0.89.0 contract: SID == returned PID).
+///
+/// Exec failures still surface: std's exec-error pipe is inherited by the
+/// grandchild and only reaches EOF once it has exec'd (CLOEXEC) or written
+/// its errno, so `spawn()` below reports a missing binary exactly as before.
+fn spawn_detached(mut command: std::process::Command) -> MixResult<Option<Value>> {
+    use std::io::Read;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 fills `fds` with two fresh descriptors or fails.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("spawn: pid pipe: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: both fds were just created and are owned only here.
+    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // Move the write end to fd >= 3. A caller that closed its stdio gets the
+    // pipe on 0/1/2, and std's child-side dup2 of the stdio routes would then
+    // overwrite it before our pre_exec runs: the grandchild would start and
+    // spawn would raise "pid was not reported".
+    // SAFETY: fcntl returns a fresh owned fd or -1; fds[1] is ours to close.
+    let wfd = unsafe { libc::fcntl(fds[1], libc::F_DUPFD_CLOEXEC, 3) };
+    unsafe { libc::close(fds[1]) };
+    if wfd < 0 {
+        return Err(MixError::RuntimeError {
+            span: None,
+            msg: format!("spawn: pid pipe: {}", std::io::Error::last_os_error()),
+        });
+    }
+    // SAFETY: wfd was just created by fcntl and is owned only here.
+    let write_end = unsafe { OwnedFd::from_raw_fd(wfd) };
+
+    // SAFETY: only raw syscalls (clone/fork, write, _exit, setsid) run in the
+    // post-fork pre-exec window — no allocation, no locks, no atfork handlers.
+    unsafe {
+        command.pre_exec(move || {
+            match raw_fork() {
+                -1 => Err(std::io::Error::last_os_error()),
+                0 => {
+                    // Grandchild: new session, then on to exec.
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                }
+                grandchild => {
+                    // Intermediate: hand the pid up and vanish. A short
+                    // write leaves the parent with no pid, which it reports.
+                    let bytes = grandchild.to_ne_bytes();
+                    libc::write(wfd, bytes.as_ptr().cast(), bytes.len());
+                    libc::_exit(0);
+                }
+            }
+        });
+    }
+
+    let spawned = command.spawn();
+    // Drop our write end before reading so a missing pid reads as EOF.
+    drop(write_end);
+    let mut intermediate = spawned.map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("spawn failed: {e}"),
+    })?;
+    // The intermediate has already exited (or is about to); reap it so the
+    // caller is left with no child at all.
+    let _ = intermediate.wait();
+
+    let mut buf = [0u8; std::mem::size_of::<libc::pid_t>()];
+    let mut pipe = std::fs::File::from(read_end);
+    pipe.read_exact(&mut buf).map_err(|e| MixError::RuntimeError {
+        span: None,
+        msg: format!("spawn: detached child's pid was not reported: {e}"),
+    })?;
+    Ok(Some(Value::Number(libc::pid_t::from_ne_bytes(buf) as f64)))
 }
 
 /// Open a stdout route's file (if it is a file route) once, so a stderr:stdout
@@ -26693,6 +26842,8 @@ mod char_aware_tests {
             // Codepoint <-> character (0.90.0) — pure string arithmetic.
             "ord",
             "chr",
+            // Unicode normalisation (0.92.0) — pure table lookup.
+            "normalize",
             "parse_form",
             "parse_query",
             "password_hash",

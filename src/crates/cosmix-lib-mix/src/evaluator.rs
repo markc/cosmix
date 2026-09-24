@@ -141,6 +141,26 @@ fn parse_event_args(_body: &str) -> Value {
     Value::Nil
 }
 
+/// A JSON string literal for `s`, without the optional `json` feature —
+/// the runtime's own refusal bodies must encode in every build.
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// In-place `container[idx] = val`. Returns `Some(error_message)` to
 /// raise, or `None` on success. Shared by the async `IndexAssignment`
 /// arm and the for-loop fast path so signed-index and non-container
@@ -1752,6 +1772,31 @@ pub trait BusHandler {
         command: &'a str,
         args: &'a Value,
     ) -> BusFuture<'a, MixResult<(i32, Value)>>;
+
+    /// [`Self::send`] plus the reply BODY, JSON-parsed (`Nil` when the body
+    /// is empty or not JSON) — what the `send` keyword binds to `$reply`.
+    /// `$result` reduces an `{"error": …}` refusal to its message string on
+    /// purpose; `$reply` keeps every field (`occluded.under`,
+    /// `stale_target.current`, …). The default derives it from `send`'s
+    /// result: a map/list/number/bool/nil passes through, and any STRING is
+    /// `Nil` — it cannot tell a JSON string body from a non-JSON one (or from
+    /// a reduced error message), and the manual promises nil for non-JSON.
+    /// A handler that can see the raw body overrides this.
+    fn send_with_reply<'a>(
+        &'a self,
+        target: &'a str,
+        command: &'a str,
+        args: &'a Value,
+    ) -> BusFuture<'a, MixResult<(i32, Value, Value)>> {
+        Box::pin(async move {
+            let (rc, result) = self.send(target, command, args).await?;
+            let reply = match &result {
+                Value::String(_) => Value::Nil,
+                other => other.clone(),
+            };
+            Ok((rc, result, reply))
+        })
+    }
 
     /// Fire-and-forget send. Returns immediately after dispatching.
     fn emit<'a>(
@@ -4658,6 +4703,67 @@ impl Evaluator {
         outcome
     }
 
+    /// Answer a `type=request` naming a command this script has no `on`
+    /// handler for: rc 10 (the application-error band, as noded answers an
+    /// unknown verb) with an `error_code` body, so `send` hands the caller a
+    /// structured refusal — the verb and the declared set — immediately.
+    /// Anything that is not a correlated request is dropped as before.
+    async fn refuse_unknown_command(&self, event: &IncomingEvent) {
+        if event.headers.get("type").map(String::as_str) != Some("request") {
+            return;
+        }
+        // A verb the serve runtime reserves (HELP/INFO/QUIT/RELOAD,
+        // `<svc>.props.get|list|describe`) is never "unknown". The event
+        // pump answers those before dispatch; the `sleep()` yield loop calls
+        // dispatch_event directly, and a reserved verb arriving there keeps
+        // its old fate (dropped) rather than a false UNKNOWN_COMMAND.
+        // `correlated: false` makes the probe side-effect free (RELOAD skips
+        // its re-read; nothing is sent).
+        let runtime = self.globals.borrow().serve_runtime.clone();
+        if let Some(rt) = runtime
+            && rt
+                .handle_reserved(&event.command, None, "", &[], false)
+                .is_some()
+        {
+            return;
+        }
+        let (handler, mut available) = {
+            let g = self.globals.borrow();
+            let available: Vec<String> = g
+                .handlers
+                .iter()
+                .filter(|(_, entries)| !entries.is_empty())
+                .map(|(cmd, _)| cmd.clone())
+                .collect();
+            (g.bus_handler.clone(), available)
+        };
+        let Some(handler) = handler else {
+            return;
+        };
+        available.sort();
+        // `error` carries the message too: a JSON-body `send` reduces an
+        // rc >= 10 body to its `error` string for `$result` (a body with no
+        // `error` would reach the caller as raw JSON text), so the caller
+        // gets a readable `$result` and the structure in `$reply`.
+        let message = json_quote(&format!(
+            "unknown command '{}' (this citizen handles: {}; HELP lists them)",
+            event.command,
+            if available.is_empty() { "none".to_string() } else { available.join(", ") }
+        ));
+        let body = format!(
+            "{{\"error_code\":\"UNKNOWN_COMMAND\",\"error\":{message},\"message\":{message},\"command\":{},\"available\":[{}]}}",
+            json_quote(&event.command),
+            available.iter().map(|c| json_quote(c)).collect::<Vec<_>>().join(","),
+        );
+        let from = event.headers.get("from").cloned().unwrap_or_default();
+        if let Err(e) = handler
+            .reply(&from, &event.command, event.headers.get("id").map(String::as_str), 10, &body)
+            .await
+        {
+            tracing::error!(command = %event.command, error = %e, "UNKNOWN_COMMAND reply failed");
+        }
+    }
+
     /// Dispatch an event: classify the registered chain for
     /// `event.command`, register the reply correlation, and route to
     /// the Class S inline path or the Class C `tokio::task::spawn_local`
@@ -4706,10 +4812,22 @@ impl Evaluator {
         // directive: do not store handles for commands with no
         // handlers). WS3-C.5 clone-out: scope the borrow inside a block
         // so the `Ref` does not survive the awaits below.
-        let entries: Vec<HandlerEntry> = match self.globals.borrow().handlers.get(&event.command) {
-            Some(v) if !v.is_empty() => v.clone(),
-            _ => return Ok(()),
-        };
+        //
+        // A correlated REQUEST for a command with no handler is refused
+        // at once (UNKNOWN_COMMAND) rather than dropped: dropping it left
+        // the caller waiting out its whole timeout and then blaming the
+        // mesh for a mistyped verb. Topic deliveries stay silent.
+        let entries: Vec<HandlerEntry> = self
+            .globals
+            .borrow()
+            .handlers
+            .get(&event.command)
+            .cloned()
+            .unwrap_or_default();
+        if entries.is_empty() {
+            self.refuse_unknown_command(&event).await;
+            return Ok(());
+        }
         let chain_class = ChainClass::from_entries(&entries);
         tracing::trace!(
             command = %event.command,
@@ -12571,7 +12689,12 @@ impl Evaluator {
         {
             return Ok(None);
         }
+        // EVAL_SPECIAL_BUILTINS (printf, write_stdout, serve_name, …) are
+        // outside `is_builtin` by design, so they need their own guard here:
+        // without it `printf() + 1` called a user `fn printf` while a plain
+        // `printf()` called the builtin.
         if crate::builtins::is_builtin(name)
+            || crate::builtins::EVAL_SPECIAL_BUILTINS.contains(&name.as_str())
             || crate::builtins_hof::lookup(name).is_some()
             || self.globals.borrow().extensions.contains_key(name)
             || matches!(
@@ -13701,17 +13824,19 @@ impl Evaluator {
                     "result",
                     Value::String("Bus not available (no handler registered)".to_string()),
                 );
+                self.scope.update_or_set("reply", Value::Nil);
                 return Ok(Value::Nil);
             }
         };
         // SPEC 18 Phase 2 WS3-C.7e — yield-on-send. The outer `?` keeps
         // a yield-machinery error fatal; the inner send outcome is
         // mapped to the rc bands, never aborts.
-        let send_fut = handler.send(&target, name, &args_map);
+        let send_fut = handler.send_with_reply(&target, name, &args_map);
         match self.await_with_class_c_yield(send_fut).await? {
-            Ok((rc, result)) => {
+            Ok((rc, result, reply)) => {
                 self.scope.update_or_set("rc", Value::Number(rc as f64));
                 self.scope.update_or_set("result", result.clone());
+                self.scope.update_or_set("reply", reply);
                 Ok(result)
             }
             Err(e) => {
@@ -13719,6 +13844,7 @@ impl Evaluator {
                     .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
                 self.scope
                     .update_or_set("result", Value::String(e.to_string()));
+                self.scope.update_or_set("reply", Value::Nil);
                 Ok(Value::Nil)
             }
         }
@@ -13994,14 +14120,19 @@ impl Evaluator {
                     "result",
                     Value::String("Bus not available (no handler registered)".to_string()),
                 );
+                self.scope.update_or_set("reply", Value::Nil);
                 return Ok(Value::Number(RC_UNAVAILABLE as f64));
             }
         };
+        // `$reply` is cleared on every path: publish sets `$rc`/`$result`
+        // like send, and a `$reply` left over from an earlier send would
+        // otherwise read as this call's.
         let fut = handler.send("noded", "topic.publish", &args_value);
         match self.await_with_class_c_yield(fut).await? {
             Ok((rc, result)) => {
                 self.scope.update_or_set("rc", Value::Number(rc as f64));
                 self.scope.update_or_set("result", result);
+                self.scope.update_or_set("reply", Value::Nil);
                 Ok(Value::Number(rc as f64))
             }
             Err(e) => {
@@ -14009,6 +14140,7 @@ impl Evaluator {
                     .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
                 self.scope
                     .update_or_set("result", Value::String(e.to_string()));
+                self.scope.update_or_set("reply", Value::Nil);
                 Ok(Value::Number(RC_TRANSPORT as f64))
             }
         }
@@ -14059,6 +14191,7 @@ impl Evaluator {
                     self.scope
                         .update_or_set("rc", Value::Number(RC_UNAVAILABLE as f64));
                     self.scope.update_or_set("result", Value::String(err_msg));
+                    self.scope.update_or_set("reply", Value::Nil);
                     return Ok(Value::Nil);
                 }
             };
@@ -14083,7 +14216,7 @@ impl Evaluator {
             // is dropped at the broker — no resource leak) and write the
             // typed `(rc=-1, result="timeout: ...")` shape that mirrors
             // other transport failures (don't invent a new rc="timeout").
-            let send_fut = handler.send(&target_str, &command_str, &args_map);
+            let send_fut = handler.send_with_reply(&target_str, &command_str, &args_map);
             let timeout_secs = timeout.map(|d| d.as_secs_f64());
             let outcome = match timeout {
                 None => self.await_with_class_c_yield(send_fut).await?,
@@ -14100,18 +14233,21 @@ impl Evaluator {
                             self.scope
                                 .update_or_set("rc", Value::Number(RC_TIMEOUT as f64));
                             self.scope.update_or_set("result", Value::String(err_msg));
+                            self.scope.update_or_set("reply", Value::Nil);
                             return Ok(Value::Nil);
                         }
                     }
                 }
             };
             match outcome {
-                Ok((rc, result)) => {
+                Ok((rc, result, reply)) => {
                     // The handler's signed rc verbatim: 0 ok, >=10 broker/app
                     // error, or RC_UNAVAILABLE (-3) for its own no-broker
-                    // degrade. Always numeric.
+                    // degrade. Always numeric. `$reply` is the whole parsed
+                    // reply body, success or refusal (0.92.0).
                     self.scope.update_or_set("rc", Value::Number(rc as f64));
                     self.scope.update_or_set("result", result.clone());
+                    self.scope.update_or_set("reply", reply);
                     Ok(result)
                 }
                 Err(e) => {
@@ -14122,6 +14258,7 @@ impl Evaluator {
                     self.scope
                         .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
                     self.scope.update_or_set("result", Value::String(err_msg));
+                    self.scope.update_or_set("reply", Value::Nil);
                     Ok(Value::Nil)
                 }
             }
@@ -14724,7 +14861,8 @@ impl Evaluator {
             Self::rewrap_functions(&mut ret, &env);
             return ret;
         }
-        const EXCLUDED_VARS: &[&str] = &["rc", "result", "status", "event"];
+        // `reply` joins `rc`/`result`: `send` binds all three (0.92.0).
+        const EXCLUDED_VARS: &[&str] = &["rc", "result", "reply", "status", "event"];
         let mut exports = IndexMap::new();
         for (name, f) in wrapped {
             if !name.starts_with('_') {

@@ -128,7 +128,8 @@ pub struct Analysis {
 }
 
 /// Runtime-injected variable names a lint must treat as declared.
-const INJECTED_VARS: &[&str] = &["rc", "result", "status", "event", "_"];
+/// `reply` is bound by `send` since 0.92.0 (the whole parsed reply body).
+const INJECTED_VARS: &[&str] = &["rc", "result", "reply", "status", "event", "_"];
 
 /// Function names defined by the embedded prelude (parsed once).
 pub fn prelude_function_names() -> &'static HashSet<String> {

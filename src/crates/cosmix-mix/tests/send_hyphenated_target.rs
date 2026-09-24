@@ -119,6 +119,15 @@ fn the_accepted_shape_covers_real_service_names() {
         "svc-1",
         "svc-10",
         "desktop-vt01",
+        // An all-digit segment that is a MALFORMED number (leading zero,
+        // several dots). The lexer refused these before the parser could
+        // see them (`ambiguous leading-zero number '007'`, an error that
+        // never mentioned send); since 0.92.0 it lexes them as word
+        // segments in bare target position only.
+        "svc-01",
+        "node-007",
+        "node-7-x",
+        "a-1.2.3",
         // A LEADING SEGMENT THAT IS A MIX KEYWORD. `next`, `print`,
         // `on`, `source`, `select`, `loop`, `end`, `to`, `in`, `and`
         // and friends all lex as keyword tokens, not identifiers, so a
@@ -148,19 +157,37 @@ fn the_accepted_shape_covers_real_service_names() {
     }
 }
 
-/// The shapes the LEXER refuses before the parser can see them. They
-/// are pinned so the manual's "quote these" table stays true, and so
-/// that fixing them later (it would take a lexer change, not a parser
-/// one) is a deliberate act with a failing test to notice.
+/// The shape the LEXER still refuses before the parser can see it: `fn-…`,
+/// where `fn` starts a lambda. Pinned so the manual's "quote these" table
+/// stays true, and so fixing it later is a deliberate act with a failing
+/// test to notice. (The malformed-number segments — `svc-01`, `node-007`,
+/// `a-1.2.3` — left this list in 0.92.0; they are in the accepted shapes.)
 #[test]
-fn malformed_number_segments_still_need_quoting() {
-    for name in ["svc-01", "node-007", "a-1.2.3", "fn-svc"] {
-        let out = mix(&["-c", &format!("send {name} ping timeout=1")]);
-        assert!(
-            !out.status.success(),
-            "{name:?} now works bare — update docs/mix/bus.md's quote-it table"
-        );
-        // …and the quoted spelling is the documented way through.
+fn fn_prefixed_names_still_need_quoting() {
+    let name = "fn-svc";
+    let out = mix(&["-c", &format!("send {name} ping timeout=1")]);
+    assert!(
+        !out.status.success(),
+        "{name:?} now works bare — update docs/mix/bus.md's quote-it table"
+    );
+    // …and the quoted spelling is the documented way through.
+    let out = mix(&[
+        "-c",
+        &format!("send \"{name}\" ping timeout=1\nprint(to_string($rc))"),
+    ]);
+    assert!(
+        out.status.success(),
+        "the quoted form of {name:?} must work: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The QUOTED spelling of a once-refused name still works on its own — it
+/// was the documented way through before 0.92.0 and scripts use it. (The
+/// differential above also runs it, but only as the comparison side.)
+#[test]
+fn quoted_malformed_number_names_still_work() {
+    for name in ["svc-01", "node-007", "a-1.2.3"] {
         let out = mix(&[
             "-c",
             &format!("send \"{name}\" ping timeout=1\nprint(to_string($rc))"),
@@ -169,6 +196,28 @@ fn malformed_number_segments_still_need_quoting() {
             out.status.success(),
             "the quoted form of {name:?} must work: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The malformed-number leniency is confined to the bare send target:
+/// everywhere else a leading-zero or multi-dot number keeps its refusal
+/// verbatim — including a `$var-007` target and a hyphenated COMMAND.
+#[test]
+fn malformed_numbers_outside_the_bare_target_are_still_refused() {
+    for src in [
+        "$x = 007",
+        "$a = 1\n$x = $a-007",
+        "$t = \"s\"\nsend $t-007 ping timeout=1",
+        "send svc cmd-007 timeout=1",
+        "$x = send-007",
+    ] {
+        let out = mix(&["-c", src]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{src:?} must still be refused");
+        assert!(
+            stderr.contains("ambiguous leading-zero number '007'"),
+            "{src:?} must keep today's refusal verbatim: {stderr}"
         );
     }
 }

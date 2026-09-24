@@ -478,9 +478,10 @@ Mix it is grammar.</p>
 <hr />
 <h2 id="send--rpc-requestreply"><code>send</code> — RPC (request/reply)</h2>
 <p><code>send &lt;target&gt; &lt;command&gt; [key=value …]</code> dispatches a command and <strong>waits for the
-reply</strong>. Two result variables are set as a side effect:</p>
+reply</strong>. Three result variables are set as a side effect:</p>
 <table><thead><tr><th>Var</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>$result</code></td><td>the reply value (a <a href="/mix/collections">map</a>, list, string, … — field-accessible)</td></tr>
+<tr><td><code>$reply</code></td><td>the WHOLE reply body, JSON-parsed, for every response — success or refusal, whatever its dialect — and <code>nil</code> when the body is empty or not JSON, or the send never got a reply (0.92.0). See <a href="/mix/bus#reading-rc-ok-vs-application-error-vs-transport-failure">below</a>.</td></tr>
 <tr><td><code>$rc</code></td><td>numeric status in signed bands: <code>0</code> delivered+accepted · <code>1..9</code> delivered with a warning (still success) · <code>&gt;= 10</code> peer application error (the exact peer rc is kept) · <code>-1</code> transport failure · <code>-2</code> per-send <code>timeout=</code> exceeded · <code>-3</code> Bus unavailable (no broker). All negatives are non-fatal.</td></tr>
 </tbody></table>
 <pre><code class="language-mix">send noded noded.info
@@ -549,14 +550,60 @@ transport failure (a broker was there but the send failed — lost or broken
 connection), <code>-2</code> a per-send <code>timeout=</code> budget exceeded, <code>-3</code> Bus unavailable (no
 broker was ever present, a bare host). See <a href="/mix/bus#per-send-timeout">timeout</a> and
 <a href="/mix/bus#no-broker-graceful-degradation">no broker</a>.</p>
-<p><strong>A structured refusal keeps its body.</strong> When a peer answers <code>rc &gt;= 10</code> with a
-JSON object naming an <code>error_code</code>, <code>$result</code> is that object — field-accessible,
-so <code>$result.error_code</code> and whatever else it carries (<code>reason</code>,
-<code>retry_requires</code>) are readable. Branching on those is the whole point of a
-refusal; flattened to prose it leaves a script parsing English to decide whether
-to retry. This is narrow on purpose: a peer that answers an error as plain text,
-or as JSON of some other shape, still produces exactly the string it always did.
-Only a body naming <code>error_code</code> takes the structured path. (0.87.0)</p>
+<p><strong>A structured refusal keeps its body — on the header route.</strong> When a
+header-routed send (one with a <code>body=</code> arg, or a SPEC-12 <code>*.props.*</code> call with
+<code>namespace=</code>) gets <code>rc &gt;= 10</code> with a JSON object naming an <code>error_code</code>,
+<code>$result</code> is that object — field-accessible, so <code>$result.error_code</code> and
+whatever else it carries (<code>reason</code>, <code>retry_requires</code>) are readable. (0.87.0)
+The ordinary JSON-body send never did this: there <code>$result</code> is the <code>error</code>
+header, else the body's <code>error</code> string, else the body text verbatim — so an
+<code>error_code</code> body with no <code>error</code> field arrives as raw JSON TEXT in <code>$result</code>.
+On either route, read the structure from <code>$reply</code> (below), which is the parsed
+body whatever its shape; <code>$result</code> is for the message.</p>
+<p><strong><code>$reply</code> keeps every field of every reply.</strong> Most daemons refuse in the other
+dialect — <code>{"error": "occluded", "under": {…}}</code> — and <code>$result</code> reduces that to
+its message string on purpose, so existing scripts keep working. The detail
+(<code>occluded.under</code>, <code>stale_target.current</code>, <code>timeout.waited_ms</code>,
+<code>invalid_args.allowed</code>) is in <code>$reply</code>, the whole parsed body:</p>
+<pre><code class="language-mix">send comp comp.window.focus id=2
+if $rc == 10 and $result == "occluded" then
+  print("covered by window " .. to_string($reply.under.id))
+end
+</code></pre>
+<p><code>$reply</code> is set on every <code>send</code> (and every address-block line): the parsed body
+for a success (the same value as <code>$result</code>) or a refusal of either dialect, and
+<code>nil</code> when the body is empty or not JSON, or when no reply arrived (<code>$rc &lt; 0</code>).
+One limit: a target reached over its <strong>local Unix port</strong> (a sibling
+user-service, not the broker) reports a refusal as a message only, so there
+<code>$reply</code> is <code>nil</code> for a refusal. (0.92.0)</p>
+<p><strong><code>$rc</code>, <code>$result</code> and <code>$reply</code> are shared, not per-call.</strong> A <code>send</code> updates the
+existing variable of that name — and once a top-level <code>send</code> has created them,
+that is the script's global, so a <code>send</code> inside a function or an <code>on</code> handler
+overwrites it too. In a <code>mix --serve</code> citizen whose async handlers interleave,
+handler A can <code>send</code>, yield, and read back the <code>$rc</code>/<code>$result</code>/<code>$reply</code> of
+handler B's send. (<code>$event</code> is only partly different: a handler BODY's own
+<code>$event</code> is per-invocation, but a function called from that body reads a
+shared global <code>$event</code> and has the same interleaving hazard — pass <code>$event</code>
+into the function as an argument.) Until these get per-invocation binding, read them immediately
+after the <code>send</code>, or capture the reply with the expression form —
+<code>$r = send svc cmd</code> — and copy <code>$rc</code> into a local before the next await.</p>
+<p><strong>A wrong verb name answers at once.</strong> A <code>mix --serve</code> citizen (or any script
+with <code>on</code> handlers) that receives a request for a command it has no handler
+for refuses it immediately with <code>rc 10</code>. On an ordinary send <code>$result</code> is the
+message ("unknown command 'x' (this citizen handles: …)"); on the header
+route (a <code>body=</code> send) the <code>error_code</code> rule above makes <code>$result</code> the whole
+object instead. Either way the structure is in <code>$reply</code> —
+<code>$reply.error_code == "UNKNOWN_COMMAND"</code>, <code>$reply.command</code> the verb you sent,
+<code>$reply.available</code> the citizen's declared handlers. (Before 0.92.0 the request
+was dropped: the caller waited out its full timeout and got <code>-2</code>, which read as
+a mesh problem.) So a <code>-2</code> from a citizen that answers its other verbs is no
+longer a typo symptom — look at the citizen's handler instead. Props paths such
+as <code>lifecycle.generation</code> are not verbs: read them with
+<code>send svc svc.props.get path="lifecycle.generation"</code>. The code is a Mix
+citizen's: other daemons name the same refusal differently — comp answers
+<code>unknown_verb</code>, noded its own rc 10 message — so a script that must work
+against any service should test <code>$rc &gt;= 10</code> and read the code from <code>$reply</code>
+rather than match one spelling.</p>
 <h2 id="send-and-the-verified-session-lane"><code>send</code> and the verified session lane</h2>
 <p>A locally registered service can be addressed two ways, and only one of them
 carries an identity. A TCP connection is known by a name the caller asserts
@@ -623,7 +670,8 @@ overrides the inner frame header (the fleet publishes topic
 and headers are newline-checked — frame injection raises instead of
 corrupting the wire.</li>
 </ul>
-<p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> and returns the rc, so
+<p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> (and sets <code>$reply</code> to <code>nil</code>, so an
+earlier send's reply is never read as the publish's) and returns the rc, so
 <code>if publish(..) != 0</code> reads naturally. Without a broker it degrades like
 <code>send</code>: <code>$rc = -3</code>, non-fatal.</p>
 <p><strong>Hyphenated targets need no quoting.</strong> <code>send comp-nested …</code>,
@@ -648,18 +696,20 @@ runtime one, because the word is taken as the target and the <code>..</code> is 
 nowhere to go. It could never have been a working concat — the left operand of
 <code>..</code> there is a bareword, which is a string, so the subtraction ahead of it
 always failed first.</p>
-<p><strong>Quote a name the bare form cannot reach.</strong> Three shapes fall outside it, and
-quoting is the answer to all three:</p>
+<p><strong>Quote a name the bare form cannot reach.</strong> Two shapes fall outside it, and
+quoting is the answer to both:</p>
 <table><thead><tr><th>name</th><th>why</th><th>write</th></tr></thead><tbody>
 <tr><td><code>a--b</code></td><td><code>--</code> opens a <strong>comment</strong>, so the bare word stops there and the shape is refused</td><td><code>send "a--b" …</code></td></tr>
-<tr><td><code>svc-01</code>, <code>node-007</code>, <code>a-1.2.3</code></td><td>a segment that is <strong>all digits</strong> is lexed as a NUMBER, and the lexer rejects a leading zero or a second dot before the parser ever sees the line</td><td><code>send "svc-01" …</code></td></tr>
 <tr><td><code>fn-svc</code></td><td><code>fn</code> starts a lambda</td><td><code>send "fn-svc" …</code></td></tr>
 </tbody></table>
-<p>Only an all-digit segment is affected, and only a malformed one: <code>svc-1</code>,
-<code>svc-10</code>, <code>bterm-bevy-3164175</code> and <code>desktop-vt01</code> are all fine bare — <code>vt01</code>
-begins with a letter, so it is an identifier, not a number. The trap is
-<code>node-007</code>, whose error (<code>ambiguous leading-zero number '007'</code>) does not
-mention <code>send</code> at all.</p>
+<p>All-digit segments are fine bare, including malformed-looking ones: <code>svc-1</code>,
+<code>svc-10</code>, <code>bterm-bevy-3164175</code>, <code>desktop-vt01</code>, and since 0.92.0 also <code>svc-01</code>,
+<code>node-007</code> and <code>a-1.2.3</code>. Before 0.92.0 the lexer read a leading-zero or
+multi-dot segment as a bad NUMBER and refused the line
+(<code>ambiguous leading-zero number '007'</code>, an error that never mentioned <code>send</code>);
+it now lexes such a segment as part of the word when it sits in the bare target
+right after <code>send</code>/<code>emit</code>/<code>address</code>. Everywhere else — <code>$x = 007</code>, a
+<code>$var-007</code> target, a hyphenated command — the refusal is unchanged.</p>
 <p>Nothing that worked before changed meaning: the shape <em>requires</em> a hyphen, so
 every target that already resolved still takes the expression path, and a
 bareword is a string, so <code>a - b</code> on two barewords was always the runtime type

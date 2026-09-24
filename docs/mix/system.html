@@ -1005,8 +1005,18 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
 controlling terminal and its own session, so a terminal hangup or the caller
 exiting does not take it down — the daemon shape, stronger than the shell
 form's <code>&amp;</code>. (Session separation, not immortality: a service-cgroup teardown
-or an explicit signal still reaches it.) Default <code>false</code> (a plain child in
-the caller's session).</li>
+or an explicit signal still reaches it.) Since v0.92.0 it is also
+<strong>double-forked</strong>: the child is reparented to init (or the nearest
+subreaper), which reaps it — so a long-lived caller such as a <code>mix --serve</code>
+launcher citizen is never left holding zombies, and "owns nothing after it
+returns" is literally true. The returned PID is the real (grandchild)
+process, and it still leads its own session. Because init reaps it, the pid
+is FREE as soon as the child exits and the kernel may hand it to an unrelated
+process: a later <code>kill($pid)</code> or <code>process_alive($pid)</code> can hit a stranger.
+A live pid only says SOME process holds that number; to stop a detached
+daemon later, have it write its own pidfile or answer a Bus verb rather than
+trusting a pid remembered from long ago. Default <code>false</code> (a plain child
+in the caller's session, which stays the caller's to reap).</li>
 <li><code>cwd</code> / <code>env</code> / <code>clear_env</code> behave exactly as in <a href="/mix/system#run_argv"><code>run_argv</code></a>
 (clear-then-layer: <code>{clear_env: true, env: {…}}</code> starts from empty).</li>
 <li><code>stdout</code> / <code>stderr</code> reuse <code>run_argv</code>'s routing, minus capture: <code>"null"</code>

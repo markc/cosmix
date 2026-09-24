@@ -1446,10 +1446,11 @@ impl Parser {
     /// fails the shape or the terminator check below and takes the
     /// expression path exactly as before.
     ///
-    /// Two shapes the LEXER refuses before this ever runs, so they must
-    /// be quoted and the manual says so: an all-digit segment that is a
-    /// malformed number (`svc-01`, `a-1.2.3`), and `fn-…`, where `fn`
-    /// starts a lambda.
+    /// One shape the LEXER refuses before this ever runs, so it must be
+    /// quoted and the manual says so: `fn-…`, where `fn` starts a lambda.
+    /// An all-digit segment that is a malformed number (`svc-01`,
+    /// `a-1.2.3`) used to be the other; since 0.92.0 the lexer's
+    /// `in_bare_send_target` lets it through as a word segment here.
     fn take_hyphenated_service_word(&mut self) -> Option<String> {
         // A bare identifier, OR a KEYWORD lexeme. `next-hop`,
         // `print-server`, `on-boot`, `source-x`, `select-db` and

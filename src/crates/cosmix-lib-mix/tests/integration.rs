@@ -2148,6 +2148,95 @@ async fn reply_without_inbound_id_omits_id() {
     assert_eq!(log.borrow()[0].2, None, "missing inbound id stays None");
 }
 
+/// A correlated request naming a command with NO handler is refused at
+/// once with UNKNOWN_COMMAND (TODO-mix, 2026-09-21: it used to be dropped,
+/// so the caller sat out its full timeout and was told "mesh unavailable").
+/// The reply being recorded by the time `dispatch_event` returns IS the
+/// timing: no timeout is involved anywhere on this path.
+#[tokio::test]
+async fn unknown_command_request_is_refused_immediately() {
+    let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+    let started = std::time::Instant::now();
+    run_then_dispatch(
+        "on q\n    reply(\"v\")\ndone\non b.verb\n    reply(\"w\")\ndone\n",
+        Some(Rc::new(ReplyRecorder(log.clone()))),
+        mk_event("nosuch.verb", "", &[("from", "c"), ("id", "5"), ("type", "request")]),
+    )
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "refusal must not wait");
+    let calls = log.borrow();
+    assert_eq!(calls.len(), 1, "an unknown-verb request must be answered exactly once");
+    let (to, cmd, id, rc, body) = &calls[0];
+    assert_eq!((to.as_str(), cmd.as_str(), id.as_deref(), *rc), ("c", "nosuch.verb", Some("5"), 10));
+    assert!(body.contains("\"error_code\":\"UNKNOWN_COMMAND\""), "body: {body}");
+    // `error` is what a JSON-body send reduces an rc>=10 reply to for
+    // `$result`; without it the caller got the raw JSON text.
+    assert!(body.contains("\"error\":\"unknown command 'nosuch.verb'"), "body: {body}");
+    assert!(body.contains("\"command\":\"nosuch.verb\""), "body: {body}");
+    assert!(body.contains("\"available\":[\"b.verb\",\"q\"]"), "body: {body}");
+}
+
+/// dispatch_event is also reached from the `sleep()` yield loop, which does
+/// not run the pump's reserved-verb interception first: a verb the serve
+/// runtime reserves must not be refused there as UNKNOWN_COMMAND.
+#[tokio::test]
+async fn reserved_verbs_are_not_refused_as_unknown() {
+    use cosmix_mix::evaluator::{ReservedOutcome, ServeRuntime};
+    struct Claims;
+    impl ServeRuntime for Claims {
+        fn handle_reserved(
+            &self,
+            command: &str,
+            _: Option<&str>,
+            _: &str,
+            _: &[(&str, Option<&str>)],
+            _: bool,
+        ) -> Option<ReservedOutcome> {
+            (command == "HELP" || command == "svc.props.get").then(|| ReservedOutcome {
+                rc: 0,
+                body: "{}".into(),
+                quit: false,
+                reload: false,
+            })
+        }
+    }
+    let source = "on q\n    reply(\"v\")\ndone\n";
+    let mut lexer = Lexer::new(source);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), source)
+        .parse_program()
+        .unwrap();
+    let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+    let mut eval = Evaluator::with_output(Box::new(SharedBuf::new()), Box::new(SharedBuf::new()));
+    eval.set_bus_handler(Rc::new(ReplyRecorder(log.clone())));
+    eval.set_serve_runtime(Rc::new(Claims));
+    eval.execute(&stmts).await.expect("main body runs");
+    for cmd in ["HELP", "svc.props.get"] {
+        eval.dispatch_event(mk_event(cmd, "", &[("id", "1"), ("type", "request")]))
+            .await
+            .expect("dispatch is soft");
+    }
+    assert!(log.borrow().is_empty(), "reserved verbs must not get UNKNOWN_COMMAND: {:?}", log.borrow());
+    eval.dispatch_event(mk_event("nosuch", "", &[("id", "2"), ("type", "request")]))
+        .await
+        .expect("dispatch is soft");
+    assert_eq!(log.borrow().len(), 1, "a genuinely unknown verb is still refused");
+    assert_eq!(log.borrow()[0].3, 10);
+}
+
+/// A topic delivery (no `type=request`) for an unhandled command has no
+/// caller to answer and stays a silent drop.
+#[tokio::test]
+async fn unknown_command_emit_is_still_dropped() {
+    let log: ReplyLog = Rc::new(RefCell::new(Vec::new()));
+    run_then_dispatch(
+        "on q\n    reply(\"v\")\ndone\n",
+        Some(Rc::new(ReplyRecorder(log.clone()))),
+        mk_event("nosuch.verb", "", &[("from", "c")]),
+    )
+    .await;
+    assert!(log.borrow().is_empty(), "an emit must never be replied to");
+}
+
 /// Wrong arity is a deterministic hard error — and because argument
 /// validation runs before the in-handler / Bus-present checks, it fires
 /// even from the main body with no handler and no Bus.
@@ -5156,6 +5245,150 @@ mod rc_band_contract_tests {
         let eval = run("emit svc event\n$after = 4\n", None).await;
         assert_eq!(eval.get_global("after").unwrap(), Value::Number(4.0));
     }
+
+    /// A handler that sees the raw body (as cosmix-mix's do) overrides
+    /// `send_with_reply`; `send` itself is never consulted by the keyword.
+    struct ReplyHandler;
+    impl BusHandler for ReplyHandler {
+        fn send<'a>(
+            &'a self,
+            _t: &'a str,
+            _c: &'a str,
+            _a: &'a Value,
+        ) -> BusFuture<'a, MixResult<(i32, Value)>> {
+            // An Err here would surface as $rc = -1 and fail the rc assertion.
+            Box::pin(async {
+                Err(MixError::RuntimeError {
+                    span: None,
+                    msg: "the send keyword must go through send_with_reply".into(),
+                })
+            })
+        }
+        fn send_with_reply<'a>(
+            &'a self,
+            _t: &'a str,
+            _c: &'a str,
+            _a: &'a Value,
+        ) -> BusFuture<'a, MixResult<(i32, Value, Value)>> {
+            Box::pin(async {
+                let under = cosmix_mix::IndexMap::from([("id".to_string(), Value::Number(1.0))]);
+                let body = cosmix_mix::IndexMap::from([
+                    ("error".to_string(), Value::String("occluded".into())),
+                    ("under".to_string(), Value::map(under)),
+                ]);
+                Ok((10, Value::String("occluded".into()), Value::map(body)))
+            })
+        }
+        fn emit<'a>(
+            &'a self,
+            _t: &'a str,
+            _c: &'a str,
+            _a: &'a Value,
+        ) -> BusFuture<'a, MixResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn port_exists<'a>(&'a self, _t: &'a str) -> BusFuture<'a, MixResult<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+        fn next_incoming<'a>(&'a self) -> BusFuture<'a, Option<IncomingEvent>> {
+            Box::pin(async { None })
+        }
+    }
+
+    /// TODO-mix "send drops the fields of an error-dialect refusal":
+    /// `$result` stays the message string, `$reply` carries every field —
+    /// for `send`, `$x = send …` and an address-block line alike.
+    #[tokio::test]
+    async fn send_binds_reply_alongside_rc_and_result() {
+        let h: std::rc::Rc<dyn BusHandler> = std::rc::Rc::new(ReplyHandler);
+        let eval = run(
+            "send comp comp.window.focus id=2\n$r1 = $result\n$u1 = $reply.under.id\n\
+             $x = send comp comp.window.focus\n$u2 = $reply.under.id\n\
+             address comp\n  ping\nend\n$u3 = $reply.under.id\n",
+            Some(h),
+        )
+        .await;
+        assert_eq!(eval.get_global("rc").unwrap(), Value::Number(10.0));
+        assert_eq!(eval.get_global("r1").unwrap(), Value::String("occluded".into()));
+        for v in ["u1", "u2", "u3"] {
+            assert_eq!(eval.get_global(v).unwrap(), Value::Number(1.0), "{v}");
+        }
+    }
+
+    /// Every non-delivery path binds `$reply` to nil, so a stale reply from
+    /// an earlier send can never be read as this send's.
+    #[tokio::test]
+    async fn reply_is_nil_on_transport_failure_and_without_a_bus() {
+        let h: std::rc::Rc<dyn BusHandler> = std::rc::Rc::new(ReplyHandler);
+        let eval = run("send comp x\n", Some(h)).await;
+        assert_ne!(eval.get_global("reply").unwrap(), Value::Nil);
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(RcHandler { send_rc: None }))).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+        let eval = run("send svc ping\n", None).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+    }
+
+    /// The trait default (a handler that only implements `send`): a success
+    /// result is the reply, a reduced error STRING is not a body (nil).
+    #[tokio::test]
+    async fn default_send_with_reply_derives_from_send() {
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(RcHandler { send_rc: Some(0) }))).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+        assert_eq!(eval.get_global("result").unwrap(), Value::Nil);
+
+        // A send-only handler's success STRING (which may have been a
+        // non-JSON body) is nil in `$reply`, as the manual promises; a
+        // non-string value passes through.
+        struct Fixed(Value);
+        impl BusHandler for Fixed {
+            fn send<'a>(
+                &'a self,
+                _t: &'a str,
+                _c: &'a str,
+                _a: &'a Value,
+            ) -> BusFuture<'a, MixResult<(i32, Value)>> {
+                let v = self.0.clone();
+                Box::pin(async move { Ok((0, v)) })
+            }
+            fn emit<'a>(
+                &'a self,
+                _t: &'a str,
+                _c: &'a str,
+                _a: &'a Value,
+            ) -> BusFuture<'a, MixResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn port_exists<'a>(&'a self, _t: &'a str) -> BusFuture<'a, MixResult<bool>> {
+                Box::pin(async { Ok(false) })
+            }
+            fn next_incoming<'a>(&'a self) -> BusFuture<'a, Option<IncomingEvent>> {
+                Box::pin(async { None })
+            }
+        }
+        let text = Value::String("# markdown".into());
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(Fixed(text.clone())))).await;
+        assert_eq!(eval.get_global("result").unwrap(), text);
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Nil);
+        let eval = run("send svc ping\n", Some(std::rc::Rc::new(Fixed(Value::Number(2.0))))).await;
+        assert_eq!(eval.get_global("reply").unwrap(), Value::Number(2.0));
+    }
+}
+
+/// A user fn named after an evaluator special form (EVAL_SPECIAL_BUILTINS:
+/// printf, write_stdout, …) must not win as a binary-operator operand when
+/// the plain call resolves to the builtin. Before the fix the inline
+/// fast path called the USER fn for `printf("B") .. "|"` (printed
+/// `USER|`) while `printf("C")` alone called the builtin.
+#[tokio::test(flavor = "current_thread")]
+async fn eval_special_builtin_wins_as_binop_operand_too() {
+    let out = run_mix_capturing(
+        "fn printf($a) = \"USER\"\nprint(printf(\"B\") .. \"|\")\nfn write_stdout($a) = \"USER\"\nprint(write_stdout(\"W\") .. \"|\")\n",
+    )
+    .await
+    .unwrap();
+    assert!(!out.contains("USER"), "the builtin must win in operand position too: {out:?}");
+    assert!(out.starts_with('B'), "printf builtin must have run: {out:?}");
+    assert!(out.contains('W'), "write_stdout builtin must have run: {out:?}");
 }
 
 /// `serve_name()` (0.91.0) is nil outside `--serve`: a plain evaluator has

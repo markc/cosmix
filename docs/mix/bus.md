@@ -45,11 +45,12 @@ Mix it is grammar.
 ## `send` — RPC (request/reply)
 
 `send <target> <command> [key=value …]` dispatches a command and **waits for the
-reply**. Two result variables are set as a side effect:
+reply**. Three result variables are set as a side effect:
 
 | Var | Meaning |
 |---|---|
 | `$result` | the reply value (a [map](collections.md), list, string, … — field-accessible) |
+| `$reply` | the WHOLE reply body, JSON-parsed, for every response — success or refusal, whatever its dialect — and `nil` when the body is empty or not JSON, or the send never got a reply (0.92.0). See [below](#reading-rc-ok-vs-application-error-vs-transport-failure). |
 | `$rc` | numeric status in signed bands: `0` delivered+accepted · `1..9` delivered with a warning (still success) · `>= 10` peer application error (the exact peer rc is kept) · `-1` transport failure · `-2` per-send `timeout=` exceeded · `-3` Bus unavailable (no broker). All negatives are non-fatal. |
 
 ```mix
@@ -142,14 +143,66 @@ connection), `-2` a per-send `timeout=` budget exceeded, `-3` Bus unavailable (n
 broker was ever present, a bare host). See [timeout](#per-send-timeout) and
 [no broker](#no-broker-graceful-degradation).
 
-**A structured refusal keeps its body.** When a peer answers `rc >= 10` with a
-JSON object naming an `error_code`, `$result` is that object — field-accessible,
-so `$result.error_code` and whatever else it carries (`reason`,
-`retry_requires`) are readable. Branching on those is the whole point of a
-refusal; flattened to prose it leaves a script parsing English to decide whether
-to retry. This is narrow on purpose: a peer that answers an error as plain text,
-or as JSON of some other shape, still produces exactly the string it always did.
-Only a body naming `error_code` takes the structured path. (0.87.0)
+**A structured refusal keeps its body — on the header route.** When a
+header-routed send (one with a `body=` arg, or a SPEC-12 `*.props.*` call with
+`namespace=`) gets `rc >= 10` with a JSON object naming an `error_code`,
+`$result` is that object — field-accessible, so `$result.error_code` and
+whatever else it carries (`reason`, `retry_requires`) are readable. (0.87.0)
+The ordinary JSON-body send never did this: there `$result` is the `error`
+header, else the body's `error` string, else the body text verbatim — so an
+`error_code` body with no `error` field arrives as raw JSON TEXT in `$result`.
+On either route, read the structure from `$reply` (below), which is the parsed
+body whatever its shape; `$result` is for the message.
+
+**`$reply` keeps every field of every reply.** Most daemons refuse in the other
+dialect — `{"error": "occluded", "under": {…}}` — and `$result` reduces that to
+its message string on purpose, so existing scripts keep working. The detail
+(`occluded.under`, `stale_target.current`, `timeout.waited_ms`,
+`invalid_args.allowed`) is in `$reply`, the whole parsed body:
+
+```mix
+send comp comp.window.focus id=2
+if $rc == 10 and $result == "occluded" then
+  print("covered by window " .. to_string($reply.under.id))
+end
+```
+
+`$reply` is set on every `send` (and every address-block line): the parsed body
+for a success (the same value as `$result`) or a refusal of either dialect, and
+`nil` when the body is empty or not JSON, or when no reply arrived (`$rc < 0`).
+One limit: a target reached over its **local Unix port** (a sibling
+user-service, not the broker) reports a refusal as a message only, so there
+`$reply` is `nil` for a refusal. (0.92.0)
+
+**`$rc`, `$result` and `$reply` are shared, not per-call.** A `send` updates the
+existing variable of that name — and once a top-level `send` has created them,
+that is the script's global, so a `send` inside a function or an `on` handler
+overwrites it too. In a `mix --serve` citizen whose async handlers interleave,
+handler A can `send`, yield, and read back the `$rc`/`$result`/`$reply` of
+handler B's send. (`$event` is only partly different: a handler BODY's own
+`$event` is per-invocation, but a function called from that body reads a
+shared global `$event` and has the same interleaving hazard — pass `$event`
+into the function as an argument.) Until these get per-invocation binding, read them immediately
+after the `send`, or capture the reply with the expression form —
+`$r = send svc cmd` — and copy `$rc` into a local before the next await.
+
+**A wrong verb name answers at once.** A `mix --serve` citizen (or any script
+with `on` handlers) that receives a request for a command it has no handler
+for refuses it immediately with `rc 10`. On an ordinary send `$result` is the
+message ("unknown command 'x' (this citizen handles: …)"); on the header
+route (a `body=` send) the `error_code` rule above makes `$result` the whole
+object instead. Either way the structure is in `$reply` —
+`$reply.error_code == "UNKNOWN_COMMAND"`, `$reply.command` the verb you sent,
+`$reply.available` the citizen's declared handlers. (Before 0.92.0 the request
+was dropped: the caller waited out its full timeout and got `-2`, which read as
+a mesh problem.) So a `-2` from a citizen that answers its other verbs is no
+longer a typo symptom — look at the citizen's handler instead. Props paths such
+as `lifecycle.generation` are not verbs: read them with
+`send svc svc.props.get path="lifecycle.generation"`. The code is a Mix
+citizen's: other daemons name the same refusal differently — comp answers
+`unknown_verb`, noded its own rc 10 message — so a script that must work
+against any service should test `$rc >= 10` and read the code from `$reply`
+rather than match one spelling.
 
 ## `send` and the verified session lane
 
@@ -235,7 +288,8 @@ if $rc2 != 0 then eprint("publish failed: " .. $result) end
   and headers are newline-checked — frame injection raises instead of
   corrupting the wire.
 
-Sets `$rc`/`$result` exactly like `send` and returns the rc, so
+Sets `$rc`/`$result` exactly like `send` (and sets `$reply` to `nil`, so an
+earlier send's reply is never read as the publish's) and returns the rc, so
 `if publish(..) != 0` reads naturally. Without a broker it degrades like
 `send`: `$rc = -3`, non-fatal.
 
@@ -264,20 +318,22 @@ nowhere to go. It could never have been a working concat — the left operand of
 `..` there is a bareword, which is a string, so the subtraction ahead of it
 always failed first.
 
-**Quote a name the bare form cannot reach.** Three shapes fall outside it, and
-quoting is the answer to all three:
+**Quote a name the bare form cannot reach.** Two shapes fall outside it, and
+quoting is the answer to both:
 
 | name | why | write |
 |---|---|---|
 | `a--b` | `--` opens a **comment**, so the bare word stops there and the shape is refused | `send "a--b" …` |
-| `svc-01`, `node-007`, `a-1.2.3` | a segment that is **all digits** is lexed as a NUMBER, and the lexer rejects a leading zero or a second dot before the parser ever sees the line | `send "svc-01" …` |
 | `fn-svc` | `fn` starts a lambda | `send "fn-svc" …` |
 
-Only an all-digit segment is affected, and only a malformed one: `svc-1`,
-`svc-10`, `bterm-bevy-3164175` and `desktop-vt01` are all fine bare — `vt01`
-begins with a letter, so it is an identifier, not a number. The trap is
-`node-007`, whose error (`ambiguous leading-zero number '007'`) does not
-mention `send` at all.
+All-digit segments are fine bare, including malformed-looking ones: `svc-1`,
+`svc-10`, `bterm-bevy-3164175`, `desktop-vt01`, and since 0.92.0 also `svc-01`,
+`node-007` and `a-1.2.3`. Before 0.92.0 the lexer read a leading-zero or
+multi-dot segment as a bad NUMBER and refused the line
+(`ambiguous leading-zero number '007'`, an error that never mentioned `send`);
+it now lexes such a segment as part of the word when it sits in the bare target
+right after `send`/`emit`/`address`. Everywhere else — `$x = 007`, a
+`$var-007` target, a hyphenated command — the refusal is unchanged.
 
 Nothing that worked before changed meaning: the shape *requires* a hyphen, so
 every target that already resolved still takes the expression path, and a

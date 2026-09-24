@@ -138,3 +138,64 @@ async fn publish_without_bus_degrades_like_send() {
     eval.execute(&stmts).await.unwrap();
     assert_eq!(stdout.to_string_lossy(), "-3/-3\n");
 }
+
+/// Replies (0, 5): a non-string result, so the default `send_with_reply`
+/// binds `$reply = 5` for a `send`.
+struct NumberBus;
+
+impl BusHandler for NumberBus {
+    fn send<'a>(
+        &'a self,
+        _target: &'a str,
+        _command: &'a str,
+        _args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = MixResult<(i32, Value)>> + 'a>> {
+        Box::pin(async move { Ok((0, Value::Number(5.0))) })
+    }
+    fn emit<'a>(
+        &'a self,
+        _target: &'a str,
+        _command: &'a str,
+        _args: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = MixResult<()>> + 'a>> {
+        Box::pin(async move { Ok(()) })
+    }
+    fn port_exists<'a>(
+        &'a self,
+        _target: &'a str,
+    ) -> Pin<Box<dyn Future<Output = MixResult<bool>> + 'a>> {
+        Box::pin(async move { Ok(true) })
+    }
+    fn next_incoming<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Option<cosmix_mix::evaluator::IncomingEvent>> + 'a>> {
+        Box::pin(async move { None })
+    }
+}
+
+#[tokio::test]
+async fn publish_clears_a_stale_reply() {
+    // publish sets $rc/$result like send; a $reply left by an earlier send
+    // must not read as the publish's (0.92.0).
+    let stdout = SharedBuf::new();
+    let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(SharedBuf::new()));
+    eval.set_bus_handler(Rc::new(NumberBus));
+    let src = "send svc ping\nprint(to_string($reply))\npublish(\"t\", \"x\")\nprint(type($reply))\n";
+    let mut lexer = Lexer::new(src);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), src)
+        .parse_program()
+        .unwrap();
+    eval.execute(&stmts).await.unwrap();
+    assert_eq!(stdout.to_string_lossy(), "5\nnil\n");
+
+    // …and on the no-bus path too.
+    let stdout = SharedBuf::new();
+    let mut eval = Evaluator::with_output(Box::new(stdout.clone()), Box::new(SharedBuf::new()));
+    let src = "$reply = 9\npublish(\"t\", \"x\")\nprint(type($reply))\n";
+    let mut lexer = Lexer::new(src);
+    let stmts = Parser::new(lexer.tokenize().unwrap(), src)
+        .parse_program()
+        .unwrap();
+    eval.execute(&stmts).await.unwrap();
+    assert_eq!(stdout.to_string_lossy(), "nil\n");
+}

@@ -553,3 +553,55 @@ fn trailing_commas_still_accepted() {
     let Value::Map(m) = &v else { panic!() };
     assert!(m.contains_key("m") && m.contains_key("xs"));
 }
+
+// --- Escapes: literal `${`, `~`, and JSON `\uXXXX` ------------------------------
+
+fn text(src: &str) -> String {
+    let v = p(src);
+    match &v {
+        Value::Map(m) => match m.get("t") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("expected string t, got {other:?}"),
+        },
+        other => panic!("expected map, got {other:?}"),
+    }
+}
+
+/// `\$` is the literal-dollar escape in strict data as in program source,
+/// so `${` is writable; `\~` likewise stops the leading-tilde expansion.
+#[test]
+fn escaped_dollar_and_tilde_are_literal() {
+    assert_eq!(text(r#"{t: "title \${name} here"}"#), "title ${name} here");
+    assert_eq!(text(r#"{t: "dangling \${"}"#), "dangling ${");
+    assert_eq!(text(r#"{t: "\~/Downloads"}"#), "~/Downloads");
+}
+
+/// JSON's `\uXXXX` decodes in strict data (0.92.0): four hex digits, and a
+/// surrogate pair joins into one codepoint — the form json_encode uses for
+/// control characters. Before, the six characters were kept literally.
+#[test]
+fn json_unicode_escapes_decode() {
+    assert_eq!(text(r#"{t: "q\u0041"}"#), "qA");
+    assert_eq!(text(r#"{t: "a\u0001b"}"#), "a\u{1}b");
+    assert_eq!(text(r#"{t: "\ud83d\ude00"}"#), "\u{1F600}");
+    assert_eq!(text(r#"{t: "\u{1F600}"}"#), "\u{1F600}");
+    // A `\u` not followed by four hex digits stays literal, as in source.
+    assert_eq!(text(r#"{t: "C:\users"}"#), "C:\\users");
+}
+
+#[test]
+fn lone_surrogates_are_refused() {
+    assert!(parse_data(r#"{t: "\ud83d"}"#).is_err(), "high surrogate alone");
+    assert!(parse_data(r#"{t: "\ud83dx"}"#).is_err(), "high surrogate + non-escape");
+    assert!(parse_data(r#"{t: "\ude00"}"#).is_err(), "lone low surrogate");
+}
+
+/// The bare `\uXXXX` form stays strict-data only: program source keeps it
+/// literal, exactly as before (a Windows path or embedded JSON is unchanged).
+#[test]
+fn program_source_keeps_bare_u_escape_literal() {
+    let src = concat!("\"q\\", "u0041\"");
+    let tokens = cosmix_mix::lexer::Lexer::new(src).tokenize().expect("lexes");
+    let want = format!("q{}u0041", '\\');
+    assert_eq!(tokens[0].token, cosmix_mix::token::Token::String(want));
+}

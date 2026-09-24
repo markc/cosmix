@@ -129,26 +129,26 @@ end
 -- ── scene-document emission ────────────────────────────────────────────
 -- A node is one `id: {json}` line inside the ```mix fence. JSON maps are
 -- valid strict Mix data; a backtick would close the fence, so it becomes a
--- visible stand-in (U+00B4) -- strict data does not decode \uXXXX escapes.
+-- visible stand-in (U+00B4). (Strict data decodes \uXXXX only from mix
+-- 0.92.0, so the backtick's escape is not relied on while older
+-- interpreters are deployed.)
 
--- Strict Mix data treats "${" inside a string as interpolation and has no
--- escape for a literal one (neither \$ nor \u0024 is honoured -- a Mix gap,
--- filed in TODO-mix), so a window title or notification carrying "${name}"
--- would make the whole document fail to parse. An invisible WORD JOINER
--- (U+2060) between "$" and "{" keeps the text looking the same and the
--- document parseable.
-$WORD_JOINER = json_parse("\"\\u2060\"")
-
+-- Strict Mix data reads "${" inside a string as interpolation, so a window
+-- title or notification carrying "${name}" would make the whole document
+-- fail to parse. JSON leaves "$" bare; the Mix escape \$ is the literal
+-- dollar (and a JSON "\\" before it still decodes to one backslash).
+--
 -- The same lexer expands a LEADING "~" (and "~/") in a double-quoted string
 -- to $HOME, which strict data also refuses -- a notification that reads
 -- "~/Downloads/x.png saved" would poison the document. Every JSON string
--- opens with a quote, so a word joiner after an opening quote that is
--- followed by "~" neutralises it. (Inside a string, an escaped quote \"~
--- also matches; the joiner there is invisible and harmless.)
+-- opens with a quote, so "~ right after a quote gets the \~ escape. (Inside a
+-- string, an escaped quote \"~ also matches; \~ is still a literal "~".)
+-- Both escapes are the data text, not a stand-in: the parsed string is the
+-- original byte for byte.
 fn node_line($id, $node)
   $json = replace(json_encode($node), "`", "´")
-  $json = replace($json, '${', '$' .. $WORD_JOINER .. '{')
-  $json = replace($json, '"~', '"' .. $WORD_JOINER .. '~')
+  $json = replace($json, '${', '\${')
+  $json = replace($json, '"~', '"\~')
   return $id .. ": " .. $json
 end
 

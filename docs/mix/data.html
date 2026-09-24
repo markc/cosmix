@@ -770,6 +770,16 @@ It is the format for substrate-internal config that must never run as code.</p>
 <p>Literal heredocs are accepted as strings, including their normal trailing-newline
 semantics. A heredoc containing <code>${...}</code> interpolation or <code>$(...)</code> command
 substitution is rejected like every other executable strict-data construct.</p>
+<p><strong>Escapes in strict-data strings.</strong> A literal <code>${</code> is written <code>\${</code> (the same
+<code>\$</code> escape as program source) and a leading <code>~</code> is written <code>\~</code> — which is
+exactly what <code>data_encode</code> emits, so its output always reads back unchanged.
+From 0.92.0 strict data also decodes JSON's <code>\uXXXX</code> form (exactly four hex
+digits; a surrogate pair is joined, a lone surrogate is a parse error) as well
+as the braced <code>\u{…}</code>, so JSON-encoded text — which escapes control characters
+that way — reads back as the original string. Program source is unchanged: a
+bare <code>\u</code> not followed by <code>{</code> stays literal there. JSON text is still not
+strict data in general: <code>json_encode</code> leaves <code>$</code> bare, so text carrying <code>${</code>
+must be escaped (<code>replace($json, '${', '\${')</code>) or produced by <code>data_encode</code>.</p>
 <pre><code class="language-mix">$cfg = { name: "alpha", port: 25, tags: ["a", "b"] }
 print(data_encode($cfg))
 print(data_encode($cfg, true))   -- truthy 2nd arg = multi-line

@@ -98,7 +98,7 @@ pub async fn run_capturing(source: &str) -> MixResult<(Value, String, String)> {
 /// substrate-internal data files. See
 /// `_doc/2026-05-04-substrate-mix-data-formats.md`.
 pub fn parse_data(source: &str) -> MixResult<Value> {
-    let mut lexer = Lexer::new(source);
+    let mut lexer = Lexer::for_data(source);
     let tokens = lexer.tokenize()?;
     let mut parser = Parser::new(tokens, source);
     parser.parse_data()
