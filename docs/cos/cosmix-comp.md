@@ -2180,7 +2180,13 @@ a `wl_surface` with any non-xdg role, and one that a live `xdg_surface`
 still wraps. Once the previous `xdg_surface` is destroyed, a fresh one for
 the same `wl_surface` is accepted and may take the same xdg role again.
 Live wrappers are tracked per `wl_surface`, so a second `xdg_wm_base`
-binding cannot bypass the guard.
+binding cannot bypass the guard. The same request also enforces
+xdg-shell's rule that the `wl_surface` has no buffer attached or committed:
+either posts `xdg_wm_base.invalid_surface_state`. A client re-wrapping a
+surface must first commit a NULL buffer. `XdgShellHandler` gained an
+additive `surface_has_buffer` hook for this, because comp consumes
+committed buffers out of Smithay's surface state and answers from its own
+record instead.
 
 Smithay's `X11Surface` has one additive test-support setter
 (`set_wl_surface_offline`) that assigns the associated `wl_surface` directly.

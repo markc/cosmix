@@ -27519,6 +27519,92 @@ fn destroying_the_xdg_surface_releases_the_wl_surface_for_a_fresh_wrapper() {
     drop(runtime);
 }
 
+/// Map the harness toplevel, then hide it the way Qt does: optionally a NULL
+/// attach + commit, then destroy the `xdg_toplevel` and its `xdg_surface`,
+/// keeping the `wl_surface`. Returns the role generation the mapped window had.
+fn map_then_destroy_xdg_objects(harness: &mut KeybindingHarness, null_attach: bool) -> u64 {
+    map_initial_test_toplevel(harness);
+    let record = test_toplevel_record(harness);
+    assert!(record.mapped, "the first map must land");
+    let generation = record.generation;
+    if null_attach {
+        send_request(
+            &mut harness.client,
+            TEST_TOPLEVEL_SURFACE_ID,
+            1,
+            &words(&[0, 0, 0]),
+        ); // wl_surface.attach(NULL)
+        send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    }
+    send_request(&mut harness.client, TEST_TOPLEVEL_ID, 0, &[]); // xdg_toplevel.destroy
+    send_request(&mut harness.client, TEST_XDG_SURFACE_ID, 0, &[]); // xdg_surface.destroy
+    harness.dispatch_client();
+    harness.assert_client_connected("after the Qt-style hide");
+    generation
+}
+
+/// xdg_surface: "Creating an xdg_surface from a wl_surface which has a buffer
+/// attached or committed is a client error." Releasing the role on
+/// `xdg_surface.destroy` makes this reachable on a surface that already
+/// showed content, so both halves are refused at `get_xdg_surface`, before a
+/// wrapper exists: here the COMMITTED half — the client destroyed both xdg
+/// objects without first committing a NULL buffer.
+#[test]
+fn a_fresh_xdg_surface_on_a_surface_with_a_committed_buffer_is_refused() {
+    let mut harness = KeybindingHarness::new(false);
+    map_then_destroy_xdg_objects(&mut harness, false);
+
+    let xdg_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    ); // xdg_wm_base.get_xdg_surface
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, TEST_XDG_WM_BASE_ID, "{message}");
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::InvalidSurfaceState as u32,
+        "{message}"
+    );
+    assert_eq!(message, "wl_surface has a buffer attached or committed");
+}
+
+/// The ATTACHED half: the committed state is empty (NULL attach + commit),
+/// but a new buffer is attached and not yet committed when the client asks
+/// for the wrapper.
+#[test]
+fn a_fresh_xdg_surface_on_a_surface_with_a_pending_buffer_is_refused() {
+    let mut harness = KeybindingHarness::new(false);
+    map_then_destroy_xdg_objects(&mut harness, true);
+
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    ); // wl_surface.attach, NOT committed
+    let xdg_surface = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    ); // xdg_wm_base.get_xdg_surface
+    harness.dispatch_client();
+    let (offending, code, message) = read_protocol_error(&mut harness.client);
+    assert_eq!(offending, TEST_XDG_WM_BASE_ID, "{message}");
+    assert_eq!(
+        code,
+        xdg_wm_base::Error::InvalidSurfaceState as u32,
+        "{message}"
+    );
+    assert_eq!(message, "wl_surface has a buffer attached or committed");
+}
+
 /// Destroying an `xdg_surface` before its role object is `defunct_role_object`,
 /// on the `xdg_surface`.
 ///

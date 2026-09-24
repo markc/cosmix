@@ -267,6 +267,29 @@ impl CompositorHandler for WaylandState {
     fn commit(&mut self, surface: &WlSurface) {
         self.invalidate_committed_opacity(surface);
         self.committed_surfaces.insert(surface.id());
+        // Read the just-applied assignment before anything below consumes it
+        // out of `current`: `get_xdg_surface` must know whether the surface's
+        // committed state still holds a buffer (see `surface_has_buffer`).
+        match compositor::with_states(surface, |states| {
+            match states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer
+            {
+                Some(BufferAssignment::NewBuffer(_)) => Some(true),
+                Some(BufferAssignment::Removed) => Some(false),
+                None => None,
+            }
+        }) {
+            Some(true) => {
+                self.buffer_bearing_surfaces.insert(surface.id());
+            }
+            Some(false) => {
+                self.buffer_bearing_surfaces.remove(&surface.id());
+            }
+            None => {}
+        }
         self.note_presentation_commit(surface);
         // Smithay invokes this handler only when a transaction is applied.
         // Synchronized-child commits remain counted while cached under their
@@ -722,6 +745,7 @@ impl CompositorHandler for WaylandState {
     fn destroyed(&mut self, surface: &WlSurface) {
         let former_root = self.toplevel_root_for_surface(surface);
         self.buffer_history_surfaces.remove(&surface.id());
+        self.buffer_bearing_surfaces.remove(&surface.id());
         self.attach_history_surfaces.remove(&surface.id());
         self.committed_surfaces.remove(&surface.id());
         self.warned_unsupported_surfaces.remove(&surface.id());
@@ -989,6 +1013,14 @@ impl WlrLayerShellHandler for WaylandState {
 impl XdgShellHandler for WaylandState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
+    }
+
+    /// Smithay's default reads `SurfaceAttributes::current`, which this
+    /// compositor empties as it consumes buffers, so the committed half comes
+    /// from `buffer_bearing_surfaces` (set by the last committed assignment).
+    fn surface_has_buffer(&mut self, surface: &WlSurface) -> bool {
+        self.buffer_bearing_surfaces.contains(&surface.id())
+            || smithay::wayland::shell::xdg::surface_has_attached_or_committed_buffer(surface)
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {

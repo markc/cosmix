@@ -107,6 +107,21 @@ where
                     );
                     return;
                 }
+                // xdg_surface: "Creating an xdg_surface from a wl_surface which
+                // has a buffer attached or committed is a client error." The
+                // role-release path above makes this reachable on a surface
+                // that already showed content, so it is enforced rather than
+                // left to the compositor's later retire-on-adoption. The code
+                // is `invalid_surface_state` on the shell (Mutter's choice):
+                // `role` means a role conflict, and `xdg_surface`'s own
+                // `unconfigured_buffer` names an object that does not exist yet.
+                if XdgShellHandler::surface_has_buffer(state, &surface) {
+                    wm_base.post_error(
+                        xdg_wm_base::Error::InvalidSurfaceState,
+                        "wl_surface has a buffer attached or committed",
+                    );
+                    return;
+                }
                 // Do not assign a role to the surface here
                 // xdg_surface is not role, only xdg_toplevel and
                 // xdg_popup are defined as roles

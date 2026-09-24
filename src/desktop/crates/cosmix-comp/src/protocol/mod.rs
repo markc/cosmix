@@ -3383,6 +3383,7 @@ impl ProtocolServer {
             foreign_toplevel_identifiers: HashMap::new(),
             foreign_toplevel_nonce,
             buffer_history_surfaces: HashSet::new(),
+            buffer_bearing_surfaces: HashSet::new(),
             attach_history_surfaces: HashSet::new(),
             committed_surfaces: HashSet::new(),
             surface_objects: HashMap::new(),
@@ -6284,6 +6285,11 @@ struct WaylandState {
     /// Surfaces that have ever attached a non-null buffer. Layer-shell's
     /// AlreadyConstructed rule uses this narrower history.
     buffer_history_surfaces: HashSet<ObjectId>,
+    /// Surfaces whose last committed buffer assignment was a non-null buffer
+    /// (a later NULL attach + commit removes them). Smithay's
+    /// `SurfaceAttributes::current` cannot answer this once the commit path
+    /// has consumed the buffer; `get_xdg_surface` refuses these.
+    buffer_bearing_surfaces: HashSet<ObjectId>,
     /// Every surface that has received wl_surface.attach, including NULL.
     /// ext-session-lock rejects any prior attach history.
     attach_history_surfaces: HashSet<ObjectId>,
