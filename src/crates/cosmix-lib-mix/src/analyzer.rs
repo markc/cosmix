@@ -2099,6 +2099,7 @@ fn check_ssh_mix_bodies(
     let mut analysed: HashSet<(usize, Option<Vec<String>>)> = HashSet::new();
     let mut reported = BodyDedupe::default();
     let openers = cfg.source.as_deref().map(literal_openers).unwrap_or_default();
+    let mut ordinals: HashMap<(usize, bool, String), Vec<usize>> = HashMap::new();
     for site in collect_remote_sites(stmts) {
         match site.body {
             RemoteBody::Literal {
@@ -2111,11 +2112,22 @@ fn check_ssh_mix_bodies(
                 // The opener's REAL line, when the source text is at hand:
                 // `ssh_mix(` / `$h,` / `<<EOF` over three lines puts the body
                 // two lines below where the statement line alone would say.
+                // Identical literals in one statement are told apart by
+                // ORDER: sites arrive in source order within a statement, so
+                // the Nth distinct body with this text is the Nth opener.
+                let same = ordinals
+                    .entry((stmt_line, heredoc, src.clone()))
+                    .or_default();
+                let nth = same.iter().position(|o| *o == origin).unwrap_or_else(|| {
+                    same.push(origin);
+                    same.len() - 1
+                });
                 let first_line = openers
                     .iter()
-                    .find(|(line, is_heredoc, text)| {
+                    .filter(|(line, is_heredoc, text)| {
                         *is_heredoc == heredoc && *line >= stmt_line && *text == src
                     })
+                    .nth(nth)
                     .map_or(first_line, |(line, is_heredoc, _)| {
                         if *is_heredoc { line + 1 } else { *line }
                     });

@@ -466,6 +466,23 @@ fn a_body_opened_below_the_statement_line_maps_to_its_real_lines() {
 }
 
 #[test]
+fn identical_bodies_in_one_statement_map_to_their_own_lines() {
+    // Two identical literals in one statement: the second must not borrow
+    // the first one's opener. `missing()` sits on lines 2 and 4.
+    let src = "$r = [ssh_mix(\"a\", '\nmissing()\n'), ssh_mix(\"b\", '\nmissing()\n')]\nprint($r)\n";
+    assert_eq!(src.lines().nth(1).unwrap(), "missing()");
+    assert_eq!(src.lines().nth(3).unwrap(), "missing()");
+    let d = diags_with_source(src);
+    let mut lines: Vec<_> = d
+        .iter()
+        .filter(|(c, ..)| c == "MIX-E1102")
+        .map(|x| x.2)
+        .collect();
+    lines.sort();
+    assert_eq!(lines, vec![Some(2), Some(4)], "{d:?}");
+}
+
+#[test]
 fn an_inline_heredoc_body_is_analysed() {
     // The manual's headline idiom writes the heredoc inline; it used to
     // count as "not a literal".
