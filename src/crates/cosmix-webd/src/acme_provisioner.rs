@@ -5236,11 +5236,13 @@ mod tests {
             "covered row must NOT trigger an issue attempt: \
              vhost_state={st:?}"
         );
+        // Inverted from the original pin: the "load-runtime-identities
+        // arm" this test deferred to never existed, which is why a
+        // restarted node served another vhost's cert. 4c IS that arm.
         assert!(
-            !p.acme_identities.contains_key("covered.example"),
-            "covered row must NOT populate acme_identities (the on-disk \
-             PEM is loaded by C4b's load-runtime-identities arm, not by \
-             apply_vhost_row)"
+            p.acme_identities.contains_key("covered.example"),
+            "covered row must adopt its on-disk PEM into acme_identities \
+             so the resolver serves it after a restart"
         );
     }
 
