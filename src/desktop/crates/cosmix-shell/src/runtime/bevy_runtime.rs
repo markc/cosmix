@@ -648,9 +648,15 @@ fn update_model(
             .clock_deadline
             .is_none_or(|deadline| now >= deadline)
         {
-            let wall = SystemTime::now();
+            // Sample wall and monotonic together: `now` is the update's start,
+            // and the wall clock read later in the frame would otherwise put
+            // the deadline early by that skew.
+            let (instant, wall) = (std::time::Instant::now(), SystemTime::now());
+            let skew = time
+                .last_update()
+                .map_or(Duration::ZERO, |start| instant.saturating_duration_since(start));
             runtime.clock_text = local_clock_text_at(wall);
-            runtime.clock_deadline = Some(next_second_boundary(now, wall));
+            runtime.clock_deadline = Some(next_second_boundary(now + skew, wall));
         }
         next_frame.content.bottom_clock_text = Some(runtime.clock_text.clone());
         if let Some(deadline) = runtime.clock_deadline {
@@ -674,13 +680,19 @@ fn update_model(
 /// runtime publishes clock text and arms its wake only while it is active.
 pub const CLOCK_PAGE_ID: &str = "launcher";
 
-/// Monotonic time of the next wall-clock second, so the displayed seconds
-/// change on the boundary instead of drifting by one update's latency.
+/// Lands the clock wake just past the second boundary. A wake even slightly
+/// early (runner early-fire, NTP slew) would read the old second, leave the
+/// text unchanged and re-arm a sub-millisecond deadline: 2-3 updates a second.
+const CLOCK_BOUNDARY_MARGIN: Duration = Duration::from_millis(2);
+
+/// Monotonic time just past the next wall-clock second, so the displayed
+/// seconds change on the boundary instead of drifting by one update's
+/// latency. `now` is the monotonic time at which `wall` was sampled.
 fn next_second_boundary(now: Duration, wall: SystemTime) -> Duration {
     let into = wall
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.subsec_nanos());
-    now + Duration::from_nanos(u64::from(1_000_000_000 - into))
+    now + Duration::from_nanos(u64::from(1_000_000_000 - into)) + CLOCK_BOUNDARY_MARGIN
 }
 
 fn local_clock_text_at(wall: SystemTime) -> String {
@@ -960,12 +972,22 @@ mod tests {
     fn clock_wakes_on_the_next_wall_second() {
         let now = Duration::from_secs(40);
         let wall = std::time::UNIX_EPOCH + Duration::from_millis(5_250);
+        let margin = Duration::from_millis(2);
         assert_eq!(
             next_second_boundary(now, wall),
-            now + Duration::from_millis(750)
+            now + Duration::from_millis(750) + margin
         );
         let exact = std::time::UNIX_EPOCH + Duration::from_secs(6);
-        assert_eq!(next_second_boundary(now, exact), now + Duration::from_secs(1));
+        assert_eq!(
+            next_second_boundary(now, exact),
+            now + Duration::from_secs(1) + margin
+        );
+        // A wake exactly on the deadline reads the NEW second.
+        let woke = wall + (next_second_boundary(now, wall) - now);
+        assert_eq!(
+            woke.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            6
+        );
     }
 
     #[test]
