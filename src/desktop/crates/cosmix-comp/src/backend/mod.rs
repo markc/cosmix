@@ -84,6 +84,13 @@ pub(crate) struct WinitBackendData {
     pub(crate) output_mode: Mode,
     pub(crate) output_size: (u32, u32),
     pub(crate) output_scale: f64,
+    /// The host window's real physical size: the swapchain the nested
+    /// renderer draws, and so the only extent a capture can copy. The logical
+    /// `output_size` is derived from it by the host and truncated, so
+    /// `output_size x output_scale` can miss it by a pixel or more (2762 at 2.5
+    /// is 1104.8 logical, kept as 1104, projected back to 2760). `None` until
+    /// the host has reported one; the projection is the fallback until then.
+    pub(crate) host_physical_size: Option<(u32, u32)>,
 }
 
 /// Exact physical source selected by a screencopy request.
@@ -376,6 +383,12 @@ impl BackendData {
                     .checked_mul(u64::from(scale120))?
                     .checked_add(60)?
                     / 120;
+                // The host's own physical size wins: a capture whose advertised
+                // extent differs from the swapchain is refused at copy time.
+                let (physical_width, physical_height) = match data.host_physical_size {
+                    Some((width, height)) => (u64::from(width), u64::from(height)),
+                    None => (physical_width, physical_height),
+                };
                 let output_name = output.name();
                 Some(CaptureSourceSnapshot {
                     source_id: CaptureSourceId::Nested {
@@ -703,6 +716,22 @@ impl BackendData {
         }
     }
 
+    /// Record the host window's physical (swapchain) size. Nested only; a KMS
+    /// output's physical size is its admitted mode. Whether it changed.
+    pub(crate) fn set_host_physical_size(&mut self, size: (u32, u32)) -> bool {
+        match self {
+            Self::Kms(_) => false,
+            Self::Winit(data) => {
+                let size = (size.0.max(1), size.1.max(1));
+                if data.host_physical_size == Some(size) {
+                    return false;
+                }
+                data.host_physical_size = Some(size);
+                true
+            }
+        }
+    }
+
     /// Apply a host-window scale. Bare-metal scale comes from KMS output
     /// admission and is not mutable through a winit event.
     pub(crate) fn change_host_output_scale(&mut self, scale: f64) -> bool {
@@ -1010,6 +1039,7 @@ mod tests {
             },
             output_size: (1920, 1080),
             output_scale: 1.0,
+            host_physical_size: None,
         });
 
         assert!(backend.port_outputs().is_empty());

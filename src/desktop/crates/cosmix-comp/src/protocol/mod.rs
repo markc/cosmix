@@ -927,6 +927,12 @@ pub(crate) enum HostInput {
     OutputScaleChanged {
         scale: f64,
     },
+    /// The host window's physical (swapchain) size, which the truncated
+    /// logical size and the scale cannot reconstruct exactly.
+    OutputPhysicalResized {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// One axis of a scroll event, exactly as the device reported it.
@@ -3223,6 +3229,7 @@ impl ProtocolServer {
                     output_mode: mode,
                     output_size,
                     output_scale: 1.0,
+                    host_physical_size: None,
                 })
             }
             BackendKind::Kms => BackendData::Kms(KmsBackendData::new(output_size)),
@@ -9034,6 +9041,9 @@ impl WaylandState {
             HostInput::OutputScaleChanged { scale } => {
                 self.change_output_scale(scale);
             }
+            HostInput::OutputPhysicalResized { width, height } => {
+                self.change_output_physical_size(width, height);
+            }
         }
     }
 
@@ -14488,6 +14498,20 @@ impl WaylandState {
         self.publish_surface_preferred_scale(scale);
         self.resnap_toplevels_to_physical_grid();
         tracing::info!(scale, "nested output scale changed");
+    }
+
+    /// The nested host window's swapchain changed size. Captures in flight
+    /// were admitted against the old extent and could only fail at copy time,
+    /// so they fail now, as on a logical resize.
+    fn change_output_physical_size(&mut self, width: u32, height: u32) {
+        if !self.backend.set_host_physical_size((width, height)) {
+            return;
+        }
+        let captures = self.capture_frames.keys().copied().collect::<Vec<_>>();
+        for id in captures {
+            self.fail_capture(id);
+        }
+        tracing::debug!(width, height, "nested output physical size changed");
     }
 
     /// Settle every placed Wayland toplevel onto the current scale's physical

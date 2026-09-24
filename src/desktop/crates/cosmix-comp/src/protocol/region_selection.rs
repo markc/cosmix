@@ -506,6 +506,7 @@ impl WaylandState {
             }
             HostInput::OutputResized { .. }
             | HostInput::OutputScaleChanged { .. }
+            | HostInput::OutputPhysicalResized { .. }
             | HostInput::TouchDeviceAdded => return false,
             _ => {} // Scroll/touch cannot reach clients or native furniture during selection.
         }

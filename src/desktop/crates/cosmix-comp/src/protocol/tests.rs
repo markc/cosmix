@@ -41828,6 +41828,47 @@ fn screencopy_nested_frame_is_physical_pixels_at_two_point_five() {
     );
 }
 
+/// A host swapchain of 2762x1555 at 2.5 is 1104.8x622 logical, which the host
+/// reports truncated to 1104x622. Projecting that back gives 2760x1555, two
+/// pixels short of the swapchain, and the renderer refuses a copy whose
+/// advertised extent differs from its target, so every capture failed. The
+/// host's own physical size is what is advertised once it is known.
+#[test]
+fn screencopy_nested_advertises_the_host_swapchain_at_a_non_integral_host_size() {
+    let mut wire = ScreencopyWireHarness::new(3);
+    let state = &mut wire.harness.server.state;
+    state.resize_output(1104, 622);
+    state.change_output_scale(2.5);
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 2760, 1555, 11040],
+        "without the host size, the truncated projection misses the swapchain"
+    );
+
+    wire.harness
+        .server
+        .state
+        .handle_host_input(HostInput::OutputPhysicalResized {
+            width: 2762,
+            height: 1555,
+        });
+    let (frame, events) = wire.capture_output(false);
+    assert_eq!(
+        screencopy_buffer_words(&events, frame),
+        vec![wl_shm::Format::Xrgb8888 as u32, 2762, 1555, 11048]
+    );
+    // Reporting the same size again is not a change.
+    assert!(
+        !wire
+            .harness
+            .server
+            .state
+            .backend
+            .set_host_physical_size((2762, 1555))
+    );
+}
+
 #[test]
 fn first_light_wire_copy_then_copy_with_damage_complete_across_animation_frames() {
     let started = Instant::now();
