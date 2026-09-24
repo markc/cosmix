@@ -168,6 +168,8 @@ pub struct FiredVerb {
     pub verb: String,
     /// The binding's arguments, sent as the verb's body (`None` = empty body).
     pub args: Option<serde_json::Value>,
+    /// The row's explicit target service; `None` = the verb's first segment.
+    pub service: Option<String>,
 }
 
 /// Observe-only: read, resolve, report. Never grabs, never fires. Blocks until
@@ -323,10 +325,12 @@ pub fn run_grab(
                         press.verb.map(|v| FiredVerb {
                             verb: v.as_str().to_string(),
                             args: press.args.clone(),
+                            service: press.service.clone(),
                         }),
                         repeat.verb.map(|v| FiredVerb {
                             verb: v.as_str().to_string(),
                             args: repeat.args.clone(),
+                            service: repeat.service.clone(),
                         }),
                     )
                 };

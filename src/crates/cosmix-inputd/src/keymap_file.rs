@@ -43,7 +43,12 @@ pub fn default_path() -> Option<PathBuf> {
 /// Load persisted physical rows, or `None` if the file is absent or unreadable.
 pub fn load(path: &Path) -> Option<Vec<PhysicalBinding>> {
     let text = std::fs::read_to_string(path).ok()?;
-    let parsed: PersistedKeymap = serde_json::from_str(&text)
+    parse(&text, path)
+}
+
+/// Parse and admit a keymap document (the pure half of [`load`]).
+fn parse(text: &str, path: &Path) -> Option<Vec<PhysicalBinding>> {
+    let parsed: PersistedKeymap = serde_json::from_str(text)
         .map_err(|error| eprintln!("cosmix-inputd: keymap {} unreadable: {error}", path.display()))
         .ok()?;
     // This path bypasses `bind_physical`'s admission checks, so enforce the
@@ -66,6 +71,20 @@ pub fn load(path: &Path) -> Option<Vec<PhysicalBinding>> {
             row.args = None;
         }
     }
+    // An explicit `service` target must be registered-name-shaped. A bad one
+    // drops the WHOLE row: stripping just the field would silently re-route
+    // the verb to its first segment, a different service than the author named.
+    physical.retain(|row| match row.service.as_deref() {
+        Some(name) if !cosmix_input_core::service_is_valid(name) => {
+            eprintln!(
+                "cosmix-inputd: keymap {}: row {:?} has invalid service {name:?}; row dropped",
+                path.display(),
+                row.action.as_str()
+            );
+            false
+        }
+        _ => true,
+    });
     Some(physical)
 }
 
@@ -88,4 +107,49 @@ pub fn save(path: &Path, physical: &[PhysicalBinding]) -> std::io::Result<()> {
         file.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(rows: &str) -> String {
+        format!(r#"{{"version":1,"physical":[{rows}]}}"#)
+    }
+
+    const MENU_WITH: &str = r#"{"stroke":{"code":108,"modifiers":{"right_ctrl":true}},
+        "action":"desktop.clipboard.menu","service":"desktop-vt1"}"#;
+    const NEXT_WITHOUT: &str =
+        r#"{"stroke":{"code":106,"modifiers":{"right_ctrl":true}},"action":"desktop.workspace.next"}"#;
+
+    #[test]
+    fn loader_accepts_the_service_field_and_its_absence() {
+        let rows = parse(&doc(&format!("{MENU_WITH},{NEXT_WITHOUT}")), Path::new("t")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].service.as_deref(), Some("desktop-vt1"));
+        assert_eq!(rows[0].action.as_str(), "desktop.clipboard.menu");
+        assert_eq!(rows[1].service, None, "pre-field files load unchanged");
+    }
+
+    #[test]
+    fn loader_drops_a_row_with_a_malformed_service() {
+        for bad in ["", "Desktop", "desk.vt1", "desktop-vt1.alpha.bus"] {
+            let row = MENU_WITH.replace("desktop-vt1", bad);
+            let rows = parse(&doc(&format!("{row},{NEXT_WITHOUT}")), Path::new("t")).unwrap();
+            assert_eq!(rows.len(), 1, "{bad:?} row must be dropped");
+            assert_eq!(rows[0].action.as_str(), "desktop.workspace.next");
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_the_service() {
+        let dir = std::env::temp_dir().join(format!("inputd-keymap-test-{}", std::process::id()));
+        let path = dir.join("keymap.json");
+        let rows = cosmix_input_core::default_keymap().physical;
+        save(&path, &rows).unwrap();
+        let back = load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(back, rows);
+        assert!(back.iter().any(|r| r.service.as_deref() == Some("desktop-vt1")));
+    }
 }

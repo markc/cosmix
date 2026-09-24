@@ -508,6 +508,47 @@ mod tests {
     }
 
     #[test]
+    fn bind_admits_a_service_target_and_query_shows_it() {
+        let mut injector = PointerInjector::default();
+        let resolver = resolver();
+        let row = |service: &str| {
+            json!({
+                "layer": "physical",
+                "stroke": {"code": 63, "modifiers": {}},
+                "action": "desktop.clipboard.menu",
+                "service": service,
+            })
+        };
+        for bad in ["", "Desktop", "desk.vt1"] {
+            let cmd = command(verbs::BIND, row(bad), Some("local"));
+            let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+            assert_eq!(rc, 10, "{bad:?}: {reply}");
+            assert!(reply.contains("InvalidService"), "{reply}");
+        }
+        let cmd = command(verbs::BIND, row("desktop-vt1"), Some("local"));
+        let (rc, reply) = dispatch(&resolver, None, &mut injector, &cmd);
+        assert_eq!(rc, 0, "{reply}");
+        let (rc, reply) = dispatch(
+            &resolver,
+            None,
+            &mut injector,
+            &command(verbs::QUERY, json!({}), None),
+        );
+        assert_eq!(rc, 0);
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        let rows = reply["physical"].as_array().unwrap();
+        let f5 = rows.iter().find(|r| r["stroke"]["code"] == 63).unwrap();
+        assert_eq!(f5["service"], "desktop-vt1");
+        assert_eq!(f5["action"], "desktop.clipboard.menu");
+        // Rows without a target keep the old wire shape: no `service` key.
+        let next = rows
+            .iter()
+            .find(|r| r["action"] == "desktop.workspace.next")
+            .unwrap();
+        assert!(next.get("service").is_none(), "{next}");
+    }
+
+    #[test]
     fn injection_manifest_lists_writable_verbs_and_arguments() {
         let manifest = serde_json::to_value(verb_manifest()).unwrap();
         for (verb, args) in [

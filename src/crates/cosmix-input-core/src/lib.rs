@@ -44,6 +44,9 @@ pub struct Resolution {
     /// The binding's arguments, delivered as the fired verb's body. Present
     /// only when `verb` is (an args-less binding fires with an empty body).
     pub args: Option<serde_json::Value>,
+    /// The row's explicit target service. Present only when `verb` is and the
+    /// row names one; `None` means "route by the verb's first dot-segment".
+    pub service: Option<String>,
     /// When true, do NOT re-emit the original event through uinput.
     pub swallow: bool,
 }
@@ -53,6 +56,7 @@ impl Resolution {
     const PASS: Self = Self {
         verb: None,
         args: None,
+        service: None,
         swallow: false,
     };
 }
@@ -68,6 +72,20 @@ pub enum BindError {
     ArgsTooLarge,
     /// The keymap already holds this many physical rows (capacity cap).
     AtCapacity,
+    /// `service` is not a registered-name-shaped string
+    /// (`^[a-z][a-z0-9-]{1,30}$`, the broker's grammar).
+    InvalidService,
+}
+
+/// True when `name` matches the broker's registered-service grammar,
+/// `^[a-z][a-z0-9-]{1,30}$` (noded's `valid_service_name`). A row's explicit
+/// `service` target must pass this at bind and at keymap-file load.
+pub fn service_is_valid(name: &str) -> bool {
+    (2..=31).contains(&name.len())
+        && name.bytes().next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// The maximum number of physical rows, a flood/exhaustion backstop.
@@ -150,9 +168,11 @@ impl Resolver {
             Edge::Repeat | Edge::Release => None,
         };
         let args = verb.as_ref().and_then(|_| binding.args.clone());
+        let service = verb.as_ref().and_then(|_| binding.service.clone());
         Resolution {
             verb,
             args,
+            service,
             swallow: true,
         }
     }
@@ -173,6 +193,9 @@ impl Resolver {
     pub fn bind_physical(&mut self, binding: PhysicalBinding) -> Result<u64, BindError> {
         if !action_is_valid(&binding.action) {
             return Err(BindError::InvalidAction);
+        }
+        if binding.service.as_deref().is_some_and(|name| !service_is_valid(name)) {
+            return Err(BindError::InvalidService);
         }
         // Args ride as the fired verb's body, and a body is a map: refuse
         // anything but a JSON object so every handler sees a uniform shape,
@@ -232,9 +255,12 @@ fn action_is_valid(action: &ActionId) -> bool {
 }
 
 /// The shipped default keymap: raw F1–F12 as `user.f01`…`user.f12` (no-op until
-/// bound), `RightCtrl+←/→` = workspace prev/next, and `RightShift+←/→/↑/↓` as
-/// reserved passthrough (Konsole tab nav survives). Evdev codes are the Linux
-/// `input-event-codes.h` values.
+/// bound), `RightCtrl+←/→` = workspace prev/next, `RightCtrl+↓/↑` = clipboard
+/// menu/rotate on the [`CLIPBOARD_SERVICE`] citizen (an explicit `service`
+/// target: the citizen is registered as `desktop-vt1` but answers
+/// `desktop.clipboard.*`, so first-segment routing cannot reach it), and
+/// `RightShift+←/→/↑/↓` as reserved passthrough (Konsole tab nav survives).
+/// Evdev codes are the Linux `input-event-codes.h` values.
 pub fn default_keymap() -> InputKeymap {
     // input-event-codes.h
     const KEY_LEFT: u16 = 105;
@@ -253,6 +279,7 @@ pub fn default_keymap() -> InputKeymap {
             },
             action: user_fkey_action(index + 1),
             args: None,
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Ignore,
             passthrough: false,
@@ -260,6 +287,8 @@ pub fn default_keymap() -> InputKeymap {
     }
     physical.push(right_ctrl_arrow(KEY_LEFT, "desktop.workspace.prev"));
     physical.push(right_ctrl_arrow(KEY_RIGHT, "desktop.workspace.next"));
+    physical.push(clipboard_row(KEY_DOWN, "desktop.clipboard.menu"));
+    physical.push(clipboard_row(KEY_UP, "desktop.clipboard.rotate"));
     for code in [KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN] {
         physical.push(PhysicalBinding {
             stroke: PhysicalStroke {
@@ -269,6 +298,7 @@ pub fn default_keymap() -> InputKeymap {
             // A passthrough row carries an inert marker action; nothing fires it.
             action: ActionId::from_static("input.passthrough"),
             args: None,
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Ignore,
             passthrough: true,
@@ -289,9 +319,32 @@ fn right_ctrl_arrow(code: u16, verb: &'static str) -> PhysicalBinding {
         },
         action: ActionId::from_static(verb),
         args: None,
+        service: None,
         scope: BindingScope::default(),
         // Workspace navigation is incremental — allow auto-repeat.
         repeat: RepeatPolicy::Allow,
+        passthrough: false,
+    }
+}
+
+/// The registered name of the desktop-session clipboard citizen the default
+/// `RightCtrl+↓/↑` rows target (`mix --serve desktop-session.mix --name
+/// desktop-vt1`).
+pub const CLIPBOARD_SERVICE: &str = "desktop-vt1";
+
+fn clipboard_row(code: u16, verb: &'static str) -> PhysicalBinding {
+    PhysicalBinding {
+        stroke: PhysicalStroke {
+            code,
+            modifiers: SideModifiers::RIGHT_CTRL,
+        },
+        action: ActionId::from_static(verb),
+        args: None,
+        service: Some(CLIPBOARD_SERVICE.to_string()),
+        scope: BindingScope::default(),
+        // One press, one menu toggle / one rotation — a held key must not
+        // flicker the menu or spin the history.
+        repeat: RepeatPolicy::Ignore,
         passthrough: false,
     }
 }
@@ -399,6 +452,7 @@ mod tests {
                 },
                 action: ActionId::from_static("term.snapshot"),
                 args: None,
+                service: None,
                 scope: BindingScope::default(),
                 repeat: RepeatPolicy::Ignore,
                 passthrough: false,
@@ -419,6 +473,7 @@ mod tests {
             },
             action: ActionId::from_static("launch.run"),
             args: Some(serde_json::json!({"command": "kcalc"})),
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Allow,
             passthrough: false,
@@ -445,6 +500,7 @@ mod tests {
             },
             action: ActionId::from_static("launch.run"),
             args: Some(serde_json::json!({"command": "x".repeat(MAX_ARGS_BYTES)})),
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Ignore,
             passthrough: false,
@@ -462,6 +518,7 @@ mod tests {
             },
             action: ActionId::from_static("launch.run"),
             args: Some(serde_json::json!("kcalc")),
+            service: None,
             scope: BindingScope::default(),
             repeat: RepeatPolicy::Ignore,
             passthrough: false,
@@ -479,5 +536,86 @@ mod tests {
         assert!(r.unbind_physical(&stroke).is_some());
         assert_eq!(r.resolve(KEY_F5, SideModifiers::NONE, Edge::Press), Resolution::PASS);
         assert!(r.unbind_physical(&stroke).is_none(), "second unbind is a no-op");
+    }
+
+    const KEY_UP: u16 = 103;
+    const KEY_DOWN: u16 = 108;
+
+    #[test]
+    fn default_clipboard_rows_target_the_citizen_with_the_verb_unchanged() {
+        // The live bug: `desktop-vt1.desktop.clipboard.menu` routed to
+        // service `desktop-vt1` with the WHOLE string as the command, which the
+        // citizen's exact `on desktop.clipboard.menu` never matched.
+        let r = resolver();
+        for (code, verb) in [
+            (KEY_DOWN, "desktop.clipboard.menu"),
+            (KEY_UP, "desktop.clipboard.rotate"),
+        ] {
+            let out = r.resolve(code, SideModifiers::RIGHT_CTRL, Edge::Press);
+            assert_eq!(out.verb.as_ref().map(|a| a.as_str()), Some(verb));
+            assert_eq!(out.service.as_deref(), Some("desktop-vt1"));
+            assert!(out.swallow);
+            let repeat = r.resolve(code, SideModifiers::RIGHT_CTRL, Edge::Repeat);
+            assert_eq!(repeat.verb, None, "clipboard rows do not auto-repeat");
+            assert_eq!(repeat.service, None, "no verb, no target");
+        }
+    }
+
+    #[test]
+    fn a_row_without_service_resolves_no_target() {
+        // Absent service = the old first-segment rule; the core reports None.
+        let out = resolver().resolve(KEY_RIGHT, SideModifiers::RIGHT_CTRL, Edge::Press);
+        assert_eq!(out.service, None);
+    }
+
+    fn row_with_service(service: Option<&str>) -> PhysicalBinding {
+        PhysicalBinding {
+            stroke: PhysicalStroke {
+                code: KEY_F5,
+                modifiers: SideModifiers::NONE,
+            },
+            action: ActionId::from_static("desktop.clipboard.menu"),
+            args: None,
+            service: service.map(str::to_string),
+            scope: BindingScope::default(),
+            repeat: RepeatPolicy::Ignore,
+            passthrough: false,
+        }
+    }
+
+    #[test]
+    fn bind_accepts_a_registered_name_shaped_service() {
+        let mut r = resolver();
+        for name in ["desktop-vt1", "ab", "a-1", &"a".repeat(31)] {
+            r.bind_physical(row_with_service(Some(name)))
+                .unwrap_or_else(|e| panic!("{name:?} refused: {e:?}"));
+            let out = r.resolve(KEY_F5, SideModifiers::NONE, Edge::Press);
+            assert_eq!(out.service.as_deref(), Some(name));
+        }
+        r.bind_physical(row_with_service(None)).expect("absent service");
+    }
+
+    #[test]
+    fn bind_refuses_a_malformed_service() {
+        let mut r = resolver();
+        for name in [
+            "",
+            "a",
+            "Desktop",
+            "1desk",
+            "-desk",
+            "desk.vt1",
+            "desk_vt1",
+            "desk vt1",
+            "desktop-vt1.alpha.bus",
+            &"a".repeat(32),
+        ] {
+            assert_eq!(
+                r.bind_physical(row_with_service(Some(name))),
+                Err(BindError::InvalidService),
+                "{name:?} must be refused"
+            );
+        }
+        assert!(service_is_valid("desktop-vt1"));
     }
 }
