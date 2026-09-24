@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -1420,16 +1420,22 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&publish_timeouts),
         shutdown.clone(),
     ));
-    // Holder cleanup on Bus departure. Best effort: the liveness probe bounds
-    // what a missed departure can leave behind.
-    let registry_task = tokio::spawn({
-        let client = Arc::clone(&client);
-        async move {
-            if let Err(error) = client.subscribe_topic(REGISTRY_TOPIC).await {
-                tracing::warn!(%error, "registry subscription failed; panel holds rely on the liveness probe");
+    // Holder cleanup on Bus departure. The supervised client replays a
+    // subscription once it has succeeded; until then every (re)connect tries
+    // again. Best effort: the liveness probe bounds what a missed departure
+    // can leave behind.
+    let registry_subscribed = Arc::new(AtomicBool::new(false));
+    let subscribe_registry = |client: &Arc<C>, subscribed: &Arc<AtomicBool>| {
+        let client = Arc::clone(client);
+        let subscribed = Arc::clone(subscribed);
+        tokio::spawn(async move {
+            match client.subscribe_topic(REGISTRY_TOPIC).await {
+                Ok(()) => subscribed.store(true, Ordering::Release),
+                Err(error) => tracing::warn!(%error, "registry subscription failed; retried on the next connect"),
             }
-        }
-    });
+        })
+    };
+    let mut registry_task = subscribe_registry(&client, &registry_subscribed);
 
     loop {
         tokio::select! {
@@ -1445,6 +1451,10 @@ async fn worker_loop<F, Fut, C>(
                 let state = *states.borrow_and_update();
                 apply_connection_state(&broker, state);
                 observation_notifier.notify_one();
+                if state == ConnState::Connected && !registry_subscribed.load(Ordering::Acquire) {
+                    registry_task.abort();
+                    registry_task = subscribe_registry(&client, &registry_subscribed);
+                }
                 if state == ConnState::Fatal {
                     tracing::error!(service = %service, "Bus registration rejected during reconnect; compositor continues without a port");
                     break;
@@ -1592,7 +1602,7 @@ fn dispatch_incoming(
     }
     // The broker's registry (only noded may publish its props topic): a
     // holder service that left takes its panel holds with it.
-    if command.topic() == Some(REGISTRY_TOPIC) {
+    if command.from == "noded" && command.topic() == Some(REGISTRY_TOPIC) {
         if let Ok(body) = serde_json::from_str::<Value>(&command.body)
             && body["path"] == "services.registered"
             && let Some(live) = body["new"].as_array().and_then(|names| {

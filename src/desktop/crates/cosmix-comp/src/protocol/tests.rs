@@ -36154,8 +36154,18 @@ fn healthy_owner_answers_the_probe_and_is_untouched() {
     let panel = &harness.server.state.observations.panel_holders[&key];
     assert!(panel.probe.is_none() && panel.quiet && !panel.stalled);
     assert!(panel.held.contains_key("popup"), "the live menu keeps its hold");
-    // Past the timeout nothing happens.
     let answered = Instant::now();
+    let click = |harness: &mut KeybindingHarness| {
+        route_pointer_button(harness, PRIMARY_POINTER_BUTTON, ButtonState::Pressed);
+        route_pointer_button(harness, PRIMARY_POINTER_BUTTON, ButtonState::Released);
+        harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    };
+    // Rate limit: an owner that just answered is not probed again at once,
+    // however often the user clicks elsewhere.
+    click(&mut harness);
+    click(&mut harness);
+    assert!(harness.server.state.observations.panel_holders[&key].probe.is_none(), "resting");
+    // Past the rest nothing happens by itself ...
     while answered.elapsed() < port_observation::PROBE_TIMEOUT + Duration::from_millis(200) {
         harness.server.dispatch_cycle(Some(Duration::from_millis(100))).unwrap();
     }
@@ -36164,6 +36174,18 @@ fn healthy_owner_answers_the_probe_and_is_untouched() {
     assert!(!panel.stalled && panel.verdict == Some(true));
     assert!(harness.server.state.observations.enforced_surfaces.is_empty());
     assert_eq!(focus(&harness), Some(menu), "the live menu keeps the keyboard");
+    // ... and the next click probes again, once: a second click while that
+    // probe is in flight adds none.
+    click(&mut harness);
+    let first = harness.server.state.observations.panel_holders[&key].probe.clone();
+    assert!(first.is_some());
+    click(&mut harness);
+    let second = harness.server.state.observations.panel_holders[&key].probe.clone();
+    assert_eq!(
+        first.map(|probe| probe.serials),
+        second.map(|probe| probe.serials),
+        "one probe in flight per owner"
+    );
 }
 
 /// A pointer reveal during a live Quoin's startup intro, then the pointer
@@ -36294,6 +36316,12 @@ fn bus_departure_and_new_generation_drop_holds() {
     assert!(harness.server.state.observations.panel_holders[&key].held.is_empty());
     assert_eq!(panel_commands(&observations), [("quoin.panel.22".to_owned(), false)]);
     assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.hold", focus).0, 0);
+    // Generations only move forward: a delayed report from generation 1
+    // changes nothing, and generation 2's hold stands.
+    let (rc, body) = nested_panel_call(&mut harness, &ingress, "comp.panel.mode", mode(1));
+    assert_eq!((rc, body["error"].as_str()), (10, Some("stale_generation")));
+    let panel = &harness.server.state.observations.panel_holders[&key];
+    assert_eq!((panel.held.len(), panel.generation), (1, Some(2)));
     // The holder service leaves the Bus: its holds go, the owner stays.
     port_observation::panel_services_live(
         &mut harness.server.state,
@@ -36358,6 +36386,32 @@ fn first_owner_race_never_binds_a_foreign_layer() {
     let (rc, body) = nested_panel_call(&mut harness, &ingress, "comp.panel.hold", hold("quoin.panel.23x"));
     assert_eq!((rc, body["error"].as_str()), (10, Some("unknown_panel_surface")));
     assert!(harness.server.state.observations.panel_holders[&key].owner.is_none());
+
+    // Reporter, then an overwrite attempt: Quoin reports the top edge before
+    // its layer exists; an anonymous report and another service's report
+    // then name a foreign token; the foreign layer maps. Neither report
+    // replaces the token Quoin named, and deferred resolution adopts nothing.
+    let top = (output.clone(), "top".to_owned());
+    let top_report = |token: &str| json!({"output":output,"edge":"top","surface":token,"mode":"hidden"});
+    assert_eq!(nested_panel_call(&mut harness, &ingress, "comp.panel.mode", top_report("quoin.panel.24")).0, 0);
+    assert_eq!(panel_call_as(&mut harness, &ingress, "", "comp.panel.mode", top_report("foreign.24")).0, 0);
+    assert_eq!(
+        panel_call_as(&mut harness, &ingress, "other-service", "comp.panel.mode", top_report("foreign.24")).0,
+        0
+    );
+    let panel = &harness.server.state.observations.panel_holders[&top];
+    assert_eq!(panel.surface, "quoin.panel.24", "the holder's token stands");
+    assert_eq!(panel.reporter.as_deref(), Some("test-caller"));
+    let _ = map_named_test_layer_surface(
+        &mut harness,
+        0,
+        TestLayerSpec { anchor: 1 | 4 | 8, ..TestLayerSpec::default() },
+        "foreign.24",
+    );
+    let _ = harness.sync();
+    harness.server.dispatch_cycle(Some(Duration::ZERO)).unwrap();
+    let panel = &harness.server.state.observations.panel_holders[&top];
+    assert_eq!((panel.owner.clone(), panel.id), (None, None), "the foreign layer is never adopted");
 }
 
 /// Focus the user moved off a live popup is theirs: the popup's later

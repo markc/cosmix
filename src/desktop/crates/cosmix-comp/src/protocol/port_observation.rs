@@ -194,6 +194,9 @@ pub(crate) struct PanelHolders {
     /// probed again until the next trigger (a commanded conceal, the verdict
     /// revealing, or nothing showing any more).
     pub(crate) quiet: bool,
+    /// The owner answered a probe: no press-triggered probe of it before
+    /// this ([`PROBE_TIMEOUT`] after the answer).
+    pub(crate) probe_rest_until: Option<Instant>,
     /// A probe went unanswered: the owner is stopped. Its popup and focus
     /// holds are dropped, its keyboard focus counts for nothing and its
     /// Exclusive layers lose their grab, until it is heard from again.
@@ -207,6 +210,9 @@ pub(crate) struct PanelHolders {
     /// (the holder service). Only such a report may give an unowned edge its
     /// owner, and that service leaving the Bus drops its holds.
     pub(crate) reporter: Option<String>,
+    /// The token the reporter itself named: the only one an unowned edge
+    /// is adopted for. A report from anyone else never replaces it.
+    pub(crate) reported_surface: Option<String>,
     /// The reporter's Bus connection generation, when it states one.
     pub(crate) generation: Option<u64>,
 }
@@ -276,9 +282,11 @@ impl PanelHolders {
             arm_pending: false,
             probe: None,
             quiet: false,
+            probe_rest_until: None,
             stalled: false,
             enforced: BTreeSet::new(),
             reporter: None,
+            reported_surface: None,
             generation: None,
         }
     }
@@ -3266,7 +3274,9 @@ fn service_panel_holders(state: &mut WaylandState) {
                 let id = resolve_panel_surface(panel_surface_candidates(state, &panel.surface, &key.0))
                     .ok()
                     .flatten();
-                let may_adopt = panel.reporter.as_deref().is_some_and(|reporter| !reporter.is_empty());
+                // Only for the very token the holder service itself named.
+                let may_adopt = panel.reporter.as_deref().is_some_and(|reporter| !reporter.is_empty())
+                    && panel.reported_surface.as_deref() == Some(panel.surface.as_str());
                 let claim = id.map(|id| panel_claim(state, panel.owner.as_ref(), id, may_adopt));
                 (key.clone(), id, claim)
             })
@@ -3436,12 +3446,18 @@ pub(super) fn panel_owner_disconnected(state: &mut WaylandState, client: &Client
 /// Bus takes its explicit holds with it. The Wayland-side state — owner,
 /// enforcement, comp's own pointer and focus holders — stays with the Wayland
 /// client, so a stalled Quoin that also lost its Bus connection is still
-/// hidden. The next stable boundary settles the verdicts.
+/// hidden. The next stable boundary settles the verdicts. This is this
+/// node's registry: a reporter reaching comp over the mesh is not in it, so
+/// its holds drop on the next local registry change (the liveness probe and
+/// its next report repair that). noded caps each path's diffs at 10 Hz, so a
+/// diff can be dropped; every diff carries the full set, so the next repairs
+/// it.
 pub(super) fn panel_services_live(state: &mut WaylandState, live: &BTreeSet<String>) {
     for panel in state.observations.panel_holders.values_mut() {
         if panel.reporter.as_ref().is_some_and(|reporter| !live.contains(reporter)) {
             panel.drop_holds();
             panel.reporter = None;
+            panel.reported_surface = None;
             panel.generation = None;
         }
     }
@@ -3517,6 +3533,15 @@ fn track_panel_holders(state: &mut WaylandState, now: Instant) -> bool {
     };
     let mut commands = Vec::new();
     let mut probes = Vec::new();
+    // At most one press-triggered probe per owner in flight; an owner that
+    // just answered rests for PROBE_TIMEOUT.
+    let mut probing: Vec<ClientId> = state
+        .observations
+        .panel_holders
+        .values()
+        .filter(|panel| panel.probe.is_some())
+        .filter_map(|panel| panel.owner.clone())
+        .collect();
     let mut deadline: Option<Instant> = None;
     for (key, panel) in &mut state.observations.panel_holders {
         let (output, edge) = key;
@@ -3622,10 +3647,13 @@ fn track_panel_holders(state: &mut WaylandState, now: Instant) -> bool {
         if only_popup_or_focus
             && panel.probe.is_none()
             && !panel.stalled
-            && owner.is_some()
             && !showing.is_empty()
+            && panel.probe_rest_until.is_none_or(|at| now >= at)
             && user_input.iter().any(|client| *client != owner)
+            && let Some(client) = owner.clone()
+            && !probing.contains(&client)
         {
+            probing.push(client);
             probes.push((key.clone(), showing.iter().copied().collect()));
         }
         let probe_at = panel.probe.as_ref().map(|probe| probe.deadline);
@@ -3676,15 +3704,27 @@ pub(super) fn note_layer_ack(
     client: Option<ClientId>,
     serial: smithay::utils::Serial,
 ) {
+    let mut answered = false;
     for panel in state.observations.panel_holders.values_mut() {
         if panel.probe.as_ref().is_some_and(|probe| {
             probe.serials.iter().any(|(probed, sent)| *probed == id && serial >= *sent)
         }) {
             panel.settle_owed();
             panel.quiet = true;
+            answered = true;
         }
         if client.is_some() && panel.owner == client {
             panel.stalled = false;
+        }
+    }
+    // An owner that answered a probe rests: no press re-probes it for
+    // PROBE_TIMEOUT, however often the user clicks elsewhere.
+    if answered && client.is_some() {
+        let rest = Instant::now() + PROBE_TIMEOUT;
+        for panel in state.observations.panel_holders.values_mut() {
+            if panel.owner == client {
+                panel.probe_rest_until = Some(rest);
+            }
         }
     }
 }
@@ -3831,20 +3871,35 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
         return ControlReply::refused("unknown_panel_surface", json!({"surface":request.surface}));
     }
     let key = (request.output.clone(), request.edge.clone());
+    let (owner, reporter, current_generation) = state
+        .observations
+        .panel_holders
+        .get(&key)
+        .map_or((None, None, None), |panel| (panel.owner.clone(), panel.reporter.clone(), panel.generation));
+    // The holder service is the first registered (broker-stamped) service to
+    // report the edge; only it reports it after that. A report from anyone
+    // else is recorded but binds nothing and never replaces the token the
+    // holder named.
+    let from_reporter = !request.sender.is_empty()
+        && reporter.as_deref().is_none_or(|reporter| reporter == request.sender);
+    let reporting = request.mode.is_some() && from_reporter;
+    let foreign_report = request.mode.is_some() && !reporting && reporter.is_some();
+    // Generations only move forward: a report from an older Bus connection
+    // of the holder (delayed, or from a dead incarnation) changes nothing.
+    if reporting
+        && let (Some(generation), Some(current)) = (request.generation, current_generation)
+        && generation < current
+    {
+        tracing::warn!(generation, current, edge = %request.edge, "stale holder generation refused");
+        return ControlReply::refused("stale_generation", json!({"generation":generation,"current":current}));
+    }
     // Incarnation fencing: a layer names the edge's owner by its Wayland
     // client, which comp attests; a copied token on another live client's
     // layer is refused rather than bound, so it can never be held, tracked or
     // enforced. Only the registered holder service adopts an unowned edge:
     // by a mode report, or by a hold once it has reported the edge (a corner
     // menu can open while its panel has no layer).
-    let reporting = request.mode.is_some() && !request.sender.is_empty();
-    let (owner, reporter) = state
-        .observations
-        .panel_holders
-        .get(&key)
-        .map_or((None, None), |panel| (panel.owner.clone(), panel.reporter.clone()));
-    let may_adopt = reporting
-        || (!request.sender.is_empty() && reporter.as_deref() == Some(request.sender.as_str()));
+    let may_adopt = reporting || (from_reporter && reporter.is_some());
     let claim = id.map(|id| panel_claim(state, owner.as_ref(), id, may_adopt));
     match &claim {
         Some(Claim::Refuse) => {
@@ -3857,23 +3912,27 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
         }
         _ => {}
     }
-    let bound = claim.as_ref().is_some_and(Claim::binds);
+    let bound = !foreign_report && claim.as_ref().is_some_and(Claim::binds);
     let id = id.filter(|_| bound);
+    let recorded = state
+        .observations
+        .panel_holders
+        .get(&key)
+        .map(|panel| (panel.surface.clone(), panel.id));
     if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
         // A replacement drops the dead incarnation before this request lands.
-        if let Some(replace @ Claim::Replace(_)) = claim.clone() {
+        if let Some(replace @ Claim::Replace(_)) = claim.clone()
+            && bound
+        {
             replace.apply(panel);
         }
-        // A report from another holder service, or another Bus generation of
-        // it, is a new Bus incarnation: its predecessor's holds end here.
-        if reporting {
-            let other_service = panel.reporter.as_ref().is_some_and(|reporter| *reporter != request.sender);
-            let other_generation = request.generation.is_some()
-                && panel.generation.is_some()
-                && panel.generation != request.generation;
-            if other_service || other_generation {
-                panel.drop_holds();
-            }
+        // A newer Bus generation of the holder is a new Bus incarnation: its
+        // predecessor's holds end here.
+        if reporting
+            && let (Some(generation), Some(current)) = (request.generation, panel.generation)
+            && generation > current
+        {
+            panel.drop_holds();
         }
     }
     if request.holder.as_deref() == Some("popup")
@@ -3889,12 +3948,19 @@ fn service_panel_request(state: &mut WaylandState, request: &PanelRequest) -> Co
     let previous = state.observations.panel_holders.get(&key).and_then(|panel| panel.verdict);
     let verdict = apply_panel_request(&mut state.observations.panel_holders, request, id);
     if let Some(panel) = state.observations.panel_holders.get_mut(&key) {
-        if let Some(adopt @ Claim::Adopt(_)) = claim {
+        if foreign_report && let Some((surface, id)) = recorded {
+            panel.surface = surface;
+            panel.id = id;
+        }
+        if let Some(adopt @ Claim::Adopt(_)) = claim
+            && bound
+        {
             adopt.apply(panel);
         }
         if reporting {
             panel.reporter = Some(request.sender.clone());
-            panel.generation = request.generation;
+            panel.reported_surface = Some(request.surface.clone());
+            panel.generation = request.generation.or(panel.generation);
         }
         // The holder answered on the Bus: it is not stopped.
         if bound || reporting {

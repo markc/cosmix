@@ -534,7 +534,12 @@ The standalone host reads the selected comp's read-only
 commands addressed to the `--comp-service` instance. Missing, false or failed
 reads leave the plane inactive and the model keeps its local rules. A comp
 that reports `true` also enforces concealment on a stalled Quoin (below), so
-the plane goes live with that comp build.
+the plane goes live with that comp build. Mode reports carry the Bus
+connection `generation` only once the leaf has read `true`: that comp is the
+one that knows the field. The deploy order is Quoin first (restart B), then
+comp (restart C); a comp with the holder verbs but without enforcement (the
+chunk 13/14 builds) was never shipped, and an older comp answers the leaf
+read with an unknown path, which keeps the plane off.
 Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
 client-side inbound drops) and a change to the leaf close the gate, re-read it
 and replay the desired state. A registry receipt that finds comp still present

@@ -532,8 +532,12 @@ pub(crate) fn report_holders(
                 "output":output.as_str(),"edge":edge_name(edge),"surface":surface,"mode":mode.as_str(),
             });
             // Comp fences holds by the reporting Bus connection: a new
-            // generation's report supersedes the old one's holds.
-            if let Some(generation) = client.generation {
+            // generation's report supersedes the old one's holds. Only a comp
+            // whose leaf reads true (the build with the full plane) knows the
+            // field; one without it would refuse the whole report.
+            if client.capable
+                && let Some(generation) = client.generation
+            {
                 report["generation"] = json!(generation);
             }
             client.desired.insert((surface.into(), "panel.mode".into()), report);
