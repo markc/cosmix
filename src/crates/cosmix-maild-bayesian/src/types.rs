@@ -96,6 +96,8 @@ pub struct AccountStats {
     /// count here.
     pub labelled_spam: u64,
     pub labelled_ham: u64,
-    /// Unix seconds of the most recent label write, `None` if never trained.
+    /// Unix seconds of the newest label that still exists, or `None` when
+    /// none does. This is not a monotonic history: untraining the newest
+    /// label moves it back to the next-newest remaining one.
     pub last_trained_at: Option<i64>,
 }
