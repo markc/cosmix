@@ -1777,8 +1777,9 @@ clients.</p>
 <h3 id="dma-buf-import-observations">DMA-BUF import observations</h3>
 <p>The linux-dmabuf format table says what the driver <em>claims</em> to support.
 The <code>dmabuf.*</code> properties say what comp actually <em>accepted</em>, which is a
-different fact. Every buffer a client asks comp to import through
-<code>zwp_linux_buffer_params_v1</code> is counted:</p>
+different fact. Every <code>zwp_linux_buffer_params_v1</code> import that comp
+answers is counted. A request that Smithay refuses first with a protocol
+error, before comp sees the buffer, is not counted:</p>
 <ul>
 <li><code>dmabuf.accepted</code> counts accepted imports.</li>
 <li><code>dmabuf.failed</code> counts refused imports.</li>
