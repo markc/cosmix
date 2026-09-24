@@ -76,12 +76,12 @@ CoS — substrate libraries and daemon family
 | `cosmix-lib-props-store` | 0.4.0 |
 | `cosmix-lib-skills` | 0.1.0 |
 | `cosmix-lib-wg` | 0.2.0 |
-| `cosmix-maild` | 0.8.3 |
+| `cosmix-maild` | 0.9.0 |
 | `cosmix-maild-auth` | 0.2.0 |
-| `cosmix-maild-bayesian` | 0.6.1 |
-| `cosmix-maild-rules` | 0.2.2 |
+| `cosmix-maild-bayesian` | 0.7.0 |
+| `cosmix-maild-rules` | 0.3.0 |
 | `cosmix-mcp` | 0.5.2 |
-| `cosmix-mds` | 0.2.2 |
+| `cosmix-mds` | 0.3.0 |
 | `cosmix-mesh-sign` | 0.8.0 |
 | `cosmix-midicomp` | 0.3.0 |
 | `cosmix-mixer-schema` | 0.5.0 |
