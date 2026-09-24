@@ -670,7 +670,8 @@ overrides the inner frame header (the fleet publishes topic
 and headers are newline-checked — frame injection raises instead of
 corrupting the wire.</li>
 </ul>
-<p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> and returns the rc, so
+<p>Sets <code>$rc</code>/<code>$result</code> exactly like <code>send</code> (and sets <code>$reply</code> to <code>nil</code>, so an
+earlier send's reply is never read as the publish's) and returns the rc, so
 <code>if publish(..) != 0</code> reads naturally. Without a broker it degrades like
 <code>send</code>: <code>$rc = -3</code>, non-fatal.</p>
 <p><strong>Hyphenated targets need no quoting.</strong> <code>send comp-nested …</code>,

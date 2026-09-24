@@ -14120,14 +14120,19 @@ impl Evaluator {
                     "result",
                     Value::String("Bus not available (no handler registered)".to_string()),
                 );
+                self.scope.update_or_set("reply", Value::Nil);
                 return Ok(Value::Number(RC_UNAVAILABLE as f64));
             }
         };
+        // `$reply` is cleared on every path: publish sets `$rc`/`$result`
+        // like send, and a `$reply` left over from an earlier send would
+        // otherwise read as this call's.
         let fut = handler.send("noded", "topic.publish", &args_value);
         match self.await_with_class_c_yield(fut).await? {
             Ok((rc, result)) => {
                 self.scope.update_or_set("rc", Value::Number(rc as f64));
                 self.scope.update_or_set("result", result);
+                self.scope.update_or_set("reply", Value::Nil);
                 Ok(Value::Number(rc as f64))
             }
             Err(e) => {
@@ -14135,6 +14140,7 @@ impl Evaluator {
                     .update_or_set("rc", Value::Number(RC_TRANSPORT as f64));
                 self.scope
                     .update_or_set("result", Value::String(e.to_string()));
+                self.scope.update_or_set("reply", Value::Nil);
                 Ok(Value::Number(RC_TRANSPORT as f64))
             }
         }

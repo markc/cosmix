@@ -288,7 +288,8 @@ if $rc2 != 0 then eprint("publish failed: " .. $result) end
   and headers are newline-checked — frame injection raises instead of
   corrupting the wire.
 
-Sets `$rc`/`$result` exactly like `send` and returns the rc, so
+Sets `$rc`/`$result` exactly like `send` (and sets `$reply` to `nil`, so an
+earlier send's reply is never read as the publish's) and returns the rc, so
 `if publish(..) != 0` reads naturally. Without a broker it degrades like
 `send`: `$rc = -3`, non-fatal.
 
