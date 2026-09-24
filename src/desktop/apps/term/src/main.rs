@@ -905,6 +905,67 @@ mod tests {
         assert_eq!(resolve_config(base, None, "xterm").config.font_px, 13.0);
     }
 
+    fn press(
+        key: iced::keyboard::Key,
+        modified: iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+        text: Option<&str>,
+        repeat: bool,
+    ) -> iced::keyboard::Event {
+        iced::keyboard::Event::KeyPressed {
+            key,
+            modified_key: modified,
+            physical_key: iced::keyboard::key::Physical::Unidentified(
+                iced::keyboard::key::NativeCode::Unidentified,
+            ),
+            location: iced::keyboard::Location::Standard,
+            modifiers,
+            text: text.map(Into::into),
+            repeat,
+        }
+    }
+
+    fn character(c: &str) -> iced::keyboard::Key {
+        iced::keyboard::Key::Character(c.into())
+    }
+
+    /// `on_key` is the dispatcher that decides chord versus shell and
+    /// filters repeats; review finding: nothing exercised it.
+    #[test]
+    fn the_dispatcher_puts_chords_before_the_shell_and_filters_repeats() {
+        use iced::keyboard::Modifiers;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let tab = |repeat| on_key(&press(character("t"), character("T"), ctrl_shift, Some("T"), repeat));
+
+        assert!(matches!(tab(false), Some(Message::Action(Action::NewTab))));
+        // A held Ctrl+Shift+T is one tab: the repeat is swallowed, and it is
+        // NOT handed to the encoder, which would send Ctrl-T to the shell.
+        assert!(tab(true).is_none(), "a repeated tab chord must be swallowed");
+
+        // Font steps repeat when held, as in foot.
+        let grow = |repeat| on_key(&press(character("="), character("="), Modifiers::CTRL, None, repeat));
+        assert!(matches!(grow(false), Some(Message::Action(Action::FontIncrease))));
+        assert!(matches!(grow(true), Some(Message::Action(Action::FontIncrease))));
+
+        // Not a chord: the shell gets it, repeats included.
+        for repeat in [false, true] {
+            assert!(matches!(
+                on_key(&press(character("a"), character("a"), Modifiers::empty(), Some("a"), repeat)),
+                Some(Message::Keys(keys)) if keys.len() == 1
+            ));
+        }
+        // Ctrl+T without Shift is the shell's Ctrl-T, not a chord.
+        assert!(matches!(
+            on_key(&press(character("t"), character("t"), Modifiers::CTRL, None, false)),
+            Some(Message::Keys(_))
+        ));
+        // Modifier state is tracked for Ctrl+wheel.
+        assert!(matches!(
+            on_key(&iced::keyboard::Event::ModifiersChanged(Modifiers::CTRL)),
+            Some(Message::Modifiers(modifiers)) if modifiers.control()
+        ));
+    }
+
     fn active_pane(tabs: &TabSet) -> u64 {
         tabs.active_tab().active_pane
     }
