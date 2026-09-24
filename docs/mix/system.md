@@ -707,10 +707,13 @@ end
   does it). Every other header value must be ASCII, and a CR, LF or NUL in
   any header raises. There is no way to inject a second header through a
   value.
-- **`headers` adds headers, or replaces a generated one**: `Date`,
-  `Message-ID`, `MIME-Version`, `Content-Type` or `Content-Transfer-Encoding`
-  (`{"Content-Type": "text/html; charset=utf-8"}` sends HTML). `From`, `To` and
-  `Subject` come only from `msg`; naming them in `headers` raises.
+- **`headers` adds headers, or replaces a generated `Date`, `Message-ID` or
+  `MIME-Version`.** `From`, `To` and `Subject` come only from `msg`, and
+  `Content-Type` and `Content-Transfer-Encoding` only from `send_mail`, which
+  encodes the body itself. Naming any of those five in `headers` raises. A
+  label of your own would describe other bytes than the ones sent: a
+  quoted-printable body labelled `8bit` reads as literal `=C3=BC`. The body is
+  always `text/plain; charset=utf-8`.
 - **Delivery is `sendmail -t -i -f <envelope>`** with the message on stdin,
   never a network SMTP client. `-t` takes the recipients from the headers, so
   a `Bcc` header works and is stripped by the MTA. `-i` keeps a line holding

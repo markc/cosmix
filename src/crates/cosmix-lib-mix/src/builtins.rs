@@ -319,8 +319,8 @@ builtin_table! {
     ("ssh_run", CapabilityClass::Network,         "system",  "Run a command on a remote host via ssh; returns {stdout, stderr, exit_code, ok, duration_ms, host, timed_out, interrupted, utf8_lossy, stdout_truncated, stderr_truncated}; max_output optionally caps local capture bytes per stream (omitted: unbounded; 0 is REJECTED — unlike run_argv, where 0 means unbounded — omit the key instead). A cap that cuts mid-UTF-8-sequence makes the lossy decode insert U+FFFD, so utf8_lossy: true beside stdout_truncated: true may be local truncation damage, not remote garbage", contract!((host: string, cmd: any_of(string, list), opts?: map) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool}); effects[must_use, blocking]; failure[returns_result])),
     ("ssh_must", CapabilityClass::Network,        "system",  "ssh_run wrapper: returns stdout on success, throws a Mix error otherwise", contract!((host: string, cmd: any_of(string, list), opts?: map) -> string; effects[blocking]; failure[raises])),
     ("ssh_mix", CapabilityClass::Network,         "system",  "Run Mix source on a remote host: ships the source over ssh stdin into `/opt/cosmix/bin/mix -`, bypassing ALL shell quoting. ssh_mix(host, source, [opts]) -> same map as ssh_run; bindings maps valid Mix identifier names to strict-data-encoded values prepended as `$name` assignments, and decode:\"data\"|\"json\" adds a parsed `.value` from stdout. max_output caps local capture per stream (0 rejected; omit for unbounded); a truncated stdout REFUSES to decode (raises) — a truncated prefix can parse as a smaller, wrong value — so omit decode and inspect stdout/stdout_truncated to work with partial output. Accepts every ssh_run opt except stdin/env_transport. Remote command failure stays in the result value; invalid arguments/options raise locally. (v0.20.4)", contract!((host: string, source: string, opts?: map("ssh_mix_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map})) -> map("ssh_result", {stdout: string, stderr: string, exit_code: number, ok: bool, duration_ms: number, host: string, timed_out: bool, interrupted: bool, utf8_lossy: bool, stdout_truncated: bool, stderr_truncated: bool, value: any}); effects[must_use, blocking]; failure[returns_result])),
-    ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers — run_parallel's numbers, its own loop). Options are validated once (even for an empty host list) and every host is checked before any ssh spawns; a wrong argument type raises TYPE_MISMATCH. After that nothing raises — one host's failure is DATA in its own map: unreachable, nonzero exit and timeout arrive as ok:false; a local spawn/pipe failure as ok:false with error_code (PROCESS_*) and error; a decode refusal (truncated or unparseable stdout, where ssh_mix raises) as ok:false, decode_error and no value; a host never started because of Ctrl-C as ok:false, interrupted:true. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch); there is no whole-call deadline", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
-    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id (+ host, only with the host opt). Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client; ok means the MTA accepted it, not that it was delivered. to is a string or list of strings; Cc/Bcc go in headers. from is exactly one mailbox, addr or Name <addr> (a comment, a second mailbox or <> raises); its address is the envelope sender. Long headers are folded within 78 columns (an unbreakable run over 998 raises); a non-ASCII body or one with a line over 998 bytes goes quoted-printable, else 7bit. A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL in any header raises. headers adds headers or replaces the generated Date/Message-ID/MIME-Version/Content-Type/Content-Transfer-Encoding; From/To/Subject there raise. sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host via ssh_exec (remote default /usr/sbin/sendmail). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); bad input raises before anything runs: OPTION_INVALID (msg fields, options), TYPE_MISMATCH (msg not a map, arity), or ssh_exec's own validation errors with host", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: map("send_mail_options", {host: string, sendmail: string, timeout: number})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
+    ("ssh_mix_many", CapabilityClass::Network,    "system",  "ssh_mix on many hosts at once: ssh_mix_many(hosts, source[, opts]) -> map host -> ssh_result, keyed in INPUT order. Every host gets the same source, bindings, env and decode, and each result is EXACTLY ssh_mix's ssh_result map, so per-host handling code ports unchanged. opts = every ssh_mix opt plus max (concurrency, default 8, at most 256 live workers — run_parallel's numbers, its own loop). Options are validated once (even for an empty host list) and every host is checked before any ssh spawns; a wrong argument type raises TYPE_MISMATCH. After that nothing raises — one host's failure is DATA in its own map: unreachable, nonzero exit and timeout arrive as ok:false; a local spawn/pipe failure as ok:false with error_code (`PROCESS_SPAWN`, `PROCESS_STDIO`, …) and error; a decode refusal (truncated or unparseable stdout, where ssh_mix raises) as ok:false, decode_error and no value; a host never started because of Ctrl-C as ok:false, interrupted:true. hosts must be unique strings; timeout:0 is refused (one hung host would park the batch); there is no whole-call deadline", contract!((hosts: list(string), source: string, opts?: map("ssh_mix_many_options", {timeout: number, max_output: number, connect_timeout: number, multiplex: bool, batch: bool, strict_host_key: string, env: map, cwd: string, extra_ssh_args: list(string), decode: string, bindings: map, max: number})) -> map; effects[must_use, blocking]; failure[returns_result])),
+    ("send_mail", CapabilityClass::Process,       "system",  "Send a plain-text email through the local MTA: send_mail({to, from, subject, body[, headers]}[, {host, sendmail, timeout}]) -> run_argv's process_result + message_id (+ host, only with the host opt). Renders an RFC 5322 message (From, To, Subject, Date, Message-ID, MIME-Version, text/plain utf-8) and pipes it to `sendmail -t -i -f <envelope>` on stdin — never a network SMTP client; ok means the MTA accepted it, not that it was delivered. to is a string or list of strings; Cc/Bcc go in headers. from is exactly one mailbox, addr or Name <addr> (a comment, a second mailbox or <> raises); its address is the envelope sender. Long headers are folded within 78 columns (an unbreakable run over 998 raises); a non-ASCII body or one with a line over 998 bytes goes quoted-printable, else 7bit. A non-ASCII subject is RFC 2047-encoded; every other header value must be ASCII, and CR/LF/NUL in any header raises. headers adds headers or replaces the generated Date/Message-ID/MIME-Version; From/To/Subject there raise (set them in msg), and so do Content-Type/Content-Transfer-Encoding (send_mail encodes the body itself, always text/plain utf-8). sendmail is found on PATH, then /usr/sbin/sendmail, /usr/lib/sendmail, unless the sendmail opt names it. host sends from that host via ssh_exec (remote default /usr/sbin/sendmail). An MTA failure or missing sendmail is DATA (ok:false, exit_code, stderr, error_code); bad input raises before anything runs: OPTION_INVALID (msg fields, options), TYPE_MISMATCH (msg not a map, arity), or ssh_exec's own validation errors with host", contract!((msg: map("send_mail_msg", {to: any_of(string, list), from: string, subject: string, body: string, headers: map}), opts?: map("send_mail_options", {host: string, sendmail: string, timeout: number})) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, message_id: string, host: string}); effects[must_use, blocking]; failure[returns_result]; cond_caps[host: Network])),
     ("ssh_exec", CapabilityClass::Network,        "system",  "Run an argv list DIRECTLY on a remote host via a strict-data driver and remote run_argv. Remote stdio allowlist: stdin nil|string|{file}|{null:true} (a stdin STRING is always data, as locally — there is no stdin \"inherit\" route on either side); stdout capture|null|{file}; stderr capture|null|stdout|{file}. File paths resolve remotely. stdout/stderr inherit and stream:true raise OPTION_INVALID locally before ssh because they would corrupt or bypass the result envelope. Binary stdin also raises locally. Transport/protocol failures and remote command failure are returned in the process_result plus host; a remote without run_argv returns SSH_REMOTE_UNSUPPORTED without running the command", contract!((host: string, argv: list(string), opts?: map) -> map("process_result", {ok: bool, exit_code: any, stdout: string, stderr: string, timed_out: bool, interrupted: bool, signal: any, duration_ms: number, stdout_truncated: bool, stderr_truncated: bool, utf8_lossy: bool, error_code: any, error: any, host: string}); effects[must_use, blocking]; failure[returns_result])),
     ("process_alive", CapabilityClass::Process,   "system",  "Test if a process exists (signal 0 check). EPERM counts as alive: existence does not imply permission to signal, including another user's process. pid must be a positive whole NUMBER; no coercion. Nonpositive, bool or string PIDs raise TYPE_MISMATCH. Reaps exited unmanaged children; controller-owned job PIDs use only signal 0 so their sole wait owner retains every status (zombies may briefly report alive).", contract!((pid: number) -> bool)),
     ("panic", CapabilityClass::Process,           "system",  "Abort via an uncatchable Rust panic (distinct from catchable die); the SPEC 18 §3.4 handler boundary isolates it in --serve mode", contract!((msg: string) -> nil; effects[terminates]; failure[terminates])),
@@ -10962,6 +10962,8 @@ const SEND_MAIL_OPT_KEYS: &[&str] = &["host", "sendmail", "timeout"];
 /// entry naming one is refused — there must be exactly one source for
 /// each, or a report could go out with two `To:` lines.
 const SEND_MAIL_OWNED_HEADERS: &[&str] = &["from", "to", "subject"];
+/// Headers that describe the body's encoding, which send_mail chooses.
+const SEND_MAIL_BODY_HEADERS: &[&str] = &["content-type", "content-transfer-encoding"];
 /// Where a local sendmail is looked for when `sendmail` is not given and
 /// none is on PATH (non-root PATHs usually lack /usr/sbin).
 const SEND_MAIL_LOCAL_FALLBACKS: &[&str] = &["/usr/sbin/sendmail", "/usr/lib/sendmail"];
@@ -11093,12 +11095,16 @@ fn send_mail_fold(name: &str, value: &str) -> MixResult<String> {
     if line.len() <= SOFT {
         return Ok(line);
     }
-    // Break points: every space/tab after "Name: ".
-    let first_break = name.len() + 2;
+    // Break points: every space/tab after "Name:", including the one right
+    // after the colon, so a long first word (a 72-column encoded-word) moves
+    // to its own continuation line instead of overrunning with the prefix.
+    // Breaking inside a quoted display name is fine too: RFC 5322's
+    // quoted-string admits FWS, and unfolding restores it exactly.
+    let first_break = name.len() + 1;
     let mut segments: Vec<&str> = Vec::new();
     let mut start = 0;
     for (i, c) in line.char_indices() {
-        if i > first_break && (c == ' ' || c == '\t') {
+        if i >= first_break && (c == ' ' || c == '\t') {
             segments.push(&line[start..i]);
             start = i;
         }
@@ -11300,6 +11306,15 @@ fn send_mail_render(msg: &Value) -> MixResult<RenderedMail> {
                 if SEND_MAIL_OWNED_HEADERS.contains(&lower.as_str()) {
                     return Err(send_mail_invalid(format!(
                         "header '{name}' comes from msg.{lower} — set it there"
+                    )));
+                }
+                // The body is encoded (7bit or quoted-printable, utf-8) by
+                // send_mail itself; a caller label would describe bytes that
+                // are not the ones sent (a QP body labelled 8bit reads as
+                // literal =C3=BC).
+                if SEND_MAIL_BODY_HEADERS.contains(&lower.as_str()) {
+                    return Err(send_mail_invalid(format!(
+                        "header '{name}' is refused — send_mail encodes the body itself"
                     )));
                 }
                 let value = send_mail_header_value(&format!("msg.headers.{name}"), v)?;
@@ -11685,7 +11700,7 @@ fn builtin_ssh_mix_many(args: Vec<Value>) -> MixResult<Option<Value>> {
                         &argvs[i],
                         template.stdin.as_deref(),
                         template.timeout,
-                        "ssh_run",
+                        caller,
                         template.max_output,
                     ) {
                         Ok(o) => ManySlot::Ran(started.elapsed(), o),
@@ -23542,16 +23557,32 @@ mod ssh_helpers_tests {
         let r = send_mail_render(&mail_msg(&[(
             "headers",
             map_of(&[
-                ("Content-Type", Value::String("text/html; charset=utf-8".into())),
+                ("Date", Value::String("Thu, 01 Jan 2026 00:00:00 +0000".into())),
                 ("Message-ID", Value::String("<fixed@example.com>".into())),
                 ("X-Report", Value::String("weekly".into())),
             ]),
         )]))
         .expect("render");
         assert_eq!(r.message_id, "<fixed@example.com>");
-        assert_eq!(r.text.matches("Content-Type:").count(), 1, "{}", r.text);
-        assert!(r.text.contains("Content-Type: text/html; charset=utf-8\n"));
+        assert_eq!(r.text.matches("Date:").count(), 1, "{}", r.text);
+        assert!(r.text.contains("Date: Thu, 01 Jan 2026 00:00:00 +0000\n"));
         assert!(r.text.contains("X-Report: weekly\n"));
+
+        // The body's encoding is send_mail's: a caller label would describe
+        // other bytes (a QP body labelled 8bit shows literal =C3=BC).
+        for (name, value) in [
+            ("Content-Transfer-Encoding", "8bit"),
+            ("content-type", "text/html; charset=utf-8"),
+        ] {
+            let e = send_mail_render(&mail_msg(&[
+                ("body", Value::String("grüße".into())),
+                ("headers", map_of(&[(name, Value::String(value.into()))])),
+            ]))
+            .err()
+            .unwrap_or_else(|| panic!("{name} in headers must raise"));
+            assert!(e.to_string().contains("encodes the body itself"), "{e}");
+            assert_eq!(e.info().map(|i| i.code.as_str()), Some("OPTION_INVALID"));
+        }
 
         let e = send_mail_render(&mail_msg(&[(
             "headers",
@@ -23666,6 +23697,20 @@ mod ssh_helpers_tests {
         assert!(e.to_string().contains("998"), "{e}");
     }
 
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn send_mail_folds_a_long_first_encoded_word_off_the_prefix_line() {
+        // 22 × é encodes to one ~72-column encoded-word; with "Subject: "
+        // in front that is over 78, and the break after the colon is used.
+        let r = send_mail_render(&mail_msg(&[("subject", Value::String("é".repeat(22)))]))
+            .expect("render");
+        let head = r.text.split_once("\n\n").unwrap().0;
+        for line in head.lines() {
+            assert!(line.len() <= 78, "line over 78: {line:?}");
+        }
+        assert!(head.contains("\nSubject:\n =?UTF-8?B?"), "{head}");
+    }
+
     #[test]
     fn send_mail_sends_a_long_line_body_as_quoted_printable_that_round_trips() {
         let long = format!("{{\"data\": \"{}\", \"end\": \"a = b \"}}", "x".repeat(1500));
@@ -23700,6 +23745,7 @@ mod ssh_helpers_tests {
             ("A <a@example.com>, B <b@example.com>", "second mailbox"),
             ("a@example.com, b@example.com", "second mailbox"),
             ("Smith, John <j@example.com>", "display name"),
+            ("\"Al \\\"the\\\" Ice\" <a@example.com>", "display name"),
             ("<>", "null sender"),
             ("Name <>", "null sender"),
             ("-f@example.com", "may not begin"),

@@ -1046,10 +1046,13 @@ or mangle it.</li>
 does it). Every other header value must be ASCII, and a CR, LF or NUL in
 any header raises. There is no way to inject a second header through a
 value.</li>
-<li><strong><code>headers</code> adds headers, or replaces a generated one</strong>: <code>Date</code>,
-<code>Message-ID</code>, <code>MIME-Version</code>, <code>Content-Type</code> or <code>Content-Transfer-Encoding</code>
-(<code>{"Content-Type": "text/html; charset=utf-8"}</code> sends HTML). <code>From</code>, <code>To</code> and
-<code>Subject</code> come only from <code>msg</code>; naming them in <code>headers</code> raises.</li>
+<li><strong><code>headers</code> adds headers, or replaces a generated <code>Date</code>, <code>Message-ID</code> or
+<code>MIME-Version</code>.</strong> <code>From</code>, <code>To</code> and <code>Subject</code> come only from <code>msg</code>, and
+<code>Content-Type</code> and <code>Content-Transfer-Encoding</code> only from <code>send_mail</code>, which
+encodes the body itself. Naming any of those five in <code>headers</code> raises. A
+label of your own would describe other bytes than the ones sent: a
+quoted-printable body labelled <code>8bit</code> reads as literal <code>=C3=BC</code>. The body is
+always <code>text/plain; charset=utf-8</code>.</li>
 <li><strong>Delivery is <code>sendmail -t -i -f &lt;envelope&gt;</code></strong> with the message on stdin,
 never a network SMTP client. <code>-t</code> takes the recipients from the headers, so
 a <code>Bcc</code> header works and is stripped by the MTA. <code>-i</code> keeps a line holding
