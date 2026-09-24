@@ -36029,7 +36029,8 @@ fn unrenewed_hold_lapses_conceals_and_frees_the_keyboard() {
     let focus = |harness: &KeybindingHarness| focused_surface(harness.server.state.keyboard.current_focus());
     let output = harness.server.state.backend.default_output().unwrap().name();
     let (width, height) = harness.server.state.backend.seat_extent();
-    route_pointer_to(&mut harness, f64::from(width) / 2.0, f64::from(height) / 2.0);
+    // Away from the panel and from the menu, which centres on the output.
+    route_pointer_to(&mut harness, f64::from(width) * 0.8, f64::from(height) * 0.8);
     let mut quoin = connect_other_layer_client(&mut harness);
     swap_test_client(&mut harness, &mut quoin);
     let _ = map_named_test_layer_surface(
