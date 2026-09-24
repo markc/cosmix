@@ -27,6 +27,14 @@ pub trait StorageBackend: Send + Sync {
     /// responsible for cold-start seeding from `default-bayesian.db`
     /// when the account has no prior database.
     async fn open_account(&self, account: &AccountId) -> Result<Arc<dyn AccountConnection>>;
+
+    /// Corpus statistics for inspection. Unlike [`Self::open_account`] this
+    /// must not create, seed or promote anything: an operator reading stats
+    /// is not a first delivery. The default opens the account, which is right
+    /// for backends with no on-disk side effect; [`SqliteBackend`] overrides it.
+    async fn peek_stats(&self, account: &AccountId) -> Result<AccountStats> {
+        self.open_account(account).await?.stats().await
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +235,70 @@ impl StorageBackend for SqliteBackend {
         cache.insert(key, arc.clone());
         Ok(arc as Arc<dyn AccountConnection>)
     }
+
+    /// Read-only stats. A cached live connection answers directly. Otherwise
+    /// the first file that `open_account` WOULD start from is opened
+    /// read-only — `bayes.db`, else a legacy `db.sqlite`, else the global
+    /// seed (reported through `seeded_from`) — and an account with none of
+    /// them reads as an empty cold-start corpus. No directory or database is
+    /// created on any path.
+    async fn peek_stats(&self, account: &AccountId) -> Result<AccountStats> {
+        {
+            let cache = self.cache.lock().await;
+            if let Some(c) = cache.get(account.as_str()) {
+                return c.stats().await;
+            }
+        }
+
+        let path = self.account_path(account);
+        let seed = self.default_seed.clone();
+        let cold_floor = self.cold_floor;
+        tokio::task::spawn_blocking(move || -> Result<AccountStats> {
+            let legacy = path.with_file_name("db.sqlite");
+            let (source, seeded_from) = if path.exists() {
+                (path, None)
+            } else if legacy.exists() {
+                (legacy, None)
+            } else if let Some(s) = seed.filter(|p| p.exists()) {
+                let label = s.display().to_string();
+                (s, Some(label))
+            } else {
+                return Ok(AccountStats {
+                    cold_start: true,
+                    ..AccountStats::default()
+                });
+            };
+            let conn = Connection::open_with_flags(
+                &source,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .map_err(|e| Error::Storage(format!("open {} read-only: {e}", source.display())))?;
+            let mut stats = stats_from(&conn, cold_floor)?;
+            stats.seeded_from = seeded_from;
+            Ok(stats)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("spawn_blocking: {e}")))?
+    }
+}
+
+/// Corpus statistics from an open spamlite database.
+fn stats_from(c: &Connection, cold_floor: u32) -> Result<AccountStats> {
+    let counts = spamlite::storage::ops::counts(c)?;
+    let version: String = c.query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
+        row.get(0)
+    })?;
+    Ok(AccountStats {
+        spam_messages: counts.total_spam as u32,
+        ham_messages: counts.total_good as u32,
+        spam_tokens: counts.unique_tokens,
+        ham_tokens: counts.unique_tokens,
+        cold_start: counts.total_good + counts.total_spam < cold_floor as u64,
+        seeded_from: None,
+        model_version: version.parse().unwrap_or(0),
+    })
 }
 
 pub struct SqliteAccountConnection {
@@ -409,20 +481,7 @@ impl AccountConnection for SqliteAccountConnection {
         let cold_floor = self.cold_floor;
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().unwrap_or_else(|e| e.into_inner());
-            let counts = spamlite::storage::ops::counts(&c)?;
-            let version: String =
-                c.query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
-                    row.get(0)
-                })?;
-            Ok(AccountStats {
-                spam_messages: counts.total_spam as u32,
-                ham_messages: counts.total_good as u32,
-                spam_tokens: counts.unique_tokens,
-                ham_tokens: counts.unique_tokens,
-                cold_start: counts.total_good + counts.total_spam < cold_floor as u64,
-                seeded_from: None,
-                model_version: version.parse().unwrap_or(0),
-            })
+            stats_from(&c, cold_floor)
         })
         .await
         .map_err(|e| Error::Storage(format!("spawn_blocking: {e}")))?
@@ -808,6 +867,53 @@ mod tests {
 
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn peek_stats_reads_without_creating_anything() {
+        let base = std::env::temp_dir().join(format!(
+            "bayes-peek-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+
+        // No corpus, no seed: empty cold-start stats and no `<id>/` dir.
+        let backend = SqliteBackend::new(&base, None, 100);
+        let ghost = AccountId::new("9");
+        let stats = backend.peek_stats(&ghost).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.ham_messages), (0, 0));
+        assert!(stats.cold_start);
+        assert!(!base.join("9").exists(), "peek_stats created a corpus dir");
+
+        // A seed is reported, not copied.
+        let seed = base.join("seed.db");
+        let seed_conn = SqliteAccountConnection::open_path(&seed, 0).unwrap();
+        seed_conn
+            .record_label("seed-1", &toks(&["alpha"]), Label::Spam, 0)
+            .await
+            .unwrap();
+        drop(seed_conn);
+        let seeded = SqliteBackend::new(&base, Some(seed.clone()), 100);
+        let stats = seeded.peek_stats(&ghost).await.unwrap();
+        assert_eq!(stats.spam_messages, 1);
+        assert_eq!(stats.seeded_from, Some(seed.display().to_string()));
+        assert!(!base.join("9").exists(), "peek_stats seeded a corpus");
+
+        // An existing corpus is read as it stands.
+        let real_path = base.join("4").join("bayes.db");
+        let real = SqliteAccountConnection::open_path(&real_path, 0).unwrap();
+        real.record_label("m-1", &toks(&["beta"]), Label::Ham, 0)
+            .await
+            .unwrap();
+        drop(real);
+        let stats = backend.peek_stats(&AccountId::new("4")).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.ham_messages), (0, 1));
+        assert_eq!(stats.seeded_from, None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

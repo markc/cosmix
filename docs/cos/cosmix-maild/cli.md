@@ -125,7 +125,7 @@ The default DKIM algorithm is `rsa-sha256`; `ed25519-sha256` is also accepted. `
 | `engine-config show` | Show the `maild.engine_config` singleton |
 | `rules stats [--top-n N]` | Show pack metadata, verdict totals, and rule hits |
 | `rules reload` | Re-read and atomically swap the configured rule pack |
-| `bayesian stats ACCOUNT_ID` | Show corpus statistics for a numeric account id |
+| `bayesian stats ACCOUNT_ID` | Show corpus statistics for a numeric account id (read-only; unknown ids are refused) |
 
 `rules stats` defaults to 256 per-rule entries. The daemon caps the request at 4096. `--top-n 0` requests cardinality without cloning the per-rule map.
 

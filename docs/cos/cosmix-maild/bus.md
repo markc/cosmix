@@ -38,7 +38,7 @@ An unknown account and a wrong password both produce `valid: false` from `verify
 | `maild.rules.reload` | None | Reload the configured pack and return load metadata |
 | `maild.rules.stats` | Optional `top_n` | Return pack metadata and persistent verdict and rule-hit counters |
 | `maild.rules.explain` | Envelope and base64 message | Explain rule evaluation without delivering |
-| `maild.bayesian.stats` | `account_id` | Return per-account corpus statistics |
+| `maild.bayesian.stats` | `account_id` | Return per-account corpus statistics, read-only; an id with no account row is refused |
 | `maild.bayesian.classify` | `account_id`, `message_b64` | Classify without recording a training label |
 
 `maild.rules.explain` accepts:

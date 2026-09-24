@@ -1,11 +1,11 @@
 //! `maild.bayesian.*` Bus action handlers.
 //!
 //! Four actions:
-//! - `maild.bayesian.stats` — per-account corpus stats. Thin wrapper
-//!   over `Classifier::stats`. An account that has never trained
-//!   surfaces with `cold_start: true` and zero counters (the storage
-//!   layer creates the per-account directory lazily — acceptable
-//!   under the spec's "WG-trusted metadata" framing).
+//! - `maild.bayesian.stats` — per-account corpus stats, read-only
+//!   (`DefaultClassifier::peek_stats`). Refuses an id with no
+//!   `maild.accounts` row, and never creates, seeds or promotes a corpus:
+//!   an account that has never trained surfaces with `cold_start: true`
+//!   and zero counters (or the seed's counts, named in `seeded_from`).
 //! - `maild.bayesian.classify` — debug action that runs
 //!   `Classifier::classify` against a caller-supplied raw RFC 5322
 //!   message. Synthesises a `ClassifyContext` with `rules_score = 0.0`,
@@ -143,7 +143,7 @@ pub async fn dispatch(
 ) -> (u8, String) {
     let args = super::resolve_args(cmd);
     match action {
-        "stats" => handle_stats(classifier, &args).await,
+        "stats" => handle_stats(classifier, db, &args).await,
         "classify" => handle_classify(classifier, &args).await,
         "rebuild" => {
             if !rebuild_authorised(cmd, state) {
@@ -174,16 +174,28 @@ struct StatsRequest {
     account_id: serde_json::Value,
 }
 
-async fn handle_stats(classifier: &DefaultClassifier, args: &serde_json::Value) -> (u8, String) {
+async fn handle_stats(
+    classifier: &DefaultClassifier,
+    database: &db::Db,
+    args: &serde_json::Value,
+) -> (u8, String) {
     let req: StatsRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
         Err(e) => return (RC_ERROR, err_body(&format!("malformed stats request: {e}"))),
     };
-    let account = match parse_account_id(&req.account_id) {
-        Ok(id) => AccountId::new(id.to_string()),
+    let account_i32 = match parse_account_id(&req.account_id) {
+        Ok(id) => id,
         Err(e) => return (RC_ERROR, err_body(&e)),
     };
-    match classifier.stats(&account).await {
+    // Refuse ids that name no account: inspection must not be a way to
+    // mint corpus directories (a 1–10 scan once created six empty ones).
+    match db::account::get_by_id(&database.conn, account_i32).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (RC_ERROR, err_body("account not found")),
+        Err(e) => return (RC_ERROR, err_body(&format!("account lookup failed: {e}"))),
+    }
+    let account = AccountId::new(account_i32.to_string());
+    match classifier.peek_stats(&account).await {
         Ok(stats) => match serde_json::to_string(&stats) {
             Ok(body) => (0, body),
             Err(e) => (RC_ERROR, err_body(&format!("serialize AccountStats: {e}"))),
@@ -1586,22 +1598,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stats_for_unknown_account_returns_cold_start_zero_values() {
-        let cls = empty_classifier();
+    async fn stats_for_untrained_account_is_cold_start_and_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let cls = disk_classifier(dir.path());
+        let database = database_with_accounts(&[99]);
         let args = serde_json::json!({"account_id": 99});
-        let (rc, body) = handle_stats(&cls, &args).await;
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["spam_messages"], 0);
         assert_eq!(v["ham_messages"], 0);
         assert_eq!(v["cold_start"], true);
+        assert!(
+            !dir.path().join("99").exists(),
+            "read-only stats created a corpus directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_refuses_an_id_with_no_account_row() {
+        let dir = TempDir::new().unwrap();
+        let cls = disk_classifier(dir.path());
+        let database = database_with_accounts(&[2]);
+        let args = serde_json::json!({"account_id": 7});
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
+        assert_eq!(rc, RC_ERROR, "body was: {body}");
+        assert!(body.contains("account not found"), "{body}");
+        assert!(!dir.path().join("7").exists());
     }
 
     #[tokio::test]
     async fn stats_with_trained_corpus_reports_counts() {
         let cls = classifier_with_corpus(3, 5).await;
+        let database = database_with_accounts(&[42]);
         let args = serde_json::json!({"account_id": "42"});
-        let (rc, body) = handle_stats(&cls, &args).await;
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
         assert_eq!(rc, 0, "body was: {body}");
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["spam_messages"], 3);
@@ -1614,6 +1645,7 @@ mod tests {
         // A peer must not be able to steer `<base>/<id>/bayes.db` out
         // of the corpus tree by passing a path-shaped account id.
         let cls = empty_classifier();
+        let database = database_with_accounts(&[1]);
         for bad in [
             serde_json::json!({"account_id": "../../etc"}),
             serde_json::json!({"account_id": "alice"}),
@@ -1621,7 +1653,7 @@ mod tests {
             serde_json::json!({"account_id": -1}),
             serde_json::json!({"account_id": 1.5}),
         ] {
-            let (rc, body) = handle_stats(&cls, &bad).await;
+            let (rc, body) = handle_stats(&cls, &database, &bad).await;
             assert_eq!(rc, RC_ERROR, "expected error for {bad}, body was: {body}");
             let v: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(
@@ -1634,8 +1666,9 @@ mod tests {
     #[tokio::test]
     async fn stats_rejects_missing_account_id() {
         let cls = empty_classifier();
+        let database = database_with_accounts(&[]);
         let args = serde_json::json!({});
-        let (rc, body) = handle_stats(&cls, &args).await;
+        let (rc, body) = handle_stats(&cls, &database, &args).await;
         assert_eq!(rc, RC_ERROR);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(v["error"].as_str().unwrap().contains("malformed"));
@@ -1697,7 +1730,7 @@ mod tests {
     async fn dispatch_stats_resolves_args_from_args_header() {
         let cls = classifier_with_corpus(2, 3).await;
         let (_dir, _mds, store) = temp_mailstore();
-        let database = database_with_accounts(&[]);
+        let database = database_with_accounts(&[42]);
         let state = BayesianBusState::default();
         let body_json = serde_json::json!({}).to_string();
         let header_args = serde_json::json!({"account_id": "42"}).to_string();
