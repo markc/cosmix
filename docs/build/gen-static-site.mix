@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gen-static-site.mix — a genuinely static, self-contained mirror of the
 -- docs, the on-demand counterpart to gen-doc-pages.mix's interactive SPA.
 --

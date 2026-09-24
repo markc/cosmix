@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- gen-doc-pages.mix — pre-rendered per-doc pages behind the interactive shell.
 --
 -- Each tracked bus/ cos/ mix/ bugs/ spec/ markdown doc gets an HTML page

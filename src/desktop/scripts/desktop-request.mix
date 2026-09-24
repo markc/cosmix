@@ -1,3 +1,4 @@
+-- version: 0.3.6
 -- Internal one-shot worker for desktop-cli.mix; no positional arguments in serve mode.
 $request = json_parse(env("DESKTOP_REQUEST"))
 $desktop = require("lib/desktop.mix")

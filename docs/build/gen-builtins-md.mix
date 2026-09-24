@@ -1,4 +1,5 @@
 #!/usr/bin/env mix
+-- version: 0.1.0
 -- gen-builtins-md.mix — regenerate docs/mix/builtins.md's category
 -- listings from the binary's own `mix builtins --json`.
 --

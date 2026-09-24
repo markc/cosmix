@@ -26,7 +26,9 @@ machine-readably, including the full 40-hex `git_sha_full`.
 capture, the native-session lane, Bus dispatch and the evaluation thread, so it
 neither starts a session nor disturbs one: `mix --version` is truthful and
 side-effect-free while other mix processes are running (0.89.1). Only `argv[1]`
-is a version query — `mix -c 'print("--version")'` runs the program, as before.
+is a version query for the interpreter — `mix -c 'print("--version")'` runs the
+program, as before. A `--version` straight after a script path asks for the
+**script's** version instead: see [`--version` for scripts](#--version-for-scripts).
 
 ## Modes at a glance
 
@@ -45,6 +47,7 @@ is a version query — `mix -c 'print("--version")'` runs the program, as before
 | `mix --strict-arity …` | Strict call arity: wrong-arity user-function/builtin calls raise catchable `ARITY_MISMATCH` instead of the compatible missing→nil / extra-ignored binding (0.29.0 — see [functions](functions.md)) |
 | `mix --serve <script> [--name <svc>]` | Run the script as a supervised Bus daemon citizen — see [serve](serve.md) |
 | `mix --version` / `-V` | Print version + build hash, and nothing else — no session lane, no Bus (0.89.1) |
+| `mix script.mix --version` / `-V` | Print the **script's** version line without running it (also `mix --serve script.mix --version`, `mix - --version`) — see [below](#--version-for-scripts) (0.95.0) |
 | `mix --help` / `-h` | Usage summary |
 | `mix stats [sub…]` | Window-labelled usage reports and static authorship coverage — see [stats](stats.md) |
 | `mix help` / `mix what <name>` / `mix man [topic]` | Builtin/keyword reference and this manual — see [the `mix` meta-command](cli.md) |
@@ -132,6 +135,67 @@ A script that registers `on <cmd> … end` handlers does **not** exit after its
 last statement — it stays alive pumping events for those handlers. For the
 supervised daemon variant (broker registration, reconnect, journald logging),
 use [`--serve`](serve.md).
+
+## `--version` for scripts
+
+Every cosmix binary AND every Mix script answers `--version` with build details
+(Mark's rule, 2026-09-25). A script declares its version with one header line
+near the top:
+
+```mix
+#!/usr/bin/env mix
+-- deploy_widget.mix — ship the widget to the fleet
+-- version: 1.4.0
+```
+
+and `mix` answers for it:
+
+```text
+$ mix deploy_widget.mix --version
+deploy_widget.mix 1.4.0 (3f9a0c1d22be, modified 2026-09-25T01:14:07Z; mix 0.95.0 (a1b2c3d4e5f6))
+$ mix plain.mix --version
+plain.mix unversioned (9e107d9d372b, modified 2026-09-24T22:03:41Z; mix 0.95.0 (a1b2c3d4e5f6))
+```
+
+The contract:
+
+- **One line, exit 0, script not run.** The fields are the script's basename,
+  its declared version (or `unversioned`), the first 12 hex digits of the
+  SHA-256 of its bytes, its mtime as RFC 3339 UTC, and the interpreter's own
+  `mix --version` provenance (`-dirty` suffix included). The hash is what
+  proves two nodes run the same bytes; the header is what a human bumps.
+- **Read, never parsed.** The answer comes from the same cold position as
+  `mix --version` — no session lane, no Bus, no prelude, no rc — and the file
+  is only read, so a script with a syntax error still reports its version. An
+  unreadable path prints the usual `Error reading '…'` and exits 1.
+- **The header form is exactly `-- version: X.Y.Z`** (optional `-pre` /
+  `+build` suffix) within the **first 32 lines**. Whitespace-tolerant
+  (`--version:1.4.0` counts), but lowercase and the colon is required:
+  `-- version 1.4.0` is prose, not a header. The first `-- version:` line
+  wins; one whose value is not `X.Y.Z` makes the script `unversioned`, and
+  [`mix lint`](lint.md) names that line (MIX-D3016).
+- **Mix owns exactly one position: the first argument after the script
+  path.** `mix script.mix --version` and `-V` there are always Mix's; a script
+  cannot give them its own meaning in that position. Anywhere else they are
+  ordinary script arguments — `mix script.mix x --version` runs the script
+  with `args()` = `["x", "--version"]`. Interpreter flags before the script
+  (`--no-prelude`, `--no-traceback`, `--strict-arity`) do not change this.
+- **`mix --serve script.mix --version`** answers the same way and exits before
+  any broker connect. **`mix - --version`** reads the script from stdin and
+  names it `-`, with no `modified` field:
+  `- 1.4.0 (3f9a0c1d22be; mix 0.95.0 (a1b2c3d4e5f6))`.
+
+A running script reads the same facts as data with `script_version()`:
+`{name, version, sha, sha256, modified, mix: {version, sha, dirty}}`, where
+`version` is nil for an undeclared header and `modified` is nil for stdin. It
+returns nil in the REPL and under `-c`, and always describes the entry script,
+not a `require`d module. Under `--serve`, a RELOAD switches it to the new file
+(a reverted reload restores the old record).
+
+```mix
+$v = script_version()
+log("starting " .. $v.name .. " " .. ($v.version ?? "unversioned") .. " @ " .. $v.sha)
+```
 
 ## `mix -c` — one-liners and the shell-first classifier
 

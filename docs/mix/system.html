@@ -1325,6 +1325,7 @@ platform()      {os, arch} map
 which("cmd")    the PATH entry joined with cmd if EXECUTABLE, else nil
 has_builtin(n)  does THIS mix have the named builtin? -&gt; bool (v0.78.0)
 mix_version()   {major, minor, patch, string} — the runtime version (v0.78.0)
+script_version() the entry script's provenance map, nil outside a script (v0.95.0)
 exit([code])    unwind finally, then terminate with status code (default 0)
 sleep(secs)     suspend for secs seconds (fractional ok; async-aware)
 </code></pre>
@@ -1340,6 +1341,11 @@ if $v.major == 0 and $v.minor &lt; 78 then die("needs mix &gt;= 0.78.0") end
 <code>has_builtin</code> (the binary knows the name — calling it raises "requires the
 X feature"); that is the honest answer, distinct from a name the binary
 has never heard of.</p>
+<p><code>script_version()</code> is the script-side twin of <code>mix_version()</code>: the running
+entry script's <code>{name, version, sha, sha256, modified, mix: {version, sha, dirty}}</code> — the facts <code>mix SCRIPT --version</code> prints, as data, so a script can
+log its own provenance. <code>version</code> comes from the <code>-- version: X.Y.Z</code> header
+(nil when absent); the map is nil in the REPL and under <code>-c</code>. See
+<a href="/mix/invocation#--version-for-scripts"><code>--version</code> for scripts</a>.</p>
 <p><code>env</code> reads an environment variable, returning <code>""</code> (not nil, no raise) when
 unset — distinct from the string-interpolation <code>${NAME}</code> form, which walks
 scope → env → literal-nil. Use <code>env(...)</code> when you want an explicit env read.</p>

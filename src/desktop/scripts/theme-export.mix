@@ -1,3 +1,4 @@
+-- version: 0.1.0
 -- theme-export.mix — one cosmix theme, foreign apps follow (proof 1).
 --
 -- Reads the cosmix theme (built-in defaults overlaid field-by-field by the

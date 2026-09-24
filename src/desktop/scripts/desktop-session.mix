@@ -1,3 +1,4 @@
+-- version: 0.3.6
 -- Run with mix --serve desktop-session.mix --name desktop-SESSION.
 -- Bind its systemd unit and clipboard-owner children to the desktop lifetime.
 $desktop = require("lib/desktop.mix")

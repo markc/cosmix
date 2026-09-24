@@ -37,6 +37,7 @@ cd $COSMIX/src/desktop && cargo test -p ctk --lib --features bus,theme app_contr
 cd $COSMIX/src && cargo clippy --workspace --all-targets -- -D warnings
 cd $COSMIX/src/desktop && cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p <crate>          # never a repo-wide fmt from a task
+mix path/to/script.mix --version   # every shipped Mix script answers; "unversioned" = add a "-- version: X.Y.Z" header
 ```
 
 On a machine without a real GPU the desktop run fails exactly two llvmpipe
@@ -74,6 +75,28 @@ defaults. Never hardcode an install path.
 - Operational docs (`_doc/`, `_plan/`, journals, private specs and decisions)
   remain in the maintainer's private control repo. Never copy them wholesale
   into the public suite. Update accepted public contracts with affected code.
+
+## `--version` — Mix scripts
+
+Every binary AND every Mix script answers `--version` with build details
+(Mark, 2026-09-25). For a script, `mix` answers on its behalf:
+`mix SCRIPT --version` (or `-V`) prints one line and exits 0 without running
+it: the script name, its declared version, the first 12 hex digits of the
+SHA-256 of its bytes, its mtime, and the interpreter's own version and sha.
+The version comes from a header in the first 32 lines, in exactly this form:
+
+```mix
+-- version: 0.1.0
+```
+
+- Every script this repo ships carries the header. Bump it when the script's
+  observable behaviour changes. That is the same test as a crate bump.
+- Mix owns the first argument after the script path. A script cannot give
+  `--version` or `-V` its own meaning in that position.
+- `mix lint` notes a missing header on a shebang or `bin/`/`_bin/` script as
+  MIX-D3016. Add `--require-version` to make it a warning.
+- Contract, header grammar, `--serve`/stdin forms and the `script_version()`
+  builtin: `docs/mix/invocation.md`, section "`--version` for scripts".
 
 ## History
 
