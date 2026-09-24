@@ -36,6 +36,10 @@ header line; `tab.close` adds `revision=`, `pane.close` adds `tab=` and
 `revision=`; each `tabs` line adds `revision=` and each `panes` line
 `tab=` and `revision=`. This lets a caller detect drift after the fact; it
 is detection, not binding (e.g. `split id=2 dir=v tab=1 pane=2 revision=2`).
+`tab.new` also ends with `binding=`: `granted` (a native launch grant was
+delivered; enrolment completes asynchronously — `term.session` tracks it),
+`graphics-only` (no usable grant, e.g. look-ahead quota exhaustion) or
+`unavailable` (the instance has no native session).
 A verb whose
 handler panics answers `internal error: verb handler panicked` (rc 10) and
 the lane keeps serving; a panic that unwinds while the tab set is locked may

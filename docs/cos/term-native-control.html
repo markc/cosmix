@@ -479,6 +479,10 @@ header line; <code>tab.close</code> adds <code>revision=</code>, <code>pane.clos
 <code>revision=</code>; each <code>tabs</code> line adds <code>revision=</code> and each <code>panes</code> line
 <code>tab=</code> and <code>revision=</code>. This lets a caller detect drift after the fact; it
 is detection, not binding (e.g. <code>split id=2 dir=v tab=1 pane=2 revision=2</code>).
+<code>tab.new</code> also ends with <code>binding=</code>: <code>granted</code> (a native launch grant was
+delivered; enrolment completes asynchronously — <code>term.session</code> tracks it),
+<code>graphics-only</code> (no usable grant, e.g. look-ahead quota exhaustion) or
+<code>unavailable</code> (the instance has no native session).
 A verb whose
 handler panics answers <code>internal error: verb handler panicked</code> (rc 10) and
 the lane keeps serving; a panic that unwinds while the tab set is locked may

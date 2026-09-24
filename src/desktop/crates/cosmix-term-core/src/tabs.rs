@@ -616,6 +616,17 @@ impl TabSet {
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
+    /// Native-session state of a pane as opened: `granted` (a launch grant
+    /// was delivered; enrolment is asynchronous — `term.session` tracks it),
+    /// `graphics-only` (no usable grant, e.g. look-ahead exhaustion), or
+    /// `unavailable` (this instance has no native session at all).
+    pub fn binding(&self, pane: u64) -> &'static str {
+        match &self.native {
+            None => "unavailable",
+            Some(native) if native.launched(pane) => "granted",
+            Some(_) => "graphics-only",
+        }
+    }
     /// Signalled when the last tab closes (see the `emptied` field).
     pub fn emptied(&self) -> Arc<tokio::sync::Notify> {
         self.emptied.clone()

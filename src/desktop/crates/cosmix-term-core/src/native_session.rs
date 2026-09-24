@@ -220,6 +220,17 @@ impl NativeSession {
             .filter(|p| p.control_ready.load(Ordering::Acquire) && p.live.load(Ordering::Acquire))
             .map(|p| p.generation.load(Ordering::Acquire))
     }
+    /// True once `prepare` handed pane `id` a launch grant (enrolment may
+    /// still be pending); false for a graphics-only pane that got none.
+    pub fn launched(&self, id: u64) -> bool {
+        self.1
+            .lock()
+            .unwrap()
+            .panes
+            .get(&id)
+            .and_then(|p| p.upgrade())
+            .is_some_and(|p| p.live.load(Ordering::Acquire) && p.launched.load(Ordering::Acquire))
+    }
     pub fn install_control(
         &self,
         tabs: Arc<std::sync::Mutex<crate::tabs::TabSet>>,
@@ -1706,6 +1717,8 @@ pub(crate) mod tests {
                 .launched
                 .load(Ordering::Acquire)
         );
+        // What the global lane's term.tab.new reports for this pane.
+        assert_eq!(tabs.binding(1), "granted");
         let repeated = Instant::now();
         supervisor.wait_startup();
         assert!(repeated.elapsed() < Duration::from_millis(50));
@@ -1727,6 +1740,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("graphics-only")
         );
+        assert_eq!(tabs.binding(1), "graphics-only");
     }
 
     #[test]
