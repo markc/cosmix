@@ -2229,108 +2229,194 @@ fn remote_injected_names(opts: Option<&Expr>) -> Option<HashSet<String>> {
     Some(out)
 }
 
-/// How many times each name is bound anywhere in the file — every binder
-/// kind [`collect_bound_names`] knows, at every depth including function
-/// and lambda bodies, plus function and lambda PARAMETERS. Deliberately
-/// scope-blind: a name bound in two different functions counts twice, so
-/// "bound exactly once" is a conservative, never an optimistic, claim.
-fn binder_counts(stmts: &[Stmt]) -> HashMap<String, usize> {
-    fn lambda_params(expr: &Expr, out: &mut Vec<String>) {
-        if let Expr::FunctionLiteral { params, body } = expr {
+/// One node reached by [`walk_frames`].
+enum FrameNode<'n> {
+    Stmt(&'n Stmt),
+    /// An expression and the line of the statement that holds it.
+    Expr(&'n Expr, usize),
+}
+
+/// Frame id of top-level code. Every function frame is identified by the
+/// address of its `FunctionDef` statement or `FunctionLiteral` node, which
+/// is never zero.
+const TOP_FRAME: usize = 0;
+
+/// Visit EVERY statement and expression node in the file, each with the id
+/// of the function frame it runs in.
+///
+/// The general walkers each leave a gap on purpose — `walk_expr_children`
+/// skips `if`-expression conditions and lambda bodies, `walk_stmt_exprs`
+/// skips a named function's parameter defaults and `= expr` body — because
+/// their scope-sensitive callers handle those positions themselves. The
+/// `ssh_mix` pass must not miss a call in any of them: an unseen body is
+/// the silent gap this pass exists to close.
+fn walk_frames(stmts: &[Stmt], frame: usize, visit: &mut dyn FnMut(FrameNode<'_>, usize)) {
+    for stmt in stmts {
+        visit(FrameNode::Stmt(stmt), frame);
+        let line = stmt.line;
+        if let StmtKind::FunctionDef { params, body, .. } = &stmt.kind {
+            let inner = std::ptr::from_ref(stmt) as usize;
             for p in params {
-                out.push(p.name.clone());
                 if let Some(d) = &p.default {
-                    lambda_params(d, out);
+                    walk_frame_expr(d, line, inner, visit);
                 }
             }
-            // Block bodies are statements, which walk_stmts reaches.
-            if let FunctionBody::Expression(e) = &**body {
-                lambda_params(e, out);
+            match body {
+                FunctionBody::Block(b) => walk_frames(b, inner, visit),
+                FunctionBody::Expression(e) => walk_frame_expr(e, line, inner, visit),
+            }
+            continue;
+        }
+        walk_stmt_exprs(stmt, &mut |e| walk_frame_expr(e, line, frame, visit));
+        for body in stmt_bodies(&stmt.kind) {
+            walk_frames(body, frame, visit);
+        }
+    }
+}
+
+fn walk_frame_expr(
+    expr: &Expr,
+    line: usize,
+    frame: usize,
+    visit: &mut dyn FnMut(FrameNode<'_>, usize),
+) {
+    visit(FrameNode::Expr(expr, line), frame);
+    match expr {
+        Expr::If(ifexpr) => {
+            walk_frame_expr(&ifexpr.condition, line, frame, visit);
+            walk_frames(&ifexpr.then_body, frame, visit);
+            for (c, b) in &ifexpr.else_ifs {
+                walk_frame_expr(c, line, frame, visit);
+                walk_frames(b, frame, visit);
+            }
+            if let Some(b) = &ifexpr.else_body {
+                walk_frames(b, frame, visit);
             }
         }
-        walk_expr_children(expr, &mut |c| lambda_params(c, out));
+        Expr::FunctionLiteral { params, body } => {
+            let inner = node_id(expr);
+            for p in params {
+                if let Some(d) = &p.default {
+                    walk_frame_expr(d, line, inner, visit);
+                }
+            }
+            match &**body {
+                FunctionBody::Block(b) => walk_frames(b, inner, visit),
+                FunctionBody::Expression(e) => walk_frame_expr(e, line, inner, visit),
+            }
+        }
+        _ => walk_expr_children(expr, &mut |c| walk_frame_expr(c, line, frame, visit)),
     }
-    let mut names: Vec<String> = Vec::new();
-    walk_stmts(stmts, &mut |stmt| {
-        match &stmt.kind {
-            StmtKind::Assignment { name, .. }
-            | StmtKind::Export { name, .. }
-            | StmtKind::FieldAssignment { object: name, .. }
-            | StmtKind::IndexAssignment { object: name, .. }
-            | StmtKind::PathAssignment { root: name, .. } => names.push(name.clone()),
-            StmtKind::For { var, .. } => names.push(var.clone()),
-            StmtKind::ForEach { var, index_var, .. } => {
-                names.push(var.clone());
-                names.extend(index_var.iter().cloned());
-            }
-            StmtKind::TryCatch { catch: Some(c), .. } => {
-                names.push(c.var.clone());
-                names.extend(c.err_var.iter().cloned());
-            }
-            StmtKind::Parse { parts, .. } => {
-                for part in parts {
-                    if let crate::ast::ParsePart::Variable(name) = part {
-                        names.push(name.clone());
+}
+
+/// Every binder of every name in the file, as the list of frames it is
+/// bound in — every binder kind [`collect_bound_names`] knows, at every
+/// depth, plus function and lambda PARAMETERS (bound in the function's own
+/// frame). `len()` is the binder count: a name bound in two different
+/// functions counts twice, so "bound exactly once" is a conservative,
+/// never an optimistic, claim.
+fn binder_frames(stmts: &[Stmt]) -> HashMap<String, Vec<usize>> {
+    let mut out: HashMap<String, Vec<usize>> = HashMap::new();
+    walk_frames(stmts, TOP_FRAME, &mut |node, frame| {
+        let mut bind = |name: &str, frame: usize| {
+            out.entry(name.to_string()).or_default().push(frame);
+        };
+        match node {
+            FrameNode::Stmt(stmt) => match &stmt.kind {
+                StmtKind::Assignment { name, .. }
+                | StmtKind::Export { name, .. }
+                | StmtKind::FieldAssignment { object: name, .. }
+                | StmtKind::IndexAssignment { object: name, .. }
+                | StmtKind::PathAssignment { root: name, .. } => bind(name, frame),
+                StmtKind::For { var, .. } => bind(var, frame),
+                StmtKind::ForEach { var, index_var, .. } => {
+                    bind(var, frame);
+                    if let Some(iv) = index_var {
+                        bind(iv, frame);
+                    }
+                }
+                StmtKind::TryCatch { catch: Some(c), .. } => {
+                    bind(&c.var, frame);
+                    if let Some(ev) = &c.err_var {
+                        bind(ev, frame);
+                    }
+                }
+                StmtKind::Parse { parts, .. } => {
+                    for part in parts {
+                        if let crate::ast::ParsePart::Variable(name) = part {
+                            bind(name, frame);
+                        }
+                    }
+                }
+                StmtKind::FunctionDef { params, .. } => {
+                    let inner = std::ptr::from_ref(stmt) as usize;
+                    for p in params {
+                        bind(&p.name, inner);
+                    }
+                }
+                _ => {}
+            },
+            FrameNode::Expr(expr, _) => {
+                if let Expr::FunctionLiteral { params, .. } = expr {
+                    for p in params {
+                        bind(&p.name, node_id(expr));
                     }
                 }
             }
-            StmtKind::FunctionDef { params, .. } => {
-                names.extend(params.iter().map(|p| p.name.clone()));
-            }
-            _ => {}
         }
-        walk_stmt_exprs(stmt, &mut |e| lambda_params(e, &mut names));
     });
-    let mut counts = HashMap::new();
-    for n in names {
-        *counts.entry(n).or_insert(0) += 1;
-    }
-    counts
+    out
 }
 
 /// Variables whose SOLE binding in the whole file is an assignment of a
 /// string literal or heredoc — the manual's own idiom binds the remote
 /// program once (`$probe = <<END … END`) and ships it from a loop over
 /// hosts, and a heredoc cannot sit inline in an argument list without
-/// losing that shape.
+/// losing that shape. Each comes with the frame it is bound in.
 ///
 /// "Sole" is the straight-line guarantee the proven-value facts rely on,
 /// made stronger: not merely "no reassignment between here and the use",
 /// but no other binder of that name ANYWHERE — so the value at every read
 /// is the one literal, whatever the control flow. A `source`/`include`
 /// can bind anything, so a file with one resolves nothing.
-fn sole_string_definitions(stmts: &[Stmt]) -> HashMap<String, RemoteBody> {
+fn sole_string_definitions(stmts: &[Stmt]) -> HashMap<String, (RemoteBody, usize)> {
     let mut out = HashMap::new();
     if has_dynamic_include(stmts).0 {
         return out;
     }
-    let counts = binder_counts(stmts);
-    walk_stmts(stmts, &mut |stmt| {
-        if let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } = &stmt.kind
-            && counts.get(name) == Some(&1)
+    let binders = binder_frames(stmts);
+    walk_frames(stmts, TOP_FRAME, &mut |node, frame| {
+        if let FrameNode::Stmt(stmt) = node
+            && let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } =
+                &stmt.kind
+            && binders.get(name).is_some_and(|f| f.len() == 1)
             && let Some(shape) = body_shape(value, stmt.line)
         {
-            out.insert(name.clone(), shape);
+            out.insert(name.clone(), (shape, frame));
         }
     });
     out
 }
 
-/// Every `ssh_mix` call in the file, at any depth, with what lint can know
-/// about its body and its injected names.
+/// Every `ssh_mix` call in the file, at any depth — loops, branches, an
+/// `if`-expression's condition, lambda bodies and parameter defaults, a
+/// named function's `= expr` body — with what lint can know about its body
+/// and its injected names.
 fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
-    fn visit(
-        expr: &Expr,
-        line: usize,
-        sole: &HashMap<String, RemoteBody>,
-        sites: &mut Vec<RemoteSite>,
-    ) {
+    let sole = sole_string_definitions(stmts);
+    let mut sites = Vec::new();
+    walk_frames(stmts, TOP_FRAME, &mut |node, _frame| {
+        let FrameNode::Expr(expr, line) = node else {
+            return;
+        };
         if let Expr::FunctionCall { name, args } = expr
             && name == "ssh_mix"
             && let Some(body) = args.get(1)
         {
             let body = match body {
-                Expr::Variable(v) => sole.get(v).cloned().unwrap_or(RemoteBody::Opaque),
+                Expr::Variable(v) => sole
+                    .get(v)
+                    .map_or(RemoteBody::Opaque, |(shape, _)| shape.clone()),
                 other => body_shape(other, line).unwrap_or(RemoteBody::Opaque),
             };
             sites.push(RemoteSite {
@@ -2339,20 +2425,6 @@ fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
                 injected: remote_injected_names(args.get(2)),
             });
         }
-        // An expression-bodied lambda (`fn($h) => ssh_mix($h, $p)`) is not
-        // a statement list, so walk_stmts cannot reach it; block bodies it
-        // does reach.
-        if let Expr::FunctionLiteral { body, .. } = expr
-            && let FunctionBody::Expression(e) = &**body
-        {
-            visit(e, line, sole, sites);
-        }
-        walk_expr_children(expr, &mut |c| visit(c, line, sole, sites));
-    }
-    let sole = sole_string_definitions(stmts);
-    let mut sites = Vec::new();
-    walk_stmts(stmts, &mut |stmt| {
-        walk_stmt_exprs(stmt, &mut |e| visit(e, stmt.line, &sole, &mut sites));
     });
     sites
 }

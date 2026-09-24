@@ -288,6 +288,64 @@ fn a_call_inside_a_loop_is_linted() {
     assert!(codes(src).iter().any(|c| c == "MIX-E1501"), "{:?}", codes(src));
 }
 
+/// A body with one finding (E1501) that needs no names from outside.
+const LOST_PUSH: &str = "'\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\n'";
+
+#[test]
+fn calls_are_found_in_every_expression_position() {
+    // The general walkers skip these positions on purpose (their callers
+    // handle scope themselves); the body pass must not.
+    for (what, src) in [
+        (
+            "if-expression condition",
+            format!("$v = if ssh_mix(\"a\", {LOST_PUSH}).ok then 1 else 0 end\nprint($v)\n"),
+        ),
+        (
+            "lambda parameter default",
+            format!("$f = function($r = ssh_mix(\"a\", {LOST_PUSH})) = $r\nprint($f())\n"),
+        ),
+        (
+            "expression lambda body",
+            format!("$f = function($h) = ssh_mix($h, {LOST_PUSH})\nprint($f(\"a\"))\n"),
+        ),
+        (
+            "named fn = expr body",
+            format!("fn go($h) = ssh_mix($h, {LOST_PUSH})\nprint(go(\"a\"))\n"),
+        ),
+        (
+            "named fn parameter default",
+            format!("fn go($r = ssh_mix(\"a\", {LOST_PUSH}))\n  return $r\nend\nprint(go())\n"),
+        ),
+    ] {
+        let c = codes(&src);
+        assert!(c.iter().any(|x| x == "MIX-E1501"), "{what}: body not analysed: {c:?}");
+    }
+}
+
+#[test]
+fn a_named_fn_expression_body_resolves_names_against_its_bindings() {
+    let src = "fn go($x) = ssh_mix(\"a\", 'print($x .. $missing)', {bindings: {x: $x}})\nprint(go(1))\n";
+    let d = diags(src);
+    let e1101: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1101").collect();
+    assert_eq!(e1101.len(), 1, "{d:?}");
+    assert!(e1101[0].3.contains("$missing"), "{}", e1101[0].3);
+}
+
+#[test]
+fn a_lambda_parameter_is_a_binder() {
+    // `$p` has a heredoc assignment AND a lambda parameter of that name, so
+    // it is bound twice and must not resolve.
+    let src = "$p = 'print(1)'\n$f = function($p) = ssh_mix(\"a\", $p)\nprint($f(\"x\"))\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-D3012"), "{:?}", codes(src));
+}
+
+#[test]
+fn a_file_with_source_or_include_resolves_nothing() {
+    // The loaded file can rebind anything, so "sole binder" is unknowable.
+    let src = "source(\"other.mix\")\n$p = 'print(1)'\n$r = ssh_mix(\"a\", $p)\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-D3012"), "{:?}", codes(src));
+}
+
 #[test]
 fn an_inline_heredoc_body_is_analysed() {
     // The manual's headline idiom writes the heredoc inline; it used to
