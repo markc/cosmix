@@ -75,7 +75,9 @@ pub(crate) struct WallpaperState {
     backoff: Duration,
     /// A read owed regardless of page visibility: the connection's
     /// bootstrap and the readback after a write. Every other read (retries,
-    /// invalidations) waits until the page is visible.
+    /// invalidations) waits until the page is visible. Cleared on send, so a
+    /// bootstrap that fails while hidden is not retried hidden: opening the
+    /// page reads anyway, and nothing on screen shows the stale value.
     owed: bool,
     /// Last page visibility seen by `present` (post-model, same update).
     visible: bool,

@@ -42,7 +42,9 @@ struct Lane {
     /// Delay applied after the next failed read.
     backoff: Duration,
     /// A status read owed regardless of page visibility: the connection's
-    /// bootstrap and the readback after an action.
+    /// bootstrap and the readback after an action. Cleared on send, so a
+    /// bootstrap that fails while hidden is not retried hidden: opening the
+    /// tab reads anyway, and nothing on screen shows the stale value.
     owed: bool,
     feedback: String,
 }
