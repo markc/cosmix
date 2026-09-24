@@ -521,7 +521,7 @@ content; the suffix is only a tiebreak when neither grammar succeeds.</p>
 <p><strong>MIX-E1101</strong> flags a <code>$name</code> read only when the name is bound <strong>nowhere in its visible universe</strong> — function bodies see params + their own binders + everything bound anywhere at file level (Mix has no block scoping and no read-before-assign rule, so lexical order is deliberately ignored). <code>${name}</code> interpolation is never flagged (it falls back to the process environment), nor are <code>$1</code>-style positionals or the runtime-injected <code>rc</code> / <code>result</code> / <code>status</code> / <code>event</code> / <code>_</code>.</p>
 </li>
 <li>
-<p><strong>MIX-E1102</strong> resolves bareword calls against builtins, HOFs, evaluator special forms, every <code>function</code> definition in the file, the embedded prelude, <code>--allow-function</code> names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside <code>address ... end</code> blocks are sends and are never flagged; <code>MethodCall</code>/<code>ValueCall</code> are dynamic dispatch and are skipped.</p>
+<p><strong>MIX-E1102</strong> resolves bareword calls against builtins, HOFs, evaluator special forms, every <code>function</code> definition in the file, the embedded prelude, <code>--allow-function</code> names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside <code>address ... end</code> blocks are sends and are never flagged; <code>MethodCall</code>/<code>ValueCall</code> are dynamic dispatch and are skipped. The hint carries the <strong>same "did you mean" the runtime prints</strong> for that name. One suggester serves both, so lint (where an agent looks first) and the failing run cannot disagree. It checks, in order: the deleted-name pointers (<code>regex_match</code> → <code>re_match(s, pattern)</code>), then a <strong>foreign-name synonym table</strong> for the names a python/bash/JS habit reaches for first (<code>json_decode</code>/<code>json_loads</code> → <code>json_parse</code>, <code>json_dumps</code> → <code>json_encode</code>, <code>str</code> → <code>to_string</code>, <code>trim_end</code>/<code>rstrip</code> → <code>rtrim</code>, <code>len_bytes</code> → <code>byte_length</code>, <code>getenv</code> → <code>env</code>, …), and only then edit distance. The order matters: <code>json_encode</code> is one edit from <code>json_decode</code> and means the opposite.</p>
 </li>
 <li>
 <p><strong>MIX-E1201</strong> checks calls against the structured contract metadata (<code>mix builtins --json</code>), including non-contiguous exact-arity sets — <code>random(1)</code> is an error, <code>random()</code>/<code>random(min, max)</code> are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (<code>mix --strict-arity</code> makes the runtime agree).</p>
@@ -603,7 +603,7 @@ single-quoted strings containing ordinary <code>"</code> stay quiet.</p>
 <p><strong>MIX-W2401</strong>: one <code>source</code>/<code>include</code> anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer <code>require()</code>: it is isolated, statically resolvable, and E1401/E1402 verify literal-path modules parse.</p>
 </li>
 <li>
-<p><strong>MIX-W2402</strong> warns when a heredoc literal contains bare <code>$NAME</code> and <code>NAME</code> is bound somewhere in the same visible universe. Heredocs interpolate <code>${NAME}</code>, not <code>$NAME</code>, so the bare form often means a generated config was silently corrupted. It does not fire for <code>${NAME}</code>, <code>$(</code> command substitution, explicitly escaped <code>\$NAME</code>, all-digit names such as <code>$1</code>, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare <code>$NAME</code> still evaluates to literal <code>$NAME</code>, and intentional literal output requires no change.</p>
+<p><strong>MIX-W2402</strong> warns when a heredoc literal contains bare <code>$NAME</code> and <code>NAME</code> is bound somewhere in the same visible universe. Heredocs interpolate <code>${NAME}</code>, not <code>$NAME</code>, so the bare form often means a generated config was silently corrupted. It does not fire for <code>${NAME}</code>, <code>$(</code> command substitution, explicitly escaped <code>\$NAME</code>, all-digit names such as <code>$1</code>, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare <code>$NAME</code> still evaluates to literal <code>$NAME</code>, and intentional literal output requires no change. In a heredoc that ships as an <code>ssh_mix</code> body it stays silent for the names the <strong>remote</strong> program owns: the call's <code>bindings</code>/<code>env</code> keys and whatever the body binds itself. There, bare is exactly right, and <code>${NAME}</code> would splice the local value into the remote source. Any other bound name still warns.</p>
 </li>
 <li>
 <p><strong>MIX-E1303</strong> (0.90.0; was <code>MIX-W2403</code> from 0.74.0) errors at the <em>definition</em> of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name — only an extracted function value or an exports-map index still reaches it. The worst shape this produces is a script that keeps running while its own function quietly stops being called, and every release that adds a builtin name arms it again for older scripts. It was a warning on the theory that a compat shim for an older mix is legitimate authoring; the fleet refuted that — two sites across 785 scripts, neither a shim: one a hand-rolled <code>ends_with</code> duplicating the builtin, the other an <code>fn mix_version()</code> in a pre-commit hook written to report a <em>named</em> interpreter's version and silently answering with the running one's, a live wrong answer that sat behind a warning for sixteen releases. Lint is also the only gate an <code>ssh_mix</code> body passes through, and a warning stops nothing by default. The <strong>runtime is unchanged</strong> — the builtin still wins; the fix is to rename. Since 0.91.0 the check also covers the evaluator's inline forms that sit outside the builtin table's dispatch gate — <code>serve_name</code>, <code>printf</code> and its stdio siblings, and the Bus forms <code>quit</code>, <code>reply</code>, <code>subscribe</code> and the rest — which beat a same-named function just the same: <code>fn quit() return 1 end; print(quit())</code> printed <code>nil</code> with no diagnostic before. Since 0.92.0 the runtime agrees in operand position too: the binary-operator fast path used to call a user <code>fn printf</code> for <code>printf("B") .. "|"</code> while a bare <code>printf("B")</code> called the builtin; now the builtin wins in both.</p>
@@ -660,9 +660,25 @@ than by the script analyzer.</p>
 <h2 id="remote-bodies--lint-sees-inside-ssh_mix-0690">Remote bodies — lint sees inside <code>ssh_mix</code> (0.69.0)</h2>
 <p><a href="/mix/remote"><code>ssh_mix(host, source[, opts])</code></a> ships its <strong>second argument</strong> to
 a remote <code>mix -</code>. That argument is Mix source, and since 0.69.0 lint treats it
-as such: when it is a <strong>string literal</strong> it is parsed and analysed, and its
+as such: when it is a <strong>literal</strong> it is parsed and analysed, and its
 diagnostics are reported against the enclosing file with a
 <code>[inside ssh_mix body]</code> prefix and the line mapped into the outer file.</p>
+<p>A literal is a plain string, an all-literal heredoc written inline (the
+<a href="/mix/remote#headline-idiom-ssh_mix--heredoc">headline idiom</a>), or a variable
+whose <strong>sole</strong> binding anywhere in the file is one of those. The last is the
+fleet shape: the program bound once, shipped from a loop over hosts.</p>
+<pre><code class="language-mix">$probe = &lt;&lt;END
+print(length($base))
+END
+for $h in $hosts do
+  $r = ssh_mix($h, $probe, {bindings: {base: $base}})
+end
+</code></pre>
+<p>"Sole" is strict. A second assignment, a loop variable or a parameter of the
+same name anywhere in the file makes the value unknowable, and the body is
+reported as unanalysable instead. Findings in a bound heredoc point at the
+heredoc's own lines. A heredoc shipped by several calls reports each finding
+once. Calls are found at any depth: in loops, branches, functions and lambdas.</p>
 <pre><code>deploy_thing.mix:283: MIX-D3001 note: [inside ssh_mix body] `regex_match` is
   pattern-first legacy: use `re_match(s, pattern)` (subject first)
 </code></pre>
@@ -673,14 +689,23 @@ lint</strong>. That is not a hypothetical: the <code>MIX-D3006</code> inventory 
 locally and on 27/27 fleet nodes, while line 283 of that file is a
 two-variable loop over a map living inside such a body.</p>
 <p><strong>A body that cannot be analysed says so</strong> — <code>MIX-D3012</code>, for a non-literal
-argument (variable, concatenation, interpolation, <code>read_file</code>) or a literal
+argument (a variable not bound once to a literal, concatenation,
+interpolation, <code>read_file</code>) or a literal
 that does not parse as Mix. This is the rule that matters more than the
 analysis: an unreadable body silently counted as clean is precisely how an
 inventory reads zero while live sites exist.</p>
-<p><strong>Name resolution is suppressed inside the body.</strong> Its free names come from
-<code>ssh_mix</code>'s <code>bindings</code> option and from the remote's own environment, neither
-visible locally, so <code>MIX-E1101</code>-class findings would be pure noise — and a
-linter that cries wolf about remote bodies gets switched off. The enclosing
+<p>A body interpolating <code>${name}</code> is reported by name. That splice puts the
+<strong>local</strong> value into the remote source text, which is the classic remote bug;
+pass the value through <code>bindings</code> and write it bare instead.</p>
+<p><strong>Names resolve against the body's own universe.</strong> A remote body is a
+separate program. It sees its own binders, the builtins and prelude, and the
+names the call injects: the keys of <code>bindings</code> and of <code>env</code>, both prepended to
+the shipped source as assignments. It does <strong>not</strong> see the enclosing file's
+functions or variables. So a bare <code>$base</code> passed as a binding is clean, while
+<code>$notbound</code>, or a call to a helper defined only in the outer file, is
+<code>MIX-E1101</code>/<code>MIX-E1102</code> with the body prefix. When the opts argument is not a
+map literal (<code>ssh_mix($h, $src, $opts)</code>) the injected names cannot be read,
+and name checks stand down for that body rather than cry wolf. The enclosing
 file keeps all of its own name checks. Everything else — legacy-name notes,
 arity, the truthiness trap — applies normally, and <strong>errors from inside a
 body gate exactly as they would anywhere else</strong>.</p>

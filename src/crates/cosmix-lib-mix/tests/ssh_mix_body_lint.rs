@@ -103,11 +103,11 @@ fn a_body_that_does_not_parse_is_reported_rather_than_swallowed() {
 }
 
 #[test]
-fn name_resolution_is_suppressed_inside_the_body() {
-    // A remote body's free names come from `ssh_mix`'s `bindings` option and
-    // from the remote's own environment — neither visible locally. Reporting
-    // them would be pure noise, and a linter that cries wolf about remote
-    // bodies gets switched off. The OUTER file keeps its own name checks.
+fn names_injected_by_bindings_are_bound_inside_the_body() {
+    // A remote body's free names come from `ssh_mix`'s `bindings` option,
+    // which prepends a real `$name = value` assignment to the shipped
+    // source. Those names are bound in the program that runs, so they must
+    // never be reported. The OUTER file keeps its own name checks.
     let src = "$h = \"alpha\"\n$r = ssh_mix($h, '\nprint($injected_by_bindings)\n', {bindings: {injected_by_bindings: 1}})\n";
     let c = codes(src);
     assert!(
@@ -142,10 +142,159 @@ fn a_clean_body_adds_nothing() {
 
 #[test]
 fn nested_ssh_mix_does_not_recurse_unboundedly() {
-    // A remote body may itself call ssh_mix. The nested analysis runs with
-    // name checks suppressed, and that same flag stops it descending again —
-    // so this terminates instead of looping.
+    // A remote body may itself call ssh_mix. The nested analysis does not
+    // descend into its own ssh_mix bodies — so this terminates instead of
+    // looping.
     let src =
         "$h = \"a\"\n$r = ssh_mix($h, '\n$q = ssh_mix(\"b\", \\'\nprint(regex_match(\"^a\", \"b\"))\n\\')\n')\n";
     let _ = codes(src); // must simply return
+}
+
+// ── heredoc bound once + `bindings` (TODO-mix, filed 2026-09-18) ──────
+
+/// The manual's own fleet idiom (probe h1): the remote program bound ONCE to
+/// a heredoc, shipped from a loop over hosts, with local values passed
+/// through `bindings` and written bare in the body.
+const H1: &str = "\
+$base = \"/srv\"
+$probe = <<END
+$n = length($base)
+print($n)
+END
+for $h in [\"alpha\", \"beta\"] do
+  $r = ssh_mix($h, $probe, {bindings: {base: $base}})
+  print($r.ok)
+end
+";
+
+#[test]
+fn h1_the_bound_heredoc_idiom_lints_clean() {
+    // It used to cost two false findings every time: MIX-W2402 on `$base`
+    // (bare is exactly right: it is the remote binding) and MIX-D3012 (it
+    // IS a literal, merely bound to a name first).
+    let c = codes(H1);
+    assert!(c.is_empty(), "h1 must lint clean, got {c:?}");
+}
+
+#[test]
+fn a_heredoc_bound_once_is_analysed_at_its_own_lines() {
+    // Resolved through the variable, the body is linted — and a finding
+    // points at the heredoc line that holds it (line 4 here), not at the
+    // call.
+    let src = "$h = \"alpha\"\n$probe = <<END\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEND\n$r = ssh_mix($h, $probe)\n";
+    assert_eq!(src.lines().nth(3).unwrap(), "push($m[\"a\"], 1)");
+    let d = diags(src);
+    let hit = d
+        .iter()
+        .find(|(c, ..)| c == "MIX-E1501")
+        .expect("the resolved body must be analysed");
+    assert_eq!(hit.2, Some(4), "{d:?}");
+    assert!(hit.3.contains("inside ssh_mix body"), "{}", hit.3);
+    assert!(!d.iter().any(|(c, ..)| c == "MIX-D3012"), "{d:?}");
+}
+
+#[test]
+fn a_shared_heredoc_reports_each_finding_once() {
+    let src = "$probe = <<END\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEND\nfor $h in [\"a\", \"b\"] do\n  $r = ssh_mix($h, $probe)\nend\n$s = ssh_mix(\"c\", $probe)\n";
+    let n = codes(src).iter().filter(|c| *c == "MIX-E1501").count();
+    assert_eq!(n, 1, "{:?}", codes(src));
+}
+
+#[test]
+fn a_variable_bound_more_than_once_is_not_resolved() {
+    // "Sole definition" is the guarantee: with two binders the value at
+    // the call is not knowable, so the body stays unanalysable.
+    let src = "$p = 'print(1)'\nif 1 == 1 then\n  $p = 'print(2)'\nend\n$r = ssh_mix(\"a\", $p)\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-D3012"), "{:?}", codes(src));
+    // A parameter is a binder too.
+    let src = "$p = 'print(1)'\nfn go($p)\n  return ssh_mix(\"a\", $p)\nend\nprint(go($p))\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-D3012"), "{:?}", codes(src));
+}
+
+#[test]
+fn a_braced_local_splice_in_the_body_still_warns() {
+    // `${base}` interpolates the LOCAL value into the remote source — the
+    // classic bug — so the body is not a literal and says so, naming it.
+    let src = "$base = \"/srv\"\n$probe = <<END\nprint(\"${base}\")\nEND\n$r = ssh_mix(\"a\", $probe, {bindings: {base: $base}})\n";
+    let d = diags(src);
+    let hit = d
+        .iter()
+        .find(|(c, ..)| c == "MIX-D3012")
+        .expect("an interpolated body must still be reported");
+    assert!(hit.3.contains("${base}"), "must name the splice: {}", hit.3);
+}
+
+#[test]
+fn an_unbound_name_in_the_body_is_flagged() {
+    // With the bindings map readable, the body's universe is known: its
+    // own binders, the builtins, and the bindings keys. Anything else is
+    // undefined on the remote.
+    let src = "$base = \"/srv\"\n$probe = <<END\nprint($base .. $notbound)\nEND\n$r = ssh_mix(\"a\", $probe, {bindings: {base: $base}})\n";
+    let d = diags(src);
+    let e1101: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1101").collect();
+    assert_eq!(e1101.len(), 1, "{d:?}");
+    assert!(e1101[0].3.contains("$notbound"), "{}", e1101[0].3);
+    assert!(e1101[0].3.contains("inside ssh_mix body"), "{}", e1101[0].3);
+}
+
+#[test]
+fn w2402_is_silenced_for_bindings_names_only() {
+    // `$target` is bound locally but NOT passed as a binding: bare in the
+    // body it is undefined remotely, so W2402 keeps firing for it (and the
+    // body's own E1101 names it) while `$base` stays silent.
+    let src = "$base = \"/srv\"\n$target = \"x\"\n$probe = <<END\nprint($base .. $target)\nEND\n$r = ssh_mix(\"a\", $probe, {bindings: {base: $base}})\n";
+    let d = diags(src);
+    let w: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-W2402").collect();
+    assert_eq!(w.len(), 1, "{d:?}");
+    assert!(w[0].3.contains("$target"), "{}", w[0].3);
+    // An ordinary text heredoc is untouched.
+    let src = "$base = \"/srv\"\n$conf = <<END\nroot $base\nEND\nprint($conf)\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-W2402"));
+}
+
+#[test]
+fn env_keys_are_bound_inside_the_body_too() {
+    // `env` ships as prepended `export KEY = "value"` lines.
+    let src = "$r = ssh_mix(\"a\", '\nprint($FOO)\n', {env: {FOO: \"1\"}})\n";
+    assert!(codes(src).is_empty(), "{:?}", codes(src));
+}
+
+#[test]
+fn an_opaque_opts_argument_suppresses_body_name_checks() {
+    // With the bindings unreadable the body's universe is unknowable, so
+    // naming checks stand down rather than cry wolf.
+    let src = "$o = {bindings: {x: 1}}\n$r = ssh_mix(\"a\", '\nprint($x)\n', $o)\n";
+    assert!(codes(src).is_empty(), "{:?}", codes(src));
+}
+
+#[test]
+fn an_undefined_function_in_the_body_is_reported_with_its_suggestion() {
+    // Probe h4: the remote half failing on a typo is the failure this pass
+    // exists to catch. A body cannot see the outer file's functions.
+    let src = "fn helper()\n  return 1\nend\n$r = ssh_mix(\"a\", '\nprint(json_decode(\"{}\"))\nprint(helper())\n')\nprint(helper())\n";
+    let d = diags(src);
+    let e1102: Vec<_> = d.iter().filter(|(c, ..)| c == "MIX-E1102").collect();
+    assert_eq!(e1102.len(), 2, "{d:?}");
+    assert!(e1102.iter().all(|x| x.3.contains("inside ssh_mix body")));
+    assert!(e1102.iter().any(|x| x.3.contains("json_decode")));
+    assert!(e1102.iter().any(|x| x.3.contains("helper")));
+}
+
+#[test]
+fn a_call_inside_a_loop_is_linted() {
+    // The loop-over-hosts shape. The 0.69.0 pass searched top-level
+    // statements only, so exactly this was invisible.
+    let src = "for $h in [\"a\"] do\n  $r = ssh_mix($h, '\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\n')\nend\n";
+    assert!(codes(src).iter().any(|c| c == "MIX-E1501"), "{:?}", codes(src));
+}
+
+#[test]
+fn an_inline_heredoc_body_is_analysed() {
+    // The manual's headline idiom writes the heredoc inline; it used to
+    // count as "not a literal".
+    let src = "$r = ssh_mix(\"alpha\", <<EOF\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEOF\n)\n";
+    let d = diags(src);
+    let hit = d.iter().find(|(c, ..)| c == "MIX-E1501").expect("analysed");
+    assert_eq!(hit.2, Some(3), "{d:?}");
+    assert!(!d.iter().any(|(c, ..)| c == "MIX-D3012"), "{d:?}");
 }

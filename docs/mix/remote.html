@@ -634,14 +634,18 @@ end
 above. This section supplies the remaining option and decoding contract.</p>
 <blockquote>
 <p><strong><code>mix lint</code> reads the body (0.69.0).</strong> Because <code>source</code> is Mix source,
-lint parses it when it is a <strong>string literal</strong> and reports its diagnostics
+lint parses it when it is a <strong>literal</strong> — a string, an inline heredoc, or a
+variable bound exactly once to either — and reports its diagnostics
 against your file, prefixed <code>[inside ssh_mix body]</code>, at mapped line numbers.
-A body it cannot read — a variable, a concatenation, an interpolated string,
-a <code>read_file</code>, or a literal that does not parse — is reported as
-<strong><code>MIX-D3012</code></strong> rather than passing silently. Prefer a plain single-quoted
-literal and the <a href="/mix/remote#options-map"><code>bindings</code></a> option over interpolation: it is
-both safer (no injection through string building) and the only form lint can
-check. See <a href="/mix/lint#remote-bodies--lint-sees-inside-ssh_mix-0690">lint</a>.</p>
+Names in the body resolve against the body itself, the builtins, and the
+call's <code>bindings</code>/<code>env</code> keys, so an unbound <code>$name</code> or a helper that exists
+only in the calling file is reported. A body it cannot read — any other
+variable, a concatenation, an interpolated string, a <code>read_file</code>, or a
+literal that does not parse — is reported as <strong><code>MIX-D3012</code></strong> rather than
+passing silently. Prefer a literal and the <a href="/mix/remote#options-map"><code>bindings</code></a>
+option over interpolation: it is both safer (no injection through string
+building) and the only form lint can check. See
+<a href="/mix/lint#remote-bodies--lint-sees-inside-ssh_mix-0690">lint</a>.</p>
 </blockquote>
 <pre><code class="language-mix">$r = ssh_mix("node1",
              "print(data_encode({host: hostname(), kernel: trim(run(\"uname -r\"))}))",

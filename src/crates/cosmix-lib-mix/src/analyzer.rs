@@ -95,12 +95,14 @@ pub struct AnalyzerConfig {
     pub allow_functions: Vec<String>,
     /// Suppress every undefined-NAME check, as a `source`/`include` does.
     ///
-    /// Set only for the nested analysis of an `ssh_mix` remote body
-    /// (v0.69.0). That body is a separate program whose free names come
-    /// from `ssh_mix`'s `bindings` option and from the remote's own
-    /// environment — neither visible here — so name resolution against the
-    /// inner file's universe would be pure noise. Reuses the existing
-    /// `dynamic` suppression rather than inventing a second switch.
+    /// Set for the nested analysis of an `ssh_mix` remote body whose
+    /// injected names cannot be read statically. Such a body's free names
+    /// come from `ssh_mix`'s `bindings`/`env` options; when those are map
+    /// literals their keys are passed as `allow_globals` and name checks
+    /// run, and when they are not (an opts VARIABLE) resolution would be
+    /// pure noise, so it is switched off. Reuses the existing `dynamic`
+    /// suppression rather than inventing a second switch. An embedder that
+    /// sets it also skips `ssh_mix` body analysis, as before.
     pub suppress_name_checks: bool,
     /// The file's SOURCE text, when the caller has it (0.90.0).
     ///
@@ -365,6 +367,18 @@ fn has_dynamic_include(stmts: &[Stmt]) -> (bool, Option<usize>) {
 
 /// The whole-file analyzer entry point.
 pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Analysis {
+    analyze_at(stmts, file, cfg, false)
+}
+
+/// [`analyze`], told whether `stmts` is itself an `ssh_mix` remote body.
+/// A body's own `ssh_mix` calls are not descended into: the one-level
+/// guard that keeps a body nested in a body from being re-analysed.
+fn analyze_at(
+    stmts: &[Stmt],
+    file: Option<&str>,
+    cfg: &AnalyzerConfig,
+    remote_body: bool,
+) -> Analysis {
     let mut a = Analysis::default();
     let ctx = FileContext::build(stmts, file, cfg);
 
@@ -406,10 +420,10 @@ pub fn analyze(stmts: &[Stmt], file: Option<&str>, cfg: &AnalyzerConfig) -> Anal
     check_recurring_silent_bugs(stmts, &ctx, &mut a);
     check_string_literal_spelling(stmts, &ctx, &mut a, cfg);
     check_release_transition_advisories(stmts, &ctx, &mut a);
-    // Guarded against unbounded recursion: a remote body may itself contain
-    // an `ssh_mix`, and nothing stops that nesting from being circular
-    // through a shared literal.
-    if !cfg.suppress_name_checks {
+    // A remote body may itself contain an `ssh_mix`; its body is analysed
+    // one level deep only (see `analyze_at`). `suppress_name_checks` from
+    // an embedder keeps its pre-existing meaning of "skip bodies too".
+    if !remote_body && !cfg.suppress_name_checks {
         check_ssh_mix_bodies(stmts, &ctx, &mut a, cfg);
     }
     collect_capabilities(stmts, &mut a);
@@ -602,6 +616,10 @@ struct FileContext {
     user_fn_arity: HashMap<String, (usize, usize)>,
     /// Undefined-name checks suppressed (dynamic include present).
     dynamic: bool,
+    /// String nodes shipped as `ssh_mix` bodies (by [`node_id`]) → the
+    /// names that are the remote program's own; MIX-W2402 stays silent
+    /// for those (see [`remote_body_names`]).
+    remote_body_names: HashMap<usize, HashSet<String>>,
 }
 
 impl FileContext {
@@ -654,6 +672,7 @@ impl FileContext {
             known_callables,
             user_fn_arity,
             dynamic,
+            remote_body_names: remote_body_names(stmts),
         }
     }
 }
@@ -1212,12 +1231,13 @@ fn check_expr(
 ) {
     match expr {
         Expr::Heredoc(parts) => {
+            let remote_own = ctx.remote_body_names.get(&node_id(expr));
             for part in parts {
                 let StringPart::Literal(literal) = part else {
                     continue;
                 };
                 for name in bare_heredoc_vars(literal) {
-                    if names.contains(name) {
+                    if names.contains(name) && !remote_own.is_some_and(|own| own.contains(name)) {
                         a.diagnostics.push(diag(
                             ctx,
                             "MIX-W2402",
@@ -1264,15 +1284,25 @@ fn check_expr(
                 && !ctx.known_callables.contains(name)
                 && !names.contains(name)
             {
+                // The runtime's own suggester, so lint — where an agent
+                // looks first — gives the answer the failing run would.
+                // Sorted so the lexical tie-break is deterministic.
+                let mut user_fns: Vec<&str> =
+                    ctx.known_callables.iter().map(String::as_str).collect();
+                user_fns.sort_unstable();
+                let fallback =
+                    format!("define it, or pass --allow-function {name} if an embedder provides it");
+                let hint = match function_suggestion(name, user_fns) {
+                    Some(s) => format!("{s} (otherwise {fallback})"),
+                    None => fallback,
+                };
                 a.diagnostics.push(diag(
                     ctx,
                     "MIX-E1102",
                     Severity::Error,
                     line,
                     format!("undefined function '{name}' (defined nowhere in this file)"),
-                    Some(format!(
-                        "define it, or pass --allow-function {name} if an embedder provides it"
-                    )),
+                    Some(hint),
                 ));
             }
             // E1201: builtin contract arity (exact-arity sets honored).
@@ -2015,82 +2045,367 @@ fn check_release_transition_advisories(stmts: &[Stmt], ctx: &FileContext, a: &mu
 /// TWO RULES, and the second matters more than the first:
 ///
 /// 1. A **literal** body is parsed and analysed, and its diagnostics are
-///    reported against the enclosing file at mapped line numbers.
-/// 2. A **non-literal** body — a variable, a concatenation, a `read_file`
-///    — cannot be analysed, and is REPORTED as unanalysable (MIX-D3012)
-///    rather than passing silently. An invisible gap counted as clean is
-///    what produced the 0.68.0 near-miss; a visible one is worth more than
-///    the analysis it replaces.
+///    reported against the enclosing file at mapped line numbers. Literal
+///    means a plain string, an all-literal heredoc (inline, as the manual's
+///    headline idiom writes it), or a variable whose SOLE binding anywhere
+///    in the file is one of those (see [`sole_string_definitions`]).
+/// 2. A **non-literal** body — any other variable, a concatenation, a
+///    `read_file`, a `${…}` interpolation — cannot be analysed, and is
+///    REPORTED as unanalysable (MIX-D3012) rather than passing silently. An
+///    invisible gap counted as clean is what produced the 0.68.0 near-miss;
+///    a visible one is worth more than the analysis it replaces.
 ///
-/// Name resolution is suppressed inside the body (`suppress_name_checks`),
-/// because its free names come from `ssh_mix`'s `bindings` option and the
-/// remote environment. Neither is visible here, so every undefined-name
-/// finding would be noise — and a linter that cries wolf about remote
-/// bodies gets switched off.
+/// NAME RESOLUTION inside the body runs against the body itself, the
+/// builtins, and the names the call injects — its `bindings` keys and its
+/// `env` keys, both prepended to the shipped source as assignments. When
+/// those cannot be read statically (the opts argument is not a map literal)
+/// name checks are suppressed for that body instead, because a linter that
+/// cries wolf about remote bodies gets switched off.
+///
+/// Every `ssh_mix` call is found, at any depth — the loop-over-hosts shape
+/// puts the call inside a `for`, and the 0.69.0 pass searched only
+/// top-level statements, so exactly that shape went unlinted.
 fn check_ssh_mix_bodies(
     stmts: &[Stmt],
     ctx: &FileContext,
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
 ) {
-    fn visit_expr(
-        expr: &Expr,
-        line: usize,
-        ctx: &FileContext,
-        a: &mut Analysis,
-        cfg: &AnalyzerConfig,
-    ) {
-        if let Expr::FunctionCall { name, args } = expr
-            && name == "ssh_mix"
-        {
-            match args.get(1) {
-                Some(Expr::StringLiteral(src) | Expr::EscapedQuoteStringLiteral(src)) => {
-                    analyse_remote_body(src, line, ctx, a, cfg);
+    // One heredoc bound once and shipped by several calls with the same
+    // injected names would otherwise report every finding once per call.
+    let mut analysed: HashSet<(usize, Option<Vec<String>>)> = HashSet::new();
+    for site in collect_remote_sites(stmts) {
+        match site.body {
+            RemoteBody::Literal {
+                src,
+                first_line,
+                origin,
+            } => {
+                let key = site.injected.as_ref().map(|names| {
+                    let mut v: Vec<String> = names.iter().cloned().collect();
+                    v.sort_unstable();
+                    v
+                });
+                if analysed.insert((origin, key)) {
+                    analyse_remote_body(&src, first_line, site.injected.as_ref(), ctx, a, cfg);
                 }
-                // An INTERPOLATED body is only partly knowable: the literal
-                // segments are Mix source but the substitutions are not, so
-                // parsing it would report errors that are artefacts of the
-                // holes. Treated as unanalysable, like any other non-literal.
-                Some(_) => a.diagnostics.push(diag(
-                    ctx,
-                    "MIX-D3012",
-                    Severity::Note,
-                    line,
-                    "ssh_mix body is not a string literal — its Mix source cannot be \
-                     analysed, so lint findings and inventory counts EXCLUDE it"
-                        .to_string(),
-                    Some(
-                        "pass the remote program as a plain single-quoted literal to make \
-                         it lintable; use the `bindings` option instead of interpolation \
-                         to inject values"
-                            .to_string(),
-                    ),
-                )),
-                None => {}
             }
+            RemoteBody::Interpolated { locals, .. } => a.diagnostics.push(diag(
+                ctx,
+                "MIX-D3012",
+                Severity::Note,
+                site.line,
+                format!(
+                    "ssh_mix body interpolates {} LOCALLY before it ships — it is not a \
+                     literal, so its Mix source was NOT analysed",
+                    locals.join(", ")
+                ),
+                Some(
+                    "pass local values through the `bindings` option and write them bare \
+                     (`$name`) in the body; `${name}` splices the LOCAL value into the remote \
+                     source text"
+                        .to_string(),
+                ),
+            )),
+            RemoteBody::Opaque => a.diagnostics.push(diag(
+                ctx,
+                "MIX-D3012",
+                Severity::Note,
+                site.line,
+                "ssh_mix body is not a string literal — its Mix source cannot be \
+                 analysed, so lint findings and inventory counts EXCLUDE it"
+                    .to_string(),
+                Some(
+                    "pass the remote program as a literal — a single-quoted string or a \
+                     heredoc, inline or assigned ONCE to a variable — and use the `bindings` \
+                     option instead of interpolation to inject values"
+                        .to_string(),
+                ),
+            )),
         }
-    }
-
-    for stmt in stmts {
-        let line = stmt.line;
-        walk_stmt_exprs(stmt, &mut |expr| visit_expr(expr, line, ctx, a, cfg));
     }
 }
 
-/// Parse + analyse one literal remote body and fold its diagnostics into
-/// the enclosing file's, with lines mapped.
+/// What lint can know about one `ssh_mix` body.
+#[derive(Clone)]
+enum RemoteBody {
+    /// The exact source that ships. Inner line N is outer line
+    /// `first_line + N - 1`; `origin` identifies the literal's AST node
+    /// (see [`node_id`]) so a heredoc shared by several calls is analysed
+    /// once, and so MIX-W2402 can recognise it as a remote body.
+    Literal {
+        src: String,
+        first_line: usize,
+        origin: usize,
+    },
+    /// A string or heredoc with local `${…}`/`$(…)`/`~` substitutions —
+    /// `locals` names them, spelled as written.
+    Interpolated { locals: Vec<String>, origin: usize },
+    /// Anything else: an unresolvable variable, a call, a concatenation.
+    Opaque,
+}
+
+/// One `ssh_mix(host, body[, opts])` call.
+struct RemoteSite {
+    /// The enclosing statement's line.
+    line: usize,
+    body: RemoteBody,
+    /// Names the call injects into the remote program, or `None` when they
+    /// cannot be read statically (see [`remote_injected_names`]).
+    injected: Option<HashSet<String>>,
+}
+
+/// Stable identity of an AST node for the life of one analysis. The
+/// statement tree is borrowed immutably throughout, so an address found by
+/// one pass is the same node another pass visits.
+fn node_id(expr: &Expr) -> usize {
+    std::ptr::from_ref(expr) as usize
+}
+
+/// The body shape of a string-valued expression, or `None` if it is not
+/// a string at all. `line` is the line of the statement holding `expr`.
+fn body_shape(expr: &Expr, line: usize) -> Option<RemoteBody> {
+    let origin = node_id(expr);
+    let (parts, first_line) = match expr {
+        Expr::StringLiteral(src) | Expr::EscapedQuoteStringLiteral(src) => {
+            return Some(RemoteBody::Literal {
+                src: src.clone(),
+                first_line: line,
+                origin,
+            });
+        }
+        // A heredoc's text starts on the line AFTER its `<<TAG` opener,
+        // which is the statement's own line in every shape the manual
+        // shows (`$p = <<END`, `ssh_mix("h", <<EOF`).
+        Expr::Heredoc(parts) => (parts, line + 1),
+        Expr::InterpolatedString(parts) => (parts, line),
+        _ => return None,
+    };
+    let mut src = String::new();
+    let mut locals = Vec::new();
+    for part in parts {
+        match part {
+            StringPart::Literal(s) => src.push_str(s),
+            StringPart::Variable(n) => locals.push(format!("`${{{n}}}`")),
+            StringPart::CommandSub(c) => locals.push(format!("`$({c})`")),
+            StringPart::EnvVar(n) => locals.push(format!("`~` (${n})")),
+        }
+    }
+    Some(if locals.is_empty() {
+        RemoteBody::Literal {
+            src,
+            first_line,
+            origin,
+        }
+    } else {
+        RemoteBody::Interpolated { locals, origin }
+    })
+}
+
+/// Names an `ssh_mix` call injects into its remote program: the keys of
+/// its `bindings` map (prepended as `$name = value` assignments) and of its
+/// `env` map (prepended as `export KEY = "value"` lines). Both are
+/// assignments in the program that actually runs, so both are bound names
+/// of the body.
 ///
-/// LINE MAPPING: inner line N reports at `stmt_line + N - 1`. That is exact
-/// for the universal shape — `$x = ssh_mix($HOST, '` with the opening quote
-/// on the statement's first line, so the literal's line 1 IS the statement
-/// line. A body opened further down a multi-line call reports offset by the
-/// same amount for every diagnostic, which still points into the right
-/// region; nothing here silently claims a precision it does not have, and
-/// the alternative (threading source text and re-locating the literal)
-/// buys exactness only for a shape that does not occur.
+/// `None` when that set cannot be known statically — an opts argument that
+/// is not a map literal, or a `bindings`/`env` value that is not one.
+fn remote_injected_names(opts: Option<&Expr>) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
+    let Some(opts) = opts else {
+        return Some(out);
+    };
+    let Expr::MapLiteral(entries) = opts else {
+        return None;
+    };
+    for (key, value) in entries {
+        if key == "bindings" || key == "env" {
+            let Expr::MapLiteral(inner) = value else {
+                return None;
+            };
+            out.extend(inner.iter().map(|(k, _)| k.clone()));
+        }
+    }
+    Some(out)
+}
+
+/// How many times each name is bound anywhere in the file — every binder
+/// kind [`collect_bound_names`] knows, at every depth including function
+/// and lambda bodies, plus function and lambda PARAMETERS. Deliberately
+/// scope-blind: a name bound in two different functions counts twice, so
+/// "bound exactly once" is a conservative, never an optimistic, claim.
+fn binder_counts(stmts: &[Stmt]) -> HashMap<String, usize> {
+    fn lambda_params(expr: &Expr, out: &mut Vec<String>) {
+        if let Expr::FunctionLiteral { params, body } = expr {
+            for p in params {
+                out.push(p.name.clone());
+                if let Some(d) = &p.default {
+                    lambda_params(d, out);
+                }
+            }
+            // Block bodies are statements, which walk_stmts reaches.
+            if let FunctionBody::Expression(e) = &**body {
+                lambda_params(e, out);
+            }
+        }
+        walk_expr_children(expr, &mut |c| lambda_params(c, out));
+    }
+    let mut names: Vec<String> = Vec::new();
+    walk_stmts(stmts, &mut |stmt| {
+        match &stmt.kind {
+            StmtKind::Assignment { name, .. }
+            | StmtKind::Export { name, .. }
+            | StmtKind::FieldAssignment { object: name, .. }
+            | StmtKind::IndexAssignment { object: name, .. }
+            | StmtKind::PathAssignment { root: name, .. } => names.push(name.clone()),
+            StmtKind::For { var, .. } => names.push(var.clone()),
+            StmtKind::ForEach { var, index_var, .. } => {
+                names.push(var.clone());
+                names.extend(index_var.iter().cloned());
+            }
+            StmtKind::TryCatch { catch: Some(c), .. } => {
+                names.push(c.var.clone());
+                names.extend(c.err_var.iter().cloned());
+            }
+            StmtKind::Parse { parts, .. } => {
+                for part in parts {
+                    if let crate::ast::ParsePart::Variable(name) = part {
+                        names.push(name.clone());
+                    }
+                }
+            }
+            StmtKind::FunctionDef { params, .. } => {
+                names.extend(params.iter().map(|p| p.name.clone()));
+            }
+            _ => {}
+        }
+        walk_stmt_exprs(stmt, &mut |e| lambda_params(e, &mut names));
+    });
+    let mut counts = HashMap::new();
+    for n in names {
+        *counts.entry(n).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Variables whose SOLE binding in the whole file is an assignment of a
+/// string literal or heredoc — the manual's own idiom binds the remote
+/// program once (`$probe = <<END … END`) and ships it from a loop over
+/// hosts, and a heredoc cannot sit inline in an argument list without
+/// losing that shape.
+///
+/// "Sole" is the straight-line guarantee the proven-value facts rely on,
+/// made stronger: not merely "no reassignment between here and the use",
+/// but no other binder of that name ANYWHERE — so the value at every read
+/// is the one literal, whatever the control flow. A `source`/`include`
+/// can bind anything, so a file with one resolves nothing.
+fn sole_string_definitions(stmts: &[Stmt]) -> HashMap<String, RemoteBody> {
+    let mut out = HashMap::new();
+    if has_dynamic_include(stmts).0 {
+        return out;
+    }
+    let counts = binder_counts(stmts);
+    walk_stmts(stmts, &mut |stmt| {
+        if let StmtKind::Assignment { name, value } | StmtKind::Export { name, value } = &stmt.kind
+            && counts.get(name) == Some(&1)
+            && let Some(shape) = body_shape(value, stmt.line)
+        {
+            out.insert(name.clone(), shape);
+        }
+    });
+    out
+}
+
+/// Every `ssh_mix` call in the file, at any depth, with what lint can know
+/// about its body and its injected names.
+fn collect_remote_sites(stmts: &[Stmt]) -> Vec<RemoteSite> {
+    fn visit(
+        expr: &Expr,
+        line: usize,
+        sole: &HashMap<String, RemoteBody>,
+        sites: &mut Vec<RemoteSite>,
+    ) {
+        if let Expr::FunctionCall { name, args } = expr
+            && name == "ssh_mix"
+            && let Some(body) = args.get(1)
+        {
+            let body = match body {
+                Expr::Variable(v) => sole.get(v).cloned().unwrap_or(RemoteBody::Opaque),
+                other => body_shape(other, line).unwrap_or(RemoteBody::Opaque),
+            };
+            sites.push(RemoteSite {
+                line,
+                body,
+                injected: remote_injected_names(args.get(2)),
+            });
+        }
+        // An expression-bodied lambda (`fn($h) => ssh_mix($h, $p)`) is not
+        // a statement list, so walk_stmts cannot reach it; block bodies it
+        // does reach.
+        if let Expr::FunctionLiteral { body, .. } = expr
+            && let FunctionBody::Expression(e) = &**body
+        {
+            visit(e, line, sole, sites);
+        }
+        walk_expr_children(expr, &mut |c| visit(c, line, sole, sites));
+    }
+    let sole = sole_string_definitions(stmts);
+    let mut sites = Vec::new();
+    walk_stmts(stmts, &mut |stmt| {
+        walk_stmt_exprs(stmt, &mut |e| visit(e, stmt.line, &sole, &mut sites));
+    });
+    sites
+}
+
+/// For every string node that ships as an `ssh_mix` body: the names that
+/// are the REMOTE program's own — its injected `bindings`/`env` keys, and
+/// for a literal body also what it binds itself plus the runtime-injected
+/// names. A bare `$name` for one of these in a heredoc body is remote Mix
+/// code, correctly bare, so MIX-W2402 ("did you mean `${name}`?") must not
+/// fire for it: following that advice would splice the LOCAL value in, the
+/// classic bug. Names outside the set still warn.
+fn remote_body_names(stmts: &[Stmt]) -> HashMap<usize, HashSet<String>> {
+    let mut out: HashMap<usize, HashSet<String>> = HashMap::new();
+    for site in collect_remote_sites(stmts) {
+        let (origin, own) = match &site.body {
+            RemoteBody::Literal { src, origin, .. } => {
+                let mut own = HashSet::new();
+                let mut lexer = crate::lexer::Lexer::new(src);
+                if let Ok(tokens) = lexer.tokenize()
+                    && let Ok(inner) = crate::parser::Parser::new(tokens, src).parse_program()
+                {
+                    collect_bound_names(&inner, false, &mut own);
+                    own.extend(INJECTED_VARS.iter().map(|v| (*v).to_string()));
+                }
+                (*origin, own)
+            }
+            RemoteBody::Interpolated { origin, .. } => (*origin, HashSet::new()),
+            RemoteBody::Opaque => continue,
+        };
+        let entry = out.entry(origin).or_default();
+        entry.extend(own);
+        entry.extend(site.injected.into_iter().flatten());
+    }
+    out
+}
+
+/// Parse + analyse one literal remote body and fold its diagnostics into
+/// the enclosing file's, with lines mapped: inner line N reports at
+/// `first_line + N - 1`.
+///
+/// That is exact for the universal shapes — `$x = ssh_mix($HOST, '` with
+/// the opening quote on the statement's first line, and a heredoc whose
+/// `<<TAG` opener ends its statement's first line. A body opened further
+/// down a multi-line call reports offset by the same amount for every
+/// diagnostic, which still points into the right region; nothing here
+/// silently claims a precision it does not have.
+///
+/// `injected` is the call's static `bindings`/`env` key set; `None` (not
+/// knowable) suppresses the body's undefined-name checks instead.
 fn analyse_remote_body(
     src: &str,
-    stmt_line: usize,
+    first_line: usize,
+    injected: Option<&HashSet<String>>,
     ctx: &FileContext,
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
@@ -2101,25 +2416,27 @@ fn analyse_remote_body(
         // A body that does not LEX is reported, not swallowed: the remote
         // would fail the same way, and silence here is the failure mode
         // this whole pass exists to remove.
-        Err(e) => return push_unparsable(a, ctx, stmt_line, &e.to_string()),
+        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string()),
     };
     let inner = match crate::parser::Parser::new(tokens, src).parse_program() {
         Ok(s) => s,
-        Err(e) => return push_unparsable(a, ctx, stmt_line, &e.to_string()),
+        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string()),
     };
+    let mut allow_globals = cfg.allow_globals.clone();
+    allow_globals.extend(injected.into_iter().flatten().cloned());
     let inner_cfg = AnalyzerConfig {
-        allow_globals: cfg.allow_globals.clone(),
+        allow_globals,
         allow_functions: cfg.allow_functions.clone(),
-        suppress_name_checks: true,
+        suppress_name_checks: injected.is_none(),
         // The BODY's own text, never the enclosing file's — the spelling
         // rules must read the source they are reporting lines against.
         // Lint is the only gate this remote program ever passes through.
         source: Some(src.to_string()),
     };
-    let nested = analyze(&inner, None, &inner_cfg);
+    let nested = analyze_at(&inner, None, &inner_cfg, true);
     for mut d in nested.diagnostics {
         d.file.clone_from(&ctx.file);
-        d.line = Some(stmt_line + d.line.unwrap_or(1).saturating_sub(1));
+        d.line = Some(first_line + d.line.unwrap_or(1).saturating_sub(1));
         d.message = format!("[inside ssh_mix body] {}", d.message);
         a.diagnostics.push(d);
     }
@@ -2573,24 +2890,76 @@ pub(crate) fn edit_distance(left: &str, right: &str) -> usize {
     row[right_chars.len()]
 }
 
-/// Runtime "did you mean" for an undefined function call — the suffix the
-/// evaluator appends to a FUNCTION_UNDEFINED message. Two sources, in order:
+/// Foreign-language function names → the Mix builtin that does that job.
+///
+/// Edit distance answers "what is SPELLED like this", which is the wrong
+/// question for a name an agent imported from python/bash/JS: the edit
+/// neighbour of `json_decode` is `json_encode`, the exact opposite of the
+/// `json_parse` it meant (probed 2026-09-18, filed in TODO-mix), and `str`,
+/// `trim_end`, `json_loads` and `len_bytes` had no neighbour at all. This
+/// table is consulted BEFORE edit distance, by lint's MIX-E1102 hint and the
+/// runtime's FUNCTION_UNDEFINED suffix alike, so both give the same answer.
+///
+/// Grow it from every E1102 an agent hits. Two invariants, both tested: every
+/// target is a live builtin, and no foreign name is one (a name that exists
+/// can never be undefined, so its row would be dead and misleading).
+pub(crate) const FOREIGN_FUNCTION_SYNONYMS: &[(&str, &str)] = &[
+    ("json_decode", "json_parse"),
+    ("json_loads", "json_parse"),
+    ("json_load", "json_parse"),
+    ("json_dumps", "json_encode"),
+    ("json_dump", "json_encode"),
+    ("json_stringify", "json_encode"),
+    ("str", "to_string"),
+    ("tostring", "to_string"),
+    ("int", "to_number"),
+    ("float", "to_number"),
+    ("parse_int", "to_number"),
+    ("parse_float", "to_number"),
+    ("trim_end", "rtrim"),
+    ("rstrip", "rtrim"),
+    ("trim_start", "ltrim"),
+    ("lstrip", "ltrim"),
+    ("strlen", "length"),
+    ("len_bytes", "byte_length"),
+    ("byte_len", "byte_length"),
+    ("tolower", "lower"),
+    ("lowercase", "lower"),
+    ("toupper", "upper"),
+    ("uppercase", "upper"),
+    ("getenv", "env"),
+    ("file_exists", "exists"),
+];
+
+/// The "did you mean" for an undefined function, WITHOUT framing — shared by
+/// the runtime ([`undefined_function_hint`]) and lint's MIX-E1102 hint, so the
+/// two can never disagree about the same name. Three sources, in order:
 ///
 ///   1. The shared deleted/renamed table (`DEPRECATED_REGEX_CALLS`, which also
 ///      drives lint D3001–D3005). A straggler that survives lint — an
 ///      extensionless shebang script, a string built at runtime — hits the
 ///      SAME rename pointer here, at the point it actually fails.
-///   2. Nearest live name (builtin or in-scope user function) within an edit
-///      distance that tightens for short names (≤1 for ≤4 chars, else ≤2), so
-///      `lenght`→`length` is caught but two unrelated 3-letter names are not.
+///   2. [`FOREIGN_FUNCTION_SYNONYMS`] — the semantic answer, which beats a
+///      closer lexical neighbour (`json_decode` → `json_parse`, not
+///      `json_encode`).
+///   3. Nearest live name (builtin, HOF, or a caller-supplied user function)
+///      within an edit distance that tightens for short names (≤1 for ≤4
+///      chars, else ≤2), so `lenght`→`length` is caught but two unrelated
+///      3-letter names are not.
 ///
-/// Returns `None` when nothing is close enough — a bare `FUNCTION_UNDEFINED`
-/// with no misleading guess is better than a wrong "did you mean".
-pub(crate) fn undefined_function_hint(name: &str, user_fns: &HashSet<String>) -> Option<String> {
+/// Returns `None` when nothing is close enough — no misleading guess is
+/// better than a wrong "did you mean".
+pub(crate) fn function_suggestion<'a>(
+    name: &str,
+    user_fns: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
     if let Some((_, _, replacement)) =
         DEPRECATED_REGEX_CALLS.iter().find(|(n, _, _)| *n == name)
     {
-        return Some(format!(" — deleted in mix 0.73.0; use {replacement}"));
+        return Some(format!("deleted in mix 0.73.0; use {replacement}"));
+    }
+    if let Some((_, target)) = FOREIGN_FUNCTION_SYNONYMS.iter().find(|(n, _)| *n == name) {
+        return Some(format!("did you mean '{target}'?"));
     }
     let threshold = if name.chars().count() <= 4 { 1 } else { 2 };
     let mut best: Option<(usize, String)> = None;
@@ -2601,17 +2970,28 @@ pub(crate) fn undefined_function_hint(name: &str, user_fns: &HashSet<String>) ->
         .iter()
         .copied()
         .chain(crate::builtins_hof::HOF_NAMES.iter().copied())
-        .chain(user_fns.iter().map(|f| f.as_str()));
+        .chain(user_fns);
     for cand in candidates {
         let d = edit_distance(name, cand);
         if d == 0 || d > threshold {
             continue;
         }
+        // Strictly-better only, so ties keep the FIRST candidate — builtins
+        // before user functions, and the builtin table's own order. A
+        // HashSet of user names iterates in arbitrary order, which is why
+        // they come last.
         if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, cand.to_string()));
         }
     }
-    best.map(|(_, cand)| format!(" — did you mean '{cand}'?"))
+    best.map(|(_, cand)| format!("did you mean '{cand}'?"))
+}
+
+/// Runtime "did you mean" for an undefined function call — the suffix the
+/// evaluator appends to a FUNCTION_UNDEFINED message. The answer itself is
+/// [`function_suggestion`], the same one lint's MIX-E1102 prints.
+pub(crate) fn undefined_function_hint(name: &str, user_fns: &HashSet<String>) -> Option<String> {
+    function_suggestion(name, user_fns.iter().map(String::as_str)).map(|s| format!(" — {s}"))
 }
 
 /// Runtime "did you mean" for an undefined `$variable` read — the suffix the
@@ -2994,6 +3374,103 @@ mod instructional_error_tests {
         // Short names tighten to distance 1: two unrelated 3-letter names
         // must not cross-suggest.
         assert_eq!(undefined_variable_hint("abc", &["xyz".to_string()]), None);
+    }
+
+    #[test]
+    fn every_foreign_synonym_points_at_a_live_builtin_and_is_not_one() {
+        for (foreign, target) in FOREIGN_FUNCTION_SYNONYMS {
+            assert!(
+                builtins::builtin_info_of(target).is_some(),
+                "{foreign} -> {target}: target is not a builtin"
+            );
+            // A name that resolves can never be undefined, so its row
+            // would be dead — and would mislead anyone reading the table.
+            assert!(
+                builtins::builtin_info_of(foreign).is_none()
+                    && !crate::builtins_hof::HOF_NAMES.contains(foreign)
+                    && !INLINE_SPECIAL_FORMS.contains(foreign)
+                    && !prelude_function_names().contains(*foreign),
+                "{foreign} resolves already; its synonym row is dead"
+            );
+        }
+    }
+
+    #[test]
+    fn each_foreign_name_maps_to_its_target() {
+        for (foreign, target) in FOREIGN_FUNCTION_SYNONYMS {
+            assert_eq!(
+                undefined_function_hint(foreign, &fns(&[])),
+                Some(format!(" — did you mean '{target}'?")),
+                "{foreign}"
+            );
+        }
+        // The names the 2026-09-18 probe found with NO suggestion at all.
+        for (foreign, target) in [
+            ("str", "to_string"),
+            ("trim_end", "rtrim"),
+            ("json_loads", "json_parse"),
+            ("len_bytes", "byte_length"),
+        ] {
+            assert_eq!(
+                function_suggestion(foreign, std::iter::empty()),
+                Some(format!("did you mean '{target}'?"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_synonym_beats_a_closer_lexical_neighbour() {
+        // `json_encode` is ONE edit from `json_decode` and is its opposite.
+        assert_eq!(edit_distance("json_decode", "json_encode"), 1);
+        assert_eq!(
+            undefined_function_hint("json_decode", &fns(&[])),
+            Some(" — did you mean 'json_parse'?".to_string())
+        );
+        // Even a user function one edit away loses to the table.
+        assert_eq!(
+            undefined_function_hint("json_decode", &fns(&["json_decodr"])),
+            Some(" — did you mean 'json_parse'?".to_string())
+        );
+    }
+
+    fn e1102_hint(src: &str) -> Option<String> {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().unwrap();
+        let stmts = crate::parser::Parser::new(tokens, src)
+            .parse_program()
+            .unwrap();
+        analyze(&stmts, None, &AnalyzerConfig::default())
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "MIX-E1102")
+            .and_then(|d| d.hint)
+    }
+
+    #[test]
+    fn lint_e1102_prints_the_runtime_suggestion() {
+        // Same answer, same source of truth: the runtime suffix minus its
+        // " — " framing must appear verbatim in the lint hint — for a
+        // synonym, a lexical typo, a deleted name, and a user function.
+        for (src, name, user) in [
+            ("json_decode(\"{}\")\n", "json_decode", vec![]),
+            ("print(lenght(\"ab\"))\n", "lenght", vec![]),
+            ("print(regex_match(\"^a\", \"abc\"))\n", "regex_match", vec![]),
+            (
+                "fn greet($n)\n  return $n\nend\nprint(greeet(1))\n",
+                "greeet",
+                vec!["greet"],
+            ),
+        ] {
+            let runtime = undefined_function_hint(name, &fns(&user)).expect("runtime suggests");
+            let hint = e1102_hint(src).expect("E1102 fires with a hint");
+            let answer = runtime.trim_start_matches(" — ");
+            assert!(hint.starts_with(answer), "{name}: lint {hint:?} vs runtime {runtime:?}");
+            assert!(hint.contains("--allow-function"), "fallback advice kept: {hint}");
+        }
+        // Nothing close: the plain advice, no invented guess.
+        assert_eq!(
+            e1102_hint("xyzzy_qw(1)\n").as_deref(),
+            Some("define it, or pass --allow-function xyzzy_qw if an embedder provides it")
+        );
     }
 
     #[test]

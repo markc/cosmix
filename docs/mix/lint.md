@@ -85,7 +85,7 @@ move, since a code's letter fixes its severity permanently. It is now
   script (`MIX-E1002`). A valid data file under any filename is recognised by
   content; the suffix is only a tiebreak when neither grammar succeeds.
 - **MIX-E1101** flags a `$name` read only when the name is bound **nowhere in its visible universe** — function bodies see params + their own binders + everything bound anywhere at file level (Mix has no block scoping and no read-before-assign rule, so lexical order is deliberately ignored). `${name}` interpolation is never flagged (it falls back to the process environment), nor are `$1`-style positionals or the runtime-injected `rc` / `result` / `status` / `event` / `_`.
-- **MIX-E1102** resolves bareword calls against builtins, HOFs, evaluator special forms, every `function` definition in the file, the embedded prelude, `--allow-function` names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside `address ... end` blocks are sends and are never flagged; `MethodCall`/`ValueCall` are dynamic dispatch and are skipped.
+- **MIX-E1102** resolves bareword calls against builtins, HOFs, evaluator special forms, every `function` definition in the file, the embedded prelude, `--allow-function` names, AND any assigned variable (a bareword call can dispatch to a function-valued variable). Calls inside `address ... end` blocks are sends and are never flagged; `MethodCall`/`ValueCall` are dynamic dispatch and are skipped. The hint carries the **same "did you mean" the runtime prints** for that name. One suggester serves both, so lint (where an agent looks first) and the failing run cannot disagree. It checks, in order: the deleted-name pointers (`regex_match` → `re_match(s, pattern)`), then a **foreign-name synonym table** for the names a python/bash/JS habit reaches for first (`json_decode`/`json_loads` → `json_parse`, `json_dumps` → `json_encode`, `str` → `to_string`, `trim_end`/`rstrip` → `rtrim`, `len_bytes` → `byte_length`, `getenv` → `env`, …), and only then edit distance. The order matters: `json_encode` is one edit from `json_decode` and means the opposite.
 - **MIX-E1201** checks calls against the structured contract metadata (`mix builtins --json`), including non-contiguous exact-arity sets — `random(1)` is an error, `random()`/`random(min, max)` are not. The contract is the documented surface; some older builtins tolerate surplus arguments at runtime, and lint is deliberately stricter (`mix --strict-arity` makes the runtime agree).
 - **MIX-E1501** flags a discarded `push`/`pop`/`shift` whose first argument is **not a bare variable** — `push($m["a"], $v)`, `push($m.a, $v)`, `$m["a"].push($v)`. These builtins mutate through the variable slot, so given any other expression they append to a temporary copy and the write is **lost in silence**. It is an ERROR, not a warning: the statement does nothing while reading as though it did. The fix **differs by builtin**: `push` returns the appended list, so assign it back (`$m["a"] = push($m["a"], $v)`); `pop`/`shift` return the **removed element**, not the list, so assigning that back replaces the list with the element (data corruption) — hoist first instead (`$l = $m[$k]; $x = pop($l); $m[$k] = $l`). For maps of maps, write the [nested assignment](collections.md) directly. A by-value **parameter** is a bare variable, so that case stays with its own definition-time dead-push warning and is not double-reported.
 - **MIX-E1502** flags a discarded `delete` / `merge` — both are **pure** (they return a new container and change nothing in place), so a bare call is a no-op. Assign it back: `$m = delete($m, "k")`.
@@ -146,7 +146,7 @@ move, since a code's letter fixes its severity permanently. It is now
   Simple command strings, computed commands, `ssh_exec`, `ssh_mix`, and
   single-quoted strings containing ordinary `"` stay quiet.
 - **MIX-W2401**: one `source`/`include` anywhere disables the undefined-name checks for the whole file (the loaded file can define anything) — reported once so you know analysis is degraded. Prefer `require()`: it is isolated, statically resolvable, and E1401/E1402 verify literal-path modules parse.
-- **MIX-W2402** warns when a heredoc literal contains bare `$NAME` and `NAME` is bound somewhere in the same visible universe. Heredocs interpolate `${NAME}`, not `$NAME`, so the bare form often means a generated config was silently corrupted. It does not fire for `${NAME}`, `$(` command substitution, explicitly escaped `\$NAME`, all-digit names such as `$1`, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare `$NAME` still evaluates to literal `$NAME`, and intentional literal output requires no change.
+- **MIX-W2402** warns when a heredoc literal contains bare `$NAME` and `NAME` is bound somewhere in the same visible universe. Heredocs interpolate `${NAME}`, not `$NAME`, so the bare form often means a generated config was silently corrupted. It does not fire for `${NAME}`, `$(` command substitution, explicitly escaped `\$NAME`, all-digit names such as `$1`, unknown names, or ordinary double-quoted strings. The warning is lint-only: bare `$NAME` still evaluates to literal `$NAME`, and intentional literal output requires no change. In a heredoc that ships as an `ssh_mix` body it stays silent for the names the **remote** program owns: the call's `bindings`/`env` keys and whatever the body binds itself. There, bare is exactly right, and `${NAME}` would splice the local value into the remote source. Any other bound name still warns.
 - **MIX-E1303** (0.90.0; was `MIX-W2403` from 0.74.0) errors at the *definition* of a function whose name is a builtin: the builtin wins at every call site (a builtin-named dot-call even desugars at parse time), so the definition is unreachable by name — only an extracted function value or an exports-map index still reaches it. The worst shape this produces is a script that keeps running while its own function quietly stops being called, and every release that adds a builtin name arms it again for older scripts. It was a warning on the theory that a compat shim for an older mix is legitimate authoring; the fleet refuted that — two sites across 785 scripts, neither a shim: one a hand-rolled `ends_with` duplicating the builtin, the other an `fn mix_version()` in a pre-commit hook written to report a *named* interpreter's version and silently answering with the running one's, a live wrong answer that sat behind a warning for sixteen releases. Lint is also the only gate an `ssh_mix` body passes through, and a warning stops nothing by default. The **runtime is unchanged** — the builtin still wins; the fix is to rename. Since 0.91.0 the check also covers the evaluator's inline forms that sit outside the builtin table's dispatch gate — `serve_name`, `printf` and its stdio siblings, and the Bus forms `quit`, `reply`, `subscribe` and the rest — which beat a same-named function just the same: `fn quit() return 1 end; print(quit())` printed `nil` with no diagnostic before. Since 0.92.0 the runtime agrees in operand position too: the binary-operator fast path used to call a user `fn printf` for `printf("B") .. "|"` while a bare `printf("B")` called the builtin; now the builtin wins in both.
 - **MIX-W2405** warns when a double-quoted literal contains a backslash escape the lexer does not recognise, so the backslash is kept: `"isn\x27t"` printed `isn\x27t` and nothing said so, which is how a `replace()` wrote that into a committed journal entry. 0.90.0 added `\xHH` (exactly two hex digits), `\0` and `\a \b \f \v`, so what remains is genuinely unrecognised — including `\x` with fewer than two hex digits and `\'`. A deliberate backslash is `\\`, so the warning has a clean escape. An unbraced `\u` is **exempt**: that literal is documented design (it protects embedded JSON and `C:\users`). Single-quoted strings and heredocs keep their own rules and are not scanned.
 - **MIX-D3015** and **MIX-W2405** ask how a literal was *spelled*, which the token stream deliberately forgets (`'$sp/x'` and `"$sp/x"` lex to the same token). They therefore need the source text: `mix lint` supplies it, and so does the nested analysis of an `ssh_mix` body, but an embedder calling `analyze()` without setting `AnalyzerConfig::source` simply does not get these two rules.
@@ -209,9 +209,29 @@ than by the script analyzer.
 
 [`ssh_mix(host, source[, opts])`](remote.md) ships its **second argument** to
 a remote `mix -`. That argument is Mix source, and since 0.69.0 lint treats it
-as such: when it is a **string literal** it is parsed and analysed, and its
+as such: when it is a **literal** it is parsed and analysed, and its
 diagnostics are reported against the enclosing file with a
 `[inside ssh_mix body]` prefix and the line mapped into the outer file.
+
+A literal is a plain string, an all-literal heredoc written inline (the
+[headline idiom](remote.md#headline-idiom-ssh_mix--heredoc)), or a variable
+whose **sole** binding anywhere in the file is one of those. The last is the
+fleet shape: the program bound once, shipped from a loop over hosts.
+
+```mix
+$probe = <<END
+print(length($base))
+END
+for $h in $hosts do
+  $r = ssh_mix($h, $probe, {bindings: {base: $base}})
+end
+```
+
+"Sole" is strict. A second assignment, a loop variable or a parameter of the
+same name anywhere in the file makes the value unknowable, and the body is
+reported as unanalysable instead. Findings in a bound heredoc point at the
+heredoc's own lines. A heredoc shipped by several calls reports each finding
+once. Calls are found at any depth: in loops, branches, functions and lambdas.
 
 ```
 deploy_thing.mix:283: MIX-D3001 note: [inside ssh_mix body] `regex_match` is
@@ -226,15 +246,25 @@ locally and on 27/27 fleet nodes, while line 283 of that file is a
 two-variable loop over a map living inside such a body.
 
 **A body that cannot be analysed says so** — `MIX-D3012`, for a non-literal
-argument (variable, concatenation, interpolation, `read_file`) or a literal
+argument (a variable not bound once to a literal, concatenation,
+interpolation, `read_file`) or a literal
 that does not parse as Mix. This is the rule that matters more than the
 analysis: an unreadable body silently counted as clean is precisely how an
 inventory reads zero while live sites exist.
 
-**Name resolution is suppressed inside the body.** Its free names come from
-`ssh_mix`'s `bindings` option and from the remote's own environment, neither
-visible locally, so `MIX-E1101`-class findings would be pure noise — and a
-linter that cries wolf about remote bodies gets switched off. The enclosing
+A body interpolating `${name}` is reported by name. That splice puts the
+**local** value into the remote source text, which is the classic remote bug;
+pass the value through `bindings` and write it bare instead.
+
+**Names resolve against the body's own universe.** A remote body is a
+separate program. It sees its own binders, the builtins and prelude, and the
+names the call injects: the keys of `bindings` and of `env`, both prepended to
+the shipped source as assignments. It does **not** see the enclosing file's
+functions or variables. So a bare `$base` passed as a binding is clean, while
+`$notbound`, or a call to a helper defined only in the outer file, is
+`MIX-E1101`/`MIX-E1102` with the body prefix. When the opts argument is not a
+map literal (`ssh_mix($h, $src, $opts)`) the injected names cannot be read,
+and name checks stand down for that body rather than cry wolf. The enclosing
 file keeps all of its own name checks. Everything else — legacy-name notes,
 arity, the truthiness trap — applies normally, and **errors from inside a
 body gate exactly as they would anywhere else**.
