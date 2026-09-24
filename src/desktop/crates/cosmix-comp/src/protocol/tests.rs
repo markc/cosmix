@@ -35380,7 +35380,10 @@ fn release_after_departure_arms_the_conceal_and_the_timer_fires_it() {
         commands.extend(panel_commands(&observations));
     }
     assert_eq!(harness.server.state.observations.conceal_timer_fired, fired + 1, "the timer fired");
-    assert!(released.elapsed() < Duration::from_secs(5), "it woke the loop early");
+    assert!(
+        released.elapsed() < Duration::from_millis(1500),
+        "the timer, not the 5 s dispatch timeout, woke the loop"
+    );
     assert_eq!(commands, [("quoin.panel.3".to_owned(), false)]);
     assert!(released.elapsed() >= Duration::from_millis(700), "after the delay, not before");
     // Chunk 15: the conceal ended a reveal comp commanded, so the one-shot

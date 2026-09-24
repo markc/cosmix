@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::core::{
-    CornerEvent, Edge, LogicalSize, OutputKey, PanelEffect, PanelInput, PanelMode, PanelWake,
-    ShellModel,
+    CornerEvent, Edge, FocusDirective, LogicalSize, OutputKey, PanelEffect, PanelInput, PanelMode,
+    PanelWake, ShellModel,
 };
 
 /// Geometry reported by a renderer/window-system host.
@@ -59,6 +59,8 @@ pub enum ShellCommandKind {
         edge: Edge,
         input: CarouselInput,
     },
+    /// Keyboard focus and the shell's own keys (shell doc §4.3, §5).
+    Keyboard(KeyboardCommand),
     /// Register a sub-panel name on `edge` (panel doc §3). The dispatch
     /// reserved the registry seat transactionally before acking; the Model
     /// stage only fills the carousel slot, without revealing or selecting.
@@ -107,6 +109,19 @@ pub struct ShellEffect {
     pub effect: PanelEffect,
 }
 
+/// Keyboard ingress that is about focus rather than one edge's mode; the
+/// per-edge pin/dock/hide bindings use the precise mode verbs instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyboardCommand {
+    /// Which panel surface now holds the keyboard (`None`: none of them).
+    FocusObserved(Option<Edge>),
+    /// Move focus to the next visible pinned or docked panel, then back to
+    /// the application.
+    CycleFocus,
+    /// Escape reached a focused panel.
+    Escape,
+}
+
 /// Carousel controls shared by pointer, keyboard, and future verb adapters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CarouselInput {
@@ -139,6 +154,10 @@ pub enum PageChange {
 pub enum KeyboardInteractivity {
     None,
     OnDemand,
+    /// Only while the focus cycle has moved the keyboard into this panel:
+    /// a client cannot focus its own layer on demand, so the cycle asks for
+    /// the grab and gives it back on Escape or the next cycle stop.
+    Exclusive,
 }
 
 /// One edge's complete host/chrome presentation state.
@@ -196,10 +215,15 @@ impl ShellFrame {
                 resize_active: panel.resize_active,
                 settled_thickness_px: panel.settled_thickness_px,
                 exclusive_zone_px: panel.exclusive_zone_px,
-                keyboard_interactivity: if panel.mapped {
-                    KeyboardInteractivity::OnDemand
-                } else {
-                    KeyboardInteractivity::None
+                keyboard_interactivity: match model.focus_directive() {
+                    _ if !panel.mapped => KeyboardInteractivity::None,
+                    // Refusing focus on every panel hands it back to the
+                    // application until the host reports it has left.
+                    FocusDirective::Release => KeyboardInteractivity::None,
+                    FocusDirective::Panel(target) if target == edge => {
+                        KeyboardInteractivity::Exclusive
+                    }
+                    _ => KeyboardInteractivity::OnDemand,
                 },
                 page_ids: model.carousel(edge).shared_page_ids(),
                 active_page_id: model.carousel(edge).active_id().map(str::to_owned),

@@ -605,6 +605,9 @@ impl PanelSurface {
                     .set_keyboard_interactivity(match interactivity {
                         ProtocolKeyboardInteractivity::None => KeyboardInteractivity::None,
                         ProtocolKeyboardInteractivity::OnDemand => KeyboardInteractivity::OnDemand,
+                        ProtocolKeyboardInteractivity::Exclusive => {
+                            KeyboardInteractivity::Exclusive
+                        }
                     }),
                 ProtocolOp::CommitBufferless => {
                     layer_surface.commit();
