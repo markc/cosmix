@@ -5030,18 +5030,24 @@ mod tests {
         }
     }
 
-    /// Pick a free ephemeral port on the loopback. Returns `None` when
-    /// the test environment can't bind to localhost (sandboxed CI seen
-    /// in the wild rejects with `PermissionDenied`); callers should
-    /// `eprintln!` and `return` rather than panic.
-    fn pick_port() -> Option<u16> {
-        match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
-            Ok(l) => l.local_addr().ok().map(|a| a.port()),
+    /// Bind an ephemeral loopback listener for a test broker and return it
+    /// with its `host:port`, for [`super::run_on`]. The listener is held from
+    /// bind to serve: probing a port, dropping it and letting noded rebind
+    /// lets an outbound ephemeral connection take the port in between.
+    /// Returns `None` when the test environment can't bind to localhost
+    /// (sandboxed CI seen in the wild rejects with `PermissionDenied`);
+    /// callers should `return` rather than panic.
+    fn pick_listener() -> Option<(tokio::net::TcpListener, String)> {
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+            Ok(l) => l,
             Err(e) => {
-                eprintln!("pick_port: bind to 127.0.0.1:0 failed ({e}); skipping test");
-                None
+                eprintln!("pick_listener: bind to 127.0.0.1:0 failed ({e}); skipping test");
+                return None;
             }
-        }
+        };
+        let listen = listener.local_addr().ok()?.to_string();
+        listener.set_nonblocking(true).ok()?;
+        Some((tokio::net::TcpListener::from_std(listener).ok()?, listen))
     }
 
     #[test]
@@ -5976,14 +5982,13 @@ mod tests {
             .with(CountWarns(warns.clone()))
             .set_default();
 
-        let Some(port) = pick_port() else { return };
-        let listen = format!("127.0.0.1:{port}");
+        let Some((listener, listen)) = pick_listener() else { return };
         let url = format!("ws://{listen}/ws");
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let listen_for_run = listen.clone();
         tokio::spawn(async move {
-            let _ = super::run(
+            let _ = super::run_on(
                 super::RunConfig {
                     session_probe: None,
                     unix_socket: None,
@@ -5997,6 +6002,7 @@ mod tests {
                     mesh_open: false,
                     observe_allowed_services: Vec::new(),
                 },
+                listener,
                 ready_tx,
             )
             .await;
@@ -6064,14 +6070,13 @@ mod tests {
     /// is a baseline — either way the session must work.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn observe_mode_does_not_break_an_old_client() {
-        let Some(port) = pick_port() else { return };
-        let listen = format!("127.0.0.1:{port}");
+        let Some((listener, listen)) = pick_listener() else { return };
         let url = format!("ws://{listen}/ws");
 
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let listen_for_run = listen.clone();
         tokio::spawn(async move {
-            let _ = super::run(
+            let _ = super::run_on(
                 super::RunConfig {
                     session_probe: None,
                     unix_socket: None,
@@ -6085,6 +6090,7 @@ mod tests {
                     mesh_open: false,
                     observe_allowed_services: Vec::new(),
                 },
+                listener,
                 ready_tx,
             )
             .await;
@@ -6221,12 +6227,11 @@ mod tests {
     }
 
     async fn spawn_broker_with_observe(observe_allowed_services: Vec<String>) -> Option<String> {
-        let port = pick_port()?;
-        let listen = format!("127.0.0.1:{port}");
+        let (listener, listen) = pick_listener()?;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let listen_for_run = listen.clone();
         tokio::spawn(async move {
-            let _ = super::run(
+            let _ = super::run_on(
                 super::RunConfig {
                     session_probe: None,
                     unix_socket: None,
@@ -6240,6 +6245,7 @@ mod tests {
                     mesh_open: false,
                     observe_allowed_services,
                 },
+                listener,
                 ready_tx,
             )
             .await;
