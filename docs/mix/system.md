@@ -843,7 +843,9 @@ spawn(["worker"], {cwd: "/srv/app", env: {ROLE: "bg"},
   example webd, cosmix-mcp or cosmix-claud evaluating on pooled `spawn_blocking`
   threads, `die_with_parent` raises `OPTION_INVALID`. An embedder that does
   own a long-lived evaluation thread opts in by calling
-  `builtins::owned_spawns::enable()` on it, and must call `sweep()` on that
+  `builtins::owned_spawns::enable()` on it. That call returns `false`, and
+  changes nothing, if another thread enabled first; only the first thread is
+  ever the host. The embedder must also call `sweep()` on that
   same thread before it exits. Off Linux the option raises
   `OPTION_INVALID`. Default `false`: a plain spawn child is untouched by mix's
   exit.

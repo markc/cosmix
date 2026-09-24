@@ -1839,7 +1839,7 @@ fn eval_thread_main() -> i32 {
     // This thread lives until exit and sweeps before it ends, so it is the
     // one host allowed to create owned children.
     #[cfg(target_os = "linux")]
-    cosmix_mix::builtins::owned_spawns::enable();
+    let _ = cosmix_mix::builtins::owned_spawns::enable();
     let code = real_main();
     owned_spawns_sweep();
     code

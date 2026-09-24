@@ -1171,7 +1171,9 @@ thread that lives until exit and sweeps before it ends. Elsewhere, for
 example webd, cosmix-mcp or cosmix-claud evaluating on pooled <code>spawn_blocking</code>
 threads, <code>die_with_parent</code> raises <code>OPTION_INVALID</code>. An embedder that does
 own a long-lived evaluation thread opts in by calling
-<code>builtins::owned_spawns::enable()</code> on it, and must call <code>sweep()</code> on that
+<code>builtins::owned_spawns::enable()</code> on it. That call returns <code>false</code>, and
+changes nothing, if another thread enabled first; only the first thread is
+ever the host. The embedder must also call <code>sweep()</code> on that
 same thread before it exits. Off Linux the option raises
 <code>OPTION_INVALID</code>. Default <code>false</code>: a plain spawn child is untouched by mix's
 exit.</p>

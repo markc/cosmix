@@ -194,7 +194,24 @@ async fn spawn_die_with_parent_needs_a_host_leads_its_group_and_refuses_detach()
     .await;
     assert_eq!(refused, "OPTION_INVALID true\n", "un-hosted spawn must be refused");
 
-    cosmix_mix::builtins::owned_spawns::enable();
+    assert!(cosmix_mix::builtins::owned_spawns::enable(), "this thread becomes the host");
+    assert!(cosmix_mix::builtins::owned_spawns::enable(), "idempotent on the host thread");
+    let other = std::thread::spawn(cosmix_mix::builtins::owned_spawns::enable)
+        .join()
+        .unwrap();
+    assert!(!other, "a second thread cannot take over and is told so");
+    let elsewhere = std::thread::spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(run_ok(
+                "try\n  spawn([\"true\"], {die_with_parent: true})\ncatch $m, $e\n  print($e.code .. \" \" .. contains($m, \"another thread\"))\nend\n",
+            ))
+    })
+    .join()
+    .unwrap();
+    assert_eq!(elsewhere, "OPTION_INVALID true\n", "the refusal names the other host thread");
     let output = run_ok(
         "try\n  spawn([\"true\"], {die_with_parent: true, detach: true})\ncatch $m, $e\n  print($e.code)\nend\n\
          try\n  spawn([\"true\"], {die_with_parent: 1})\ncatch $m, $e\n  print($e.code)\nend\n\

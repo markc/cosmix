@@ -4213,6 +4213,15 @@ fn builtin_spawn_argv(args: Vec<Value>) -> MixResult<Option<Value>> {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]).stdin(std::process::Stdio::null());
     #[cfg(target_os = "linux")]
+    if die_with_parent && owned_spawns::hosted_elsewhere() {
+        return Err(opt_invalid(
+            caller,
+            "die_with_parent: another thread of this process is the owned-children host \
+             (builtins::owned_spawns::enable() was called there first); only that thread \
+             may create them",
+        ));
+    }
+    #[cfg(target_os = "linux")]
     if die_with_parent && !owned_spawns::enabled_here() {
         return Err(opt_invalid(
             caller,
@@ -4392,9 +4401,18 @@ pub mod owned_spawns {
 
     /// Opt this thread in as the host that owns `die_with_parent` children.
     /// The first call wins; the host must sweep on this same thread before it
-    /// exits. The `mix` binary calls this on its evaluation thread.
-    pub fn enable() {
-        let _ = HOST.set(std::thread::current().id());
+    /// exits. The `mix` binary calls this on its evaluation thread. Returns
+    /// whether THIS thread is the host afterwards — `false` means another
+    /// thread enabled first and this call changed nothing (review R7).
+    #[must_use]
+    pub fn enable() -> bool {
+        let me = std::thread::current().id();
+        *HOST.get_or_init(|| me) == me
+    }
+
+    /// Is some OTHER thread the host?
+    pub(crate) fn hosted_elsewhere() -> bool {
+        HOST.get().is_some_and(|host| *host != std::thread::current().id())
     }
 
     /// May the current thread create an owned child?
