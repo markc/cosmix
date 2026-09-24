@@ -248,15 +248,21 @@ async fn vhost_add(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, String)
         )
         .await;
     match outcome {
-        Ok(_) => (
-            0,
-            json!({
+        Ok(_) => {
+            let mut reply = json!({
                 "ok": true,
                 "fqdn": fqdn,
                 "source": SOURCE_BUS_RUNTIME,
-            })
-            .to_string(),
-        ),
+            });
+            // On an explicit-listener node the live allowlists were fixed
+            // at startup: the row is stored and the next boot will serve
+            // it, but nothing serves it now. Say so rather than let "ok"
+            // imply it is live.
+            if node.explicit_listeners {
+                reply["served_after"] = json!("restart");
+            }
+            (0, reply.to_string())
+        }
         Err(e) => write_error("vhost.add", &e),
     }
 }
@@ -857,6 +863,12 @@ mod tests {
         operators: &[&str],
         listener_config: ListenerConfigSource,
     ) -> Arc<NodeState> {
+        // Mirror production: explicit iff the node config carries a
+        // [[webd.listener]] array.
+        let explicit_listeners = matches!(
+            &listener_config,
+            ListenerConfigSource::Fixed(Some(cfg)) if !cfg.webd.listener.is_empty()
+        );
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
@@ -924,6 +936,7 @@ mod tests {
             ))),
             handler_ast_cache: crate::mix_handler::new_ast_cache(),
             tls_reload: None,
+            explicit_listeners,
         })
     }
 
@@ -1003,6 +1016,8 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["fqdn"], "p3test.example.com");
         assert_eq!(v["source"], "bus_runtime");
+        // No explicit listener array: no restart caveat in the reply.
+        assert!(v.get("served_after").is_none(), "{body}");
 
         // Read it back via store().get and assert source.
         let runtime = node.vhosts_runtime.as_ref().unwrap();
@@ -1637,6 +1652,7 @@ mod tests {
                 ))),
                 handler_ast_cache: crate::mix_handler::new_ast_cache(),
                 tls_reload: None,
+                explicit_listeners: false,
             })
         };
         let _tx = tx; // keep sender alive for the rx to remain live
@@ -1862,6 +1878,9 @@ mod tests {
         let www_dir = www.path().to_string_lossy().into_owned();
         let (rc, body) = vhost_add(&node, &add_cmd_in(host, &www_dir)).await;
         assert_eq!(rc, 0, "admitted add rc=0; body={body}");
+        // Explicit-listener node: the reply must not imply it is live.
+        let v: JsonValue = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["served_after"], "restart", "{body}");
 
         // Surface: routing directory — rebuilt exactly as the next boot
         // does (namespace snapshot → from_namespace_rows), so the host

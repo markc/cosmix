@@ -958,6 +958,11 @@ struct NodeState {
     /// nodes (no TLS). The verb returns a helpful `rc=10` when `None`.
     /// See [`bus::tls`].
     tls_reload: Option<bus::tls::TlsReloadState>,
+    /// Whether this RUNNING daemon partitions hosts by an explicit
+    /// `[[webd.listener]]` array. Each listener's allowlist is fixed at
+    /// startup, so a host `webd.vhost.add` creates is not served until
+    /// the next restart; the add reply says so (`served_after`).
+    explicit_listeners: bool,
 }
 
 /// Which Basic seam a cached service token belongs to (keeps the dev and
@@ -6373,6 +6378,7 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
         )),
         handler_ast_cache: mix_handler::new_ast_cache(),
         tls_reload: None,
+        explicit_listeners: false,
     });
 
     let listen = addr.to_string();
@@ -7250,6 +7256,7 @@ async fn main() -> Result<()> {
                         handler_ast_cache: mix_handler::new_ast_cache(),
                         // Pre-ACME bootstrap node serves no TLS — no reload.
                         tls_reload: None,
+                        explicit_listeners: false,
                     });
                     let redirect = build_http_redirect_router(bootstrap_node);
                     let listener = tokio::net::TcpListener::bind(&http_listen)
@@ -7830,6 +7837,7 @@ async fn main() -> Result<()> {
                 handlers,
                 handler_ast_cache,
                 tls_reload,
+                explicit_listeners: has_explicit_listeners,
             });
 
             // Slice #3 — webd.handlers reload task. The namespace hooks
@@ -8836,6 +8844,7 @@ vhost: [
             )),
             handler_ast_cache: mix_handler::new_ast_cache(),
             tls_reload: None,
+            explicit_listeners: false,
         })
     }
 
@@ -10088,6 +10097,7 @@ mod session_login_tests {
             handlers: Arc::new(ArcSwap::from(Arc::new(handlers))),
             handler_ast_cache: mix_handler::new_ast_cache(),
             tls_reload: None,
+            explicit_listeners: false,
         })
     }
 
