@@ -838,3 +838,52 @@ fn occlusion_trickle_serves_every_surface_while_the_root_requeues() {
         assert!(h.server.state.occlusion.is_occluded(id));
     }
 }
+
+/// Leaving occlusion drops the pacing entry, so a root covered again waits a
+/// full interval from its re-occlusion before its first trickle.
+#[test]
+fn occlusion_trickle_window_restarts_on_re_occlusion() {
+    let (mut h, victim, cover) = fixture();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    let id = h.server.state.surfaces[&victim].id;
+    h.server.state.occlusion.trickle_clock_ms = 5_000;
+    let first = request(&mut h, victim.protocol_id());
+    assert_eq!(h.server.state.occlusion.trickle_at.get(&id), Some(&5_000));
+    h.server.state.surfaces.get_mut(&cover).unwrap().layout.x += 1.0;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, first), 1, "exposure drains");
+    assert!(h.server.state.occlusion.trickle_at.is_empty());
+
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    assert!(h.server.state.occlusion.is_occluded(id));
+    h.server.state.occlusion.trickle_clock_ms = 9_000;
+    let second = request(&mut h, victim.protocol_id());
+    assert_eq!(h.server.state.occlusion.trickle_at.get(&id), Some(&9_000));
+    h.server.state.occlusion.trickle_clock_ms = 9_999;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, second), 0, "a fresh interval, not the old one");
+    h.server.state.occlusion.trickle_clock_ms = 10_000;
+    h.frame(Vec::new());
+    assert_eq!(done(&mut h, second), 1);
+}
+
+/// The session-lock / presentation-unlock gate outranks the trickle: nothing
+/// is completed while it holds, however overdue, and the trickle resumes
+/// once it lifts.
+#[test]
+fn occlusion_trickle_is_held_by_the_session_lock_gate() {
+    let (mut h, victim, cover) = fixture();
+    align(&mut h, &victim, &cover);
+    certify(&mut h, true);
+    h.server.state.occlusion.trickle_clock_ms = 5_000;
+    let callback = request(&mut h, victim.protocol_id());
+    h.server.state.kms_session_lock_gate.deferred_unlock = true;
+    h.server.state.occlusion.trickle_clock_ms = 8_000;
+    h.server.state.limit_occluded_callbacks();
+    assert_eq!(done(&mut h, callback), 0, "held while the gate is closed");
+    h.server.state.kms_session_lock_gate.deferred_unlock = false;
+    h.server.state.limit_occluded_callbacks();
+    assert_eq!(done(&mut h, callback), 1, "released once it lifts");
+}
