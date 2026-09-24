@@ -467,6 +467,7 @@ non-Mix script and exists solely because <code>mix</code> does not yet.</li>
 </ul>
 <h2 id="build-and-verify">Build and verify</h2>
 <pre><code class="language-sh">cd $COSMIX/src &amp;&amp; cargo build --workspace --release     # or: mix $COSMIX/setup.mix
+cd $COSMIX/src &amp;&amp; mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 cd $COSMIX/src &amp;&amp; cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
 cd $COSMIX/src/desktop &amp;&amp; cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
 cd $COSMIX/src/desktop &amp;&amp; cargo test -p ctk --lib --features bus,theme app_control::
@@ -475,7 +476,6 @@ cd $COSMIX/src/desktop &amp;&amp; cargo test -p ctk --lib --features bus,theme a
 cd $COSMIX/src &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cd $COSMIX/src/desktop &amp;&amp; cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p &lt;crate&gt;          # never a repo-wide fmt from a task
-cd $COSMIX/src &amp;&amp; mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 </code></pre>
 <p>On a machine without a real GPU the desktop run fails exactly two llvmpipe
 pixel tests in <code>cosmix-comp</code> (<code>client_surface_material::…_on_a_real_gpu</code> and

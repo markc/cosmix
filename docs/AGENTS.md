@@ -29,6 +29,7 @@ names, addresses, domains, keys, operator home paths) anywhere in it.
 
 ```sh
 cd $COSMIX/src && cargo build --workspace --release     # or: mix $COSMIX/setup.mix
+cd $COSMIX/src && mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 cd $COSMIX/src && cargo test --workspace                # core workspace; desktop is EXCLUDED (src/Cargo.toml)
 cd $COSMIX/src/desktop && cargo test --workspace --no-fail-fast   # ctk, quoin, comp, term: its own workspace
 cd $COSMIX/src/desktop && cargo test -p ctk --lib --features bus,theme app_control::
@@ -37,7 +38,6 @@ cd $COSMIX/src/desktop && cargo test -p ctk --lib --features bus,theme app_contr
 cd $COSMIX/src && cargo clippy --workspace --all-targets -- -D warnings
 cd $COSMIX/src/desktop && cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt -p <crate>          # never a repo-wide fmt from a task
-cd $COSMIX/src && mix tools/version_flag_gate.mix   # after both release builds: every binary answers --version
 ```
 
 On a machine without a real GPU the desktop run fails exactly two llvmpipe
