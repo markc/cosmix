@@ -35523,7 +35523,7 @@ fn connect_other_layer_client(harness: &mut KeybindingHarness) -> OtherTestClien
         .server
         .state
         .display_handle
-        .insert_client(server, Arc::clone(&state))
+        .insert_client(server, Arc::clone(&state) as Arc<dyn ClientData>)
         .expect("register second Wayland client");
     send_display_request(&mut client, 1, 2);
     send_display_request(&mut client, 0, 3);

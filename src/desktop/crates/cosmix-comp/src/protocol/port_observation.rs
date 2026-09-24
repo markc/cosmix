@@ -3279,7 +3279,7 @@ fn apply_panel_enforcement(state: &mut WaylandState) -> bool {
 
 /// Per-edge counts for the volatile `input.corners.enforced.*` and
 /// `input.corners.held.*` leaves, summed over outputs.
-pub(crate) fn panel_edge_counts(state: &WaylandState) -> (EdgeCounts, EdgeCounts) {
+pub(super) fn panel_edge_counts(state: &WaylandState) -> (EdgeCounts, EdgeCounts) {
     let mut enforced = EdgeCounts::default();
     let mut held = EdgeCounts::default();
     for ((_, edge), panel) in &state.observations.panel_holders {
