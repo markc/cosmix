@@ -27543,6 +27543,51 @@ fn map_then_destroy_xdg_objects(harness: &mut KeybindingHarness, null_attach: bo
     generation
 }
 
+/// The re-wrapped toplevel is a NEW role: it maps with a fresh, larger
+/// role generation, so a script holding the old `{id, generation}` cannot
+/// act on the new window by accident (the manual's "Window identity" claim).
+#[test]
+fn a_rewrapped_toplevel_maps_as_a_new_role_generation() {
+    let mut harness = KeybindingHarness::new(false);
+    let before = map_then_destroy_xdg_objects(&mut harness, true);
+
+    let xdg_surface = harness.allocate_object_id();
+    let toplevel = harness.allocate_object_id();
+    send_request(
+        &mut harness.client,
+        TEST_XDG_WM_BASE_ID,
+        2,
+        &words(&[xdg_surface, TEST_TOPLEVEL_SURFACE_ID]),
+    ); // xdg_wm_base.get_xdg_surface on the same wl_surface
+    send_request(&mut harness.client, xdg_surface, 1, &words(&[toplevel])); // get_toplevel
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]); // initial commit
+    harness.dispatch_client();
+    harness.assert_client_connected("after re-wrapping the wl_surface");
+    let serial: u32 = test_toplevel_record(&harness)
+        .required_configure
+        .expect("the re-wrapped toplevel is configured")
+        .into();
+    send_request(&mut harness.client, xdg_surface, 4, &words(&[serial])); // ack_configure
+    let buffer = harness.create_dmabuf_buffer_sized(64, 32);
+    send_request(
+        &mut harness.client,
+        TEST_TOPLEVEL_SURFACE_ID,
+        1,
+        &words(&[buffer, 0, 0]),
+    );
+    send_request(&mut harness.client, TEST_TOPLEVEL_SURFACE_ID, 6, &[]);
+    harness.dispatch_client();
+    harness.assert_client_connected("after the second map");
+
+    let record = test_toplevel_record(&harness);
+    assert!(record.mapped, "the re-wrapped toplevel maps");
+    assert!(
+        record.generation > before,
+        "a re-wrapped toplevel is a new role: generation {} must exceed {before}",
+        record.generation
+    );
+}
+
 /// xdg_surface: "Creating an xdg_surface from a wl_surface which has a buffer
 /// attached or committed is a client error." Releasing the role on
 /// `xdg_surface.destroy` makes this reachable on a surface that already
