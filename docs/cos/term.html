@@ -454,8 +454,9 @@ D10). Set <code>COSMIX_TERM_BIN</code> to the <code>term</code> binary to launch
 <h2 id="tabs-and-panes">Tabs and panes</h2>
 <p>The tab strip across the top shows one button per tab and a <code>+</code> that opens a
 new one. Clicking a tab selects it. Each tab holds a tree of split panes, and
-clicking a pane focuses it. The focused pane's border takes the design's
-focus-ring colour. Every other pane's border takes the plain border colour.
+clicking a pane focuses it. When a tab has more than one pane, the focused
+pane's border takes the design's focus-ring colour. Every other border,
+including a tab's only pane, takes the plain border colour.
 All strip and border colours come from the <code>cosmix-design</code> tokens.</p>
 <p>Every pane keeps a border of the same width whether or not it is focused, so
 moving focus never resizes a PTY. Split edges are placed on whole physical

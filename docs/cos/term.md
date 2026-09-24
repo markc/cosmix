@@ -15,8 +15,9 @@ D10). Set `COSMIX_TERM_BIN` to the `term` binary to launch this one.
 
 The tab strip across the top shows one button per tab and a `+` that opens a
 new one. Clicking a tab selects it. Each tab holds a tree of split panes, and
-clicking a pane focuses it. The focused pane's border takes the design's
-focus-ring colour. Every other pane's border takes the plain border colour.
+clicking a pane focuses it. When a tab has more than one pane, the focused
+pane's border takes the design's focus-ring colour. Every other border,
+including a tab's only pane, takes the plain border colour.
 All strip and border colours come from the `cosmix-design` tokens.
 
 Every pane keeps a border of the same width whether or not it is focused, so

@@ -604,11 +604,7 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
         // Not sized or not painted yet: the next wake does both.
         _ => space().into(),
     };
-    let frame_colour = if id == state.shape.active_pane {
-        tokens.ring
-    } else {
-        tokens.border
-    };
+    let frame_colour = frame_colour(&state.shape, id, tokens);
     let inner = container(grid)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -631,6 +627,18 @@ fn pane(state: &State, id: u64, bounds: Geometry, scale: f32) -> Element<'_, Mes
         .on_press(Message::FocusPane(id))
         .on_scroll(Message::Wheel)
         .into()
+}
+
+/// A pane's border colour. The focus ring marks which pane keys go to, so it
+/// shows only when there is a choice: a lone pane wears the plain border, as
+/// foot shows nothing at all. The border's WIDTH never changes — that is what
+/// keeps focus changes from resizing a PTY — only its colour.
+fn frame_colour(shape: &Shape, id: u64, tokens: cosmix_iced_widgets::Tokens) -> iced::Color {
+    if id == shape.active_pane && shape.visible().len() > 1 {
+        tokens.ring
+    } else {
+        tokens.border
+    }
 }
 
 #[cfg(feature = "wgpu")]
@@ -964,6 +972,30 @@ mod tests {
             on_key(&iced::keyboard::Event::ModifiersChanged(Modifiers::CTRL)),
             Some(Message::Modifiers(modifiers)) if modifiers.control()
         ));
+    }
+
+    #[test]
+    fn the_focus_ring_shows_only_when_there_is_more_than_one_pane() {
+        let tokens = theme::tokens();
+        assert_ne!(tokens.ring, tokens.border, "the test needs two distinct tokens");
+        let lone = Shape {
+            tabs: Vec::new(),
+            tree: Some(Node::Leaf(7)),
+            active_pane: 7,
+        };
+        assert_eq!(frame_colour(&lone, 7, tokens), tokens.border);
+
+        let split = Shape {
+            tree: Some(Node::Split {
+                dir: SplitDir::Vertical,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(7)),
+                second: Box::new(Node::Leaf(8)),
+            }),
+            ..lone
+        };
+        assert_eq!(frame_colour(&split, 7, tokens), tokens.ring);
+        assert_eq!(frame_colour(&split, 8, tokens), tokens.border);
     }
 
     fn active_pane(tabs: &TabSet) -> u64 {
