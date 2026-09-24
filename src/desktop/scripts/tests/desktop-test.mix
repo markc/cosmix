@@ -219,11 +219,17 @@ try
   $prev_open = env("COSMIX_MESH_OPEN", "")
   export COSMIX_MESH_OPEN = "1"
   $bare_mesh = {broker_origin:"mesh",from:"bridge-gamma",broker_peer:"gamma"}
-  for each $verb in $d.prepare($ctx,"desktop.capabilities",$headers,{},2).body.verbs
+  -- Origin ONLY: no from, no broker_peer, no broker_service. A mutant that
+  -- still demanded any part of the bridge attestation under open fails here.
+  $origin_only = {broker_origin:"mesh"}
+  $open_caps = $d.prepare($ctx,"desktop.capabilities",$headers,{},2).body
+  check($open_caps.access == "mesh-open" and $open_caps.mesh_open == true,"open posture not advertised: " .. json_encode($open_caps))
+  for each $verb in $open_caps.verbs
     check($d.caller_allowed($ctx,$verb,$bare_mesh),"open mesh caller refused " .. $verb)
+    check($d.caller_allowed($ctx,$verb,$origin_only),"origin-only mesh caller refused " .. $verb)
   end
   check(not $d.caller_allowed($ctx,"desktop.clipboard.menu",{from:"bridge-gamma"}),"unstamped caller admitted")
-  $menu = $d.prepare($ctx,"desktop.clipboard.menu",$bare_mesh,{},2)
+  $menu = $d.prepare($ctx,"desktop.clipboard.menu",$origin_only,{},2)
   check($menu.rc == 0 and $menu.body.menu == true,"mesh caller refused menu: " .. json_encode($menu))
   $rot = $d.prepare($ctx,"desktop.clipboard.rotate",$bare_mesh,{instance:$ctx.instance},2)
   check($rot.rc == 0 or $rot.action == "clipboard_rotate","mesh caller refused rotate: " .. json_encode($rot))
@@ -236,6 +242,9 @@ try
     for each $verb in ["desktop.clipboard.menu","desktop.clipboard.rotate"]
       check($d.prepare($ctx,$verb,$mesh,{},2).rc == 13,"locked mesh reached " .. $verb)
     end
+    check(not $d.caller_allowed($ctx,"desktop.clipboard.read",$origin_only),"locked posture admitted an unattested caller")
+    $locked_caps = $d.prepare($ctx,"desktop.capabilities",$headers,{},2).body
+    check($locked_caps.access == "registered-local-with-explicit-mesh-clipboard-grants" and $locked_caps.mesh_open == false,"locked posture not advertised: " .. json_encode($locked_caps))
   end
   -- A fresh ring of two, so rotate semantics are exact and isolated.
   $ring = {session:"test",instance:"instance-one",max_bytes:65536,wayland:"test-0",runtime:"/run/user/test",copy:"/usr/bin/true",paste:"/usr/bin/true",opener:"/usr/bin/true",

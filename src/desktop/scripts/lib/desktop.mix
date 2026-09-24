@@ -407,6 +407,13 @@ fn target_ok($target)
   return type($target) == "string" and re_match($target,"^[a-z][a-z0-9-]{1,30}(\\.[a-z][a-z0-9-]{0,23}\\.bus)?$")
 end
 
+-- The effective mesh posture: open (the default) unless the provider runs
+-- with COSMIX_MESH_OPEN=0, the opt-in lock. One reading, shared by the caller
+-- gate and desktop.capabilities so the two can never disagree.
+fn mesh_open()
+  return env("COSMIX_MESH_OPEN", "1") != "0"
+end
+
 fn caller_allowed($ctx,$verb,$headers)
   if $headers.broker_origin == "local" then
     return type($headers.from) == "string" and re_match($headers.from,"^[a-z][a-z0-9-]{1,30}$")
@@ -420,7 +427,7 @@ fn caller_allowed($ctx,$verb,$headers)
   -- admitted WG peer; the WG /24 + signed inventory is the trust boundary.
   -- What survives is correctness, not authorization: the `instance` staleness
   -- fence in prepare() still applies to mesh callers exactly as to local ones.
-  if env("COSMIX_MESH_OPEN", "1") != "0" then return true end
+  if mesh_open() then return true end
   -- Opt-in lock-down (COSMIX_MESH_OPEN=0): transfer verbs ride the clipboard
   -- grants; history reads (previews and entry fetch for pick-remote) ride the
   -- explicit history subset; every other verb is local-only; and each grant
@@ -463,7 +470,7 @@ fn prepare($ctx, $verb, $headers, $body, $raw_bytes)
     if not keys_are($body, []) then return error("INVALID_REQUEST", 10) end
     $clipboard = $ctx.copy != nil and $ctx.paste != nil and $ctx.wayland != "" and $ctx.runtime != ""
     return {rc:0, body:{api_version:1, implementation_version:"0.3.6", session:$ctx.session,
-      instance:$ctx.instance, access:"registered-local-with-explicit-mesh-clipboard-grants", max_text_bytes:$ctx.max_bytes,
+      instance:$ctx.instance, access:(mesh_open() ? "mesh-open" : "registered-local-with-explicit-mesh-clipboard-grants"), mesh_open:mesh_open(), max_text_bytes:$ctx.max_bytes,
       -- history_mesh: granted peers may read history previews and entries.
       history_mesh:{granted:len($ctx.mesh_history_nodes == nil ? [] : $ctx.mesh_history_nodes)},
       clipboard:{configured:$clipboard, mime:"text/plain;charset=utf-8", history:history_capabilities($ctx)},
