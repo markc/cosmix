@@ -707,11 +707,23 @@ end
 -- …the citizen logs it, replies an error to THIS caller, keeps serving others.
 </code></pre>
 <p><strong>What the caller sees vs. what you debug with.</strong> The caller's reply is a
-<strong>fixed</strong> <code>rc=1</code>, <code>internal handler error</code> — the real error message is
-deliberately <strong>not</strong> put on the wire (it can carry request data or
-Trojan-Source bytes, and a peer in the mesh is not automatically trusted). The
-real error — with the command, handler index, and the failing line — is
-<strong>logged instead</strong>, and that's where you debug:</p>
+<strong>fixed</strong> <code>rc=15</code> with the body
+<code>{"error": "internal handler error", "error_code": "HANDLER_FAULT"}</code>. That is in
+the application-error band, so the usual <code>$rc &gt;= 10</code> check catches it; on an
+ordinary send <code>$result</code> is <code>internal handler error</code>, and on every route
+<code>$reply.error_code == "HANDLER_FAULT"</code> (see <a href="/mix/bus#reading-rc-ok-vs-application-error-vs-transport-failure">Reading <code>$rc</code></a>).
+Up to mix 0.93.0 this reply was <code>rc=1</code>, which the Bus contract reads as
+delivered-with-warning <em>success</em>: a caller testing <code>$rc &gt;= 10</code> took a crashed
+handler for a working one.</p>
+<pre><code class="language-mix">send risky risky.op body="not a number"
+if $rc &gt;= 10 and $reply.error_code == "HANDLER_FAULT" then
+  print("the citizen's handler crashed; its log has the real error")
+end
+</code></pre>
+<p>The real error message is deliberately <strong>not</strong> put on the wire (it can carry
+request data or Trojan-Source bytes, and a peer in the mesh is not
+automatically trusted). The real error — with the command, handler index, and
+the failing line — is <strong>logged instead</strong>, and that's where you debug:</p>
 <ul>
 <li><strong>Interactive</strong> (<code>mix --serve foo.mix</code> in a terminal): faults print straight
 to the terminal, e.g. <code>ERROR … Handler body errored … command=risky.op error=Runtime error at line 2: …</code>.</li>
@@ -841,8 +853,9 @@ globals. State that must survive a reload belongs in the substrate
 memory.</li>
 <li><strong>A request in flight across the swap gets a terminal reply, not
 silence.</strong> When the old generation is retired its pending requests are
-answered with a shutdown-flavoured reply (the connection is live, so the
-caller is never left hanging to its own timeout). SIGTERM/Ctrl-C during a
+answered with <code>rc=16</code> and <code>error_code</code> <code>HANDLER_CANCELLED</code> (the connection
+is live, so the caller is never left hanging to its own timeout; up to mix
+0.93.0 this reply was <code>rc=2</code>, which read as success). SIGTERM/Ctrl-C during a
 reload's init still shuts the citizen down cleanly, and a new init body
 that fails after admitting traffic has its spawned handlers cancelled
 before the old generation resumes.</li>
@@ -970,7 +983,7 @@ resident <code>--serve</code> daemon is what requires the broker to be up.</p>
 <tr><td>Init</td><td>top-level body runs <strong>once</strong>, then the pump runs forever</td></tr>
 <tr><td>Reserved (injected)</td><td><code>HELP</code>, <code>INFO</code>, <code>QUIT</code>, <code>&lt;svc&gt;.props.{get,list,describe}</code></td></tr>
 <tr><td>Author can override reserved?</td><td><strong>No</strong> — runtime wins (pre-dispatch intercept)</td></tr>
-<tr><td>Handler fault</td><td>caught per-request, logged, error reply, pump continues</td></tr>
+<tr><td>Handler fault</td><td>caught per-request, logged, <code>rc=15</code> <code>HANDLER_FAULT</code> reply, pump continues</td></tr>
 <tr><td>Slow downstream + concurrent callers</td><td>mark the handler <code>async</code> (Class C)</td></tr>
 <tr><td>Sync cycle A→B→A</td><td>prohibited — deadlocks; break with <code>emit</code> + topic reply</td></tr>
 <tr><td>Shutdown</td><td><code>SIGTERM</code> / Ctrl-C / <code>QUIT</code> → deregister → exit 0</td></tr>
