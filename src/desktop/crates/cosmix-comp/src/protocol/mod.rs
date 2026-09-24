@@ -307,7 +307,7 @@ const CAPTURE_SHM_BYTES_PER_TURN: usize = 256 * 1024;
 /// reservation remains charged until Bevy reports completion.
 pub(crate) const CAPTURE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct SurfaceId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -927,6 +927,12 @@ pub(crate) enum HostInput {
     OutputScaleChanged {
         scale: f64,
     },
+    /// The host window's physical (swapchain) size, which the truncated
+    /// logical size and the scale cannot reconstruct exactly.
+    OutputPhysicalResized {
+        width: u32,
+        height: u32,
+    },
 }
 
 /// One axis of a scroll event, exactly as the device reported it.
@@ -970,6 +976,8 @@ impl HostInput {
 }
 
 enum ProtocolCommand {
+    #[cfg(feature = "bus")]
+    HotspotBridge(crate::hotspot_scene::HotspotBridge),
     #[cfg(feature = "bus")]
     RegionBridge(crate::region_scene::RegionBridge),
     #[cfg(feature = "embedded-quoin")]
@@ -1120,9 +1128,69 @@ fn assert_dmabuf_validation_off_protocol_thread() {
     }
 }
 
+/// One validation on the worker: run the probe (unless an earlier panic
+/// retired it), record the outcome in the import ledger, and answer whether
+/// the import is accepted. Split from the loop so the outcome-to-ledger
+/// mapping is testable without an `ImportNotifier`, which only smithay can
+/// construct.
+fn validate_and_record(
+    validator: &mut dyn ValidateDmabuf,
+    poisoned: &mut bool,
+    descriptor: DmabufDescriptor,
+    format: Format,
+    ledger: &dmabuf_ledger::DmabufImportLedger,
+) -> bool {
+    use dmabuf_ledger::DmabufFailureReason;
+    // A poisoned probe is never called again, but the loop keeps running:
+    // `ImportNotifier`'s destructor only logs, so a worker that returned
+    // would leave every queued client waiting on an event that can no longer
+    // arrive. Draining and refusing is what tells them.
+    if *poisoned {
+        ledger.record_failed(
+            format,
+            DmabufFailureReason::ProbeRetired,
+            "validation probe retired after an earlier panic",
+        );
+        return false;
+    }
+    match catch_unwind(AssertUnwindSafe(|| validator.validate(descriptor))) {
+        Err(_) => {
+            // An ordinary `Err` means this buffer is unusable; a panic means
+            // the probe itself is. Its state after an unwind is not something
+            // this compositor can reason about, so it is retired permanently
+            // rather than called again on the next client's descriptor.
+            *poisoned = true;
+            tracing::error!(
+                ?format,
+                "DMA-BUF validation probe panicked; refusing every further import"
+            );
+            ledger.record_failed(
+                format,
+                DmabufFailureReason::ProbePanicked,
+                "validation probe panicked",
+            );
+            false
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                ?format,
+                %error,
+                "Vulkan test import rejected DMA-BUF parameters"
+            );
+            ledger.record_failed(format, DmabufFailureReason::VulkanRejected, error);
+            false
+        }
+        Ok(Ok(())) => {
+            ledger.record_accepted();
+            true
+        }
+    }
+}
+
 fn spawn_dmabuf_validation_worker(
     mut validator: Box<dyn ValidateDmabuf>,
     wake: channel::Sender<()>,
+    ledger: dmabuf_ledger::DmabufImportLedger,
 ) -> Result<SyncSender<DmabufValidationRequest>, String> {
     let (sender, receiver) =
         mpsc::sync_channel::<DmabufValidationRequest>(DMABUF_VALIDATION_QUEUE_CAPACITY);
@@ -1141,45 +1209,18 @@ fn spawn_dmabuf_validation_worker(
                     notifier,
                     format,
                 } = request;
-                // A poisoned probe is never called again, but the loop keeps
-                // running: `ImportNotifier`'s destructor only logs, so a worker
-                // that returned here would leave every queued client waiting on
-                // an event that can no longer arrive. Draining and refusing is
-                // what tells them.
-                if poisoned {
-                    notifier.failed();
-                } else {
-                    match catch_unwind(AssertUnwindSafe(|| validator.validate(descriptor))) {
-                        Err(_) => {
-                            // An ordinary `Err` means this buffer is unusable; a
-                            // panic means the probe itself is. Its state after an
-                            // unwind is not something this compositor can reason
-                            // about, so it is retired permanently rather than
-                            // called again on the next client's descriptor.
-                            poisoned = true;
-                            tracing::error!(
-                                ?format,
-                                "DMA-BUF validation probe panicked; refusing every further import"
-                            );
-                            notifier.failed();
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(
-                                ?format,
-                                %error,
-                                "Vulkan test import rejected DMA-BUF parameters"
-                            );
-                            notifier.failed();
-                        }
-                        Ok(Ok(())) => {
-                            if let Err(error) = notifier.successful::<WaylandState>() {
-                                tracing::debug!(
-                                    %error,
-                                    "DMA-BUF client destroyed params during import"
-                                );
-                            }
-                        }
+                if validate_and_record(
+                    validator.as_mut(),
+                    &mut poisoned,
+                    descriptor,
+                    format,
+                    &ledger,
+                ) {
+                    if let Err(error) = notifier.successful::<WaylandState>() {
+                        tracing::debug!(%error, "DMA-BUF client destroyed params during import");
                     }
+                } else {
+                    notifier.failed();
                 }
                 // Both `failed` and `successful` only *queue* the event onto the
                 // client's connection; the protocol thread flushes solely from
@@ -1307,6 +1348,16 @@ pub(crate) struct ClientSceneFeed {
 static_assertions::assert_not_impl_any!(ClientSceneFeed: Clone, Copy);
 
 impl ClientSceneFeed {
+    #[cfg(feature = "bus")]
+    pub(crate) fn install_hotspot_bridge(&self, bridge: crate::hotspot_scene::HotspotBridge) {
+        if self
+            .commands
+            .send(ProtocolCommand::HotspotBridge(bridge))
+            .is_err()
+        {
+            tracing::debug!("protocol thread gone before hotspot renderer attachment");
+        }
+    }
     #[cfg(feature = "bus")]
     pub(crate) fn install_region_bridge(&self, bridge: crate::region_scene::RegionBridge) {
         if self
@@ -1457,6 +1508,8 @@ impl ClientSceneFeed {
                 Ok(ProtocolCommand::ReleaseDmabuf { token }) => tokens.push(token),
                 #[cfg(feature = "bus")]
                 Ok(ProtocolCommand::RegionBridge(_)) => {} // Startup renderer attachment owns no buffer.
+                #[cfg(feature = "bus")]
+                Ok(ProtocolCommand::HotspotBridge(_)) => {} // Likewise.
                 Ok(_) => panic!("scene feed emitted an unrelated command"),
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return tokens,
             }
@@ -1493,6 +1546,9 @@ impl ClientSceneFeed {
                 Ok(ProtocolCommand::CaptureFailed { id, .. }) => {
                     outcomes.push(CaptureTestOutcome::Failed(id));
                 }
+                // Startup renderer attachment, not a capture outcome.
+                #[cfg(feature = "bus")]
+                Ok(ProtocolCommand::HotspotBridge(_)) => {}
                 Ok(_) => panic!("scene feed emitted an unrelated command"),
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
                     return outcomes;
@@ -3173,6 +3229,7 @@ impl ProtocolServer {
                     output_mode: mode,
                     output_size,
                     output_scale: 1.0,
+                    host_physical_size: None,
                 })
             }
             BackendKind::Kms => BackendData::Kms(KmsBackendData::new(output_size)),
@@ -3196,6 +3253,7 @@ impl ProtocolServer {
         // Spawned here rather than beside the other workers above because the
         // worker needs a handle onto this event loop: its outcomes are queued
         // from off-thread and only a dispatch cycle flushes them.
+        let dmabuf_ledger = dmabuf_ledger::DmabufImportLedger::default();
         let dmabuf_validation = match dmabuf_validator {
             Some(validator) => {
                 let (wake_sender, wake_source) = channel::channel::<()>();
@@ -3203,7 +3261,11 @@ impl ProtocolServer {
                     .handle()
                     .insert_source(wake_source, |_event, (), _state| {})
                     .map_err(|error| error.to_string())?;
-                Some(spawn_dmabuf_validation_worker(validator, wake_sender)?)
+                Some(spawn_dmabuf_validation_worker(
+                    validator,
+                    wake_sender,
+                    dmabuf_ledger.clone(),
+                )?)
             }
             None => None,
         };
@@ -3263,6 +3325,7 @@ impl ProtocolServer {
             supported_dmabuf_formats,
             capture_advertisements,
             dmabuf_validation,
+            dmabuf_ledger,
             data_device_state,
             xdg_activation_state,
             relative_pointer_state,
@@ -3327,6 +3390,7 @@ impl ProtocolServer {
             foreign_toplevel_identifiers: HashMap::new(),
             foreign_toplevel_nonce,
             buffer_history_surfaces: HashSet::new(),
+            buffer_bearing_surfaces: HashSet::new(),
             attach_history_surfaces: HashSet::new(),
             committed_surfaces: HashSet::new(),
             surface_objects: HashMap::new(),
@@ -3479,6 +3543,14 @@ impl ProtocolServer {
             event_loop
                 .handle()
                 .insert_source(source, |event, (), state| match event {
+                    ChannelEvent::Msg(PortCommand::Panel(request)) => {
+                        if state.pending_port_controls.len() < PORT_QUEUE_CAPACITY {
+                            state.pending_port_controls.push(PortControl::Panel(request));
+                        }
+                    }
+                    ChannelEvent::Msg(PortCommand::ServicesLive(live)) => {
+                        port_observation::panel_services_live(state, &live);
+                    }
                     ChannelEvent::Msg(PortCommand::Snapshot(request)) => {
                         if state.pending_port_requests.len() < PORT_QUEUE_CAPACITY {
                             state.pending_port_requests.push(request);
@@ -3547,6 +3619,10 @@ impl ProtocolServer {
         event_loop
             .handle()
             .insert_source(command_source, |event, (), state| match event {
+                #[cfg(feature = "bus")]
+                ChannelEvent::Msg(ProtocolCommand::HotspotBridge(bridge)) => {
+                    state.install_hotspot_bridge(bridge);
+                }
                 #[cfg(feature = "bus")]
                 ChannelEvent::Msg(ProtocolCommand::RegionBridge(bridge)) => {
                     state.region.bridge = Some(bridge);
@@ -5068,6 +5144,12 @@ struct SurfaceRecord {
     chrome_pointer: ChromePointerSceneState,
     committed_window_geometry: Option<SceneWindowGeometry>,
     committed_window_geometry_explicit: bool,
+    /// The unsnapped origin comp last placed this window at, and the
+    /// whole-pixel origin it produced. Later re-snaps (a new geometry inset, a
+    /// scale change) start from the anchor, never from a snapped value, so a
+    /// half-pixel tie cannot walk the window one pixel per change. Stale, and
+    /// ignored, once `window_origin` no longer equals `placed`.
+    grid_placement: Option<GridPlacement>,
     pending_popup_reposition: Option<PendingPopupReposition>,
     /// Adding a subsurface is double-buffered on its parent.
     parent_association_committed: bool,
@@ -6123,6 +6205,9 @@ struct WaylandState {
     /// the compositor runs without a probe, in which case metadata validation is
     /// the whole of the check.
     dmabuf_validation: Option<SyncSender<DmabufValidationRequest>>,
+    /// Observed import outcomes, shared with the validation worker; served
+    /// as the volatile `dmabuf.*` props (TODO-comp C4).
+    pub(crate) dmabuf_ledger: dmabuf_ledger::DmabufImportLedger,
     data_device_state: DataDeviceState,
     xdg_activation_state: XdgActivationState,
     /// Held, never read. `zwp_relative_pointer_v1` has no handler trait — the
@@ -6213,6 +6298,11 @@ struct WaylandState {
     /// Surfaces that have ever attached a non-null buffer. Layer-shell's
     /// AlreadyConstructed rule uses this narrower history.
     buffer_history_surfaces: HashSet<ObjectId>,
+    /// Surfaces whose last committed buffer assignment was a non-null buffer
+    /// (a later NULL attach + commit removes them). Smithay's
+    /// `SurfaceAttributes::current` cannot answer this once the commit path
+    /// has consumed the buffer; `get_xdg_surface` refuses these.
+    buffer_bearing_surfaces: HashSet<ObjectId>,
     /// Every surface that has received wl_surface.attach, including NULL.
     /// ext-session-lock rejects any prior attach history.
     attach_history_surfaces: HashSet<ObjectId>,
@@ -6352,10 +6442,24 @@ fn capture_physical_region(
         let rounded = numerator.checked_add(60)?.checked_div(120)?;
         u32::try_from(rounded).ok()
     };
+    let (displayed_width, displayed_height) = source.displayed_physical_extent;
     let physical_left = project(left)?;
     let physical_top = project(top)?;
-    let physical_right = project(right)?;
-    let physical_bottom = project(bottom)?;
+    // The output's own far edge IS the displayed physical edge. The logical
+    // size is a rounded or truncated quotient of it, so projecting it back can
+    // land short (nested 2762 at 2.5 is 1104 logical, 2760 projected) or past
+    // it (a region then refused below), and a whole-output copy must be the
+    // whole buffer.
+    let physical_right = if right == i64::from(logical_width) {
+        displayed_width
+    } else {
+        project(right)?
+    };
+    let physical_bottom = if bottom == i64::from(logical_height) {
+        displayed_height
+    } else {
+        project(bottom)?
+    };
     let (x, y, width, height) = (
         physical_left,
         physical_top,
@@ -6365,7 +6469,6 @@ fn capture_physical_region(
     if width == 0 || height == 0 {
         return None;
     }
-    let (displayed_width, displayed_height) = source.displayed_physical_extent;
     let right = x.checked_add(width)?;
     let bottom = y.checked_add(height)?;
     if right > displayed_width || bottom > displayed_height {
@@ -8585,6 +8688,9 @@ impl WaylandState {
 
     fn handle_client_disconnect(&mut self, client_id: &ClientId) {
         self.destroy_client_acquire_gates(client_id);
+        // A Quoin that crashed or exited takes its panel holds with it.
+        #[cfg(feature = "bus")]
+        port_observation::panel_owner_disconnected(self, client_id);
         let frames = self
             .capture_frames
             .iter()
@@ -8953,6 +9059,9 @@ impl WaylandState {
             }
             HostInput::OutputScaleChanged { scale } => {
                 self.change_output_scale(scale);
+            }
+            HostInput::OutputPhysicalResized { width, height } => {
+                self.change_output_physical_size(width, height);
             }
         }
     }
@@ -10547,6 +10656,12 @@ impl WaylandState {
         let mut observed = Vec::new();
         // Read once: the loop holds `surfaces` mutably.
         let current_workspace = self.workspace_current();
+        // Panel layers comp hides for a stalled shell (holder-plane
+        // enforcement): exactly the surface ids it recorded, and through this
+        // one funnel, so rendering, hit-testing and focus all agree. A field
+        // borrow, disjoint from `surfaces` and `events` below.
+        #[cfg(feature = "bus")]
+        let enforced_layers = &self.observations.enforced_surfaces;
         while let Some((id, ancestor_visible)) = stack.pop() {
             let Some(object) = self.surface_objects.get(&id).cloned() else {
                 continue;
@@ -10569,12 +10684,17 @@ impl WaylandState {
             };
             // The own-buffer term: hidden = minimised OR off the current
             // workspace (managed toplevels only; bands, layers, popups and
-            // locks are on every workspace). Both hide through this one
-            // funnel, so `visible:false, minimized:false` needs no reader
-            // change.
+            // locks are on every workspace) OR an enforced panel layer. All
+            // hide through this one funnel, so `visible:false,
+            // minimized:false` needs no reader change.
+            #[cfg(feature = "bus")]
+            let enforced = enforced_layers.contains(&record.id);
+            #[cfg(not(feature = "bus"))]
+            let enforced = false;
             let visible = effectively_visible(
                 record.mapped
                     && !record.minimized
+                    && !enforced
                     && workspaces::on_workspace(record, current_workspace),
                 ancestor_visible,
                 association_visible,
@@ -11767,6 +11887,18 @@ impl WaylandState {
     }
 
     fn pointer_button(&mut self, button: u32, state: HostButtonState, time: u32) {
+        // A press lands on some client: a trigger for the panel holders'
+        // liveness check (a stopped shell menu must not keep the input).
+        #[cfg(feature = "bus")]
+        if state == HostButtonState::Pressed {
+            let client = self
+                .pointer
+                .current_focus()
+                .and_then(|target| target.owned_surface())
+                .and_then(|surface| surface.client())
+                .map(|client| client.id());
+            port_observation::note_user_input(self, client);
+        }
         #[cfg(feature = "bus")]
         if (state == HostButtonState::Pressed && self.consume_corner_press(button))
             || (state == HostButtonState::Released && self.consume_corner_release(button))
@@ -12195,6 +12327,16 @@ impl WaylandState {
     /// [`HostInput::key_from_evdev`] for why the evdev offset is applied by
     /// exactly one transport and never here.
     fn keyboard_keycode(&mut self, keycode: Keycode, state: HostButtonState, time: u32) {
+        #[cfg(feature = "bus")]
+        if state == HostButtonState::Pressed {
+            let client = self
+                .keyboard
+                .current_focus()
+                .and_then(|target| target.owned_surface())
+                .and_then(|surface| surface.client())
+                .map(|client| client.id());
+            port_observation::note_user_input(self, client);
+        }
         let keyboard = self.keyboard.clone();
         let serial = SERIAL_COUNTER.next_serial();
         let pressed = state == HostButtonState::Pressed;
@@ -13494,8 +13636,18 @@ impl WaylandState {
                 let SurfaceRole::Layer(role) = &record.role else {
                     return None;
                 };
+                // A shell that left a liveness probe unanswered (stopped)
+                // keeps no keyboard grab: its layer counts as on-demand.
+                #[cfg(feature = "bus")]
+                let stalled = port_observation::layer_owner_stalled(
+                    self,
+                    role.surface.wl_surface().client().map(|client| client.id()),
+                );
+                #[cfg(not(feature = "bus"))]
+                let stalled = false;
                 (record.mapped
                     && record.layout.visible
+                    && !stalled
                     && role.surface.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::Exclusive)
                     .then_some((object.clone(), role.surface.wl_surface().clone(), record))
@@ -13626,8 +13778,27 @@ impl WaylandState {
                     Some(surface) => self.interaction_focus_root(&surface),
                     None => None,
                 };
+                // An Exclusive layer that holds the keyboard and demotes
+                // itself to OnDemand keeps it: the grab ends, the focus it
+                // was granted does not. (Quoin's panels ask for the grab only
+                // until it lands, so a later click elsewhere can move focus.)
+                // A layer with an active popup keyboard grab keeps the
+                // documented dismissal instead.
+                let demoted_keeps_focus = !fallback
+                    && !self.keyboard.is_grabbed()
+                    && previous_exclusive.is_some()
+                    && current_focus_surface.as_ref().is_some_and(|focus| {
+                        previous_exclusive.as_ref() == Some(&focus.id())
+                            && self.surfaces.get(&focus.id()).is_some_and(|record| {
+                                record.mapped && record.layout.visible
+                            })
+                            && self.layer_keyboard_interactivity_for_surface(focus)
+                                == Some(KeyboardInteractivity::OnDemand)
+                    });
                 if requested.is_some() {
                     requested
+                } else if demoted_keeps_focus {
+                    break 'focus_policy;
                 } else if fallback || current_layer_became_none || previous_exclusive.is_some() {
                     self.highest_visible_toplevel_surface()
                 } else if clear_if_unrequested {
@@ -14187,6 +14358,7 @@ impl WaylandState {
         self.begin_pointer_hit_test_batch();
         self.arrange_all_layer_outputs();
         let usable = self.usable_output_rect();
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
 
         let mut shifted_roots = Vec::new();
         let mut configure_surfaces = Vec::new();
@@ -14208,7 +14380,7 @@ impl WaylandState {
                 continue;
             }
             let server_side = record.committed_decoration == SceneDecorationMode::ServerSide;
-            let delta = if server_side {
+            let (delta, bounds) = if server_side {
                 let extents = DecoExtents::of(&decoration_theme);
                 let content_size = record.committed_window_geometry.map_or(
                     vec2(
@@ -14233,7 +14405,11 @@ impl WaylandState {
                 record.layout.y += delta.1;
                 record.window_origin.0 += delta.0;
                 record.window_origin.1 += delta.1;
-                delta
+                let bounds = (
+                    (usable.x + extents.left, max_x + extents.left),
+                    (usable.y + extents.top, max_y + extents.top),
+                );
+                (delta, bounds)
             } else {
                 let previous_origin = (record.layout.x, record.layout.y);
                 let max_x =
@@ -14244,10 +14420,49 @@ impl WaylandState {
                 record.layout.y = record.layout.y.clamp(usable.y, max_y);
                 record.window_origin.0 += record.layout.x - previous_origin.0;
                 record.window_origin.1 += record.layout.y - previous_origin.1;
+                let inset = (
+                    record.window_origin.0 - record.layout.x,
+                    record.window_origin.1 - record.layout.y,
+                );
                 (
-                    record.layout.x - previous_origin.0,
-                    record.layout.y - previous_origin.1,
+                    (
+                        record.layout.x - previous_origin.0,
+                        record.layout.y - previous_origin.1,
+                    ),
+                    (
+                        (usable.x + inset.0, max_x + inset.0),
+                        (usable.y + inset.1, max_y + inset.1),
+                    ),
                 )
+            };
+            // A clamp lands on the work-area edge minus the window's logical
+            // size, which is off the physical grid whenever that size is odd
+            // at 2.5x; settle the buffer back onto the nearest whole pixel
+            // that is still inside the clamp, so the snap neither slides the
+            // window under a panel nor shrinks the room it was clamped to fit.
+            let delta = if delta != (0.0, 0.0) {
+                let offset = (
+                    record.window_origin.0 - record.layout.x,
+                    record.window_origin.1 - record.layout.y,
+                );
+                let snapped = if grid_exempt(record) {
+                    record.window_origin
+                } else {
+                    (
+                        clamp_axis_to_grid(record.window_origin.0, offset.0, bounds.0, scale120),
+                        clamp_axis_to_grid(record.window_origin.1, offset.1, bounds.1, scale120),
+                    )
+                };
+                let extra = (
+                    snapped.0 - record.window_origin.0,
+                    snapped.1 - record.window_origin.1,
+                );
+                set_grid_origin(record, snapped, snapped);
+                record.layout.x += extra.0;
+                record.layout.y += extra.1;
+                (delta.0 + extra.0, delta.1 + extra.1)
+            } else {
+                delta
             };
             if delta != (0.0, 0.0) {
                 shifted_roots.push((record.id, delta));
@@ -14322,7 +14537,50 @@ impl WaylandState {
         // not the nested output's integer coordinate scale. Keep
         // wl_output.scale at 1 as the legacy-client fallback.
         self.publish_surface_preferred_scale(scale);
+        self.resnap_toplevels_to_physical_grid();
         tracing::info!(scale, "nested output scale changed");
+    }
+
+    /// The nested host window's swapchain changed size. Captures in flight
+    /// were admitted against the old extent and could only fail at copy time,
+    /// so they fail now, as on a logical resize.
+    fn change_output_physical_size(&mut self, width: u32, height: u32) {
+        if !self.backend.set_host_physical_size((width, height)) {
+            return;
+        }
+        let captures = self.capture_frames.keys().copied().collect::<Vec<_>>();
+        for id in captures {
+            self.fail_capture(id);
+        }
+        tracing::debug!(width, height, "nested output physical size changed");
+    }
+
+    /// Settle every placed Wayland toplevel onto the current scale's physical
+    /// pixel grid. A scale change moves the grid under windows that were on
+    /// the old one (x = 2 is whole at 2.5x, not at 1.75x).
+    fn resnap_toplevels_to_physical_grid(&mut self) {
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+        let targets = self
+            .surfaces
+            .values()
+            .filter(|record| {
+                if !matches!(record.role, SurfaceRole::Toplevel(_)) {
+                    return false;
+                }
+                let offset = record
+                    .committed_window_geometry
+                    .map(|geometry| (geometry.x, geometry.y))
+                    .unwrap_or_default();
+                physical_grid_window_origin(record, placement_anchor(record), offset, scale120)
+                    != record.window_origin
+            })
+            // From the anchor: re-snapping a snapped origin would drift across
+            // repeated scale changes (2.5 -> 1.25 -> 2.5 must round-trip).
+            .map(|record| (record.role.wl_surface().clone(), placement_anchor(record)))
+            .collect::<Vec<_>>();
+        for (surface, origin) in targets {
+            self.move_window_to(&surface, origin, "output.geometry");
+        }
     }
 
     fn publish_surface_preferred_scale(&self, scale: f64) {
@@ -14421,6 +14679,13 @@ impl WaylandState {
                         start_origin.1
                     },
                 );
+                let origin = self.anchored_resize_origin(
+                    &surface,
+                    origin,
+                    (start_origin, start_size),
+                    new_size,
+                    (left, top),
+                );
                 self.resize_window_to(&surface, origin, new_size, "wayland.map")
                     .unwrap_or_else(|| {
                         self.interactive_pointer = None;
@@ -14428,6 +14693,69 @@ impl WaylandState {
                     })
             }
         }
+    }
+
+    /// The whole-pixel origin for a left or top edge drag that keeps the
+    /// STATIONARY far edge on the physical pixel it started on. Snapping the
+    /// raw origin alone rounds origin and width separately, so the edge under
+    /// no one's hand would wobble a pixel as the drag crosses odd sizes.
+    fn anchored_resize_origin(
+        &self,
+        surface: &WlSurface,
+        raw: (f32, f32),
+        (start_origin, start_size): ((f32, f32), (i32, i32)),
+        new_size: (i32, i32),
+        (left, top): (bool, bool),
+    ) -> (f32, f32) {
+        let Some(record) = self.surfaces.get(&surface.id()) else {
+            return raw;
+        };
+        // The axis no one is dragging carries its recorded anchor, so the
+        // resize does not re-anchor it at a snapped value.
+        let anchor = placement_anchor(record);
+        if !left && !top {
+            return anchor;
+        }
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+        let offset = record
+            .committed_window_geometry
+            .map(|geometry| (geometry.x, geometry.y))
+            .unwrap_or_default();
+        let edge = |value: f32| crate::compositor_scene::physical_edge(value, scale120);
+        let far = (
+            edge(start_origin.0 + start_size.0 as f32),
+            edge(start_origin.1 + start_size.1 as f32),
+        );
+        let far_edges = |candidate: (f32, f32)| {
+            (
+                edge(candidate.0 + new_size.0 as f32),
+                edge(candidate.1 + new_size.1 as f32),
+            )
+        };
+        let candidates = grid_origin_candidates(record, raw, offset, scale120);
+        // Exactly on the starting pixel when a candidate can be. A far edge
+        // that sits on ZERO may have none (half-away rounding sends -0.5 to -1
+        // and +0.5 to +1); then keep it on the visible side, never behind the
+        // output's left or top edge, rather than let a fallback pick a side.
+        let chosen = candidates
+            .iter()
+            .copied()
+            .find(|candidate| {
+                let edges = far_edges(*candidate);
+                (!left || edges.0 == far.0) && (!top || edges.1 == far.1)
+            })
+            .or_else(|| {
+                candidates.iter().copied().find(|candidate| {
+                    let edges = far_edges(*candidate);
+                    (!left || (edges.0 >= far.0 && edges.0 - far.0 <= 1))
+                        && (!top || (edges.1 >= far.1 && edges.1 - far.1 <= 1))
+                })
+            })
+            .unwrap_or(candidates[0]);
+        (
+            if left { chosen.0 } else { anchor.0 },
+            if top { chosen.1 } else { anchor.1 },
+        )
     }
 
     /// A window size inside the client's (clamped) min/max constraints.
@@ -14449,13 +14777,16 @@ impl WaylandState {
         origin: (f32, f32),
         #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
     ) -> Option<bool> {
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let record = self.surfaces.get_mut(&surface.id())?;
         let old_origin = record.window_origin;
-        record.window_origin = origin;
         let offset = record
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
+        let anchor = requested_anchor(record, origin);
+        let placed = physical_grid_window_origin(record, anchor, offset, scale120);
+        set_grid_origin(record, anchor, placed);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         let delta = (
@@ -14503,16 +14834,19 @@ impl WaylandState {
         size: (i32, i32),
         #[cfg_attr(not(feature = "bus"), allow(unused_variables))] cause: &'static str,
     ) -> Option<bool> {
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let record = self.surfaces.get_mut(&surface.id())?;
         if size == record.configured_size {
             return Some(false);
         }
         let old_origin = record.window_origin;
-        record.window_origin = origin;
         let offset = record
             .committed_window_geometry
             .map(|geometry| (geometry.x, geometry.y))
             .unwrap_or_default();
+        let anchor = requested_anchor(record, origin);
+        let placed = physical_grid_window_origin(record, anchor, offset, scale120);
+        set_grid_origin(record, anchor, placed);
         record.layout.x = record.window_origin.0 - offset.0;
         record.layout.y = record.window_origin.1 - offset.1;
         record.configured_size = size;
@@ -14832,12 +15166,11 @@ impl WaylandState {
     }
 
     fn refresh_toplevel_window_geometry(&mut self, root: &WlSurface) {
-        let Some((size, old_layout, window_origin, mapped, id, explicit)) =
+        let Some((size, old_layout, mapped, id, explicit)) =
             self.surfaces.get(&root.id()).map(|record| {
                 (
                     (record.layout.width, record.layout.height),
                     (record.layout.x, record.layout.y),
-                    record.window_origin,
                     record.mapped,
                     record.id,
                     record.committed_window_geometry_explicit,
@@ -14850,15 +15183,17 @@ impl WaylandState {
             return;
         }
         let geometry = self.effective_window_geometry(root, size);
-        let new_layout = (window_origin.0 - geometry.x, window_origin.1 - geometry.y);
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let Some(record) = self.surfaces.get_mut(&root.id()) else {
             return;
         };
+        let previous = (record.window_origin, record.grid_placement);
+        settle_buffer_under_inset(record, (geometry.x, geometry.y), scale120);
+        let new_layout = (record.layout.x, record.layout.y);
         if record.committed_window_geometry == Some(geometry) && old_layout == new_layout {
+            (record.window_origin, record.grid_placement) = previous;
             return;
         }
-        record.layout.x = new_layout.0;
-        record.layout.y = new_layout.1;
         record.committed_window_geometry = Some(geometry);
         sync_toplevel_scene_state(record);
         let scene = record.scene_snapshot();
@@ -14885,6 +15220,7 @@ impl WaylandState {
             .get(&surface.id())
             .is_some_and(|r| r.committed_fullscreen);
         let extents = DecoExtents::of(&self.decoration.theme);
+        let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
         let (shifted, clear_chrome_pointer, chrome_scene_changed) = {
             let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                 return;
@@ -14947,8 +15283,7 @@ impl WaylandState {
                 .committed_window_geometry
                 .map(|geometry| (geometry.x, geometry.y))
                 .unwrap_or_default();
-            record.layout.x = record.window_origin.0 - geometry_offset.0;
-            record.layout.y = record.window_origin.1 - geometry_offset.1;
+            settle_buffer_under_inset(record, geometry_offset, scale120);
             sync_toplevel_scene_state(record);
             let layout_delta = (
                 record.layout.x - old_layout.0,
@@ -15592,6 +15927,8 @@ impl WaylandState {
                     #[cfg(feature = "bus")]
                     self.mark_surface_mapped(surface);
                     let current_workspace = self.workspace_current();
+                    let scale120 =
+                        crate::compositor_scene::output_scale120(self.backend.output_scale());
                     let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                         #[cfg(test)]
                         {
@@ -15607,8 +15944,11 @@ impl WaylandState {
                     workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                     let old_origin = (record.layout.x, record.layout.y);
                     if let Some(window_geometry) = window_geometry {
-                        record.layout.x = record.window_origin.0 - window_geometry.x;
-                        record.layout.y = record.window_origin.1 - window_geometry.y;
+                        settle_buffer_under_inset(
+                            record,
+                            (window_geometry.x, window_geometry.y),
+                            scale120,
+                        );
                         record.committed_window_geometry = Some(window_geometry);
                     }
                     record.layout.width = presentation.size.0;
@@ -15767,6 +16107,7 @@ impl WaylandState {
                 #[cfg(feature = "bus")]
                 self.mark_surface_mapped(surface);
                 let current_workspace = self.workspace_current();
+                let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
                 let Some(record) = self.surfaces.get_mut(&surface.id()) else {
                     return;
                 };
@@ -15775,8 +16116,11 @@ impl WaylandState {
                 workspaces::stamp_workspace_at_map(record, was_mapped, current_workspace);
                 let old_origin = (record.layout.x, record.layout.y);
                 if let Some(window_geometry) = window_geometry {
-                    record.layout.x = record.window_origin.0 - window_geometry.x;
-                    record.layout.y = record.window_origin.1 - window_geometry.y;
+                    settle_buffer_under_inset(
+                        record,
+                        (window_geometry.x, window_geometry.y),
+                        scale120,
+                    );
                     record.committed_window_geometry = Some(window_geometry);
                 }
                 record.layout.width = presentation.size.0;
@@ -16044,6 +16388,7 @@ fn invalidate_keyboard_action<T>(action: &mut Option<T>) {
 }
 
 mod acquire_gate;
+pub(crate) mod dmabuf_ledger;
 mod explicit_sync;
 mod focus;
 mod handlers;
@@ -16388,6 +16733,167 @@ fn validate_surface_buffer_size(
         ));
     }
     Ok(bytes)
+}
+
+/// The window-geometry origin nearest `origin` whose SURFACE origin
+/// (`origin - offset`, the buffer's top-left) lies on a whole physical pixel.
+///
+/// At a fractional scale an odd logical origin (x = 1 at 2.5x is 2.5 physical)
+/// makes the renderer's edge projection one pixel narrower or wider than the
+/// client's `round(width x scale)` buffer, so the content is resampled and
+/// blurs. On the grid, both edges project exactly and a neighbour placed at
+/// this window's reported origin plus its width shares its edge. The surface
+/// origin is snapped rather than the geometry origin because the buffer is what
+/// is sampled; a CSD shadow offset is an integer logical inset, not a pixel
+/// one. X11 windows keep their origin: X positions are integers in the X
+/// coordinate space, and Xwayland buffers are not fractional-scale anyway.
+/// Maximised and fullscreen windows keep theirs too: they are sized to the
+/// work area or output and must start exactly where it does. Only xdg
+/// toplevels are snapped; every other role keeps `origin`.
+fn physical_grid_window_origin(
+    record: &SurfaceRecord,
+    origin: (f32, f32),
+    offset: (f32, f32),
+    scale120: u32,
+) -> (f32, f32) {
+    grid_origin_candidates(record, origin, offset, scale120)[0]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GridPlacement {
+    anchor: (f32, f32),
+    placed: (f32, f32),
+}
+
+fn grid_exempt(record: &SurfaceRecord) -> bool {
+    !matches!(record.role, SurfaceRole::Toplevel(_))
+        || record.committed_maximized
+        || record.requested_maximized
+        || record.committed_fullscreen
+        || record.requested_fullscreen
+}
+
+/// Whole-pixel window origins around `anchor`, nearest first: per axis the
+/// grid point nearest the anchor and the one on its other side, combined.
+/// An exempt window has exactly one candidate, `anchor` itself.
+fn grid_origin_candidates(
+    record: &SurfaceRecord,
+    anchor: (f32, f32),
+    offset: (f32, f32),
+    scale120: u32,
+) -> Vec<(f32, f32)> {
+    if grid_exempt(record) {
+        return vec![anchor];
+    }
+    let xs = crate::compositor_scene::physical_grid_neighbours(anchor.0 - offset.0, scale120)
+        .map(|x| x + offset.0);
+    let ys = crate::compositor_scene::physical_grid_neighbours(anchor.1 - offset.1, scale120)
+        .map(|y| y + offset.1);
+    // Ordered by per-axis rank, not by measured distance: at a half-pixel tie
+    // the two neighbours are equally far and f32 noise would pick either, while
+    // the renderer's projection (and so a neighbour's shared edge) resolves the
+    // tie deterministically. Its choice is `neighbours[0]`; keep it first.
+    vec![
+        (xs[0], ys[0]),
+        (xs[1], ys[0]),
+        (xs[0], ys[1]),
+        (xs[1], ys[1]),
+    ]
+}
+
+/// The nearest whole-pixel origin around `anchor` that `accept` admits, or
+/// the nearest one when none does.
+fn choose_grid_origin(
+    record: &SurfaceRecord,
+    anchor: (f32, f32),
+    offset: (f32, f32),
+    scale120: u32,
+    accept: impl Fn((f32, f32)) -> bool,
+) -> (f32, f32) {
+    let candidates = grid_origin_candidates(record, anchor, offset, scale120);
+    candidates
+        .iter()
+        .copied()
+        .find(|candidate| accept(*candidate))
+        .unwrap_or(candidates[0])
+}
+
+/// Where comp last meant this window to be: the recorded anchor while the
+/// window still stands where that placement put it, else its origin now
+/// (something other than a grid placement moved it since).
+fn placement_anchor(record: &SurfaceRecord) -> (f32, f32) {
+    match record.grid_placement {
+        Some(placement) if placement.placed == record.window_origin => placement.anchor,
+        _ => record.window_origin,
+    }
+}
+
+/// One axis of a clamped window origin on the whole-pixel grid: the nearest
+/// grid neighbour inside `[low, high]`, else (an interval narrower than a
+/// pixel, which is what `max(usable.x)` collapses to when the window is wider
+/// than the work area) the nearest neighbour at or past `low`, so the window
+/// never slides under a panel; the size clamp that follows shrinks it anyway.
+/// The result is on the grid, so the caller records it as the anchor and a
+/// later commit's settle keeps it rather than re-snapping to the nearest.
+fn clamp_axis_to_grid(value: f32, offset: f32, (low, high): (f32, f32), scale120: u32) -> f32 {
+    const SLACK: f32 = 1e-3;
+    let neighbours =
+        crate::compositor_scene::physical_grid_neighbours(value - offset, scale120).map(|v| v + offset);
+    if let Some(inside) = neighbours
+        .iter()
+        .copied()
+        .find(|v| *v >= low - SLACK && *v <= high + SLACK)
+    {
+        return inside;
+    }
+    neighbours
+        .iter()
+        .copied()
+        .filter(|v| *v >= low - SLACK)
+        .min_by(f32::total_cmp)
+        .unwrap_or(value)
+}
+
+/// The anchor a move or resize request should record. An axis the request
+/// leaves where the window already stands (a right-edge drag, a size-only
+/// place, the unmoved axis of a left drag) keeps its recorded anchor; taking
+/// the snapped position as a new anchor there would let an inset that changes
+/// between requests walk the window 0.2 logical per round at 2.5x.
+fn requested_anchor(record: &SurfaceRecord, origin: (f32, f32)) -> (f32, f32) {
+    const SAME: f32 = 1e-3;
+    let anchor = placement_anchor(record);
+    (
+        if (origin.0 - record.window_origin.0).abs() < SAME {
+            anchor.0
+        } else {
+            origin.0
+        },
+        if (origin.1 - record.window_origin.1).abs() < SAME {
+            anchor.1
+        } else {
+            origin.1
+        },
+    )
+}
+
+/// Stand the window at `placed`, remembering `anchor` for later re-snaps.
+fn set_grid_origin(record: &mut SurfaceRecord, anchor: (f32, f32), placed: (f32, f32)) {
+    record.grid_placement = Some(GridPlacement { anchor, placed });
+    record.window_origin = placed;
+}
+
+/// The one rule every commit path uses when a window-geometry inset lands:
+/// the geometry origin stays where comp placed it and the buffer goes under
+/// it, re-derived from the placement anchor so repeated inset changes (GTK
+/// shadows change on focus) cannot accumulate a half-pixel tie.
+fn settle_buffer_under_inset(record: &mut SurfaceRecord, offset: (f32, f32), scale120: u32) {
+    if !grid_exempt(record) {
+        let anchor = placement_anchor(record);
+        let placed = physical_grid_window_origin(record, anchor, offset, scale120);
+        set_grid_origin(record, anchor, placed);
+    }
+    record.layout.x = record.window_origin.0 - offset.0;
+    record.layout.y = record.window_origin.1 - offset.1;
 }
 
 fn logical_surface_size(width: u32, height: u32, buffer_scale: i32) -> Result<(f32, f32), String> {
@@ -17203,6 +17709,43 @@ fn send_frames_surface_tree_limited(
         |_, _, &()| true,
     );
     batch
+}
+
+/// Complete the oldest queued frame callback of EVERY surface in the tree that
+/// has one, and return their ids. Per surface, not per tree: a callback
+/// releases only its own surface's present, so a root that re-requests every
+/// interval must not starve a FIFO-blocked subsurface (a GL or video
+/// subsurface on its own thread). Bounded by the tree's size.
+fn complete_oldest_frame_callback_per_surface(
+    surface: &WlSurface,
+    time: u32,
+    surfaces: &HashMap<ObjectId, SurfaceRecord>,
+) -> Vec<ObjectId> {
+    let mut completed = Vec::new();
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, states, &()| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let callbacks = &mut attributes.current().frame_callbacks;
+            if callbacks.is_empty() {
+                return;
+            }
+            let callback = callbacks.remove(0);
+            callback.done(time);
+            crate::frame_trace::event("comp_callback_done_queued", || {
+                (
+                    surfaces.get(&surface.id()).map_or(0, |record| record.id.0),
+                    u64::from(callback.id().protocol_id()),
+                    u64::from(surface.id().protocol_id()),
+                )
+            });
+            completed.push(callback.id());
+        },
+        |_, _, &()| true,
+    );
+    completed
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -830,7 +830,11 @@ fn build_live_render_app(
     capture_advertisements: crate::capture::CaptureAdvertisementRegistry,
     scene_mode: LiveSceneMode,
     decoration: DecorationStartup,
+    bus_service: String,
 ) -> Result<App, super::kms_live::KmsLiveError> {
+    // Only the (feature-gated) Quoin installs below consume the name.
+    #[cfg(not(any(feature = "hud-probe", feature = "embedded-quoin")))]
+    let _ = bus_service;
     let mut app = App::new();
     init_chrome_font_cx(&mut app);
     app.insert_resource(decoration)
@@ -846,7 +850,7 @@ fn build_live_render_app(
     install_live_scene(&mut app, scene_mode);
     #[cfg(feature = "hud-probe")]
     if scene_mode == LiveSceneMode::ClientContent {
-        hud_probe::install_from_environment(&mut app);
+        hud_probe::install_from_environment(&mut app, &bus_service);
     }
     // Native Quoin as a PERSISTENT desktop, independent of the hud-probe
     // comparison harness. Previously embedded_shell::install ran ONLY from
@@ -863,7 +867,7 @@ fn build_live_render_app(
         && std::env::var("COSMIX_COMP_EMBEDDED_QUOIN").as_deref() == Ok("1")
         && std::env::var("COSMIX_COMP_HUD_PROBE").as_deref() != Ok("1")
     {
-        crate::embedded_shell::install(&mut app);
+        crate::embedded_shell::install(&mut app, &bus_service);
         // Force continuous rendering in native mode. Without it comp's
         // idle-render-skip (backend/render_idle.rs) stops driving the pulse
         // when it judges the scene settled, and pointer motion then delays
@@ -2697,6 +2701,9 @@ struct LivePreparedBackend {
 struct LiveRenderScene {
     mode: LiveSceneMode,
     decoration: DecorationStartup,
+    /// This compositor's Bus service name, for the embedded Quoin's
+    /// comp-service selection.
+    bus_service: String,
 }
 
 #[cfg(any(all(feature = "kms-live", not(test)), test))]
@@ -2709,6 +2716,7 @@ impl LiveRenderPump {
         target_pairing: super::kms_live::LiveTargetPairingLedger,
         scene_mode: LiveSceneMode,
         decoration: DecorationStartup,
+        bus_service: String,
     ) -> Result<LiveRenderPumpPreparation, super::kms_live::KmsLiveError> {
         let (commands, command_receiver) = mpsc::sync_channel(1);
         let (preparation_sender, preparation_receiver) = mpsc::sync_channel(0);
@@ -2734,6 +2742,7 @@ impl LiveRenderPump {
                     LiveRenderScene {
                         mode: scene_mode,
                         decoration,
+                        bus_service,
                     },
                     atomic_cancellation,
                 );
@@ -3089,6 +3098,7 @@ fn run_live_render_pump(
         capture_advertisements,
         scene_mode,
         scene.decoration,
+        scene.bus_service,
     ) {
         Ok(app) => app,
         Err(error) => {

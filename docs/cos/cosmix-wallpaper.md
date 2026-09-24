@@ -66,9 +66,13 @@ No-op or rejected writes do not advance the sequence. Multiple writes can
 coalesce into one notification; a full outbound queue retains one pending
 invalidation for retry, and reconnect invalidates subscribers again.
 
-Notifications are non-retained, best-effort hints. Re-read with `.get` after
-watching, after a notification or reconnect, and every second to recover from
-a missed final event. A new process instance resets the sequence. Do not
+Notifications are non-retained, best-effort hints: noded drops one silently
+when a subscriber's queue is full. Re-read with `.get` after watching, after a
+notification or reconnect, when `event_seq` jumps or the `instance` changes,
+and whenever the consumer starts showing the preferences again (for example,
+on page open). A consumer may also reconcile slowly while it is showing them,
+to recover a missed final event; the 1 s re-read that `reconcile_ms`
+advertises is not required. A new process instance resets the sequence. Do not
 reconstruct preferences by counting events or treating the notification as a
 snapshot. These counters and the instance are never persisted.
 

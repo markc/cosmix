@@ -8,30 +8,50 @@ const MIN_STATIONARY_CONFIRM_MS: u64 = 1;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct CornerConfig {
     pub(crate) enabled: bool,
+    /// Hotspot side in logical units (shell design §2): the square at each
+    /// output corner that detects, and that the affordance draws.
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
-    pub(crate) hold_ms: u64,
     pub(crate) velocity_max_px_s: f64,
+    /// Comp draws the hover reveal, release flash and discovery flash
+    /// (shell design §8.7: disableable, so corners may be silent).
+    pub(crate) affordance: bool,
+    /// Slow discovery flash on every hotspot until the first reveal
+    /// (shell design §8.5). Comp cannot know "first run" — it keeps no
+    /// state across restarts — so the shell turns this on; comp turns it
+    /// off at the first engagement.
+    pub(crate) discovery: bool,
 }
 
 impl Default for CornerConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            deadzone_px: 12.0,
+            deadzone_px: 10.0,
             dwell_ms: 200,
-            hold_ms: 500,
             velocity_max_px_s: 1_500.0,
+            affordance: true,
+            discovery: false,
         }
     }
 }
 
 impl CornerConfig {
+    /// The fields that shape detection. Drawing-only leaves are excluded so
+    /// toggling them never ends an engagement.
+    fn detection(self) -> (bool, f64, u64, f64) {
+        (
+            self.enabled,
+            self.deadzone_px,
+            self.dwell_ms,
+            self.velocity_max_px_s,
+        )
+    }
+
     pub(crate) fn valid(self) -> bool {
         self.deadzone_px.is_finite()
             && (1.0..=256.0).contains(&self.deadzone_px)
             && self.dwell_ms <= 5_000
-            && (1..=5_000).contains(&self.hold_ms)
             && self.velocity_max_px_s.is_finite()
             && (1.0..=20_000.0).contains(&self.velocity_max_px_s)
     }
@@ -46,6 +66,34 @@ pub(crate) enum Corner {
 }
 
 impl Corner {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::TopLeft,
+        Self::TopRight,
+        Self::BottomLeft,
+        Self::BottomRight,
+    ];
+
+    /// Position in [`Corner::ALL`]; the affordance indexes squares by it.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::TopLeft => 0,
+            Self::TopRight => 1,
+            Self::BottomLeft => 2,
+            Self::BottomRight => 3,
+        }
+    }
+
+    /// The panel edge this corner's hotspot governs: the next edge
+    /// counter-clockwise (shell design §2), named as the holder plane names it.
+    pub(crate) const fn summoned_edge(self) -> &'static str {
+        match self {
+            Self::TopLeft => "left",
+            Self::BottomLeft => "bottom",
+            Self::BottomRight => "right",
+            Self::TopRight => "top",
+        }
+    }
+
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::TopLeft => "tl",
@@ -106,6 +154,13 @@ impl CornerDetector {
 
     pub(crate) fn engaged_corner(&self) -> Option<Corner> {
         self.engaged.map(|e| e.corner)
+    }
+
+    /// The hotspot the pointer is in, dwelled or not.
+    pub(crate) fn contact_corner(&self) -> Option<Corner> {
+        self.engaged
+            .map(|engaged| engaged.corner)
+            .or(self.candidate.map(|candidate| candidate.corner))
     }
 
     pub(crate) fn engaged_dwell_ms(&self) -> Option<u64> {
@@ -237,7 +292,7 @@ impl CornerDetector {
     }
 
     pub(crate) fn reconfigure(&mut self, config: CornerConfig, size: (f64, f64)) -> CornerEvents {
-        let changed = self.config != config || self.size != size;
+        let changed = self.config.detection() != config.detection() || self.size != size;
         self.config = config;
         self.size = size;
         if changed || !config.enabled || !config.valid() || !valid_size(size) {
@@ -436,6 +491,51 @@ mod tests {
         let mut detector = detector();
         detector.sample(10, (5.0, 5.0), (0.0, 0.0));
         assert_eq!(detector.sample(9, (5.0, 5.0), (-1.0, 0.0)), [None, None]);
+    }
+
+    #[test]
+    fn default_hotspot_is_ten_logical_units_and_edges_are_inclusive() {
+        let config = CornerConfig::default();
+        assert_eq!(config.deadzone_px, 10.0);
+        assert!(config.valid());
+        assert!(config.affordance, "hover reveal is on unless disabled");
+        assert!(
+            !config.discovery,
+            "the shell opts in to the first-run flash"
+        );
+        assert_eq!(corner_at((10.0, 10.0), SIZE, 10.0), Some(Corner::TopLeft));
+        assert_eq!(corner_at((10.5, 1.0), SIZE, 10.0), None);
+        assert_eq!(corner_at((11.0, 11.0), SIZE, 10.0), None);
+    }
+
+    #[test]
+    fn affordance_and_discovery_toggles_do_not_end_an_engagement() {
+        let mut detector = detector();
+        detector.sample(0, (5.0, 5.0), (0.0, 0.0));
+        detector.sample(200, (5.0, 5.0), (0.0, 0.0));
+        assert_eq!(detector.engaged_corner(), Some(Corner::TopLeft));
+        let config = CornerConfig {
+            affordance: false,
+            discovery: true,
+            ..CornerConfig::default()
+        };
+        assert_eq!(detector.reconfigure(config, SIZE), [None, None]);
+        assert_eq!(detector.engaged_corner(), Some(Corner::TopLeft));
+    }
+
+    /// Quoin insets its carousel chevrons by comp's hotspot size and falls
+    /// back to a mirrored constant until the first Bus observation. The
+    /// mirror lives in a crate comp cannot depend on, so read its source.
+    #[test]
+    fn quoin_hotspot_mirror_matches_default_deadzone() {
+        let chrome = include_str!("../../../cosmix-shell/src/chrome.rs");
+        let needle = "pub const DEFAULT_COMP_HOTSPOT_PX: f32 = ";
+        let start = chrome.find(needle).expect("Quoin mirror constant exists") + needle.len();
+        let literal = chrome[start..].split(';').next().unwrap().trim();
+        let mirrored = literal
+            .parse::<f64>()
+            .expect("mirror is a plain float literal");
+        assert_eq!(mirrored, CornerConfig::default().deadzone_px);
     }
 
     #[test]

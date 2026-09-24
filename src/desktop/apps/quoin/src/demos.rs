@@ -18,20 +18,55 @@ use ctk::{
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
 
+use crate::wallpaper::{RETRY_INITIAL, arm, next_backoff};
+
 #[derive(Clone)]
 struct Call {
     verb: &'static str,
     body: Value,
 }
-#[derive(Default)]
+/// Neither `bg-showcase` (`background.status`) nor `capture`
+/// (`capture.status`) publishes a change notification for the state this
+/// page shows, and capture phases move on their own (a recording finishes,
+/// auto-stops at 300 s, finalises). So while — and only while — the page is
+/// visible, status is re-read no faster than this; hidden, nothing polls and
+/// opening the page reads immediately.
+const VISIBLE_REFRESH: Duration = Duration::from_secs(5);
+
 struct Lane {
     snapshot: Option<Value>,
     pending: Option<(u64, bool, Duration)>,
     queued: Option<Call>,
-    refresh: Duration,
+    /// When the next status read is due.
+    refresh: Option<Duration>,
+    /// Delay applied after the next failed read.
+    backoff: Duration,
+    /// A status read owed regardless of page visibility: the connection's
+    /// bootstrap and the readback after an action. Cleared on send, so a
+    /// bootstrap that fails while hidden is not retried hidden: opening the
+    /// tab reads anyway, and nothing on screen shows the stale value.
+    owed: bool,
     feedback: String,
 }
+impl Default for Lane {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            pending: None,
+            queued: None,
+            refresh: Some(Duration::ZERO),
+            backoff: RETRY_INITIAL,
+            owed: true,
+            feedback: String::new(),
+        }
+    }
+}
 impl Lane {
+    fn failed(&mut self, now: Duration) {
+        self.snapshot = None;
+        self.refresh = Some(now + self.backoff);
+        self.backoff = next_backoff(self.backoff);
+    }
     fn can_act(&self) -> bool {
         self.snapshot.is_some()
             && self.queued.is_none()
@@ -61,20 +96,21 @@ impl Lane {
                                 self.feedback.clear();
                             }
                         }
-                        self.refresh = if action {
-                            now
-                        } else {
-                            now + Duration::from_secs(1)
-                        };
                         if action {
+                            // Read the action's effect back straight away.
+                            self.refresh = Some(now);
+                            self.owed = true;
                             self.feedback.clear();
                             self.snapshot = None;
+                        } else {
+                            self.refresh = Some(now + VISIBLE_REFRESH);
+                            self.backoff = RETRY_INITIAL;
                         }
                     }
                     _ => {
-                        self.snapshot = None;
                         self.feedback = "Invalid service reply".into();
-                        self.refresh = now + Duration::from_secs(2);
+                        self.owed |= action;
+                        self.failed(now);
                     }
                 },
                 other => {
@@ -82,8 +118,8 @@ impl Lane {
                         Ok(reply) => reply.body.clone(),
                         Err(error) => error.to_string(),
                     };
-                    self.snapshot = None;
-                    self.refresh = now + Duration::from_secs(2);
+                    self.owed |= action;
+                    self.failed(now);
                 }
             }
         }
@@ -93,18 +129,29 @@ impl Lane {
         bridge: &BusBridge,
         now: Duration,
         id: &mut u64,
-        target: &str,
-        status: &'static str,
+        (target, status): (&str, &'static str),
+        visible: bool,
         deadline: &mut LayerHostDeadline,
     ) {
-        if self.pending.is_some_and(|(_, _, at)| now >= at) {
+        if let Some((_, action, at)) = self.pending
+            && now >= at
+        {
             self.pending = None;
             self.snapshot = None;
             self.queued = None;
             self.feedback = "Timed out; checking service state".into();
-            self.refresh = now;
+            if action {
+                // An unconfirmed action owes its status readback at once.
+                self.refresh = Some(now);
+                self.owed = true;
+            } else {
+                // A hung producer is a failed read: back off, visible-only.
+                self.failed(now);
+            }
         }
-        if self.pending.is_none() && (self.queued.is_some() || now >= self.refresh) {
+        let may_read = visible || self.owed;
+        let due = may_read && self.refresh.is_some_and(|at| now >= at);
+        if self.pending.is_none() && (self.queued.is_some() || due) {
             *id += 1;
             let action = self.queued.is_some();
             let call = self.queued.clone().unwrap_or(Call {
@@ -121,14 +168,24 @@ impl Lane {
                 )
                 .is_ok()
             {
+                if !action {
+                    self.refresh = None;
+                    self.owed = false;
+                }
                 self.queued = None;
                 self.pending = Some((*id, action, now + Duration::from_secs(3)));
             } else {
-                self.refresh = now + Duration::from_millis(250);
+                // Bridge queue full: a local condition, retried shortly.
+                self.refresh = Some(now + Duration::from_millis(250));
             }
         }
-        let at = self.pending.map_or(self.refresh, |(_, _, at)| at);
-        deadline.0 = Some(deadline.0.map_or(at, |existing| existing.min(at)));
+        if let Some((_, _, at)) = self.pending {
+            arm(deadline, at);
+        } else if let Some(at) = self.refresh
+            && (may_read || self.queued.is_some())
+        {
+            arm(deadline, at);
+        }
     }
 }
 
@@ -138,6 +195,8 @@ pub(crate) struct DemoState {
     next: u64,
     background: Lane,
     capture: Lane,
+    /// Last page visibility seen by `present` (post-model, same update).
+    visible: bool,
 }
 impl Default for DemoState {
     fn default() -> Self {
@@ -146,10 +205,33 @@ impl Default for DemoState {
             next: 0x58_0000_0000,
             background: Lane::default(),
             capture: Lane::default(),
+            visible: false,
         }
     }
 }
 impl DemoState {
+    /// Record the page's visibility from `present`. Opening the page makes
+    /// each idle lane's status read due now (nothing refreshed it while
+    /// hidden). Returns true when a read became due; the caller requests a
+    /// redraw so the next update sends it. A lane with a read in flight is
+    /// answered by that reply instead.
+    ///
+    /// Hiding does not disarm a deadline already merged into the shared
+    /// host deadline (a backoff or `VISIBLE_REFRESH`): it fires once as a
+    /// no-op wake, then nothing is armed while hidden.
+    fn set_visible(&mut self, visible: bool) -> bool {
+        let mut due = false;
+        if visible && !self.visible && self.connected {
+            for lane in [&mut self.background, &mut self.capture] {
+                if lane.pending.is_none() {
+                    lane.refresh = Some(Duration::ZERO);
+                    due = true;
+                }
+            }
+        }
+        self.visible = visible;
+        due
+    }
     pub(crate) fn event(&mut self, event: &BusBridgeEvent, now: Duration) {
         match event {
             BusBridgeEvent::Connection { state, .. } => {
@@ -181,16 +263,16 @@ impl DemoState {
             bridge,
             now,
             &mut self.next,
-            "bg-showcase",
-            "background.status",
+            ("bg-showcase", "background.status"),
+            self.visible,
             deadline,
         );
         self.capture.tick(
             bridge,
             now,
             &mut self.next,
-            "capture",
-            "capture.status",
+            ("capture", "capture.status"),
+            self.visible,
             deadline,
         );
     }
@@ -367,12 +449,16 @@ fn activate(
 fn present(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    state: Res<DemoState>,
+    (mut state, mut redraw): (ResMut<DemoState>, MessageWriter<bevy::window::RequestRedraw>),
     mut focus: ResMut<InputFocus>,
     mut buttons: Query<(Entity, &Action, &mut TabIndex, Has<InteractionDisabled>)>,
     mut labels: Query<(&ActionLabel, &mut Text), Without<Feedback>>,
     mut feedback: Query<(&Feedback, &mut Text), Without<ActionLabel>>,
 ) {
+    if state.visible != visible(&frame) && state.set_visible(visible(&frame)) {
+        // Captured in `Last` this update: an immediate re-update sends it.
+        redraw.write(bevy::window::RequestRedraw);
+    }
     for (entity, &action, mut tab, disabled) in &mut buttons {
         let enabled = visible(&frame) && allowed(&state, action);
         let wanted = if enabled { 0 } else { -1 };
@@ -538,6 +624,161 @@ mod tests {
         assert!(lane.feedback.is_empty());
         assert_eq!(lane.snapshot.unwrap()["path"], "/captures/demo.mp4");
     }
+    fn ok(id: u64, value: Value) -> BusBridgeEvent {
+        BusBridgeEvent::Reply {
+            request_id: id,
+            result: Ok(BusReply {
+                rc: 0,
+                body: value.to_string(),
+                result: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn status_is_not_polled_while_hidden_and_only_slowly_while_visible() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = DemoState::default();
+        state.event(
+            &BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation: 1,
+            },
+            Duration::ZERO,
+        );
+        // The bootstrap read is owed even with the page hidden.
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        for call in peer.drain_calls() {
+            state.event(
+                &ok(call.request_id, json!({"scene":"boing","phase":"idle"})),
+                Duration::ZERO,
+            );
+        }
+        for secs in [5, 10, 60] {
+            let mut deadline = LayerHostDeadline::default();
+            state.tick(&bridge, Duration::from_secs(secs), &mut deadline);
+            assert!(peer.drain_calls().is_empty(), "hidden poll at {secs}s");
+            assert_eq!(deadline.0, None, "hidden wake at {secs}s");
+        }
+        // Opening the page makes both lanes due now (the caller redraws).
+        let mut deadline = LayerHostDeadline::default();
+        assert!(state.set_visible(true));
+        assert_eq!(state.capture.refresh, Some(Duration::ZERO));
+        let now = Duration::from_secs(61);
+        state.tick(&bridge, now, &mut deadline);
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            state.event(&ok(call.request_id, json!({"scene":"boing"})), now);
+        }
+        assert_eq!(state.background.refresh, Some(now + VISIBLE_REFRESH));
+        state.tick(
+            &bridge,
+            now + VISIBLE_REFRESH - Duration::from_millis(1),
+            &mut LayerHostDeadline::default(),
+        );
+        assert!(peer.drain_calls().is_empty(), "no faster than VISIBLE_REFRESH");
+        state.tick(&bridge, now + VISIBLE_REFRESH, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls().len(), 2);
+    }
+
+    #[test]
+    fn failed_status_backs_off_to_a_cap_and_only_retries_while_visible() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut lane = Lane::default();
+        let mut id = 0;
+        let mut now = Duration::ZERO;
+        let mut gaps = Vec::new();
+        let tick = |lane: &mut Lane, id: &mut u64, now: Duration, visible: bool| {
+            let mut deadline = LayerHostDeadline::default();
+            lane.tick(&bridge, now, id, ("capture", "capture.status"), visible, &mut deadline);
+            deadline.0
+        };
+        for _ in 0..7 {
+            tick(&mut lane, &mut id, now, true);
+            let call = peer.drain_calls().remove(0);
+            lane.event(
+                &BusBridgeEvent::Reply {
+                    request_id: call.request_id,
+                    result: Err("capture is down".into()),
+                },
+                now,
+            );
+            let at = lane.refresh.expect("a failure schedules a retry");
+            tick(&mut lane, &mut id, at - Duration::from_millis(1), true);
+            assert!(peer.drain_calls().is_empty());
+            gaps.push((at - now).as_secs());
+            now = at;
+        }
+        assert_eq!(gaps, [2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(tick(&mut lane, &mut id, now, false), None);
+        assert!(peer.drain_calls().is_empty(), "hidden page: no retry");
+        tick(&mut lane, &mut id, now, true);
+        let call = peer.drain_calls().remove(0);
+        lane.event(&ok(call.request_id, json!({"phase":"idle"})), now);
+        assert_eq!(lane.backoff, RETRY_INITIAL, "success resets the backoff");
+    }
+
+    #[test]
+    fn a_hidden_action_is_still_read_back_and_other_deadlines_survive() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut state = DemoState::default();
+        state.event(
+            &BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation: 1,
+            },
+            Duration::ZERO,
+        );
+        state.tick(&bridge, Duration::ZERO, &mut LayerHostDeadline::default());
+        for call in peer.drain_calls() {
+            state.event(&ok(call.request_id, json!({"scene":"boing"})), Duration::ZERO);
+        }
+        // Another projection's wake survives a hidden tick with reads due.
+        let holders = Some(Duration::from_secs(7));
+        let mut deadline = LayerHostDeadline(holders);
+        state.tick(&bridge, VISIBLE_REFRESH * 4, &mut deadline);
+        assert!(peer.drain_calls().is_empty());
+        assert_eq!(deadline.0, holders);
+        // The page is hidden right after the click: the ack still owes a
+        // status readback, sent without the page.
+        state.background.queue("boing.kick", json!({}));
+        let now = VISIBLE_REFRESH * 4;
+        state.tick(&bridge, now, &mut LayerHostDeadline::default());
+        let kick = peer.drain_calls().remove(0);
+        assert_eq!(kick.command, "boing.kick");
+        state.event(&ok(kick.request_id, json!({"accepted":true})), now);
+        state.tick(&bridge, now, &mut LayerHostDeadline::default());
+        assert_eq!(peer.drain_calls()[0].command, "background.status");
+    }
+
+    #[test]
+    fn a_timed_out_status_backs_off_and_a_hidden_one_is_not_retried() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut id = 0;
+        let mut tick = |lane: &mut Lane, now: Duration, visible: bool| {
+            let mut deadline = LayerHostDeadline::default();
+            lane.tick(&bridge, now, &mut id, ("capture", "capture.status"), visible, &mut deadline);
+            deadline.0
+        };
+        for visible in [true, false] {
+            let mut lane = Lane::default();
+            tick(&mut lane, Duration::ZERO, visible);
+            assert_eq!(peer.drain_calls().len(), 1);
+            let timeout = Duration::from_secs(3);
+            tick(&mut lane, timeout, visible);
+            assert!(peer.drain_calls().is_empty(), "no flat 3 s retry");
+            assert_eq!(lane.refresh, Some(timeout + RETRY_INITIAL));
+            let armed = tick(&mut lane, timeout + RETRY_INITIAL, visible);
+            if visible {
+                assert_eq!(peer.drain_calls().len(), 1, "visible: backed-off retry");
+            } else {
+                assert!(peer.drain_calls().is_empty(), "hidden: no retry");
+                assert_eq!(armed, None, "hidden: no retry wake");
+            }
+        }
+    }
+
     #[test]
     fn finalising_is_not_a_saved_file_or_a_new_recording_opportunity() {
         let mut state = DemoState::default();

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bevy::ecs::message::MessageWriter;
 use bevy::prelude::*;
@@ -8,10 +8,11 @@ use cosmix_props_core::{PropDescribe, PropPath, PropTree, PropType, PropValue};
 use cosmix_shell::core::{Corner, Edge, PanelMode};
 use cosmix_shell::runtime::{
     ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
-    ShellSemanticVerb, semantic_shell_command,
+    ShellSemanticVerb, SubPanelRegistryState, remove_owned_subpanels_before,
+    semantic_shell_command,
 };
 use ctk::app_control::verify_caller_provenance;
-use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, InboundRequest};
+use ctk::bus::{BusBridge, BusBridgeEvent, BusConnectionState, BusMessage, InboundRequest};
 use serde_json::{Value, json};
 
 use crate::power::{PowerAction, PowerSync};
@@ -50,6 +51,15 @@ struct ShellBusState {
     /// own timeout — worse than answering late.
     pending_replies: Vec<(InboundRequest, u8, String, Option<ShellCommand>)>,
     pending_resizes: BTreeMap<u64, (InboundRequest, u64)>,
+    /// Local receipt ordering, not a broker incarnation token. Absence sweeps
+    /// only affect reservations accepted strictly before their cutoff.
+    /// CTK uses separate control/telemetry planes: this orders consumption in
+    /// Quoin, not the owner's real lifetime across both broker connections.
+    citizen_receipt: u64,
+    disconnected_citizens: BTreeMap<String, u64>,
+    /// Request id, connection generation and conservative acceptance cutoff.
+    citizen_snapshot: Option<(u64, u64, u64)>,
+    citizen_snapshot_retry: bool,
     frame: u64,
 }
 
@@ -64,6 +74,10 @@ impl Default for ShellBusState {
             live_generation: None,
             pending_replies: Vec::new(),
             pending_resizes: BTreeMap::new(),
+            citizen_receipt: 0,
+            disconnected_citizens: BTreeMap::new(),
+            citizen_snapshot: None,
+            citizen_snapshot_retry: false,
             frame: 0,
         }
     }
@@ -88,25 +102,60 @@ impl BusDiagnostics {
 
 pub(crate) struct ShellBusPlugin;
 
+/// Ordering seam for hosts that prepare the selected output inside the
+/// Update schedule: the embedded host replaces the shell model in its
+/// `prepare` system, and a seat reserved by a dispatch against the outgoing
+/// output must queue its command against the replacement — not against an
+/// output the Model stage would drop. Hosts order their output preparation
+/// `.before` this set.
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ShellBusDispatch;
+
 impl Plugin for ShellBusPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ShellBusState>()
+            .init_resource::<cosmix_shell::chrome::QuoinHotspotSize>()
+            .init_resource::<SubPanelRegistryState>()
             .init_resource::<cosmix_scene_bevy::SceneStore>()
             .init_resource::<cosmix_scene_bevy::SceneEvents>()
             .init_resource::<crate::wallpaper::WallpaperState>()
             .init_resource::<crate::demos::DemoState>()
+            .init_resource::<crate::config::ShellConfig>()
+            .add_message::<cosmix_shell::chrome::QuoinSchemeSelected>()
             .init_resource::<cosmix_shell_host::LayerHostDeadline>()
             .add_message::<cosmix_shell::runtime::ShellResizeResult>()
-            .add_systems(Update, service_bus.in_set(ShellRuntimeSet::Input))
-            .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation));
+            .add_systems(
+                Update,
+                service_bus
+                    .in_set(ShellBusDispatch)
+                    .in_set(ShellRuntimeSet::Input),
+            )
+            .add_systems(
+                Update,
+                apply_citizen_disconnects
+                    .in_set(ShellRuntimeSet::Input)
+                    .after(service_bus),
+            )
+            .add_systems(Update, reply_resizes.in_set(ShellRuntimeSet::Presentation))
+            .add_systems(
+                Update,
+                crate::holders::report_holders
+                    .in_set(ShellRuntimeSet::Presentation)
+                    .after(service_bus),
+            );
     }
 }
 
 #[derive(bevy::ecs::system::SystemParam)]
 struct SceneBus<'w, 's> {
+    holders: Option<ResMut<'w, crate::holders::HolderClient>>,
+    targets: Option<ResMut<'w, crate::activation::ActivationTargets>>,
     power_text: Query<'w, 's, &'static mut Text, With<QuoinPowerText>>,
     scenes: ResMut<'w, cosmix_scene_bevy::SceneStore>,
     events: ResMut<'w, cosmix_scene_bevy::SceneEvents>,
+    registry: ResMut<'w, SubPanelRegistryState>,
+    config: ResMut<'w, crate::config::ShellConfig>,
+    schemes: MessageWriter<'w, cosmix_shell::chrome::QuoinSchemeSelected>,
 }
 
 // Reply after model application in the same update: a refusal need not
@@ -154,11 +203,15 @@ fn reply_resizes(
 
 fn service_bus(
     bridge: Res<BusBridge>,
-    frame: Res<ShellFrameState>,
-    time: Res<Time<Real>>,
+    (frame, time): (Res<ShellFrameState>, Res<Time<Real>>),
     mut state: ResMut<ShellBusState>,
     mut shell_commands: MessageWriter<ShellCommand>,
     mut content: SceneBus,
+    (mut hotspot, mut hotspot_size, state_store): (
+        Option<ResMut<crate::hotspot::HotspotObserver>>,
+        ResMut<cosmix_shell::chrome::QuoinHotspotSize>,
+        Option<Res<crate::state::StateStore>>,
+    ),
     mut wallpaper: (
         ResMut<crate::wallpaper::WallpaperState>,
         ResMut<cosmix_shell_host::LayerHostDeadline>,
@@ -193,9 +246,17 @@ fn service_bus(
     if let Some(generation) = state.snapshot_retry.take() {
         request_power_snapshot(&bridge, &mut state, generation);
     }
+    if state.citizen_snapshot_retry {
+        request_citizen_snapshot(&bridge, &mut state);
+    }
 
     let mut power_changed = false;
     for event in bridge.drain_events() {
+        if let Some(client) = content.holders.as_deref_mut() { client.event(&event); }
+        if let Some(targets) = content.targets.as_deref_mut() { targets.event(&event); }
+        if let Some(observer) = hotspot.as_deref_mut() {
+            observer.event(&event, &mut hotspot_size);
+        }
         content.events.reply(&event);
         wallpaper.0.event(&event, time.elapsed());
         wallpaper.2.event(&event, time.elapsed());
@@ -210,6 +271,7 @@ fn service_bus(
                 }
                 state.live_generation = Some(generation);
                 request_power_snapshot(&bridge, &mut state, generation);
+                request_citizen_snapshot(&bridge, &mut state);
                 power_changed = true;
             }
             BusBridgeEvent::Connection { .. } | BusBridgeEvent::Fatal(_) => {
@@ -217,6 +279,9 @@ fn service_bus(
                 state.power.invalidate();
                 state.snapshot_retry = None;
                 state.live_generation = None;
+                state.citizen_snapshot = None;
+                state.citizen_snapshot_retry = false;
+                state.disconnected_citizens.clear();
                 // Replies stashed under the epoch that just ended: the worker
                 // drops a response stamped with a stale generation anyway, so
                 // retrying them only re-fires dead sends.
@@ -230,9 +295,35 @@ fn service_bus(
                 power_changed = true;
             }
             BusBridgeEvent::Reply { request_id, result } => {
-                power_changed |= state.power.accept_reply(request_id, result);
+                if state
+                    .citizen_snapshot
+                    .is_some_and(|(id, _, _)| id == request_id)
+                {
+                    let (_, generation, cutoff) = state.citizen_snapshot.take().unwrap();
+                    if state.live_generation == Some(generation) {
+                        if let Ok(reply) = result
+                            && reply.rc == 0
+                            && let Ok(body) = serde_json::from_str::<Value>(&reply.body)
+                            && let Some(live) =
+                                body.pointer("/services/registered").and_then(service_names)
+                        {
+                            // A reply may have been captured before a new load.
+                            // Use the request's fence, never the later reply time.
+                            reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                            if let Some(client) = content.holders.as_deref_mut() { client.presence(&live); }
+                            if let Some(observer) = hotspot.as_deref_mut() {
+                                observer.presence(&live, &mut hotspot_size);
+                            }
+                        } else {
+                            warn!("citizen registry snapshot failed; awaiting next Bus trigger");
+                        }
+                    }
+                } else {
+                    power_changed |= state.power.accept_reply(request_id, result);
+                }
             }
             BusBridgeEvent::DroppedMessages(_) => {
+                request_citizen_snapshot(&bridge, &mut state);
                 if let Some(generation) = state.power.generation() {
                     request_power_snapshot(&bridge, &mut state, generation);
                 } else {
@@ -242,13 +333,63 @@ fn service_bus(
                 }
                 power_changed = true;
             }
+            BusBridgeEvent::ObservationDroppedMessages(_) => {
+                request_citizen_snapshot(&bridge, &mut state);
+            }
             BusBridgeEvent::ObservationConnection { .. }
-            | BusBridgeEvent::ObservationReply { .. }
-            | BusBridgeEvent::ObservationDroppedMessages(_) => {}
+            | BusBridgeEvent::ObservationReply { .. } => {}
         }
     }
+    // The model goes command-driven before the commands the open gate admits,
+    // and back to local rules the moment the gate closes.
+    let holder_plane = |client: &mut crate::holders::HolderClient,
+                        commands: &mut MessageWriter<ShellCommand>| {
+        if let Some(available) = client.plane_change() {
+            commands.write(ShellCommand {
+                output: frame.0.geometry.output.clone(),
+                at: time.elapsed(),
+                kind: ShellCommandKind::HolderPlane(available),
+            });
+        }
+    };
+    if let Some(client) = content.holders.as_deref_mut() {
+        holder_plane(client, &mut shell_commands);
+    }
     for message in bridge.drain_messages() {
+        if let Some(client) = content.holders.as_deref_mut()
+            && let Some(command) = client.message(&message)
+            && let Some(command) = command.shell_command(time.elapsed())
+        {
+            shell_commands.write(command);
+        }
+        if let Some(observer) = hotspot.as_deref_mut() {
+            observer.message(&message);
+        }
+        if let Some(targets) = content.targets.as_deref_mut() { targets.message(&message); }
         wallpaper.0.message(&message, time.elapsed());
+        if state.live_generation == Some(message.connection_generation) {
+            if let Some(live) = registered_services(&message) {
+                state.citizen_receipt = state
+                    .citizen_receipt
+                    .checked_add(1)
+                    .expect("receipt sequence exhausted");
+                let cutoff = state.citizen_receipt;
+                // This full observation supersedes any in-flight snapshot.
+                state.citizen_snapshot = None;
+                state.citizen_snapshot_retry = false;
+                reconcile_citizens(&mut state, &content.registry.0, &live, cutoff);
+                if let Some(client) = content.holders.as_deref_mut() { client.presence(&live); }
+                if let Some(observer) = hotspot.as_deref_mut() {
+                    observer.presence(&live, &mut hotspot_size);
+                }
+            } else if message
+                .headers
+                .get("gap")
+                .is_some_and(|value| value == "true")
+            {
+                request_citizen_snapshot(&bridge, &mut state);
+            }
+        }
         match state.power.observe_message(message) {
             PowerAction::None => {}
             PowerAction::Changed => power_changed = true,
@@ -261,6 +402,19 @@ fn service_bus(
                     power_changed = true;
                 }
             }
+        }
+    }
+    if let Some(client) = content.holders.as_deref_mut() {
+        holder_plane(client, &mut shell_commands);
+    }
+    if let Some(targets) = content.targets.as_deref_mut() { targets.flush(&bridge); }
+    if let Some(observer) = hotspot.as_deref_mut() {
+        observer.flush(&bridge);
+        // Comp accepted the first-run discovery write: never request it again.
+        if observer.take_first_run_written()
+            && let Some(store) = state_store.as_deref()
+        {
+            store.consume_first_run();
         }
     }
     wallpaper.0.tick(&bridge, time.elapsed(), &mut wallpaper.1);
@@ -292,29 +446,125 @@ fn service_bus(
 
     for request in bridge.drain_inbound() {
         let started = std::time::Instant::now();
-        let (rc, body, command) =
-            if let Some(verb) = cosmix_shell::runtime::SceneVerb::parse(&request.command) {
-                let args = parse_args(&request).unwrap_or(Value::Null);
-                let (rc, body) = content.scenes.dispatch(verb, &request.body, &args, &bridge);
-                (rc, body, None)
-            } else if request.command == "shell.debug.status" {
+        let (rc, body, command) = if let Some(verb) =
+            cosmix_shell::runtime::SceneVerb::parse(&request.command)
+        {
+            let args = parse_args(&request).unwrap_or(Value::Null);
+            let (rc, body) = if let Err(error) = verify_caller_provenance(&request) {
                 (
-                    0,
-                    json!({
-                        "requests":state.diagnostics.requests,
-                        "rejected":state.diagnostics.rejected,
-                        "accepted_mutations":state.diagnostics.accepted_mutations,
-                        "max_dispatch_us":state.diagnostics.max_dispatch_us,
-                        "pending_replies":state.pending_replies.len(),
-                        "connected":state.live_generation.is_some(),
-                        "scope":"this process; dispatch excludes model application and transport"
-                    })
-                    .to_string(),
+                    10,
+                    json!({"error":format!("scene caller provenance: {error:?}")}).to_string(),
+                )
+            } else if state
+                .live_generation
+                .is_some_and(|generation| generation != request.connection_generation)
+            {
+                (
+                    10,
+                    json!({"error":"scene request belongs to a stale Quoin connection"})
+                        .to_string(),
+                )
+            } else {
+                state.citizen_receipt = state
+                    .citizen_receipt
+                    .checked_add(1)
+                    .expect("receipt sequence exhausted");
+                let owner = attested_owner(&request, state.citizen_receipt);
+                let SceneBus {
+                    scenes, registry, ..
+                } = &mut content;
+                scenes.dispatch(
+                    verb,
+                    &request.body,
+                    &args,
+                    &bridge,
+                    &mut cosmix_scene_bevy::SceneMount {
+                        registry: &mut registry.0,
+                        output: &frame.0.geometry.output,
+                        owner: &owner,
+                        accepted_at: state.citizen_receipt,
+                    },
+                )
+            };
+            (rc, body, None)
+        } else if matches!(
+            request.command.as_str(),
+            "shell.sub.register" | "shell.sub.remove"
+        ) {
+            let (rc, body, command) = dispatch_sub_panel_verb(
+                &request,
+                &frame.0,
+                &mut content.registry.0,
+                &mut state,
+                time.elapsed(),
+            );
+            (rc, body, command)
+        } else if request.command == "shell.sub.activate" {
+            // Gated on the gate the model follows: the plane change above
+            // already reached it, so an admitted activation's reveal is
+            // command-driven and held by comp, never left to local grace.
+            // Wontfix (review NIT-5): the gate can close in the one frame
+            // between this check and the Model stage; the reveal then falls
+            // to local rules and stays up through its explicit-show flag
+            // until a hide, as `shell.panel.show` does. Closing that would
+            // mean deferring the reply to the Model stage for a window that
+            // only a comp gap or restart opens, and a panel left open is the
+            // safe side of it (never one that vanishes while typed into).
+            crate::activation::dispatch_activate(
+                &request,
+                &frame.0,
+                &content.registry.0,
+                content.holders.as_deref().is_some_and(|client| client.capable),
+                content.targets.as_deref().and_then(|targets| targets.target()),
+                state.live_generation,
+                time.elapsed(),
+            )
+        } else if request.command.starts_with("shell.settings.") {
+            // The bridge drops stale epochs before dispatch; the same fence
+            // the scene and sub-panel verbs keep — a stale request must not
+            // spend a settings write (a live theme application, a conf.mix
+            // rewrite or a resize command).
+            if state
+                .live_generation
+                .is_some_and(|generation| generation != request.connection_generation)
+            {
+                (
+                    10,
+                    json!({"error":"settings request belongs to a stale Quoin connection"})
+                        .to_string(),
                     None,
                 )
             } else {
-                dispatch_shell_request(&request, &frame.0, time.elapsed())
-            };
+                let SceneBus {
+                    config, schemes, ..
+                } = &mut content;
+                crate::settings::dispatch_verb(
+                    &request,
+                    &frame.0,
+                    config,
+                    &crate::config::conf_mix_path(),
+                    schemes,
+                    time.elapsed(),
+                )
+            }
+        } else if request.command == "shell.debug.status" {
+            (
+                0,
+                json!({
+                    "requests":state.diagnostics.requests,
+                    "rejected":state.diagnostics.rejected,
+                    "accepted_mutations":state.diagnostics.accepted_mutations,
+                    "max_dispatch_us":state.diagnostics.max_dispatch_us,
+                    "pending_replies":state.pending_replies.len(),
+                    "connected":state.live_generation.is_some(),
+                    "scope":"this process; dispatch excludes model application and transport"
+                })
+                .to_string(),
+                None,
+            )
+        } else {
+            dispatch_shell_request(&request, &frame.0, time.elapsed())
+        };
         let elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         state.diagnostics.record(rc, command.is_some(), elapsed_us);
         if command.is_some() || rc != 0 {
@@ -373,6 +623,110 @@ fn service_bus(
             command,
             &mut dispatch,
         );
+    }
+}
+
+/// The full registration set is authoritative; `old` is deliberately ignored.
+/// A missed diff is repaired by the next full observation, reconnect or gap.
+fn registered_services(message: &BusMessage) -> Option<BTreeSet<String>> {
+    if message.topic() != Some("noded.props.changed") {
+        return None;
+    }
+    let body = serde_json::from_str::<Value>(&message.body).ok()?;
+    if body["path"] != "services.registered" {
+        return None;
+    }
+    service_names(&body["new"])
+}
+
+fn service_names(value: &Value) -> Option<BTreeSet<String>> {
+    // A partial/malformed list is not evidence that an owner disappeared.
+    value
+        .as_array()?
+        .iter()
+        .map(|name| name.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn reconcile_citizens(
+    state: &mut ShellBusState,
+    registry: &cosmix_shell::core::SubPanelRegistry,
+    live: &BTreeSet<String>,
+    cutoff: u64,
+) {
+    for owner in registry.live_owners().difference(live) {
+        state
+            .disconnected_citizens
+            .entry(owner.clone())
+            .and_modify(|before| *before = (*before).max(cutoff))
+            .or_insert(cutoff);
+    }
+}
+
+/// A registered local sender is broker-restamped `from`. Attested mesh
+/// identity is qualified so a remote service cannot alias a local owner.
+/// Anonymous callers remain mesh-open, but have no discoverable lifetime or
+/// stable identity for same-owner updates. Give each acceptance a distinct
+/// untracked seat owner instead of conflating unrelated anonymous callers.
+///
+/// The one owner-derivation rule for every citizen-facing ingress (scene
+/// mounts and the sub-panel verbs alike): caller-authored metadata or verb
+/// arguments never choose lifetime ownership.
+fn attested_owner(request: &InboundRequest, receipt: u64) -> String {
+    if let (Some(peer), Some(service)) = (
+        request.headers.get("broker_peer"),
+        request.headers.get("broker_service"),
+    ) {
+        return format!("{service}@{peer}");
+    }
+    if request.from.is_empty() {
+        format!("anonymous@{receipt}")
+    } else {
+        request.from.clone()
+    }
+}
+
+/// Event-driven resync only. A full outbound queue retries this one request
+/// on the next update; a failed RPC waits for the next observation/gap/connect.
+fn request_citizen_snapshot(bridge: &BusBridge, state: &mut ShellBusState) {
+    state.citizen_snapshot_retry = false;
+    let Some(generation) = state.live_generation else {
+        return;
+    };
+    state.next_request_id = state.next_request_id.saturating_add(1);
+    let id = state.next_request_id;
+    state.citizen_receipt = state
+        .citizen_receipt
+        .checked_add(1)
+        .expect("receipt sequence exhausted");
+    state.citizen_snapshot = Some((id, generation, state.citizen_receipt));
+    if bridge
+        .try_call(id, "noded", "noded.props.get", BTreeMap::new(), "{}")
+        .is_err()
+    {
+        state.citizen_snapshot = None;
+        state.citizen_snapshot_retry = !bridge.worker_is_gone();
+    }
+}
+
+/// Apply broker-reported citizen disconnects with world access: for each
+/// owner, older sub-panel seats and their carousel content are removed first
+/// (landing per the carousel's removal rule), then its scenes unload so the
+/// scene reconcile in this frame destroys the mounted content without
+/// rebuilding the carousel or changing its remembered selection.
+fn apply_citizen_disconnects(world: &mut World) {
+    let citizens = std::mem::take(&mut world.resource_mut::<ShellBusState>().disconnected_citizens);
+    for (citizen, before) in &citizens {
+        remove_owned_subpanels_before(world, citizen, *before);
+        if let Some(mut store) = world.get_resource_mut::<cosmix_scene_bevy::SceneStore>() {
+            let scenes = store.unload_owned_before(citizen, *before);
+            if !scenes.is_empty() {
+                println!(
+                    "QUOIN_CITIZEN_DISCONNECT citizen={citizen} scenes={}",
+                    scenes.join(",")
+                );
+            }
+        }
     }
 }
 
@@ -452,6 +806,148 @@ fn request_power_snapshot(bridge: &BusBridge, state: &mut ShellBusState, generat
     }
 }
 
+/// The sub-panel lifecycle verbs (panel doc §3): `sub.register` and
+/// `sub.remove` — activation is a separate verb, gated on the compositor
+/// ([`crate::activation::dispatch_activate`]).
+///
+/// These validate against the process-wide registry, not just the frame: a
+/// name is globally unique across all four edges and all outputs, and only
+/// the registry knows names outside the selected model. Correctness checks
+/// alone refuse (duplicate name, unknown name, stale generation) — the
+/// mesh's full-verb-access law applies, so there is deliberately no "who
+/// may" gate beyond the provenance stamp every verb requires.
+///
+/// Registering reserves the seat transactionally at dispatch,
+/// receipt-stamped exactly like a scene mount, so two same-name
+/// registrations drained in one batch cannot both be acked; the enqueued
+/// command fills the carousel at the Model stage of this update. Removing
+/// resolves the seat here and carries its owner and acceptance receipt in
+/// the command — the registry applies the carousel's removal landing rule
+/// at the Model stage, atomically with the seat, and only while that exact
+/// registration still stands.
+fn dispatch_sub_panel_verb(
+    request: &InboundRequest,
+    frame: &ShellFrame,
+    registry: &mut cosmix_shell::core::SubPanelRegistry,
+    state: &mut ShellBusState,
+    at: std::time::Duration,
+) -> (u8, String, Option<ShellCommand>) {
+    if let Err(error) = verify_caller_provenance(request) {
+        return (
+            10,
+            json!({"error":format!("sub-panel caller provenance: {error:?}")}).to_string(),
+            None,
+        );
+    }
+    // The bridge drops stale epochs before dispatch; this is the same fence
+    // the scene verbs keep — a stale request must not spend a seat.
+    if state
+        .live_generation
+        .is_some_and(|generation| generation != request.connection_generation)
+    {
+        return (
+            10,
+            json!({"error":"sub-panel request belongs to a stale Quoin connection"}).to_string(),
+            None,
+        );
+    }
+    let register = request.command == "shell.sub.register";
+    let verb = if register { "register" } else { "remove" };
+    let Some(name) = argument(request, "name").filter(|name| !name.trim().is_empty()) else {
+        return (
+            10,
+            json!({"error":format!("sub.{verb} requires a name argument")}).to_string(),
+            None,
+        );
+    };
+    if register {
+        let Some(edge) = argument(request, "edge").and_then(parse_edge) else {
+            return (
+                10,
+                json!({"error":"edge must be left, bottom, right or top"}).to_string(),
+                None,
+            );
+        };
+        state.citizen_receipt = state
+            .citizen_receipt
+            .checked_add(1)
+            .expect("receipt sequence exhausted");
+        let receipt = state.citizen_receipt;
+        let owner = attested_owner(request, receipt);
+        return register_sub_panel(frame, registry, name, edge, owner, receipt, at);
+    }
+    // Removal: the name is the address; the seat supplies the edge, owner
+    // and acceptance receipt the command carries. An unknown name is
+    // refused, never a creation. The Model stage applies the removal only
+    // while that exact registration (same owner AND same receipt) still
+    // stands, so a replacement accepted after this seat was dropped
+    // survives the stale command.
+    let Some((edge, owner, accepted_at)) = registry
+        .seat(&name)
+        .map(|seat| (seat.edge, seat.owner.clone(), seat.accepted_at))
+    else {
+        let error = cosmix_shell::core::SubPanelRegistryError::Unknown(name);
+        return (10, json!({"error":error.to_string()}).to_string(), None);
+    };
+    let command = semantic_shell_command(
+        frame.geometry.output.clone(),
+        at,
+        edge,
+        ShellSemanticVerb::SubRemove {
+            name,
+            owner,
+            accepted_at,
+        },
+    );
+    (0, json!({"accepted":true}).to_string(), Some(command))
+}
+
+/// Shared sub.register acceptance path for Bus callers and host-owned content.
+/// The caller supplies its attested owner; registration never reveals a panel.
+pub(crate) fn register_sub_panel(
+    frame: &ShellFrame,
+    registry: &mut cosmix_shell::core::SubPanelRegistry,
+    name: String,
+    edge: Edge,
+    owner: String,
+    receipt: u64,
+    at: std::time::Duration,
+) -> (u8, String, Option<ShellCommand>) {
+    // Global duplicate first (the registry is the address space), then
+    // the frame: a live page without a seat (host chrome content) is as
+    // taken as a seated one, on ANY edge of this output — names are
+    // globally unique, so a seat-less page on another edge refuses a
+    // registration the requested edge alone would have accepted.
+    if registry.seat(&name).is_some() {
+        let error = cosmix_shell::core::SubPanelRegistryError::Duplicate(name);
+        return (10, json!({"error":error.to_string()}).to_string(), None);
+    }
+    if Edge::ALL.into_iter().any(|live_edge| {
+        frame
+            .panel(live_edge)
+            .page_ids
+            .iter()
+            .any(|page| page == &name)
+    }) {
+        return (
+            10,
+            json!({"error":format!("name '{name}' is already a page on this output")}).to_string(),
+            None,
+        );
+    }
+    if let Err(error) = registry.mount(&name, frame.geometry.output.clone(), edge, &owner, receipt)
+    {
+        return (10, json!({"error":error.to_string()}).to_string(), None);
+    }
+    let command = semantic_shell_command(
+        frame.geometry.output.clone(),
+        at,
+        edge,
+        ShellSemanticVerb::SubRegister { name, owner },
+    );
+    (0, json!({"accepted":true}).to_string(), Some(command))
+}
+
 fn dispatch_shell_request(
     request: &InboundRequest,
     frame: &ShellFrame,
@@ -469,7 +965,7 @@ fn dispatch_shell_request(
             "service":"shell",
             "contract":"cosmix-shell.v1",
             "props":["get","list","describe"],
-            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.resize","panel.page.next","panel.page.prev","panel.page.set","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
+            "verbs":["quit","panel.show","panel.hide","panel.toggle","panel.pin","panel.unpin","panel.dock","panel.mode","panel.resize","panel.page.next","panel.page.prev","panel.page.set","sub.register","sub.remove","sub.activate","settings.scheme","settings.motion","settings.size","corner.show","corner.hide","corner.toggle","corner.pin","corner.unpin","debug.status","scene.load","scene.patch","scene.get","scene.describe","scene.unload","scene.watch"],
             "corners":{"top-left":"left","bottom-left":"bottom","bottom-right":"right","top-right":"top"}
         }).to_string(), None);
     }
@@ -567,6 +1063,27 @@ fn dispatch_shell_request(
             None,
         );
     }
+    // Validate the precise mode verb's argument before `semantic_verb`, which
+    // would otherwise collapse a bad mode into "unknown shell command".
+    if request.command == "shell.panel.mode" {
+        match argument(request, "mode") {
+            None => {
+                return (
+                    10,
+                    json!({"error":"panel.mode requires a mode argument"}).to_string(),
+                    None,
+                );
+            }
+            Some(value) if PanelMode::parse(&value).is_none() => {
+                return (
+                    10,
+                    json!({"error":"mode must be hidden, pinned or docked"}).to_string(),
+                    None,
+                );
+            }
+            Some(_) => {}
+        }
+    }
     let Some(verb) = semantic_verb(request) else {
         return (
             10,
@@ -661,6 +1178,10 @@ fn semantic_verb(request: &InboundRequest) -> Option<ShellSemanticVerb> {
         "shell.panel.toggle" | "shell.corner.toggle" => ShellSemanticVerb::PanelToggle,
         "shell.panel.pin" | "shell.corner.pin" => ShellSemanticVerb::PanelPin,
         "shell.panel.unpin" | "shell.corner.unpin" => ShellSemanticVerb::PanelUnpin,
+        "shell.panel.dock" => ShellSemanticVerb::PanelDock,
+        "shell.panel.mode" => {
+            ShellSemanticVerb::PanelMode(PanelMode::parse(&argument(request, "mode")?)?)
+        }
         "shell.panel.page.next" => ShellSemanticVerb::PageNext,
         "shell.panel.page.prev" => ShellSemanticVerb::PagePrevious,
         "shell.panel.page.set" => ShellSemanticVerb::PageSet(argument(request, "id")?),
@@ -720,7 +1241,7 @@ const WIRE_OWNED_HEADERS: &[&str] = &[
 /// simply absent — the honest answer, and the one that makes `page.set`
 /// report "requires an id argument" instead of rejecting the broker's
 /// correlation id as an unknown page.
-fn argument(request: &InboundRequest, name: &str) -> Option<String> {
+pub(crate) fn argument(request: &InboundRequest, name: &str) -> Option<String> {
     if !WIRE_OWNED_HEADERS
         .iter()
         .any(|owned| owned.eq_ignore_ascii_case(name))
@@ -734,7 +1255,7 @@ fn argument(request: &InboundRequest, name: &str) -> Option<String> {
 /// Read a finite numeric argument, accepting both a JSON number
 /// (`thickness_px=240`) and a numeric string (`thickness_px="240"`) — Mix's
 /// `send … k=v` may deliver either shape.
-fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
+pub(crate) fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
     let value = parse_args(request)?;
     let field = value.get(name)?;
     let number = field
@@ -743,7 +1264,7 @@ fn number_argument(request: &InboundRequest, name: &str) -> Option<f64> {
     number.is_finite().then_some(number)
 }
 
-fn parse_edge(value: String) -> Option<Edge> {
+pub(crate) fn parse_edge(value: String) -> Option<Edge> {
     match value.as_str() {
         "left" => Some(Edge::Left),
         "bottom" => Some(Edge::Bottom),
@@ -769,6 +1290,9 @@ impl PropTree for ShellProps<'_> {
                     // visibility of a Hidden panel must never read as pinned.
                     (panel.mode != PanelMode::Hidden).into(),
                 ),
+                // The precise signal: the panel's persistent mode, independent
+                // of transient visibility.
+                leaf(format!("panels.{name}.mode"), panel.mode.as_str().into()),
                 leaf(
                     format!("panels.{name}.width_px"),
                     (panel.thickness_px as f64).into(),
@@ -796,7 +1320,7 @@ impl PropTree for ShellProps<'_> {
     fn list(&self) -> Vec<PropPath> {
         let mut paths = Vec::new();
         for edge in Edge::ALL {
-            for field in ["visible", "pinned", "width_px", "page", "pages", "output"] {
+            for field in ["visible", "pinned", "mode", "width_px", "page", "pages", "output"] {
                 paths.push(PropPath::new(format!("panels.{}.{}", edge_name(edge), field)).unwrap());
             }
         }
@@ -807,18 +1331,22 @@ impl PropTree for ShellProps<'_> {
         let field = path.as_str().rsplit('.').next()?;
         let ty = match field {
             "visible" | "pinned" => PropType::Bool,
+            "mode" | "page" | "output" => PropType::String,
             "width_px" => PropType::Number,
-            "page" | "output" => PropType::String,
             "pages" => PropType::List,
             _ => return None,
         };
         Some(PropDescribe::leaf(
             path.clone(),
             ty,
-            if field == "pinned" {
-                "compatibility shim: true for persistent Pinned or Docked; false for Hidden, including transient reveal"
-            } else {
-                "live Quoin panel state"
+            match field {
+                "pinned" => {
+                    "compatibility shim: true for persistent Pinned or Docked; false for Hidden, including transient reveal"
+                }
+                "mode" => {
+                    "persistent panel mode: hidden, pinned (overlay, reserves nothing) or docked (reserves its thickness)"
+                }
+                _ => "live Quoin panel state",
             },
         ))
     }
@@ -831,7 +1359,7 @@ fn leaf(path: String, value: PropValue) -> (PropPath, PropValue) {
     )
 }
 
-fn edge_name(edge: Edge) -> &'static str {
+pub(crate) fn edge_name(edge: Edge) -> &'static str {
     match edge {
         Edge::Left => "left",
         Edge::Bottom => "bottom",
@@ -843,9 +1371,220 @@ fn edge_name(edge: Edge) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire contract against a non-default comp: literal `comp.*`
+    /// commands addressed to that service. A menu closed while the Bus was
+    /// down is still released after reconnect (comp kept the hold), and
+    /// once acknowledged its token goes quiet.
+    #[test]
+    fn client_sends_hold_on_popup_open() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        assert!(bus.subscriptions.contains(&"comp-nested.panel.command".into()));
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+        });
+        let reply = |request_id, body: &str| BusBridgeEvent::Reply {
+            request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
+        };
+        let comp_calls = || -> Vec<_> {
+            peer.drain_calls().into_iter().filter(|call| call.command.starts_with("comp")).collect()
+        };
+        let menu = |app: &mut App, open: bool| {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(), at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left,
+                    input: cosmix_shell::core::PanelInput::MenuHold(open) },
+            });
+        };
+        // Chunk 15: mode reports carry the Bus connection generation.
+        let mode = json!({"output":"test","edge":"left","surface":"panel-token","mode":"hidden",
+            "generation":1});
+        let hold = |acquire: bool| json!({"output":"test","edge":"left","surface":"menu-token",
+            "holder":"popup","acquire":acquire});
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        menu(&mut app, true);
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1, "only the capability read before capability");
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.props.get"));
+        assert_eq!(calls[0].body, r#"{"path":"input.corners.holders"}"#);
+        peer.deliver_event(reply(calls[0].request_id, "true"));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.panel.mode"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), mode);
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", "comp.panel.hold"));
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold(true));
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        // The Bus drops; the menu closes meanwhile.
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Disconnected, generation: 1,
+        });
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        menu(&mut app, false);
+        app.update();
+        assert!(comp_calls().is_empty(), "nothing is sent while disconnected");
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 2,
+        });
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls[0].command, "comp.props.get");
+        peer.deliver_event(reply(calls[0].request_id, "true"));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls[0].command, "comp.panel.mode", "mode reports replay first");
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        let calls = comp_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].body).unwrap(), hold(false));
+        peer.deliver_event(reply(calls[0].request_id, r#"{"accepted":true}"#));
+        app.update();
+        app.update();
+        assert!(comp_calls().is_empty(), "an acknowledged release is never replayed");
+    }
+
+    /// Comp's registration lapses while comp itself (and its hold) lives on.
+    /// The menu closing during that outage is still released on return.
+    #[test]
+    fn hold_is_released_after_comp_registration_outage() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        app.insert_resource(cosmix_shell_host::holders::PopupLayerIdentity {
+            output: test_model().output().clone(), edge: Edge::Left, surface: "menu-token".into(),
+        });
+        let reply = |request_id, body: &str| BusBridgeEvent::Reply {
+            request_id, result: Ok(ctk::bus::BusReply { rc: 0, body: body.into(), result: None }),
+        };
+        let comp_calls = || -> Vec<_> {
+            peer.drain_calls().into_iter().filter(|call| call.command.starts_with("comp")).collect()
+        };
+        let menu = |app: &mut App, open: bool| {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(), at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left,
+                    input: cosmix_shell::core::PanelInput::MenuHold(open) },
+            });
+        };
+        let presence = |app: &mut App, services: &[&str]| {
+            let live = services.iter().map(|name| (*name).to_owned()).collect();
+            app.world_mut().resource_mut::<crate::holders::HolderClient>().presence(&live);
+        };
+        // Read, mode report, acquire: each acknowledged in turn.
+        let accept_next = |app: &mut App, command: &str, body: &str| {
+            app.update();
+            let calls = comp_calls();
+            assert_eq!(calls.len(), 1, "{command}");
+            assert_eq!((calls[0].to.as_str(), calls[0].command.as_str()), ("comp-nested", command));
+            peer.deliver_event(reply(calls[0].request_id, body));
+            serde_json::from_str::<Value>(&calls[0].body).unwrap()
+        };
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        menu(&mut app, true);
+        accept_next(&mut app, "comp.props.get", "true");
+        accept_next(&mut app, "comp.panel.mode", r#"{"accepted":true}"#);
+        assert_eq!(accept_next(&mut app, "comp.panel.hold", r#"{"accepted":true}"#)["acquire"], true);
+        presence(&mut app, &[]);
+        app.world_mut().remove_resource::<cosmix_shell_host::holders::PopupLayerIdentity>();
+        menu(&mut app, false);
+        app.update();
+        assert!(comp_calls().is_empty(), "nothing is sent while comp is unregistered");
+        presence(&mut app, &["comp-nested"]);
+        accept_next(&mut app, "comp.props.get", "true");
+        accept_next(&mut app, "comp.panel.mode", r#"{"accepted":true}"#);
+        let release = accept_next(&mut app, "comp.panel.hold", r#"{"accepted":true}"#);
+        assert_eq!(release["surface"], "menu-token");
+        assert_eq!(release["acquire"], false, "the stranded hold is released");
+        app.update();
+        assert!(comp_calls().is_empty(), "and, acknowledged, goes quiet");
+    }
+
+    /// The model follows comp's commands exactly while the holder plane is
+    /// open, and any doubt (here a gap frame) hands it back to local rules.
+    #[test]
+    fn comp_commands_drive_the_model_only_while_capable() {
+        let (bridge, peer) = ctk::bus::test_bridge("shell");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
+        let mut bus = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(vec![(
+            test_model().output().clone(), Edge::Left, "panel-token".into(),
+        )]));
+        let comp_frame = |sequence: u64, body: Value| ctk::bus::BusMessage {
+            connection_generation: 1,
+            from: "comp-nested".into(),
+            command: "panel.command".into(),
+            body: body.to_string(),
+            headers: BTreeMap::from([
+                ("topic".into(), "comp-nested.panel.command".into()),
+                ("command".into(), "panel.command".into()),
+                ("event_seq".into(), sequence.to_string()),
+            ]),
+        };
+        let command = |sequence: u64, action: &str| comp_frame(sequence, json!({"version":1,
+            "output":"test","edge":"left","surface":"panel-token","action":action,
+            "event_seq":sequence}));
+        let revealed = |app: &App| {
+            app.world().resource::<ShellFrameState>().0.panel(Edge::Left).transient_revealed
+        };
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected, generation: 1,
+        });
+        app.update();
+        peer.deliver_message(command(1, "reveal"));
+        app.update();
+        assert!(!revealed(&app), "no capability yet: comp's reveal is ignored");
+        let read = peer.drain_calls().into_iter()
+            .find(|call| call.command == "comp.props.get").expect("the capability read");
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id: read.request_id,
+            result: Ok(ctk::bus::BusReply { rc: 0, body: "true".into(), result: None }),
+        });
+        app.update();
+        peer.deliver_message(command(2, "reveal"));
+        app.update();
+        assert!(revealed(&app), "a holder reveals the hidden panel");
+        peer.deliver_message(command(3, "conceal"));
+        app.update();
+        assert!(!revealed(&app), "the last release conceals at once");
+        peer.deliver_message(command(4, "reveal"));
+        app.update();
+        assert!(revealed(&app));
+        // Lost records may include commands: back to local rules, and comp's
+        // later commands are dropped until the plane is confirmed again.
+        peer.deliver_message(comp_frame(5, json!({"gap":true,"lost_count":1,
+            "cause":"outbox.overflow"})));
+        app.update();
+        peer.deliver_message(command(6, "conceal"));
+        app.update();
+        assert!(revealed(&app), "a local reveal is left to local grace");
+    }
+
     use cosmix_shell::core::PanelInput;
     use cosmix_shell::runtime::{CarouselInput, ShellCommandKind};
-    use ctk::bus::{BusMessage, test_bridge};
+    use ctk::bus::test_bridge;
 
     fn request(command: &str) -> InboundRequest {
         InboundRequest {
@@ -892,6 +1631,24 @@ mod tests {
         );
     }
 
+    /// `shell.info` is the discovery surface: a verb missing from its list is
+    /// a verb no script can find, so the settings verbs must be advertised.
+    #[test]
+    fn shell_info_lists_the_settings_verbs() {
+        let frame = test_frame();
+        let (rc, body, _) =
+            dispatch_shell_request(&request("shell.info"), &frame, Default::default());
+        assert_eq!(rc, 0);
+        let info: Value = serde_json::from_str(&body).unwrap();
+        let verbs = info["verbs"].as_array().expect("verbs is a list");
+        for verb in ["settings.scheme", "settings.motion", "settings.size"] {
+            assert!(
+                verbs.contains(&json!(verb)),
+                "shell.info must advertise {verb}; got {verbs:?}"
+            );
+        }
+    }
+
     /// The filed defect (TODO-cos, 2026-09-20): `send "shell"
     /// shell.panel.pin edge="right"` from a plain `mix -c` answered
     /// `local registered caller required: UnregisteredCaller`, so the
@@ -918,12 +1675,12 @@ mod tests {
             "shell.panel.toggle",
             "shell.panel.unpin",
         ] {
-            let (rc, body, command_out) = dispatch_shell_request(
-                &unregistered(command),
-                &frame,
-                std::time::Duration::ZERO,
+            let (rc, body, command_out) =
+                dispatch_shell_request(&unregistered(command), &frame, std::time::Duration::ZERO);
+            assert_eq!(
+                rc, 0,
+                "{command} refused an unregistered local caller: {body}"
             );
-            assert_eq!(rc, 0, "{command} refused an unregistered local caller: {body}");
             // rc alone is not acceptance. A regression that answered
             // `(0, accepted, None)` for anonymous callers specifically would
             // report success and do nothing, which is the shape a gate tends
@@ -942,7 +1699,10 @@ mod tests {
             &frame,
             std::time::Duration::ZERO,
         );
-        assert_eq!(rc, 0, "shell.quit refused an unregistered local caller: {body}");
+        assert_eq!(
+            rc, 0,
+            "shell.quit refused an unregistered local caller: {body}"
+        );
         assert_eq!(command_out.map(|c| c.kind), Some(ShellCommandKind::Quit));
 
         let mut resize = unregistered("shell.panel.resize");
@@ -1217,9 +1977,10 @@ mod tests {
     #[test]
     fn every_panel_verb_resolves_its_edge_from_the_live_wire_shape() {
         let frame = paged_frame();
-        for (command, expected) in [
+        for (command, body, expected) in [
             (
                 "shell.panel.show",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Reveal,
@@ -1227,6 +1988,7 @@ mod tests {
             ),
             (
                 "shell.panel.hide",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Hide,
@@ -1234,6 +1996,7 @@ mod tests {
             ),
             (
                 "shell.panel.toggle",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Toggle,
@@ -1241,6 +2004,7 @@ mod tests {
             ),
             (
                 "shell.panel.pin",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Dock,
@@ -1248,13 +2012,31 @@ mod tests {
             ),
             (
                 "shell.panel.unpin",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Panel {
                     edge: Edge::Bottom,
                     input: PanelInput::Release,
                 },
             ),
             (
+                "shell.panel.dock",
+                json!({"edge":"bottom"}),
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::Dock,
+                },
+            ),
+            (
+                "shell.panel.mode",
+                json!({"edge":"bottom","mode":"pinned"}),
+                ShellCommandKind::Panel {
+                    edge: Edge::Bottom,
+                    input: PanelInput::SetMode(PanelMode::Pinned),
+                },
+            ),
+            (
                 "shell.panel.page.next",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Carousel {
                     edge: Edge::Bottom,
                     input: CarouselInput::Next,
@@ -1262,13 +2044,14 @@ mod tests {
             ),
             (
                 "shell.panel.page.prev",
+                json!({"edge":"bottom"}),
                 ShellCommandKind::Carousel {
                     edge: Edge::Bottom,
                     input: CarouselInput::Previous,
                 },
             ),
         ] {
-            let request = wire(command, json!({"edge":"bottom"}));
+            let request = wire(command, body);
             let (rc, body, enqueued) = dispatch_shell_request(&request, &frame, Default::default());
             assert_eq!(rc, 0, "{command}: {body}");
             assert_eq!(
@@ -1276,6 +2059,80 @@ mod tests {
                 expected,
                 "{command}"
             );
+        }
+    }
+
+    /// The precise dock verb: `Docked` is never a side effect of another
+    /// verb (shell doc §3.1 — docking reflows the workspace), so it gets its
+    /// own named verb enqueuing the model's `Dock` input for the addressed
+    /// edge. Distinct from legacy `pin`, which happens to map to the same
+    /// input only for popup-space compatibility.
+    #[test]
+    fn panel_dock_verb_enqueues_dock_input() {
+        let frame = test_frame();
+        let dock_request = wire("shell.panel.dock", json!({"edge":"right"}));
+        let (rc, body, command) = dispatch_shell_request(&dock_request, &frame, Default::default());
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(
+            command.expect("accepted dock verb enqueues a command").kind,
+            ShellCommandKind::Panel {
+                edge: Edge::Right,
+                input: PanelInput::Dock,
+            }
+        );
+        // An unstamped caller is refused like every other semantic verb.
+        let (rc, _, command) = dispatch_shell_request(
+            &request("shell.panel.dock"),
+            &frame,
+            Default::default(),
+        );
+        assert_eq!(rc, 10);
+        assert!(command.is_none());
+    }
+
+    /// The precise mode verb carries its mode as a string argument: every
+    /// token the `panels.<edge>.mode` leaf can emit is accepted, and anything
+    /// else — missing, unknown, or the wrong JSON type — is refused with a
+    /// precise error rather than the generic "unknown shell command".
+    #[test]
+    fn panel_mode_verb_validates_mode_string() {
+        let frame = test_frame();
+        for (token, mode) in [
+            ("hidden", PanelMode::Hidden),
+            ("pinned", PanelMode::Pinned),
+            ("docked", PanelMode::Docked),
+        ] {
+            let request = wire("shell.panel.mode", json!({"edge":"left","mode":token}));
+            let (rc, body, command) = dispatch_shell_request(&request, &frame, Default::default());
+            assert_eq!(rc, 0, "{token}: {body}");
+            assert_eq!(
+                command
+                    .expect("accepted mode verb enqueues a command")
+                    .kind,
+                ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input: PanelInput::SetMode(mode),
+                },
+                "{token}"
+            );
+        }
+        for (body, fragment) in [
+            (json!({"edge":"left"}), "requires a mode argument"),
+            (
+                json!({"edge":"left","mode":"sideways"}),
+                "mode must be hidden, pinned or docked",
+            ),
+            (
+                json!({"edge":"left","mode":""}),
+                "mode must be hidden, pinned or docked",
+            ),
+            (json!({"edge":"left","mode":7}), "requires a mode argument"),
+        ] {
+            let request = wire("shell.panel.mode", body.clone());
+            let (rc, error, command) = dispatch_shell_request(&request, &frame, Default::default());
+            assert_eq!(rc, 10, "{body}");
+            assert!(error.contains(fragment), "{body}: {error}");
+            assert!(command.is_none(), "{body} must not enqueue a command");
         }
     }
 
@@ -1414,6 +2271,57 @@ mod tests {
         );
     }
 
+    /// The shared Bus drain updates the exact resource read by chrome.
+    #[test]
+    fn hotspot_bus_observations_update_chrome_resource_without_polling() {
+        let (bridge, peer) = test_bridge("shell");
+        let mut app = bus_app(bridge);
+        let mut config = ctk::bus::BusBridgeConfig::new("shell", "ws://127.0.0.1:9000");
+        crate::hotspot::install(&mut app, &mut config, "comp-nested".into());
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        let request = peer.drain_calls().into_iter()
+            .find(|call| call.command == "comp.props.get").unwrap();
+        assert_eq!(request.to, "comp-nested");
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id: request.request_id,
+            result: Ok(ctk::bus::BusReply {
+                rc: 0,
+                body: json!(24.0).to_string(),
+                result: None,
+            }),
+        });
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_shell::chrome::QuoinHotspotSize>().0, 24.0);
+        app.update();
+        assert!(peer.drain_calls().is_empty());
+        peer.deliver_message(BusMessage {
+            connection_generation: 1,
+            from: "comp-nested".into(),
+            command: "props.changed".into(),
+            body: json!({"path":"input.corners.deadzone_px", "new":32.0}).to_string(),
+            headers: BTreeMap::from([("topic".into(), "comp-nested.props.changed".into())]),
+        });
+        app.update();
+        let calls = peer.drain_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].command, "comp.props.get");
+        assert_eq!(calls[0].to, "comp-nested");
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id: calls[0].request_id,
+            result: Ok(ctk::bus::BusReply {
+                rc: 0,
+                body: json!(32.0).to_string(),
+                result: None,
+            }),
+        });
+        app.update();
+        assert_eq!(app.world().resource::<cosmix_shell::chrome::QuoinHotspotSize>().0, 32.0);
+    }
+
     /// A `power.props.changed` delivery-gap notice on `generation`.
     fn gap_change(generation: u64) -> BusMessage {
         let mut headers = BTreeMap::new();
@@ -1458,6 +2366,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "power.props.get",
+                "noded.props.get",
                 "wallpaper.props.get",
                 "background.status",
                 "capture.status"
@@ -1490,8 +2399,13 @@ mod tests {
         peer.deliver_message(gap_change(2));
         app.update();
         let calls = peer.drain_calls();
-        assert_eq!(calls.len(), 1, "a live-generation resync must be honored");
-        assert_eq!(calls[0].command, "power.props.get");
+        assert_eq!(
+            calls.len(),
+            2,
+            "a live-generation gap resyncs both projections"
+        );
+        assert_eq!(calls[0].command, "noded.props.get");
+        assert_eq!(calls[1].command, "power.props.get");
     }
 
     /// The drain order the gate depends on: `drain_events` BEFORE
@@ -1518,12 +2432,1005 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "power.props.get",
+                "noded.props.get",
+                "noded.props.get",
                 "power.props.get",
                 "wallpaper.props.get",
                 "background.status",
                 "capture.status"
             ],
             "drain_events must run before drain_messages"
+        );
+    }
+
+    /// A broker registry observation. Consumers must reconcile against `new`,
+    /// even if a dropped or coalesced event omitted the owner from `old`.
+    fn services_registered_change(generation: u64, old: &[&str], new: &[&str]) -> BusMessage {
+        let mut headers = BTreeMap::new();
+        headers.insert("topic".to_owned(), "noded.props.changed".to_owned());
+        BusMessage {
+            connection_generation: generation,
+            from: "noded".to_owned(),
+            command: "noded.topic.event".to_owned(),
+            body: json!({
+                "path": "services.registered",
+                "old": old,
+                "new": new,
+                "cause": "disconnect:quoin-panel",
+            })
+            .to_string(),
+            headers,
+        }
+    }
+
+    fn mounted_bus_app() -> (App, ctk::bus::TestBusPeer) {
+        use cosmix_shell::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            spawn_quoin_chrome,
+        };
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()))
+            .add_plugins(QuoinChromePlugin)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_systems(
+                Update,
+                cosmix_scene_bevy::reconcile_scene_mounts
+                    .after(ShellRuntimeSet::Input)
+                    .before(ShellRuntimeSet::Model),
+            );
+        let world = app.world_mut();
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        peer.drain_calls();
+        (app, peer)
+    }
+
+    fn scene_load(name: &str, owner: &str, edge: &str) -> InboundRequest {
+        let mut req = local("shell.scene.load");
+        req.from = owner.into();
+        // Deliberately unrelated metadata: it must never choose lifetime ownership.
+        req.body = format!(
+            "---\nscene: 1\nname: {name}\ncitizen: authored-metadata\nwindow: {{\"kind\":\"edge\",\"edge\":\"{edge}\"}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"
+        );
+        req
+    }
+
+    fn load_scene(
+        app: &mut App,
+        peer: &ctk::bus::TestBusPeer,
+        name: &str,
+        owner: &str,
+        edge: &str,
+    ) {
+        peer.send(scene_load(name, owner, edge));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(match edge {
+                    "left" => Edge::Left,
+                    "right" => Edge::Right,
+                    "top" => Edge::Top,
+                    _ => Edge::Bottom,
+                })
+                .page_ids
+                .iter()
+                .any(|id| id == &format!("scene-{name}")),
+            "fixture must have real mounted chrome"
+        );
+    }
+
+    fn absent(peer: &ctk::bus::TestBusPeer) {
+        // The missed owner's name is not even in old: old-minus-new cannot pass.
+        peer.deliver_message(services_registered_change(
+            1,
+            &["shell"],
+            &["shell", "keeper"],
+        ));
+    }
+
+    #[test]
+    fn citizen_disconnect_removes_owned_subpanels_and_scenes() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "alpha", "keeper", "left");
+        load_scene(&mut app, &peer, "beta", "keeper", "left");
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        load_scene(&mut app, &peer, "other-edge", "owner", "right");
+        // Mounting only registers; select the owner's page so disconnect must
+        // exercise removal landing and selection-memory fallback.
+        app.world_mut().write_message(ShellCommand {
+            output: test_model().output().clone(),
+            at: Default::default(),
+            kind: ShellCommandKind::Carousel {
+                edge: Edge::Left,
+                input: CarouselInput::SelectId("scene-notes".into()),
+            },
+        });
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-notes")
+        );
+        peer.deliver_message(services_registered_change(0, &["owner"], &[]));
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_some()
+        );
+        absent(&peer);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner")
+                .is_empty()
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-beta")
+        );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Right)
+                .page_ids
+                .is_empty()
+        );
+        // Actual scene teardown has run. A fresh reveal must remember the primary,
+        // not rewrite the previous-neighbour landing as last_selected.
+        for input in [PanelInput::Hide, PanelInput::Reveal] {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(),
+                at: Default::default(),
+                kind: ShellCommandKind::Panel {
+                    edge: Edge::Left,
+                    input,
+                },
+            });
+            app.update();
+        }
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-alpha")
+        );
+    }
+
+    #[test]
+    fn citizen_disconnect_queued_before_replacement_load_preserves_replacement() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        load_scene(&mut app, &peer, "old-only", "owner", "right");
+        absent(&peer);
+        peer.send(scene_load("notes", "owner", "left"));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        assert!(registry.seat("scene-notes").is_some());
+        assert!(registry.seat("scene-old-only").is_none());
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner"),
+            ["notes"]
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("scene-notes")
+        );
+    }
+
+    #[test]
+    fn citizen_scene_load_rejects_cross_owner_output_and_edge_collisions() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        for (owner, edge) in [("other", "left"), ("owner", "right")] {
+            peer.send(scene_load("notes", owner, edge));
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies[0].rc, 10);
+            assert!(replies[0].body.contains("SUBPANEL_COLLISION"));
+            assert_eq!(
+                app.world()
+                    .resource::<SubPanelRegistryState>()
+                    .0
+                    .seat("scene-notes")
+                    .unwrap()
+                    .owner,
+                "owner"
+            );
+        }
+        // Reserve elsewhere, then enter through the actual scene-load mount path.
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "scene-remote",
+                cosmix_shell::core::OutputKey::new("other-output").unwrap(),
+                Edge::Left,
+                "owner",
+                0,
+            )
+            .unwrap();
+        peer.send(scene_load("remote", "owner", "left"));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 10);
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner"),
+            ["notes"]
+        );
+        // Same owner/seat is a successful update, regardless of authored citizen.
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("authored-metadata")
+                .is_empty()
+        );
+    }
+
+    fn citizen_snapshot_id(peer: &ctk::bus::TestBusPeer) -> u64 {
+        peer.drain_calls()
+            .into_iter()
+            .find(|call| call.command == "noded.props.get")
+            .expect("registry reconciliation must request a full snapshot")
+            .request_id
+    }
+
+    fn reply_citizen_snapshot(peer: &ctk::bus::TestBusPeer, request_id: u64, names: &[&str]) {
+        peer.deliver_event(BusBridgeEvent::Reply {
+            request_id,
+            result: Ok(ctk::bus::BusReply {
+                rc: 0,
+                result: None,
+                body: json!({"services":{"registered":names}}).to_string(),
+            }),
+        });
+    }
+
+    #[test]
+    fn citizen_reconnect_and_dropped_messages_reconcile_full_snapshot() {
+        for trigger in [
+            BusBridgeEvent::Connection {
+                state: BusConnectionState::Connected,
+                generation: 2,
+            },
+            BusBridgeEvent::DroppedMessages(1),
+            BusBridgeEvent::ObservationDroppedMessages(1),
+        ] {
+            let (mut app, peer) = mounted_bus_app();
+            load_scene(&mut app, &peer, "notes", "owner", "left");
+            peer.deliver_event(trigger);
+            app.update();
+            let id = citizen_snapshot_id(&peer);
+            reply_citizen_snapshot(&peer, id, &["shell"]);
+            app.update();
+            assert!(
+                app.world()
+                    .resource::<SubPanelRegistryState>()
+                    .0
+                    .seat("scene-notes")
+                    .is_none()
+            );
+            assert!(
+                app.world()
+                    .resource::<ShellFrameState>()
+                    .0
+                    .panel(Edge::Left)
+                    .page_ids
+                    .is_empty()
+            );
+            app.update();
+            assert!(peer.drain_calls().is_empty(), "no periodic polling");
+        }
+    }
+
+    #[test]
+    fn citizen_snapshot_cannot_remove_load_accepted_after_request() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        peer.deliver_event(BusBridgeEvent::DroppedMessages(1));
+        app.update();
+        let id = citizen_snapshot_id(&peer);
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        reply_citizen_snapshot(&peer, id, &[]);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_some()
+        );
+        // A later observation still cleans this seat when it really disappears.
+        absent(&peer);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn citizen_malformed_snapshot_and_stale_reply_remove_nothing() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        peer.deliver_event(BusBridgeEvent::DroppedMessages(1));
+        app.update();
+        let id = citizen_snapshot_id(&peer);
+        peer.deliver_message(services_registered_change(1, &[], &["owner"]));
+        app.update();
+        reply_citizen_snapshot(&peer, id, &[]);
+        let mut malformed = services_registered_change(1, &[], &[]);
+        malformed.body = json!({"path":"services.registered", "new":["shell", 3]}).to_string();
+        peer.deliver_message(malformed);
+        app.update();
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn citizen_mesh_and_anonymous_scene_callers_remain_open() {
+        let (mut app, peer) = mounted_bus_app();
+        let mut remote = scene_load("remote", "bridge-peer", "left");
+        remote.headers.insert("broker_origin".into(), "mesh".into());
+        remote
+            .headers
+            .insert("broker_peer".into(), "remote-node".into());
+        remote
+            .headers
+            .insert("broker_service".into(), "notes".into());
+        peer.send(remote);
+        peer.send(scene_load("anonymous", "", "right"));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|reply| reply.rc == 0));
+        absent(&peer);
+        app.update();
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        assert_eq!(
+            registry.seat("scene-remote").unwrap().owner,
+            "notes@remote-node"
+        );
+        assert!(registry.seat("scene-anonymous").is_some());
+        // No local registration set can attest either lifetime. Do not guess.
+        // Nor may another anonymous request silently become that same owner.
+        peer.send(scene_load("anonymous", "", "right"));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 10);
+    }
+
+    #[test]
+    fn citizen_scene_load_refuses_stale_connection_and_unattested_sender() {
+        let (mut app, peer) = mounted_bus_app();
+        let mut stale = scene_load("stale", "owner", "left");
+        stale.connection_generation = 0;
+        peer.send(stale);
+        app.update();
+        // The bridge drops stale epochs before Quoin dispatch. Their reply
+        // correlation belongs to a dead connection, so no reply is expected.
+        assert!(peer.drain_responses().is_empty());
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner")
+                .is_empty()
+        );
+        let mut unattested = scene_load("unattested", "owner", "left");
+        unattested.headers.clear();
+        peer.send(unattested);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(replies[0].body.contains("scene caller provenance"));
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("owner")
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .is_empty()
+        );
+        // Positive control: the same live, attested sender can still load.
+        load_scene(&mut app, &peer, "accepted", "owner", "left");
+    }
+
+    /// The settings branch keeps the same stale-connection fence as the scene
+    /// and sub-panel verbs. The test bridge's committed generation stays 1,
+    /// so a request stamped 1 still drains after a `Connected` event for
+    /// generation 2 — exactly the leaked-epoch shape the fence exists for:
+    /// the request must be refused before `dispatch_verb`, spending no
+    /// settings write (here, no live theme application).
+    #[test]
+    fn settings_verbs_refuse_a_stale_quoin_connection() {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        // Before any connection, the fence is open (no live generation to
+        // mismatch) and the write spends normally.
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<cosmix_shell::chrome::QuoinSchemeSelected>>()
+                .drain()
+                .count(),
+            1,
+            "the live request applied the theme"
+        );
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 2,
+        });
+        app.update();
+        peer.drain_calls();
+        peer.send(wire("shell.settings.scheme", json!({"name":"forest"})));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(
+            replies[0].body.contains("stale Quoin connection"),
+            "{}",
+            replies[0].body
+        );
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<Messages<cosmix_shell::chrome::QuoinSchemeSelected>>()
+                .drain()
+                .count(),
+            0,
+            "a stale settings request must not apply a theme"
+        );
+    }
+
+    /// Chunk-8 fixture: the sub-panel verbs address the process-wide
+    /// registry and the model's carousels, which the runtime plugin owns —
+    /// no chrome needed, so a plain bus app with its model connected.
+    fn sub_panel_app() -> (App, ctk::bus::TestBusPeer) {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        peer.drain_calls();
+        (app, peer)
+    }
+
+    /// Send one sub-panel verb over the live wire shape and drain its reply.
+    fn sub_send(
+        app: &mut App,
+        peer: &ctk::bus::TestBusPeer,
+        command: &str,
+        body: Value,
+    ) -> (u8, Value) {
+        peer.send(wire(command, body));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(
+            replies.len(),
+            1,
+            "one request must produce exactly one reply"
+        );
+        (
+            replies[0].rc,
+            serde_json::from_str(&replies[0].body).unwrap(),
+        )
+    }
+
+    #[test]
+    fn sub_register_remove_round_trip() {
+        let (mut app, peer) = sub_panel_app();
+        // Ownership is the attested caller; a caller-supplied `owner`
+        // argument is never read.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"left","name":"notify.n42","owner":"spoofed"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body["accepted"], true);
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["notify.n42"],
+            "registration fills the carousel without chrome content"
+        );
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        let seat = registry.seat("notify.n42").unwrap();
+        assert_eq!(seat.owner, "peer", "the attested caller owns the seat");
+        assert_eq!(seat.edge, Edge::Left);
+        assert!(
+            seat.accepted_at >= 1,
+            "the seat carries its acceptance receipt for disconnect sweeps"
+        );
+
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.remove",
+            json!({"name":"notify.n42"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .is_empty()
+        );
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.n42")
+                .is_none()
+        );
+
+        // The name is free again after removal — for anyone.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"right","name":"notify.n42"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.n42")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn sub_register_duplicate_name_refused() {
+        let (mut app, peer) = sub_panel_app();
+        let (rc, _) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.register",
+            json!({"edge":"left","name":"notify.n42"}),
+        );
+        assert_eq!(rc, 0);
+        // The same name again — same edge and owner, then another edge: a
+        // name is globally unique across all edges and outputs (panel doc
+        // §5), and both refusals happen at dispatch, before any ack.
+        for edge in ["left", "right"] {
+            let (rc, body) = sub_send(
+                &mut app,
+                &peer,
+                "shell.sub.register",
+                json!({"edge":edge,"name":"notify.n42"}),
+            );
+            assert_eq!(rc, 10, "{edge}: {body}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("already registered"),
+                "{edge}: {body}"
+            );
+        }
+        // Neither refusal disturbed the original registration.
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(
+            frame
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["notify.n42"]
+        );
+        assert!(frame.panel(Edge::Right).page_ids.is_empty());
+        assert_eq!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.n42")
+                .unwrap()
+                .owner,
+            "peer"
+        );
+        // A live page WITHOUT a seat (host chrome content) is equally taken,
+        // wherever it sits: the frame check sweeps every edge of the output,
+        // so a seat-less page on ANOTHER edge refuses a registration that
+        // the requested edge alone would have accepted.
+        cosmix_shell::runtime::set_shell_pages(
+            app.world_mut(),
+            Edge::Bottom,
+            vec!["launcher".to_owned()],
+            None,
+        );
+        for edge in ["bottom", "right"] {
+            let (rc, body) = sub_send(
+                &mut app,
+                &peer,
+                "shell.sub.register",
+                json!({"edge":edge,"name":"launcher"}),
+            );
+            assert_eq!(rc, 10, "{edge}: {body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("already a page"),
+                "{edge}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_remove_unknown_is_refused() {
+        let (mut app, peer) = sub_panel_app();
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"ghost"}));
+        assert_eq!(rc, 10, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("not registered"),
+            "{body}"
+        );
+        // Malformed requests are refused with precise errors; nothing
+        // enqueues and no seat is spent.
+        for (command, body_value, fragment) in [
+            ("shell.sub.remove", json!({}), "requires a name"),
+            ("shell.sub.remove", json!({"name":"  "}), "requires a name"),
+            ("shell.sub.register", json!({"name":"x"}), "edge must be"),
+            (
+                "shell.sub.register",
+                json!({"edge":"sideways","name":"x"}),
+                "edge must be",
+            ),
+        ] {
+            let (rc, body) = sub_send(&mut app, &peer, command, body_value.clone());
+            assert_eq!(rc, 10, "{command} {body_value}: {body}");
+            assert!(body["error"].as_str().unwrap().contains(fragment));
+        }
+        // An unattested caller is refused before any argument is read — the
+        // provenance stamp every verb requires, not a "who may" gate.
+        let mut unattested = request("shell.sub.register");
+        unattested.body = json!({"edge":"left","name":"x"}).to_string();
+        peer.send(unattested);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].rc, 10);
+        assert!(replies[0].body.contains("sub-panel caller provenance"));
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("x")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sub_remove_lands_per_removal_rule() {
+        let (mut app, peer) = sub_panel_app();
+        for name in ["alpha", "beta", "gamma"] {
+            let (rc, body) = sub_send(
+                &mut app,
+                &peer,
+                "shell.sub.register",
+                json!({"edge":"left","name":name}),
+            );
+            assert_eq!(rc, 0, "{name}: {body}");
+        }
+        let pages = |app: &App| {
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<String>>()
+        };
+        let active = |app: &App| {
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .clone()
+        };
+        assert_eq!(pages(&app), ["alpha", "beta", "gamma"]);
+        // Activation is chunk 16; page.set selects today.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.panel.page.set",
+            json!({"edge":"left","id":"gamma"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(active(&app).as_deref(), Some("gamma"));
+
+        // Removing the shown page lands on the previous registered
+        // neighbour (panel doc §3).
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"gamma"}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(active(&app).as_deref(), Some("beta"));
+        assert_eq!(pages(&app), ["alpha", "beta"]);
+
+        // The remembered selection fell back to the primary, not to the
+        // landing: a fresh reveal shows alpha (chunk 5's rule, reached
+        // through the verb).
+        for verb in ["shell.panel.hide", "shell.panel.show"] {
+            let (rc, body) = sub_send(&mut app, &peer, verb, json!({"edge":"left"}));
+            assert_eq!(rc, 0, "{verb}: {body}");
+        }
+        assert_eq!(active(&app).as_deref(), Some("alpha"));
+
+        // Removing a page that is not shown never moves the selection.
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(active(&app).as_deref(), Some("alpha"));
+        assert_eq!(pages(&app), ["alpha"]);
+        assert_eq!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .names_owned_by("peer"),
+            ["alpha"],
+            "each removal took its seat with its page"
+        );
+    }
+
+    /// Review #4 (chunk 8): a queued removal applies only to the exact
+    /// registration its dispatch resolved — same owner AND same acceptance
+    /// receipt — never to whatever holds the name at the Model stage. In
+    /// one batch: `sub.remove` queues against the seat; a scene unload
+    /// drops that seat; another caller's load reserves a replacement under
+    /// the same name. The stale removal must drop silently and the
+    /// replacement survive.
+    #[test]
+    fn sub_remove_spared_a_replacement_reserved_in_the_same_batch() {
+        let (mut app, peer) = mounted_bus_app();
+        load_scene(&mut app, &peer, "notes", "owner", "left");
+        // Arrival order is the race: the removal resolves the live seat
+        // first, the unload then drops it, and the replacement load
+        // re-reserves the name before the Model stage drains the queue.
+        peer.send(wire("shell.sub.remove", json!({"name":"scene-notes"})));
+        peer.send(wire("shell.scene.unload", json!({"scene":"notes"})));
+        peer.send(scene_load("notes", "other", "left"));
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies.len(), 3);
+        for reply in &replies {
+            assert_eq!(reply.rc, 0, "{}", reply.body);
+        }
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        let seat = registry.seat("scene-notes").expect("replacement seat");
+        assert_eq!(seat.owner, "other");
+        assert_eq!(
+            app.world()
+                .resource::<cosmix_scene_bevy::SceneStore>()
+                .scenes_owned_by("other"),
+            ["notes"]
+        );
+        assert!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .any(|page| page == "scene-notes"),
+            "the replacement's carousel page survives the stale removal"
+        );
+        // The spared replacement is itself removable through a fresh verb.
+        let (rc, body) = sub_send(
+            &mut app,
+            &peer,
+            "shell.sub.remove",
+            json!({"name":"scene-notes"}),
+        );
+        assert_eq!(rc, 0, "{body}");
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-notes")
+                .is_none()
+        );
+    }
+
+    /// Review #5 (chunk 8): a dispatch reserves its seat and queues its
+    /// command against the current output; an output replacement landing
+    /// before the Model stage (the embedded host's model swap — now ordered
+    /// before the dispatch — or a stashed reply drained a frame later)
+    /// migrates the seat. The Model stage must apply the lifecycle command
+    /// against the replacement model rather than drop it at the output
+    /// gate: the register fills the replacement's carousel, and a later
+    /// acked removal still lands.
+    #[test]
+    fn lifecycle_commands_apply_across_an_output_replacement() {
+        #[derive(Resource)]
+        struct PendingReplacement(cosmix_shell::core::ShellModel);
+        // A one-shot host system standing in for the embedded `prepare`
+        // race: it replaces the model after the Input stage has dispatched
+        // against the outgoing output, and before the Model stage applies.
+        fn replace_output(world: &mut World) {
+            if let Some(pending) = world.remove_resource::<PendingReplacement>() {
+                cosmix_shell::runtime::replace_shell_model(world, pending.0);
+            }
+        }
+        fn model_on(output: &str) -> cosmix_shell::core::ShellModel {
+            cosmix_shell::core::ShellModel::new(
+                cosmix_shell::core::OutputKey::new(output).unwrap(),
+                cosmix_shell::core::LogicalSize::new(1000.0, 800.0).unwrap(),
+                Default::default(),
+                std::time::Duration::from_millis(800),
+                std::time::Duration::from_millis(200),
+            )
+            .unwrap()
+        }
+
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(model_on("test")))
+            .add_systems(
+                Update,
+                replace_output
+                    .after(ShellRuntimeSet::Input)
+                    .before(ShellRuntimeSet::Model),
+            );
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        app.update();
+        peer.drain_calls();
+
+        // Register dispatched against "test"; the model becomes
+        // "replacement" between dispatch and application.
+        peer.send(wire(
+            "shell.sub.register",
+            json!({"edge":"left","name":"notify.migrate"}),
+        ));
+        app.insert_resource(PendingReplacement(model_on("replacement")));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "replacement");
+        assert_eq!(
+            frame
+                .panel(Edge::Left)
+                .page_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["notify.migrate"],
+            "a register dispatched against the replaced output fills the \
+             replacement's carousel"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.migrate")
+                .unwrap()
+                .output
+                .as_str(),
+            "replacement"
+        );
+
+        // An acked removal across a second replacement still lands: the
+        // seat migrates again and the Model stage applies the removal
+        // against the current registry.
+        peer.send(wire("shell.sub.remove", json!({"name":"notify.migrate"})));
+        app.insert_resource(PendingReplacement(model_on("third")));
+        app.update();
+        assert_eq!(peer.drain_responses()[0].rc, 0);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "third");
+        assert!(
+            frame.panel(Edge::Left).page_ids.is_empty(),
+            "the removal took the migrated page with its seat"
+        );
+        assert!(
+            app.world()
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("notify.migrate")
+                .is_none()
         );
     }
 
@@ -1755,6 +3662,7 @@ mod tests {
             };
             let before = props(&model);
             assert_eq!(before["pinned"], json!(mode != PanelMode::Hidden));
+            assert_eq!(before["mode"], json!(mode.as_str()));
             assert_eq!(
                 before["visible"],
                 json!(mode != PanelMode::Hidden || transient)
@@ -1780,11 +3688,155 @@ mod tests {
             model.panel_input(edge, at, input).unwrap();
             assert_eq!(model.panel(edge).exclusive_zone_px, 0.0);
             assert_eq!(props(&model)["pinned"], json!(false));
+            assert_eq!(props(&model)["mode"], json!("hidden"));
             model.panel_input(edge, at, PanelInput::Hide).unwrap();
             model.tick(Duration::from_millis(400)).unwrap();
             let confirmed = props(&model);
             assert_eq!(confirmed["pinned"], json!(false));
+            assert_eq!(confirmed["mode"], json!("hidden"));
             assert_eq!(confirmed["visible"], json!(false));
+        }
+    }
+
+    /// Chunk-2 acceptance gate: every mode-changing cell of the shell
+    /// design's §3.1 transition table (the LMB and Shift+LMB columns; RMB
+    /// opens the menu and changes nothing here, the drag gestures are
+    /// deferred), walked twice — once as the raw corner-click input each
+    /// gesture decodes to, once through the precise Bus verbs — asserting
+    /// the APPLIED state, not the verb round-trip: resulting mode, the
+    /// reservation that mode owes (only `Docked` claims an exclusive zone,
+    /// and it claims its full thickness), and the persistence effect. The
+    /// verb rows also read the applied mode back through the
+    /// `panels.<edge>.mode` leaf.
+    #[test]
+    fn every_s31_mode_cell_applies_mode_and_reservation_via_verbs_and_clicks() {
+        use std::time::Duration;
+        let at = Duration::from_millis(100);
+        let lmb = PanelInput::PinToggle;
+        let shift_lmb = PanelInput::DockToggle;
+        let mode_verb = |mode: &str| ("shell.panel.mode", json!({"edge":"left","mode":mode}));
+        let dock_verb = || ("shell.panel.dock", json!({"edge":"left"}));
+        let cells = [
+            // hidden (incl. transiently revealed): LMB → pinned, Shift+LMB → docked
+            (PanelMode::Hidden, false, lmb, mode_verb("pinned"), PanelMode::Pinned),
+            (PanelMode::Hidden, true, lmb, mode_verb("pinned"), PanelMode::Pinned),
+            (PanelMode::Hidden, false, shift_lmb, dock_verb(), PanelMode::Docked),
+            (PanelMode::Hidden, true, shift_lmb, dock_verb(), PanelMode::Docked),
+            // pinned: LMB → hidden, Shift+LMB → docked
+            (PanelMode::Pinned, false, lmb, mode_verb("hidden"), PanelMode::Hidden),
+            (PanelMode::Pinned, false, shift_lmb, dock_verb(), PanelMode::Docked),
+            // docked: LMB → pinned, Shift+LMB → hidden
+            (PanelMode::Docked, false, lmb, mode_verb("pinned"), PanelMode::Pinned),
+            (PanelMode::Docked, false, shift_lmb, mode_verb("hidden"), PanelMode::Hidden),
+        ];
+        for (start, transient, click, (verb, body), target) in cells {
+            let context = format!("{start:?} + {click:?} → {target:?}");
+            // Click path: the gesture's decoded input, held and unheld — the
+            // corner holds the panel while the pointer rests in it.
+            for held in [false, true] {
+                let mut model = test_model();
+                if start != PanelMode::Hidden {
+                    model.set_mode(Edge::Left, Duration::ZERO, start).unwrap();
+                } else if transient {
+                    model
+                        .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+                        .unwrap();
+                }
+                if held {
+                    model
+                        .panel_input(Edge::Left, at, PanelInput::CornerEntered)
+                        .unwrap();
+                }
+                let update = model.panel_input(Edge::Left, at, click).unwrap();
+                assert_applied_mode(&model, target, &context);
+                assert_eq!(
+                    update.effect,
+                    Some(cosmix_shell::core::PanelEffect::ModeChanged { mode: target }),
+                    "{context} (held={held})"
+                );
+                // Chunk 3's arm: a deliberate undock from Docked hides at
+                // once only when nothing holds the panel; held keeps the
+                // transient reveal (§4.3 — grace never applies to the
+                // deliberate action itself, but the holder still holds).
+                if start == PanelMode::Docked && click == PanelInput::DockToggle {
+                    let snapshot = model.panel(Edge::Left);
+                    assert_eq!(snapshot.transient_revealed, held, "{context}");
+                    assert_eq!(snapshot.hide_at, None, "{context}");
+                }
+            }
+
+            // Verb path: the precise Bus verb, applied to the model and read
+            // back through the props leaf.
+            let mut model = test_model();
+            if start != PanelMode::Hidden {
+                model.set_mode(Edge::Left, Duration::ZERO, start).unwrap();
+            } else if transient {
+                model
+                    .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+                    .unwrap();
+            }
+            let verb_request = wire(verb, body);
+            let (rc, reply, command) = dispatch_shell_request(
+                &verb_request,
+                &ShellFrame::from_model(&model),
+                at,
+            );
+            assert_eq!(rc, 0, "{context}: {reply}");
+            let ShellCommandKind::Panel {
+                edge,
+                input: panel_input,
+            } = command.expect("accepted verb enqueues a command").kind
+            else {
+                panic!("{context}: panel command");
+            };
+            let update = model.panel_input(edge, at, panel_input).unwrap();
+            assert_applied_mode(&model, target, &context);
+            assert_eq!(
+                update.effect,
+                Some(cosmix_shell::core::PanelEffect::ModeChanged { mode: target }),
+                "{context}"
+            );
+            // A deliberate Hide through the mode verb conceals at once: no
+            // transient reveal survives, no grace deadline is armed.
+            if target == PanelMode::Hidden {
+                let snapshot = model.panel(Edge::Left);
+                assert!(!snapshot.transient_revealed, "{context}");
+                assert_eq!(snapshot.hide_at, None, "{context}");
+            }
+            let mut props = request("shell.props.get");
+            props.body = json!({"path":"panels.left.mode"}).to_string();
+            let (rc, leaf, _) = dispatch_shell_request(
+                &props,
+                &ShellFrame::from_model(&model),
+                model.last_update(),
+            );
+            assert_eq!(rc, 0);
+            assert_eq!(
+                serde_json::from_str::<Value>(&leaf).unwrap(),
+                json!(target.as_str()),
+                "{context}: the mode leaf must report the applied mode"
+            );
+        }
+
+        fn assert_applied_mode(
+            model: &cosmix_shell::core::ShellModel,
+            target: PanelMode,
+            context: &str,
+        ) {
+            let snapshot = model.panel(Edge::Left);
+            assert_eq!(snapshot.mode, target, "{context}");
+            if target == PanelMode::Docked {
+                // Docked reserves its full thickness (shell doc §3).
+                assert!(snapshot.exclusive_zone_px > 0.0, "{context}");
+                assert_eq!(
+                    snapshot.exclusive_zone_px, snapshot.thickness_px,
+                    "{context}"
+                );
+            } else {
+                // Hidden and Pinned reserve nothing; a transient reveal
+                // never reads as a reservation.
+                assert_eq!(snapshot.exclusive_zone_px, 0.0, "{context}");
+            }
         }
     }
 
@@ -1809,5 +3861,599 @@ mod tests {
             );
         }
         ShellFrame::from_model(&model)
+    }
+
+    /// Chunk 16: a minimal comp for [`pump`] — it answers reads and verbs,
+    /// and for the left edge keeps comp's holder verdict (explicit holds
+    /// plus its own keyboard-focus membership), publishing `panel.command`
+    /// on a change and re-stating it for every hidden mode report.
+    struct FakeComp {
+        capable: std::cell::Cell<bool>,
+        focus: std::cell::RefCell<Value>,
+        outputs: std::cell::RefCell<BTreeMap<u64, &'static str>>,
+        /// Refuse hold acquisitions with this code — `unknown_panel_surface`
+        /// for a layer comp has not mapped yet, `locked` under a session
+        /// lock (comp refuses before touching holder state, publishing
+        /// nothing).
+        refuse_holds: std::cell::Cell<Option<&'static str>>,
+        left_surface: std::cell::RefCell<Option<String>>,
+        left_hidden: std::cell::Cell<bool>,
+        left_holds: std::cell::RefCell<BTreeSet<String>>,
+        left_focused: std::cell::Cell<bool>,
+        verdict: std::cell::Cell<Option<bool>>,
+        sequence: std::cell::Cell<u64>,
+        /// Every command published, in order: `true` reveal, `false` conceal.
+        published: std::cell::RefCell<Vec<bool>>,
+        dirty: std::cell::Cell<bool>,
+    }
+
+    impl FakeComp {
+        fn new(capable: bool) -> Self {
+            Self {
+                capable: capable.into(),
+                focus: json!({"keyboard":null,"pointer":null}).into(),
+                outputs: BTreeMap::new().into(),
+                refuse_holds: None.into(),
+                left_surface: None.into(),
+                left_hidden: true.into(),
+                left_holds: BTreeSet::new().into(),
+                left_focused: false.into(),
+                verdict: None.into(),
+                sequence: 0.into(),
+                published: Vec::new().into(),
+                dirty: false.into(),
+            }
+        }
+
+        fn settle(&self, peer: &ctk::bus::TestBusPeer, restate: bool) {
+            let Some(surface) = self.left_surface.borrow().clone() else { return };
+            if !self.left_hidden.get() {
+                self.verdict.set(None);
+                return;
+            }
+            let holding = self.left_focused.get() || !self.left_holds.borrow().is_empty();
+            if restate || self.verdict.get() != Some(holding) {
+                self.verdict.set(Some(holding));
+                self.sequence.set(self.sequence.get() + 1);
+                self.published.borrow_mut().push(holding);
+                self.dirty.set(true);
+                peer.deliver_message(panel_command(self.sequence.get(), &surface,
+                    if holding { "reveal" } else { "conceal" }));
+            }
+        }
+
+        /// Keyboard focus moves onto (or off) the left panel's layer.
+        fn set_focused(&self, peer: &ctk::bus::TestBusPeer, focused: bool) {
+            self.left_focused.set(focused);
+            self.settle(peer, false);
+        }
+
+        fn published(&self) -> Vec<bool> {
+            std::mem::take(&mut *self.published.borrow_mut())
+        }
+    }
+
+    /// Run updates, answering every call to comp as comp would, until an
+    /// update sends none and comp published nothing; returns those calls.
+    /// Every comp verb Quoin sends must be the literal `comp.*` command
+    /// addressed to the instance.
+    fn pump(app: &mut App, peer: &ctk::bus::TestBusPeer, comp: &FakeComp) -> Vec<ctk::bus::TestBusCall> {
+        let mut seen = Vec::new();
+        for _ in 0..32 {
+            app.update();
+            let calls: Vec<_> = peer.drain_calls().into_iter()
+                .filter(|call| call.to == "comp-nested").collect();
+            if calls.is_empty() && !comp.dirty.replace(false) {
+                return seen;
+            }
+            for call in calls {
+                assert!(call.command.starts_with("comp."), "literal comp verb: {}", call.command);
+                let body: Value = serde_json::from_str(&call.body).unwrap();
+                let left = body["edge"] == "left";
+                let (rc, reply) = match (call.command.as_str(), body["path"].as_str()) {
+                    ("comp.props.get", Some("input.corners.holders")) => (0, json!(comp.capable.get())),
+                    ("comp.props.get", Some("focus")) => (0, comp.focus.borrow().clone()),
+                    ("comp.props.get", Some(path)) => {
+                        let id = path.strip_prefix("surfaces.s")
+                            .and_then(|rest| rest.strip_suffix(".output"))
+                            .and_then(|id| id.parse::<u64>().ok())
+                            .unwrap_or_else(|| panic!("unexpected read {path}"));
+                        (0, json!(comp.outputs.borrow().get(&id)))
+                    }
+                    ("comp.panel.hold", _) if body["acquire"] == true && comp.refuse_holds.get().is_some() => {
+                        (10, json!({"error":comp.refuse_holds.get(),"surface":body["surface"]}))
+                    }
+                    _ => (0, json!({"accepted":true,"surface":body["surface"]})),
+                };
+                peer.deliver_event(BusBridgeEvent::Reply {
+                    request_id: call.request_id,
+                    result: Ok(ctk::bus::BusReply { rc, body: reply.to_string(), result: None }),
+                });
+                match call.command.as_str() {
+                    "comp.panel.mode" if left => {
+                        *comp.left_surface.borrow_mut() = body["surface"].as_str().map(str::to_owned);
+                        comp.left_hidden.set(body["mode"] == "hidden");
+                        if body["mode"] != "hidden" {
+                            comp.left_holds.borrow_mut().clear();
+                        }
+                        comp.settle(peer, true);
+                    }
+                    "comp.panel.hold" if left && rc == 0 && comp.left_hidden.get() => {
+                        let holder = body["holder"].as_str().unwrap().to_owned();
+                        if body["acquire"] == true {
+                            comp.left_holds.borrow_mut().insert(holder);
+                        } else {
+                            comp.left_holds.borrow_mut().remove(&holder);
+                        }
+                        comp.settle(peer, false);
+                    }
+                    _ => {}
+                }
+                seen.push(call);
+            }
+        }
+        panic!("comp traffic never settled");
+    }
+
+    fn comp_message(suffix: &str, body: Value) -> BusMessage {
+        BusMessage {
+            connection_generation: 1,
+            from: "comp-nested".into(),
+            command: suffix.into(),
+            body: body.to_string(),
+            headers: BTreeMap::from([
+                ("topic".into(), format!("comp-nested.{suffix}")),
+                ("command".into(), suffix.into()),
+            ]),
+        }
+    }
+
+    fn focus_changed(keyboard: Option<u64>, previous: Option<u64>) -> BusMessage {
+        comp_message("focus.changed", json!({"keyboard":keyboard,"previous":previous,
+            "exclusive_latch":null,"event_seq":1}))
+    }
+
+    fn holds(calls: &[ctk::bus::TestBusCall]) -> Vec<Value> {
+        calls.iter().filter(|call| call.command == "comp.panel.hold")
+            .map(|call| serde_json::from_str(&call.body).unwrap()).collect()
+    }
+
+    /// A connected Quoin with the standalone holder client and activation
+    /// targeting against `comp-nested`, and `alpha` + `beta` registered on
+    /// the left edge. Left has no layer token yet: a hidden panel has no
+    /// layer until a reveal maps one (the test inserts it then); the other
+    /// edges report their modes during setup.
+    ///
+    /// Harness limit: `TestBusPeer::drain_calls` and `drain_responses` share
+    /// one queue and each discards what the other would return, so a verb
+    /// sent with [`sub_send`] must not also send a comp call in the same
+    /// update. The tests arrange that the way the live host does — the left
+    /// layer token appears only after the reveal — and drive mode, focus and
+    /// Escape with `write_message` rather than over the Bus.
+    fn activation_app(comp: &FakeComp) -> (App, ctk::bus::TestBusPeer) {
+        let (bridge, peer) = test_bridge("quoin");
+        let mut app = bus_app(bridge);
+        app.add_plugins(cosmix_shell::runtime::ShellRuntimePlugin::new(test_model()));
+        let mut bus = ctk::bus::BusBridgeConfig::new("quoin", "ws://127.0.0.1:9000");
+        crate::activation::install(&mut app, &mut bus, "comp-nested".into());
+        crate::holders::install(&mut app, &mut bus, "comp-nested".into());
+        assert_eq!(
+            bus.subscriptions.iter().filter(|topic| *topic == "comp-nested.focus.changed").count(),
+            1,
+            "one subscription to comp's focus topic"
+        );
+        app.insert_resource(cosmix_shell_host::holders::PanelLayerIdentities(
+            [Edge::Top, Edge::Right, Edge::Bottom].into_iter()
+                .map(|edge| (test_model().output().clone(), edge, format!("panel-{}", edge_name(edge))))
+                .collect(),
+        ));
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Connected,
+            generation: 1,
+        });
+        pump(&mut app, &peer, comp);
+        peer.drain_responses();
+        for name in ["alpha", "beta"] {
+            let (rc, body) = sub_send(&mut app, &peer, "shell.sub.register",
+                json!({"edge":"left","name":name}));
+            assert_eq!(rc, 0, "{body}");
+        }
+        (app, peer)
+    }
+
+    /// Host input for the model: which panel surface holds the keyboard,
+    /// or an Escape reaching the focused panel.
+    fn keyboard(app: &mut App, command: cosmix_shell::runtime::KeyboardCommand) {
+        app.world_mut().write_message(ShellCommand {
+            output: test_model().output().clone(),
+            at: Default::default(),
+            kind: ShellCommandKind::Keyboard(command),
+        });
+    }
+
+    fn observe_focus(app: &mut App, edge: Option<Edge>) {
+        keyboard(app, cosmix_shell::runtime::KeyboardCommand::FocusObserved(edge));
+    }
+
+    fn left(app: &App) -> cosmix_shell::runtime::PanelPresentation {
+        app.world().resource::<ShellFrameState>().0.panel(Edge::Left).clone()
+    }
+
+    fn map_left_layer(app: &mut App, token: &str) {
+        let mut identities = app.world_mut()
+            .resource_mut::<cosmix_shell_host::holders::PanelLayerIdentities>();
+        identities.0.retain(|(_, edge, _)| *edge != Edge::Left);
+        identities.0.push((test_model().output().clone(), Edge::Left, token.into()));
+    }
+
+    fn unmap_left_layer(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<cosmix_shell_host::holders::PanelLayerIdentities>()
+            .0
+            .retain(|(_, edge, _)| *edge != Edge::Left);
+    }
+
+    fn panel_command(event_seq: u64, surface: &str, action: &str) -> BusMessage {
+        comp_message("panel.command", json!({"version":1,"output":"test","edge":"left",
+            "surface":surface,"action":action,"event_seq":event_seq}))
+    }
+
+    /// Activate `beta` on the hidden left edge, map its layer and let comp
+    /// acknowledge the focus hold: the state every hidden-edge test starts
+    /// from. Returns the hold comp received.
+    fn activate_hidden_and_hold(app: &mut App, peer: &ctk::bus::TestBusPeer, comp: &FakeComp,
+        token: &str) -> Value {
+        let (rc, body) = sub_send(app, peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        map_left_layer(app, token);
+        let acquired = holds(&pump(app, peer, comp));
+        assert_eq!(acquired.len(), 1, "{acquired:?}");
+        assert!(left(app).transient_revealed);
+        acquired[0].clone()
+    }
+
+    #[test]
+    fn activate_unknown_subpanel_is_refused() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        let before = left(&app);
+        for (body, fragment) in [
+            (json!({"name":"ghost"}), "'ghost' is not registered"),
+            (json!({}), "requires a name"),
+            (json!({"name":"  "}), "requires a name"),
+            (json!({"name":"alpha","focus":"maybe"}), "focus must be true or false"),
+            (json!({"name":"alpha","focus":1}), "focus must be true or false"),
+        ] {
+            let (rc, reply) = sub_send(&mut app, &peer, "shell.sub.activate", body.clone());
+            assert_eq!(rc, 10, "{body}: {reply}");
+            assert!(reply["error"].as_str().unwrap().contains(fragment), "{body}: {reply}");
+            assert!(reply.get("error_code").is_none(), "not a capability refusal: {reply}");
+        }
+        // The same refusal `sub.remove` gives: activation never creates.
+        let (_, removal) = sub_send(&mut app, &peer, "shell.sub.remove", json!({"name":"ghost"}));
+        let (_, activation) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"ghost"}));
+        assert_eq!(activation, removal);
+        // Provenance first, before any argument is read.
+        let mut unattested = request("shell.sub.activate");
+        unattested.body = json!({"name":"alpha"}).to_string();
+        peer.send(unattested);
+        app.update();
+        let replies = peer.drain_responses();
+        assert_eq!(replies[0].rc, 10);
+        assert!(replies[0].body.contains("sub-panel caller provenance"));
+        assert_eq!(left(&app), before, "no refusal touches the panel");
+        assert!(app.world().resource::<SubPanelRegistryState>().0.seat("ghost").is_none());
+    }
+
+    /// The B→C window: comp without the holder plane (or no holder client
+    /// at all, as in the embedded host) refuses with the reason — never a
+    /// silent no-op, never a local reveal.
+    #[test]
+    fn activate_while_uncapable_is_refused_with_reason() {
+        let comp = FakeComp::new(false);
+        let (mut app, peer) = activation_app(&comp);
+        let before = left(&app);
+        assert_eq!(before.active_page_id.as_deref(), Some("alpha"));
+        for remove_client in [false, true] {
+            if remove_client {
+                app.world_mut().remove_resource::<crate::holders::HolderClient>();
+            }
+            for focus in [true, false] {
+                let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate",
+                    json!({"name":"beta","focus":focus}));
+                assert_eq!(rc, 10, "{body}");
+                assert_eq!(body["error_code"], "ACTIVATION_UNAVAILABLE");
+                assert_eq!(body["reason"], "compositor holder plane not available");
+                assert_eq!(body["name"], "beta");
+                assert!(body["error"].as_str().unwrap().contains("compositor holder plane not available"));
+                assert_eq!(left(&app), before, "no reveal, page switch or focus request");
+                assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+            }
+        }
+        // An unknown name is still the unknown-name refusal while uncapable.
+        let (_, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"ghost"}));
+        assert!(body["error"].as_str().unwrap().contains("not registered"), "{body}");
+        // Discoverable: the verb is advertised, refusal and all.
+        let (_, info, _) = dispatch_shell_request(&request("shell.info"), &test_frame(), Default::default());
+        let info: Value = serde_json::from_str(&info).unwrap();
+        assert!(info["verbs"].as_array().unwrap().contains(&json!("sub.activate")));
+    }
+
+    /// End to end across the B→C window: refused while comp reports no
+    /// holder plane; comp's leaf changes (restart C), Quoin re-reads it on
+    /// the `props.changed`, and the same request is accepted and held.
+    #[test]
+    fn activation_is_refused_until_the_holder_plane_arrives() {
+        let comp = FakeComp::new(false);
+        let (mut app, peer) = activation_app(&comp);
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!((rc, &body["error_code"]), (10, &json!("ACTIVATION_UNAVAILABLE")));
+        comp.capable.set(true);
+        peer.deliver_message(comp_message("props.changed", json!({"path":"input.corners.holders",
+            "old":false,"new":true,"cause":"props.set","event_seq":2})));
+        let reads: Vec<_> = pump(&mut app, &peer, &comp).into_iter()
+            .map(|call| serde_json::from_str::<Value>(&call.body).unwrap()["path"].clone())
+            .collect();
+        assert!(reads.contains(&json!("input.corners.holders")), "the leaf is re-read: {reads:?}");
+        let hold = activate_hidden_and_hold(&mut app, &peer, &comp, "panel-left");
+        assert_eq!(hold["holder"], "focus");
+        assert_eq!(left(&app).active_page_id.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn activate_on_hidden_reveals_with_focus_hold() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        assert_eq!(body, json!({"accepted":true,"name":"beta","edge":"left","output":"test",
+            "target":null,"focus":true}));
+        let panel = left(&app);
+        assert_eq!(panel.mode, PanelMode::Hidden, "activation never changes a mode");
+        assert!(panel.transient_revealed);
+        assert_eq!(panel.active_page_id.as_deref(), Some("beta"));
+        assert_eq!(panel.page_change, cosmix_shell::runtime::PageChange::Named);
+        // The Panel(Left) focus request: the layer asks for the keyboard.
+        assert!(panel.keyboard_requested && !panel.keyboard_focused);
+        assert_eq!(panel.keyboard_interactivity, cosmix_shell::runtime::KeyboardInteractivity::Exclusive);
+
+        // The reveal maps the layer: its mode report, then the focus hold —
+        // the literal `comp.panel.hold`, addressed to the comp instance.
+        // Comp answers the hidden report with a re-stated conceal (nothing
+        // holds yet) — delivered after the mode report's ack and before any
+        // hold ack, since comp refuses the hold until the layer is mapped:
+        // the explicit reveal survives it (the anti-vanish invariant).
+        comp.refuse_holds.set(Some("unknown_panel_surface"));
+        map_left_layer(&mut app, "panel-left");
+        let calls = pump(&mut app, &peer, &comp);
+        let commands: Vec<_> = calls.iter().map(|call| (call.to.as_str(), call.command.as_str())).collect();
+        assert_eq!(commands, [("comp-nested", "comp.panel.mode"), ("comp-nested", "comp.panel.hold")]);
+        assert_eq!(holds(&calls), [json!({"output":"test","edge":"left","surface":"panel-left",
+            "holder":"focus","acquire":true})]);
+        assert_eq!(comp.published(), [false], "the re-stated conceal verdict");
+        assert!(left(&app).transient_revealed, "a conceal before the hold leaves the reveal");
+        // The layer maps: the refused hold is sent again and holds the edge.
+        comp.refuse_holds.set(None);
+        peer.deliver_message(comp_message("surface.mapped", json!({"id":4,"role":"layer","event_seq":3})));
+        let acquired = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(acquired.len(), 1);
+        assert_eq!(acquired[0]["acquire"], true);
+        assert_eq!(comp.published(), [true]);
+        assert!(left(&app).transient_revealed);
+
+        // The keyboard lands (the host reports it; comp's focus membership
+        // sees it too): the grab drops to on-demand, and the hold has done
+        // its job — Quoin releases it and comp's focus holder carries the
+        // reveal, so no conceal follows.
+        observe_focus(&mut app, Some(Edge::Left));
+        comp.set_focused(&peer, true);
+        let released = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(released.len(), 1);
+        assert_eq!((&released[0]["holder"], &released[0]["acquire"]), (&json!("focus"), &json!(false)));
+        assert!(comp.published().is_empty(), "comp's focus membership keeps the verdict");
+        let panel = left(&app);
+        assert!(panel.transient_revealed && panel.keyboard_focused && panel.keyboard_requested);
+        assert_eq!(panel.keyboard_interactivity, cosmix_shell::runtime::KeyboardInteractivity::OnDemand,
+            "granted: a click elsewhere can take focus");
+        // A comp focus event of any kind no longer bears on the hold.
+        peer.deliver_message(focus_changed(Some(5), Some(4)));
+        assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+
+        // Click-away: focus leaves the panel, the request ends, comp's last
+        // holder releases and the reveal ends.
+        observe_focus(&mut app, None);
+        comp.set_focused(&peer, false);
+        pump(&mut app, &peer, &comp);
+        assert_eq!(comp.published(), [false]);
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested);
+        assert_eq!(panel.mode, PanelMode::Hidden);
+
+        // Escape ends it too, before the keyboard ever landed: the request
+        // and the hold both go. Concealment destroyed the layer; the next
+        // reveal maps one with a new token.
+        unmap_left_layer(&mut app);
+        activate_hidden_and_hold(&mut app, &peer, &comp, "panel-left-2");
+        keyboard(&mut app, cosmix_shell::runtime::KeyboardCommand::Escape);
+        let released = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(released.len(), 1);
+        assert_eq!((&released[0]["surface"], &released[0]["acquire"]), (&json!("panel-left-2"), &json!(false)));
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested);
+    }
+
+    /// The grant never lands (a lock, a higher Exclusive layer): when the
+    /// request times out the reveal the activation made ends with it — the
+    /// model hides it and Quoin releases the hold — rather than leaving an
+    /// unfocused panel open that Escape (which goes to the application)
+    /// cannot reach.
+    #[test]
+    fn an_ungranted_activation_releases_its_hold_at_the_grant_timeout() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        activate_hidden_and_hold(&mut app, &peer, &comp, "panel-left");
+        comp.published();
+        std::thread::sleep(cosmix_shell::core::FOCUS_GRANT_TIMEOUT + std::time::Duration::from_millis(100));
+        let released = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0]["acquire"], false);
+        assert_eq!(comp.published(), [false], "nothing else holds: comp conceals");
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested);
+    }
+
+    /// The session-lock shape (review round 2): comp refuses the hold
+    /// `locked` before touching its holder state and publishes nothing, so
+    /// no reveal/conceal transition ever reaches Quoin and only the model can
+    /// end the reveal. At the grant timeout it does: the activation-made
+    /// reveal hides and no hold intent is left. A `focus=false` reveal has no
+    /// keyboard request to lapse and keeps the `shell.panel.show` lifecycle.
+    #[test]
+    fn an_ungranted_activation_under_a_lock_hides_at_the_grant_timeout() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        comp.refuse_holds.set(Some("locked"));
+        map_left_layer(&mut app, "panel-left");
+        let refused = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(refused.len(), 1, "the hold was sent and refused");
+        assert_eq!(refused[0]["acquire"], true);
+        comp.published();
+        assert!(left(&app).transient_revealed);
+        std::thread::sleep(cosmix_shell::core::FOCUS_GRANT_TIMEOUT + std::time::Duration::from_millis(100));
+        pump(&mut app, &peer, &comp);
+        assert!(comp.published().is_empty(), "comp said nothing");
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested, "the model ended it");
+        assert_eq!(panel.mode, PanelMode::Hidden);
+        assert_eq!(app.world().resource::<crate::holders::HolderClient>().focus_holds(), 0,
+            "no hold intent is left");
+
+        // focus=false under the same lock: nothing lapses, the reveal stays.
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate",
+            json!({"name":"alpha","focus":false}));
+        assert_eq!(rc, 0, "{body}");
+        std::thread::sleep(cosmix_shell::core::FOCUS_GRANT_TIMEOUT + std::time::Duration::from_millis(100));
+        assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+        assert!(left(&app).transient_revealed, "a focus=false reveal is untouched");
+    }
+
+    /// `focus=false`: reveal or switch for attention, without asking for the
+    /// keyboard and without a focus hold — as a header string or a JSON bool.
+    #[test]
+    fn activate_without_focus_reveals_without_keyboard_or_hold() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        map_left_layer(&mut app, "panel-left");
+        pump(&mut app, &peer, &comp);
+        comp.published();
+        let mut header = wire("shell.sub.activate", json!({"name":"beta"}));
+        header.headers.insert("focus".into(), "false".into());
+        for request in [header, wire("shell.sub.activate", json!({"name":"alpha","focus":false}))] {
+            peer.send(request);
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+            let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+            assert_eq!(body["focus"], false);
+            let panel = left(&app);
+            assert!(panel.transient_revealed, "revealed for attention");
+            assert_eq!(panel.active_page_id.as_deref(), body["name"].as_str());
+            assert!(!panel.keyboard_requested);
+            assert_eq!(panel.keyboard_interactivity, cosmix_shell::runtime::KeyboardInteractivity::OnDemand);
+            assert!(holds(&pump(&mut app, &peer, &comp)).is_empty(), "no focus hold");
+        }
+    }
+
+    #[test]
+    fn activate_on_pinned_or_docked_switches_carousel_only() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        map_left_layer(&mut app, "panel-left");
+        for mode in [PanelMode::Pinned, PanelMode::Docked] {
+            app.world_mut().write_message(ShellCommand {
+                output: test_model().output().clone(),
+                at: Default::default(),
+                kind: ShellCommandKind::Panel { edge: Edge::Left, input: PanelInput::SetMode(mode) },
+            });
+            pump(&mut app, &peer, &comp);
+            for name in ["beta", "alpha"] {
+                let before = left(&app);
+                assert_eq!(before.mode, mode);
+                assert_ne!(before.active_page_id.as_deref(), Some(name));
+                let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":name}));
+                assert_eq!(rc, 0, "{mode:?} {name}: {body}");
+                let after = left(&app);
+                assert_eq!(after.mode, mode, "{mode:?}: the mode is unchanged");
+                assert!(!after.transient_revealed, "{mode:?}: no transient reveal");
+                assert_eq!(after.active_page_id.as_deref(), Some(name), "{mode:?}");
+                assert_eq!(after.page_change, cosmix_shell::runtime::PageChange::Named,
+                    "{mode:?}: a direct jump, never a slide");
+                assert!(after.keyboard_requested, "{mode:?}: focus is requested");
+                assert_eq!(after.keyboard_interactivity,
+                    cosmix_shell::runtime::KeyboardInteractivity::Exclusive,
+                    "{mode:?}: the panel asks for the keyboard");
+                assert!(holds(&pump(&mut app, &peer, &comp)).is_empty(),
+                    "{mode:?}: persistent panels take no hold");
+            }
+            // The grant lands and the page stays: nothing reverts it.
+            observe_focus(&mut app, Some(Edge::Left));
+            pump(&mut app, &peer, &comp);
+            assert_eq!(left(&app).keyboard_interactivity,
+                cosmix_shell::runtime::KeyboardInteractivity::OnDemand);
+            observe_focus(&mut app, None);
+            pump(&mut app, &peer, &comp);
+            let after = left(&app);
+            assert_eq!((after.mode, after.active_page_id.as_deref()), (mode, Some("alpha")));
+            assert!(!after.keyboard_requested);
+        }
+    }
+
+    #[test]
+    fn activation_targets_focused_window_output_else_pointer() {
+        let comp = FakeComp::new(true);
+        *comp.focus.borrow_mut() = json!({"keyboard":7,"pointer":9,"window":{"id":7,"generation":1}});
+        *comp.outputs.borrow_mut() = BTreeMap::from([(7, "DP-1"), (9, "HDMI-A-1")]);
+        let (mut app, peer) = activation_app(&comp);
+        let target = |app: &mut App| {
+            let (rc, body) = sub_send(app, &peer, "shell.sub.activate", json!({"name":"alpha"}));
+            assert_eq!(rc, 0, "{body}");
+            assert_eq!(body["output"], "test", "the sub-panel shows on its seat's output");
+            body["target"].clone()
+        };
+        assert_eq!(target(&mut app), "DP-1", "the focused window's output");
+        // Nothing focused: the pointer's output. The focus change starts a
+        // fresh round of reads, literal `comp.props.get`s to the instance.
+        *comp.focus.borrow_mut() = json!({"keyboard":null,"pointer":9});
+        peer.deliver_message(focus_changed(None, Some(7)));
+        let reads: Vec<_> = pump(&mut app, &peer, &comp).into_iter()
+            .filter(|call| call.command == "comp.props.get")
+            .map(|call| serde_json::from_str::<Value>(&call.body).unwrap()["path"].clone())
+            .collect();
+        assert_eq!(reads, [json!("focus"), json!("surfaces.s9.output")]);
+        assert_eq!(target(&mut app), "HDMI-A-1");
+        // A focused surface comp puts on no output falls back to the pointer.
+        *comp.focus.borrow_mut() = json!({"keyboard":11,"pointer":9});
+        peer.deliver_message(focus_changed(Some(11), None));
+        pump(&mut app, &peer, &comp);
+        assert_eq!(target(&mut app), "HDMI-A-1");
+        // Neither known: no target, and the activation still stands.
+        *comp.focus.borrow_mut() = json!({"keyboard":null,"pointer":null});
+        peer.deliver_message(focus_changed(None, Some(11)));
+        pump(&mut app, &peer, &comp);
+        assert_eq!(target(&mut app), Value::Null);
+        // A lost connection forgets where the user was.
+        *comp.focus.borrow_mut() = json!({"keyboard":7,"pointer":null});
+        peer.deliver_message(focus_changed(Some(7), None));
+        pump(&mut app, &peer, &comp);
+        assert_eq!(target(&mut app), "DP-1");
+        peer.deliver_event(BusBridgeEvent::Connection {
+            state: BusConnectionState::Disconnected,
+            generation: 1,
+        });
+        app.update();
+        let targets = app.world().resource::<crate::activation::ActivationTargets>();
+        assert_eq!(targets.target(), None);
     }
 }

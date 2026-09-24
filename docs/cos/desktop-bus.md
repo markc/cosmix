@@ -171,6 +171,32 @@ It is event-driven: the tree is scanned once at start and again only on
 intended rescan trigger. `src/desktop/scripts/cosmix-desk-apps.service` is
 an example user unit bound to `graphical-session.target`.
 
+`apps.launch` sets `DISPLAY` for each child from comp's live XWayland,
+not from the citizen's own environment. A static `DISPLAY` in the
+citizen's unit is ignored. At every launch it reads comp's XWayland
+descriptor, `$XDG_RUNTIME_DIR/cosmix-comp/$WAYLAND_DISPLAY.xwayland.env`,
+and passes its `DISPLAY=:N` to the child on top of the inherited
+environment. Because it is read per launch, an XWayland restart on another
+display number is seen by the next launch.
+
+With no usable descriptor, the child is launched with `DISPLAY` removed,
+never inherited. That covers XWayland not ready yet, restarting or
+disabled, and a nested comp without it. An X11 app then fails at once
+instead of drawing on another X server. The citizen writes one stderr line
+per such launch naming the reason, including an unreadable descriptor. The
+file is mode 0600, so the citizen must run as comp's uid. The unset goes
+through `/usr/bin/env -u DISPLAY`, because Mix's spawn `env` option cannot
+remove a variable. The program is resolved first, on the same `PATH` the
+child gets, and env is handed the absolute path. A path containing `=` goes
+through `/bin/sh -c 'exec "$@"'`, because GNU env reads any such operand
+as an assignment. On this path the app's `argv[0]` is therefore its
+absolute path. A missing or non-executable program is still refused with
+rc 11 `spawn_failed`, never answered with the wrapper's pid.
+
+A descriptor left behind by a comp killed with SIGKILL is not checked
+against its `GENERATION` or against a live XWayland. It is trusted until
+comp's next start republishes or removes it.
+
 | Verb | JSON request | Successful response |
 |---|---|---|
 | `apps.list` | `{category?, query?}` | array of `{id,name,generic_name,comment,icon,categories,exec,terminal,path}` sorted by name |

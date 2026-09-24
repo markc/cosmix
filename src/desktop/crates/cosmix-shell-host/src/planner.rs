@@ -40,6 +40,7 @@ pub struct ProtocolMargin {
 pub enum ProtocolKeyboardInteractivity {
     None,
     OnDemand,
+    Exclusive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +279,7 @@ fn desired(panel: &PanelPresentation) -> Result<DesiredSurface, PlanError> {
         keyboard: match panel.keyboard_interactivity {
             KeyboardInteractivity::None => ProtocolKeyboardInteractivity::None,
             KeyboardInteractivity::OnDemand => ProtocolKeyboardInteractivity::OnDemand,
+            KeyboardInteractivity::Exclusive => ProtocolKeyboardInteractivity::Exclusive,
         },
     })
 }
@@ -340,8 +342,11 @@ mod tests {
             } else {
                 KeyboardInteractivity::None
             },
+            keyboard_requested: false,
+            keyboard_focused: false,
             page_ids: Arc::default(),
             active_page_id: None,
+            page_change: Default::default(),
         }
     }
 
@@ -596,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_mapping_is_strictly_none_or_on_demand() {
+    fn keyboard_mapping_follows_the_presentation() {
         let hidden = panel(Edge::Top, PanelMode::Hidden, false, 0.0);
         let mapped = panel(Edge::Top, PanelMode::Hidden, true, 1.0);
         assert_eq!(
@@ -608,6 +613,21 @@ mod tests {
         assert_eq!(
             plan_surface(None, &no_keyboard, GEOMETRY).unwrap()[6],
             ProtocolOp::SetKeyboardInteractivity(ProtocolKeyboardInteractivity::None)
+        );
+        // Only the focus cycle's target asks for the grab, and moving it off
+        // again is an ordinary diffed property change.
+        let mut cycled = mapped.clone();
+        cycled.keyboard_interactivity = KeyboardInteractivity::Exclusive;
+        assert_eq!(
+            plan_surface(None, &cycled, GEOMETRY).unwrap()[6],
+            ProtocolOp::SetKeyboardInteractivity(ProtocolKeyboardInteractivity::Exclusive)
+        );
+        assert_eq!(
+            plan_surface(Some(&cycled), &mapped, GEOMETRY).unwrap(),
+            [
+                ProtocolOp::SetKeyboardInteractivity(ProtocolKeyboardInteractivity::OnDemand),
+                ProtocolOp::Commit,
+            ]
         );
         assert!(plan_surface(None, &hidden, GEOMETRY).unwrap().is_empty());
     }

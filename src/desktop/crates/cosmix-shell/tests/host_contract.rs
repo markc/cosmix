@@ -24,6 +24,245 @@ fn model() -> ShellModel {
     .unwrap()
 }
 
+fn carousel_after_removal() -> ShellModel {
+    let mut model = model();
+    model
+        .declare_carousel(Edge::Left, ["alpha", "beta", "gamma"])
+        .unwrap();
+    for name in ["alpha", "beta", "gamma"] {
+        model.carousel_mut(Edge::Left).register(name).unwrap();
+    }
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Reveal)
+        .unwrap();
+    let carousel = model.carousel_mut(Edge::Left);
+    carousel.activate("gamma").unwrap();
+    carousel.remove("gamma").unwrap();
+    assert_eq!(carousel.active_id(), Some("beta"));
+    assert_eq!(carousel.last_selected(), Some("alpha"));
+    model
+}
+
+#[test]
+fn carousel_corner_reveal_restores_memory_after_removal() {
+    let mut model = carousel_after_removal();
+    model.tick(ms(200)).unwrap();
+    model
+        .panel_input(Edge::Left, ms(200), PanelInput::Hide)
+        .unwrap();
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+    model.tick(ms(400)).unwrap();
+    assert!(!model.panel(Edge::Left).mapped);
+    model
+        .corner_event(
+            ms(400),
+            CornerEvent::Entered {
+                corner: Corner::TopLeft,
+                dwell: ms(200),
+                trigger: CornerTrigger::Dwell,
+            },
+        )
+        .unwrap();
+    assert!(model.panel(Edge::Left).transient_revealed);
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("alpha"));
+    assert_eq!(
+        ShellFrame::from_model(&model)
+            .panel(Edge::Left)
+            .active_page_id
+            .as_deref(),
+        Some("alpha")
+    );
+}
+
+#[test]
+fn carousel_transient_reveal_restores_memory_only_from_hidden() {
+    for input in [
+        PanelInput::Reveal,
+        PanelInput::Toggle,
+        PanelInput::CornerEntered,
+    ] {
+        let mut model = carousel_after_removal();
+        // A repeated reveal while already visible must retain removal landing.
+        model
+            .panel_input(Edge::Left, ms(0), PanelInput::Reveal)
+            .unwrap();
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+        model.tick(ms(200)).unwrap();
+        model
+            .panel_input(Edge::Left, ms(200), PanelInput::Hide)
+            .unwrap();
+        // Still mapped during concealment, but logically hidden.
+        assert!(model.panel(Edge::Left).mapped);
+        model.panel_input(Edge::Left, ms(200), input).unwrap();
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("alpha"));
+    }
+}
+
+#[test]
+fn carousel_reveal_after_expired_grace_restores_memory_without_prior_tick() {
+    for input in [
+        PanelInput::Reveal,
+        PanelInput::Toggle,
+        PanelInput::CornerEntered,
+    ] {
+        let mut model = carousel_after_removal();
+        model
+            .panel_input(Edge::Left, ms(0), PanelInput::CornerEntered)
+            .unwrap();
+        model
+            .panel_input(Edge::Left, ms(1), PanelInput::CornerLeft)
+            .unwrap();
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+        model.panel_input(Edge::Left, ms(1000), input).unwrap();
+        assert!(model.panel(Edge::Left).transient_revealed);
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("alpha"));
+    }
+}
+
+#[test]
+fn carousel_persistent_reveal_preserves_removal_landing() {
+    for mode in [PanelMode::Pinned, PanelMode::Docked] {
+        let mut model = carousel_after_removal();
+        model.set_mode(Edge::Left, ms(0), mode).unwrap();
+        model
+            .panel_input(Edge::Left, ms(0), PanelInput::Hide)
+            .unwrap();
+        model
+            .panel_input(Edge::Left, ms(0), PanelInput::Reveal)
+            .unwrap();
+        assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+    }
+}
+
+#[test]
+fn carousel_redeclare_promotes_tail_and_preserves_remaining_tail_order() {
+    let mut model = model();
+    model.declare_carousel(Edge::Left, ["alpha"]).unwrap();
+    for name in ["alpha", "tail-one", "beta", "tail-two"] {
+        model.carousel_mut(Edge::Left).register(name).unwrap();
+    }
+    model.carousel_mut(Edge::Left).activate("beta").unwrap();
+    model
+        .declare_carousel(Edge::Left, ["beta", "alpha"])
+        .unwrap();
+    let carousel = model.carousel(Edge::Left);
+    assert_eq!(
+        carousel.page_ids(),
+        ["beta", "alpha", "tail-one", "tail-two"]
+    );
+    assert_eq!(carousel.active_id(), Some("beta"));
+    assert_eq!(carousel.active_index(), Some(0));
+    assert_eq!(carousel.last_selected(), Some("beta"));
+    let carousel = model.carousel_mut(Edge::Left);
+    carousel.activate("beta").unwrap();
+    carousel.remove("beta").unwrap();
+    carousel.register("beta").unwrap();
+    assert_eq!(
+        carousel.page_ids(),
+        ["beta", "alpha", "tail-one", "tail-two"]
+    );
+}
+
+#[test]
+fn carousel_redeclare_demotes_live_names_and_discards_obsolete_empty_slots() {
+    let mut model = model();
+    model
+        .declare_carousel(Edge::Left, ["alpha", "beta", "empty"])
+        .unwrap();
+    for name in ["alpha", "beta", "tail-one", "tail-two"] {
+        model.carousel_mut(Edge::Left).register(name).unwrap();
+    }
+    model.carousel_mut(Edge::Left).activate("alpha").unwrap();
+    model.declare_carousel(Edge::Left, ["beta"]).unwrap();
+    let carousel = model.carousel(Edge::Left);
+    assert_eq!(
+        carousel.page_ids(),
+        ["beta", "alpha", "tail-one", "tail-two"]
+    );
+    assert_eq!(carousel.active_id(), Some("alpha"));
+    assert_eq!(carousel.last_selected(), Some("alpha"));
+    let carousel = model.carousel_mut(Edge::Left);
+    carousel.register("empty").unwrap();
+    carousel.remove("alpha").unwrap();
+    carousel.register("alpha").unwrap();
+    assert_eq!(
+        carousel.page_ids(),
+        ["beta", "tail-one", "tail-two", "empty", "alpha"]
+    );
+}
+
+#[test]
+fn carousel_redeclare_reorders_by_name_preserving_distinct_selection_and_memory() {
+    let mut model = carousel_after_removal();
+    model
+        .declare_carousel(Edge::Left, ["beta", "new", "alpha"])
+        .unwrap();
+    let carousel = model.carousel(Edge::Left);
+    assert_eq!(carousel.page_ids(), ["beta", "alpha"]);
+    assert_eq!(carousel.active_id(), Some("beta"));
+    assert_eq!(carousel.active_index(), Some(0));
+    assert_eq!(carousel.last_selected(), Some("alpha"));
+    model.carousel_mut(Edge::Left).register("new").unwrap();
+    assert_eq!(
+        model.carousel(Edge::Left).page_ids(),
+        ["beta", "new", "alpha"]
+    );
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Hide)
+        .unwrap();
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Reveal)
+        .unwrap();
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("alpha"));
+}
+
+#[test]
+fn carousel_invalid_redeclaration_leaves_registry_unchanged() {
+    let mut model = carousel_after_removal();
+    let before = model.carousel(Edge::Left).clone();
+    for names in [["alpha", "alpha"], ["alpha", ""]] {
+        assert!(model.declare_carousel(Edge::Left, names).is_err());
+        assert_eq!(model.carousel(Edge::Left), &before);
+    }
+}
+
+#[test]
+fn carousel_default_reveal_uses_primary_and_skips_empty_slots() {
+    let mut model = model();
+    model
+        .declare_carousel(Edge::Left, ["alpha", "beta", "gamma"])
+        .unwrap();
+    model.carousel_mut(Edge::Left).register("gamma").unwrap();
+    model.carousel_mut(Edge::Left).register("beta").unwrap();
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("gamma"));
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Reveal)
+        .unwrap();
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+    model.carousel_mut(Edge::Left).register("alpha").unwrap();
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Hide)
+        .unwrap();
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Reveal)
+        .unwrap();
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("alpha"));
+    assert_eq!(model.carousel(Edge::Left).last_selected(), None);
+}
+
+#[test]
+fn carousel_intro_restores_memory_only_from_hidden() {
+    let mut model = carousel_after_removal();
+    model.start_intro(ms(100));
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("beta"));
+    model
+        .panel_input(Edge::Left, ms(0), PanelInput::Hide)
+        .unwrap();
+    model.start_intro(ms(100));
+    assert_eq!(model.carousel(Edge::Left).active_id(), Some("alpha"));
+}
+
 #[derive(Debug)]
 struct MockHost {
     geometry: HostGeometry,

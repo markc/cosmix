@@ -9,9 +9,9 @@ use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 use super::{
-    Carousel, CornerEvent, Edge, LogicalSize, OutputKey, PanelConfig, PanelConfigError, PanelInput,
-    PanelMode, PanelSnapshot, PanelStateMachine, PanelTimeError, PanelUpdate, PanelWake,
-    seed_panel_thickness,
+    Carousel, CarouselError, CornerEvent, Edge, FocusDirective, FocusStop, LogicalSize, OutputKey,
+    PanelConfig, PanelConfigError, PanelInput, PanelMode, PanelSnapshot, PanelStateMachine,
+    PanelTimeError, PanelUpdate, PanelWake, next_focus_stop, seed_panel_thickness,
 };
 
 /// Complete pure shell state for one output.
@@ -21,8 +21,29 @@ pub struct ShellModel {
     geometry: LogicalSize,
     panels: [PanelStateMachine; 4],
     carousels: [Carousel; 4],
+    thickness_set: [bool; 4],
+    /// The panel whose surface holds the keyboard, as the host last reported.
+    keyboard_focus: Option<Edge>,
+    /// Whether the host has ever reported keyboard focus. A host without
+    /// per-panel surfaces never does, and only then does Escape fall back to
+    /// every mapped panel.
+    focus_reported: bool,
+    focus_directive: FocusDirective,
+    /// When an ungranted cycle request gives up (see [`FOCUS_GRANT_TIMEOUT`]).
+    focus_grant_deadline: Option<Duration>,
+    /// The pending request came from a named activation that revealed a
+    /// hidden edge: if it lapses ungranted, that reveal ends with it.
+    focus_request_revealed: bool,
     last_update: Duration,
 }
+
+/// How long a focus-cycle target may ask for the keyboard without receiving
+/// it. Comp grants an Exclusive layer only when it is actually shown and no
+/// session lock is active; an ungranted request must not linger and seize
+/// the keyboard later (on unlock, or once shown) with no user action. A
+/// granted request that a lock then takes the keyboard from ends through the
+/// ordinary landed-then-left rule of `keyboard_focus_observed`.
+pub const FOCUS_GRANT_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl ShellModel {
     pub fn new(
@@ -48,6 +69,12 @@ impl ShellModel {
             geometry,
             panels,
             carousels: std::array::from_fn(|_| Carousel::empty()),
+            thickness_set: [false; 4],
+            keyboard_focus: None,
+            focus_reported: false,
+            focus_directive: FocusDirective::Follow,
+            focus_grant_deadline: None,
+            focus_request_revealed: false,
             last_update: start_at,
         })
     }
@@ -86,7 +113,27 @@ impl ShellModel {
         self.carousels[edge.index()] = carousel;
     }
 
-    /// Restored thickness has the same validation as a newly constructed panel.
+    /// Reconcile an edge's declared order, with new names starting empty.
+    ///
+    /// This is the config-driven construction path: registering attaches
+    /// content to the declared names afterwards — a declared name fills its
+    /// slot in order, an undeclared name appends to the tail. Re-declaring
+    /// preserves registrations, selection and memory by name. Live names no
+    /// longer declared become tail entries in their previous relative order.
+    pub fn declare_carousel(
+        &mut self,
+        edge: Edge,
+        page_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<(), CarouselError> {
+        self.carousels[edge.index()].redeclare(page_ids)
+    }
+
+    /// Whether this edge has a restored, resized or scene-seeded thickness.
+    pub fn has_remembered_thickness(&self, edge: Edge) -> bool {
+        self.thickness_set[edge.index()]
+    }
+
+    /// Restore an edge preference, preventing later scenes from replacing it.
     pub fn restore_thickness(
         &mut self,
         edge: Edge,
@@ -97,7 +144,9 @@ impl ShellModel {
         } else {
             thickness
         };
-        self.panels[edge.index()].restore_thickness(thickness)
+        self.panels[edge.index()].restore_thickness(thickness)?;
+        self.thickness_set[edge.index()] = true;
+        Ok(())
     }
 
     /// Maximum thickness that leaves space for the opposite panel and work area.
@@ -116,6 +165,7 @@ impl ShellModel {
     }
 
     fn fit_output_budget(&mut self) {
+        let thickness_set = self.thickness_set;
         for (a, b, extent) in [
             (Edge::Left, Edge::Right, self.geometry.width()),
             (Edge::Top, Edge::Bottom, self.geometry.height()),
@@ -132,6 +182,7 @@ impl ShellModel {
                 let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
             }
         }
+        self.thickness_set = thickness_set;
     }
 
     pub fn resize_thickness(&mut self, edge: Edge, thickness: f32) -> Result<(), PanelConfigError> {
@@ -144,16 +195,51 @@ impl ShellModel {
             });
         }
         if max < *super::RESIZE_THICKNESS_RANGE.start() && thickness == max {
-            return self.panels[edge.index()].restore_thickness(thickness);
+            return self.restore_thickness(edge, thickness);
         }
-        self.panels[edge.index()].resize_thickness(thickness)
+        self.panels[edge.index()].resize_thickness(thickness)?;
+        self.thickness_set[edge.index()] = true;
+        Ok(())
     }
 
     /// Cold-start discovery is independent of compositor corner membership.
     pub fn start_intro(&mut self, duration: Duration) {
-        for panel in &mut self.panels {
+        for (panel, carousel) in self.panels.iter_mut().zip(&mut self.carousels) {
+            let before = panel.snapshot();
             panel.start_intro(duration);
+            if before.mode == PanelMode::Hidden && !before.transient_revealed {
+                carousel.restore_selection();
+            }
         }
+    }
+
+    /// Hand transient reveal/conceal to the compositor's holder plane, or take
+    /// it back (see [`PanelStateMachine::set_holder_plane`]). The grace given to
+    /// [`ShellModel::new`] only applies while the plane is inactive: the dev
+    /// host and a compositor that does not report the plane.
+    /// `at` is when the capability changed; a fall back to local rules gives
+    /// an unheld reveal its full grace from then. Like any input it advances
+    /// the model to `at` first, so later inputs cannot be timed before it.
+    pub fn set_holder_plane(
+        &mut self,
+        available: bool,
+        at: Duration,
+    ) -> Result<[PanelUpdate; 4], PanelTimeError> {
+        self.ensure_monotonic(at)?;
+        let [left, bottom, right, top] = &mut self.panels;
+        let updates = [
+            left.set_holder_plane(available, at)?,
+            bottom.set_holder_plane(available, at)?,
+            right.set_holder_plane(available, at)?,
+            top.set_holder_plane(available, at)?,
+        ];
+        self.last_update = at;
+        Ok(updates)
+    }
+
+    /// Whether the compositor's holder plane drives transient visibility.
+    pub fn holder_plane(&self) -> bool {
+        self.panels[0].holder_plane()
     }
 
     /// Output migration preserves live panel state, including stored sizes and pages.
@@ -163,6 +249,7 @@ impl ShellModel {
             panel.leave_output();
         }
         self.carousels = outgoing.carousels.clone();
+        self.thickness_set = outgoing.thickness_set;
         self.last_update = outgoing.last_update;
         self.fit_output_budget();
     }
@@ -185,9 +272,25 @@ impl ShellModel {
             input,
             PanelInput::Dock | PanelInput::DockToggle | PanelInput::SetMode(PanelMode::Docked)
         ) {
+            let remembered = self.thickness_set[edge.index()];
             let _ = self.restore_thickness(edge, self.panel(edge).thickness_px);
+            self.thickness_set[edge.index()] = remembered;
         }
-        let update = self.panels[edge.index()].apply(at, input)?;
+        let panel = &mut self.panels[edge.index()];
+        let before = panel.snapshot();
+        // Resolve expired grace/intro timers before deciding whether this input
+        // reveals a hidden edge, including when no frame tick ran in between.
+        let advanced = panel.tick(at)?;
+        let hidden =
+            advanced.snapshot.mode == PanelMode::Hidden && !advanced.snapshot.transient_revealed;
+        let mut update = panel.apply(at, input)?;
+        update.changed = update.snapshot != before;
+        update.effect = update.effect.or(advanced.effect);
+        if hidden
+            && (update.snapshot.mode != PanelMode::Hidden || update.snapshot.transient_revealed)
+        {
+            self.carousels[edge.index()].restore_selection();
+        }
         self.last_update = at;
         Ok(update)
     }
@@ -221,21 +324,165 @@ impl ShellModel {
         }
     }
 
+    /// The panel whose surface holds the keyboard, as the host last reported.
+    pub const fn keyboard_focus(&self) -> Option<Edge> {
+        self.keyboard_focus
+    }
+
+    pub const fn focus_directive(&self) -> FocusDirective {
+        self.focus_directive
+    }
+
+    /// Host report of which panel surface now holds the keyboard. A
+    /// [`FocusDirective::Panel`] ends once focus has landed there and then
+    /// left; a [`FocusDirective::Release`] ends once no panel holds it.
+    pub fn keyboard_focus_observed(&mut self, edge: Option<Edge>) {
+        let previous = std::mem::replace(&mut self.keyboard_focus, edge);
+        self.focus_reported = true;
+        if matches!(self.focus_directive, FocusDirective::Panel(target) if edge == Some(target)) {
+            self.focus_grant_deadline = None;
+        }
+        self.focus_directive = match self.focus_directive {
+            FocusDirective::Panel(target) if previous == Some(target) && edge != Some(target) => {
+                FocusDirective::Follow
+            }
+            FocusDirective::Release if edge.is_none() => FocusDirective::Follow,
+            directive => directive,
+        };
+    }
+
+    /// The "cycle focus through shell panels" binding (shell doc §5): the
+    /// visible pinned and docked panels on this output in [`Edge::ALL`]
+    /// order, then back to the application. Never changes a mode. A stop
+    /// that has not received the keyboard by `at` + [`FOCUS_GRANT_TIMEOUT`]
+    /// stops asking for it.
+    pub fn cycle_keyboard_focus(&mut self, at: Duration) -> FocusStop {
+        let current = match self.focus_directive {
+            FocusDirective::Panel(edge) => Some(edge),
+            _ => self.keyboard_focus,
+        };
+        let stops: Vec<Edge> = Edge::ALL
+            .into_iter()
+            .filter(|&edge| {
+                let panel = self.panel(edge);
+                panel.mode != PanelMode::Hidden && panel.mapped
+            })
+            .collect();
+        let stop = next_focus_stop(&stops, current);
+        match stop {
+            FocusStop::Panel(edge) => self.request_keyboard_focus(edge, at),
+            FocusStop::Application => {
+                self.focus_directive = self.release_directive();
+                self.focus_grant_deadline = None;
+            }
+        }
+        stop
+    }
+
+    /// Ask for the keyboard in `edge`'s panel: the focus cycle's stops and
+    /// named activation (panel doc §6, whose hidden edge is revealed first)
+    /// both come here. The request lapses unless comp grants it by `at` +
+    /// [`FOCUS_GRANT_TIMEOUT`], and ends once focus has landed there and
+    /// then left, on Escape, or at the next cycle stop. An unmapped panel has
+    /// no surface to focus and is not asked for. Never changes a mode.
+    pub fn request_keyboard_focus(&mut self, edge: Edge, at: Duration) {
+        if !self.panel(edge).mapped {
+            return;
+        }
+        self.focus_directive = FocusDirective::Panel(edge);
+        self.focus_grant_deadline =
+            (self.keyboard_focus != Some(edge)).then_some(at + FOCUS_GRANT_TIMEOUT);
+        self.focus_request_revealed = false;
+    }
+
+    /// A named activation's request ([`Self::request_keyboard_focus`]).
+    /// `revealed`: the activation revealed a hidden edge for it. Should comp
+    /// never grant the keyboard (a session lock, a higher exclusive layer),
+    /// that reveal ends when the request lapses — an open panel without the
+    /// keyboard is one Escape cannot reach, since Escape goes to the
+    /// application.
+    pub fn request_activation_focus(&mut self, edge: Edge, at: Duration, revealed: bool) {
+        self.request_keyboard_focus(edge, at);
+        self.focus_request_revealed = revealed && self.focus_grant_deadline.is_some();
+    }
+
+    /// Escape from a focused panel (shell doc §4.3). A transient reveal hides
+    /// (latching while the pointer is still inside); a pinned or docked panel
+    /// changes nothing. Either way keyboard focus is given back. Only a host
+    /// that has never reported focus (one without per-panel surfaces) sends
+    /// the Escape to every mapped panel, as before focus was tracked; once
+    /// focus is reported, "no panel holds it" addresses no panel.
+    pub fn escape(&mut self, at: Duration) -> Result<Vec<(Edge, PanelUpdate)>, PanelTimeError> {
+        let focused = self.keyboard_focus.or(match self.focus_directive {
+            FocusDirective::Panel(edge) => Some(edge),
+            _ => None,
+        });
+        let targets: Vec<Edge> = match focused {
+            Some(edge) => vec![edge],
+            None if self.focus_reported => Vec::new(),
+            None => Edge::ALL
+                .into_iter()
+                .filter(|&edge| self.panel(edge).mapped)
+                .collect(),
+        };
+        let mut updates = Vec::with_capacity(targets.len());
+        for edge in targets {
+            updates.push((edge, self.panel_input(edge, at, PanelInput::Escape)?));
+        }
+        self.focus_directive = self.release_directive();
+        self.focus_grant_deadline = None;
+        Ok(updates)
+    }
+
+    /// Only a panel that holds the keyboard has anything to give back; a
+    /// release nobody observes ending would leave every panel refusing focus.
+    fn release_directive(&self) -> FocusDirective {
+        if self.keyboard_focus.is_some() {
+            FocusDirective::Release
+        } else {
+            FocusDirective::Follow
+        }
+    }
+
     pub fn tick(&mut self, at: Duration) -> Result<[PanelUpdate; 4], PanelTimeError> {
         self.ensure_monotonic(at)?;
         let [left, bottom, right, top] = &mut self.panels;
-        let updates = [
+        let mut updates = [
             left.tick(at)?,
             bottom.tick(at)?,
             right.tick(at)?,
             top.tick(at)?,
         ];
+        // A focus target that has finished unmapping has no surface to hold
+        // the keyboard, and one comp has not granted it in time is not being
+        // shown; either way a later reveal must never inherit the grab.
+        if let FocusDirective::Panel(edge) = self.focus_directive
+            && (!self.panel(edge).mapped
+                || self.focus_grant_deadline.is_some_and(|deadline| deadline <= at))
+        {
+            let lapsed = self.focus_grant_deadline.is_some_and(|deadline| deadline <= at);
+            self.focus_directive = FocusDirective::Follow;
+            self.focus_grant_deadline = None;
+            // An activation's reveal that never got the keyboard ends too.
+            if lapsed && std::mem::take(&mut self.focus_request_revealed) {
+                let panel = self.panel(edge);
+                if panel.mode == PanelMode::Hidden && panel.transient_revealed {
+                    let update = self.panels[edge.index()].apply(at, PanelInput::Hide)?;
+                    let ticked = updates[edge.index()];
+                    updates[edge.index()] = PanelUpdate {
+                        changed: ticked.changed || update.changed,
+                        snapshot: update.snapshot,
+                        effect: update.effect.or(ticked.effect),
+                    };
+                }
+            }
+        }
         self.last_update = at;
         Ok(updates)
     }
 
     pub fn wake(&self) -> PanelWake {
-        let mut earliest = None;
+        let mut earliest = self.focus_grant_deadline;
         for panel in &self.panels {
             match panel.wake() {
                 PanelWake::Animate => return PanelWake::Animate,
@@ -253,6 +500,7 @@ impl ShellModel {
         self.panels
             .iter()
             .filter_map(PanelStateMachine::next_deadline)
+            .chain(self.focus_grant_deadline)
             .min()
     }
 

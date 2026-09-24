@@ -1331,7 +1331,9 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
                 ..default()
             }),
     );
+    app.insert_resource(CornerMenuHook(corner_menu::open));
     app.insert_resource(LayerHostWake(external_wake))
+        .init_resource::<crate::file_watch::LayerHostFileWatches>()
         .init_resource::<LayerHostUpdateWake>()
         .init_resource::<LayerHostDeadline>()
         .add_systems(Last, capture_layer_host_redraw);
@@ -1348,6 +1350,8 @@ pub fn configure_layer_host(app: &mut App, config: LayerHostConfig) -> &mut App 
 
 #[path = "ime.rs"]
 mod ime;
+#[path = "corner_menu.rs"]
+mod corner_menu;
 
 struct RunnerState {
     text_input: ime::TextInputBridge,
@@ -1389,6 +1393,7 @@ struct RunnerState {
     corner_bus: Option<CornerBusHandle>,
     corner_engaged: BTreeSet<cosmix_shell::core::Corner>,
     corner_epoch: u64,
+    menu: Option<corner_menu::NativeCornerMenu>,
 }
 
 impl WakeTimerTarget for RunnerState {
@@ -1678,6 +1683,7 @@ fn run_layer_host(
         corner_bus: None,
         corner_engaged: BTreeSet::new(),
         corner_epoch: 0,
+        menu: None,
     };
 
     // wl_output and xdg-output each use done boundaries. Two roundtrips make
@@ -1753,6 +1759,17 @@ fn run_layer_host(
         Ok(event_loop) => event_loop,
         Err(error) => return state_exit(state, &format!("calloop-create-failed-{error}"), true),
     };
+    for watch in std::mem::take(
+        &mut state
+            .app
+            .world_mut()
+            .resource_mut::<crate::file_watch::LayerHostFileWatches>()
+            .0,
+    ) {
+        if let Err(error) = watch.insert(&event_loop.handle(), |state| state.needs_update = true) {
+            return state_exit(state, &format!("file-watch-insert-failed-{error}"), true);
+        }
+    }
     if let Err(error) = event_loop
         .handle()
         .insert_source(external_wakes, |event, _, state| {
@@ -1893,6 +1910,7 @@ fn state_setup_error(mut state: RunnerState, reason: String) -> AppExit {
 }
 
 fn state_exit(mut state: RunnerState, reason: &str, abnormal: bool) -> AppExit {
+    state.dismiss_corner_menu(None);
     state.wake_timer.token = None;
     state.apply_corner_ingress(CornerIngress::Reset {
         epoch: state.corner_epoch,
@@ -1989,13 +2007,15 @@ impl PanelWaylandFactory<'_> {
         wl_surface::WlSurface,
         LayerSurface,
         Option<FractionalObjects>,
+        String,
     ) {
         let wl_surface = self.compositor_state.create_surface(qh);
+        let identity = crate::holders::new_layer_identity(&format!("{}.panel", self.namespace));
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             wl_surface.clone(),
             Layer::Overlay,
-            Some(self.namespace.to_owned()),
+            Some(identity.clone()),
             Some(output),
         );
         let fractional = match (self.fractional_manager, self.viewporter) {
@@ -2005,7 +2025,7 @@ impl PanelWaylandFactory<'_> {
             }),
             _ => None,
         };
-        (wl_surface, layer_surface, fractional)
+        (wl_surface, layer_surface, fractional, identity)
     }
 }
 
@@ -2024,9 +2044,11 @@ impl RunnerState {
             namespace: &self.namespace,
         };
         let mut panel_vec = Vec::with_capacity(Edge::ALL.len());
+        let mut identities = crate::holders::PanelLayerIdentities::default();
         for edge in Edge::ALL {
-            let (wl_surface, layer_surface, fractional) =
+            let (wl_surface, layer_surface, fractional, identity) =
                 factory.create(qh, &selected.wl_output, edge);
+            identities.0.push((selected.key.clone(), edge, identity));
             let panel = PanelSurface::from_wayland(
                 &mut self.app,
                 &self.connection,
@@ -2041,6 +2063,7 @@ impl RunnerState {
             .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
             panel_vec.push(panel);
         }
+        self.app.insert_resource(identities);
         panel_vec
             .try_into()
             .map_err(|_| LayerHostError::new("panel construction count was not four"))
@@ -2170,11 +2193,15 @@ impl RunnerState {
                 .map_err(|error| LayerHostError::new(error.to_string()))?;
             if !panel.has_wayland_objects() && operations.contains(&ProtocolOp::CreateSurface) {
                 let _trace = frame_trace::span("quoin_panel_create", edge.index() as u64);
-                let (wl_surface, layer_surface, fractional) =
+                let (wl_surface, layer_surface, fractional, identity) =
                     factory.create(qh, &output.wl_output, edge);
                 panel
                     .install_wayland(connection, wl_surface, layer_surface, fractional)
                     .map_err(|error| LayerHostError::new(format!("raw-handle-failed-{error}")))?;
+                let mut identities = app.world_mut().resource_mut::<crate::holders::PanelLayerIdentities>();
+                identities.0.retain(|(o, e, _)| o != key || *e != edge);
+                identities.0.push((key.clone(), edge, identity));
+                *needs_update = true;
             }
             if operations.contains(&ProtocolOp::Unmap) {
                 keyboard_bridge.cleanup(app, Some(panel.window));
@@ -2206,6 +2233,9 @@ impl RunnerState {
                 }
             }
         }
+        // Create the menu after newly mapped panels so its click-away layer
+        // is above them in the compositor's overlay insertion order.
+        self.reconcile_corner_menu(qh)?;
         Ok(())
     }
 
@@ -2222,12 +2252,14 @@ impl RunnerState {
             self.outputs
                 .values()
                 .flat_map(|output| output.panels.iter())
+                .chain(self.menu.iter().map(|menu| &menu.surface))
                 .filter_map(PanelSurface::pending_frame_requested_at),
         );
         let configure_deadlines = self
             .outputs
             .values()
             .flat_map(|output| output.panels.iter())
+            .chain(self.menu.iter().map(|menu| &menu.surface))
             .filter_map(|panel| {
                 (panel.phase == SurfacePhase::WaitingConfigure)
                     .then_some(panel.waiting_configure_since)
@@ -2310,6 +2342,7 @@ impl RunnerState {
             .outputs
             .values()
             .flat_map(|output| output.panels.iter())
+            .chain(self.menu.iter().map(|menu| &menu.surface))
             .find(|panel| {
                 panel.phase == SurfacePhase::WaitingConfigure
                     && panel
@@ -2332,12 +2365,20 @@ impl RunnerState {
         {
             panel.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
         }
+        if let Some(menu) = self.menu.as_mut() {
+            menu.surface.clear_overdue_frame(elapsed, ANIMATE_BACKSTOP);
+        }
     }
 
     fn panel_for_surface_mut(
         &mut self,
         surface: &wl_surface::WlSurface,
     ) -> Option<&mut PanelSurface> {
+        if let Some(menu) = self.menu.as_mut()
+            && menu.surface.matches_surface(surface)
+        {
+            return Some(&mut menu.surface);
+        }
         self.outputs
             .values_mut()
             .flat_map(|output| output.panels.iter_mut())
@@ -2436,6 +2477,9 @@ impl CompositorHandler for RunnerState {
         surface: &wl_surface::WlSurface,
         scale: i32,
     ) {
+        if self.menu_scale(qh, surface, scale) {
+            return;
+        }
         debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
         let output_size = panel_output_size(&self.outputs, surface);
         let elapsed = self
@@ -2565,6 +2609,10 @@ impl OutputHandler for RunnerState {
 
 impl LayerShellHandler for RunnerState {
     fn closed(&mut self, _connection: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.menu_matches_layer(layer) {
+            self.dismiss_corner_menu(None);
+            return;
+        }
         let Some((output_key, panel_output, edge)) =
             self.outputs.iter().find_map(|(key, output)| {
                 output
@@ -2618,6 +2666,9 @@ impl LayerShellHandler for RunnerState {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
+        if self.configure_menu(qh, layer, &configure) {
+            return;
+        }
         debug_assert_render_device_texture_limit(&self.app, self.max_texture_dimension_2d);
         let elapsed = self
             .app
@@ -2740,6 +2791,9 @@ impl PointerHandler for RunnerState {
             return;
         }
         self.needs_update = true;
+        if self.menu_pointer(events) {
+            return;
+        }
         let targets = self.surface_targets();
         let Some(output) = self.selected_key.as_ref() else {
             return;
@@ -2792,6 +2846,15 @@ impl KeyboardHandler for RunnerState {
         _serial: u32,
     ) {
         if self.active_keyboard.as_ref() == Some(keyboard)
+            && self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.surface.matches_surface(surface))
+        {
+            self.dismiss_corner_menu(None);
+            return;
+        }
+        if self.active_keyboard.as_ref() == Some(keyboard)
             && self.keyboard_bridge.leave(&mut self.app, surface)
         {
             self.needs_update = true;
@@ -2807,6 +2870,9 @@ impl KeyboardHandler for RunnerState {
         event: KeyEvent,
     ) {
         if self.active_keyboard.as_ref() != Some(keyboard) {
+            return;
+        }
+        if self.menu_key(&event) {
             return;
         }
         let now = Instant::now();
@@ -2995,6 +3061,11 @@ impl RunnerState {
     }
 
     fn apply_corner_ingress(&mut self, ingress: CornerIngress) {
+        if matches!(&ingress, CornerIngress::Action { output, action: CornerAction::Menu, .. } if self.selected_key.as_ref() == Some(output))
+            || matches!(&ingress, CornerIngress::Reset { .. } | CornerIngress::Disabled { .. })
+        {
+            self.dismiss_corner_menu(None);
+        }
         match &ingress {
             CornerIngress::Action {
                 output,
@@ -3097,6 +3168,9 @@ impl RunnerState {
         if self.keyboard_bridge.cleanup(&mut self.app, None) {
             self.needs_update = true;
         }
+        // Escape needs a keyboard: with the active seat gone, nothing could
+        // close an open corner menu, so take it down with its hold released.
+        self.dismiss_corner_menu(None);
         if let Some(keyboard) = self.active_keyboard.take() {
             release_keyboard(keyboard);
         }
@@ -3134,10 +3208,8 @@ impl RunnerState {
     }
 }
 
-/// Optional main-world corner menu entry point. Register this resource on the
-/// host App; the callback must check configuration for the supplied output and
-/// corner and do nothing if that corner has no menu. No fallback action exists.
-/// TODO: wire configurable corner menus when the menu UI is implemented.
+/// Corner menu entry point. The host installs the three-mode menu; applications
+/// may replace the hook to append their accepted config declarations.
 #[derive(Resource, Clone, Copy)]
 pub struct CornerMenuHook(pub fn(&mut World, &OutputKey, cosmix_shell::core::Corner));
 
@@ -3162,12 +3234,16 @@ pub(crate) fn apply_corner_ingress_to_app(
                 CornerAction::PinToggle => cosmix_shell::core::PanelInput::PinToggle,
                 CornerAction::DockToggle => cosmix_shell::core::PanelInput::DockToggle,
                 CornerAction::Menu => {
-                    if let Some(hook) = app.world().get_resource::<CornerMenuHook>().copied() {
-                        (hook.0)(app.world_mut(), &output, corner);
-                        return true;
+                    let hook = app.world().get_resource::<CornerMenuHook>().copied()
+                        .unwrap_or(CornerMenuHook(corner_menu::open));
+                    (hook.0)(app.world_mut(), &output, corner);
+                    if app.world().contains_resource::<cosmix_shell::chrome::corner_menu::CornerMenuRequest>() {
+                        stage_shell_command(app, output, ShellCommandKind::Panel {
+                            edge: corner.summoned_edge(),
+                            input: cosmix_shell::core::PanelInput::MenuHold(true),
+                        });
                     }
-                    tracing::trace!(event = "quoin_corner_menu_unconfigured", ?corner);
-                    return false;
+                    return true;
                 }
             };
             stage_shell_command(
@@ -4296,21 +4372,18 @@ mod tests {
                     app.insert_resource(CornerMenuHook(hook));
                 }
                 let mut engaged = BTreeSet::from([Corner::TopLeft]);
-                assert_eq!(
-                    apply_corner_ingress_to_app(
-                        &mut app,
-                        Some(&output),
-                        &mut engaged,
-                        CornerIngress::Action {
-                            output: output.clone(),
-                            epoch: 0,
-                            corner: Corner::TopLeft,
-                            action: CornerAction::Menu,
-                        },
-                    ),
-                    registered
-                );
-                assert!(!staged_shell_commands_pending(&app));
+                assert!(apply_corner_ingress_to_app(
+                    &mut app,
+                    Some(&output),
+                    &mut engaged,
+                    CornerIngress::Action {
+                        output: output.clone(),
+                        epoch: 0,
+                        corner: Corner::TopLeft,
+                        action: CornerAction::Menu,
+                    },
+                ));
+                assert_eq!(staged_shell_commands_pending(&app), !registered);
                 app.update();
                 assert_eq!(
                     app.world()

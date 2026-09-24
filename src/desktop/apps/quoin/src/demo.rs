@@ -104,7 +104,8 @@ pub(crate) fn quoin_props(
     bindings.set(
         Edge::Bottom,
         vec![
-            QuoinPageContent::new("launcher", bottom_launcher(commands)),
+            // The runtime ticks the clock only while this page is active.
+            QuoinPageContent::new(cosmix_shell::runtime::CLOCK_PAGE_ID, bottom_launcher(commands)),
             QuoinPageContent::new(
                 "tasks",
                 placeholder(

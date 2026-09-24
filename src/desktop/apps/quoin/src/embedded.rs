@@ -25,6 +25,13 @@ use std::time::Duration;
 #[derive(Resource)]
 pub(crate) struct EmbeddedPanelMounts(pub QuoinPanelMounts);
 
+/// The output identity used until the host reports the real one. It lives in
+/// the non-persistent `wl-output-` namespace (see `state`'s identity rule):
+/// the placeholder never restores, claims or persists state. The first real
+/// connector observation replaces it and restores then, so the migrated
+/// legacy default entry stays unclaimed until a real output can take it.
+const PLACEHOLDER_OUTPUT: &str = "wl-output-embedded";
+
 /// Host updates this before `ShellRuntimeSet::Input`. Coordinates are logical.
 #[derive(Resource, Default)]
 pub struct EmbeddedOutput {
@@ -52,14 +59,42 @@ struct EmbeddedHost {
 #[derive(Resource, Default)]
 struct GripDrag(Option<(Edge, f32)>);
 
-pub struct EmbeddedQuoinPlugin;
+/// Quoin hosted inside the compositor's renderer. `comp_service` names the
+/// compositor's registered Bus service (default `comp`) for the hotspot
+/// observer's deadzone mirror, supplied by the host the same way the
+/// layer host takes `--comp-service`.
+pub struct EmbeddedQuoinPlugin {
+    comp_service: String,
+}
+
+impl Default for EmbeddedQuoinPlugin {
+    fn default() -> Self {
+        Self {
+            comp_service: "comp".to_owned(),
+        }
+    }
+}
+
+impl EmbeddedQuoinPlugin {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_comp_service(mut self, service: impl Into<String>) -> Self {
+        self.comp_service = service.into();
+        self
+    }
+}
 
 impl Plugin for EmbeddedQuoinPlugin {
     fn build(&self, app: &mut App) {
         let registry = crate::page_registry();
         let store = crate::state::StateStore::startup(false);
-        let mut model = model("primary", Vec2::new(1920.0, 1080.0), &registry);
-        store.snapshot().restore(&mut model);
+        // The placeholder model restores nothing: comp has not named the
+        // output yet, and claiming under a placeholder identity would take
+        // the migrated legacy entry away from the real connector. `prepare`
+        // restores when the first real observation arrives.
+        let mut model = model(PLACEHOLDER_OUTPUT, Vec2::new(1920.0, 1080.0), &registry);
         model.start_intro(Duration::from_secs(2));
         app.add_plugins(ShellRuntimePlugin::new(model));
         let mounts: [Entity; 4] = std::array::from_fn(|i| {
@@ -86,10 +121,12 @@ impl Plugin for EmbeddedQuoinPlugin {
                 CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
                     .expect("valid corner tuning"),
             ),
-            name: "primary".into(),
+            name: PLACEHOLDER_OUTPUT.into(),
             size: Vec2::new(1920.0, 1080.0),
         });
         let mut bus = BusBridgeConfig::new("shell", resolve_noded_url());
+        crate::hotspot::install(app, &mut bus, self.comp_service.clone());
+        crate::hotspot::arm_first_run(app, store.first_run());
         bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
         bus.inbound_prefixes.push("shell.".into());
         bus.subscriptions.extend(
@@ -97,11 +134,23 @@ impl Plugin for EmbeddedQuoinPlugin {
                 "power.props.changed",
                 "wallpaper.props.changed",
                 "bg-showcase.props.changed",
+                "noded.props.changed",
             ]
             .map(str::to_owned),
         );
         crate::configure_content(app, bus, registry, store, false, false);
-        app.add_systems(Update, prepare.in_set(ShellRuntimeSet::Input))
+        // Output preparation runs BEFORE the Bus dispatch drains: a
+        // dispatch reserves its registry seat and queues its command
+        // against the current frame's output, so the model replacement
+        // must land first or the command targets an output the Model stage
+        // would drop — a reserved seat no page ever fills, and an acked
+        // removal lost.
+        app.add_systems(
+            Update,
+            prepare
+                .in_set(ShellRuntimeSet::Input)
+                .before(crate::bus_service::ShellBusDispatch),
+        )
             .add_systems(Update, present.in_set(ShellRuntimeSet::Host))
             .add_observer(grip_start)
             .add_observer(grip_move)
@@ -250,7 +299,19 @@ fn prepare(world: &mut World) {
     }
     let host = world.resource::<EmbeddedHost>();
     if host.name != name || host.size != size {
-        let replacement = model(&name, size, world.resource());
+        let mut replacement = model(&name, size, world.resource());
+        if host.name != name {
+            // A different output restores its own remembered state (per-
+            // (output, edge) persistence); a same-output resize keeps the
+            // fresh-model rebuild.
+            world.resource::<crate::state::StateStore>().restore(&mut replacement);
+            // Replacing the placeholder is the first real observation:
+            // replay the startup intro on the output the user can see (the
+            // placeholder never renders).
+            if host.name == PLACEHOLDER_OUTPUT {
+                replacement.start_intro(Duration::from_secs(2));
+            }
+        }
         replace_shell_model(world, replacement);
         let mut host = world.resource_mut::<EmbeddedHost>();
         host.name = name.clone();
@@ -347,6 +408,150 @@ fn present(
 mod tests {
     use super::*;
 
+    /// A legacy v2 state file as today's Quoin writes it, for the migration
+    /// path (mirrors `state`'s `v2_source` fixture).
+    fn v2_state_file() -> String {
+        let mut source = String::from("{version: 2, scheme: \"v2\"");
+        for (edge, page) in [
+            (Edge::Left, "places"),
+            (Edge::Bottom, "launcher"),
+            (Edge::Right, "monitor"),
+            (Edge::Top, "status"),
+        ] {
+            source.push_str(&format!(
+                ", {}: {{thickness_px: {}, mode: \"{}\", page: \"{}\"}}",
+                crate::edge_name(edge),
+                150 + edge.index(),
+                if edge == Edge::Left { "docked" } else { "hidden" },
+                page,
+            ));
+        }
+        source.push('}');
+        source
+    }
+
+    #[test]
+    fn output_change_repopulates_carousel_from_migrated_seats() {
+        use cosmix_shell::runtime::{SubPanelRegistryState, register_shell_page};
+        let registry = crate::page_registry();
+        let size = Vec2::new(1920.0, 1080.0);
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            ShellRuntimePlugin::new(model("DP-1", size, &registry)),
+        ))
+        .insert_resource(registry)
+        .insert_resource(crate::state::StateStore::load(None))
+        .insert_resource(EmbeddedHost {
+            detector: CornerDetector::new(
+                CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0).unwrap(),
+            ),
+            name: "DP-1".into(),
+            size,
+        })
+        .init_resource::<EmbeddedOutput>();
+        let world = app.world_mut();
+        crate::config::ingest_test_config(
+            world,
+            r#"{panels: {left: ["scene-mounted", "verb-only", "nav"]}}"#,
+        );
+        // Receipt order deliberately differs from declaration order.
+        for (name, receipt) in [("verb-only", 1), ("scene-mounted", 2), ("tail", 3)] {
+            world
+                .resource_mut::<SubPanelRegistryState>()
+                .0
+                .mount(name, OutputKey::new("DP-1").unwrap(), Edge::Left, "owner", receipt)
+                .unwrap();
+            register_shell_page(world, Edge::Left, name);
+        }
+        {
+            let mut output = world.resource_mut::<EmbeddedOutput>();
+            output.name = "HDMI-1".into();
+            output.size = size;
+            output.active = true;
+        }
+        // The production host constructs a static model, restores state and
+        // calls replace_shell_model. No declarations are seeded into it here.
+        prepare(world);
+        let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert_eq!(
+            panel.page_ids.as_ref(),
+            ["scene-mounted", "verb-only", "nav", "places", "info", "tail"]
+        );
+        assert!(!panel.mapped);
+        for name in ["verb-only", "scene-mounted", "tail"] {
+            assert_eq!(
+                world.resource::<SubPanelRegistryState>().0.seat(name)
+                    .unwrap().output.as_str(),
+                "HDMI-1"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_placeholder_restores_nothing_until_the_first_real_observation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("quoin.state.mix");
+        std::fs::write(&path, v2_state_file()).unwrap();
+
+        // Mirrors EmbeddedQuoinPlugin::build: a placeholder model with no
+        // restore, waiting for the host's first real observation.
+        let registry = crate::page_registry();
+        let fresh = model(PLACEHOLDER_OUTPUT, Vec2::new(1920.0, 1080.0), &registry);
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            ShellRuntimePlugin::new(model(
+                PLACEHOLDER_OUTPUT,
+                Vec2::new(1920.0, 1080.0),
+                &registry,
+            )),
+        ))
+        .insert_resource(crate::state::StateStore::load(Some(path)))
+        .insert_resource(crate::page_registry())
+        .insert_resource(EmbeddedHost {
+            detector: CornerDetector::new(
+                CornerDetectorConfig::new(8.0, Duration::from_millis(250), 100.0)
+                    .expect("valid corner tuning"),
+            ),
+            name: PLACEHOLDER_OUTPUT.into(),
+            size: Vec2::new(1920.0, 1080.0),
+        })
+        .init_resource::<EmbeddedOutput>();
+
+        // The placeholder claims nothing: it keeps the fresh-model defaults,
+        // so the migrated legacy entry waits for a real connector.
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        assert_eq!(frame.geometry.output.as_str(), PLACEHOLDER_OUTPUT);
+        for edge in Edge::ALL {
+            assert_eq!(
+                frame.panel(edge).thickness_px,
+                fresh.panel(edge).thickness_px
+            );
+            assert_eq!(frame.panel(edge).mode, PanelMode::Hidden);
+        }
+
+        // The first real connector observation restores through prepare()
+        // and claims the migrated v2 state for that connector.
+        {
+            let mut output = app.world_mut().resource_mut::<EmbeddedOutput>();
+            output.size = Vec2::new(1920.0, 1080.0);
+            output.name = "DP-1".into();
+            output.active = true;
+        }
+        prepare(app.world_mut());
+        let frame = app.world().resource::<ShellFrameState>().0.clone();
+        assert_eq!(frame.geometry.output.as_str(), "DP-1");
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 150.0);
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(
+            frame.panel(Edge::Left).active_page_id.as_deref(),
+            Some("places")
+        );
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 152.0);
+        assert_eq!(frame.panel(Edge::Bottom).thickness_px, 151.0);
+    }
+
     #[test]
     fn every_overlay_edge_stacks_above_every_dock_edge() {
         for overlay in Edge::ALL {
@@ -388,6 +593,13 @@ mod tests {
         .init_resource::<EmbeddedWorkArea>()
         .add_systems(Update, present);
 
+        // A deliberate undock hides immediately when nothing holds the panel,
+        // so hold the bottom edge with the pointer first: the undock iteration
+        // must still land in an overlay state (transient reveal) for this
+        // stacking walk.
+        model
+            .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::PointerEntered)
+            .unwrap();
         for input in [PanelInput::Pin, PanelInput::Dock, PanelInput::Undock] {
             model
                 .panel_input(Edge::Bottom, Duration::ZERO, input)

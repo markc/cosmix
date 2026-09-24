@@ -3,10 +3,12 @@
 #![deny(unsafe_code)]
 
 pub mod background;
+pub mod file_watch;
 mod corner_bus;
 #[cfg(test)]
 mod feature_graph;
 pub mod input;
+pub mod holders;
 mod input_keysym;
 pub mod output;
 pub mod planner;

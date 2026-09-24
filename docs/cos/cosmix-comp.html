@@ -488,6 +488,17 @@ keep their family running whenever any member is exposed. This applies to
 layer-shell backgrounds, ordinary toplevels and XWayland surface trees.
 Minimised/off-workspace and session-lock gates retain their existing precedence;
 callbacks before the first buffer are never withheld by occlusion.</p>
+<p>Withholding is a throttle, not a stop. A client on Mesa's default FIFO present
+mode blocks inside present until its frame callback completes, so a covered one
+could not even answer a configure. Once per second, every surface of an
+occluded tree that retains a callback has its oldest one completed. It is per
+surface because a callback releases only its own surface's present, so a root
+that requests again every second cannot starve a subsurface. This matches the ~1 Hz KWin and Mutter give
+hidden windows. The trickle is paced by the existing frame opportunities, with
+no timer of its own, and the window restarts whenever a root becomes occluded
+again. At most 64 callbacks are retained per surface of an occluded tree, so a
+root with one subsurface can hold 128. Excess older ones complete at once rather
+than being dropped.</p>
 <p>Coverage uses applied opaque-region transactions and renderer-confirmed installed
 content. A pending DMA-BUF replacement cannot lend its opaque region to an older
 texture. Candidate bounds round outwards and occluders round inwards in output
@@ -765,7 +776,7 @@ owner) or an object subtree with its immediate children.</li>
 the name this compositor instance actually registered. The reply is truthful
 only for a caller that subscribed to that topic before calling <code>watch</code> and
 remains subscribed.</li>
-<li><code>comp.props.set {path,value,generation?}</code> mutates the five corner
+<li><code>comp.props.set {path,value,generation?}</code> mutates the six corner
 properties, <code>windows.s&lt;id&gt;.band</code>, <code>windows.s&lt;id&gt;.minimized</code>,
 <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>, <code>workspaces.current</code>,
 <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>, or
@@ -893,7 +904,9 @@ focus.{keyboard,exclusive_latch,pointer,pointer_grab,session_lock,
        window.{id,generation}}
 decoration.{enabled,style}
 bindings.{enabled,profile,table}
-input.corners.{enabled,deadzone_px,dwell_ms,hold_ms,velocity_max_px_s}
+input.corners.{holders,enabled,deadzone_px,dwell_ms,velocity_max_px_s,affordance,discovery,
+               enforced.{top,bottom,left,right},
+               held.{top,bottom,left,right}}     (enforced, held: volatile)
 input.host.passthrough            (nested backend only)
 xwayland.{enabled,persist_path,display}
 port.{level,event_seq,lost_count,queue_depth,reply_timeouts,publish_timeouts,
@@ -913,7 +926,10 @@ sequence watermark across every topic, and <code>port.lost_count</code> is cumul
 separate bounded lanes; both abandon a sink wait after two seconds.</p>
 <p>Window rows add seven read-only leaves. <code>generation</code> is the window's role
 generation (below). <code>window_x</code>/<code>window_y</code> are the window-geometry origin and
-<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. Use all four
+<code>window_width</code>/<code>window_height</code> its extent, all in logical pixels. The origin
+stands its buffer on a whole physical pixel, so <code>window_x</code>/<code>window_y</code> can be
+fractional at a fractional scale and are integers at scale 1 (see
+<a href="/cos/cosmix-comp#whole-pixel-placement">Whole-pixel placement</a>). Use all four
 for window screenshots that exclude client-side shadow margins. <code>x</code>/<code>y</code> remain
 the buffer origin and <code>width</code>/<code>height</code> the buffer extent, including those margins.
 Without explicit client geometry, all four <code>window_*</code> fields use the effective
@@ -932,7 +948,12 @@ new role, so an id alone can name a different window than the one a script
 read. Every role assignment (including the role ending) takes a new,
 never-reused <code>generation</code>. Unmapping and remapping the same role (a null
 buffer, then a new one) keeps it; an X11 window that is associated again
-counts as a new role.
+counts as a new role. A client may also destroy its <code>xdg_toplevel</code> and
+<code>xdg_surface</code> and later wrap the same <code>wl_surface</code> in a fresh <code>xdg_surface</code>
+(Qt's hide→show does this); comp accepts it, and the new toplevel is a new
+role. A second <code>xdg_surface</code> is refused with <code>xdg_wm_base.role</code> only while an
+earlier one for that <code>wl_surface</code> is still alive, or when the surface carries
+a non-xdg role.
 Every surface row publishes it as <code>surfaces.s&lt;id&gt;.generation</code>, and window rows
 repeat it. X11 windows have no <code>windows.*</code> row yet, so read their generation
 from <code>surfaces.s&lt;id&gt;</code>. Treat <code>{id, generation}</code> as the window's identity:
@@ -1030,7 +1051,8 @@ window is not a valid X11 activation target
 (<code>window_switch_candidate</code>), un-minimising is the separate request that
 restores it. Two verbs drive the workspaces:</p>
 <ul>
-<li><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
+<li>
+<p><code>comp.workspace.switch {index,output?,wrap?}</code> makes <code>index</code> the output's
 current workspace: a 1-based number, or <code>"next"</code> / <code>"prev"</code> relative to
 the current one, which wrap at the ends unless <code>wrap:false</code>, when they are
 refused with <code>{"error":"at_end",output,from,count}</code> (<code>output</code> there is the
@@ -1043,8 +1065,10 @@ is <code>invalid_value</code> naming <code>index</code> with the range. The repl
 <code>from == to</code> and does nothing. Minimise state is untouched: a minimised
 window on the arriving workspace stays minimised. The verb names no
 window but changes what is on screen, so a session lock refuses it
-(<code>locked</code>).</li>
-<li><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
+(<code>locked</code>).</p>
+</li>
+<li>
+<p><code>comp.window.send_to_workspace {id,generation,index,follow?}</code> moves the
 window to <code>index</code> (a number, or <code>"next"</code> / <code>"prev"</code> relative to the
 window's own workspace, always wrapping) without switching; the window
 becomes <code>visible:false, minimized:false</code> if it leaves the current
@@ -1067,8 +1091,10 @@ and <code>current</code> reads 1, so a send to workspace 1 answers <code>followe
 The move has happened either way. The reply is <code>{id,generation,index}</code>
 (plus <code>followed</code> with <code>follow:true</code>). A move never changes the window's
 <code>generation</code>. Out-of-range indices are <code>invalid_value</code> and change
-nothing; the usual <code>{id,generation}</code> fence applies.</li>
-<li><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
+nothing; the usual <code>{id,generation}</code> fence applies.</p>
+</li>
+<li>
+<p><code>comp.window.focus {id,generation,raise?}</code> gives the window keyboard focus.
 With <code>raise</code> (the default) it also raises it and re-targets the pointer,
 exactly like Alt+Tab. The reply is <code>{id,generation,focused}</code>. When
 <code>focused</code> is false, <code>reason</code> says why, the first that holds in this
@@ -1077,15 +1103,19 @@ order: <code>exclusive_layer</code> (an exclusive layer surface holds the keyboa
 or <code>refused</code>. The first three are what keep an off-workspace window's
 switch from running, so such a window names the gate that held it, not
 the visibility the switch would have given it; a refusal changes nothing
-and attributes nothing to the window.</li>
-<li><code>comp.window.raise {id,generation}</code> raises the window within its band
+and attributes nothing to the window.</p>
+</li>
+<li>
+<p><code>comp.window.raise {id,generation}</code> raises the window within its band
 without focusing it. The reply is <code>{id,generation,raised}</code>. Raise is
 stacking only: it never switches workspace and never un-minimises. An
 off-workspace or minimised window is restacked in place and stays where it
 is; <code>raised</code> reports the stacking change alone. <code>comp.window.focus</code> and
-<code>comp.window.restore</code> are the verbs that bring a window into view.</li>
-<li><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
-or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.
+<code>comp.window.restore</code> are the verbs that bring a window into view.</p>
+</li>
+<li>
+<p><code>comp.window.close {id,generation}</code> asks the client to close (xdg <code>close</code>,
+or X11 <code>WM_DELETE_WINDOW</code>) and replies <code>{closed:"polite"}</code> at once.</p>
 <ul>
 <li>With <code>force:true</code> (and optional <code>timeout_ms</code>, default 3000, at most
 60000) the reply waits. The deadline runs from when the port admitted
@@ -1105,8 +1135,9 @@ and the verb replies at once with
 <code>{"error":"still_open","reason":"x11_kill_unsupported",polite_close_sent:true}</code>.</li>
 </ul>
 </li>
-<li><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
-and/or resizes the window, with at least one field given.
+<li>
+<p><code>comp.window.place {id,generation,output?,x?,y?,width?,height?}</code> moves
+and/or resizes the window, with at least one field given.</p>
 <ul>
 <li><code>x</code>/<code>y</code> are output-local logical coordinates of the window-geometry
 origin (<code>window_x</code>/<code>window_y</code>). <code>output</code> is an <code>outputs</code> key or output
@@ -1120,23 +1151,35 @@ size for the other axis in the configure. For an xdg window this is a configure,
 changes when the client answers: wait with <code>comp.window.wait {until:"size"}</code>.</li>
 <li>The reply is
 <code>{id,generation,output,window_x,window_y,requested:{width,height}|null,configure_pending}</code>.</li>
+<li>The window lands on whole physical pixels, so <code>window_x</code>/<code>window_y</code> can
+differ from the request by up to half a physical pixel and need not be
+integers: at scale 2.5, <code>x: 1</code> answers <code>window_x: 1.2</code>. See
+<a href="/cos/cosmix-comp#whole-pixel-placement">Whole-pixel placement</a>. To put a neighbour flush
+against this window, place it at the REPLIED origin plus the window's
+logical size, not the requested one.</li>
 <li>A maximised or fullscreen window is refused with
 <code>{"error":"invalid_state",maximized,fullscreen}</code>. An unknown output is
 <code>unknown_output</code>. A place that would leave the window wholly outside
 every output is refused with <code>{"error":"off_output",x,y,width,height}</code>.</li>
 </ul>
 </li>
-<li><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
-window reaches a state.
+<li>
+<p><code>comp.window.wait {match,until,width?,height?,timeout_ms?}</code> replies when a
+window reaches a state.</p>
 <ul>
 <li><code>match</code> is either <code>{id,generation?}</code> or
 <code>{app_id?,title?,title_contains?}</code> with at least one field. Name filters
 are at most 4096 bytes. With <code>id</code>, the wait is about that window; an id
 comp never handed out is refused with <code>unknown_window</code>. Without it, the
 wait is about the lowest-id mapped window whose names match.</li>
-<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (a frame presented at or
-after the current mapping began; a late report of an earlier frame does
-not count), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
+<li><code>until</code> is <code>mapped</code>, <code>visible</code>, <code>presented</code> (the renderer showed the
+window in a frame at or after the current mapping began, judged from
+the renderer's frame reports that <code>comp.window.stats</code> also reads, so no
+<code>wp_presentation</code> feedback is needed. Static content that was hidden at
+map time counts once exposed. Feedback presented in that span also
+counts. A late report of an earlier frame does not. The window must
+also be unminimised and on the current workspace when the wait
+resolves), <code>size</code> (needs <code>width</code> and <code>height</code>, compared with the
 window-geometry size), <code>focused</code>, <code>unmapped</code> or <code>gone</code>. For a match
 without <code>id</code>, <code>unmapped</code> and <code>gone</code> mean no mapped window matches.
 <code>mapped</code> is workspace-blind; <code>visible</code> and <code>presented</code> need the
@@ -1159,16 +1202,98 @@ the reply is <code>{"error":"timeout",until,waited_ms}</code>.</li>
 <code>comp.input.sequence</code>.</li>
 </ul>
 </li>
-<li><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
+<li>
+<p><code>comp.windows.list {app_id?,title?,title_contains?,visible?,workspace?}</code>
 returns <code>{windows:[&lt;row&gt;...]}</code> in id order, filtered by every given field
 (text filters at most 4096 bytes; <code>workspace</code> is an index in <code>1..=count</code>
 — above the count is <code>invalid_value</code>, not an empty list — <code>"current"</code> for
 the current workspace, or <code>"all"</code>, the default). The
 rows are the <code>windows.s&lt;id&gt;</code> rows. Like that tree, the list has no X11
-windows and is empty while a session lock is active.</li>
+windows and is empty while a session lock is active.</p>
+</li>
 </ul>
 <p>Every argument object is checked for unknown fields
 (<code>{"error":"invalid_args",field,allowed}</code>).</p>
+<h4 id="whole-pixel-placement">Whole-pixel placement</h4>
+<p>At a fractional output scale a logical origin can fall between physical
+pixels: x = 1 at 2.5 is physical 2.5. The KMS renderer projects each window
+edge to a whole pixel on its own, so a 795-wide window there spans 1987
+pixels while its fractional-scale client drew <code>round(795 x 2.5)</code> = 1988, and
+the content is resampled and blurs. comp therefore stands every xdg
+toplevel's BUFFER origin on a whole physical pixel. The snap moves the buffer
+by at most half a physical pixel. It applies in these places:</p>
+<ul>
+<li>the cascade slot a new window opens in;</li>
+<li><code>comp.window.place</code>;</li>
+<li>interactive move and resize;</li>
+<li>the clamp after the output shrinks;</li>
+<li>every commit that changes the client's window-geometry inset, whichever
+buffer path it arrives on (none, SHM or DMA-BUF), and the inset comp derives
+from subsurface bounds;</li>
+<li>a return from maximised or fullscreen;</li>
+<li>a nested host scale change.</li>
+</ul>
+<p>The reported <code>window_x</code>/<code>window_y</code> and the <code>windows.s&lt;id&gt;</code> position leaves are
+the snapped values. They can be fractional in logical units at a fractional
+scale, and they are integers at scale 1, where the same rule rounds a
+fractional pointer-driven origin to a whole pixel.</p>
+<p><strong>Re-snaps start from where comp meant the window to be.</strong> comp remembers the
+unsnapped origin it last placed a window at. A later inset change or scale
+change derives the new whole-pixel origin from that anchor, never from an
+already snapped value. So a GTK window whose shadow inset changes on every
+focus change stays put, and a scale change from 2.5 to 1.25 and back returns
+the window to the same pixel.</p>
+<p>Which requests set the anchor:</p>
+<ul>
+<li>A move, <code>comp.window.place</code>, an interactive resize and the output-shrink
+clamp each REPLACE the anchor, per axis, with the origin they asked for.</li>
+<li>An axis such a request leaves where the window already stands keeps its
+recorded anchor. Examples are a size-only place, a right or bottom edge
+drag, and the unmoved axis of a left drag. So interleaving resizes with
+inset changes cannot walk the window either.</li>
+<li>Anything else that moves the window, such as a return from maximised or a
+decoration-mode switch, makes its new origin the anchor.</li>
+</ul>
+<p><strong>Constraints choose between the two nearest grid points.</strong></p>
+<ul>
+<li><code>comp.window.place</code> validates the snapped origin, not the requested one.
+When the nearest grid point would put the window wholly off every output,
+it takes the grid point on the other side.</li>
+<li>The output-shrink clamp takes the nearest grid point that is still inside
+the clamp. The window does not slide under a panel or lose the room it was
+clamped to fit. When the window is wider than the work area, the clamp
+interval is narrower than a pixel. Then the origin takes the nearest grid
+point at or past the work area's near edge, and the size clamp that follows
+shrinks the window. That grid point becomes the anchor, so the next commit
+keeps it.</li>
+<li>A left or top edge drag whose stationary edge sits exactly on the output's
+left or top edge may have no grid point that keeps it on its pixel. It then
+moves one pixel toward the visible side, never behind the output edge.</li>
+<li>A left or top edge drag keeps the STATIONARY edge on the physical pixel it
+started on. The moving origin takes whichever grid point preserves it, so
+the far edge does not wobble as the drag crosses odd sizes.</li>
+</ul>
+<p><strong>What 1:1 means, and where.</strong> On the grid, both edges of the buffer project
+exactly. On KMS the drawn width is then the client's <code>round(width x scale)</code>
+buffer, sampled 1:1. The nested compositor renders through the host camera's
+scale without this edge projection, so it still resamples a window whose
+logical width is odd at 2.5. Nested pixel gates cannot prove sharpness at a
+fractional scale. A neighbour placed at the REPLIED origin plus the window's
+logical size projects its left edge to this window's right edge, with no seam
+and no overlap. Placing it at the REQUESTED origin plus the width can overlap
+by one pixel. With a client-side-decorated window only the buffer is on the
+grid; its visible window-geometry edges sit at the client's integer logical
+inset from it and can fall between pixels.</p>
+<p>Three kinds of surface are left alone:</p>
+<ul>
+<li>X11 windows keep integer X coordinates.</li>
+<li>Maximised and fullscreen windows start exactly at the work area or output
+origin.</li>
+<li>Popups and subsurfaces keep their client-chosen offsets from the parent.</li>
+</ul>
+<p>A window whose right or bottom edge falls on a negative half pixel, straddling
+the left or top output edge, can still project one pixel short. The renderer
+rounds half away from zero on both sides of the origin.</p>
 <h3 id="input-injection">Input injection</h3>
 <p>The <code>comp.input.*</code> verbs feed the seat exactly as a device does. Every event
 enters the one seat entry point with user activity on, so these all apply
@@ -1285,7 +1410,7 @@ below, so handlers do not depend on the instance name.</p>
 <tr><td><code>&lt;service&gt;.corner.entered</code></td><td><code>corner.entered</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.left</code></td><td><code>corner.left</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.corner.clicked</code></td><td><code>corner.clicked</code></td><td><code>{output,corner,dwell_ms,event_seq}</code></td></tr>
-<tr><td><code>&lt;service&gt;.corner.clicked.v2</code></td><td><code>corner.clicked.v2</code></td><td><code>{output,corner,button,kind,dwell_ms,event_seq}</code></td></tr>
+<tr><td><code>&lt;service&gt;.corner.clicked.v2</code></td><td><code>corner.clicked.v2</code></td><td><code>{output,corner,button,kind,modifiers,dwell_ms,event_seq}</code></td></tr>
 <tr><td><code>&lt;service&gt;.pointer.changed</code></td><td><code>pointer.changed</code></td><td><code>{version:1,instance,output,position,valid,timestamp_ms,event_seq}</code></td></tr>
 </tbody></table>
 <p>Map edges carry the surface's role <code>generation</code> and its <code>app_id</code> and <code>title</code>
@@ -1302,26 +1427,45 @@ condition, use <code>comp.window.wait</code> rather than subscribing and hoping:
 topics are not retained, so an edge that happened before the subscription is
 never delivered.</p>
 <p>Engaged corners consume pointer presses and their matching releases. The v2
-click topic reports <code>button: "left"|"right"</code> and <code>kind: "brief"|"hold"</code>.
-LMB emits brief on release, with no hold behaviour. RMB emits brief on release
-before <code>input.corners.hold_ms</code> (default 500ms), or hold once at that deadline;
-release after hold emits nothing. Other buttons are consumed without an action.
+click topic reports <code>button: "left"|"right"</code> and <code>kind: "brief"</code>.
+Both buttons emit on release, with no hold timer or hold action. <code>modifiers</code>
+contains the active <code>shift</code>, <code>ctrl</code>, <code>alt</code> and <code>super</code> names captured at press
+time in the compositor input path, even if they change before release. The field
+is always present, including <code>modifiers: []</code>; Quoin refuses a v2 body without
+it. Other buttons are consumed without an action.
 Movement further than <code>input.corners.deadzone_px</code> from the press position cancels
 the pending action, even within the hotspot. Leaving the corner or resetting
 engagement (including output changes, lock, or config changes) also cancels it.
 Cancellation retains release ownership; returning to the corner cannot revive
-the action. A hold already emitted is not retracted by later movement.</p>
+the action.</p>
 <p>The original <code>corner.clicked</code> topic retains its exact JSON body and emits only
-successful LMB brief actions, now on release. V2 consumers should subscribe only
-to <code>corner.clicked.v2</code> to avoid handling LMB twice. Consumers retaining an old-comp
-fallback must deduplicate: each LMB emits legacy at sequence N immediately followed
-by v2 at N+1, with the same output, corner and engagement dwell. Quoin uses this
-pair to admit the first click once, then ignores legacy after observing v2.
-This versioning preserves old
-shell-hosts with strict JSON decoding; they receive no RMB actions during rollout.
+successful unmodified LMB brief actions, on release. Every modified click,
+including Ctrl/Alt/Super+LMB, emits only v2. V2 consumers should subscribe only
+to <code>corner.clicked.v2</code> to avoid handling LMB twice. Consumers that also take
+legacy, as a fallback while their v2 subscription settles, must deduplicate:
+each unmodified LMB emits legacy at sequence N immediately followed by v2 at
+N+1, with the same output, corner and engagement dwell. Quoin uses this pair to
+admit the first click once in either delivery order, then ignores legacy after
+observing v2. The legacy sibling is required even with <code>modifiers: []</code>: Quoin
+canonicalises the v2 sequence to N. Modified clicks keep their own sequence.</p>
+<p>Compositor and shell-host must be upgraded together; neither skew is clean. A
+host that predates v2 entirely sees legacy LMB and nothing else. A v2-aware host
+from before <code>modifiers</code> existed rejects every v2 body, never marks v2 as seen
+and acts only on legacy, so RMB and every Shift/Ctrl/Alt/Super+LMB click is lost
+silently. The reverse skew — a compositor from before <code>modifiers</code> against the
+current Quoin — is louder but no better: Quoin refuses every v2 body from it
+(ERROR <code>quoin_corner_old_format_rejected</code>, <code>field=modifiers</code>), so RMB does
+nothing and the corner menu is unreachable from the corner. That compositor
+also emitted legacy for every LMB, modified or not, so unmodified LMB still
+pins and Shift+LMB pins instead of docking — but only on a fresh Quoin
+connection. Rolling the compositor back in place while Quoin stays connected
+is worse still: Quoin has already seen v2, so it ignores legacy, and the
+rewound sequences drop as stale, so no corner click acts until Quoin
+reconnects.
 Both versions carry engagement dwell, not press duration. Quoin routes LMB brief
-to overlay pinning, RMB brief to docking, and RMB hold to an optional corner menu
-hook; an unconfigured menu does nothing.</p>
+to overlay pinning, Shift+LMB to docking, and RMB to the corner menu.
+Ctrl/Alt/Super without Shift retain LMB pinning. LMB from docked becomes pinned;
+Shift+LMB toggles docked/hidden. No bare button click docks a panel.</p>
 <p>For a reliable property bootstrap: subscribe to the instance topic (for
 example <code>comp.props.changed</code> on the seat or <code>comp-nested.props.changed</code> when
 nested), call <code>comp.props.watch</code>, verify its returned topic, then read the
@@ -1462,6 +1606,161 @@ compile within the call. It does not loop until pipelines settle or prove every
 intended draw was submitted. An independent 30-second settlement deadline prevents
 fallback presentations from indefinitely hiding pending assets or pipelines.
 The budget resets for a replacement output generation after resume.</p>
+<p>The panel holder plane is two verbs, sent like every comp verb as the literal
+command (<code>comp.panel.hold</code>, not <code>&lt;service&gt;.panel.hold</code>) addressed to the
+selected service. <code>comp.panel.hold</code> takes <code>output</code> (raw connector name), <code>edge</code>
+(<code>top</code>, <code>bottom</code>, <code>left</code>, <code>right</code>), <code>surface</code> (the layer-shell namespace token),
+<code>holder</code> (<code>pointer</code>, <code>focus</code>, <code>popup</code>) and boolean <code>acquire</code>.
+<code>comp.panel.mode</code> takes the same output/edge/surface address, <code>mode</code>
+(<code>hidden</code>, <code>pinned</code>, <code>docked</code>) and an optional <code>generation</code> (the reporter's
+Bus connection generation, a non-negative integer). Both run at the stable
+observation dispatch boundary and return <code>{"accepted":true,"surface":...}</code>.
+Malformed arguments are refused as <code>invalid_args</code> naming the offending
+<code>field</code>, with the <code>allowed</code> list (a hold carrying <code>generation</code> is malformed).
+Acquisitions require a live layer on that output. Mode reports survive concealed
+panel-layer destruction; releases match their recorded token even if the layer
+has already gone, and a release for an edge comp holds no state for is a no-op.
+Refusals are <code>unknown_output</code>, <code>unknown_panel_surface</code> (acquire with no layer,
+or with a layer on an edge no registered holder service has reported yet),
+<code>panel_output_mismatch</code> (the token's one layer is on another output),
+<code>ambiguous_panel_surface</code> (the token names more than one layer, whatever their
+order), <code>panel_owner_mismatch</code> (the token's layer belongs to a different live
+Wayland client than the one that owns the edge), <code>stale_generation</code> (a holder
+report whose <code>generation</code> is lower than the edge's current one: a delayed
+report from an older Bus connection, which changes nothing) and <code>locked</code>
+(session lock).
+Explicit requests are idempotent; persistent modes clear holders and ignore
+acquisitions.</p>
+<p>The namespace token is created by Quoin for each layer lifetime. It resolves
+to comp's own surface identity without relying on client-local Wayland object
+numbers or choosing the topmost layer. Popup holds name the menu's own layer
+because the panel can be hidden. The association is re-resolved whenever a layer
+maps or unmaps, so a mode report that overtakes its layer binds when the layer
+maps; tokens are never reused, and Quoin's carry 128 random bits, so another
+client cannot guess one. Namespaces are not authenticated: a client that
+copies a token makes it ambiguous, which refuses rather than misdirects. A Bus
+peer that can read the panel topics can copy a token and report it; that is
+the mesh trust boundary (every mesh caller reaches every verb), not a hole
+this plane closes. For the same reason, enforcement that hides a panel or
+excludes its input acts on the surface identity comp resolved from the token,
+never on a namespace prefix match. Output
+removal drops that output's state without a signal; Quoin rebuilds its panels
+with fresh tokens when an output goes, so nothing stale is suppressed.
+Besides the explicit holds, comp tracks two holders per reported panel itself
+(shell design §4.3). The pointer holder is acquired by dwelling in the edge's
+hotspot (the corner engaging) or by the pointer entering the panel's layer or a
+held popup's; any contact with those, including an undwelled pass through the
+hotspot, keeps it; leaving them all starts an 800 ms conceal delay that re-entry
+cancels. The focus holder is keyboard focus on the panel's layer or a held
+popup's. A held popup's layer being destroyed releases its hold at once, even
+before the client's release arrives; the popup hold also records the keyboard
+focus the popup displaced when it takes focus and restores it (toplevel or
+layer) only when the popup's destruction moved focus and focus is still where
+comp's fallback put it; focus moved off a live popup cancels the restoration,
+except into another held popup (a nested menu), which restores back to it.
+Membership is evaluated at the stable post-dispatch boundary, and again after
+the cycle's Bus controls, so a command is
+emitted only when an edge's verdict changes: <code>reveal</code> when the first holder
+arrives, <code>conceal</code> when the last leaves — at once for focus and popup, after the
+delay for the pointer. The delay is a single one-shot calloop timer, armed only
+while a lingering pointer is the last holder of a hidden panel. A hidden
+<code>comp.panel.mode</code> report always re-states the current verdict, so a client that
+has just started following the commands learns it. Commands go out on
+<code>&lt;service&gt;.panel.command</code> through the existing bounded observation outbox and
+its gap reporting; the version-1 body contains <code>output</code>, <code>edge</code>, <code>surface</code> (the
+panel's token when comp has one), <code>action</code> and <code>event_seq</code>.</p>
+<p>Each edge belongs to one Quoin incarnation, identified by the Wayland client
+of its panel layer — an identity comp attests itself, unlike the token. An
+unowned edge is adopted only for a layer whose token a registered holder
+service (the broker-stamped sender, never an anonymous caller) named: in a
+<code>comp.panel.mode</code> report, or in a hold once that service has reported the
+edge (a corner menu can open while its panel has no layer). The first such
+service to report an edge is its holder service; a mode report from anyone
+else — an anonymous caller or another service — is recorded (its mode applies)
+but never replaces the token the holder named and binds nothing, so a foreign
+token can never become the one a later mapping adopts. A layer from a
+different client that is still connected is refused as <code>panel_owner_mismatch</code>
+and never binds, even when it is the only layer the (copied) token names; an
+edge whose owner has gone is taken over by the next reported client with
+nothing of the old incarnation carried across. When the owning Wayland client
+disconnects (Quoin crashed or exited), comp drops every explicit hold it
+acquired, its popups and any enforcement, and the edge conceals by the normal
+rules: the automatic pointer and focus holders are comp's own and still apply.
+Comp also subscribes to noded's registry (<code>noded.props.changed</code>,
+<code>services.registered</code>): when the holder service that reported an edge leaves
+the Bus, its explicit holds go, while the owner and any enforcement — which
+belong to the Wayland client — stay. This is the local node's registry: a
+holder reaching comp over the mesh is not in it, so its holds drop on the next
+local registry change until its next report. noded rate-limits each path's
+diffs, so one can be dropped; every diff carries the full set, so the next
+repairs it. The subscription is retried on every reconnect until it succeeds,
+after which the client replays it. Generations only move forward: a holder
+report with a higher <code>generation</code> is a new Bus incarnation whose
+predecessor's holds end there, and a lower one is refused. The liveness probe
+below bounds anything a missed registry event could leave behind.</p>
+<p>Comp enforces its conceals (shell design §7: a slow or stopped shell must not
+keep a panel shown or hold the input). When a conceal ends a reveal comp
+itself commanded, comp records the owner's layers showing for that edge — the
+panel layer and any popup layer acquired for it. If any of them unmaps or goes,
+the shell has applied the conceal and nothing is owed, so a panel the user
+shows again at once is never hidden. If they are still mapped 1 s later (the
+shell's slide takes 200 ms), comp asks whether the shell is alive: it re-sends
+each layer its current configure, unchanged, and waits up to 1 s for the
+<code>ack_configure</code> a live client sends and a stopped one cannot. The same probe
+runs when an owner layer stays shown for 1 s while the verdict is conceal for
+another reason (a shell that stopped during its startup intro or an explicit
+show), and at once when the user clicks or types somewhere the shell does not
+own while only a popup or focus hold keeps the edge revealed (a stopped menu
+or launcher). A probe costs a live shell one configure round-trip and one
+re-rendered frame; at most one runs per owner at a time, and an owner that has
+just answered is not probed by a press again for a second, however often the
+user clicks elsewhere. An answered probe owes nothing and is not repeated
+until the next trigger. An unanswered one marks the owner stalled: its popup and focus
+holds drop, its keyboard focus stops counting as a holder, its Exclusive
+layers lose their keyboard grab (arbitration treats them as on-demand, so the
+application gets the keyboard back), the edge conceals, and the showing layers
+are hidden and excluded from input at once. Any later acknowledgement or Bus
+request from the owner clears the stalled mark.</p>
+<p>Hiding goes through the same effective-visibility funnel as minimising, so
+the layers stop rendering, stop being hit-tested, lose keyboard and pointer
+focus and can no longer hold an exclusive keyboard grab; their subsurfaces and
+popups go with them. It acts only on the recorded surface ids, never on a
+namespace or prefix match, so no other client's surface — a foreign layer or
+toplevel on the same output — is touched. Enforcement ends when comp reveals
+the edge again, when the client unmaps or destroys the layer itself, on any
+mode report for the edge, and with the owner's disconnect. A hidden report
+that finds a conceal still owed lifts the exclusion but owes it again with a
+fresh grace, so a shell that resumes and stalls again stays bounded. A
+stopped shell's panel is therefore hidden about 2 s after the conceal: 1 s of
+grace and 1 s for the probe to go unanswered. The grace and the probe share
+the single one-shot timer with the conceal delay; nothing polls and nothing is
+sent to a shell that is not being checked.</p>
+<p>What remains open to a Bus peer: the verbs are mesh-open, so any caller can
+send a <code>comp.panel.mode</code> for an edge. Before a holder service has reported an
+edge, a registered service's report makes it the holder; after that, anyone
+else's report can change the edge's mode and lift an exclusion (owing it
+again), but cannot change the token, make another client's layer the panel or
+select it for hiding. A registered service name is trusted as the broker
+stamps it: the mesh is the trust boundary.</p>
+<p>Not covered: a docked panel's reservation from a stalled shell stays in place
+(shell design §7, "stale reservations"); tracked in TODO-cos.</p>
+<p>The read-only <code>input.corners.holders</code> leaf is the switch clients gate on. It
+reads <code>true</code>: the verbs, holder tracking, the conceal timer, the liveness
+probe and enforcement on a stalled client, disconnect cleanup and
+resynchronisation are all live, and Quoin hands reveal/conceal over to comp
+when it reads it. Two families of
+read-only, volatile leaves (served by <code>comp.props.get</code>/<code>list</code>/<code>describe</code>,
+never in <code>props.changed</code>) report the plane per edge, summed over outputs:
+<code>input.corners.enforced.{top,bottom,left,right}</code> counts the layers comp is
+hiding and excluding right now, and <code>input.corners.held.{top,bottom,left,right}</code>
+the explicit holds it records. A stalled-shell check reads them: with the
+shell stopped (<code>SIGSTOP</code>) after a pointer reveal, the pointer's departure
+conceals after 800 ms, comp probes a second later, and <code>enforced.&lt;edge&gt;</code> reads
+1 about a second after that; with a menu open instead, a click on an
+application probes at once, and a second later the keyboard returns to the
+application and the panel and menu are enforced. After <code>SIGCONT</code> the shell's
+own conceal returns <code>enforced</code> to 0, and <code>held.&lt;edge&gt;</code> returns to 0 once its
+menus have closed.</p>
 <p>Hot-corner detection is compositor-side and uses the current logical output.
 It emits one <code>entered</code>, then one <code>left</code> on deadzone exit, output or geometry
 change, session lock, disable, or config invalidation. <code>corner</code> is <code>tl</code>, <code>tr</code>,
@@ -1471,12 +1770,43 @@ motion constrained by the output edge can enter early. Defaults and inclusive
 ranges are:</p>
 <table><thead><tr><th>Property</th><th style="text-align: right">Default</th><th style="text-align: right">Range</th></tr></thead><tbody>
 <tr><td><code>input.corners.enabled</code></td><td style="text-align: right"><code>true</code></td><td style="text-align: right">boolean</td></tr>
-<tr><td><code>input.corners.deadzone_px</code></td><td style="text-align: right"><code>12.0</code></td><td style="text-align: right"><code>1.0..=256.0</code> logical px</td></tr>
+<tr><td><code>input.corners.deadzone_px</code></td><td style="text-align: right"><code>10.0</code></td><td style="text-align: right"><code>1.0..=256.0</code> logical px</td></tr>
 <tr><td><code>input.corners.dwell_ms</code></td><td style="text-align: right"><code>200</code></td><td style="text-align: right"><code>0..=5000</code> ms</td></tr>
-<tr><td><code>input.corners.hold_ms</code></td><td style="text-align: right"><code>500</code></td><td style="text-align: right"><code>1..=5000</code> ms (RMB only)</td></tr>
 <tr><td><code>input.corners.velocity_max_px_s</code></td><td style="text-align: right"><code>1500.0</code></td><td style="text-align: right"><code>1.0..=20000.0</code> logical px/s</td></tr>
+<tr><td><code>input.corners.affordance</code></td><td style="text-align: right"><code>true</code></td><td style="text-align: right">boolean</td></tr>
+<tr><td><code>input.corners.discovery</code></td><td style="text-align: right"><code>false</code></td><td style="text-align: right">boolean</td></tr>
 </tbody></table>
-<p>The mutable leaves are the five corner leaves, <code>windows.s&lt;id&gt;.band</code>,
+<p><code>deadzone_px</code> is the hotspot: a square of that many logical units at each
+output corner, so it is the same size on a 2x output as on a 1x one.</p>
+<p>The compositor draws the hotspot affordance itself, above every client —
+layer-shell panels included — and below the cursor, in the scheme accent. With <code>affordance</code> true it
+shows the engaged hotspot while the pointer rests there, flashes it for
+180 ms on every recognised release (the brief LMB or RMB that emits
+<code>corner.clicked.v2</code>), and, while <code>discovery</code> is true, blinks every hotspot
+slowly until the first engagement. That engagement sets <code>discovery</code> back to
+<code>false</code> with cause <code>corner.entered</code>; a shell that reveals a panel another way
+(keyboard) writes <code>false</code> itself. The compositor keeps no record of a first
+run, so it never turns <code>discovery</code> on: a shell does, when its own state says
+the user has not yet found the corners — Quoin writes <code>true</code> once, on the
+launch that finds no <code>quoin.state.mix</code>, and creates that file when the
+compositor accepts the write, so it is never requested again. <code>affordance: false</code> makes the corners
+silent without changing detection. Nothing is drawn under a session lock.
+The affordance renders only when what it draws changes — once on engage, once
+on leave, a few quantised steps for a flash, two frames per 2 s blink — so a
+settled corner leaves the renderer idle.</p>
+<p>The affordance is ordinary on-screen furniture in the base layer, not a
+cursor-plane overlay, so screenshots and screencasts include a hover square
+or flash that is showing when they are taken. With the <code>embedded-quoin</code>
+build feature, the embedded Quoin draws its panels as UI that composites
+above the compositor's scene, so an embedded panel covering a corner hides
+that corner's affordance; the production Quoin is a separate layer-shell
+client and is unaffected, and the ordering belongs to the embedding work.
+Squares are sized and placed in each output's own logical coordinates, but
+the renderer currently places every output camera over one shared logical
+canvas at one output scale — the same limit client placement has — so
+mixed-scale, multi-output correctness depends on the renderer's multi-output
+camera model, not on the affordance.</p>
+<p>The mutable leaves are the six corner leaves, <code>windows.s&lt;id&gt;.band</code>,
 <code>windows.s&lt;id&gt;.minimized</code>, <code>windows.s&lt;id&gt;.workspace</code>, <code>workspaces.count</code>,
 <code>workspaces.current</code>, <code>workspaces.o_&lt;slug&gt;.current</code>, <code>input.host.passthrough</code>
 (nested only) and <code>xwayland.enabled</code>. The corner, window and workspace
@@ -1543,7 +1873,15 @@ wake the publisher with an event notification, which drains the outbox to
 empty. There is no publisher polling timer or idle tick source. <code>topic.idle</code>
 drops the property baseline and a later <code>topic.active</code> seeds one at the next
 stable service point; both lifecycle directions coalesce latest-wins if the
-ingress is temporarily full.</p>
+ingress is temporarily full. These notices, and the <code>noded.props.changed</code>
+registry diffs, are honoured only from the local broker: <code>from: noded</code> with
+<code>broker_origin</code> absent or <code>local</code>. Absent is the normal case, because noded
+does not stamp its topic notices. A message claiming <code>noded</code> with
+<code>broker_origin: mesh</code> is ignored and logged at warn level, at most once every
+10 seconds. This is defence in depth. Mesh ingress strips <code>from</code>, and responses
+never reach this dispatch. The one reachable forgery is a client connected
+over WireGuard to a pre-0.18 noded that let it register the name <code>noded</code>.
+noded 0.18.0 refuses that name.</p>
 <p>The 16,384-surface cap bounds tree cardinality, not reply bytes. A full tree can
 still serialise far beyond the wire allowance, so comp measures the cached
 full-tree bytes once and returns <code>too_large</code>; callers can read a leaf or subtree
@@ -1570,6 +1908,28 @@ clients.</p>
 <tr><td><code>zwlr_screencopy_manager_v1</code></td><td style="text-align: right">3</td><td>Compatibility output capture into exact-layout <code>wl_shm</code> buffers, plus eligible whole-output v3 DMA-BUF destinations; includes clipped SHM regions, real damage waiting, exact cursor inclusion and presentation-timestamped nested or KMS completion.</td></tr>
 <tr><td><code>wp_presentation</code></td><td style="text-align: right">2</td><td>Nested mode, and live KMS in client-content mode with kernel page-flip times, vblank sequence and mode refresh (see Presentation feedback below).</td></tr>
 </tbody></table>
+<h3 id="dma-buf-import-observations">DMA-BUF import observations</h3>
+<p>The linux-dmabuf format table says what the driver <em>claims</em> to support.
+The <code>dmabuf.*</code> properties say what comp actually <em>accepted</em>, which is a
+different fact. Every <code>zwp_linux_buffer_params_v1</code> import that comp
+answers is counted. A request that Smithay refuses first with a protocol
+error, before comp sees the buffer, is not counted:</p>
+<ul>
+<li><code>dmabuf.accepted</code> counts accepted imports.</li>
+<li><code>dmabuf.failed</code> counts refused imports.</li>
+<li><code>dmabuf.failures</code> lists the newest 16 refusals, oldest first. Each is
+<code>{format, modifier, reason, detail, at_us}</code>: the fourcc as four
+characters, the modifier as <code>0x</code> plus 16 hex digits, a reason, the
+refusing check's own message, and the CLOCK_MONOTONIC µs it happened.</li>
+</ul>
+<p><code>reason</code> is one of <code>invalid_metadata</code> (comp's own size, plane or format
+checks), <code>vulkan_rejected</code> (the Vulkan test import on the renderer's
+device said no), <code>descriptor_dup_failed</code>, <code>queue_full</code>, <code>worker_stopped</code>,
+<code>probe_panicked</code> or <code>probe_retired</code> (refused because an earlier panic
+retired the probe). The leaves are read-only and volatile: <code>comp.props.get dmabuf</code> reads them, but they never appear in <code>props.changed</code>, because a
+refusal storm would flood the topic. They live in memory only and start
+from zero when comp starts. The advertised format set is not yet demoted
+from these observations.</p>
 <h3 id="presentation-feedback">Presentation feedback</h3>
 <p><code>wp_presentation</code> reports when a client's commit was actually shown. The
 global is advertised only once a backend has wired a frame reporter, so no
@@ -1778,8 +2138,12 @@ band are supported.</p>
 <p><code>DISPLAY</code> is never set globally. After the XWM owns <code>WM_S0</code>, the compositor
 atomically publishes a mode-0600 per-socket descriptor at
 <code>$XDG_RUNTIME_DIR/cosmix-comp/&lt;WAYLAND_DISPLAY&gt;.xwayland.env</code> containing
-<code>DISPLAY=:N</code> and the XWayland generation; launchers read it once and pass
-<code>DISPLAY</code> explicitly to each X client. A missing <code>Xwayland</code> binary or a
+<code>DISPLAY=:N</code> and the XWayland generation; launchers read it at each launch
+(the number can change when XWayland restarts) and pass <code>DISPLAY</code>
+explicitly to each X client. The desktop's <code>apps.launch</code> does exactly that
+(see the apps citizen in <a href="/cos/desktop-bus">desktop-bus</a>). comp itself spawns
+no desktop applications, so setting <code>DISPLAY</code> in its own process would
+reach nothing but Xwayland. A missing <code>Xwayland</code> binary or a
 failed start degrades to a fully working native-Wayland compositor with a
 warning. An unexpected XWayland death destroys that generation's windows,
 removes the descriptor and arms a single 60-second one-shot restart backstop;
@@ -1991,7 +2355,28 @@ capture feed and completion path while ignoring client scene content; every
 changed animation frame marks full-output damage, so <code>copy_with_damage</code> wakes.
 The wlr protocol is a compatibility surface; the planned
 <code>ext-image-copy-capture-v1</code> implementation will become another consumer of the
-same capture service. The automated nested acceptance gate uses <code>grim</code>; the
+same capture service.</p>
+<p><strong>Frames are physical pixels, on nested too.</strong> A whole-output screencopy frame
+is the output's physical buffer: at scale 2.5 a 320x240 logical output
+advertises and delivers 800x600, and a logical region is projected to
+physical pixels. On nested, the extent is the host window's own swapchain
+size, not the truncated logical size times the scale (a 2762-pixel-wide host
+at 2.5 is 1104.8 logical, reported as 1104). The nested scene itself is laid
+out on that truncated 1104-wide canvas, so the last physical pixel or two at
+the right or bottom of such a frame are background that no client can draw
+into. The strip is cosmetic and is not a capture error. What a client does with the frame
+is its own business. grim composes its image at the output's integer
+<code>wl_output.scale</code>, which is 1 on nested and <code>ceil(scale)</code> on KMS, so by
+default it downsamples a nested frame to the logical size and upsamples a KMS
+one. A pixel gate that must see what the panel shows runs
+<code>grim -s &lt;exact scale&gt;</code>, for example <code>grim -s 2.5</code>, which composes at 1:1.</p>
+<p>An earlier note held that nested screencopy returned a LOGICAL-size frame and
+that nested pixel gates were therefore vacuous. That premise was wrong. The
+1105x622 images it cited were grim's default composition. comp itself has no
+Bus capture verb: <code>capture.screenshot</code> belongs to the separate
+<code>cosmix-capture</code> screencopy client, and a native <code>comp.capture.frame</code> is
+still a proposal.</p>
+<p>The automated nested acceptance gate uses <code>grim</code>; the
 <code>cosmix-screencopy-probe</code> binary is a deadline-bounded manual diagnostic for the
 advertised layout, non-zero SHM offset, guard bytes and non-black pixels. Its
 <code>--dmabuf --drm-node PATH</code> mode waits for <code>buffer_done</code>, allocates an advertised
@@ -2031,7 +2416,11 @@ keyboard focus dismisses any active XDG popup keyboard grab before the arbiter
 sets its chosen focus. While an Exclusive latch is held, an unrelated popup
 grab request is denied with <code>popup_done</code>, because xdg-shell requires the
 topmost grabbing popup to own keyboard focus; a popup belonging to the latched
-layer may grab normally. When a focused layer stops being eligible, focus
+layer may grab normally. A latched layer that holds the keyboard (with no
+popup keyboard grab active) and commits
+<code>OnDemand</code> keeps the keyboard: the latch ends, the focus stays, and from then
+on a click elsewhere moves it like any <code>OnDemand</code> layer (Quoin's panels ask
+for the grab only until it lands). When a focused layer stops being eligible, focus
 moves to the next Exclusive layer, otherwise to the highest visible normal
 toplevel, or to no surface when neither exists. Keyboard focus inside an
 Exclusive layer's own active popup grab satisfies the layer's latch: ordinary
@@ -2211,6 +2600,18 @@ attach/commit ledger enforce <code>AlreadyConstructed</code>.
 The session-lock registry also exposes a narrow exact-surface retirement helper
 for KMS output replacement; it removes only the originating protocol object and
 does not alter the accepted lock generation.</p>
+<p>Smithay's <code>xdg_wm_base.get_xdg_surface</code> guard is narrowed. It still refuses
+a <code>wl_surface</code> with any non-xdg role, and one that a live <code>xdg_surface</code>
+still wraps. Once the previous <code>xdg_surface</code> is destroyed, a fresh one for
+the same <code>wl_surface</code> is accepted and may take the same xdg role again.
+Live wrappers are tracked per <code>wl_surface</code>, so a second <code>xdg_wm_base</code>
+binding cannot bypass the guard. The same request also enforces
+xdg-shell's rule that the <code>wl_surface</code> has no buffer attached or committed:
+either posts <code>xdg_wm_base.invalid_surface_state</code>. A client re-wrapping a
+surface must first commit a NULL buffer. <code>XdgShellHandler</code> gained an
+additive <code>surface_has_buffer</code> hook for this, because comp consumes
+committed buffers out of Smithay's surface state and answers from its own
+record instead.</p>
 <p>Smithay's <code>X11Surface</code> has one additive test-support setter
 (<code>set_wl_surface_offline</code>) that assigns the associated <code>wl_surface</code> directly.
 The xwayland-shell serial handshake owns the real association; the setter

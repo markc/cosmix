@@ -16,6 +16,8 @@ mod embedded_shell;
 mod frame_capture;
 mod frame_content;
 mod frame_trace;
+#[cfg(feature = "bus")]
+mod hotspot_scene;
 mod occlusion;
 #[cfg(feature = "bus")]
 mod port;
@@ -52,7 +54,8 @@ use bevy::{
         view::ExtractedWindows,
     },
     window::{
-        PresentMode, WindowBackendScaleFactorChanged, WindowEvent, WindowPlugin, WindowResized,
+        PresentMode, PrimaryWindow, WindowBackendScaleFactorChanged, WindowEvent, WindowPlugin,
+        WindowResized,
     },
 };
 use cosmix_deco::ChromeStyle;
@@ -945,6 +948,8 @@ struct HostInputQueue {
     pending: Vec<HostInput>,
     keyboard_focused: bool,
     scrolling_axes: ScrollingAxes,
+    /// The last host physical size forwarded; `None` until the first.
+    physical_size: Option<(u32, u32)>,
 }
 
 impl Default for HostInputQueue {
@@ -953,6 +958,7 @@ impl Default for HostInputQueue {
             pending: Vec::new(),
             keyboard_focused: true,
             scrolling_axes: ScrollingAxes::default(),
+            physical_size: None,
         }
     }
 }
@@ -1136,11 +1142,29 @@ fn gesture_axis(value: f32, ending: bool, in_flight: &mut bool) -> Option<HostAx
     })
 }
 
+/// The host physical size to forward, if any. The window is read only when the
+/// host has just reported a resize or scale change, or once before the first
+/// report, and forwarded only when it differs from what was last sent. The
+/// logical size in `WindowResized` is the physical size divided by the scale
+/// and then truncated, so the physical size cannot be reconstructed from it.
+fn host_physical_resize(
+    last: Option<(u32, u32)>,
+    geometry_changed: bool,
+    current: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if !geometry_changed && last.is_some() {
+        return None;
+    }
+    let current = current.filter(|(width, height)| *width > 0 && *height > 0)?;
+    (last != Some(current)).then_some(current)
+}
+
 fn collect_host_input(
     mut button_events: MessageReader<MouseButtonInput>,
     mut window_events: MessageReader<WindowEvent>,
     mut resize_events: MessageReader<WindowResized>,
     mut scale_events: MessageReader<WindowBackendScaleFactorChanged>,
+    primary_window: Query<&Window, With<PrimaryWindow>>,
     mut queue: ResMut<HostInputQueue>,
 ) {
     // Bevy's input messages carry no device timestamp, so the collection point
@@ -1149,7 +1173,9 @@ fn collect_host_input(
     // itself.
     let time = protocol::monotonic_millis();
 
+    let mut geometry_changed = false;
     for event in resize_events.read() {
+        geometry_changed = true;
         queue.pending.push(HostInput::OutputResized {
             width: event.width.max(1.0) as u32,
             height: event.height.max(1.0) as u32,
@@ -1157,9 +1183,23 @@ fn collect_host_input(
     }
 
     for event in scale_events.read() {
+        geometry_changed = true;
         queue.pending.push(HostInput::OutputScaleChanged {
             scale: event.scale_factor,
         });
+    }
+
+    let physical = primary_window
+        .single()
+        .ok()
+        .map(|window| (window.physical_width(), window.physical_height()));
+    if let Some((width, height)) =
+        host_physical_resize(queue.physical_size, geometry_changed, physical)
+    {
+        queue.physical_size = Some((width, height));
+        queue
+            .pending
+            .push(HostInput::OutputPhysicalResized { width, height });
     }
 
     for event in button_events.read() {
@@ -2150,6 +2190,33 @@ mod tests {
     #[test]
     fn nested_window_title_is_phase_neutral() {
         assert_eq!(WINDOW_TITLE, "CosMix Compositor");
+    }
+
+    #[test]
+    fn host_physical_size_is_forwarded_on_first_sight_and_on_real_change_only() {
+        // First sight: forwarded even with no resize message, so the capture
+        // extent is right before the host ever resizes.
+        assert_eq!(
+            host_physical_resize(None, false, Some((2762, 1555))),
+            Some((2762, 1555))
+        );
+        // A window not yet sized is not a size.
+        assert_eq!(host_physical_resize(None, true, Some((0, 1555))), None);
+        assert_eq!(host_physical_resize(None, true, None), None);
+        // No host geometry message: the window is not re-read.
+        assert_eq!(
+            host_physical_resize(Some((2762, 1555)), false, Some((2000, 1000))),
+            None
+        );
+        // A resize that leaves the swapchain unchanged forwards nothing.
+        assert_eq!(
+            host_physical_resize(Some((2762, 1555)), true, Some((2762, 1555))),
+            None
+        );
+        assert_eq!(
+            host_physical_resize(Some((2762, 1555)), true, Some((2763, 1555))),
+            Some((2763, 1555))
+        );
     }
 
     #[test]

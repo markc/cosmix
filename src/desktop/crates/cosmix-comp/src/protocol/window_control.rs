@@ -566,6 +566,17 @@ pub(crate) struct WindowWaiters {
     /// (the counters live as long as the `wl_surface`) nor a late report of a
     /// pre-hide frame satisfies it.
     presented_base: HashMap<SurfaceId, MappingBase>,
+    /// Per window root: its generation and the newest frame time at which
+    /// the renderer showed any surface of it (new content, or content hidden
+    /// at map time and since exposed), from the same frame reports
+    /// `comp.window.stats` reads. Needs no `wp_presentation` feedback, which
+    /// most clients never request. Sized like `presented_base`: at
+    /// `MAX_PRESENTED_BASES` a new entry prunes DEAD surfaces only, so the
+    /// table holds max(1024, live window roots) — a pruning threshold, not a
+    /// hard cap. Live roots are never evicted: dropping one's evidence would
+    /// turn a shown window back into a false `presented` timeout. Past 1024
+    /// live roots each first-time insert rescans (O(live roots)).
+    shown: HashMap<SurfaceId, (u64, u64)>,
 }
 
 const MAX_PRESENTED_BASES: usize = 1024;
@@ -816,14 +827,30 @@ impl WaylandState {
         // A window placed wholly off every output could never be seen or
         // clicked again by a caller that trusted the reply.
         let size = requested.unwrap_or(current);
-        let on_output = port_snapshot::project_outputs(self).is_some_and(|projection| {
-            projection.rows.values().any(|output| {
-                target.0 < (output.x as f32 + output.width as f32)
-                    && target.0 + size.0 as f32 > output.x as f32
-                    && target.1 < (output.y as f32 + output.height as f32)
-                    && target.1 + size.1 as f32 > output.y as f32
+        let projection = port_snapshot::project_outputs(self);
+        let visible_at = |target: (f32, f32)| {
+            projection.as_ref().is_some_and(|projection| {
+                projection.rows.values().any(|output| {
+                    target.0 < (output.x as f32 + output.width as f32)
+                        && target.0 + size.0 as f32 > output.x as f32
+                        && target.1 < (output.y as f32 + output.height as f32)
+                        && target.1 + size.1 as f32 > output.y as f32
+                })
             })
-        });
+        };
+        // Validate where the window will actually stand: the whole-pixel
+        // origin, preferring the grid point on the output side when the
+        // nearest one would push a sliver of window off it.
+        let target = {
+            let record = &self.surfaces[&object];
+            let offset = record
+                .committed_window_geometry
+                .map(|geometry| (geometry.x, geometry.y))
+                .unwrap_or_default();
+            let scale120 = crate::compositor_scene::output_scale120(self.backend.output_scale());
+            choose_grid_origin(record, target, offset, scale120, visible_at)
+        };
+        let on_output = visible_at(target);
         if !on_output {
             return ControlReply::refused(
                 "off_output",
@@ -885,6 +912,30 @@ impl WaylandState {
         );
     }
 
+    /// The renderer showed new content of window root `id` in a frame at
+    /// `tv_us` (called from the frame report, alongside the stats fold).
+    pub(crate) fn note_window_shown(&mut self, id: SurfaceId, generation: u64, tv_us: u64) {
+        let objects = &self.surface_objects;
+        let shown = &mut self.window_waiters.shown;
+        if shown.len() >= MAX_PRESENTED_BASES && !shown.contains_key(&id) {
+            shown.retain(|id, _| objects.contains_key(id));
+        }
+        let entry = shown.entry(id).or_insert((generation, tv_us));
+        if entry.0 != generation {
+            *entry = (generation, tv_us);
+        }
+        // A late report of an older frame never moves the evidence back.
+        entry.1 = entry.1.max(tv_us);
+    }
+
+    /// A frame of this mapping was shown: renderer-shown content (what
+    /// `comp.window.stats` counts) or, additionally, `wp_presentation`
+    /// feedback. Either must be at or after the map time.
+    ///
+    /// Known limit, shared by both signals: the test is the frame's
+    /// presentation time against the map time, not when the frame was
+    /// extracted. A frame extracted before an unmap but presented after a
+    /// remap in the same frame period can count for the new mapping.
     fn presented_since_map(&self, record: &SurfaceRecord) -> bool {
         let counters = self.presentation.ledger.counters(record.id);
         let (base, mapped_at_us) = self
@@ -893,10 +944,18 @@ impl WaylandState {
             .get(&record.id)
             .filter(|base| base.generation == record.generation)
             .map_or((0, 0), |base| (base.presented, base.mapped_at_us));
-        counters.presented > base
+        let shown = self
+            .window_waiters
+            .shown
+            .get(&record.id)
+            .is_some_and(|&(generation, tv_us)| {
+                generation == record.generation && tv_us >= mapped_at_us
+            });
+        let fed_back = counters.presented > base
             && counters
                 .last_presented_us
-                .is_some_and(|presented_us| presented_us >= mapped_at_us)
+                .is_some_and(|presented_us| presented_us >= mapped_at_us);
+        shown || fed_back
     }
 
     /// The target's role ended or was replaced (as opposed to a live window
@@ -1166,10 +1225,18 @@ impl WaylandState {
         {
             return None;
         }
+        let current_workspace = self.workspace_current();
         let holds = |record: &SurfaceRecord| match spec.until {
             WaitUntil::Mapped => true,
             WaitUntil::Visible => record.layout.visible && !record.minimized,
-            WaitUntil::Presented => self.presented_since_map(record),
+            // Evidence of a shown frame is retained, so it is decided now:
+            // a window since minimised or moved off the current workspace is
+            // not presented, however recently it was shown.
+            WaitUntil::Presented => {
+                !record.minimized
+                    && super::workspaces::on_workspace(record, current_workspace)
+                    && self.presented_since_map(record)
+            }
             WaitUntil::Size { width, height } => geometry_size(record) == (width, height),
             WaitUntil::Focused => record.focused,
             WaitUntil::Unmapped | WaitUntil::Gone => false,

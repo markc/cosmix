@@ -7,14 +7,15 @@
 use bevy::app::{App, AppExit, Plugin, Update};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::schedule::{IntoScheduleConfigs, SystemSet};
-use bevy::prelude::{Res, ResMut, Resource, Time, World};
+use bevy::prelude::{Mut, Res, ResMut, Resource, Time, World};
 use bevy::time::Real;
 use std::time::{Duration, SystemTime};
 
 use crate::chrome::QuoinCommittedMotionModes;
-use crate::core::{Edge, PanelInput, ShellModel};
+use crate::core::{Edge, PanelInput, PanelMode, ShellModel, SubPanelRegistry, SubPanelSeat};
 use crate::runtime::{
-    CarouselInput, ShellCommand, ShellCommandKind, ShellEffect, ShellFrame, WakePolicy,
+    CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellEffect,
+    ShellFrame, WakePolicy,
 };
 
 #[derive(Resource)]
@@ -22,11 +23,30 @@ struct ShellRuntime {
     model: ShellModel,
     clock_text: String,
     clock_deadline: Option<Duration>,
+    /// Carousel change markers for the update in flight; merged into the
+    /// frame after the model rebuild and cleared on the next update.
+    page_changes: [PageChange; 4],
 }
 
 /// Current renderer-neutral output. This is the sole presentation input.
 #[derive(Resource, Clone, Debug)]
 pub struct ShellFrameState(pub ShellFrame);
+
+/// Last accepted declarations, retained across model factories in both hosts.
+#[derive(Resource, Clone)]
+struct ShellPageDeclarations([Vec<String>; 4]);
+
+/// The process-wide sub-panel registry: every live sub-panel name with its
+/// `(output, edge, owner)` seat, held above the one live [`ShellModel`]
+/// because names are globally unique across outputs while a model is not.
+///
+/// Inserted by [`ShellRuntimePlugin`], so exactly one instance exists per
+/// process (the Quoin host and each embedded host run one runtime plugin);
+/// output replacement migrates the selected model's seats. Hosts
+/// reserve seats transactionally before accepting scene content;
+/// citizen disconnect is applied with [`remove_all_owned_subpanels`].
+#[derive(Resource, Clone, Debug, Default)]
+pub struct SubPanelRegistryState(pub SubPanelRegistry);
 
 /// Semantic effects emitted during the current model update only.
 /// The first list records panel transitions; the second records edges whose
@@ -48,6 +68,13 @@ pub enum ShellRuntimeSet {
     Host,
 }
 
+/// Host-staged ingress drained at the start of [`ShellRuntimeSet::Input`]:
+/// keyboard focus reports and other commands a host queued between updates.
+/// Keyboard systems order after it, so an Escape or binding in the same
+/// update as a focus change is applied against the new focus.
+#[derive(SystemSet, Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ShellStagedIngress;
+
 pub struct ShellRuntimePlugin {
     model: ShellModel,
 }
@@ -65,9 +92,11 @@ impl Plugin for ShellRuntimePlugin {
                 model: self.model.clone(),
                 clock_text: String::new(),
                 clock_deadline: None,
+                page_changes: [PageChange::None; 4],
             })
             .insert_resource(ShellFrameState(ShellFrame::from_model(&self.model)))
             .init_resource::<ShellEffects>()
+            .init_resource::<SubPanelRegistryState>()
             .add_message::<super::ShellResizeResult>()
             .configure_sets(
                 Update,
@@ -79,22 +108,54 @@ impl Plugin for ShellRuntimePlugin {
                 )
                     .chain(),
             )
+            .configure_sets(Update, ShellStagedIngress.in_set(ShellRuntimeSet::Input))
             .add_systems(Update, update_model.in_set(ShellRuntimeSet::Model));
     }
 }
 
-/// Replace the singleton v1 model after its selected output disappears.
+/// Replace the singleton v1 model after a rebuild or an output switch.
 ///
-/// Live pins, pages and dimensions win over the replacement factory's seeds.
-/// The layer host drains and destroys the old surfaces first, then calls this
-/// before mapping fresh surfaces on the replacement output.
+/// A same-output rebuild (a resize) carries live pins, pages and dimensions
+/// over the replacement's seeds. An output change does not: the replacement
+/// keeps whatever its factory restored or defaulted to, so the outgoing
+/// output's live state never leaks into another output's remembered
+/// configuration (per-(output, edge) persistence). Registry seats migrate and
+/// refill slots after reapplying the last accepted declarations. A pending saved
+/// selection is fulfilled as its seat registers. The layer
+/// host drains and destroys the old surfaces first, then calls this before
+/// mapping fresh surfaces on the replacement output.
 pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
-    model.carry_live_state(&world.resource::<ShellRuntime>().model);
+    let old_output = world.resource::<ShellRuntime>().model.output().clone();
+    if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
+        registry.0.migrate_output(&old_output, model.output());
+    }
+    if model.output() == &old_output {
+        model.carry_live_state(&world.resource::<ShellRuntime>().model);
+    }
+    // The holder plane is the compositor's capability, not the output's: a
+    // replacement's factory builds a local model, which must not resume local
+    // conceal timers while the compositor still drives reveal/conceal.
+    let plane = world.resource::<ShellRuntime>().model.holder_plane();
+    let at = model.last_update();
+    // At the model's own last update: cannot be refused as out of order.
+    let _ = model.set_holder_plane(plane, at);
+    if let Some(declarations) = world.get_resource::<ShellPageDeclarations>() {
+        for edge in Edge::ALL {
+            model
+                .carousel_mut(edge)
+                .redeclare(declarations.0[edge.index()].iter().cloned())
+                .expect("accepted shell declarations remain valid");
+        }
+    }
+    if let Some(registry) = world.get_resource::<SubPanelRegistryState>() {
+        registry.0.populate_model(&mut model);
+    }
     let frame = ShellFrame::from_model(&model);
     *world.resource_mut::<ShellRuntime>() = ShellRuntime {
         model,
         clock_text: String::new(),
         clock_deadline: None,
+        page_changes: [PageChange::None; 4],
     };
     world.resource_mut::<ShellFrameState>().0 = frame;
     if let Some(mut modes) = world.get_resource_mut::<QuoinCommittedMotionModes>() {
@@ -102,7 +163,9 @@ pub fn replace_shell_model(world: &mut World, mut model: ShellModel) {
     }
 }
 
-/// Apply an authored page extent without persisting a pointer resize preference.
+/// Set an edge preference without emitting a pointer-resize persistence effect.
+/// Production calls this only through `seed_page_thickness`; direct calls are
+/// used by tests to establish remembered preferences.
 pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
     let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
         return;
@@ -112,6 +175,28 @@ pub fn set_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
         let frame = ShellFrame::from_model(&runtime.model);
         world.resource_mut::<ShellFrameState>().0 = frame;
     }
+}
+
+/// Seed an edge once; restored preferences and earlier mounts take precedence.
+pub fn seed_page_thickness(world: &mut World, edge: Edge, thickness: f32) {
+    if world
+        .get_resource::<ShellRuntime>()
+        .is_some_and(|runtime| !runtime.model.has_remembered_thickness(edge))
+    {
+        set_page_thickness(world, edge, thickness);
+    }
+}
+
+/// Add mounted content without rebuilding declarations; only a pending saved
+/// selection may move the resting page during registration.
+/// A scene may already have been registered by its ingress transaction.
+pub fn register_shell_page(world: &mut World, edge: Edge, name: &str) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    let _ = runtime.model.carousel_mut(edge).register(name);
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
 }
 
 /// Update a dynamic carousel while retaining its active page when possible.
@@ -133,10 +218,104 @@ pub fn set_shell_pages(world: &mut World, edge: Edge, ids: Vec<String>, select: 
     world.resource_mut::<ShellFrameState>().0 = frame;
 }
 
+/// Reapply configuration declarations without rebuilding live carousels.
+/// Validate every edge before mutation; registrations, active names and selection
+/// memory survive. Retain accepted declarations for replacement models in either
+/// host. Returns false if the host has not installed its model yet.
+pub fn redeclare_shell_pages(
+    world: &mut World,
+    declarations: &[Vec<String>; 4],
+) -> Result<bool, crate::core::CarouselError> {
+    for names in declarations {
+        crate::core::Carousel::declared(names.iter().cloned())?;
+    }
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return Ok(false);
+    };
+    for edge in Edge::ALL {
+        runtime
+            .model
+            .carousel_mut(edge)
+            .redeclare(declarations[edge.index()].iter().cloned())?;
+    }
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
+    world.insert_resource(ShellPageDeclarations(declarations.clone()));
+    Ok(true)
+}
+
+/// Remove host content without rebuilding the carousel or selecting its landing.
+/// Owner cleanup may already have removed it; that second removal is a no-op.
+pub fn remove_shell_page(world: &mut World, edge: Edge, name: &str) {
+    let Some(mut runtime) = world.get_resource_mut::<ShellRuntime>() else {
+        return;
+    };
+    if runtime
+        .model
+        .carousel(edge)
+        .page_ids()
+        .iter()
+        .any(|id| id == name)
+    {
+        let _ = runtime.model.carousel_mut(edge).remove(name);
+    }
+    let frame = ShellFrame::from_model(&runtime.model);
+    world.resource_mut::<ShellFrameState>().0 = frame;
+}
+
+/// Drop the sub-panel registry seat for a page a host unmounted, without
+/// touching any carousel (the host unmount drives its own page removal).
+pub fn forget_shell_subpanel(world: &mut World, name: &str) {
+    if let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() {
+        registry.0.forget(name);
+    }
+}
+
+/// Citizen disconnect: remove every sub-panel seat `owner` holds plus its
+/// carousel content in the live model, landing per the carousel's removal
+/// rule, and refresh the frame. Returns the removed seats.
+///
+/// Runs before the scene reconcile that tears the owner's mounted content
+/// down. The later host unmount is idempotent and preserves both the landing
+/// and the remembered selection; it must not rebuild the page list.
+pub fn remove_all_owned_subpanels(world: &mut World, owner: &str) -> Vec<SubPanelSeat> {
+    remove_owned_subpanels_before(world, owner, u64::MAX)
+}
+
+/// Deferred reconciliation must not remove a mount accepted after the absence.
+pub fn remove_owned_subpanels_before(
+    world: &mut World,
+    owner: &str,
+    before: u64,
+) -> Vec<SubPanelSeat> {
+    if !world.contains_resource::<SubPanelRegistryState>()
+        || !world.contains_resource::<ShellRuntime>()
+    {
+        return Vec::new();
+    }
+    let seats = world.resource_scope(|world, mut runtime: Mut<ShellRuntime>| {
+        let Some(mut registry) = world.get_resource_mut::<SubPanelRegistryState>() else {
+            return Vec::new();
+        };
+        registry
+            .0
+            .remove_owned_before(owner, before, &mut runtime.model)
+    });
+    if !seats.is_empty()
+        && let Some(runtime) = world.get_resource::<ShellRuntime>()
+    {
+        let frame = ShellFrame::from_model(&runtime.model);
+        world.resource_mut::<ShellFrameState>().0 = frame;
+    }
+    seats
+}
+
+#[allow(clippy::too_many_arguments)] // a Bevy system: each parameter is one resource
 fn update_model(
     time: Res<Time<Real>>,
     mut commands: MessageReader<ShellCommand>,
     mut runtime: ResMut<ShellRuntime>,
+    mut registry: ResMut<SubPanelRegistryState>,
     mut frame: ResMut<ShellFrameState>,
     mut effects: ResMut<ShellEffects>,
     mut replies: (
@@ -148,7 +327,159 @@ fn update_model(
     let now = time.elapsed();
     effects.0.clear();
     effects.1.clear();
+    runtime.page_changes = [PageChange::None; 4];
     for command in commands.read() {
+        // Sub-panel lifecycle commands address the process-wide registry, so
+        // the seat — not the command's dispatch-time output — is the
+        // authority: an output replaced between dispatch and application
+        // (the embedded host's model swap, a stashed reply drained a frame
+        // later) must not void an acked command at the output gate below.
+        // A register applies to the current model when its reservation
+        // migrated with it (or rolls a stranded reservation back); a remove
+        // lands against the current registry.
+        match &command.kind {
+            ShellCommandKind::SubPanelRegister { edge, name, owner } => {
+                // Dispatch reserved the seat (receipt-stamped) before
+                // acking; fill the carousel only while that reservation
+                // still stands, assessed against the CURRENT model. A
+                // reservation left on an output the model no longer runs
+                // can never fill: roll it back rather than leak a seat no
+                // verb can address again.
+                let (reserved, stranded) = match registry.0.seat(name) {
+                    Some(seat) => (
+                        seat.edge == *edge
+                            && seat.owner == *owner
+                            && seat.output == *runtime.model.output(),
+                        seat.edge == *edge
+                            && seat.owner == *owner
+                            && seat.output == command.output,
+                    ),
+                    None => (false, false),
+                };
+                let before = runtime.model.carousel(*edge).active_index();
+                if reserved {
+                    if let Err(error) = runtime.model.carousel_mut(*edge).register(name) {
+                        bevy::log::warn!("sub-panel register refused at the model: {error}");
+                    }
+                } else if stranded {
+                    bevy::log::warn!(
+                        "sub-panel register for '{name}' stranded on a replaced output; \
+                         rolling back its reservation"
+                    );
+                    registry.0.forget(name);
+                } else {
+                    bevy::log::warn!(
+                        "sub-panel register for '{name}' arrived without its reserved seat"
+                    );
+                }
+                if runtime.model.carousel(*edge).active_index() != before {
+                    effects.1.push(*edge);
+                    // A registration only shifts the resting page (a pending
+                    // restore landing); never a sequential change.
+                    runtime.page_changes[edge.index()] = PageChange::Named;
+                }
+                continue;
+            }
+            ShellCommandKind::SubPanelRemove {
+                edge,
+                name,
+                owner,
+                accepted_at,
+            } => {
+                // The registry owns both halves: the seat and the carousel
+                // page leave together, the selection landing per the
+                // carousel's removal rule (previous, else next, else
+                // primary). Only that exact registration — same owner AND
+                // same acceptance receipt as the one dispatch resolved —
+                // is this command's target: a name re-reserved by a later
+                // load after this seat was dropped is a replacement and
+                // survives, the stale removal dropping silently because
+                // its target is already gone.
+                let exact = registry.0.seat(name).is_some_and(|seat| {
+                    seat.owner == *owner && seat.accepted_at == *accepted_at
+                });
+                if exact {
+                    let before = runtime.model.carousel(*edge).active_index();
+                    let _ = registry.0.remove(name, &mut runtime.model);
+                    if runtime.model.carousel(*edge).active_index() != before {
+                        effects.1.push(*edge);
+                        // Removal lands on a neighbour directly (panel doc §3).
+                        runtime.page_changes[edge.index()] = PageChange::Named;
+                    }
+                }
+                continue;
+            }
+            ShellCommandKind::SubPanelActivate {
+                edge,
+                name,
+                owner,
+                accepted_at,
+                focus,
+            } => {
+                // Addressed like a removal: only that exact registration,
+                // and only on the model that carries its seat — an
+                // activation whose name was removed, replaced or migrated
+                // away since dispatch has nothing to show here. The verb was
+                // acked at dispatch, so that one-frame race answers accepted
+                // and applies nothing (logged below).
+                let exact = registry.0.seat(name).is_some_and(|seat| {
+                    seat.owner == *owner
+                        && seat.accepted_at == *accepted_at
+                        && seat.edge == *edge
+                        && seat.output == *runtime.model.output()
+                });
+                let carousel = runtime.model.carousel_mut(*edge);
+                let before = carousel.active_index();
+                if !exact || !carousel.select_id(name) {
+                    bevy::log::warn!(
+                        "sub-panel activation of '{name}' no longer matches its registration"
+                    );
+                    continue;
+                }
+                if carousel.active_index() != before {
+                    effects.1.push(*edge);
+                }
+                // A named target is a direct jump, never a slide (panel doc
+                // §5) — including onto a page already sliding in.
+                runtime.page_changes[edge.index()] = PageChange::Named;
+                // Hidden: a transient reveal, never a mode change (panel doc
+                // §6); a focusing one is held by a compositor focus hold
+                // until the keyboard lands. Pinned or docked: a page switch,
+                // no mode change. With `focus` the panel then asks for the
+                // keyboard exactly as a focus-cycle stop does (exclusive until
+                // granted, then on-demand; ends when focus leaves, on Escape
+                // or when the grant times out).
+                let at = command.at.clamp(runtime.model.last_update(), now);
+                let before = runtime.model.panel(*edge);
+                // This activation made the reveal (it was not already shown).
+                let revealed = before.mode == PanelMode::Hidden && !before.transient_revealed;
+                if before.mode == PanelMode::Hidden
+                    && let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
+                    && let Some(effect) = update.effect
+                {
+                    effects.0.push(ShellEffect {
+                        edge: *edge,
+                        effect,
+                    });
+                }
+                if *focus {
+                    runtime.model.request_activation_focus(*edge, at, revealed);
+                }
+                continue;
+            }
+            ShellCommandKind::HolderPlane(available) => {
+                let at = command.at.clamp(runtime.model.last_update(), now);
+                if let Ok(updates) = runtime.model.set_holder_plane(*available, at) {
+                    for (edge, update) in Edge::ALL.into_iter().zip(updates) {
+                        if let Some(effect) = update.effect {
+                            effects.0.push(ShellEffect { edge, effect });
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
         if command.output != *runtime.model.output() {
             if let ShellCommandKind::ResizeChecked {
                 edge,
@@ -170,6 +501,12 @@ fn update_model(
         match &command.kind {
             // Scene content is owned by the host adapter; it has no motion effect.
             ShellCommandKind::Scene(_) => {}
+            // Lifecycle and capability commands were applied (and
+            // `continue`d) above the output gate.
+            ShellCommandKind::SubPanelRegister { .. }
+            | ShellCommandKind::SubPanelRemove { .. }
+            | ShellCommandKind::SubPanelActivate { .. }
+            | ShellCommandKind::HolderPlane(_) => {}
             ShellCommandKind::Resize { edge, thickness_px } => {
                 let thickness_px = if thickness_px.is_finite() {
                     thickness_px.min(runtime.model.max_thickness(*edge))
@@ -249,9 +586,23 @@ fn update_model(
                     });
                 }
             }
+            ShellCommandKind::Keyboard(KeyboardCommand::FocusObserved(edge)) => {
+                runtime.model.keyboard_focus_observed(*edge);
+            }
+            ShellCommandKind::Keyboard(KeyboardCommand::CycleFocus) => {
+                runtime.model.cycle_keyboard_focus(at);
+            }
+            ShellCommandKind::Keyboard(KeyboardCommand::Escape) => {
+                if let Ok(updates) = runtime.model.escape(at) {
+                    effects.0.extend(updates.into_iter().filter_map(|(edge, update)| {
+                        update.effect.map(|effect| ShellEffect { edge, effect })
+                    }));
+                }
+            }
             ShellCommandKind::Carousel { edge, input } => {
                 let carousel = runtime.model.carousel_mut(*edge);
                 let before = carousel.active_index();
+                let mut named = false;
                 match input {
                     CarouselInput::Next => {
                         carousel.next_page();
@@ -260,11 +611,22 @@ fn update_model(
                         carousel.previous_page();
                     }
                     CarouselInput::SelectId(id) => {
-                        carousel.select_id(id);
+                        named = carousel.select_id(id);
                     }
                 }
                 if carousel.active_index() != before {
                     effects.1.push(*edge);
+                    // Only chevron paging is sequential (panel doc §5): a
+                    // selection — dots, `page.set`, activate — jumps directly.
+                    runtime.page_changes[edge.index()] = match input {
+                        CarouselInput::Next => PageChange::Sequential { forward: true },
+                        CarouselInput::Previous => PageChange::Sequential { forward: false },
+                        CarouselInput::SelectId(_) => PageChange::Named,
+                    };
+                }
+                // Naming the page already sliding in must also land it now.
+                if named {
+                    runtime.page_changes[edge.index()] = PageChange::Named;
                 }
             }
         }
@@ -277,13 +639,24 @@ fn update_model(
         }
     }
     let mut next_frame = ShellFrame::from_model(&runtime.model);
-    if next_frame.panel(Edge::Bottom).mapped {
+    // Tick only while the built-in clock is on screen: another bottom page
+    // (e.g. a citizen's scene page) hides it, and a hidden clock must not
+    // wake the host every second.
+    let bottom = next_frame.panel(Edge::Bottom);
+    if bottom.mapped && bottom.active_page_id.as_deref() == Some(CLOCK_PAGE_ID) {
         if runtime
             .clock_deadline
             .is_none_or(|deadline| now >= deadline)
         {
-            runtime.clock_text = local_clock_text_at(SystemTime::now());
-            runtime.clock_deadline = Some(now + Duration::from_secs(1));
+            // Sample wall and monotonic together: `now` is the update's start,
+            // and the wall clock read later in the frame would otherwise put
+            // the deadline early by that skew.
+            let (instant, wall) = (std::time::Instant::now(), SystemTime::now());
+            let skew = time
+                .last_update()
+                .map_or(Duration::ZERO, |start| instant.saturating_duration_since(start));
+            runtime.clock_text = local_clock_text_at(wall);
+            runtime.clock_deadline = Some(next_second_boundary(now + skew, wall));
         }
         next_frame.content.bottom_clock_text = Some(runtime.clock_text.clone());
         if let Some(deadline) = runtime.clock_deadline {
@@ -297,7 +670,29 @@ fn update_model(
     } else {
         runtime.clock_deadline = None;
     }
+    for (index, change) in runtime.page_changes.into_iter().enumerate() {
+        next_frame.panels[index].page_change = change;
+    }
     frame.0 = next_frame;
+}
+
+/// The bottom page whose content carries the built-in `QuoinClock`; the
+/// runtime publishes clock text and arms its wake only while it is active.
+pub const CLOCK_PAGE_ID: &str = "launcher";
+
+/// Lands the clock wake just past the second boundary. A wake even slightly
+/// early (runner early-fire, NTP slew) would read the old second, leave the
+/// text unchanged and re-arm a sub-millisecond deadline: 2-3 updates a second.
+const CLOCK_BOUNDARY_MARGIN: Duration = Duration::from_millis(2);
+
+/// Monotonic time just past the next wall-clock second, so the displayed
+/// seconds change on the boundary instead of drifting by one update's
+/// latency. `now` is the monotonic time at which `wall` was sampled.
+fn next_second_boundary(now: Duration, wall: SystemTime) -> Duration {
+    let into = wall
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+    now + Duration::from_nanos(u64::from(1_000_000_000 - into)) + CLOCK_BOUNDARY_MARGIN
 }
 
 fn local_clock_text_at(wall: SystemTime) -> String {
@@ -391,6 +786,61 @@ mod tests {
         );
         assert_eq!(model.panel(Edge::Right).thickness_px, 1.0);
         assert_eq!(model.panel(Edge::Right).exclusive_zone_px, 1.0);
+    }
+
+    #[test]
+    fn chrome_teardown_preserves_removal_landing_and_selection_memory() {
+        use crate::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            mount_page, spawn_quoin_chrome, unmount_page,
+        };
+        let mut app = app();
+        app.add_plugins(QuoinChromePlugin);
+        let world = app.world_mut();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        for edge in Edge::ALL {
+            for name in ["primary", "neighbour", "removed"] {
+                let content = world.spawn_empty().id();
+                assert!(mount_page(world, edge, name, name, content));
+            }
+            // Registration preserves selection; explicitly visit the page whose
+            // removal must land on its neighbour and reset memory to primary.
+            assert!(
+                world
+                    .resource_mut::<ShellRuntime>()
+                    .model
+                    .carousel_mut(edge)
+                    .select_id("removed")
+            );
+            // Owner cleanup lands first; actual chrome teardown must neither
+            // resurrect removed pages nor remember the landing as a selection.
+            remove_shell_page(world, edge, "removed");
+            unmount_page(world, edge, "removed");
+            let mut runtime = world.resource_mut::<ShellRuntime>();
+            let carousel = runtime.model.carousel(edge);
+            assert_eq!(carousel.page_ids(), ["primary", "neighbour"]);
+            assert_eq!(carousel.active_id(), Some("neighbour"));
+            assert_eq!(carousel.last_selected(), Some("primary"));
+            runtime
+                .model
+                .panel_input(edge, Duration::ZERO, PanelInput::Reveal)
+                .unwrap();
+            assert_eq!(runtime.model.carousel(edge).active_id(), Some("primary"));
+        }
     }
 
     #[test]
@@ -489,6 +939,55 @@ mod tests {
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)));
         app
+    }
+
+    #[test]
+    fn clock_ticks_only_while_its_page_is_shown() {
+        let mut app = app();
+        app.world_mut()
+            .resource_mut::<ShellRuntime>()
+            .model
+            .panel_input(Edge::Bottom, Duration::ZERO, PanelInput::Dock)
+            .unwrap();
+        let pages = vec![CLOCK_PAGE_ID.to_owned(), "scene-panel".to_owned()];
+        set_shell_pages(app.world_mut(), Edge::Bottom, pages.clone(), Some("scene-panel"));
+        app.update();
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert!(frame.panel(Edge::Bottom).mapped);
+        assert_eq!(frame.content.bottom_clock_text, None);
+        assert_eq!(
+            app.world().resource::<ShellRuntime>().clock_deadline,
+            None,
+            "a hidden clock arms no wake"
+        );
+        set_shell_pages(app.world_mut(), Edge::Bottom, pages, Some(CLOCK_PAGE_ID));
+        app.update();
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert!(frame.content.bottom_clock_text.is_some());
+        let deadline = app.world().resource::<ShellRuntime>().clock_deadline.unwrap();
+        assert!(frame.wake_deadline.is_some_and(|wake| wake <= deadline));
+    }
+
+    #[test]
+    fn clock_wakes_on_the_next_wall_second() {
+        let now = Duration::from_secs(40);
+        let wall = std::time::UNIX_EPOCH + Duration::from_millis(5_250);
+        let margin = Duration::from_millis(2);
+        assert_eq!(
+            next_second_boundary(now, wall),
+            now + Duration::from_millis(750) + margin
+        );
+        let exact = std::time::UNIX_EPOCH + Duration::from_secs(6);
+        assert_eq!(
+            next_second_boundary(now, exact),
+            now + Duration::from_secs(1) + margin
+        );
+        // A wake exactly on the deadline reads the NEW second.
+        let woke = wall + (next_second_boundary(now, wall) - now);
+        assert_eq!(
+            woke.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            6
+        );
     }
 
     #[test]
@@ -637,9 +1136,22 @@ mod tests {
         );
     }
 
+    /// The live state a same-output rebuild must preserve: pins, pages and
+    /// dimensions carry over the replacement factory's seeds.
     #[test]
-    fn output_migration_carries_live_pin_page_and_thickness() {
+    fn same_output_replacement_carries_live_pin_page_and_thickness() {
         let mut app = app();
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "places",
+                OutputKey::new("DP-1").unwrap(),
+                Edge::Left,
+                "owner",
+                7,
+            )
+            .unwrap();
         {
             let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
             runtime.model.restore_thickness(Edge::Left, 137.0).unwrap();
@@ -653,6 +1165,58 @@ mod tests {
                 .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Dock)
                 .unwrap();
         }
+        let replacement = ShellModel::new(
+            OutputKey::new("DP-1").unwrap(),
+            LogicalSize::new(1920.0, 1080.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        replace_shell_model(app.world_mut(), replacement);
+        let frame = &app.world().resource::<ShellFrameState>().0;
+        assert_eq!(frame.geometry.output.as_str(), "DP-1");
+        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
+        assert_eq!(frame.panel(Edge::Left).thickness_px, 137.0);
+        assert_eq!(
+            frame.panel(Edge::Left).active_page_id.as_deref(),
+            Some("places")
+        );
+        assert_eq!(frame.panel(Edge::Right).mode, PanelMode::Hidden);
+    }
+
+    /// An output change keeps the replacement's own restored/default state:
+    /// the outgoing output's live pins, selection and dimensions are per-output
+    /// remembered state and must not follow the switch.
+    #[test]
+    fn output_change_keeps_replacement_state_not_live_state() {
+        let mut app = app();
+        app.world_mut()
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount(
+                "places",
+                OutputKey::new("DP-1").unwrap(),
+                Edge::Left,
+                "owner",
+                7,
+            )
+            .unwrap();
+        {
+            let mut runtime = app.world_mut().resource_mut::<ShellRuntime>();
+            runtime.model.restore_thickness(Edge::Left, 137.0).unwrap();
+            runtime.model.set_carousel(
+                Edge::Left,
+                crate::core::Carousel::new(["nav", "places"]).unwrap(),
+            );
+            runtime.model.carousel_mut(Edge::Left).select_id("places");
+            runtime
+                .model
+                .panel_input(Edge::Left, Duration::ZERO, crate::core::PanelInput::Dock)
+                .unwrap();
+        }
+        // The replacement carries HDMI-A-1's own remembered seeds, as both
+        // hosts' model factories produce for a restored output.
         let mut replacement = ShellModel::new(
             OutputKey::new("HDMI-A-1").unwrap(),
             LogicalSize::new(1920.0, 1080.0).unwrap(),
@@ -661,17 +1225,132 @@ mod tests {
             Duration::from_millis(200),
         )
         .unwrap();
-        replacement.start_intro(Duration::from_secs(2));
+        replacement.set_carousel(
+            Edge::Left,
+            crate::core::Carousel::new(["nav", "places"]).unwrap(),
+        );
+        replacement.restore_thickness(Edge::Left, 88.0).unwrap();
         replace_shell_model(app.world_mut(), replacement);
         let frame = &app.world().resource::<ShellFrameState>().0;
         assert_eq!(frame.geometry.output.as_str(), "HDMI-A-1");
-        assert_eq!(frame.panel(Edge::Left).mode, PanelMode::Docked);
-        assert_eq!(frame.panel(Edge::Left).thickness_px, 137.0);
         assert_eq!(
+            frame.panel(Edge::Left).mode,
+            PanelMode::Hidden,
+            "DP-1's live dock must not follow the output change"
+        );
+        assert_eq!(
+            frame.panel(Edge::Left).thickness_px, 88.0,
+            "DP-1's live thickness must not follow the output change"
+        );
+        assert_ne!(
             frame.panel(Edge::Left).active_page_id.as_deref(),
-            Some("places")
+            Some("places"),
+            "DP-1's live page must not follow the output change"
         );
         assert_eq!(frame.panel(Edge::Right).mode, PanelMode::Hidden);
+        // Registry seats follow the output (chunk 5) even though live panel
+        // state does not (chunk 7).
+        let registry = &app.world().resource::<SubPanelRegistryState>().0;
+        let seat = registry.seat("places").unwrap();
+        assert_eq!(seat.output.as_str(), "HDMI-A-1");
+        assert_eq!(seat.accepted_at, 7);
+    }
+
+    #[test]
+    fn replacement_reapplies_accepted_declarations_before_migrated_seats() {
+        let mut app = app();
+        let world = app.world_mut();
+        for (name, receipt) in [("verb-only", 1), ("scene-mounted", 2)] {
+            world
+                .resource_mut::<SubPanelRegistryState>()
+                .0
+                .mount(
+                    name,
+                    OutputKey::new("DP-1").unwrap(),
+                    Edge::Left,
+                    "owner",
+                    receipt,
+                )
+                .unwrap();
+            register_shell_page(world, Edge::Left, name);
+        }
+        world
+            .resource_mut::<ShellRuntime>()
+            .model
+            .carousel_mut(Edge::Left)
+            .activate("scene-mounted")
+            .unwrap();
+        let mut replacement = ShellModel::new(
+            OutputKey::new("HDMI-A-1").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        let mut declarations = std::array::from_fn(|_| Vec::new());
+        declarations[Edge::Left.index()] = vec!["scene-mounted".into(), "verb-only".into()];
+        redeclare_shell_pages(world, &declarations).unwrap();
+        replacement.restore_thickness(Edge::Left, 88.0).unwrap();
+        replace_shell_model(world, replacement);
+        let runtime = world.resource::<ShellRuntime>();
+        let carousel = runtime.model.carousel(Edge::Left);
+        assert_eq!(carousel.page_ids(), ["scene-mounted", "verb-only"]);
+        assert_eq!(carousel.last_selected(), None);
+        assert_eq!(runtime.model.panel(Edge::Left).thickness_px, 88.0);
+        for name in ["scene-mounted", "verb-only"] {
+            assert_eq!(
+                world
+                    .resource::<SubPanelRegistryState>()
+                    .0
+                    .seat(name)
+                    .unwrap()
+                    .output
+                    .as_str(),
+                "HDMI-A-1"
+            );
+        }
+        let frame = &world.resource::<ShellFrameState>().0;
+        assert_eq!(
+            frame.panel(Edge::Left).page_ids.as_ref(),
+            ["scene-mounted", "verb-only"]
+        );
+        assert!(!frame.panel(Edge::Left).mapped);
+    }
+
+    #[test]
+    fn scene_seed_respects_resize_and_same_output_replacement() {
+        let mut app = app();
+        let world = app.world_mut();
+        {
+            let mut runtime = world.resource_mut::<ShellRuntime>();
+            runtime
+                .model
+                .set_geometry(LogicalSize::new(1200.0, 900.0).unwrap());
+            assert!(!runtime.model.has_remembered_thickness(Edge::Left));
+            runtime.model.resize_thickness(Edge::Left, 230.0).unwrap();
+        }
+        seed_page_thickness(world, Edge::Left, 310.0);
+        let replacement = ShellModel::new(
+            OutputKey::new("DP-1").unwrap(),
+            LogicalSize::new(1000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(800),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        replace_shell_model(world, replacement);
+        seed_page_thickness(world, Edge::Left, 320.0);
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(Edge::Left).thickness_px,
+            230.0
+        );
+        // An untouched edge can still receive its first authored extent.
+        seed_page_thickness(world, Edge::Right, 240.0);
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(Edge::Right).thickness_px,
+            240.0
+        );
     }
 
     #[test]

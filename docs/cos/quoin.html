@@ -482,7 +482,10 @@ launches need to run under a separate desktop user.</p>
 <p><code>cosmix-quoin</code> is the Cosmix desktop furniture shell. It owns four independent
 <code>zwlr_layer_surface_v1</code> panels — left, bottom, right and top — and renders the
 existing Quoin chrome into one explicit Bevy window target per surface. The
-installable application id and layer namespace are <code>dev.cosmix.quoin</code>.</p>
+installable application id is <code>dev.cosmix.quoin</code>, and every layer namespace
+starts with it: each panel layer is <code>dev.cosmix.quoin.panel.&lt;unique&gt;</code> and the
+corner menu <code>dev.cosmix.quoin-corner-menu.&lt;unique&gt;</code> (see
+<a href="/cos/quoin#holder-control-plane">holder control plane</a>).</p>
 <p>Quoin presents real layer-shell buffers through <code>cosmix-shell-host</code>,
 <code>cosmix-shell</code> and SCTK. See <a href="/VERSIONS">component versions</a> for the
 current source versions. <code>cosmix-quoin-demo</code> remains a
@@ -491,6 +494,23 @@ layer-shell client.</p>
 <p><code>QUOIN_BUS_READY service=NAME</code> reports the configured Bus identity (including
 <code>--bus-service</code> overrides). It records the first connected event consumed by
 the shell service, not successful presentation or continued event-loop progress.</p>
+<h2 id="core-carousel-registry">Core carousel registry</h2>
+<p>The host-neutral <code>cosmix-shell</code> carousel keeps config-declared names in order
+and appends undeclared registrations to the tail. Empty declared slots are
+skipped when paging or choosing a default page. Registration preserves the
+page currently shown; activation selects and remembers a registered name.</p>
+<p>Removing the shown page immediately selects its previous live neighbour,
+otherwise its next. Removing the remembered selection resets that memory to
+the primary. On the next reveal from hidden, <code>ShellModel</code> restores the remembered
+name or defaults to the primary, skipping empty slots. Repeated reveals while
+already visible retain the shown page, including a removal's neighbour landing.</p>
+<p><code>ShellModel::declare_carousel</code> reconciles declarations by name. Registered
+content, current selection and remembered selection survive reordering. A tail
+name promoted into config keeps its content in its new declared position.
+Live names omitted from config follow the new declarations in their previous
+relative order, preserving the order of remaining tail entries; omitted empty
+slots disappear. Invalid declarations leave the registry unchanged. These are
+core API contracts; scene mount and Bus lifecycle integration are separate.</p>
 <h2 id="output-and-scale">Output and scale</h2>
 <p>Version 1 owns exactly one output runtime. <code>--output NAME</code> selects the exact
 complete SCTK <code>wl_output</code> advertising that name. A missing name is an error
@@ -539,7 +559,11 @@ transiently revealed hidden panels and mapped-concealing panels use <code>Overla
 reserve zero and slide with their edge protocol margin. Pinning a transient
 reveal changes neither layer nor reservation. Docking from hidden claims the full zone at
 fraction zero while chrome supplies the only visual translation. Keyboard
-policy maps only to <code>None</code> or <code>OnDemand</code>; Quoin never requests <code>Exclusive</code>.
+policy is <code>OnDemand</code> for a mapped panel and <code>None</code> otherwise. Two keyboard
+actions change it (see Keyboard below): the focus cycle and a named activation
+request <code>Exclusive</code> on the one panel they move focus into, until the keyboard
+lands there (then <code>OnDemand</code> again), and handing focus back sets every panel
+to <code>None</code> until no panel holds the keyboard.
 Chrome selects its translation owner from the last successfully committed
 protocol mode, not the model's next desired mode. The host advances that latch
 only after a commit, or after completed role destruction for unmap, so docking
@@ -552,29 +576,72 @@ intent without a new commit. This never bypasses an outstanding configure.</p>
 without changing its mode. Only transient visibility auto-hides. An idle hidden
 panel is unmapped; during concealment it stays mapped until its slide finishes.
 Hide, Escape and ordinary visibility toggle do not release either persistent
-mode. Core <code>PinToggle</code> and <code>DockToggle</code> select their respective mode, or release
-it to hidden with transient grace if already selected. <code>SetMode(Hidden)</code> instead
-conceals directly. The Rust model exposes <code>set_mode(edge, at, mode)</code>; new
+mode. Core <code>PinToggle</code> and <code>DockToggle</code> select their respective mode.
+<code>PinToggle</code> from pinned releases into transient visibility with normal conceal
+rules. <code>Undock</code> or <code>DockToggle</code> from docked keeps a transient reveal while held,
+following the normal conceal rules once the holds end. Holders today are the
+pointer in the hotspot or panel, or an active resize. With no holder, a deliberate
+undock hides at once: conceal animation starts immediately, without grace.
+<code>SetMode(Hidden)</code> conceals directly regardless of holds. The Rust model exposes
+<code>set_mode(edge, at, mode)</code>; new
 compositor corner-event discrimination is a separate integration.</p>
+<p>Those holder rules are the model's <strong>local</strong> driver, used by the dev host and
+whenever the compositor does not report its holder plane. While it does, the
+model is <strong>command-driven</strong> (<code>ShellModel::set_holder_plane</code>, applied through
+<code>ShellCommandKind::HolderPlane</code>): the compositor owns the pointer, focus and
+popup holders and the 800 ms conceal delay, and its commands arrive as
+<code>PanelInput::HolderReveal</code> (some holder holds the edge) and
+<code>PanelInput::HolderConceal</code> (the last one released, its delay already served).
+Corner and pointer membership then only record state — they neither reveal nor
+arm grace, and no grace deadline is ever armed. A conceal waits only for a
+local hold to end: an open corner menu, a resize, the startup intro, or an
+explicit <code>show</code>/<code>toggle</code>, which a repeated verdict does not end but a release
+after a hold (the pointer came and went) does. A deliberate hide from a
+persistent mode (<code>SetMode(Hidden)</code>, an unheld undock) latches against the
+compositor's verdict on the hidden report until it next reports the holders
+released, so a still-open menu cannot reopen the panel it just hid. Hide,
+Escape and toggle-off latch the same way while the compositor holds the edge,
+because a replayed hidden report (a registry receipt, a gap) restates its
+reveal, and also while the local membership shows the pointer inside before
+comp has said so; that membership-only latch ends when the pointer leaves. A
+held unpin or undock keeps its reveal until that verdict, or for at most the
+800 ms grace: with no verdict by then it counts as unheld and conceals. Every mode
+change re-sends the edge's report even when it nets to the one comp last
+acknowledged (a pin and unpin in one pass, or both inside a retry backoff), so
+that verdict always comes. Going command-driven drops
+any local grace deadline, concealing at once a reveal the local membership no
+longer holds; going back to local rules gives an unheld reveal its full grace
+from the moment of the change. A
+model replacement keeps the current driver.</p>
 <h2 id="event-driven-wake-contract">Event-driven wake contract</h2>
 <p>There is no fixed rendering tick or animation sleep. The calloop runner
 coalesces work into one <code>app.update()</code> demand. <code>Idle</code> removes the model timer
 and blocks on the Wayland file descriptor when no configure or frame request
 is outstanding. <code>WakeAt</code> owns one replaceable absolute calloop timer.
 <code>Animate</code> advances only from <code>wl_surface.frame</code> callbacks, with at most one
-outstanding callback per mapped animating panel. The visible bottom clock's
-one-second deadline is content work and disappears when that panel is
-unmapped. Callbacks are generation-tagged, so late or expired callbacks are
+outstanding callback per mapped animating panel. The bottom clock's deadline
+is content work, armed for the next wall-clock second only while the bottom
+panel is mapped with its clock-bearing <code>launcher</code> page active; any other
+bottom page (a citizen's scene page, for instance) or an unmapped panel arms
+none. Unchanged clock text is not rewritten. Callbacks are generation-tagged, so late or expired callbacks are
 ignored (the tag is a saturating 64-bit counter: reuse would need 2^64
 requests, which no process lifetime reaches).</p>
 <p>The clock follows the system timezone, or the process <code>TZ</code> override, and shows
 local time with an explicit numeric UTC offset. Persist timezone preferences
 through the operating system's timezone configuration; Quoin reuses that
 configuration on subsequent launches.</p>
-<p>Background preference reconciliation shares this deadline mechanism. It
-requests a fresh wallpaper snapshot once per second, including while panels
-are hidden, and also responds to Bus invalidations. Unchanged values do not
-rewrite widget text.</p>
+<p>Background preference reconciliation shares this deadline mechanism and
+never polls while its page is hidden. Quoin reads the wallpaper snapshot once
+per connection, again after each write, and again whenever the System page is
+opened; while that page is visible it re-reads on a <code>wallpaper.props.changed</code>
+(or <code>bg-showcase.props.changed</code>) invalidation, on a delivery gap in Quoin's own
+Bus queue, and as a backstop 30 s after its last good read. While the page is
+hidden an invalidation only marks the snapshot stale. The backstop exists
+because noded drops a notification silently when a subscriber's queue is full,
+and the last notice of a burst has no successor to reveal the loss: a visible
+page can therefore show stale values until the next change, the 30 s backstop,
+or a reopen. A failed read retries only while the page is visible, backing off
+from 2 s to at most 30 s. Unchanged values do not rewrite widget text.</p>
 <p>Keyboard repeat shares this wake layer. The active key owns one replaceable
 absolute deadline; a due wake emits one coalesced repeat and arms the next
 deadline from the actual wake time. There is no per-key thread, catch-up burst,
@@ -615,15 +682,17 @@ the patterns below.</p>
 plane is <code>shell-sub</code>. <code>shell.ping</code> and <code>shell.info</code> provide presence and
 discovery. Live panel state is read through the uniform
 <code>shell.props.{get,list,describe}</code> surface under
-<code>panels.&lt;edge&gt;.{visible,pinned,width_px,page,pages,output}</code>.</p>
-<p><code>pinned</code> is a read-compatibility shim: true for either persistent <code>Pinned</code> or
-<code>Docked</code>, false for <code>Hidden</code> even while transiently revealed. It is not a precise
-mode signal. Existing Bus <code>pin</code> retains its reserving behaviour (<code>Docked</code>),
-including the corner-addressed alias. Existing Bus <code>unpin</code> releases either
-persistent mode into transient grace; follow it with <code>hide</code> to conceal.
-No new mode property or Bus verb is introduced here. Taskbar, popup and capture
-callers retain their existing verb mapping pending the separate caller update.</p>
-<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin}</code>,
+<code>panels.&lt;edge&gt;.{visible,pinned,mode,width_px,page,pages,output}</code>.</p>
+<p><code>mode</code> is the precise mode signal: <code>hidden</code>, <code>pinned</code> (a persistent overlay
+that reserves no space) or <code>docked</code> (reserves its full thickness), independent
+of transient visibility. <code>pinned</code> is a read-compatibility shim: true for either
+persistent <code>Pinned</code> or <code>Docked</code>, false for <code>Hidden</code> even while transiently
+revealed. Existing Bus <code>pin</code> retains its reserving behaviour (<code>Docked</code>),
+including the corner-addressed alias, and existing Bus <code>unpin</code> releases either
+persistent mode into transient grace; follow it with <code>hide</code> to conceal. The
+legacy pair is deliberately unchanged; the corner menu, keyboard bindings and
+citizens that need to drive a mode explicitly use the precise verbs below.</p>
+<p>The semantic verbs are <code>shell.panel.{show,hide,toggle,pin,unpin,dock,mode}</code>,
 <code>shell.panel.page.{next,prev,set}</code> and <code>shell.quit</code>. They require a broker-stamped local,
 registered caller and are translated to the same <code>ShellCommand</code> ingress used
 by Quoin's controls. Replies acknowledge validation and enqueueing, not disk
@@ -631,6 +700,65 @@ persistence. <code>shell.quit</code> and the right Monitoring page's Quit Quoin 
 request a successful Bevy exit through the normal render and surface drain
 (<code>QUOIN_LAYER_HOST_EXIT reason=bevy-app-exit</code>). <code>shell.panel.resize</code> accepts
 <code>edge</code> and <code>thickness_px</code> in the supported 120–500 range.</p>
+<p><code>shell.panel.dock</code> takes <code>edge</code> and enters <code>Docked</code> from any current mode —
+the explicit docking route, since docking reflows the workspace and is never
+a side effect of another verb. <code>shell.panel.mode</code> takes <code>edge</code> and
+<code>mode=hidden|pinned|docked</code> and sets that persistent mode exactly: unlike the
+legacy verbs it never leaves a transient reveal behind, and <code>mode=hidden</code>
+conceals at once with no grace delay, because it is a deliberate action. Read
+back <code>shell.props.get path="panels.&lt;edge&gt;.mode"</code> to verify the applied mode.</p>
+<p>Sub-panels are addressed by their stable name, unique across every edge and
+output. <code>shell.sub.register</code> takes <code>edge</code> and <code>name</code> (the owner is the
+broker-attested caller) and fills a carousel slot without revealing or
+selecting it; <code>shell.sub.remove</code> takes <code>name</code> and lands per the removal rule.</p>
+<p><code>shell.sub.activate</code> takes <code>name</code> and an optional <code>focus</code> (<code>true</code> or <code>false</code>,
+a JSON boolean or the string; default <code>true</code>) and reveals, shows and focuses
+that sub-panel (panel design §6). The carousel jumps to the page (no slide);
+activation never changes the persisted mode.</p>
+<ul>
+<li><strong>Hidden edge, <code>focus=true</code>:</strong> a transient reveal, and the panel asks for
+the keyboard exactly as a focus-cycle stop does — its layer requests
+exclusive keyboard interactivity until comp grants it, then drops back to
+on-demand. Until the keyboard lands Quoin holds the reveal with a <code>focus</code>
+hold on the panel's layer; once it lands Quoin releases that hold and comp's
+own focus holder keeps the panel. It ends when focus leaves the panel —
+including a click elsewhere, which works as soon as the keyboard has landed
+— on Escape, at the next focus-cycle stop, or on a hide, a corner action or
+a mode change. If comp never grants the keyboard (a session lock, a higher
+exclusive layer) the request lapses after 500 ms and the reveal it made
+ends with it (its hold is released and the panel hides): an open panel
+without the keyboard is one Escape cannot reach, since Escape goes to the
+application. An edge that was already showing when activated is left as
+it was.</li>
+<li><strong>Pinned or docked edge, <code>focus=true</code>:</strong> the page switch, then the same
+keyboard request (and the same exits); the panel keeps the page when focus
+leaves.</li>
+<li><strong><code>focus=false</code>:</strong> the reveal or page switch alone — no keyboard request and
+no focus hold — for a caller that wants attention without taking the
+keyboard (a notification). A hidden edge's reveal then behaves like
+<code>shell.panel.show</code>: it stays until the pointer has come and gone or the
+panel is hidden.</li>
+</ul>
+<p>The reply is
+<code>{"accepted":true,"name":…,"edge":…,"output":…,"target":…,"focus":…}</code>:
+<code>output</code> is where the sub-panel lives, and <code>target</code> the output the user is at
+(the focused surface's, else the pointer's, as comp last reported them; <code>null</code>
+when unknown). The pointer's output is refreshed only when keyboard focus
+changes (or Quoin reconnects), so after the pointer alone crosses to another
+output it can be stale. This Quoin runs one output, so <code>target</code> is reported
+only: the sub-panel still shows on its own output. <code>accepted</code> is an
+acceptance, not an application receipt: a name removed or replaced in the same
+frame, after the reply, applies nothing (Quoin logs it). Refusals: an
+unregistered name is refused exactly like <code>sub.remove</code>
+(<code>sub-panel name 'NAME' is not registered</code>) — activation never creates; a
+<code>focus</code> that is not a boolean is <code>focus must be true or false</code>. While the
+compositor does not report its holder plane (below) nothing could hold the
+reveal, so the verb is refused rather than shown and left to vanish:
+<code>{"error_code":"ACTIVATION_UNAVAILABLE","error":"named activation unavailable: compositor holder plane not available","reason":"compositor holder plane not available","name":…}</code>.
+That is the answer from a comp without the plane — every build before the one
+that turns <code>input.corners.holders</code> true (restart C) — and from the embedded
+host, which has no holder client; callers get the error, never a silent no-op.
+When the leaf turns true Quoin re-reads it and the next activation is accepted.</p>
 <p>Quoin 0.10.1 also accepts <code>shell.corner.{show,hide,toggle,pin,unpin}</code> with a
 <code>corner</code> argument. These use the same panel state machine and caller checks:</p>
 <table><thead><tr><th>Corner</th><th>Controlled panel</th></tr></thead><tbody>
@@ -645,6 +773,24 @@ request a successful Bevy exit through the normal render and surface drain
 These are semantic commands; they do not move the pointer or fabricate
 compositor corner-observation notifications. Read back
 <code>shell.props.get path="panels.left.visible"</code> to verify the applied state.</p>
+<p>The Settings/Appearance panel's own controls come back as
+<code>shell.settings.{scheme,motion,size}</code> (also listed by <code>shell.info</code>).
+<code>shell.settings.scheme</code> takes <code>name</code> (a known scheme such as <code>forest</code>) and
+applies the theme live through the same path as the chrome scheme dots,
+persisting it for the next launch. <code>shell.settings.motion</code> takes
+<code>motion slide|fade</code>: <code>slide</code> is accepted and written to the <code>carousel_motion</code>
+field of the data-only <code>conf.mix</code>; <code>fade</code> is refused with
+<code>MOTION_FADE_UNAVAILABLE</code> until the scene renderer can stack sibling
+documents in one rectangle, and a <code>fade</code> authored directly in <code>conf.mix</code>
+ingests but renders as slide (a <code>QUOIN_CONFIG</code> line says so at ingest, and
+the panel's marks follow the ingested value). A motion write re-encodes the
+whole <code>conf.mix</code>: other authored values are preserved, but comments and
+formatting are not. <code>shell.settings.size</code> takes <code>edge</code> and <code>delta_px</code> and
+enqueues the same resize commit an edge-drag completion produces, clamped to
+the supported thickness range and the output budget. Like the scene and
+sub-panel verbs, settings verbs from a stale Quoin connection are refused.
+Read back <code>shell.props.get path="panels.&lt;edge&gt;.width_px"</code> to verify a size
+change.</p>
 <p><code>shell.debug.status</code> exposes process-lifetime request/rejection counts,
 accepted mutation counts, maximum dispatch time in microseconds, pending reply
 count and connection state. It excludes model application, transport delay and
@@ -687,35 +833,75 @@ Process feedback wakes the UI without periodic polling. The default child
 inherits Quoin's environment and service lifetime.</p>
 <p>Quoin loads strict-data <code>$COSMIX_VAR/quoin.state.mix</code> before constructing its
 initial model, using the shared path resolver (including its XDG fallback).
-The v2 root contains exactly six fields: <code>version: 2</code>, <code>scheme</code>, and <code>left</code>,
-<code>bottom</code>, <code>right</code>, <code>top</code>. Each edge has exactly <code>thickness_px</code>, <code>mode</code> and <code>page</code>:</p>
+The v3 root contains exactly three fields: <code>version: 3</code>, <code>scheme</code>, and
+<code>outputs</code> — a map from an output identity to that output's four edges. Each
+output entry has exactly <code>left</code>, <code>bottom</code>, <code>right</code> and <code>top</code>; each edge has
+exactly <code>thickness_px</code>, <code>mode</code> and <code>page</code>:</p>
 <pre><code class="language-text">{
-  version: 2,
+  version: 3,
   scheme: "builtin",
-  left:   {thickness_px: 240, mode: "hidden", page: "nav"},
-  bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
-  right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
-  top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+  outputs: {
+    "connector:DP-1": {
+      left:   {thickness_px: 240, mode: "hidden", page: "nav"},
+      bottom: {thickness_px: 60,  mode: "docked", page: "tasks"},
+      right:  {thickness_px: 240, mode: "pinned", page: "monitor"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+    },
+    "connector:HDMI-1": {
+      left:   {thickness_px: 200, mode: "docked", page: "places"},
+      bottom: {thickness_px: 60,  mode: "hidden", page: "tasks"},
+      right:  {thickness_px: 240, mode: "hidden", page: "monitor"},
+      top:    {thickness_px: 32,  mode: "hidden", page: "status"}
+    }
+  }
 }
 </code></pre>
+<p>An output's key in the <code>outputs</code> map is its persistent identity, not its
+geometry: today <code>connector:&lt;name&gt;</code>, where <code>&lt;name&gt;</code> is the connector name comp
+reports for the output — the <code>outputs</code> props row name the layer host's
+<code>OutputKey</code> mirrors. comp cannot yet supply EDID make/model/serial, so no
+EDID-based identity tier exists; keys are opaque non-empty strings, so an
+<code>edid:</code> tier can be added when comp grows EDID fields without another format
+version. Real identities always carry a prefix, which keeps them clear of the
+reserved <code>default</code> entry that legacy files migrate to. Only connector names
+are persistent identities: an output the compositor has not named (the layer
+host's <code>wl-output-&lt;id&gt;</code> fallback, the embedded host's pre-observation
+placeholder) restores nothing, claims nothing and is never persisted —
+protocol ids are reassigned across sessions and must not anchor state.</p>
 <p>Modes are the strings <code>hidden</code>, <code>pinned</code> or <code>docked</code>. Thickness must be finite
-and positive; unknown page IDs use the edge's default page. The strict legacy
-five-field root (no version) with three-field edges containing <code>pinned</code> booleans
-is migrated in memory: true becomes <code>docked</code>, false becomes <code>hidden</code>, preserving
-thickness, page and scheme. Only successfully parsed legacy files migrate.
-The next normal persistent mutation writes v2; loading and transient visibility
-do not rewrite the file. Missing or invalid files use hidden defaults with one
-diagnostic line and no startup write. As before, a later normal mutation may
-overwrite a corrupt file; write inhibition is a separate outstanding issue.</p>
+and positive; unknown page IDs use the edge's default page. On restore, an
+output with an entry under its own identity reuses it as-is. The strict
+legacy five-field root (no version) with three-field edges containing
+<code>pinned</code> booleans is migrated in memory — true becomes <code>docked</code>, false
+becomes <code>hidden</code>, preserving thickness, page and scheme — as is a v2 root
+(<code>version: 2</code> with the four edges at the top level). Both park their single
+edge set under the reserved <code>default</code> output entry, and the first output to
+restore claims it, re-filing the entry under its own identity; a different,
+later output gets the default config instead. Only successfully parsed
+legacy files migrate, and an output with no matching entry (and no unclaimed
+<code>default</code>) restores nothing: it keeps the default config and gains no entry
+until its first save. The next normal persistent mutation writes v3,
+rewriting only the current output's entry — other outputs' remembered state
+stays for reconnection. Loading and transient visibility do not rewrite the
+file. A missing file is a first run: hidden defaults, one diagnostic line,
+and persistence stays enabled so the first accepted mutation creates the
+file. A file that exists but cannot be parsed (or read) also uses hidden
+defaults with one diagnostic line, and disables persistence for the whole
+session: a later mutation must not overwrite a file this Quoin never
+successfully read. Fixing or removing the file restores persistence on the
+next launch.</p>
 <p>Accepted mode, page, scheme and completed resize changes save state after the Model stage,
-using a temporary file and atomic rename. Output migration carries live
-mode, page and thickness state; it never reloads disk state. Both smoke modes
-skip restore, saving and the intro pulse.</p>
+using a temporary file and atomic rename. A same-output rebuild carries live
+mode, page and thickness state; an output change keeps the replacement's
+restored or default state, so live state never crosses outputs. Both smoke
+modes skip restore, saving and the intro pulse.</p>
 <p>A normal cold start transiently reveals hidden panels for two seconds, then releases
 a temporary startup hold into normal 800 ms grace. This discovery pulse is
 an explicit exception to compositor-only corner reveal. Real corner and
 pointer membership remain independent and can keep panels revealed after
-the pulse expires. Restored pins and docks keep their persistent modes.</p>
+the pulse expires. Restored pins and docks keep their persistent modes. When the
+model is command-driven the pulse ends without grace: the panel conceals at
+once unless comp reports a holder.</p>
 <p><code>setup.mix --desktop</code> installs <code>dev.cosmix.quoin.desktop</code> into the user's XDG
 applications directory, pointing at the installed checkout binary. Quit
 completes the existing render/surface drain; the launcher adds no settle sleep.</p>
@@ -731,36 +917,187 @@ names missing charge or state explicitly; a full reading renders only the
 supplied percentage, state, time, rate and health fields. Missing values are
 never rendered as zero.</p>
 <h2 id="interaction-boundary">Interaction boundary</h2>
+<h3 id="holder-control-plane">Holder control plane</h3>
+<p>The standalone host reads the selected comp's read-only
+<code>input.corners.holders</code> capability (<code>comp.props.get</code>) before sending
+<code>comp.panel.mode</code> or <code>comp.panel.hold</code>; like every comp verb these are literal
+commands addressed to the <code>--comp-service</code> instance. Missing, false or failed
+reads leave the plane inactive and the model keeps its local rules. A comp
+that reports <code>true</code> also enforces concealment on a stalled Quoin (below), so
+the plane goes live with that comp build. Mode reports carry the Bus
+connection <code>generation</code> only once the leaf has read <code>true</code>: that comp is the
+one that knows the field. The deploy order is Quoin first (restart B), then
+comp (restart C); a comp with the holder verbs but without enforcement (the
+chunk 13/14 builds) was never shipped, and an older comp answers the leaf
+read with an unknown path, which keeps the plane off.
+Reconnects, comp arriving or leaving, delivery gaps (comp's gap frames and
+client-side inbound drops) and a change to the leaf close the gate, re-read it
+and replay the desired state. A registry receipt that finds comp still present
+keeps the gate open and re-reads and replays in the background, since comp may
+have re-registered in between. Actual mode reports precede popup acquisitions
+from the corner-menu call sites. A focusing activation of a hidden edge
+acquires a <code>focus</code> hold naming the panel's own layer token once that layer
+maps (an acquisition that overtakes the mapping is refused and resent on the
+next <code>surface.mapped</code>), and releases it when the keyboard lands on the panel
+(comp's focus holder then holds it), when the keyboard request ends without
+landing, when the reveal ends or when the edge goes persistent. All of these
+are read from Quoin's own model, never from comp's focus events, so the order
+in which comp's events and replies arrive cannot end the hold early. Comp's
+<code>focus.changed</code> topic drives activation targeting only: each change starts
+one <code>comp.props.get path=focus</code> read, then the <code>surfaces.s&lt;id&gt;.output</code> of the
+focused surface and of the one under the pointer. No pointer lease is held.</p>
+<p>A refused request is resent only on the event that can change the answer: a
+layer mapping for surface and output refusals, a session-lock change for
+<code>locked</code>, and a changed intent otherwise. A busy comp, a timeout or a transport
+failure is retried once on a one-shot deadline whose delay doubles from 250 ms
+to 8 s (a cap on the delay, not the attempts); nothing at all is sent while
+that deadline is pending, and there is no polling. Comp keeps a hold while
+Quoin reconnects or comp's own registration lapses, so an acquired hold is
+remembered until its release is acknowledged: a menu that closes during either
+outage is released afterwards, and an acknowledged release is never replayed.</p>
+<p>Each panel gets a unique layer-shell namespace token at creation, exposed to
+the client through <code>PanelLayerIdentities</code>. Requests carry that token as
+<code>surface</code>, plus the raw output name and edge. Comp resolves the exact namespace
+on that output, refusing a token that names more than one layer. Concealment
+destroys the panel layer, so its mode report may
+retain an unresolved token until the next reveal creates a new layer. A menu
+can open with its panel hidden: popup holds therefore name the menu's own
+unique layer token, exposed through <code>PopupLayerIdentity</code>. Releases accept that
+same token even after Wayland destruction overtakes the Bus request. Client-local
+Wayland object numbers cannot identify a surface across connections; an explicit
+namespace token avoids that ambiguity, so no topmost-surface fallback is used.
+Replacement panels and menus receive new tokens; delayed commands for old
+tokens are ignored.</p>
+<p>Comp's <code>&lt;service&gt;.panel.command</code> topic carries version 1, output, edge,
+surface, an <code>action</code> of <code>reveal</code> or <code>conceal</code>, and <code>event_seq</code>. Quoin only accepts
+them with current capability, connection generation, layer identity and an
+advancing sequence. The gate drives the model: the host hands every change of
+it to the model (<code>ShellCommandKind::HolderPlane</code>) after draining Bus events and
+again after messages, so the model is command-driven before the first command
+an opened gate admits and back on local rules the moment the gate closes.
+Accepted commands become <code>HolderReveal</code>/<code>HolderConceal</code> inputs for that edge.
+Comp answers every hidden mode report with its current verdict, which is how a
+model that has just gone command-driven — after a reconnect, a gap or a comp
+restart — learns whether anything still holds a panel it shows.</p>
+<p>Comp tracks the holders per <code>(output, edge)</code> itself (shell design §4.3). The
+<strong>pointer</strong> holder is acquired by dwelling in the edge's hotspot or by entering
+the panel's layer (which exists only while the panel is visible) or a popup it
+holds; any contact with those keeps it, and leaving them all starts the 800 ms
+conceal delay, which re-entry — even an undwelled pass through the hotspot —
+cancels. The <strong>focus</strong> holder is keyboard focus on the panel's layer or a held
+popup, released at once when focus moves elsewhere. The <strong>popup</strong> holder is the
+explicit <code>comp.panel.hold</code> Quoin sends for its corner menu, released at once by
+Quoin's release or by the menu layer's destruction, whichever comes first; comp
+records the keyboard focus the menu displaced when it takes focus (a toplevel or
+a layer such as the panel) and restores it only when the menu's destruction is
+what moved focus and focus is still where comp's fallback put it; focus the
+user moved off the live menu is left alone, except into a nested held menu,
+which restores focus back to its parent menu when it closes. The one timer is a one-shot armed
+when a lingering pointer becomes the last holder and cancelled when any holder
+returns; comp reconciles holders and the timer again after handling holder
+requests in the same cycle, so a release never waits for an unrelated event.
+Nothing polls. Pinned and
+docked panels have no holders. The embedded host has no Wayland panel layers
+and does not install this standalone transport adapter.</p>
+<p>A slow, stopped or crashed Quoin cannot keep a panel shown, hold the keyboard
+or leave holds behind; stale docked reservations are the part of shell design
+§7 not yet covered. Comp identifies Quoin by the Wayland client of its layers,
+never by a namespace token (Quoin adds 128 random bits to each token so it
+cannot be guessed), and an edge is adopted only for a token Quoin itself
+reported; another live client's layer under a copied token is refused
+(<code>panel_owner_mismatch</code>, which Quoin retries on the next layer mapping or
+registry receipt). Quoin sends nothing extra to stay alive: comp checks it
+only when it has reason to — a panel still showing 1 s after comp's conceal,
+or a click or key elsewhere while only Quoin's menu or launcher holds a
+panel — by re-sending an unchanged layer configure that a live Quoin
+acknowledges within a second, as SCTK does on its own. A Quoin that does not
+answer is taken to be stopped: its menu and focus holds drop, its Exclusive
+menu loses the keyboard, and its panel and menu are hidden and excluded from
+input; nothing of any other client is touched. A conceal Quoin applies (the
+layer unmapped) owes nothing, so a panel shown again at once stays. When
+Quoin's Wayland connection dies comp drops everything it held; when its Bus
+connection goes (comp watches noded's registry), or a report arrives from a
+new Bus generation (mode reports carry <code>generation</code>), its holds end there. A
+report lifts comp's exclusion, and a conceal still owed is owed again with a
+fresh grace. Comp's read-only <code>input.corners.enforced.&lt;edge&gt;</code> and
+<code>input.corners.held.&lt;edge&gt;</code> counts show the state.</p>
+<h3 id="corner-input">Corner input</h3>
 <p>Production reveal comes only from the compositor's semantic corner topics;
 Quoin creates no corner hotspot surfaces. <code>--comp-service NAME</code> selects the
 registered compositor instance (default <code>comp</code>), giving topic headers
 <code>&lt;service&gt;.corner.entered</code>, <code>&lt;service&gt;.corner.left</code>, <code>&lt;service&gt;.corner.clicked.v2</code>,
 <code>&lt;service&gt;.corner.clicked</code> and <code>&lt;service&gt;.output.changed</code>. Their inner commands
-are the same suffixes without the service prefix.
-Brief LMB toggles <strong>Pinned</strong> (persistent overlay); brief RMB toggles <strong>Docked</strong>
-(reserves space). Both use the existing counter-clockwise mapping: TL→left,
+are the same suffixes without the service prefix. The same selection scopes the
+carousel furniture's hotspot inset: Quoin observes <code>&lt;service&gt;.props.changed</code> and
+reads <code>input.corners.deadzone_px</code> through a path-scoped <code>&lt;service&gt;.props.get</code>
+(whose reply body is the bare value at that path), re-reading on a relevant
+change, reconnect, delivery gap, or any registry observation that reports the
+service registered — a restarted comp republishes no initial value. Until a
+read lands, or while no cosmix comp is present, the inset falls back to 10 px,
+mirroring comp's own default; a failed read keeps that fallback and logs one
+<code>QUOIN_HOTSPOT_READ_FAILED</code> notice per run of failures. The compositor's
+embedded Quoin host passes its own registered service name the same way.
+LMB toggles <strong>Pinned</strong> (persistent overlay); from Docked it becomes Pinned.
+Shift+LMB toggles <strong>Docked</strong> (reserves space) and Hidden. RMB opens the corner
+menu. Ctrl/Alt/Super+LMB without Shift retain pinning. All use the
+counter-clockwise mapping: TL→left,
 BL→bottom, BR→right, TR→top. Each click is an impulse, independent of corner
 membership; the model resolves the toggle from its current mode and persists
-the change. Unpinning or undocking leaves transient reveal/grace to the panel model.
-The header pin control toggles overlay pinning; its glyph is <code>◇</code> for hidden
-(including transient reveal), <code>◆</code> for pinned and <code>▣</code> for docked.</p>
-<p>The compositor also publishes <code>corner.clicked.v2</code> with <code>button</code> and <code>kind</code> for
-LMB brief, RMB brief and RMB hold actions. It consumes engaged corner presses and
-their releases, cancelling pending actions on excess movement or disengagement.
-RMB hold never toggles a mode. It calls the optional host App resource
-<code>CornerMenuHook(fn(&amp;mut World, &amp;OutputKey, Corner))</code>. The callback must look up
-that output/corner's configured menu and do nothing if none exists. Without
-the resource, hold is a traced no-op. No callback or menu UI is installed yet.</p>
-<p>Both click topics are subscribed for old-compositor compatibility. Successful
+the change. Unpinning leaves transient reveal/grace to the panel model;
+undocking with Shift+LMB does so only while the panel is held, otherwise it
+starts concealment immediately. The menu's Hide conceals at once from any mode.
+Horizontal panels (bottom, top) carry a paging chevron at each end, inset from
+the panel ends by comp's corner-hotspot size, with the title and page dots as a
+centred overlay across the content strip; vertical panels (left, right) keep a
+<code>&lt; [title] &gt;</code> header with the chevrons inside it, the header's top grown by the
+same inset. Only the chevrons are inset — page content fills the panel below the
+header on a side edge, and the full width on a top/bottom edge with a single
+page — and an edge with a single page shows no chevrons and no inset. Chevron paging slides the
+carousel 300 ms, collapsing to zero under reduced motion; named jumps — the
+dots, <code>panel.page.set</code>, activation, restore and a removal's landing — go
+directly to the page without the slide. Headers carry no pin glyph or mode
+button; change mode at the corner, in its menu, or through the precise mode
+verbs.</p>
+<p>The compositor publishes <code>corner.clicked.v2</code> with <code>button</code>, <code>kind: "brief"</code> and
+<code>modifiers</code> captured at press time (always present, even when empty). Quoin
+refuses a v2 body without <code>modifiers</code> — it comes from a compositor older than
+this input model — and logs ERROR <code>quoin_corner_old_format_rejected</code> with
+<code>field=modifiers</code> at counts 1, 2, 4, 8, … (counted separately from other decode
+rejections); <code>kind: "hold"</code> is likewise refused for either button. Against such
+a compositor RMB does nothing, unmodified LMB still pins through the legacy
+topic below, and Shift+LMB pins instead of docking, because that compositor
+emits legacy for every LMB. That holds only on a fresh Quoin connection: a
+compositor rolled back in place, without Quoin reconnecting, leaves v2 marked
+as seen (so legacy stays ignored) and rewinds sequences (so records drop as
+stale), and no corner click acts until Quoin reconnects. The compositor consumes
+engaged corner presses and their releases, cancelling pending actions on excess
+movement or disengagement. Both buttons act on release; neither has a hold action.
+The menu action calls <code>CornerMenuHook(fn(&amp;mut World, &amp;OutputKey, Corner))</code>.
+The host always provides <strong>Pin / Dock / Hide</strong>, with the current mode checked
+and disabled; Quoin appends <code>conf.mix</code>'s <code>menu_items</code> for that edge. Each mode
+choice uses the same <code>SetMode</code> command as the precise mode verbs. Extra items
+invoke their declared Bus target and verb, with the string list in <code>args</code>.
+The menu uses the panel chrome theme tokens. Arrow keys or Tab select an item;
+Return or Space chooses it. Escape, click-away and item choice close the menu,
+end its local reveal hold and release its exclusive keyboard layer. Without the
+holder plane comp's existing policy then focuses the top toplevel; with it, the
+menu's popup holder returns focus to the surface the menu displaced. Pin and Dock
+apply before the local hold is released, so concealment cannot race the choice.
+Under local rules, opening a menu at a hidden corner does not itself reveal the
+panel; with the holder plane the menu's popup hold does.</p>
+<p>Both click topics are subscribed: legacy is the fallback that keeps the first
+unmodified LMB working while the v2 subscription settles. Successful
 subscription is not capability discovery: the broker accepts unpublished topics.
-Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The current
-compositor emits each LMB's legacy record at sequence N and its v2 record at N+1;
+Until a valid v2 click arrives, legacy LMB toggles Pinned immediately. The
+compositor emits each unmodified LMB's legacy record at sequence N and its v2
+record at N+1, including when the v2 payload has <code>modifiers: []</code>;
 the host maps both to N and admits that logical click once, in either delivery
-order. On observing v2 it ignores all subsequent legacy clicks for that connection.
+order. Every modified click emits only v2 and keeps its own sequence, including
+Ctrl/Alt/Super+LMB. On observing v2 it ignores all subsequent legacy clicks for that connection.
 A sequence high-water mark also rejects duplicate/stale click records, before
 output-map queueing. Reconnect clears preference and sequence state; ordinary
 output refreshes and loss markers retain them. This relies on the compositor's
-consecutive LMB pair and monotonically increasing observation stream, not a
+consecutive unmodified LMB pair and monotonically increasing observation stream, not a
 timing window. It is not an exactly-once guarantee across a connection reset or
 publisher sequence restart; a publisher restart requires a fresh host/connection.
 High-water rejections emit <code>quoin_corner_sequence_rejected</code> WARNs at counts
@@ -789,10 +1126,12 @@ disconnect: synthesize left for all engagements, invalidate the slug map, and
 refresh it before accepting mapped corner state again.
 A lost click is a missed toggle and is never replayed or synthetically recovered.
 If only a click is dropped at the host-to-runner queue, existing holds are retained.</p>
-<p>A compositor enter reveals and holds the counter-clockwise edge (TL→left, BL→bottom,
-BR→right, TR→top). Matching left starts the 800 ms grace only when the native
-pointer is also outside. Native SCTK pointer enter/leave supplies the second
-hold; Bevy pointer button events drive pin, both carousel chevrons and page
+<p>Under the model's local rules, a compositor enter reveals and holds the
+counter-clockwise edge (TL→left, BL→bottom, BR→right, TR→top). Matching left
+starts the 800 ms grace only when the native pointer is also outside. When comp
+reports the holder plane, these events only record membership and comp's
+commands reveal and conceal instead (see the holder control plane above). Native SCTK pointer enter/leave supplies the second
+hold; Bevy pointer button events drive both carousel chevrons and page
 dots. Pin survives both leaves, and unpin outside both holds starts normal
 grace. Wheel events are delivered to Bevy although current chrome does not
 consume them.</p>
@@ -811,16 +1150,91 @@ Quoin chooses the first advertised seat independently for pointer, keyboard
 and touch, and fails each capability over after its selected seat is removed.</p>
 <p>The pure <code>CornerDetector</code> remains a development-host tuning tool and is not a
 production reveal source.</p>
+<h3 id="keyboard">Keyboard</h3>
+<p><code>conf.mix</code> binds keys per edge and one focus-cycle key. They are all unbound by
+default:</p>
+<pre><code class="language-mix">{bindings: {left: {pin: "Super+Shift+Left", dock: "Super+Shift+D", hide: nil},
+            right: {dock: "Super+F2"},
+            cycle_focus: "Super+Tab"}}
+</code></pre>
+<p>Chords are canonicalised at ingestion, so modifier order does not matter.
+Every chord needs Ctrl, Alt or Super. A bare or Shift-only key would take
+typing from the panel's own controls. Escape cannot be bound with any
+modifiers, because any Escape reaching a panel is the panel's own Escape.
+Duplicates, unknown keys, modifier-less chords and Escape chords are refused.
+<code>Super+Escape</code> is also comp's reserved chord. The refusal is loud and the
+previous configuration is kept.</p>
+<p>Letters and digits match the key labelled with them in the current layout,
+and named keys match by meaning, so a keypad arrow is <code>Left</code>. Any other key
+falls back to its physical position, so <code>Ctrl+Shift+1</code> is the 1 key even
+though it types <code>!</code>. Modifiers count as they were at the moment of the press.
+A binding fires only on a fresh press. Key repeat does not fire it, and
+neither does a key that was already held when a panel received focus. Such
+keys have to be released and pressed again, so a cycle stop can never be
+triggered by the chord that moved focus there.</p>
+<ul>
+<li><strong>pin / dock / hide</strong> each send the precise mode command
+(<code>SetMode(pinned|docked|hidden)</code>), the same one the corner menu and
+<code>shell.panel.mode</code> send. They never use the legacy <code>pin</code>/<code>unpin</code> pair.</li>
+<li><strong>cycle_focus</strong> moves the keyboard to the next visible pinned or docked
+panel on this output, in left, bottom, right, top order. After the last
+panel, focus goes back to the application. Transient reveals are not stops.
+A Wayland client cannot focus its own layer surface, so the cycle requests
+<code>Exclusive</code> interactivity on the target panel until the keyboard lands, then
+drops back to <code>OnDemand</code> (comp lets a demoted layer keep the keyboard it was
+granted). The panel keeps the keyboard until focus leaves it — a click
+elsewhere included — Escape, the next cycle stop, or until it unmaps. Named
+activation (<code>shell.sub.activate</code>) makes the same request. Comp grants the
+request only for a panel it is actually showing. If the keyboard has not
+arrived within 500 ms, the request is withdrawn, so a panel shown later
+never takes the keyboard on its own.</li>
+<li><strong>Escape</strong> from a focused panel hides it only if it is a transient reveal.
+Only the focused panel receives it. If the pointer is still in the panel or
+its hotspot, the reveal latches: no hover can re-reveal it until the slide
+out has finished and the pointer is out of the hotspot. Pointer leaves and
+re-entries during the slide do not end the latch, because the slide itself
+moves the pointer off the surface. Escape on a pinned or docked panel
+changes neither mode nor reservation. In every case focus goes back: all
+panels refuse the keyboard, comp's policy focuses the top toplevel, and
+ordinary <code>OnDemand</code> resumes once Quoin sees that no panel has the keyboard.
+Exact restoration of the previous surface belongs to the compositor focus
+holder.</li>
+</ul>
+<p><strong>Scope.</strong> Quoin has no global key grab. A binding works only while one of
+Quoin's own panels holds the keyboard, after a click into it or a cycle stop.
+So a binding can never shadow an application's shortcut. It also means that a
+binding cannot reveal a panel while an application is focused. That route
+needs a chord grab in the compositor, which does not exist yet.</p>
+<p>Keyboard actions target the output of the focused window, or the pointer's
+output when no window has focus. The keys Quoin receives always come from its
+own focused panel, so they target that panel's output. The pointer fallback
+applies only to the future compositor-grabbed route.</p>
+<p>Only while a request is still waiting for the keyboard is the panel
+<code>Exclusive</code>, and a click elsewhere cannot take the keyboard then. Once the
+keyboard has landed, a click elsewhere moves it away like from any
+<code>OnDemand</code> panel, which ends the request.</p>
+<p>The latch described above is the local one, used while comp does not report
+the holder plane. A hide latches in the same way when the pointer is inside:
+<code>hide</code>, a toggle-off, or a mode set to hidden, whether from a binding, the
+menu or <code>shell.panel.mode</code>. When comp does report the holder plane, all of
+them take the command-driven latch described earlier. The panel stays
+concealed against comp's reveals until comp reports that the holders have been
+released. If comp had not yet reported a hold, the latch ends when the pointer
+leaves instead. A local latch that is still standing when comp starts
+reporting the holder plane carries over as that pointer-only latch.</p>
 <p>Stable transition markers are:</p>
 <pre><code class="language-text">QUOIN_REVEAL edge=left trigger=corner
+QUOIN_REVEAL edge=left trigger=holders
 QUOIN_CONCEAL edge=left reason=corner-left
 QUOIN_CONCEAL edge=left reason=grace
+QUOIN_CONCEAL edge=left reason=holders
 QUOIN_MODE edge=left mode=pinned
 QUOIN_MODE edge=left mode=docked
 QUOIN_MODE edge=left mode=hidden
 </code></pre>
 <p>The edge is one of <code>left</code>, <code>bottom</code>, <code>right</code> or <code>top</code>. A marker is printed once
-per real semantic transition. <code>--smoke-all-panels</code> starts all four panels
+per real semantic transition. The <code>holders</code> forms come only from the
+command-driven model. <code>--smoke-all-panels</code> starts all four panels
 docked and retains the compatibility <code>QUOIN_PIN edge=... state=pinned</code> smoke
 marker per edge before the existing four-surface
 ready marker. Mutually exclusive <code>--smoke-hidden</code> starts them hidden and prints
@@ -874,7 +1288,11 @@ have a five-minute ceiling. Pending and finalising states are distinct from
 <code>complete</code>, which displays the saved file path. Files default to
 <code>~/Videos/Cosmix</code> in the capture citizen's account, or its configured directory.</p>
 <p>These controls share Quoin's existing asynchronous Bus bridge, reconcile after
-reconnect and report unavailable services. They do not launch competing
+reconnect and report unavailable services. Neither service publishes a change
+notification for this state, so Quoin reads both statuses once per connection,
+after each action and when the Demos tab opens, then at most every 5 s while
+the tab stays visible; a hidden tab polls nothing. Failed reads back off from
+2 s to at most 30 s, visible-only. They do not launch competing
 background processes. Session supervision starts one showcase and one capture
 citizen alongside the compositor. The existing System-page boids preferences
 can target the showcase with <code>COSMIX_QUOIN_BACKGROUND_SERVICE=bg-showcase</code>;

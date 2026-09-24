@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-comp"
-version = "0.63.4"
+version = "0.68.0"
 dependencies = [
  "bevy",
  "chrono",
@@ -3357,7 +3357,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-quoin"
-version = "0.13.2"
+version = "0.14.1"
 dependencies = [
  "bevy",
  "cosmix-lib-buildinfo",
@@ -3385,7 +3385,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-scene-bevy"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bevy",
  "cosmix-scene",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell"
-version = "0.13.2"
+version = "0.15.0"
 dependencies = [
  "accesskit",
  "bevy",
@@ -3410,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "cosmix-shell-host"
-version = "0.7.2"
+version = "0.9.0"
 dependencies = [
  "bevy",
  "bevy_winit",

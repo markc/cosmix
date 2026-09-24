@@ -1,11 +1,18 @@
 //! Cosmix Quoin's real SCTK layer-shell host.
 
+mod activation;
 mod bus_service;
+pub mod config;
+mod corner_menu;
 mod demos;
 mod desktop_font;
+mod holders;
+mod hotspot;
+mod keyboard;
 mod launcher;
 pub mod embedded;
 mod power;
+mod settings;
 mod state;
 mod wallpaper;
 
@@ -82,7 +89,7 @@ pub fn run_layer_host() -> AppExit {
     };
     let registry = page_registry();
     let state_store = state::StateStore::startup(cli.smoke_all_panels || cli.smoke_hidden);
-    let restored = state_store.snapshot();
+    let restore_saved = state_store.shared_saved();
     let model_registry = registry.clone();
     let smoke_all_panels = cli.smoke_all_panels;
     let smoke_hidden = cli.smoke_hidden;
@@ -104,22 +111,31 @@ pub fn run_layer_host() -> AppExit {
             }
         }
         if !smoke_all_panels && !smoke_hidden {
-            restored.restore(&mut model);
+            // Restore through the store's shared handle so claiming the
+            // migrated default-output entry reaches the next save.
+            state::StateStore::restore_shared(&restore_saved, &mut model);
             model.start_intro(Duration::from_secs(2));
         }
         model
     })
-    .with_comp_service(cli.comp_service);
+    .with_comp_service(cli.comp_service.clone());
 
     let mut app = App::new();
     configure_layer_host(&mut app, host);
     let wake = app.world().resource::<LayerHostWake>().callback();
     let mut bus = BusBridgeConfig::new(cli.bus_service, resolve_noded_url());
+    hotspot::install(&mut app, &mut bus, cli.comp_service.clone());
+    hotspot::arm_first_run(&mut app, state_store.first_run());
+    activation::install(&mut app, &mut bus, cli.comp_service.clone());
+    holders::install(&mut app, &mut bus, cli.comp_service);
     bus.provenance = provenance_from_build(cosmix_buildinfo::build_info!());
     bus.subscriptions.push("power.props.changed".to_owned());
     bus.subscriptions.push("wallpaper.props.changed".to_owned());
     bus.subscriptions
         .push("bg-showcase.props.changed".to_owned());
+    // Broker service-registry diffs: the citizen-disconnect notification
+    // sub-panel ownership keys on (the `services.registered` leaf).
+    bus.subscriptions.push("noded.props.changed".to_owned());
     bus.inbound_prefixes.push("shell.".to_owned());
     bus.max_inbound_body_bytes = cosmix_scene::MAX_DOCUMENT_BYTES;
     bus.worker_wake = Some(BusWorkerWake::new(wake));
@@ -131,6 +147,9 @@ pub fn run_layer_host() -> AppExit {
         smoke_all_panels,
         smoke_hidden,
     );
+    config::install(&mut app, smoke_all_panels || smoke_hidden);
+    keyboard::install(&mut app);
+    corner_menu::install(&mut app);
     app.run()
 }
 
@@ -166,6 +185,7 @@ fn configure_content(
             Update,
             state::persist_transitions.in_set(ShellRuntimeSet::Host),
         );
+    settings::install(app, all_panels || hidden);
 }
 
 fn parse_cli(arguments: impl IntoIterator<Item = String>) -> Result<CliAction, String> {
@@ -256,12 +276,18 @@ fn log_transitions(
             PanelEffect::Reveal {
                 trigger: RevealTrigger::Corner,
             } => println!("QUOIN_REVEAL edge={edge} trigger=corner"),
+            PanelEffect::Reveal {
+                trigger: RevealTrigger::Holders,
+            } => println!("QUOIN_REVEAL edge={edge} trigger=holders"),
             PanelEffect::Conceal {
                 reason: ConcealReason::CornerLeft,
             } => println!("QUOIN_CONCEAL edge={edge} reason=corner-left"),
             PanelEffect::Conceal {
                 reason: ConcealReason::Grace,
             } => println!("QUOIN_CONCEAL edge={edge} reason=grace"),
+            PanelEffect::Conceal {
+                reason: ConcealReason::Holders,
+            } => println!("QUOIN_CONCEAL edge={edge} reason=holders"),
             PanelEffect::ModeChanged { mode } => {
                 println!("QUOIN_MODE edge={edge} mode={}", mode.as_str())
             }
@@ -301,7 +327,7 @@ fn setup(
     // default is Ocean/Dark, overridden by a persisted scheme when present.
     let scheme = state_store
         .scheme()
-        .and_then(Scheme::from_name)
+        .and_then(|scheme| Scheme::from_name(&scheme))
         .unwrap_or(Scheme::Ocean);
     let mut spec = ThemeSpec::from_scheme(scheme, Mode::Dark);
     // Match the host desktop's UI font where it can be read; otherwise CTK's
@@ -321,7 +347,11 @@ fn setup(
     bindings.set(
         Edge::Bottom,
         vec![
-            QuoinPageContent::new("launcher", bottom_launcher(&mut commands)),
+            // The runtime ticks the clock only while this page is active.
+            QuoinPageContent::new(
+                cosmix_shell::runtime::CLOCK_PAGE_ID,
+                bottom_launcher(&mut commands),
+            ),
             QuoinPageContent::new("power", bottom_power(&mut commands)),
             QuoinPageContent::new(
                 "tasks",

@@ -192,7 +192,57 @@ try
   check($hit.hit != nil and $hit.hit.theme == "hicolor", "absent theme did not fall through to hicolor")
   $ctx = $hit.ctx
 
-  print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache")
+  -- ── XWayland DISPLAY for launches (TODO-comp C8) ─────────────────────
+  check($a.xwayland_descriptor_path("/run/user/1", "wayland-1") == "/run/user/1/cosmix-comp/wayland-1.xwayland.env",
+    "descriptor path wrong")
+  check($a.xwayland_descriptor_path("", "wayland-1") == "", "descriptor path invented without a runtime dir")
+  check($a.xwayland_descriptor_path("/run/user/1", "/run/user/1/wayland-1") == "", "descriptor path from a socket path")
+  check($a.parse_xwayland_descriptor("DISPLAY=:3\nGENERATION=2\n") == ":3", "descriptor DISPLAY not parsed")
+  check($a.parse_xwayland_descriptor("GENERATION=2\nDISPLAY=:12\n") == ":12", "DISPLAY not found after another key")
+  check($a.parse_xwayland_descriptor("DISPLAY=:0; rm -rf /\n") == nil, "malformed DISPLAY accepted")
+  check($a.parse_xwayland_descriptor("") == nil, "empty descriptor produced a DISPLAY")
+  -- No descriptor (XWayland not up, or died): no display, with a reason.
+  $ld = $a.launch_display($tmp, "wayland-9")
+  check($ld.display == nil and contains($ld.why, "no XWayland descriptor"), "launch_display invented a DISPLAY with no descriptor")
+  check($a.launch_display("", "wayland-9").display == nil, "launch_display without a runtime dir")
+  fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=:1\nGENERATION=1\n")
+  check($a.launch_display($tmp, "wayland-9").display == ":1", "launch_display did not read the descriptor")
+  -- A restarted XWayland on a different number is seen on the next launch.
+  fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=:4\nGENERATION=2\n")
+  check($a.launch_display($tmp, "wayland-9").display == ":4", "launch_display cached a stale DISPLAY")
+  fixture("cosmix-comp/wayland-9.xwayland.env", "DISPLAY=nope\n")
+  $ld = $a.launch_display($tmp, "wayland-9")
+  check($ld.display == nil and contains($ld.why, "no valid DISPLAY"), "malformed descriptor not reported")
+  -- argv[0] is resolved before the env(1) wrapper can hide a missing program.
+  check($a.resolve_exec("sh", "") != nil, "resolve_exec missed sh on PATH")
+  check($a.resolve_exec("definitely-not-a-real-binary-xyz", "") == nil, "resolve_exec invented a PATH hit")
+  fixture("bin/runnable", "#!/bin/sh\n")
+  fixture("bin/not-runnable", "#!/bin/sh\n")
+  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/runnable"])
+  $_chmod = run_argv_must(["chmod", "0644", $tmp .. "/bin/not-runnable"])
+  check($a.resolve_exec($tmp .. "/bin/runnable", "") == $tmp .. "/bin/runnable", "resolve_exec missed an absolute executable")
+  check($a.resolve_exec($tmp .. "/bin/not-runnable", "") == nil, "resolve_exec accepted a non-executable file")
+  check($a.resolve_exec($tmp .. "/bin/absent", "") == nil, "resolve_exec accepted a missing path")
+  check($a.resolve_exec("bin/runnable", $tmp) == $tmp .. "/bin/runnable", "resolve_exec ignored the launch cwd")
+  check($a.resolve_exec("", "") == nil, "resolve_exec accepted an empty argv[0]")
+  -- With a display it is set; without one it is REMOVED via env -u, never inherited.
+  $s = $a.launch_spawn(["xapp", "--flag"], "/usr/bin/xapp", ":4")
+  check(deep_eq($s.argv, ["xapp", "--flag"]) and $s.env.DISPLAY == ":4", "launch_spawn with a display wrong")
+  -- Unset path: absolute /usr/bin/env and the RESOLVED absolute program,
+  -- so env does not search PATH.
+  $s = $a.launch_spawn(["xapp", "--flag"], "/usr/bin/xapp", nil)
+  check(deep_eq($s.argv, ["/usr/bin/env", "-u", "DISPLAY", "--", "/usr/bin/xapp", "--flag"]) and len(keys($s.env)) == 0,
+    "launch_spawn without a display must unset DISPLAY via /usr/bin/env and the resolved path")
+  -- End to end: a program whose name has '=' runs, instead of env treating
+  -- it as an assignment (which would run the NEXT word as the program).
+  fixture("bin/A=b", "#!/bin/sh\necho ran-A=b\n")
+  $_chmod = run_argv_must(["chmod", "0755", $tmp .. "/bin/A=b"])
+  $s = $a.launch_spawn(["A=b"], $a.resolve_exec("bin/A=b", $tmp), nil)
+  $r = run_argv($s.argv, {cwd: $tmp})
+  -- (No stdout in the message: a misparse makes env print the whole environment.)
+  check($r.ok and trim($r.stdout) == "ran-A=b", "an '='-named program was misparsed by env")
+
+  print("PASS apps scan filters, locale precedence, subdir ids, dir precedence, queries, Exec quoting and field codes, icon exact/closest/scaled/inherit/hicolor/pixmap/absolute resolution, theme cache, XWayland launch DISPLAY")
 finally
   if starts_with($tmp, "/tmp/cosmix-apps-lib-test.") then
     $_remove = run_argv_must(["rm", "-rf", "--", $tmp])

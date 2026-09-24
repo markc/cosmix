@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, TrySendError},
     },
     thread::{self, JoinHandle},
@@ -67,7 +67,14 @@ const CLIENT_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 const DEREGISTER_BUDGET: Duration = Duration::from_millis(200);
 const CLOSE_BUDGET: Duration = Duration::from_millis(50);
 
+/// noded's own props topic; its `services.registered` diffs carry the full
+/// registration set, which is how comp sees a holder service leave the Bus.
+const REGISTRY_TOPIC: &str = "noded.props.changed";
+
 pub(crate) enum PortCommand {
+    Panel(PortPanelRequest),
+    /// The registered services, from a registry diff (full set, not a delta).
+    ServicesLive(std::collections::BTreeSet<String>),
     Snapshot(PortRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
@@ -88,6 +95,12 @@ pub(crate) struct PortRequest {
 pub(crate) struct PortReply {
     pub(crate) order: u64,
     pub(crate) reply: tokio::sync::oneshot::Sender<ControlReply>,
+}
+
+pub(crate) struct PortPanelRequest {
+    pub(crate) order: u64,
+    pub(crate) op: port_observation::PanelRequest,
+    pub(crate) reply: Option<tokio::sync::oneshot::Sender<ControlReply>>,
 }
 
 pub(crate) struct PortSetRequest {
@@ -620,6 +633,7 @@ impl ControlReply {
 }
 
 pub(crate) enum PortControl {
+    Panel(PortPanelRequest),
     Watch(PortReply),
     PointerWatch(PortReply),
     Set(PortSetRequest),
@@ -632,6 +646,7 @@ pub(crate) enum PortControl {
 impl PortControl {
     pub(crate) fn order(&self) -> u64 {
         match self {
+            Self::Panel(request) => request.order,
             Self::Watch(request) => request.order,
             Self::PointerWatch(request) => request.order,
             Self::Set(request) => request.order,
@@ -653,6 +668,12 @@ pub(crate) struct PortIngress {
 }
 
 impl PortIngress {
+    pub(crate) fn request_panel(&self, op: port_observation::PanelRequest) -> Result<ControlAdmission, ()> {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.admit(PortCommand::Panel(PortPanelRequest {
+            order: self.next_control_order(), op, reply: Some(reply),
+        }), receive)
+    }
     /// Whole-tree snapshot; production reads go through the scoped form.
     #[cfg(test)]
     pub(crate) fn request_snapshot(&self) -> Result<SnapshotAdmission, ()> {
@@ -750,6 +771,14 @@ impl PortIngress {
         // A refused send drops the command, and with it the slot.
         self.sender.try_send(command).map_err(|_| ())?;
         Ok(LongAdmission { receive, timeout })
+    }
+
+    /// Best effort: a full queue drops the set, and the next registry diff or
+    /// the liveness probe on the holder's layers repair it.
+    pub(crate) fn services_live(&self, live: std::collections::BTreeSet<String>) {
+        if self.sender.try_send(PortCommand::ServicesLive(live)).is_err() {
+            tracing::debug!("registry update dropped: compositor port queue full");
+        }
     }
 
     pub(crate) fn set_watch_state(&self, active: bool) {
@@ -912,6 +941,53 @@ pub(crate) fn test_wiring_with_observation_capacity(
         ingress,
         observations,
     )
+}
+
+/// One Bus command through the real dispatch boundary as the named service
+/// receives it; `pump` runs the compositor cycle that answers it. Returns the
+/// reply's rc and JSON body.
+#[cfg(test)]
+pub(crate) fn test_dispatch(
+    ingress: &PortIngress,
+    service: &str,
+    verb: &str,
+    args: Value,
+    pump: impl FnOnce(),
+) -> (u8, Value) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("test runtime");
+    let _entered = runtime.enter();
+    let mut responders = JoinSet::new();
+    let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+    let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+    let (reply_sender, mut replies) = tokio_mpsc::channel(1);
+    let reply_timeouts = Arc::new(AtomicU64::new(0));
+    let command = cosmix_client::IncomingCommand {
+        from: "test-caller".into(),
+        command: verb.into(),
+        id: Some("0".into()),
+        body: args.to_string(),
+        args,
+        headers: BTreeMap::new(),
+    };
+    dispatch_incoming(
+        ingress,
+        &mut responders,
+        &permits,
+        &long_permits,
+        &reply_sender,
+        &reply_timeouts,
+        service,
+        command,
+    );
+    pump();
+    runtime.block_on(async {
+        while responders.join_next().await.is_some() {}
+    });
+    let reply = replies.try_recv().expect("the command is answered");
+    (reply.rc, serde_json::from_str(&reply.body).expect("reply body is JSON"))
 }
 
 pub(crate) struct PortStarter {
@@ -1195,6 +1271,8 @@ trait WorkerClient: Send + Sync + 'static {
     ) -> WorkerFuture<'a, Result<(), String>>;
     fn deregister(&self) -> WorkerFuture<'_, Result<(), String>>;
     fn close(&self) -> WorkerFuture<'_, ()>;
+    /// Subscribe once; the supervised client replays it on every reconnect.
+    fn subscribe_topic<'a>(&'a self, topic: &'a str) -> WorkerFuture<'a, Result<(), String>>;
 }
 
 impl WorkerClient for SupervisedClient {
@@ -1255,6 +1333,14 @@ impl WorkerClient for SupervisedClient {
 
     fn close(&self) -> WorkerFuture<'_, ()> {
         Box::pin(SupervisedClient::close(self))
+    }
+
+    fn subscribe_topic<'a>(&'a self, topic: &'a str) -> WorkerFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            SupervisedClient::subscribe_topic(self, topic)
+                .await
+                .map_err(|error| error.to_string())
+        })
     }
 }
 
@@ -1334,6 +1420,22 @@ async fn worker_loop<F, Fut, C>(
         Arc::clone(&publish_timeouts),
         shutdown.clone(),
     ));
+    // Holder cleanup on Bus departure. The supervised client replays a
+    // subscription once it has succeeded; until then every (re)connect tries
+    // again. Best effort: the liveness probe bounds what a missed departure
+    // can leave behind.
+    let registry_subscribed = Arc::new(AtomicBool::new(false));
+    let subscribe_registry = |client: &Arc<C>, subscribed: &Arc<AtomicBool>| {
+        let client = Arc::clone(client);
+        let subscribed = Arc::clone(subscribed);
+        tokio::spawn(async move {
+            match client.subscribe_topic(REGISTRY_TOPIC).await {
+                Ok(()) => subscribed.store(true, Ordering::Release),
+                Err(error) => tracing::warn!(%error, "registry subscription failed; retried on the next connect"),
+            }
+        })
+    };
+    let mut registry_task = subscribe_registry(&client, &registry_subscribed);
 
     loop {
         tokio::select! {
@@ -1349,6 +1451,10 @@ async fn worker_loop<F, Fut, C>(
                 let state = *states.borrow_and_update();
                 apply_connection_state(&broker, state);
                 observation_notifier.notify_one();
+                if state == ConnState::Connected && !registry_subscribed.load(Ordering::Acquire) {
+                    registry_task.abort();
+                    registry_task = subscribe_registry(&client, &registry_subscribed);
+                }
                 if state == ConnState::Fatal {
                     tracing::error!(service = %service, "Bus registration rejected during reconnect; compositor continues without a port");
                     break;
@@ -1382,6 +1488,7 @@ async fn worker_loop<F, Fut, C>(
         }
     }
 
+    registry_task.abort();
     responders.abort_all();
     while responders.join_next().await.is_some() {}
     drop(reply_sender);
@@ -1464,6 +1571,49 @@ fn handle_incoming(
     );
 }
 
+/// A `from: noded` message is the local broker only when noded did not stamp
+/// it as relayed from the mesh. ABSENT IS THE NORMAL PRODUCTION CASE: noded's
+/// `build_topic_notice` never stamps `broker_origin`, on any broker version,
+/// so every real `topic.active`/`topic.idle` arrives without it. Requiring
+/// `local` here would silently break the props publishing lifecycle. Accept
+/// absent or `local`; refuse anything else. Every case-variant spelling of
+/// the header must say `local`, independent of noded's own stripping.
+fn from_local_broker(command: &cosmix_client::IncomingCommand) -> bool {
+    command
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("broker_origin"))
+        .all(|(_, origin)| origin.eq_ignore_ascii_case("local"))
+}
+
+const FOREIGN_BROKER_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// At most one warning per interval: a peer replaying these must not flood
+/// the journal, but the first one is always visible.
+fn warn_foreign_broker_claim(command: &cosmix_client::IncomingCommand) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let now = std::time::Instant::now();
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|at| now.duration_since(at) < FOREIGN_BROKER_WARN_INTERVAL) {
+        return;
+    }
+    *last = Some(now);
+    let header = |key: &str| {
+        command
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map_or("", |(_, value)| value.as_str())
+    };
+    tracing::warn!(
+        broker_origin = header("broker_origin"),
+        source_peer = header("source_peer"),
+        command = %command.command,
+        topic = command.topic().unwrap_or(""),
+        "ignored a non-local message claiming to be the broker (from: noded)"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_incoming(
     ingress: &PortIngress,
@@ -1482,15 +1632,42 @@ fn dispatch_incoming(
     }
     let malformed =
         !command.body.is_empty() && serde_json::from_str::<Value>(&command.body).is_err();
-    if command.from == "noded"
+    let broker_lifecycle = command.from == "noded"
         && matches!(command.command.as_str(), "topic.active" | "topic.idle")
         && command.headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("name")
                 && value
                     == &port_observation::topic_name(service, port_observation::PROPS_TOPIC_SUFFIX)
-        })
-    {
+        });
+    let broker_registry = command.from == "noded" && command.topic() == Some(REGISTRY_TOPIC);
+    // Only the LOCAL broker speaks as `noded`. Defence in depth: mesh ingress
+    // strips `from` (noded.rs mesh handler) and responses never reach this
+    // dispatch, so the one reachable forgery is a client connected over
+    // WireGuard to a PRE-0.18 noded that let it register the name `noded` —
+    // its routed messages arrive as `from: noded` + `broker_origin: mesh`.
+    // noded 0.18.0 refuses that name; this check does not rely on it.
+    if (broker_lifecycle || broker_registry) && !from_local_broker(&command) {
+        warn_foreign_broker_claim(&command);
+        return;
+    }
+    if broker_lifecycle {
         ingress.set_watch_state(command.command == "topic.active");
+        return;
+    }
+    // The broker's registry (only noded may publish its props topic): a
+    // holder service that left takes its panel holds with it.
+    if broker_registry {
+        if let Ok(body) = serde_json::from_str::<Value>(&command.body)
+            && body["path"] == "services.registered"
+            && let Some(live) = body["new"].as_array().and_then(|names| {
+                names
+                    .iter()
+                    .map(|name| name.as_str().map(str::to_owned))
+                    .collect::<Option<std::collections::BTreeSet<String>>>()
+            })
+        {
+            ingress.services_live(live);
+        }
         return;
     }
     if command.command == "comp.ping" {
@@ -1768,6 +1945,42 @@ fn dispatch_incoming(
             admission,
             permit,
         );
+        return;
+    }
+    // Literal `comp.*` commands addressed to the service, like every other
+    // verb: `comp-nested.panel.hold` is an unknown verb, not an alias.
+    if matches!(command.command.as_str(), "comp.panel.hold" | "comp.panel.mode") {
+        let parsed = if malformed {
+            Err(invalid_argument("args", "JSON object", "{output, edge, surface, ...}"))
+        } else {
+            port_observation::PanelRequest::parse(&command.command, &command.args)
+        };
+        let op = match parsed {
+            Ok(mut op) => {
+                // Only the broker's stamp names the holder service.
+                op.sender.clone_from(&command.from);
+                op
+            }
+            Err(reply) => {
+                queue_reply(reply_sender, reply_timeouts,
+                    PendingReply::new(command, reply.into_wire()));
+                return;
+            }
+        };
+        let permit = match Arc::clone(responder_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                queue_reply(reply_sender, reply_timeouts,
+                    PendingReply::new(command, error("busy")));
+                return;
+            }
+        };
+        match ingress.request_panel(op) {
+            Ok(admission) => spawn_control_responder(responders, reply_sender,
+                reply_timeouts, command, admission, permit),
+            Err(()) => queue_reply(reply_sender, reply_timeouts,
+                PendingReply::new(command, error("busy"))),
+        }
         return;
     }
     let needs_snapshot = matches!(
@@ -3651,6 +3864,10 @@ mod tests {
             self.closed.fetch_add(1, Ordering::AcqRel);
             Box::pin(future::ready(()))
         }
+
+        fn subscribe_topic<'a>(&'a self, _topic: &'a str) -> WorkerFuture<'a, Result<(), String>> {
+            Box::pin(future::ready(Ok(())))
+        }
     }
 
     fn test_ingress() -> (PortIngress, channel::Channel<PortCommand>, Arc<AtomicUsize>) {
@@ -4600,6 +4817,116 @@ mod tests {
         assert_eq!(long_permits.available_permits(), LONG_VERB_PERMITS);
     }
 
+    /// noded's registry diffs reach the compositor as the full live set,
+    /// unanswered (a topic delivery is not a verb); other props diffs, and a
+    /// malformed set, change nothing.
+    #[tokio::test]
+    async fn registry_diffs_reach_the_compositor_as_the_live_set() {
+        let (ingress, source, _depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        for (index, body) in [
+            json!({"path":"services.registered","old":["quoin"],"new":["noded","comp-nested"]}),
+            json!({"path":"mesh.peers","old":[],"new":["x"]}),
+            json!({"path":"services.registered","old":[],"new":["noded", 7]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut delivery = command("props.changed", index);
+            delivery.from = "noded".into();
+            delivery.id = None;
+            delivery.body = body.to_string();
+            delivery.args = body;
+            delivery.headers.insert("topic".into(), REGISTRY_TOPIC.into());
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                delivery,
+            );
+        }
+        let Ok(PortCommand::ServicesLive(live)) = source.try_recv() else {
+            panic!("the registry diff reaches the compositor");
+        };
+        assert_eq!(live, std::collections::BTreeSet::from(["noded".to_owned(), "comp-nested".to_owned()]));
+        assert!(source.try_recv().is_err(), "nothing else is admitted");
+        assert!(replies.try_recv().is_err(), "a topic delivery is never answered");
+    }
+
+    #[tokio::test]
+    async fn panel_verbs_dispatch_by_literal_command_under_a_non_default_service() {
+        let (ingress, source, _depth) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(8);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let hold = json!({"output":"Output-1","edge":"left","surface":"quoin.panel.1",
+            "holder":"popup","acquire":true});
+        for (index, (verb, args)) in [
+            ("comp.panel.hold", hold.clone()),
+            ("comp-nested.panel.hold", hold),
+            (
+                "comp.panel.mode",
+                json!({"output":"Output-1","edge":"left","surface":"quoin.panel.1",
+                    "mode":"hidden","sticky":true}),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut incoming = command(verb, index);
+            incoming.body = args.to_string();
+            incoming.args = args;
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                incoming,
+            );
+        }
+        // The service-prefixed spelling is not a verb, and a typo names its field.
+        let mut refusals = BTreeMap::new();
+        for _ in 0..2 {
+            let reply = replies.try_recv().unwrap();
+            let body: Value = serde_json::from_str(&reply.body).unwrap();
+            refusals.insert(reply.id.clone().unwrap(), (reply.rc, body));
+        }
+        assert_eq!(refusals["1"].0, 10);
+        assert_eq!(refusals["1"].1["error"], "unknown_verb");
+        assert_eq!(refusals["2"].0, 10);
+        assert_eq!(refusals["2"].1["error"], "invalid_args");
+        assert_eq!(refusals["2"].1["field"], "sticky");
+        // The literal verb reaches the compositor thread under any service name.
+        let Ok(PortCommand::Panel(mut request)) = source.try_recv() else {
+            panic!("comp.panel.hold must be admitted");
+        };
+        assert_eq!(request.op.surface, "quoin.panel.1");
+        assert_eq!(request.op.acquire, Some(true));
+        assert!(source.try_recv().is_err(), "refused requests are never admitted");
+        request
+            .reply
+            .take()
+            .unwrap()
+            .send(ControlReply::Body(json!({"accepted":true,"surface":"quoin.panel.1"})))
+            .unwrap();
+        responders.join_next().await.unwrap().unwrap();
+        let reply = replies.try_recv().unwrap();
+        assert_eq!((reply.id.as_deref(), reply.rc), (Some("0"), 0));
+    }
+
     #[tokio::test]
     async fn window_wait_and_forced_close_take_the_long_pool() {
         let (ingress, source, depth) = test_ingress();
@@ -5361,6 +5688,79 @@ mod tests {
             };
             assert_eq!(observed, active);
         }
+    }
+
+    /// `from: noded` with `broker_origin: mesh` is what a WireGuard client of
+    /// a pre-0.18 noded that registered the name `noded` looks like; it is
+    /// not this node's broker (defence in depth): it must not turn
+    /// this compositor's props publishing off, nor rewrite its live-service
+    /// set. A `local` stamp is still honoured.
+    #[tokio::test]
+    async fn mesh_origin_noded_claims_do_not_steer_the_broker_state() {
+        let (ingress, source, _) = test_ingress();
+        let mut responders = JoinSet::new();
+        let permits = Arc::new(Semaphore::new(PORT_QUEUE_CAPACITY));
+        let long_permits = Arc::new(Semaphore::new(LONG_VERB_PERMITS));
+        let (reply_sender, mut replies) = tokio_mpsc::channel(4);
+        let reply_timeouts = Arc::new(AtomicU64::new(0));
+        let idle = |origin: &str| {
+            let mut idle = command("topic.idle", 1);
+            idle.from = "noded".into();
+            idle.id = None;
+            idle.headers
+                .insert("name".into(), "comp-nested.props.changed".into());
+            idle.headers.insert("broker_origin".into(), origin.into());
+            idle.headers
+                .insert("source_peer".into(), "beta.example".into());
+            idle
+        };
+        let body = json!({"path":"services.registered","old":["quoin"],"new":["noded"]});
+        let mut registry = command("props.changed", 2);
+        registry.from = "noded".into();
+        registry.id = None;
+        registry.body = body.to_string();
+        registry.args = body;
+        registry
+            .headers
+            .insert("topic".into(), REGISTRY_TOPIC.into());
+        registry
+            .headers
+            .insert("broker_origin".into(), "mesh".into());
+        // A `local` spelling beside a non-local one is still refused.
+        let mut mixed = idle("local");
+        mixed.headers.insert("Broker_Origin".into(), "mesh".into());
+        for forged in [idle("mesh"), idle("MESH"), mixed, registry] {
+            dispatch_incoming(
+                &ingress,
+                &mut responders,
+                &permits,
+                &long_permits,
+                &reply_sender,
+                &reply_timeouts,
+                "comp-nested",
+                forged,
+            );
+        }
+        assert!(
+            matches!(source.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "a mesh-origin noded claim reaches nothing"
+        );
+        assert!(replies.try_recv().is_err(), "and is never answered");
+
+        dispatch_incoming(
+            &ingress,
+            &mut responders,
+            &permits,
+            &long_permits,
+            &reply_sender,
+            &reply_timeouts,
+            "comp-nested",
+            idle("local"),
+        );
+        let Ok(PortCommand::WatchState { active, .. }) = source.try_recv() else {
+            panic!("the local broker's idle notice still lands");
+        };
+        assert!(!active);
     }
 
     #[test]

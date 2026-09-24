@@ -17,6 +17,7 @@ use smithay::{
     wayland::shell::wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer as WlrLayer},
 };
 
+use super::dmabuf_ledger::DmabufLedgerSnapshot;
 use super::presentation::SourcePresentationLeaves;
 use super::presentation_stats::{OutputStats, PresentationLeaves};
 use super::{
@@ -100,6 +101,9 @@ pub(crate) struct CompSnapshot {
     pub(crate) input: InputSnapshot,
     #[cfg(feature = "xwayland")]
     pub(crate) xwayland: XwaylandSnapshot,
+    /// Observed linux-dmabuf import outcomes (volatile; filled only in read
+    /// snapshots, so the diff snapshot never sees them change).
+    pub(crate) dmabuf: DmabufLedgerSnapshot,
     pub(crate) port: PortSnapshot,
     #[serde(skip)]
     full_tree: tokio::sync::OnceCell<SerialisedReply>,
@@ -380,22 +384,68 @@ pub(crate) struct XwaylandSnapshot {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct CornersSnapshot {
+    pub(crate) holders: bool,
     pub(crate) enabled: bool,
     pub(crate) deadzone_px: f64,
     pub(crate) dwell_ms: u64,
-    pub(crate) hold_ms: u64,
     pub(crate) velocity_max_px_s: f64,
+    pub(crate) affordance: bool,
+    pub(crate) discovery: bool,
+    /// Volatile, read snapshots only: per edge, the panel layers comp is
+    /// hiding and excluding from input itself because a conceal went
+    /// unapplied past its grace (a stalled shell).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) enforced: Option<EdgeCounts>,
+    /// Volatile, read snapshots only: per edge, the explicit holds
+    /// (`comp.panel.hold` acquisitions) comp currently records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) held: Option<EdgeCounts>,
+}
+
+/// One count per panel edge, summed over outputs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct EdgeCounts {
+    pub(crate) top: u64,
+    pub(crate) bottom: u64,
+    pub(crate) left: u64,
+    pub(crate) right: u64,
+}
+
+impl EdgeCounts {
+    pub(crate) fn edge_mut(&mut self, edge: &str) -> Option<&mut u64> {
+        match edge {
+            "top" => Some(&mut self.top),
+            "bottom" => Some(&mut self.bottom),
+            "left" => Some(&mut self.left),
+            "right" => Some(&mut self.right),
+            _ => None,
+        }
+    }
 }
 
 impl From<CornerConfig> for CornersSnapshot {
     fn from(config: CornerConfig) -> Self {
         Self {
+            holders: super::port_observation::HOLDER_PLANE_AVAILABLE,
             enabled: config.enabled,
             deadzone_px: config.deadzone_px,
             dwell_ms: config.dwell_ms,
-            hold_ms: config.hold_ms,
             velocity_max_px_s: config.velocity_max_px_s,
+            affordance: config.affordance,
+            discovery: config.discovery,
+            enforced: None,
+            held: None,
         }
+    }
+}
+
+impl CornersSnapshot {
+    fn select(&self, path: &[&str]) -> Option<Value> {
+        select_serialised(self, path)
+    }
+
+    fn node_kind(&self, path: &[&str]) -> Option<SnapshotNodeKind> {
+        serialised_node_kind(self, path)
     }
 }
 
@@ -441,6 +491,7 @@ impl CompSnapshot {
             "input" => self.input.select(tail),
             #[cfg(feature = "xwayland")]
             "xwayland" => self.xwayland.select(tail),
+            "dmabuf" => self.dmabuf.select(tail),
             "port" => self.port.select(tail),
             _ => None,
         }
@@ -465,6 +516,7 @@ impl CompSnapshot {
             "input" => self.input.node_kind(tail),
             #[cfg(feature = "xwayland")]
             "xwayland" => self.xwayland.node_kind(tail),
+            "dmabuf" => self.dmabuf.node_kind(tail),
             "port" => self.port.node_kind(tail),
             _ => None,
         }
@@ -588,6 +640,7 @@ flat_snapshot!(
 );
 #[cfg(feature = "xwayland")]
 flat_snapshot!(XwaylandSnapshot, enabled, persist_path, display);
+flat_snapshot!(DmabufLedgerSnapshot, accepted, failed, failures);
 flat_snapshot!(OutputWorkspaceSnapshot, current);
 
 impl WorkspacesSnapshot {
@@ -691,14 +744,6 @@ impl FocusSnapshot {
 }
 flat_snapshot!(DecorationSnapshot, enabled, style);
 flat_snapshot!(BindingsSnapshot, enabled, profile, table);
-flat_snapshot!(
-    CornersSnapshot,
-    enabled,
-    deadzone_px,
-    dwell_ms,
-    hold_ms,
-    velocity_max_px_s
-);
 flat_snapshot!(
     PortSnapshot,
     level,
@@ -1249,6 +1294,7 @@ pub(super) fn snapshot(state: &WaylandState, context: &SnapshotContext) -> Optio
                 .display_number
                 .map(|number| Arc::from(format!(":{number}"))),
         },
+        dmabuf: DmabufLedgerSnapshot::default(),
         port: PortSnapshot {
             level: "L2",
             event_seq: context.event_seq.load(Ordering::Acquire),
@@ -1320,6 +1366,12 @@ pub(super) fn read_snapshot(
         .unwrap_or_else(|e| e.into_inner())
         .counters;
     snapshot.occlusion.counters = counters;
+    if scopes.wants("dmabuf") {
+        snapshot.dmabuf = state.dmabuf_ledger.snapshot();
+    }
+    let (enforced, held) = super::port_observation::panel_edge_counts(state);
+    snapshot.input.corners.enforced = Some(enforced);
+    snapshot.input.corners.held = Some(held);
     let stats = &state.presentation.stats;
     for (key, window) in &mut snapshot.windows {
         if !scopes.wants(&format!("windows.{key}.presentation")) {
@@ -1988,13 +2040,13 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
     descriptor!(
         &[L("windows"), S, L("window_x")],
         Number,
-        "Window-geometry x origin (x/y are the buffer origin, CSD shadow included)",
+        "Window-geometry x origin (x/y are the buffer origin, CSD shadow included); the buffer stands on a whole physical pixel, so this can be fractional at a fractional scale (1.2 at 2.5x) and is an integer at scale 1",
         format = "logical_px"
     ),
     descriptor!(
         &[L("windows"), S, L("window_y")],
         Number,
-        "Window-geometry y origin",
+        "Window-geometry y origin; fractional at a fractional scale like window_x, an integer at scale 1",
         format = "logical_px"
     ),
     descriptor!(
@@ -2107,6 +2159,11 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         "Compiled keybinding chord/action rows"
     ),
     descriptor!(
+        &[L("input"), L("corners"), L("holders")],
+        Bool,
+        "Whether the panel holder control plane is available"
+    ),
+    descriptor!(
         &[L("input"), L("corners"), L("enabled")],
         Bool,
         "Whether compositor hot-corner detection is enabled",
@@ -2127,18 +2184,63 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         range = "0..=5000"
     ),
     descriptor!(
-        &[L("input"), L("corners"), L("hold_ms")],
-        Number,
-        "Right-button corner hold threshold in milliseconds",
-        mutable,
-        range = "1..=5000"
-    ),
-    descriptor!(
         &[L("input"), L("corners"), L("velocity_max_px_s")],
         Number,
         "Maximum corner-entry velocity in logical pixels per second",
         mutable,
         range = "1.0..=20000.0"
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("affordance")],
+        Bool,
+        "Whether comp draws the hotspot hover reveal, release flash and discovery flash",
+        mutable
+    ),
+    descriptor!(
+        &[L("input"), L("corners"), L("discovery")],
+        Bool,
+        "Whether every hotspot flashes slowly until the first corner reveal",
+        mutable
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("top")],
+        Number,
+        "Top-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("bottom")],
+        Number,
+        "Bottom-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("left")],
+        Number,
+        "Left-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("enforced"), L("right")],
+        Number,
+        "Right-edge shell layers comp hides and excludes from input for an unapplied conceal; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("top")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for top-edge panels; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("bottom")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for bottom-edge panels; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("left")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for left-edge panels; read-only, never diffed"
+    ),
+    volatile!(
+        [L("input"), L("corners"), L("held"), L("right")],
+        Number,
+        "Explicit comp.panel.hold holds recorded for right-edge panels; read-only, never diffed"
     ),
     descriptor!(
         &[L("input"), L("host"), L("passthrough")],
@@ -2176,6 +2278,28 @@ pub(crate) static DESCRIPTORS: &[DescribeEntry] = &[
         String,
         "The X display this compositor's Xwayland serves (\":N\"); null until the \
          generation is ready and again after it goes down"
+    ),
+    // Observed linux-dmabuf imports (TODO-comp C4): what the driver actually
+    // accepted, not what it advertised. In memory only — a comp restart
+    // starts from zero — and never diffed (a refusal storm would flood
+    // props.changed).
+    volatile!(
+        [L("dmabuf"), L("accepted")],
+        Number,
+        "linux-dmabuf imports comp accepted since this compositor started (reset on restart)"
+    ),
+    volatile!(
+        [L("dmabuf"), L("failed")],
+        Number,
+        "linux-dmabuf imports comp refused since this compositor started (reset on restart)"
+    ),
+    volatile!(
+        [L("dmabuf"), L("failures")],
+        List,
+        "The newest 16 refused imports, oldest first: {format (fourcc), modifier (hex), \
+         reason (invalid_metadata|descriptor_dup_failed|queue_full|worker_stopped|\
+         vulkan_rejected|probe_panicked|probe_retired), detail, at_us (CLOCK_MONOTONIC)}; \
+         not persisted"
     ),
     // Presentation statistics are volatile: served by get/list/describe,
     // never diffed into props.changed (a watched 60 Hz client would flood
@@ -2532,12 +2656,20 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// Paths `props.changed` never reports: presentation statistics and the
-/// content-source registry change every frame.
+/// content-source registry change every frame; the holder-plane counts
+/// (`input.corners.enforced.*`, `input.corners.held.*`) are read-only
+/// diagnostics served only by reads.
 pub(crate) fn volatile_path(path: &str) -> bool {
     path == "sources"
         || path.starts_with("sources.")
+        || path == "input.corners.enforced"
+        || path.starts_with("input.corners.enforced.")
+        || path == "input.corners.held"
+        || path.starts_with("input.corners.held.")
         || path.split('.').any(|segment| segment == "presentation")
         || path.starts_with("occlusion.counters.")
+        || path == "dmabuf"
+        || path.starts_with("dmabuf.")
 }
 
 pub(super) fn service_requests(state: &mut WaylandState) {
@@ -3179,7 +3311,12 @@ mod tests {
                 }],
             },
             input: InputSnapshot {
-                corners: CornerConfig::default().into(),
+                // A read snapshot, with the volatile holder-plane counts.
+                corners: CornersSnapshot {
+                    enforced: Some(EdgeCounts { left: 1, ..EdgeCounts::default() }),
+                    held: Some(EdgeCounts::default()),
+                    ..CornersSnapshot::from(CornerConfig::default())
+                },
                 host: Some(HostInputSnapshot { passthrough: true }),
             },
             #[cfg(feature = "xwayland")]
@@ -3187,6 +3324,18 @@ mod tests {
                 enabled: true,
                 persist_path: Arc::from("/tmp/fixture/etc/comp/xwayland-enabled.comp-nested"),
                 display: Some(Arc::from(":3")),
+            },
+            // A read snapshot, with the volatile import ledger.
+            dmabuf: DmabufLedgerSnapshot {
+                accepted: 5,
+                failed: 1,
+                failures: vec![super::super::dmabuf_ledger::DmabufFailureRecord {
+                    format: "AR24".into(),
+                    modifier: "0x0000000000000000".into(),
+                    reason: "vulkan_rejected",
+                    detail: "fixture".into(),
+                    at_us: 9,
+                }],
             },
             port: PortSnapshot {
                 level: "L2",
@@ -3200,6 +3349,16 @@ mod tests {
             },
             full_tree: tokio::sync::OnceCell::new(),
         }
+    }
+
+    #[test]
+    fn corner_hold_property_is_absent_from_snapshot_and_schema() {
+        let snapshot = fixture();
+        assert_eq!(snapshot.select(&["input", "corners", "hold_ms"]), None);
+        assert_eq!(snapshot.node_kind(&["input", "corners", "hold_ms"]), None);
+        let corners = snapshot.select(&["input", "corners"]).unwrap();
+        assert!(corners.get("hold_ms").is_none());
+        assert!(describe(&snapshot, &PropPath::new("input.corners.hold_ms").unwrap()).is_none());
     }
 
     #[test]
@@ -3217,16 +3376,19 @@ mod tests {
         // 0.59.0 adds the four workspace leaves: the window's workspace,
         // the count, and the current workspace by default output and by
         // output key.
+        // Chunk 19 adds the two affordance leaves, `input.corners.affordance`
+        // and `input.corners.discovery`.
         #[cfg(feature = "xwayland")]
-        assert_eq!(mutable.len(), 13);
+        assert_eq!(mutable.len(), 14);
         #[cfg(not(feature = "xwayland"))]
-        assert_eq!(mutable.len(), 12);
+        assert_eq!(mutable.len(), 13);
         for path in [
             "input.corners.enabled",
             "input.corners.deadzone_px",
             "input.corners.dwell_ms",
-            "input.corners.hold_ms",
             "input.corners.velocity_max_px_s",
+            "input.corners.affordance",
+            "input.corners.discovery",
             "input.host.passthrough",
             "windows.s2.band",
             "windows.s2.minimized",
@@ -3285,6 +3447,38 @@ mod tests {
     }
 
     #[test]
+    fn capability_leaf_reflects_holder_plane() {
+        let snapshot = fixture();
+        assert_eq!(snapshot.select(&["input", "corners", "holders"]),
+            Some(json!(super::super::port_observation::HOLDER_PLANE_AVAILABLE)));
+        // Quoin goes command-driven on this leaf: it is true only because
+        // holder tracking, the conceal timer, enforcement on a stalled shell,
+        // disconnect cleanup and resynchronisation all exist (chunk 15).
+        assert_eq!(snapshot.select(&["input", "corners", "holders"]), Some(json!(true)));
+        // The enforcement and hold counts are read-only, volatile leaves.
+        assert_eq!(snapshot.select(&["input", "corners", "enforced", "left"]), Some(json!(1)));
+        for path in ["input.corners.enforced.left", "input.corners.held.top"] {
+            let descriptor: Value = serde_json::from_str(
+                &describe(&snapshot, &PropPath::new(path).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(descriptor["mutable"], false, "{path}");
+            assert_eq!(descriptor["volatile"], true, "{path}");
+            assert!(matches!(
+                super::super::port_observation::validate_set_request(path, &json!(0)),
+                Err(super::super::port_observation::SetValidationError::ReadOnly)
+            ), "{path}");
+        }
+        let path = PropPath::new("input.corners.holders").unwrap();
+        let descriptor: Value = serde_json::from_str(&describe(&snapshot, &path).unwrap()).unwrap();
+        assert_eq!(descriptor["mutable"], false);
+        assert_eq!(descriptor["type"], "bool");
+        assert!(matches!(super::super::port_observation::validate_set_request(
+            "input.corners.holders", &json!(false)),
+            Err(super::super::port_observation::SetValidationError::ReadOnly)));
+    }
+
+    #[test]
     fn descriptor_table_and_serialised_fixture_have_exact_parity() {
         let tree = serde_json::to_value(fixture()).expect("fixture serialises");
         let leaves = flattened_paths(&tree);
@@ -3334,7 +3528,9 @@ mod tests {
             assert_eq!(descriptor.volatile, volatile_path(&path), "{path}");
             volatile += usize::from(descriptor.volatile);
         }
-        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4);
+        // + 8: the four `input.corners.enforced.*` and four `held.*` counts.
+        // + 3: the `dmabuf.*` import ledger.
+        assert_eq!(volatile, 13 + 8 + 4 + 19 + 4 + 8 + 3);
     }
 
     #[test]
@@ -3361,6 +3557,43 @@ mod tests {
             ["vsync", "hw_clock", "hw_completion"]
         );
         assert_eq!(presentation_flag_names(0x8), ["zero_copy"]);
+    }
+
+    #[test]
+    fn dmabuf_import_ledger_is_served_read_only_and_volatile() {
+        let snapshot = fixture();
+        let describe_json = |path: &str| {
+            let body = describe(&snapshot, &PropPath::new(path).unwrap())
+                .unwrap_or_else(|| panic!("describe {path}"));
+            serde_json::from_str::<Value>(&body).unwrap()
+        };
+        for path in ["dmabuf.accepted", "dmabuf.failed", "dmabuf.failures"] {
+            let body = describe_json(path);
+            assert_eq!(body["volatile"], true, "{path}");
+            assert_eq!(body["mutable"], false, "{path}");
+            assert!(volatile_path(path), "{path}");
+        }
+        assert_eq!(describe_json("dmabuf.failures")["type"], "list");
+        assert_eq!(snapshot.select(&["dmabuf", "accepted"]), Some(json!(5)));
+        assert_eq!(snapshot.select(&["dmabuf", "failed"]), Some(json!(1)));
+        assert_eq!(
+            snapshot.select(&["dmabuf", "failures"]),
+            Some(json!([{
+                "format": "AR24",
+                "modifier": "0x0000000000000000",
+                "reason": "vulkan_rejected",
+                "detail": "fixture",
+                "at_us": 9
+            }]))
+        );
+        let leaves = snapshot
+            .leaf_paths()
+            .into_iter()
+            .map(|path| path.as_str().to_owned())
+            .collect::<Vec<_>>();
+        for path in ["dmabuf.accepted", "dmabuf.failed", "dmabuf.failures"] {
+            assert!(leaves.iter().any(|leaf| leaf == path), "{path} listed");
+        }
     }
 
     #[test]

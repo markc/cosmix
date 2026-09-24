@@ -1,5 +1,8 @@
 //! Edge-generic CTK chrome from
-//! `_plan/2026-08-06-cosmix-shell-corner-panels.md` §E1, §E2 and §E5.
+//! `_plan/2026-08-06-cosmix-shell-corner-panels.md` §E1, §E2 and §E5, plus
+//! the carousel chrome of `_doc/2026-09-22-quoin-panel-behavior-design.md`
+//! §7–§8: chevrons and title per edge layout, inset from the panel ends by
+//! the configured hotspot size, with slide-only page motion.
 //!
 //! The chrome owns no shell semantics and performs no window queries. A host
 //! supplies four mount entities; every visual update is driven only by the
@@ -9,26 +12,32 @@
 //! only docked motion with [`UiTransform::translation`].
 
 use accesskit::Role;
+pub mod corner_menu;
 use std::error::Error;
 use std::fmt::{Display as FmtDisplay, Formatter};
+use std::time::Duration;
 
 use bevy::a11y::AccessibilityNode;
 use bevy::app::{App, Plugin, Update};
 use bevy::ecs::observer::On;
 use bevy::ecs::system::SystemParam;
+use bevy::input::ButtonState;
+use bevy::input::keyboard::KeyboardInput;
 use bevy::input_focus::InputFocus;
 use bevy::input_focus::tab_navigation::{TabGroup, TabIndex};
 use bevy::picking::Pickable;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
-use bevy::ui::{InteractionDisabled, UiRect, Val2, percent, px};
+use bevy::time::Real;
+use bevy::ui::{InteractionDisabled, UiRect, Val, Val2, percent, px};
 use bevy::ui_widgets::{Activate, Button as WidgetButton, ButtonPlugin as WidgetButtonPlugin};
 use bevy::window::RequestRedraw;
 use ctk::theme::{Mode, Scheme, ThemeSpec, ThemeState, tokens};
 
 use crate::core::{Carousel, CarouselError, Edge, Orientation, PanelInput, PanelMode};
 use crate::runtime::{
-    CarouselInput, ShellCommand, ShellCommandKind, ShellFrame, ShellFrameState, ShellRuntimeSet,
+    CarouselInput, KeyboardCommand, PageChange, ShellCommand, ShellCommandKind, ShellFrame,
+    ShellFrameState, ShellRuntimeSet, ShellStagedIngress,
 };
 
 /// The four host-owned attachment points. Chrome assumes nothing about their
@@ -340,6 +349,67 @@ pub struct QuoinResizeGrip(pub Edge);
 
 const RESIZE_GRIP_PX: f32 = 6.0;
 
+/// Carousel slide duration — panel doc §8's `duration-slow` (the DCS
+/// starting point, tuned in use).
+pub const CAROUSEL_SLIDE: Duration = Duration::from_millis(300);
+/// Carousel cleanup deadline (panel doc §8): slightly longer than the slide
+/// so the outgoing page retires only after the slide has completed.
+pub const CAROUSEL_CLEANUP: Duration = Duration::from_millis(320);
+
+/// The effective carousel slide duration: [`CAROUSEL_SLIDE`], collapsed to
+/// zero under reduced motion. Panel doc §8: a zero duration is handled
+/// directly — DCS's `0.01ms` exists only because browsers never fire
+/// `transitionend` at zero, and is not imported here.
+pub const fn carousel_slide_duration(reduced_motion: bool) -> Duration {
+    if reduced_motion {
+        Duration::ZERO
+    } else {
+        CAROUSEL_SLIDE
+    }
+}
+
+/// The compositor's corner-hotspot size in logical pixels — comp's
+/// `input.corners.deadzone_px`, mirrored over the Bus (decided 2026-09-23,
+/// refactor open question 4: comp owns hotspots, so its configured deadzone
+/// is the one authority). The Quoin host's Bus service observes the property
+/// and replaces this resource; the fallback default mirrors comp's own
+/// default deadzone and applies only until the first observation arrives,
+/// or for as long as no cosmix comp is present.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct QuoinHotspotSize(pub f32);
+
+/// Mirrors comp's default in `cosmix-comp/src/protocol/corner.rs` (10 logical
+/// pixels, shell design §2), until the first Bus observation or while no
+/// cosmix comp is present. Comp's `quoin_hotspot_mirror_matches_default_deadzone`
+/// test reads this literal and fails if the two drift.
+pub const DEFAULT_COMP_HOTSPOT_PX: f32 = 10.0;
+
+impl Default for QuoinHotspotSize {
+    fn default() -> Self {
+        Self(DEFAULT_COMP_HOTSPOT_PX)
+    }
+}
+
+/// Accessibility seam for carousel motion (panel doc §8): reduced motion
+/// collapses the slide to zero. Hosts insert this when the user asks for
+/// reduced motion; the default is full motion.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct QuoinReducedMotion(pub bool);
+
+/// One edge's in-flight carousel slide (panel doc §8).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QuoinSlide {
+    /// The page sliding out, kept displayed until cleanup retires it.
+    outgoing: String,
+    /// Travel direction along the panel's long axis.
+    forward: bool,
+    started_at: Duration,
+}
+
+/// Chrome-side carousel slide state, indexed by [`Edge::index`].
+#[derive(Resource, Default)]
+struct QuoinCarouselSlides([Option<QuoinSlide>; 4]);
+
 #[derive(Component)]
 struct QuoinPanelChrome {
     edge: Edge,
@@ -349,14 +419,25 @@ struct QuoinPanelChrome {
 
 #[derive(Component)]
 struct QuoinPanelParts {
+    /// Side panels: the `< [title] >` header bar at the top. Horizontal
+    /// panels: the centred title-and-dots overlay across the content strip.
     header: Entity,
-    pin_label: Entity,
+    /// `[previous, next]` chevron buttons. Side panels keep them in the
+    /// header; horizontal panels pin them at the two panel ends. Hidden with
+    /// the header while the active page is chromeless, and on an edge with a
+    /// single page. They alone carry the hotspot inset.
+    chevrons: [Entity; 2],
     title_label: Entity,
+    dots_host: Entity,
+    page_host: Entity,
     page_titles: Vec<(String, String)>,
     page_chromeless: Vec<(String, bool)>,
     page_wrappers: Vec<(String, Entity)>,
     dot_labels: Vec<(String, Entity)>,
     controls: Vec<Entity>,
+    /// The active page id this panel last presented; diffs against the frame
+    /// to detect page switches and pick their motion kind.
+    presented_page: Option<String>,
 }
 
 #[derive(SystemParam)]
@@ -366,12 +447,13 @@ struct PresentPanelQueries<'w, 's> {
         's,
         (
             &'static QuoinPanelChrome,
-            &'static QuoinPanelParts,
+            &'static mut QuoinPanelParts,
             &'static mut Node,
             &'static mut UiTransform,
         ),
     >,
     nodes: Query<'w, 's, &'static mut Node, Without<QuoinPanelChrome>>,
+    transforms: Query<'w, 's, &'static mut UiTransform, Without<QuoinPanelChrome>>,
     labels: Query<'w, 's, &'static mut Text>,
     tab_indices: Query<'w, 's, &'static mut TabIndex>,
     disabled_controls: Query<'w, 's, Has<InteractionDisabled>>,
@@ -391,7 +473,6 @@ enum QuoinAction {
     Scheme(Scheme),
     Intent,
     Quit,
-    TogglePin,
     Previous,
     Next,
     Select(String),
@@ -415,13 +496,22 @@ impl Plugin for QuoinChromePlugin {
             app.add_plugins(WidgetButtonPlugin);
         }
         app.init_resource::<InputFocus>()
+            .init_resource::<QuoinCarouselSlides>()
+            .init_resource::<QuoinHotspotSize>()
+            .init_resource::<QuoinReducedMotion>()
             .add_message::<QuoinSchemeSelected>()
+            // Escape reads key messages; a host's InputPlugin registers the
+            // same (idempotent) message type.
+            .add_message::<KeyboardInput>()
+            // Chrome requests redraws even in hosts without WindowPlugin.
+            .add_message::<RequestRedraw>()
             .add_observer(on_activate)
             .add_systems(
                 Update,
                 (panel_hover, escape_panels)
                     .chain()
-                    .in_set(ShellRuntimeSet::Input),
+                    .in_set(ShellRuntimeSet::Input)
+                    .after(ShellStagedIngress),
             )
             .add_systems(
                 Update,
@@ -467,7 +557,8 @@ pub fn mount_page(world: &mut World, edge: Edge, id: &str, title: &str, content:
     mount_page_with(world, edge, id, title, content, false)
 }
 
-/// Mount or update a page, optionally hiding the header while it is active.
+/// Register or update content without revealing or selecting it. Optionally
+/// hide the header when the page is explicitly selected later.
 pub fn mount_page_with(
     world: &mut World,
     edge: Edge,
@@ -476,13 +567,17 @@ pub fn mount_page_with(
     content: Entity,
     chromeless: bool,
 ) -> bool {
-    let mut query = world.query::<(Entity, &QuoinPanelChrome, &Children)>();
-    let Some((panel, host)) = query
+    let mut query = world.query::<(Entity, &QuoinPanelChrome)>();
+    let Some(panel) = query
         .iter(world)
-        .find(|(_, chrome, _)| chrome.edge == edge)
-        .and_then(|(entity, _, children)| children.get(1).map(|host| (entity, *host)))
+        .find(|(_, chrome)| chrome.edge == edge)
+        .map(|(entity, _)| entity)
     else {
         return false;
+    };
+    let (host, dots) = {
+        let parts = world.get::<QuoinPanelParts>(panel).unwrap();
+        (parts.page_host, parts.dots_host)
     };
     let exists = world
         .get::<QuoinPanelParts>(panel)
@@ -506,18 +601,21 @@ pub fn mount_page_with(
         return true;
     }
     let wrapper = world
-        .spawn(Node {
-            width: percent(100),
-            height: percent(100),
-            min_width: px(0),
-            display: Display::None,
-            ..default()
-        })
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: px(0),
+                top: px(0),
+                width: percent(100),
+                height: percent(100),
+                display: Display::None,
+                ..default()
+            },
+            UiTransform::default(),
+        ))
         .add_child(content)
         .id();
     world.entity_mut(host).add_child(wrapper);
-    let header = world.get::<QuoinPanelParts>(panel).unwrap().header;
-    let dots = world.get::<Children>(header).unwrap()[3];
     let mut queue = bevy::ecs::world::CommandQueue::default();
     let mut commands = Commands::new(&mut queue, world);
     let label = text(&mut commands, "○", 11.0, true);
@@ -536,17 +634,18 @@ pub fn mount_page_with(
     parts.page_titles.push((id.into(), title.into()));
     parts.page_chromeless.push((id.into(), chromeless));
     parts.page_wrappers.push((id.into(), wrapper));
-    let ids = parts
-        .page_wrappers
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect();
-    crate::runtime::set_shell_pages(world, edge, ids, Some(id));
+    crate::runtime::register_shell_page(world, edge, id);
     true
 }
 
 /// Remove a dynamic page and repair the carousel selection.
 pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
+    unmount_page_content(world, edge, id);
+    crate::runtime::remove_shell_page(world, edge, id);
+}
+
+/// Tear down chrome after a registry removal has already applied the landing.
+pub fn unmount_page_content(world: &mut World, edge: Edge, id: &str) {
     let mut query = world.query::<(Entity, &QuoinPanelChrome)>();
     let Some(panel) = query
         .iter(world)
@@ -570,11 +669,6 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
     parts.page_titles.retain(|(page, _)| page != id);
     parts.page_chromeless.retain(|(page, _)| page != id);
     parts.page_wrappers.retain(|(page, _)| page != id);
-    let ids = parts
-        .page_wrappers
-        .iter()
-        .map(|(id, _)| id.clone())
-        .collect();
     if let Some(label) = dot_label
         && let Some(parent) = world.get::<ChildOf>(label).map(ChildOf::parent)
     {
@@ -588,7 +682,6 @@ pub fn unmount_page(world: &mut World, edge: Edge, id: &str) {
     if let Some(wrapper) = wrapper {
         world.despawn(wrapper);
     }
-    crate::runtime::set_shell_pages(world, edge, ids, None);
 }
 
 fn spawn_panel(
@@ -603,14 +696,6 @@ fn spawn_panel(
         .iter()
         .map(|page| (page.id.clone(), page.title.clone()))
         .collect::<Vec<_>>();
-    let pin_label = text(commands, "◇", 15.0, false);
-    let pin = button(
-        commands,
-        edge,
-        QuoinAction::TogglePin,
-        pin_label,
-        "Pin panel",
-    );
     let previous_label = text(commands, "‹", 17.0, false);
     let previous = button(
         commands,
@@ -639,7 +724,7 @@ fn spawn_panel(
             ..default()
         })
         .id();
-    let mut controls = vec![pin, previous, next];
+    let mut controls = vec![previous, next];
     let mut dot_labels = Vec::with_capacity(pages.len());
     for page in &pages {
         let label = text(commands, "○", 11.0, true);
@@ -655,23 +740,52 @@ fn spawn_panel(
         dot_labels.push((page.id.clone(), label));
     }
 
-    let header = commands
-        .spawn((
-            Node {
-                min_width: px(0),
-                min_height: px(34),
-                flex_shrink: 0.0,
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                justify_content: JustifyContent::Center,
-                column_gap: px(4),
-                padding: UiRect::axes(px(5), px(3)),
-                ..default()
-            },
-            bevy::feathers::theme::ThemeBackgroundColor(tokens::MASTER_PANEL),
-        ))
-        .add_children(&[pin, title_label, previous, dots, next])
-        .id();
+    // Panel doc §7: side panels carry a `< [title] >` header at the top with
+    // the same prev/next; horizontal panels leave the strip to content, with
+    // the chevrons at the two panel ends and the title and dots as a centred
+    // overlay.
+    let horizontal = edge.orientation() == Orientation::Horizontal;
+    let header = if horizontal {
+        commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: px(0),
+                    width: percent(100),
+                    height: percent(100),
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    column_gap: px(4),
+                    ..default()
+                },
+                // The strip belongs to content: only the title and the dots
+                // pick, so the overlay itself must not.
+                Pickable::IGNORE,
+                ZIndex(1),
+            ))
+            .add_children(&[title_label, dots])
+            .id()
+    } else {
+        commands
+            .spawn((
+                Node {
+                    min_width: px(0),
+                    min_height: px(34),
+                    flex_shrink: 0.0,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    justify_content: JustifyContent::Center,
+                    column_gap: px(4),
+                    padding: side_header_padding(0.0),
+                    ..default()
+                },
+                bevy::feathers::theme::ThemeBackgroundColor(tokens::MASTER_PANEL),
+            ))
+            .add_children(&[previous, title_label, dots, next])
+            .id()
+    };
 
     let page_host = commands
         .spawn(Node {
@@ -685,23 +799,37 @@ fn spawn_panel(
     let mut page_wrappers = Vec::with_capacity(pages.len());
     for (index, page) in pages.into_iter().enumerate() {
         let wrapper = commands
-            .spawn(Node {
-                width: percent(100),
-                height: percent(100),
-                display: if index == 0 {
-                    Display::Flex
-                } else {
-                    Display::None
+            .spawn((
+                // Stacked pages (panel doc §8): the slide translates two
+                // wrappers inside the same clipped rectangle, so every
+                // wrapper is absolutely positioned at the host's full size
+                // and rests at translation zero.
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(0),
+                    top: px(0),
+                    width: percent(100),
+                    height: percent(100),
+                    display: if index == 0 {
+                        Display::Flex
+                    } else {
+                        Display::None
+                    },
+                    ..default()
                 },
-                ..default()
-            })
+                UiTransform::default(),
+            ))
             .add_child(page.content)
             .id();
         commands.entity(page_host).add_child(wrapper);
         page_wrappers.push((page.id, wrapper));
     }
 
-    let horizontal = edge.orientation() == Orientation::Horizontal;
+    let root_children = if horizontal {
+        vec![previous, page_host, next, header]
+    } else {
+        vec![header, page_host]
+    };
     let root = commands
         .spawn((
             Node {
@@ -731,16 +859,19 @@ fn spawn_panel(
             },
             QuoinPanelParts {
                 header,
-                pin_label,
+                chevrons: [previous, next],
                 title_label,
+                dots_host: dots,
+                page_host,
                 page_titles,
                 page_chromeless: Vec::new(),
                 page_wrappers,
                 dot_labels,
                 controls,
+                presented_page: None,
             },
         ))
-        .add_children(&[header, page_host])
+        .add_children(&root_children)
         .id();
     let grip = commands
         .spawn((
@@ -803,6 +934,47 @@ fn panel_border(edge: Edge) -> UiRect {
         Edge::Bottom => UiRect::top(px(1)),
         Edge::Right => UiRect::left(px(1)),
         Edge::Top => UiRect::bottom(px(1)),
+    }
+}
+
+/// Inset of the chevrons from the panel ends (panel doc §7): the extreme ends
+/// of a horizontal panel and the top end of a side panel sit under a corner
+/// hotspot, where a control is unclickable. Only the chevrons move — page
+/// content always fills the panel — and an edge with a single page has no
+/// chevrons, so no inset. Presentation re-reads the observed size every frame.
+fn chevron_inset(size: QuoinHotspotSize, paging: bool) -> f32 {
+    if paging { size.0 } else { 0.0 }
+}
+
+/// Horizontal panels: `[previous, next]` margins holding the chevrons off
+/// the two panel ends by `inset`.
+fn chevron_margins(inset: f32) -> [UiRect; 2] {
+    [UiRect::left(px(inset)), UiRect::right(px(inset))]
+}
+
+/// Side panels: the `< [title] >` header's padding, its top grown by `inset`
+/// so the chevrons inside it clear the corner hotspot while the header's own
+/// background still reaches the panel end.
+fn side_header_padding(inset: f32) -> UiRect {
+    UiRect {
+        left: px(5),
+        right: px(5),
+        top: px(3.0 + inset),
+        bottom: px(3),
+    }
+}
+
+/// Slide translation for one page wrapper as a percentage of its own size
+/// along the panel's long axis (panel doc §8, constant-speed like the panel
+/// motion): the incoming page travels from beyond its edge to rest, the
+/// outgoing from rest out the opposite edge, in lockstep.
+fn slide_translation(edge: Edge, forward: bool, progress: f32, outgoing: bool) -> Val2 {
+    let sign = if forward { 1.0 } else { -1.0 };
+    let fraction = if outgoing { -progress } else { 1.0 - progress };
+    let offset = Val::Percent(sign * fraction * 100.0);
+    match edge.orientation() {
+        Orientation::Horizontal => Val2::new(offset, Val::ZERO),
+        Orientation::Vertical => Val2::new(Val::ZERO, offset),
     }
 }
 
@@ -1104,10 +1276,6 @@ fn on_activate(
             return;
         }
         QuoinAction::Quit => ShellCommandKind::Quit,
-        QuoinAction::TogglePin => ShellCommandKind::Panel {
-            edge: control.edge,
-            input: PanelInput::PinToggle,
-        },
         QuoinAction::Previous => ShellCommandKind::Carousel {
             edge: control.edge,
             input: CarouselInput::Previous,
@@ -1157,36 +1325,52 @@ fn panel_hover(
 }
 
 fn escape_panels(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut keys: MessageReader<KeyboardInput>,
     frame: Res<ShellFrameState>,
     time: Res<Time<Real>>,
     mut commands: MessageWriter<ShellCommand>,
 ) {
-    if !keys.just_pressed(KeyCode::Escape) {
+    // Keys reach chrome only while a shell surface holds the keyboard, so
+    // Escape here is never an application's. The model picks the focused
+    // panel, hides it only if transient and gives focus back (§4.3). Only a
+    // fresh press counts: repeats and keys already held when focus arrived
+    // (which the host marks `repeat`) never do.
+    let pressed = keys.read().any(|key| {
+        key.key_code == KeyCode::Escape && key.state == ButtonState::Pressed && !key.repeat
+    });
+    if !pressed {
         return;
     }
-    for edge in Edge::ALL {
-        if frame.0.panel(edge).mapped {
-            commands.write(ShellCommand {
-                output: frame.0.geometry.output.clone(),
-                at: time.elapsed(),
-                kind: ShellCommandKind::Panel {
-                    edge,
-                    input: PanelInput::Escape,
-                },
-            });
-        }
-    }
+    commands.write(ShellCommand {
+        output: frame.0.geometry.output.clone(),
+        at: time.elapsed(),
+        kind: ShellCommandKind::Keyboard(KeyboardCommand::Escape),
+    });
 }
+
+/// Optional presentation settings `present_panels` reads when present.
+type PresentSettings<'w> = (
+    Option<Res<'w, QuoinHotspotSize>>,
+    Option<Res<'w, QuoinReducedMotion>>,
+    Option<Res<'w, QuoinCommittedMotionModes>>,
+);
 
 fn present_panels(
     mut commands: Commands,
     frame: Res<ShellFrameState>,
-    committed_modes: Option<Res<QuoinCommittedMotionModes>>,
+    (hotspot, reduced_motion, committed_modes): PresentSettings,
+    (time, mut slides, mut redraw): (
+        Res<Time<Real>>,
+        ResMut<QuoinCarouselSlides>,
+        MessageWriter<RequestRedraw>,
+    ),
     mut focus: ResMut<InputFocus>,
     mut queries: PresentPanelQueries,
 ) {
-    for (chrome, parts, mut node, mut transform) in &mut queries.panels {
+    let now = time.elapsed();
+    let duration =
+        carousel_slide_duration(reduced_motion.is_some_and(|reduced_motion| reduced_motion.0));
+    for (chrome, mut parts, mut node, mut transform) in &mut queries.panels {
         let panel = frame.0.panel(chrome.edge);
         let chromeless = parts
             .page_chromeless
@@ -1201,7 +1385,18 @@ fn present_panels(
         if node.display != display {
             node.display = display;
         }
+        // Chevrons page between pages: an edge with one page has none, and
+        // so no inset (panel doc §7). The inset is re-read every frame so an
+        // observed comp deadzone moves the chevrons live; page content is
+        // never inset.
+        // The model's carousel, not the chrome's wrapper list: chevrons walk
+        // the carousel, and a mounted page the carousel refused (an empty id)
+        // has a wrapper but nothing to page to.
+        let paging = panel.page_ids.len() > 1;
+        let inset = chevron_inset(hotspot.as_deref().copied().unwrap_or_default(), paging);
         for control in &parts.controls {
+            let controls_enabled =
+                controls_enabled && (paging || !parts.chevrons.contains(control));
             if let Ok(mut tab_index) = queries.tab_indices.get_mut(*control) {
                 let index = if controls_enabled { 0 } else { -1 };
                 if tab_index.0 != index {
@@ -1242,16 +1437,6 @@ fn present_panels(
         if transform.translation != translation {
             transform.translation = translation;
         }
-        if let Ok(mut label) = queries.labels.get_mut(parts.pin_label) {
-            let text = match panel.mode {
-                PanelMode::Hidden => "◇",
-                PanelMode::Pinned => "◆",
-                PanelMode::Docked => "▣",
-            };
-            if label.0 != text {
-                label.0 = text.to_owned();
-            }
-        }
         if let Some(title) = panel.active_page_id.as_deref().and_then(|active| {
             parts
                 .page_titles
@@ -1271,18 +1456,114 @@ fn present_panels(
             if header.display != display {
                 header.display = display;
             }
+            if chrome.edge.orientation() == Orientation::Vertical {
+                let padding = side_header_padding(inset);
+                if header.padding != padding {
+                    header.padding = padding;
+                }
+            }
         }
+        // Chromeless pages hide the whole carousel furniture, and a single
+        // page has nothing to page to: on horizontal panels the chevrons sit
+        // outside the header and hide with it.
+        let margins = chevron_margins(inset);
+        for (chevron, margin) in parts.chevrons.into_iter().zip(margins) {
+            if let Ok(mut chevron_node) = queries.nodes.get_mut(chevron) {
+                let display = if chromeless || !paging {
+                    Display::None
+                } else {
+                    Display::Flex
+                };
+                if chevron_node.display != display {
+                    chevron_node.display = display;
+                }
+                if chrome.edge.orientation() == Orientation::Horizontal
+                    && chevron_node.margin != margin
+                {
+                    chevron_node.margin = margin;
+                }
+            }
+        }
+        // Carousel motion (panel doc §5, §8): only a sequential change —
+        // chevron paging, including its wrap-around — slides. A named jump
+        // (dots, `page.set`, activate, restore, removal landing) and reduced
+        // motion switch directly.
+        let index = chrome.edge.index();
+        if panel.active_page_id != parts.presented_page {
+            let outgoing = parts.presented_page.take();
+            let sequential = matches!(panel.page_change, PageChange::Sequential { .. });
+            slides.0[index] = match outgoing {
+                Some(outgoing)
+                    if sequential
+                        && !duration.is_zero()
+                        && panel.active_page_id.is_some()
+                        && parts
+                            .page_wrappers
+                            .iter()
+                            .any(|(id, _)| *id == outgoing) =>
+                {
+                    Some(QuoinSlide {
+                        outgoing,
+                        forward: matches!(
+                            panel.page_change,
+                            PageChange::Sequential { forward: true }
+                        ),
+                        started_at: now,
+                    })
+                }
+                _ => None,
+            };
+            parts.presented_page = panel.active_page_id.clone();
+        }
+        let mut slide = slides.0[index].take();
+        if duration.is_zero() || panel.page_change == PageChange::Named || slide
+            .as_ref()
+            .is_some_and(|slide| now.saturating_sub(slide.started_at) >= CAROUSEL_CLEANUP)
+        {
+            // Cleanup (panel doc §8): the outgoing page retires only after
+            // the slide has completed.
+            slide = None;
+        }
+        let progress = slide.as_ref().map(|slide| {
+            (now.saturating_sub(slide.started_at).as_secs_f32() / duration.as_secs_f32()).min(1.0)
+        });
         for (id, entity) in &parts.page_wrappers {
             if let Ok(mut page_node) = queries.nodes.get_mut(*entity) {
-                let display = if panel.active_page_id.as_deref() == Some(id) {
+                let mut display = if panel.active_page_id.as_deref() == Some(id) {
                     Display::Flex
                 } else {
                     Display::None
                 };
+                if slide
+                    .as_ref()
+                    .is_some_and(|slide| slide.outgoing == *id)
+                {
+                    display = Display::Flex;
+                }
                 if page_node.display != display {
                     page_node.display = display;
                 }
             }
+            let translation = match &slide {
+                Some(slide) if slide.outgoing == *id => {
+                    slide_translation(chrome.edge, slide.forward, progress.unwrap_or(1.0), true)
+                }
+                Some(slide) if panel.active_page_id.as_deref() == Some(id) => {
+                    slide_translation(chrome.edge, slide.forward, progress.unwrap_or(1.0), false)
+                }
+                _ => Val2::default(),
+            };
+            if let Ok(mut wrapper_transform) = queries.transforms.get_mut(*entity)
+                && wrapper_transform.translation != translation
+            {
+                wrapper_transform.translation = translation;
+            }
+        }
+        if let Some(slide) = slide {
+            slides.0[index] = Some(slide);
+            // Keep frames flowing in reactive hosts until cleanup retires
+            // the outgoing page.
+            redraw.write(RequestRedraw);
         }
         for (id, entity) in &parts.dot_labels {
             if let Ok(mut label) = queries.labels.get_mut(*entity) {
@@ -1331,7 +1612,11 @@ fn present_content(frame: Res<ShellFrameState>, mut clocks: Query<&mut Text, Wit
         return;
     };
     for mut clock in &mut clocks {
-        clock.0.clone_from(value);
+        // Compare through `Deref` first: an unconditional write marks the
+        // Text changed every update and re-lays-out an unchanged clock.
+        if clock.0 != *value {
+            clock.0.clone_from(value);
+        }
     }
 }
 
@@ -1377,6 +1662,44 @@ mod tests {
             model.set_carousel(edge, registry.carousel(edge));
         }
         ShellFrame::from_model(&model)
+    }
+
+    #[test]
+    fn present_content_leaves_an_unchanged_clock_unmarked() {
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        let mut frame = ShellFrame::from_model(&model);
+        frame.content.bottom_clock_text = Some("12:00:00 +10:00".into());
+        let mut world = World::new();
+        world.insert_resource(ShellFrameState(frame));
+        let clock = world
+            .spawn((Text::new("12:00:00 +10:00"), QuoinClock))
+            .id();
+        world.clear_trackers();
+        let changed = |world: &World| {
+            world
+                .entity(clock)
+                .get_ref::<Text>()
+                .unwrap()
+                .last_changed()
+        };
+        let before = changed(&world);
+        world.run_system_once(present_content).unwrap();
+        assert_eq!(changed(&world), before, "equal text must not be rewritten");
+        world
+            .resource_mut::<ShellFrameState>()
+            .0
+            .content
+            .bottom_clock_text = Some("12:00:01 +10:00".into());
+        world.run_system_once(present_content).unwrap();
+        assert_ne!(changed(&world), before);
+        assert_eq!(world.get::<Text>(clock).unwrap().0, "12:00:01 +10:00");
     }
 
     fn pointer_click_command(action: QuoinAction) -> ShellCommandKind {
@@ -1647,14 +1970,7 @@ mod tests {
     }
 
     #[test]
-    fn pointer_cursor_press_release_activates_pin_both_chevrons_and_dot() {
-        assert_eq!(
-            pointer_click_command(QuoinAction::TogglePin),
-            ShellCommandKind::Panel {
-                edge: Edge::Left,
-                input: PanelInput::PinToggle,
-            }
-        );
+    fn pointer_cursor_press_release_activates_both_chevrons_and_dot() {
         assert_eq!(
             pointer_click_command(QuoinAction::Previous),
             ShellCommandKind::Carousel {
@@ -1758,12 +2074,11 @@ mod tests {
         frame.panels[Edge::Left.index()].mode = PanelMode::Hidden;
         frame.panels[Edge::Left.index()].transient_revealed = true;
         let mut world = World::new();
-        let pin = world.spawn(Text::new("")).id();
         let title = world.spawn(Text::new("")).id();
         let nav_dot = world.spawn(Text::new("")).id();
         let places_dot = world.spawn(Text::new("")).id();
-        let nav_page = world.spawn(Node::default()).id();
-        let places_page = world.spawn(Node::default()).id();
+        let nav_page = world.spawn((Node::default(), UiTransform::default())).id();
+        let places_page = world.spawn((Node::default(), UiTransform::default())).id();
         let control = world.spawn(TabIndex(-1)).id();
         let panel = world
             .spawn((
@@ -1774,9 +2089,11 @@ mod tests {
                 },
                 QuoinPanelParts {
                     header: Entity::PLACEHOLDER,
-                    page_chromeless: Vec::new(),
-                    pin_label: pin,
+                    chevrons: [Entity::PLACEHOLDER; 2],
                     title_label: title,
+                    dots_host: Entity::PLACEHOLDER,
+                    page_host: Entity::PLACEHOLDER,
+                    page_chromeless: Vec::new(),
                     page_titles: vec![
                         ("nav".into(), "Navigation".into()),
                         ("places".into(), "Places".into()),
@@ -1784,6 +2101,7 @@ mod tests {
                     page_wrappers: vec![("nav".into(), nav_page), ("places".into(), places_page)],
                     dot_labels: vec![("nav".into(), nav_dot), ("places".into(), places_dot)],
                     controls: vec![control],
+                    presented_page: None,
                 },
                 Node::default(),
                 UiTransform::default(),
@@ -1792,10 +2110,13 @@ mod tests {
         world.insert_resource(ShellFrameState(frame));
         world.insert_resource(InputFocus::default());
         world.insert_resource(QuoinCommittedMotionModes::hidden());
+        world.insert_resource(Time::<Real>::default());
+        world.insert_resource(QuoinCarouselSlides::default());
+        world.init_resource::<bevy::ecs::message::Messages<RequestRedraw>>();
         world.run_system_once(present_panels).unwrap();
         world.clear_trackers();
         world.run_system_once(present_panels).unwrap();
-        for entity in [pin, title, nav_dot, places_dot] {
+        for entity in [title, nav_dot, places_dot] {
             assert!(!world.entity(entity).get_ref::<Text>().unwrap().is_changed());
         }
         for entity in [panel, nav_page, places_page] {
@@ -1816,7 +2137,7 @@ mod tests {
                 .is_changed()
         );
 
-        // Pin and carousel changes must still reach the existing entities.
+        // Carousel changes must still reach the existing entities.
         {
             let mut frame = world.resource_mut::<ShellFrameState>();
             let left = &mut frame.0.panels[Edge::Left.index()];
@@ -1825,10 +2146,9 @@ mod tests {
             left.active_page_id = Some("places".into());
         }
         world.run_system_once(present_panels).unwrap();
-        for entity in [pin, title, nav_dot, places_dot] {
+        for entity in [title, nav_dot, places_dot] {
             assert!(world.entity(entity).get_ref::<Text>().unwrap().is_changed());
         }
-        assert_eq!(world.get::<Text>(pin).unwrap().0, "▣");
         assert_eq!(world.get::<Text>(title).unwrap().0, "Places");
         assert_eq!(world.get::<Node>(nav_page).unwrap().display, Display::None);
         assert_eq!(
@@ -1886,7 +2206,6 @@ mod tests {
             .unwrap();
 
         let mut world = World::new();
-        let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         let chrome = world
             .spawn((
@@ -1897,13 +2216,16 @@ mod tests {
                 },
                 QuoinPanelParts {
                     header: Entity::PLACEHOLDER,
-                    page_chromeless: Vec::new(),
-                    pin_label,
+                    chevrons: [Entity::PLACEHOLDER; 2],
                     title_label,
+                    dots_host: Entity::PLACEHOLDER,
+                    page_host: Entity::PLACEHOLDER,
+                    page_chromeless: Vec::new(),
                     page_titles: Vec::new(),
                     page_wrappers: Vec::new(),
                     dot_labels: Vec::new(),
                     controls: Vec::new(),
+                    presented_page: None,
                 },
                 Node::default(),
                 UiTransform::default(),
@@ -1912,6 +2234,9 @@ mod tests {
         world.insert_resource(ShellFrameState(ShellFrame::from_model(&model)));
         world.insert_resource(QuoinCommittedMotionModes::hidden());
         world.insert_resource(InputFocus::default());
+        world.insert_resource(Time::<Real>::default());
+        world.insert_resource(QuoinCarouselSlides::default());
+        world.init_resource::<bevy::ecs::message::Messages<RequestRedraw>>();
         world.run_system_once(present_panels).unwrap();
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
@@ -1937,7 +2262,6 @@ mod tests {
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(0), px(0))
         );
-        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "◆");
 
         model
             .panel_input(Edge::Left, Duration::ZERO, PanelInput::Dock)
@@ -1945,7 +2269,6 @@ mod tests {
         world.resource_mut::<ShellFrameState>().0 = ShellFrame::from_model(&model);
         world.run_system_once(present_panels).unwrap();
         // Current docked with committed overlay remains protocol-owned.
-        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "▣");
         assert_eq!(
             world.get::<UiTransform>(chrome).unwrap().translation,
             Val2::new(px(0), px(0))
@@ -1978,7 +2301,6 @@ mod tests {
         );
         assert_eq!(model.panel(Edge::Left).visible_fraction, 0.0);
         assert_eq!(model.panel(Edge::Left).exclusive_zone_px, 0.0);
-        assert_eq!(world.get::<Text>(pin_label).unwrap().0, "◇");
     }
 
     #[test]
@@ -1999,7 +2321,6 @@ mod tests {
         let control = world.spawn(TabIndex(0)).id();
         let content_control = world.spawn(TabIndex(0)).id();
         let header = world.spawn(Node::default()).add_child(control).id();
-        let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         world
             .spawn((
@@ -2010,13 +2331,16 @@ mod tests {
                 },
                 QuoinPanelParts {
                     header,
-                    pin_label,
+                    chevrons: [Entity::PLACEHOLDER; 2],
                     title_label,
+                    dots_host: Entity::PLACEHOLDER,
+                    page_host: Entity::PLACEHOLDER,
                     page_chromeless: vec![("plain".into(), true)],
                     page_titles: Vec::new(),
                     page_wrappers: Vec::new(),
                     dot_labels: Vec::new(),
                     controls: vec![control],
+                    presented_page: None,
                 },
                 Node::default(),
                 UiTransform::default(),
@@ -2025,6 +2349,9 @@ mod tests {
             .add_children(&[header, content_control]);
         world.insert_resource(ShellFrameState(frame));
         world.insert_resource(InputFocus::from_entity(control));
+        world.insert_resource(Time::<Real>::default());
+        world.insert_resource(QuoinCarouselSlides::default());
+        world.init_resource::<bevy::ecs::message::Messages<RequestRedraw>>();
         world.run_system_once(present_panels).unwrap();
         assert_eq!(world.get::<Node>(header).unwrap().display, Display::None);
         assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(-1)));
@@ -2067,7 +2394,6 @@ mod tests {
 
         let mut world = World::new();
         let control = world.spawn((TabIndex(-1), InteractionDisabled)).id();
-        let pin_label = world.spawn(Text::new("◇")).id();
         let title_label = world.spawn(Text::new("Panel")).id();
         world.spawn((
             QuoinPanelChrome {
@@ -2077,19 +2403,25 @@ mod tests {
             },
             QuoinPanelParts {
                 header: Entity::PLACEHOLDER,
-                page_chromeless: Vec::new(),
-                pin_label,
+                chevrons: [Entity::PLACEHOLDER; 2],
                 title_label,
+                dots_host: Entity::PLACEHOLDER,
+                page_host: Entity::PLACEHOLDER,
+                page_chromeless: Vec::new(),
                 page_titles: Vec::new(),
                 page_wrappers: Vec::new(),
                 dot_labels: Vec::new(),
                 controls: vec![control],
+                presented_page: None,
             },
             Node::default(),
             UiTransform::default(),
         ));
         world.insert_resource(ShellFrameState(mapped));
         world.insert_resource(InputFocus::default());
+        world.insert_resource(Time::<Real>::default());
+        world.insert_resource(QuoinCarouselSlides::default());
+        world.init_resource::<bevy::ecs::message::Messages<RequestRedraw>>();
         world.run_system_once(present_panels).unwrap();
         assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(0)));
         assert!(!world.entity(control).contains::<InteractionDisabled>());
@@ -2108,6 +2440,13 @@ mod tests {
         assert_eq!(world.get::<TabIndex>(control), Some(&TabIndex(-1)));
         assert!(world.entity(control).contains::<InteractionDisabled>());
         assert_eq!(world.resource::<InputFocus>().get(), None);
+    }
+
+    #[test]
+    fn chrome_registers_redraw_messages_without_window_plugin() {
+        let mut app = App::new();
+        app.add_plugins(QuoinChromePlugin);
+        assert!(app.world().contains_resource::<Messages<RequestRedraw>>());
     }
 
     /// Type-identity regression for the 2026-09-06 click-dead bug: the
@@ -2142,7 +2481,7 @@ mod tests {
     }
 
     /// Full-spawn sweep: every control the production `spawn_quoin_chrome`
-    /// path produces — pins, chevrons, dots, page controls on all four
+    /// path produces — chevrons, dots, page controls on all four
     /// edges — must carry the ui_widgets Button. Guards the assumption that
     /// `button()` stays the single spawn choke point; a control spawned some
     /// other way would pass the choke-point test above and still be
@@ -2178,11 +2517,727 @@ mod tests {
             !controls.is_empty(),
             "spawn_quoin_chrome produced no controls — the sweep would be vacuous"
         );
+        assert_eq!(
+            controls.len(),
+            12,
+            "only two chevrons and one page dot per header; no mode control"
+        );
         for control in controls {
             assert!(
                 app.world().entity(control).contains::<WidgetButton>(),
                 "control {control} lacks bevy::ui_widgets::Button — it renders but can never Activate"
             );
         }
+    }
+
+    #[derive(Resource)]
+    struct TestPanelEntity(Entity);
+
+    /// A production-spawned panel on one edge, with the frame's carousel on
+    /// that edge only and time primed so `advance` moves the clock.
+    fn panel_world(edge: Edge, page_ids: &[&str]) -> World {
+        let mut panels: [Vec<QuoinPageSpec>; 4] = std::array::from_fn(|_| Vec::new());
+        panels[edge.index()] = page_ids.iter().map(|id| spec(id)).collect();
+        let registry = QuoinPageRegistry::new(
+            panels[0].clone(),
+            panels[1].clone(),
+            panels[2].clone(),
+            panels[3].clone(),
+        )
+        .unwrap();
+        let mut world = World::new();
+        world.insert_resource(ShellFrameState(frame_for(&registry)));
+        world.insert_resource(InputFocus::default());
+        let mut time = Time::<Real>::default();
+        time.update_with_duration(Duration::ZERO);
+        world.insert_resource(time);
+        world.insert_resource(QuoinCarouselSlides::default());
+        world.init_resource::<bevy::ecs::message::Messages<RequestRedraw>>();
+        let mount = world.spawn_empty().id();
+        let pages = page_ids
+            .iter()
+            .map(|id| QuoinPage {
+                id: (*id).to_owned(),
+                title: (*id).to_owned(),
+                content: world.spawn_empty().id(),
+            })
+            .collect();
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_panel(
+            &mut Commands::new(&mut queue, &world),
+            mount,
+            edge,
+            QuoinMotionOwnership::Chrome,
+            QuoinPointerOwnership::ChromeHover,
+            pages,
+        );
+        queue.apply(&mut world);
+        let mut query = world.query::<(Entity, &QuoinPanelChrome)>();
+        let entity = query.iter(&world)
+            .find(|(_, chrome)| chrome.edge == edge)
+            .map(|(entity, _)| entity)
+            .unwrap();
+        world.insert_resource(TestPanelEntity(entity));
+        world
+    }
+
+    fn panel_entity(world: &World, edge: Edge) -> Entity {
+        let entity = world.resource::<TestPanelEntity>().0;
+        assert_eq!(world.get::<QuoinPanelChrome>(entity).unwrap().edge, edge);
+        entity
+    }
+
+    fn wrapper_of(world: &World, edge: Edge, id: &str) -> Entity {
+        world
+            .get::<QuoinPanelParts>(panel_entity(world, edge))
+            .unwrap()
+            .page_wrappers
+            .iter()
+            .find(|(page, _)| page == id)
+            .map(|(_, entity)| *entity)
+            .unwrap()
+    }
+
+    fn advance(world: &mut World, by: Duration) {
+        world
+            .resource_mut::<Time<Real>>()
+            .update_with_duration(by);
+    }
+
+    fn switch_page(world: &mut World, edge: Edge, id: &str, change: PageChange) {
+        let panel = &mut world.resource_mut::<ShellFrameState>().0.panels[edge.index()];
+        panel.active_page_id = Some(id.to_owned());
+        panel.page_change = change;
+    }
+
+    /// A key the host marks `repeat` — a held repeat, or one already held
+    /// when focus arrived — is not an Escape; only a fresh press is.
+    #[test]
+    fn escape_acts_only_on_a_fresh_press() {
+        use crate::runtime::ShellRuntimePlugin;
+        use bevy::input::keyboard::Key;
+
+        let mut model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        model
+            .panel_input(Edge::Left, Duration::ZERO, PanelInput::Reveal)
+            .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_message::<RequestRedraw>();
+        let escape = |app: &mut App, repeat| {
+            app.world_mut().write_message(KeyboardInput {
+                key_code: KeyCode::Escape,
+                logical_key: Key::Escape,
+                state: ButtonState::Pressed,
+                text: None,
+                repeat,
+                window: Entity::PLACEHOLDER,
+            });
+            app.update();
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .transient_revealed
+        };
+        assert!(escape(&mut app, true), "a held key hid the panel");
+        assert!(!escape(&mut app, false));
+    }
+
+    /// The chevron actions page sequentially and wrap in both directions,
+    /// and the wrap still carries the sequential marker so it animates
+    /// (panel doc §5: chevrons are the sequential prev/next with DCS's
+    /// directional wrap-around; a named jump never animates).
+    #[test]
+    fn chevrons_wrap_at_both_ends() {
+        use crate::runtime::ShellRuntimePlugin;
+
+        let mut model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        model.set_carousel(Edge::Left, Carousel::new(["first", "last"]).unwrap());
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_message::<RequestRedraw>();
+        let output = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        let page = |app: &mut App, input: CarouselInput| {
+            app.world_mut().write_message(ShellCommand {
+                output: output.clone(),
+                at: Duration::ZERO,
+                kind: ShellCommandKind::Carousel {
+                    edge: Edge::Left,
+                    input,
+                },
+            });
+            app.update();
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .clone()
+        };
+        assert_eq!(
+            page(&mut app, CarouselInput::Next).active_page_id.as_deref(),
+            Some("last")
+        );
+        // Next off the last page wraps to the first and still animates.
+        let wrapped = page(&mut app, CarouselInput::Next);
+        assert_eq!(wrapped.active_page_id.as_deref(), Some("first"));
+        assert_eq!(
+            wrapped.page_change,
+            PageChange::Sequential { forward: true }
+        );
+        // Previous off the first page wraps back to the last.
+        let wrapped = page(&mut app, CarouselInput::Previous);
+        assert_eq!(wrapped.active_page_id.as_deref(), Some("last"));
+        assert_eq!(
+            wrapped.page_change,
+            PageChange::Sequential { forward: false }
+        );
+        assert_eq!(
+            page(&mut app, CarouselInput::Previous)
+                .active_page_id
+                .as_deref(),
+            Some("first")
+        );
+        // A named selection of the already-active page still cancels a slide.
+        assert_eq!(
+            page(&mut app, CarouselInput::SelectId("first".into())).page_change,
+            PageChange::Named
+        );
+        for edge in Edge::ALL {
+            for forward in [false, true] {
+                let sign = if forward { 1.0 } else { -1.0 };
+                let translation = |offset| match edge.orientation() {
+                    Orientation::Horizontal => Val2::new(Val::Percent(offset), Val::ZERO),
+                    Orientation::Vertical => Val2::new(Val::ZERO, Val::Percent(offset)),
+                };
+                assert_eq!(slide_translation(edge, forward, 0.5, true), translation(-50.0 * sign));
+                assert_eq!(slide_translation(edge, forward, 0.5, false), translation(50.0 * sign));
+            }
+        }
+    }
+
+    /// Where the chevron inset lands for `edge`: the two chevrons' margins on
+    /// a horizontal panel, the side header's padding on a vertical one.
+    fn chevron_placement(world: &World, edge: Edge) -> (Option<[UiRect; 2]>, UiRect) {
+        let parts = world
+            .get::<QuoinPanelParts>(panel_entity(world, edge))
+            .unwrap();
+        let margins = parts
+            .chevrons
+            .map(|chevron| world.get::<Node>(chevron).unwrap().margin);
+        let header = world.get::<Node>(parts.header).unwrap().padding;
+        match edge.orientation() {
+            Orientation::Horizontal => (Some(margins), header),
+            Orientation::Vertical => {
+                assert_eq!(
+                    margins,
+                    [UiRect::DEFAULT; 2],
+                    "{edge:?}: side chevrons sit inside the header, which carries the inset"
+                );
+                (None, header)
+            }
+        }
+    }
+
+    /// Page content fills the panel on every edge: the root carries no
+    /// padding, the page host none either, and each page wrapper spans the
+    /// whole host (panel doc §7 — "the panel ends belong to the chevrons and
+    /// everything else is content").
+    fn assert_content_not_inset(world: &World, edge: Edge, page_ids: &[&str]) {
+        let panel = panel_entity(world, edge);
+        let root = world.get::<Node>(panel).unwrap();
+        assert_eq!(root.padding, UiRect::DEFAULT, "{edge:?}: the panel root must not inset its content");
+        let parts = world.get::<QuoinPanelParts>(panel).unwrap();
+        let host = world.get::<Node>(parts.page_host).unwrap();
+        assert_eq!(host.padding, UiRect::DEFAULT, "{edge:?}: page host padding");
+        assert_eq!(host.margin, UiRect::DEFAULT, "{edge:?}: page host margin");
+        assert_eq!(host.flex_grow, 1.0, "{edge:?}: page host must take the free length");
+        for id in page_ids {
+            let wrapper = world.get::<Node>(wrapper_of(world, edge, id)).unwrap();
+            assert_eq!(wrapper.position_type, PositionType::Absolute);
+            assert_eq!((wrapper.left, wrapper.top), (px(0), px(0)), "{edge:?}/{id}");
+            assert_eq!(
+                (wrapper.width, wrapper.height),
+                (percent(100), percent(100)),
+                "{edge:?}/{id}: the page must span its host"
+            );
+            assert_eq!(wrapper.padding, UiRect::DEFAULT, "{edge:?}/{id}");
+            assert_eq!(wrapper.margin, UiRect::DEFAULT, "{edge:?}/{id}");
+        }
+    }
+
+    /// The chevrons — not the page content — are inset from the panel ends
+    /// by the configured hotspot size, never flush (panel doc §7): the ends
+    /// of a horizontal panel and the top of a side panel sit under a corner
+    /// hotspot. The inset tracks comp's observed `input.corners.deadzone_px`
+    /// live, falling back to the comp default only while unobserved.
+    #[test]
+    fn chevron_inset_reads_hotspot_size() {
+        let pages = ["alpha", "beta"];
+        for edge in Edge::ALL {
+            let mut world = panel_world(edge, &pages);
+            for (observed, why) in [
+                (None, "unobserved fallback must mirror comp's default deadzone"),
+                (Some(24.0), "the inset must follow the observed deadzone, not a constant"),
+                (Some(40.0), "the inset must follow the observed deadzone, not a constant"),
+            ] {
+                if let Some(observed) = observed {
+                    world.insert_resource(QuoinHotspotSize(observed));
+                }
+                world.run_system_once(present_panels).unwrap();
+                let size = observed.unwrap_or(DEFAULT_COMP_HOTSPOT_PX);
+                let (margins, header) = chevron_placement(&world, edge);
+                match edge.orientation() {
+                    Orientation::Horizontal => {
+                        assert_eq!(margins, Some(chevron_margins(size)), "{edge:?}: {why}");
+                        assert_eq!(
+                            margins.unwrap(),
+                            [UiRect::left(px(size)), UiRect::right(px(size))],
+                            "{edge:?}: previous holds off the left end, next the right"
+                        );
+                    }
+                    Orientation::Vertical => {
+                        assert_eq!(header, side_header_padding(size), "{edge:?}: {why}");
+                        assert_eq!(header.top, px(3.0 + size), "{edge:?}: {why}");
+                    }
+                }
+                let parts = world
+                    .get::<QuoinPanelParts>(panel_entity(&world, edge))
+                    .unwrap();
+                for chevron in parts.chevrons {
+                    assert_eq!(
+                        world.get::<Node>(chevron).unwrap().display,
+                        Display::Flex,
+                        "{edge:?}: a multi-page edge shows its chevrons"
+                    );
+                }
+                assert_content_not_inset(&world, edge, &pages);
+            }
+        }
+    }
+
+    /// An edge with a single page has nothing to page to: no chevrons, and
+    /// no hotspot inset anywhere — the page fills the panel exactly as it
+    /// did before the carousel chrome (the bottom panel's launcher and peek
+    /// buttons sit flush at the panel ends).
+    #[test]
+    fn single_page_edge_has_no_chevrons_and_no_inset() {
+        for edge in Edge::ALL {
+            let mut world = panel_world(edge, &["alpha"]);
+            world.insert_resource(QuoinHotspotSize(40.0));
+            // Mapped, so a -1 tab index below is the single-page rule's doing,
+            // not an unmapped panel's.
+            world.resource_mut::<ShellFrameState>().0.panels[edge.index()].mapped = true;
+            world.run_system_once(present_panels).unwrap();
+            let parts = world
+                .get::<QuoinPanelParts>(panel_entity(&world, edge))
+                .unwrap();
+            for chevron in parts.chevrons {
+                assert_eq!(
+                    world.get::<Node>(chevron).unwrap().display,
+                    Display::None,
+                    "{edge:?}: a single-page edge shows no chevrons"
+                );
+                assert_eq!(
+                    world.get::<TabIndex>(chevron),
+                    Some(&TabIndex(-1)),
+                    "{edge:?}: hidden chevrons must leave the tab order"
+                );
+            }
+            let (margins, header) = chevron_placement(&world, edge);
+            if let Some(margins) = margins {
+                assert_eq!(margins, [UiRect::DEFAULT; 2], "{edge:?}: no chevron inset");
+            }
+            if edge.orientation() == Orientation::Vertical {
+                assert_eq!(header, side_header_padding(0.0), "{edge:?}: no header inset");
+            }
+            assert_content_not_inset(&world, edge, &["alpha"]);
+        }
+    }
+
+    /// A multi-page edge still never insets its content: the hotspot inset
+    /// lives only on the chevrons (horizontal: their own end slots beside
+    /// the page host; vertical: the header above it), so the page host and
+    /// its pages carry no padding or margin whatever the deadzone.
+    #[test]
+    fn multi_page_edge_content_is_not_inset() {
+        for edge in Edge::ALL {
+            let mut world = panel_world(edge, &["alpha", "beta", "gamma"]);
+            world.insert_resource(QuoinHotspotSize(40.0));
+            world.run_system_once(present_panels).unwrap();
+            assert_content_not_inset(&world, edge, &["alpha", "beta", "gamma"]);
+            let panel = panel_entity(&world, edge);
+            let parts = world.get::<QuoinPanelParts>(panel).unwrap();
+            let children = world.get::<Children>(panel).unwrap();
+            let expected: Vec<Entity> = match edge.orientation() {
+                Orientation::Horizontal => {
+                    vec![parts.chevrons[0], parts.page_host, parts.chevrons[1], parts.header]
+                }
+                Orientation::Vertical => vec![parts.header, parts.page_host],
+            };
+            assert_eq!(
+                &children[..expected.len()],
+                expected.as_slice(),
+                "{edge:?}: chunk 10's furniture structure is kept"
+            );
+        }
+    }
+
+    /// The live dynamic-page path: a real shell runtime, production chrome
+    /// with no authored pages, and pages arriving through `mount_page` —
+    /// which registers them with the model's carousel — as chunk 21's
+    /// sub-panels do.
+    fn runtime_chrome_app() -> App {
+        use crate::runtime::ShellRuntimePlugin;
+
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(1_000.0, 800.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(300),
+            Duration::from_millis(180),
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.add_plugins((
+            bevy::MinimalPlugins,
+            ShellRuntimePlugin::new(model),
+            QuoinChromePlugin,
+        ))
+        .add_message::<RequestRedraw>();
+        let world = app.world_mut();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        app
+    }
+
+    /// Present `edge` as mapped (so a -1 tab index is the paging rule's
+    /// doing) and return its chevrons' `(display, tab index, margin)`.
+    fn present_chevrons(world: &mut World, edge: Edge) -> Vec<(Display, TabIndex, UiRect)> {
+        world.resource_mut::<ShellFrameState>().0.panels[edge.index()].mapped = true;
+        world.run_system_once(present_panels).unwrap();
+        let mut query = world.query::<(&QuoinPanelChrome, &QuoinPanelParts)>();
+        let chevrons = query
+            .iter(world)
+            .find(|(chrome, _)| chrome.edge == edge)
+            .map(|(_, parts)| parts.chevrons)
+            .unwrap();
+        chevrons
+            .iter()
+            .map(|chevron| {
+                let node = world.get::<Node>(*chevron).unwrap();
+                (node.display, *world.get::<TabIndex>(*chevron).unwrap(), node.margin)
+            })
+            .collect()
+    }
+
+    /// Chevrons follow the model's page count through `present_panels` as
+    /// pages come and go: one page, none; a second mounted, both appear,
+    /// reachable and inset; back to one, gone again with no inset.
+    #[test]
+    fn chevrons_follow_mounted_page_count() {
+        let mut app = runtime_chrome_app();
+        let world = app.world_mut();
+        world.insert_resource(QuoinHotspotSize(30.0));
+        let edge = Edge::Bottom;
+        let hidden = vec![(Display::None, TabIndex(-1), UiRect::DEFAULT); 2];
+        let content = world.spawn_empty().id();
+        assert!(mount_page(world, edge, "first", "First", content));
+        assert_eq!(present_chevrons(world, edge), hidden, "one page: no chevrons");
+        let content = world.spawn_empty().id();
+        assert!(mount_page(world, edge, "second", "Second", content));
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.len(),
+            2
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            vec![
+                (Display::Flex, TabIndex(0), UiRect::left(px(30.0))),
+                (Display::Flex, TabIndex(0), UiRect::right(px(30.0))),
+            ],
+            "two pages: chevrons shown, tabbable and inset by the hotspot size"
+        );
+        unmount_page(world, edge, "second");
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.len(),
+            1
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            hidden,
+            "back to one page: chevrons hidden, untabbable, not inset"
+        );
+    }
+
+    /// Paging follows the model's carousel, not the chrome's wrapper list:
+    /// a mounted page the carousel refuses (a whitespace-only id) still gets
+    /// a wrapper, but Next/Previous have nothing to walk, so the chevrons
+    /// stay hidden rather than showing inert.
+    #[test]
+    fn chevrons_ignore_a_mounted_page_the_carousel_refused() {
+        let mut app = runtime_chrome_app();
+        let world = app.world_mut();
+        let edge = Edge::Bottom;
+        for id in ["only", "  "] {
+            let content = world.spawn_empty().id();
+            assert!(mount_page(world, edge, id, id, content));
+        }
+        let mut query = world.query::<(&QuoinPanelChrome, &QuoinPanelParts)>();
+        let wrappers = query
+            .iter(world)
+            .find(|(chrome, _)| chrome.edge == edge)
+            .map(|(_, parts)| parts.page_wrappers.len())
+            .unwrap();
+        assert_eq!(wrappers, 2, "precondition: the refused page still has a wrapper");
+        assert_eq!(
+            world.resource::<ShellFrameState>().0.panel(edge).page_ids.as_ref(),
+            ["only".to_owned()],
+            "precondition: the model's carousel refused the empty id"
+        );
+        assert_eq!(
+            present_chevrons(world, edge),
+            vec![(Display::None, TabIndex(-1), UiRect::DEFAULT); 2]
+        );
+    }
+
+    /// Panel doc §8: the slide is 300 ms and collapses to zero under reduced
+    /// motion — a zero duration handled directly, not DCS's browser
+    /// workaround. Reduced motion switches pages with no slide state and no
+    /// leftover offset.
+    #[test]
+    fn slide_duration_is_300ms_and_zero_when_reduced_motion() {
+        assert_eq!(
+            carousel_slide_duration(false),
+            Duration::from_millis(300)
+        );
+        assert_eq!(carousel_slide_duration(true), Duration::ZERO);
+        assert!(
+            CAROUSEL_CLEANUP > CAROUSEL_SLIDE,
+            "cleanup must run after the slide completes"
+        );
+
+        let mut world = panel_world(Edge::Left, &["alpha", "beta"]);
+        world.insert_resource(QuoinReducedMotion(true));
+        world.run_system_once(present_panels).unwrap();
+        advance(&mut world, Duration::from_millis(50));
+        switch_page(
+            &mut world,
+            Edge::Left,
+            "beta",
+            PageChange::Sequential { forward: true },
+        );
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<Node>(wrapper_of(&world, Edge::Left, "alpha"))
+                .unwrap()
+                .display,
+            Display::None,
+            "reduced motion retires the outgoing page immediately"
+        );
+        let beta = wrapper_of(&world, Edge::Left, "beta");
+        assert_eq!(world.get::<Node>(beta).unwrap().display, Display::Flex);
+        assert_eq!(
+            world.get::<UiTransform>(beta).unwrap().translation,
+            Val2::default()
+        );
+        assert!(world
+            .resource::<QuoinCarouselSlides>()
+            .0[Edge::Left.index()]
+            .is_none());
+
+        // Switching the preference while a slide is running also lands now.
+        world.insert_resource(QuoinReducedMotion(false));
+        switch_page(&mut world, Edge::Left, "alpha", PageChange::Sequential { forward: false });
+        world.run_system_once(present_panels).unwrap();
+        assert!(world.resource::<QuoinCarouselSlides>().0[Edge::Left.index()].is_some());
+        world.insert_resource(QuoinReducedMotion(true));
+        world.run_system_once(present_panels).unwrap();
+        assert!(world.resource::<QuoinCarouselSlides>().0[Edge::Left.index()].is_none());
+        assert_eq!(world.get::<Node>(beta).unwrap().display, Display::None);
+    }
+
+    /// A wrap-around slide keeps the outgoing page rendered until the 320 ms
+    /// cleanup deadline — past the 300 ms slide — retires it (panel doc §8).
+    #[test]
+    fn wrap_cleanup_runs_after_slide_completes() {
+        let mut world = panel_world(Edge::Left, &["alpha", "beta"]);
+        world.run_system_once(present_panels).unwrap();
+        // Rest on the last page, then page forward: a wrap to the first.
+        switch_page(&mut world, Edge::Left, "beta", PageChange::None);
+        world.run_system_once(present_panels).unwrap();
+        advance(&mut world, Duration::from_millis(100));
+        switch_page(
+            &mut world,
+            Edge::Left,
+            "alpha",
+            PageChange::Sequential { forward: true },
+        );
+        world.run_system_once(present_panels).unwrap();
+        let outgoing = wrapper_of(&world, Edge::Left, "beta");
+        let incoming = wrapper_of(&world, Edge::Left, "alpha");
+        // Slide start: both render; the incoming page enters from beyond
+        // its edge, the outgoing one rests.
+        assert_eq!(world.get::<Node>(outgoing).unwrap().display, Display::Flex);
+        assert_eq!(
+            world.get::<UiTransform>(incoming).unwrap().translation,
+            Val2::new(Val::ZERO, Val::Percent(100.0))
+        );
+
+        advance(&mut world, CAROUSEL_SLIDE);
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<UiTransform>(incoming).unwrap().translation,
+            Val2::default(),
+            "the wrap slide must reach rest at its duration"
+        );
+        assert_eq!(
+            world.get::<UiTransform>(outgoing).unwrap().translation,
+            Val2::new(Val::ZERO, Val::Percent(-100.0)),
+            "the outgoing page must be fully off-panel"
+        );
+        assert_eq!(
+            world.get::<Node>(outgoing).unwrap().display,
+            Display::Flex,
+            "the slide has completed but the cleanup deadline has not"
+        );
+
+        advance(&mut world, CAROUSEL_CLEANUP - CAROUSEL_SLIDE - Duration::from_millis(1));
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<Node>(outgoing).unwrap().display,
+            Display::Flex,
+            "one millisecond short of the cleanup deadline"
+        );
+
+        advance(&mut world, Duration::from_millis(1));
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<Node>(outgoing).unwrap().display,
+            Display::None,
+            "cleanup retires the outgoing page after the slide completes"
+        );
+        assert_eq!(
+            world.get::<UiTransform>(outgoing).unwrap().translation,
+            Val2::default()
+        );
+        assert!(world
+            .resource::<QuoinCarouselSlides>()
+            .0[Edge::Left.index()]
+            .is_none());
+    }
+
+    /// A named jump — dots, `page.set`, activate (panel doc §5) — switches
+    /// with no slide, before and during a running one.
+    #[test]
+    fn named_jump_is_not_animated() {
+        for change in [PageChange::Named, PageChange::None] {
+            let mut world = panel_world(Edge::Bottom, &["alpha", "beta"]);
+            world.run_system_once(present_panels).unwrap();
+            advance(&mut world, Duration::from_millis(10));
+            switch_page(&mut world, Edge::Bottom, "beta", change);
+            world.run_system_once(present_panels).unwrap();
+            assert_eq!(
+                world.get::<Node>(wrapper_of(&world, Edge::Bottom, "alpha"))
+                    .unwrap()
+                    .display,
+                Display::None,
+                "{change:?}: a named jump retires the outgoing page immediately"
+            );
+            let beta = wrapper_of(&world, Edge::Bottom, "beta");
+            assert_eq!(world.get::<Node>(beta).unwrap().display, Display::Flex);
+            assert_eq!(
+                world.get::<UiTransform>(beta).unwrap().translation,
+                Val2::default()
+            );
+            assert!(world
+                .resource::<QuoinCarouselSlides>()
+                .0[Edge::Bottom.index()]
+                .is_none());
+        }
+
+        // A named jump mid-flight discards the running slide and lands.
+        let mut world = panel_world(Edge::Bottom, &["alpha", "beta", "gamma"]);
+        world.run_system_once(present_panels).unwrap();
+        switch_page(
+            &mut world,
+            Edge::Bottom,
+            "beta",
+            PageChange::Sequential { forward: true },
+        );
+        world.run_system_once(present_panels).unwrap();
+        advance(&mut world, Duration::from_millis(100));
+        switch_page(&mut world, Edge::Bottom, "gamma", PageChange::Named);
+        world.run_system_once(present_panels).unwrap();
+        assert_eq!(
+            world.get::<Node>(wrapper_of(&world, Edge::Bottom, "beta"))
+                .unwrap()
+                .display,
+            Display::None
+        );
+        let gamma = wrapper_of(&world, Edge::Bottom, "gamma");
+        assert_eq!(world.get::<Node>(gamma).unwrap().display, Display::Flex);
+        assert_eq!(
+            world.get::<UiTransform>(gamma).unwrap().translation,
+            Val2::default()
+        );
+        assert!(world
+            .resource::<QuoinCarouselSlides>()
+            .0[Edge::Bottom.index()]
+            .is_none());
+
+        // Naming the current incoming page must stop its existing slide too.
+        switch_page(&mut world, Edge::Bottom, "alpha", PageChange::Sequential { forward: true });
+        world.run_system_once(present_panels).unwrap();
+        assert!(world.resource::<QuoinCarouselSlides>().0[Edge::Bottom.index()].is_some());
+        switch_page(&mut world, Edge::Bottom, "alpha", PageChange::Named);
+        world.run_system_once(present_panels).unwrap();
+        assert!(world.resource::<QuoinCarouselSlides>().0[Edge::Bottom.index()].is_none());
+        let alpha = wrapper_of(&world, Edge::Bottom, "alpha");
+        assert_eq!(world.get::<UiTransform>(alpha).unwrap().translation, Val2::default());
+        assert_eq!(world.get::<Node>(gamma).unwrap().display, Display::None);
     }
 }

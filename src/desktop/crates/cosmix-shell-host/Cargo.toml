@@ -1,6 +1,6 @@
 [package]
 name = "cosmix-shell-host"
-version = "0.7.2"
+version = "0.9.0"
 description = "SCTK layer-shell renderer host for Cosmix Quoin"
 edition = "2024"
 rust-version = "1.95"
@@ -32,7 +32,7 @@ bevy = { version = "=0.19.0", default-features = false, features = [
 ] }
 bevy_winit = { version = "=0.19.1", default-features = false, features = ["wayland"] }
 calloop = { version = "=0.13.0", features = ["signals"] }
-rustix = { version = "1", features = ["time", "thread"] }
+rustix = { version = "1", features = ["time", "thread", "fs"] }
 wgpu = { version = "=29.0.4", default-features = false, features = ["std"] }
 cosmix-client = { package = "cosmix-lib-client", path = "../../../crates/cosmix-lib-client" }
 cosmix-config = { package = "cosmix-lib-config", path = "../../../crates/cosmix-lib-config", features = ["client-helpers"] }

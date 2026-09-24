@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::core::{Edge, OutputKey, PanelInput};
+use crate::core::{Edge, OutputKey, PanelInput, PanelMode};
 
 use super::{CarouselInput, ShellCommand, ShellCommandKind};
 
@@ -39,9 +39,46 @@ pub enum ShellSemanticVerb {
     PanelToggle,
     PanelPin,
     PanelUnpin,
+    /// Precise dock: enter `Docked` regardless of the current mode. Docking
+    /// reflows the workspace, so it is never a side effect of another verb.
+    PanelDock,
+    /// Precise per-edge mode set: drive `Hidden`/`Pinned`/`Docked` explicitly
+    /// (shell doc §3.1's verb surface for the menu, keyboard and citizens).
+    /// Unlike the legacy verbs this never leaves a transient reveal behind.
+    PanelMode(PanelMode),
     PageNext,
     PagePrevious,
     PageSet(String),
+    /// Register a sub-panel name on the verb's edge (panel doc §3). Unlike
+    /// the panel verbs, identity binds at dispatch: `owner` is the
+    /// broker-attested caller, never a caller-supplied field, and the
+    /// dispatch reserves the registry seat before acking. Hosts route these
+    /// through their registry-aware ingress, not the frame-only verb parser.
+    SubRegister {
+        name: String,
+        owner: String,
+    },
+    /// Remove a sub-panel (panel doc §3). The name is the address (§5): the
+    /// verb's edge, owner and acceptance receipt are the sub-panel's own
+    /// seat values, resolved at dispatch — a caller never picks the edge a
+    /// removal lands on, and the Model stage applies only against that
+    /// exact registration. Routed like [`Self::SubRegister`].
+    SubRemove {
+        name: String,
+        owner: String,
+        accepted_at: u64,
+    },
+    /// Named activation (panel doc §6), addressed exactly like
+    /// [`Self::SubRemove`]: the name's seat supplies the edge, owner and
+    /// receipt at dispatch. Routed like [`Self::SubRegister`].
+    SubActivate {
+        name: String,
+        owner: String,
+        accepted_at: u64,
+        /// Ask for the keyboard too (the §6 default); `false` reveals or
+        /// switches without it.
+        focus: bool,
+    },
 }
 
 /// Produce the same [`ShellCommand`] used by pointer and keyboard input.
@@ -49,6 +86,9 @@ pub enum ShellSemanticVerb {
 /// Deliberately takes no frame snapshot: every verb (toggle included) binds
 /// its direction inside the core at Model time, so a stale snapshot cannot
 /// mis-route a verb and two toggles drained in one batch net to identity.
+/// The sub-panel verbs are the exception that proves the rule: they carry
+/// identity (name, owner), and their dispatch binds that identity against
+/// the sub-panel registry before this adapter ever runs.
 pub fn semantic_shell_command(
     output: OutputKey,
     at: Duration,
@@ -71,13 +111,22 @@ pub fn semantic_shell_command(
         },
         ShellSemanticVerb::PanelPin => ShellCommandKind::Panel {
             edge,
-            // Legacy Bus pin reserves space; precise mode verbs are deferred.
+            // Legacy Bus pin keeps its reserving behaviour so popup citizens
+            // hold their space; the precise verbs are PanelDock/PanelMode.
             input: PanelInput::Dock,
         },
         ShellSemanticVerb::PanelUnpin => ShellCommandKind::Panel {
             edge,
             // Includes legacy popup records restored as Docked, and new pins.
             input: PanelInput::Release,
+        },
+        ShellSemanticVerb::PanelDock => ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::Dock,
+        },
+        ShellSemanticVerb::PanelMode(mode) => ShellCommandKind::Panel {
+            edge,
+            input: PanelInput::SetMode(mode),
         },
         ShellSemanticVerb::PageNext => ShellCommandKind::Carousel {
             edge,
@@ -90,6 +139,31 @@ pub fn semantic_shell_command(
         ShellSemanticVerb::PageSet(id) => ShellCommandKind::Carousel {
             edge,
             input: CarouselInput::SelectId(id),
+        },
+        ShellSemanticVerb::SubRegister { name, owner } => {
+            ShellCommandKind::SubPanelRegister { edge, name, owner }
+        }
+        ShellSemanticVerb::SubRemove {
+            name,
+            owner,
+            accepted_at,
+        } => ShellCommandKind::SubPanelRemove {
+            edge,
+            name,
+            owner,
+            accepted_at,
+        },
+        ShellSemanticVerb::SubActivate {
+            name,
+            owner,
+            accepted_at,
+            focus,
+        } => ShellCommandKind::SubPanelActivate {
+            edge,
+            name,
+            owner,
+            accepted_at,
+            focus,
         },
     };
     ShellCommand { output, at, kind }

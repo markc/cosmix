@@ -245,7 +245,12 @@ struct View {
 #[derive(Component)]
 struct SceneLayoutBase(Node);
 
-pub(crate) fn reconcile(world: &mut World) {
+/// Apply accepted scene transactions to mounted chrome. `ScenePlugin` schedules
+/// this between shell input and model updates; minimal hosts may do so directly.
+/// Mounting only registers content and seeds an unset edge size. Reveal and
+/// selection remain explicit shell actions, including on scene revisions.
+pub fn reconcile(world: &mut World) {
+    remove_unseated_scenes(world);
     let scale = icons::effective_scale(world);
     let scale_changed = world
         .get_resource::<IconScale>()
@@ -257,6 +262,28 @@ pub(crate) fn reconcile(world: &mut World) {
         }
         for entry in store.scenes.values_mut() {
             let edge = scene_edge(&entry.tree);
+            // Production ingress reserved this exact name before replying.
+            // Rendering never creates or steals a registry seat.
+            if let Some(owner) = &entry.owner {
+                let valid = world
+                    .get_resource::<cosmix_shell::runtime::SubPanelRegistryState>()
+                    .and_then(|registry| registry.0.seat(&page_id(&entry.tree)))
+                    .is_some_and(|seat| {
+                        seat.owner == owner.citizen
+                            && seat.accepted_at == owner.accepted_at
+                            && seat.edge == edge
+                            && world
+                                .get_resource::<cosmix_shell::runtime::ShellFrameState>()
+                                .is_some_and(|frame| seat.output == frame.0.geometry.output)
+                    });
+                if !valid {
+                    warn!(
+                        scene = entry.tree.name,
+                        "scene mount has no matching reserved seat"
+                    );
+                    continue;
+                }
+            }
             if entry.mounted.as_ref().is_some_and(|m| m.edge != edge) {
                 // Reparent the existing page when its edge changes: fields survive.
                 let m = entry.mounted.as_mut().unwrap();
@@ -307,14 +334,7 @@ pub(crate) fn reconcile(world: &mut World) {
                     config.as_ref().and_then(|w| w["chrome"].as_bool()) == Some(false),
                 );
                 if mounted.registered {
-                    use cosmix_shell::runtime::{ShellCommand, ShellCommandKind, ShellFrameState};
-                    let output = world
-                        .resource::<ShellFrameState>()
-                        .0
-                        .geometry
-                        .output
-                        .clone();
-                    let at = world.resource::<Time<bevy::time::Real>>().elapsed();
+                    use cosmix_shell::runtime::ShellFrameState;
                     let dimension = if matches!(edge, Edge::Left | Edge::Right) {
                         "w"
                     } else {
@@ -328,15 +348,55 @@ pub(crate) fn reconcile(world: &mut World) {
                         .as_ref()
                         .and_then(|window| window[dimension].as_f64())
                         .map_or(default_size, |size| size.min(f32::MAX as f64) as f32);
-                    cosmix_shell::runtime::set_page_thickness(world, edge, size);
-                    world.write_message(ShellCommand {
-                        output,
-                        at,
-                        kind: ShellCommandKind::Panel {
-                            edge,
-                            input: cosmix_shell::core::PanelInput::Reveal,
-                        },
-                    });
+                    cosmix_shell::runtime::seed_page_thickness(world, edge, size);
+                }
+            }
+        }
+    });
+}
+
+/// Registry removal owns the carousel landing. Drop its scene and chrome in
+/// the same update, without issuing another carousel removal. Unowned test
+/// and minimal-host scenes have no seat and follow explicit unload instead.
+pub(crate) fn remove_unseated_scenes(world: &mut World) {
+    world.resource_scope(|world, mut store: Mut<SceneStore>| {
+        let Some(registry) = world.get_resource::<cosmix_shell::runtime::SubPanelRegistryState>()
+        else {
+            return;
+        };
+        let removed: Vec<_> = store
+            .scenes
+            .iter()
+            .filter_map(|(name, entry)| {
+                entry
+                    .owner
+                    .as_ref()
+                    .filter(|owner| {
+                        registry.0.seat(&page_id(&entry.tree)).is_none_or(|seat| {
+                            seat.owner != owner.citizen || seat.accepted_at != owner.accepted_at
+                        })
+                    })
+                    .map(|_| name.clone())
+            })
+            .collect();
+        for name in removed {
+            if let Some(mounted) = store.scenes.remove(&name).and_then(|entry| entry.mounted) {
+                let id = page_id(&mounted.tree);
+                let still_registered = world
+                    .get_resource::<cosmix_shell::runtime::ShellFrameState>()
+                    .is_some_and(|frame| frame.0.panel(mounted.edge).page_ids.contains(&id));
+                if still_registered {
+                    eprintln!("QUOIN_INVARIANT unseated_scene_still_in_carousel page={id}");
+                    #[cfg(test)]
+                    debug_assert!(!still_registered, "unseated scene still in carousel: {id}");
+                }
+                cosmix_shell::chrome::unmount_page_content(
+                    world,
+                    mounted.edge,
+                    &page_id(&mounted.tree),
+                );
+                if world.get_entity(mounted.page).is_ok() {
+                    world.despawn(mounted.page);
                 }
             }
         }
@@ -344,15 +404,33 @@ pub(crate) fn reconcile(world: &mut World) {
 }
 
 fn destroy(world: &mut World, mounted: Mounted) {
-    cosmix_shell::chrome::unmount_page(world, mounted.edge, &page_id(&mounted.tree));
+    let id = page_id(&mounted.tree);
+    // The acceptance/unload transaction owns the reservation. An old mounted
+    // tree can be destroyed after a same-name replacement has reserved it.
+    // Explicit unload lands here; registry-driven removal instead tears down
+    // content through remove_unseated_scenes without a second carousel remove.
+    cosmix_shell::chrome::unmount_page(world, mounted.edge, &id);
     if world.get_entity(mounted.page).is_ok() {
         world.despawn(mounted.page);
     }
 }
-fn page_id(tree: &ResolvedScene) -> String {
-    format!("scene-{}", tree.name)
+/// The sub-panel address a scene mounts under.
+///
+/// The default is the anonymous `scene-<name>` id. A document authored for a
+/// *declared* sub-panel (panel doc §2/§5) names it in the window envelope's
+/// `panel` field — mounting metadata beside `edge`/`title` — because a
+/// declared name is the carousel's address and can carry characters the
+/// scene-name grammar forbids (`settings.appearance`). Without the override a
+/// declared slot could never be filled by scene content.
+pub(crate) fn page_id(tree: &ResolvedScene) -> String {
+    mount_config(tree)
+        .as_ref()
+        .and_then(|window| window["panel"].as_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("scene-{}", tree.name))
 }
-fn scene_edge(tree: &ResolvedScene) -> Edge {
+pub(crate) fn scene_edge(tree: &ResolvedScene) -> Edge {
     match mount_config(tree)
         .as_ref()
         .and_then(|w| w["edge"].as_str())
@@ -1032,6 +1110,398 @@ fn color(value: &str, fallback: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::ecs::message::Messages;
+
+    fn mount_test_app(chrome: bool) -> App {
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{ShellRuntimePlugin, ShellRuntimeSet};
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, ShellRuntimePlugin::new(model)))
+            .init_resource::<SceneStore>()
+            .add_systems(
+                Update,
+                remove_unseated_scenes
+                    .after(ShellRuntimeSet::Model)
+                    .before(ShellRuntimeSet::Presentation),
+            );
+        if chrome {
+            mount_test_chrome(app.world_mut());
+        }
+        app
+    }
+
+    fn mount_test_chrome(world: &mut World) {
+        use cosmix_shell::chrome::{
+            QuoinContentBindings, QuoinPageContent, QuoinPageRegistry, QuoinPageSpec,
+            QuoinPanelMounts, spawn_quoin_chrome,
+        };
+        use cosmix_shell::runtime::ShellFrameState;
+        // Late chrome construction must bind the pages already in the model.
+        let frame = world.resource::<ShellFrameState>().0.clone();
+        let mut bindings = QuoinContentBindings::default();
+        let specs = Edge::ALL.map(|edge| {
+            let ids = &frame.panel(edge).page_ids;
+            bindings.set(
+                edge,
+                ids.iter()
+                    .map(|id| QuoinPageContent::new(id.clone(), world.spawn_empty().id()))
+                    .collect(),
+            );
+            ids.iter()
+                .map(|id| QuoinPageSpec::new(id.clone(), id.clone()))
+                .collect()
+        });
+        let [left, bottom, right, top] = specs;
+        let props = QuoinPageRegistry::new(left, bottom, right, top)
+            .unwrap()
+            .bind(&frame, bindings)
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+    }
+
+    fn load_mount_test_scene(world: &mut World, name: &str, edge: Edge, size: u32) {
+        use cosmix_shell::runtime::{SceneVerb, ShellFrameState, SubPanelRegistryState};
+        let edge = match edge {
+            Edge::Left => "left",
+            Edge::Right => "right",
+            Edge::Top => "top",
+            Edge::Bottom => "bottom",
+        };
+        let source = format!(
+            "---\nscene: 1\nname: {name}\ncitizen: test\n---\n```mix\nroot: {{widget: \"window\", kind: \"edge\", edge: \"{edge}\", w: {size}, h: {size}}}\n```\n"
+        );
+        world.resource_scope(|world, mut store: Mut<SceneStore>| {
+            world.resource_scope(|world, mut registry: Mut<SubPanelRegistryState>| {
+                store
+                    .request_mounted(
+                        SceneVerb::Load,
+                        &source,
+                        &Value::Null,
+                        Some(&mut super::super::SceneMount {
+                            registry: &mut registry.0,
+                            output: &world.resource::<ShellFrameState>().0.geometry.output,
+                            owner: "test",
+                            accepted_at: 1,
+                        }),
+                    )
+                    .unwrap();
+            });
+        });
+    }
+
+    #[test]
+    fn first_mount_registers_without_reveal_or_selection() {
+        use cosmix_shell::runtime::{ShellCommand, ShellFrameState, set_shell_pages};
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        set_shell_pages(world, Edge::Left, vec!["existing".into()], Some("existing"));
+        load_mount_test_scene(world, "new", Edge::Left, 200);
+        reconcile(world);
+        assert!(world.resource::<Messages<ShellCommand>>().is_empty());
+        app.update();
+        let panel = app
+            .world()
+            .resource::<ShellFrameState>()
+            .0
+            .panel(Edge::Left);
+        assert_eq!(panel.page_ids.as_ref(), ["existing", "scene-new"]);
+        assert_eq!(panel.active_page_id.as_deref(), Some("existing"));
+        assert!(!panel.mapped);
+    }
+
+    #[test]
+    fn mount_seeds_thickness_only_when_unset() {
+        use cosmix_shell::runtime::{ShellFrameState, set_page_thickness};
+        for edge in Edge::ALL {
+            for remembered in [false, true] {
+                let mut app = mount_test_app(true);
+                let world = app.world_mut();
+                if remembered {
+                    set_page_thickness(world, edge, 173.0);
+                }
+                load_mount_test_scene(world, "first", edge, 210);
+                reconcile(world);
+                let expected = if remembered { 173.0 } else { 210.0 };
+                assert_eq!(
+                    world
+                        .resource::<ShellFrameState>()
+                        .0
+                        .panel(edge)
+                        .thickness_px,
+                    expected
+                );
+                load_mount_test_scene(world, "second", edge, 290);
+                reconcile(world);
+                assert_eq!(
+                    world
+                        .resource::<ShellFrameState>()
+                        .0
+                        .panel(edge)
+                        .thickness_px,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remount_after_revision_preserves_thickness_and_selection() {
+        use cosmix_shell::runtime::{
+            SceneVerb, ShellFrameState, set_page_thickness, set_shell_pages,
+        };
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        load_mount_test_scene(world, "revision", Edge::Left, 200);
+        reconcile(world);
+        let page = world.resource::<SceneStore>().scenes["revision"]
+            .mounted
+            .as_ref()
+            .unwrap()
+            .page;
+        set_shell_pages(
+            world,
+            Edge::Left,
+            vec!["scene-revision".into(), "selected".into()],
+            Some("selected"),
+        );
+        set_page_thickness(world, Edge::Left, 177.0);
+        for (path, value) in [
+            ("root.w", json!(310)),
+            ("root.title", json!("Revised")),
+            ("root.chrome", json!(false)),
+        ] {
+            world
+                .resource_mut::<SceneStore>()
+                .request(
+                    SceneVerb::Patch,
+                    "",
+                    &json!({"scene":"revision", "path":path, "value":value}),
+                )
+                .unwrap();
+            reconcile(world);
+            let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+            assert_eq!(panel.thickness_px, 177.0);
+            assert_eq!(panel.active_page_id.as_deref(), Some("selected"));
+            assert_eq!(
+                world.resource::<SceneStore>().scenes["revision"]
+                    .mounted
+                    .as_ref()
+                    .unwrap()
+                    .page,
+                page
+            );
+        }
+    }
+
+    #[test]
+    fn late_registration_while_chrome_absent_retries() {
+        use cosmix_shell::runtime::{
+            ShellCommand, ShellFrameState, set_page_thickness, set_shell_pages,
+        };
+        let mut app = mount_test_app(false);
+        let world = app.world_mut();
+        set_shell_pages(world, Edge::Left, vec!["selected".into()], Some("selected"));
+        set_page_thickness(world, Edge::Left, 177.0);
+        load_mount_test_scene(world, "late", Edge::Left, 200);
+        reconcile(world);
+        reconcile(world);
+        let mounted = world.resource::<SceneStore>().scenes["late"]
+            .mounted
+            .as_ref()
+            .unwrap();
+        assert!(!mounted.registered);
+        let page = mounted.page;
+        mount_test_chrome(world);
+        reconcile(world);
+        let mounted = world.resource::<SceneStore>().scenes["late"]
+            .mounted
+            .as_ref()
+            .unwrap();
+        assert!(mounted.registered);
+        assert_eq!(mounted.page, page);
+        let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert_eq!(panel.page_ids.as_ref(), ["selected", "scene-late"]);
+        assert_eq!(panel.active_page_id.as_deref(), Some("selected"));
+        assert_eq!(panel.thickness_px, 177.0);
+        assert!(world.resource::<Messages<ShellCommand>>().is_empty());
+    }
+
+    #[test]
+    fn mount_preserves_verb_registered_pages() {
+        use cosmix_shell::runtime::{
+            ShellCommand, ShellCommandKind, ShellFrameState, SubPanelRegistryState,
+        };
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        let output = world
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        world
+            .resource_mut::<SubPanelRegistryState>()
+            .0
+            .mount("verb-only", output.clone(), Edge::Left, "owner", 1)
+            .unwrap();
+        world.write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::SubPanelRegister {
+                edge: Edge::Left,
+                name: "verb-only".into(),
+                owner: "owner".into(),
+            },
+        });
+        app.update();
+        let world = app.world_mut();
+        load_mount_test_scene(world, "mounted", Edge::Left, 200);
+        reconcile(world);
+        assert_eq!(
+            world
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .page_ids
+                .as_ref(),
+            ["verb-only", "scene-mounted"]
+        );
+        assert!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("verb-only")
+                .is_some()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unseated scene still in carousel")]
+    fn unseated_scene_with_live_carousel_page_trips_invariant() {
+        use cosmix_shell::runtime::SubPanelRegistryState;
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        load_mount_test_scene(world, "orphan", Edge::Left, 200);
+        reconcile(world);
+        // Deliberately violate the registry-removal contract: drop only the
+        // seat, leaving the frame's page live when content teardown runs.
+        world.resource_mut::<SubPanelRegistryState>().0.forget("scene-orphan");
+        remove_unseated_scenes(world);
+    }
+
+    #[test]
+    fn sub_remove_scene_backed_unloads_content_once() {
+        use cosmix_shell::runtime::{
+            SceneVerb, ShellCommand, ShellCommandKind, ShellFrameState, SubPanelRegistryState,
+            set_shell_pages,
+        };
+        let mut app = mount_test_app(true);
+        let world = app.world_mut();
+        load_mount_test_scene(world, "removed", Edge::Left, 200);
+        let output = world
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        reconcile(world);
+        let page = world.resource::<SceneStore>().scenes["removed"]
+            .mounted
+            .as_ref()
+            .unwrap()
+            .page;
+        let wrapper = world.get::<ChildOf>(page).unwrap().parent();
+        set_shell_pages(
+            world,
+            Edge::Left,
+            vec!["primary".into(), "previous".into(), "scene-removed".into()],
+            Some("scene-removed"),
+        );
+        world.write_message(ShellCommand {
+            output,
+            at: Duration::ZERO,
+            kind: ShellCommandKind::SubPanelRemove {
+                edge: Edge::Left,
+                name: "scene-removed".into(),
+                owner: "test".into(),
+                accepted_at: 1,
+            },
+        });
+        app.update();
+        let world = app.world_mut();
+        assert!(
+            !world
+                .resource::<SceneStore>()
+                .scenes
+                .contains_key("removed")
+        );
+        assert!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-removed")
+                .is_none()
+        );
+        assert!(world.get_entity(page).is_err());
+        assert!(world.get_entity(wrapper).is_err());
+        assert!(
+            world
+                .resource_mut::<SceneStore>()
+                .request(SceneVerb::Get, "", &json!({"scene":"removed"}))
+                .is_err()
+        );
+        load_mount_test_scene(world, "later", Edge::Left, 300);
+        reconcile(world);
+        reconcile(world);
+        let panel = world.resource::<ShellFrameState>().0.panel(Edge::Left);
+        assert_eq!(
+            panel.page_ids.as_ref(),
+            ["primary", "previous", "scene-later"]
+        );
+        assert_eq!(panel.active_page_id.as_deref(), Some("previous"));
+        // The removal landing is distinct from remembered selection: the
+        // next reveal must return to the primary, even after another mount.
+        let output = world
+            .resource::<ShellFrameState>()
+            .0
+            .geometry
+            .output
+            .clone();
+        let at = world.resource::<Time<bevy::time::Real>>().elapsed();
+        world.write_message(ShellCommand {
+            output,
+            at,
+            kind: ShellCommandKind::Panel {
+                edge: Edge::Left,
+                input: cosmix_shell::core::PanelInput::Reveal,
+            },
+        });
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ShellFrameState>()
+                .0
+                .panel(Edge::Left)
+                .active_page_id
+                .as_deref(),
+            Some("primary"),
+        );
+    }
 
     const ICON_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red" fill-opacity="0.5"/></svg>"#;
 
@@ -1526,6 +1996,13 @@ mod tests {
             "Normal",
             normal
         ));
+        // Mounting does not select the normal page; the user does.
+        set_shell_pages(
+            app.world_mut(),
+            Edge::Bottom,
+            vec!["scene-chrome-test".into(), "normal".into()],
+            Some("normal"),
+        );
         app.update();
         assert_eq!(
             app.world().get::<Node>(header).unwrap().display,
@@ -1632,6 +2109,99 @@ mod tests {
     }
 
     #[test]
+    fn declared_panel_name_is_the_page_id() {
+        use cosmix_shell::chrome::{
+            QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts, spawn_quoin_chrome,
+        };
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{SceneVerb, ShellFrameState, ShellRuntimePlugin};
+        let mut app = App::new();
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ShellRuntimePlugin::new(model));
+        let world = app.world_mut();
+        let registry = QuoinPageRegistry::new(vec![], vec![], vec![], vec![]).unwrap();
+        let props = registry
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        let mut queue = bevy::ecs::world::CommandQueue::default();
+        spawn_quoin_chrome(&mut Commands::new(&mut queue, world), mounts, props);
+        queue.apply(world);
+        let mut store = SceneStore::default();
+        // A declared sub-panel name in the window envelope is the mount
+        // address; the scene's own name stays inside its grammar.
+        store.request(
+            SceneVerb::Load,
+            "---\nscene: 1\nname: settings\ncitizen: test\nwindow: {\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"settings.appearance\"}\n---\n```mix\nroot: {widget: \"column\", children: []}\n```\n",
+            &Value::Null,
+        )
+        .unwrap();
+        store.request(
+            SceneVerb::Load,
+            "---\nscene: 1\nname: plain\ncitizen: test\n---\n```mix\nroot: {widget: \"window\", kind: \"edge\", edge: \"right\"}\n```\n",
+            &Value::Null,
+        )
+        .unwrap();
+        world.insert_resource(store);
+        reconcile(world);
+        let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
+        // Reconciliation visits scenes in name order (BTreeMap), not load
+        // order. The envelope overrides the page id, not that traversal.
+        assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
+        // The mount survives a revision under the same declared name.
+        world
+            .resource_mut::<SceneStore>()
+            .request(
+                SceneVerb::Load,
+                "---\nscene: 1\nname: settings\ncitizen: test\nwindow: {\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"settings.appearance\"}\n---\n```mix\nroot: {widget: \"column\", children: [\"extra\"]}\nextra: {widget: \"text\", text: \"x\"}\n```\n",
+                &Value::Null,
+            )
+            .unwrap();
+        reconcile(world);
+        let right = &world.resource::<ShellFrameState>().0.panel(Edge::Right).page_ids;
+        assert_eq!(right.as_ref(), &["scene-plain", "settings.appearance"]);
+        // A live panel address cannot be aliased or renamed.
+        for (name, panel) in [("impostor", "settings.appearance"), ("settings", "renamed")] {
+            let result = world.resource_mut::<SceneStore>().request(
+                SceneVerb::Load,
+                &format!("---\nscene: 1\nname: {name}\ncitizen: test\nwindow: {{\"kind\":\"edge\",\"edge\":\"right\",\"panel\":\"{panel}\"}}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"),
+                &Value::Null,
+            );
+            assert!(result.is_err(), "a live address cannot be aliased or renamed");
+        }
+        // An empty or non-string panel field falls back to the anonymous id.
+        for window in ["{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":\"\"}", "{\"kind\":\"edge\",\"edge\":\"bottom\",\"panel\":7}"] {
+            let mut fallback = SceneStore::default();
+            fallback
+                .request(
+                    SceneVerb::Load,
+                    &format!(
+                        "---\nscene: 1\nname: fb\ncitizen: test\nwindow: {window}\n---\n```mix\nroot: {{widget: \"column\", children: []}}\n```\n"
+                    ),
+                    &Value::Null,
+                )
+                .unwrap();
+            assert_eq!(page_id(&fallback.scenes["fb"].tree), "scene-fb");
+        }
+    }
+
+    #[test]
     fn reconcile_moves_node_mount_and_unloads_last_page() {
         use cosmix_shell::chrome::{
             QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts, spawn_quoin_chrome,
@@ -1728,10 +2298,9 @@ mod tests {
             .unwrap();
         reconcile(world);
         let frame = &world.resource::<ShellFrameState>().0;
-        assert_eq!(
-            frame.panel(Edge::Right).thickness_px,
-            cosmix_shell::core::seed_panel_thickness(Edge::Right, frame.geometry.logical_size)
-        );
+        // Clearing an authored extent cannot reset the edge's seeded size.
+        assert_eq!(frame.panel(Edge::Right).thickness_px, 200.0);
+        assert!(!frame.panel(Edge::Right).mapped);
         world
             .resource_mut::<SceneStore>()
             .request(SceneVerb::Unload, "", &json!({"scene":"mount-test"}))
@@ -1746,6 +2315,209 @@ mod tests {
                 .is_empty()
         );
         assert!(world.get_entity(page).is_err());
+    }
+
+    /// Exercise the reservation used by production ingress and actual chrome.
+    #[test]
+    fn scene_mounts_feed_the_subpanel_owner_map() {
+        use cosmix_shell::chrome::{
+            QuoinChromePlugin, QuoinContentBindings, QuoinPageRegistry, QuoinPanelMounts,
+            spawn_quoin_chrome,
+        };
+        use cosmix_shell::core::{LogicalSize, OutputKey, ShellModel};
+        use cosmix_shell::runtime::{
+            SceneVerb, ShellFrameState, ShellRuntimePlugin, SubPanelRegistryState,
+        };
+        fn request(
+            world: &mut World,
+            verb: SceneVerb,
+            body: &str,
+            args: &Value,
+            owner: &str,
+            receipt: u64,
+        ) -> Result<(Value, Option<Value>), Value> {
+            world.resource_scope(|world, mut store: Mut<SceneStore>| {
+                world.resource_scope(|world, mut registry: Mut<SubPanelRegistryState>| {
+                    store.request_mounted(
+                        verb,
+                        body,
+                        args,
+                        Some(&mut super::super::SceneMount {
+                            registry: &mut registry.0,
+                            output: &world.resource::<ShellFrameState>().0.geometry.output,
+                            owner,
+                            accepted_at: receipt,
+                        }),
+                    )
+                })
+            })
+        }
+        let mut app = App::new();
+        let model = ShellModel::new(
+            OutputKey::new("test").unwrap(),
+            LogicalSize::new(800.0, 600.0).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(ShellRuntimePlugin::new(model))
+            .add_plugins(QuoinChromePlugin)
+            .init_resource::<SceneStore>();
+        let world = app.world_mut();
+        let props = QuoinPageRegistry::new(vec![], vec![], vec![], vec![])
+            .unwrap()
+            .bind(
+                &world.resource::<ShellFrameState>().0,
+                QuoinContentBindings::default(),
+            )
+            .unwrap();
+        let mounts = QuoinPanelMounts::new(
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+            world.spawn_empty().id(),
+        );
+        spawn_quoin_chrome(&mut world.commands(), mounts, props);
+        world.flush();
+        let source = |citizen: &str| {
+            format!(
+                "---\nscene: 1\nname: feed-test\ncitizen: {citizen}\n---\n```mix\nroot: {{widget: \"window\", kind: \"edge\", edge: \"left\", w: 200}}\n```\n"
+            )
+        };
+        request(
+            world,
+            SceneVerb::Load,
+            &source("metadata"),
+            &Value::Null,
+            "sender",
+            1,
+        )
+        .unwrap();
+        reconcile(world);
+        let page = world.resource::<SceneStore>().scenes["feed-test"]
+            .mounted
+            .as_ref()
+            .unwrap()
+            .page;
+        let seat = world
+            .resource::<SubPanelRegistryState>()
+            .0
+            .seat("scene-feed-test")
+            .unwrap();
+        assert_eq!(
+            (seat.edge, seat.owner.as_str(), seat.accepted_at),
+            (Edge::Left, "sender", 1)
+        );
+
+        // Authored citizen revisions cannot transfer lifecycle ownership.
+        request(
+            world,
+            SceneVerb::Load,
+            &source("other-metadata"),
+            &Value::Null,
+            "sender",
+            2,
+        )
+        .unwrap();
+        reconcile(world);
+        assert_eq!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .unwrap()
+                .owner,
+            "sender"
+        );
+        assert_eq!(
+            world.resource::<SceneStore>().scenes["feed-test"]
+                .mounted
+                .as_ref()
+                .unwrap()
+                .page,
+            page
+        );
+        assert!(
+            request(
+                world,
+                SceneVerb::Load,
+                &source("metadata"),
+                &Value::Null,
+                "other-sender",
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            request(
+                world,
+                SceneVerb::Patch,
+                "",
+                &json!({
+                    "scene":"feed-test", "path":"root.edge", "value":"right"
+                }),
+                "sender",
+                3
+            )
+            .is_err()
+        );
+
+        // Old teardown must not release a replacement accepted in the same frame.
+        request(
+            world,
+            SceneVerb::Unload,
+            "",
+            &json!({"scene":"feed-test"}),
+            "sender",
+            3,
+        )
+        .unwrap();
+        request(
+            world,
+            SceneVerb::Load,
+            &source("metadata"),
+            &Value::Null,
+            "replacement",
+            3,
+        )
+        .unwrap();
+        reconcile(world);
+        assert!(world.get_entity(page).is_err());
+        assert_eq!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .unwrap()
+                .owner,
+            "replacement"
+        );
+        assert!(
+            world.resource::<SceneStore>().scenes["feed-test"]
+                .mounted
+                .as_ref()
+                .unwrap()
+                .registered
+        );
+        request(
+            world,
+            SceneVerb::Unload,
+            "",
+            &json!({"scene":"feed-test"}),
+            "replacement",
+            4,
+        )
+        .unwrap();
+        reconcile(world);
+        assert!(
+            world
+                .resource::<SubPanelRegistryState>()
+                .0
+                .seat("scene-feed-test")
+                .is_none()
+        );
     }
 
     #[test]
