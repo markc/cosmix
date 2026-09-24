@@ -3854,54 +3854,129 @@ mod tests {
         ShellFrame::from_model(&model)
     }
 
-    /// Chunk 16: what comp answers, for [`pump`].
+    /// Chunk 16: a minimal comp for [`pump`] — it answers reads and verbs,
+    /// and for the left edge keeps comp's holder verdict (explicit holds
+    /// plus its own keyboard-focus membership), publishing `panel.command`
+    /// on a change and re-stating it for every hidden mode report.
     struct FakeComp {
-        capable: bool,
-        focus: Value,
-        outputs: BTreeMap<u64, &'static str>,
+        capable: std::cell::Cell<bool>,
+        focus: std::cell::RefCell<Value>,
+        outputs: std::cell::RefCell<BTreeMap<u64, &'static str>>,
+        /// Refuse hold acquisitions as a layer comp has not mapped yet.
+        refuse_holds: std::cell::Cell<bool>,
+        left_surface: std::cell::RefCell<Option<String>>,
+        left_hidden: std::cell::Cell<bool>,
+        left_holds: std::cell::RefCell<BTreeSet<String>>,
+        left_focused: std::cell::Cell<bool>,
+        verdict: std::cell::Cell<Option<bool>>,
+        sequence: std::cell::Cell<u64>,
+        /// Every command published, in order: `true` reveal, `false` conceal.
+        published: std::cell::RefCell<Vec<bool>>,
+        dirty: std::cell::Cell<bool>,
     }
 
     impl FakeComp {
         fn new(capable: bool) -> Self {
             Self {
-                capable,
-                focus: json!({"keyboard":null,"pointer":null}),
-                outputs: BTreeMap::new(),
+                capable: capable.into(),
+                focus: json!({"keyboard":null,"pointer":null}).into(),
+                outputs: BTreeMap::new().into(),
+                refuse_holds: false.into(),
+                left_surface: None.into(),
+                left_hidden: true.into(),
+                left_holds: BTreeSet::new().into(),
+                left_focused: false.into(),
+                verdict: None.into(),
+                sequence: 0.into(),
+                published: Vec::new().into(),
+                dirty: false.into(),
             }
+        }
+
+        fn settle(&self, peer: &ctk::bus::TestBusPeer, restate: bool) {
+            let Some(surface) = self.left_surface.borrow().clone() else { return };
+            if !self.left_hidden.get() {
+                self.verdict.set(None);
+                return;
+            }
+            let holding = self.left_focused.get() || !self.left_holds.borrow().is_empty();
+            if restate || self.verdict.get() != Some(holding) {
+                self.verdict.set(Some(holding));
+                self.sequence.set(self.sequence.get() + 1);
+                self.published.borrow_mut().push(holding);
+                self.dirty.set(true);
+                peer.deliver_message(panel_command(self.sequence.get(), &surface,
+                    if holding { "reveal" } else { "conceal" }));
+            }
+        }
+
+        /// Keyboard focus moves onto (or off) the left panel's layer.
+        fn set_focused(&self, peer: &ctk::bus::TestBusPeer, focused: bool) {
+            self.left_focused.set(focused);
+            self.settle(peer, false);
+        }
+
+        fn published(&self) -> Vec<bool> {
+            std::mem::take(&mut *self.published.borrow_mut())
         }
     }
 
     /// Run updates, answering every call to comp as comp would, until an
-    /// update sends none; returns those calls. Every comp verb Quoin sends
-    /// must be the literal `comp.*` command addressed to the instance.
+    /// update sends none and comp published nothing; returns those calls.
+    /// Every comp verb Quoin sends must be the literal `comp.*` command
+    /// addressed to the instance.
     fn pump(app: &mut App, peer: &ctk::bus::TestBusPeer, comp: &FakeComp) -> Vec<ctk::bus::TestBusCall> {
         let mut seen = Vec::new();
         for _ in 0..32 {
             app.update();
             let calls: Vec<_> = peer.drain_calls().into_iter()
                 .filter(|call| call.to == "comp-nested").collect();
-            if calls.is_empty() {
+            if calls.is_empty() && !comp.dirty.replace(false) {
                 return seen;
             }
             for call in calls {
                 assert!(call.command.starts_with("comp."), "literal comp verb: {}", call.command);
                 let body: Value = serde_json::from_str(&call.body).unwrap();
-                let reply = match (call.command.as_str(), body["path"].as_str()) {
-                    ("comp.props.get", Some("input.corners.holders")) => json!(comp.capable),
-                    ("comp.props.get", Some("focus")) => comp.focus.clone(),
+                let left = body["edge"] == "left";
+                let (rc, reply) = match (call.command.as_str(), body["path"].as_str()) {
+                    ("comp.props.get", Some("input.corners.holders")) => (0, json!(comp.capable.get())),
+                    ("comp.props.get", Some("focus")) => (0, comp.focus.borrow().clone()),
                     ("comp.props.get", Some(path)) => {
                         let id = path.strip_prefix("surfaces.s")
                             .and_then(|rest| rest.strip_suffix(".output"))
                             .and_then(|id| id.parse::<u64>().ok())
                             .unwrap_or_else(|| panic!("unexpected read {path}"));
-                        json!(comp.outputs.get(&id))
+                        (0, json!(comp.outputs.borrow().get(&id)))
                     }
-                    _ => json!({"accepted":true,"surface":body["surface"]}),
+                    ("comp.panel.hold", _) if body["acquire"] == true && comp.refuse_holds.get() => {
+                        (10, json!({"error":"unknown_panel_surface","surface":body["surface"]}))
+                    }
+                    _ => (0, json!({"accepted":true,"surface":body["surface"]})),
                 };
                 peer.deliver_event(BusBridgeEvent::Reply {
                     request_id: call.request_id,
-                    result: Ok(ctk::bus::BusReply { rc: 0, body: reply.to_string(), result: None }),
+                    result: Ok(ctk::bus::BusReply { rc, body: reply.to_string(), result: None }),
                 });
+                match call.command.as_str() {
+                    "comp.panel.mode" if left => {
+                        *comp.left_surface.borrow_mut() = body["surface"].as_str().map(str::to_owned);
+                        comp.left_hidden.set(body["mode"] == "hidden");
+                        if body["mode"] != "hidden" {
+                            comp.left_holds.borrow_mut().clear();
+                        }
+                        comp.settle(peer, true);
+                    }
+                    "comp.panel.hold" if left && rc == 0 && comp.left_hidden.get() => {
+                        let holder = body["holder"].as_str().unwrap().to_owned();
+                        if body["acquire"] == true {
+                            comp.left_holds.borrow_mut().insert(holder);
+                        } else {
+                            comp.left_holds.borrow_mut().remove(&holder);
+                        }
+                        comp.settle(peer, false);
+                    }
+                    _ => {}
+                }
                 seen.push(call);
             }
         }
@@ -3941,8 +4016,8 @@ mod tests {
     /// one queue and each discards what the other would return, so a verb
     /// sent with [`sub_send`] must not also send a comp call in the same
     /// update. The tests arrange that the way the live host does — the left
-    /// layer token appears only after the reveal — and drive mode changes
-    /// with `write_message` rather than over the Bus.
+    /// layer token appears only after the reveal — and drive mode, focus and
+    /// Escape with `write_message` rather than over the Bus.
     fn activation_app(comp: &FakeComp) -> (App, ctk::bus::TestBusPeer) {
         let (bridge, peer) = test_bridge("quoin");
         let mut app = bus_app(bridge);
@@ -3974,13 +4049,18 @@ mod tests {
         (app, peer)
     }
 
-    /// The host's report of which panel surface holds the keyboard.
-    fn observe_focus(app: &mut App, edge: Option<Edge>) {
+    /// Host input for the model: which panel surface holds the keyboard,
+    /// or an Escape reaching the focused panel.
+    fn keyboard(app: &mut App, command: cosmix_shell::runtime::KeyboardCommand) {
         app.world_mut().write_message(ShellCommand {
             output: test_model().output().clone(),
             at: Default::default(),
-            kind: ShellCommandKind::Keyboard(cosmix_shell::runtime::KeyboardCommand::FocusObserved(edge)),
+            kind: ShellCommandKind::Keyboard(command),
         });
+    }
+
+    fn observe_focus(app: &mut App, edge: Option<Edge>) {
+        keyboard(app, cosmix_shell::runtime::KeyboardCommand::FocusObserved(edge));
     }
 
     fn left(app: &App) -> cosmix_shell::runtime::PanelPresentation {
@@ -3988,15 +4068,36 @@ mod tests {
     }
 
     fn map_left_layer(app: &mut App, token: &str) {
+        let mut identities = app.world_mut()
+            .resource_mut::<cosmix_shell_host::holders::PanelLayerIdentities>();
+        identities.0.retain(|(_, edge, _)| *edge != Edge::Left);
+        identities.0.push((test_model().output().clone(), Edge::Left, token.into()));
+    }
+
+    fn unmap_left_layer(app: &mut App) {
         app.world_mut()
             .resource_mut::<cosmix_shell_host::holders::PanelLayerIdentities>()
             .0
-            .push((test_model().output().clone(), Edge::Left, token.into()));
+            .retain(|(_, edge, _)| *edge != Edge::Left);
     }
 
     fn panel_command(event_seq: u64, surface: &str, action: &str) -> BusMessage {
         comp_message("panel.command", json!({"version":1,"output":"test","edge":"left",
             "surface":surface,"action":action,"event_seq":event_seq}))
+    }
+
+    /// Activate `beta` on the hidden left edge, map its layer and let comp
+    /// acknowledge the focus hold: the state every hidden-edge test starts
+    /// from. Returns the hold comp received.
+    fn activate_hidden_and_hold(app: &mut App, peer: &ctk::bus::TestBusPeer, comp: &FakeComp,
+        token: &str) -> Value {
+        let (rc, body) = sub_send(app, peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!(rc, 0, "{body}");
+        map_left_layer(app, token);
+        let acquired = holds(&pump(app, peer, comp));
+        assert_eq!(acquired.len(), 1, "{acquired:?}");
+        assert!(left(app).transient_revealed);
+        acquired[0].clone()
     }
 
     #[test]
@@ -4008,6 +4109,8 @@ mod tests {
             (json!({"name":"ghost"}), "'ghost' is not registered"),
             (json!({}), "requires a name"),
             (json!({"name":"  "}), "requires a name"),
+            (json!({"name":"alpha","focus":"maybe"}), "focus must be true or false"),
+            (json!({"name":"alpha","focus":1}), "focus must be true or false"),
         ] {
             let (rc, reply) = sub_send(&mut app, &peer, "shell.sub.activate", body.clone());
             assert_eq!(rc, 10, "{body}: {reply}");
@@ -4043,14 +4146,17 @@ mod tests {
             if remove_client {
                 app.world_mut().remove_resource::<crate::holders::HolderClient>();
             }
-            let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
-            assert_eq!(rc, 10, "{body}");
-            assert_eq!(body["error_code"], "ACTIVATION_UNAVAILABLE");
-            assert_eq!(body["reason"], "compositor holder plane not available");
-            assert_eq!(body["name"], "beta");
-            assert!(body["error"].as_str().unwrap().contains("compositor holder plane not available"));
-            assert_eq!(left(&app), before, "no reveal and no page switch");
-            assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+            for focus in [true, false] {
+                let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate",
+                    json!({"name":"beta","focus":focus}));
+                assert_eq!(rc, 10, "{body}");
+                assert_eq!(body["error_code"], "ACTIVATION_UNAVAILABLE");
+                assert_eq!(body["reason"], "compositor holder plane not available");
+                assert_eq!(body["name"], "beta");
+                assert!(body["error"].as_str().unwrap().contains("compositor holder plane not available"));
+                assert_eq!(left(&app), before, "no reveal, page switch or focus request");
+                assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+            }
         }
         // An unknown name is still the unknown-name refusal while uncapable.
         let (_, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"ghost"}));
@@ -4061,6 +4167,27 @@ mod tests {
         assert!(info["verbs"].as_array().unwrap().contains(&json!("sub.activate")));
     }
 
+    /// End to end across the B→C window: refused while comp reports no
+    /// holder plane; comp's leaf changes (restart C), Quoin re-reads it on
+    /// the `props.changed`, and the same request is accepted and held.
+    #[test]
+    fn activation_is_refused_until_the_holder_plane_arrives() {
+        let comp = FakeComp::new(false);
+        let (mut app, peer) = activation_app(&comp);
+        let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
+        assert_eq!((rc, &body["error_code"]), (10, &json!("ACTIVATION_UNAVAILABLE")));
+        comp.capable.set(true);
+        peer.deliver_message(comp_message("props.changed", json!({"path":"input.corners.holders",
+            "old":false,"new":true,"cause":"props.set","event_seq":2})));
+        let reads: Vec<_> = pump(&mut app, &peer, &comp).into_iter()
+            .map(|call| serde_json::from_str::<Value>(&call.body).unwrap()["path"].clone())
+            .collect();
+        assert!(reads.contains(&json!("input.corners.holders")), "the leaf is re-read: {reads:?}");
+        let hold = activate_hidden_and_hold(&mut app, &peer, &comp, "panel-left");
+        assert_eq!(hold["holder"], "focus");
+        assert_eq!(left(&app).active_page_id.as_deref(), Some("beta"));
+    }
+
     #[test]
     fn activate_on_hidden_reveals_with_focus_hold() {
         let comp = FakeComp::new(true);
@@ -4068,74 +4195,124 @@ mod tests {
         let (rc, body) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"beta"}));
         assert_eq!(rc, 0, "{body}");
         assert_eq!(body, json!({"accepted":true,"name":"beta","edge":"left","output":"test",
-            "target":null}));
+            "target":null,"focus":true}));
         let panel = left(&app);
         assert_eq!(panel.mode, PanelMode::Hidden, "activation never changes a mode");
         assert!(panel.transient_revealed);
         assert_eq!(panel.active_page_id.as_deref(), Some("beta"));
         assert_eq!(panel.page_change, cosmix_shell::runtime::PageChange::Named);
-        assert_eq!(panel.keyboard_interactivity,
-            cosmix_shell::runtime::KeyboardInteractivity::Exclusive,
-            "the panel asks for the keyboard: FocusDirective::Panel(Left)");
-        // The exclusive layer maps and takes the keyboard: the host reports
-        // it, and comp publishes the same move. A focus change before comp
-        // has acknowledged the hold is not the user leaving it.
-        observe_focus(&mut app, Some(Edge::Left));
-        peer.deliver_message(focus_changed(Some(4), Some(3)));
-        pump(&mut app, &peer, &comp);
+        // The Panel(Left) focus request: the layer asks for the keyboard.
+        assert!(panel.keyboard_requested && !panel.keyboard_focused);
+        assert_eq!(panel.keyboard_interactivity, cosmix_shell::runtime::KeyboardInteractivity::Exclusive);
+
         // The reveal maps the layer: its mode report, then the focus hold —
         // the literal `comp.panel.hold`, addressed to the comp instance.
+        // Comp answers the hidden report with a re-stated conceal (nothing
+        // holds yet) and refuses the hold until the layer is mapped: the
+        // explicit reveal survives both.
+        comp.refuse_holds.set(true);
         map_left_layer(&mut app, "panel-left");
         let calls = pump(&mut app, &peer, &comp);
         let commands: Vec<_> = calls.iter().map(|call| (call.to.as_str(), call.command.as_str())).collect();
         assert_eq!(commands, [("comp-nested", "comp.panel.mode"), ("comp-nested", "comp.panel.hold")]);
         assert_eq!(holds(&calls), [json!({"output":"test","edge":"left","surface":"panel-left",
             "holder":"focus","acquire":true})]);
-        // Comp's verdict: the hold holds the edge.
-        peer.deliver_message(panel_command(1, "panel-left", "reveal"));
-        pump(&mut app, &peer, &comp);
-        assert!(left(&app).transient_revealed);
-        // Only the exclusive latch moved: keyboard focus did not.
-        peer.deliver_message(focus_changed(Some(4), Some(4)));
-        assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
-        assert_eq!(left(&app).keyboard_interactivity,
-            cosmix_shell::runtime::KeyboardInteractivity::Exclusive, "focus landed: still held");
-        // Focus moves: the focus request ends (focus landed, then left) and
-        // the hold has done its job and is released ...
-        observe_focus(&mut app, None);
-        peer.deliver_message(focus_changed(Some(5), Some(4)));
-        let released = holds(&pump(&mut app, &peer, &comp));
-        assert_eq!(left(&app).keyboard_interactivity,
-            cosmix_shell::runtime::KeyboardInteractivity::OnDemand, "the grab is given back");
-        assert_eq!(released.len(), 1);
-        assert_eq!((&released[0]["holder"], &released[0]["acquire"]), (&json!("focus"), &json!(false)));
-        // ... and comp's conceal (nothing else holds) ends the reveal.
-        peer.deliver_message(panel_command(2, "panel-left", "conceal"));
-        pump(&mut app, &peer, &comp);
-        assert!(!left(&app).transient_revealed);
-
-        // An explicit close ends it too: Hide releases the hold. Concealment
-        // destroyed the layer; the next reveal maps one with a new token.
-        app.world_mut()
-            .resource_mut::<cosmix_shell_host::holders::PanelLayerIdentities>()
-            .0
-            .retain(|(_, edge, _)| *edge != Edge::Left);
-        let (rc, _) = sub_send(&mut app, &peer, "shell.sub.activate", json!({"name":"alpha"}));
-        assert_eq!(rc, 0);
-        assert!(left(&app).transient_revealed);
-        map_left_layer(&mut app, "panel-left-2");
+        assert_eq!(comp.published(), [false], "the re-stated conceal verdict");
+        assert!(left(&app).transient_revealed, "a conceal before the hold leaves the reveal");
+        // The layer maps: the refused hold is sent again and holds the edge.
+        comp.refuse_holds.set(false);
+        peer.deliver_message(comp_message("surface.mapped", json!({"id":4,"role":"layer","event_seq":3})));
         let acquired = holds(&pump(&mut app, &peer, &comp));
         assert_eq!(acquired.len(), 1);
-        assert_eq!((&acquired[0]["surface"], &acquired[0]["acquire"]), (&json!("panel-left-2"), &json!(true)));
-        app.world_mut().write_message(ShellCommand {
-            output: test_model().output().clone(),
-            at: Default::default(),
-            kind: ShellCommandKind::Panel { edge: Edge::Left, input: PanelInput::Hide },
-        });
+        assert_eq!(acquired[0]["acquire"], true);
+        assert_eq!(comp.published(), [true]);
+        assert!(left(&app).transient_revealed);
+
+        // The keyboard lands (the host reports it; comp's focus membership
+        // sees it too): the grab drops to on-demand, and the hold has done
+        // its job — Quoin releases it and comp's focus holder carries the
+        // reveal, so no conceal follows.
+        observe_focus(&mut app, Some(Edge::Left));
+        comp.set_focused(&peer, true);
+        let released = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(released.len(), 1);
+        assert_eq!((&released[0]["holder"], &released[0]["acquire"]), (&json!("focus"), &json!(false)));
+        assert!(comp.published().is_empty(), "comp's focus membership keeps the verdict");
+        let panel = left(&app);
+        assert!(panel.transient_revealed && panel.keyboard_focused && panel.keyboard_requested);
+        assert_eq!(panel.keyboard_interactivity, cosmix_shell::runtime::KeyboardInteractivity::OnDemand,
+            "granted: a click elsewhere can take focus");
+        // A comp focus event of any kind no longer bears on the hold.
+        peer.deliver_message(focus_changed(Some(5), Some(4)));
+        assert!(holds(&pump(&mut app, &peer, &comp)).is_empty());
+
+        // Click-away: focus leaves the panel, the request ends, comp's last
+        // holder releases and the reveal ends.
+        observe_focus(&mut app, None);
+        comp.set_focused(&peer, false);
+        pump(&mut app, &peer, &comp);
+        assert_eq!(comp.published(), [false]);
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested);
+        assert_eq!(panel.mode, PanelMode::Hidden);
+
+        // Escape ends it too, before the keyboard ever landed: the request
+        // and the hold both go. Concealment destroyed the layer; the next
+        // reveal maps one with a new token.
+        unmap_left_layer(&mut app);
+        activate_hidden_and_hold(&mut app, &peer, &comp, "panel-left-2");
+        keyboard(&mut app, cosmix_shell::runtime::KeyboardCommand::Escape);
+        let released = holds(&pump(&mut app, &peer, &comp));
+        assert_eq!(released.len(), 1);
+        assert_eq!((&released[0]["surface"], &released[0]["acquire"]), (&json!("panel-left-2"), &json!(false)));
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested);
+    }
+
+    /// The grant never lands (a lock, a higher Exclusive layer): when the
+    /// request times out Quoin also releases the hold, and the reveal ends
+    /// by comp's ordinary rules instead of lingering until focus happens to
+    /// change.
+    #[test]
+    fn an_ungranted_activation_releases_its_hold_at_the_grant_timeout() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        activate_hidden_and_hold(&mut app, &peer, &comp, "panel-left");
+        comp.published();
+        std::thread::sleep(cosmix_shell::core::FOCUS_GRANT_TIMEOUT + std::time::Duration::from_millis(100));
         let released = holds(&pump(&mut app, &peer, &comp));
         assert_eq!(released.len(), 1);
         assert_eq!(released[0]["acquire"], false);
-        assert_eq!(left(&app).mode, PanelMode::Hidden);
+        assert_eq!(comp.published(), [false], "nothing else holds: comp conceals");
+        let panel = left(&app);
+        assert!(!panel.transient_revealed && !panel.keyboard_requested);
+    }
+
+    /// `focus=false`: reveal or switch for attention, without asking for the
+    /// keyboard and without a focus hold — as a header string or a JSON bool.
+    #[test]
+    fn activate_without_focus_reveals_without_keyboard_or_hold() {
+        let comp = FakeComp::new(true);
+        let (mut app, peer) = activation_app(&comp);
+        map_left_layer(&mut app, "panel-left");
+        pump(&mut app, &peer, &comp);
+        comp.published();
+        let mut header = wire("shell.sub.activate", json!({"name":"beta"}));
+        header.headers.insert("focus".into(), "false".into());
+        for request in [header, wire("shell.sub.activate", json!({"name":"alpha","focus":false}))] {
+            peer.send(request);
+            app.update();
+            let replies = peer.drain_responses();
+            assert_eq!(replies[0].rc, 0, "{}", replies[0].body);
+            let body: Value = serde_json::from_str(&replies[0].body).unwrap();
+            assert_eq!(body["focus"], false);
+            let panel = left(&app);
+            assert!(panel.transient_revealed, "revealed for attention");
+            assert_eq!(panel.active_page_id.as_deref(), body["name"].as_str());
+            assert!(!panel.keyboard_requested);
+            assert_eq!(panel.keyboard_interactivity, cosmix_shell::runtime::KeyboardInteractivity::OnDemand);
+            assert!(holds(&pump(&mut app, &peer, &comp)).is_empty(), "no focus hold");
+        }
     }
 
     #[test]
@@ -4162,20 +4339,31 @@ mod tests {
                 assert_eq!(after.active_page_id.as_deref(), Some(name), "{mode:?}");
                 assert_eq!(after.page_change, cosmix_shell::runtime::PageChange::Named,
                     "{mode:?}: a direct jump, never a slide");
+                assert!(after.keyboard_requested, "{mode:?}: focus is requested");
                 assert_eq!(after.keyboard_interactivity,
                     cosmix_shell::runtime::KeyboardInteractivity::Exclusive,
                     "{mode:?}: the panel asks for the keyboard");
                 assert!(holds(&pump(&mut app, &peer, &comp)).is_empty(),
                     "{mode:?}: persistent panels take no hold");
             }
+            // The grant lands and the page stays: nothing reverts it.
+            observe_focus(&mut app, Some(Edge::Left));
+            pump(&mut app, &peer, &comp);
+            assert_eq!(left(&app).keyboard_interactivity,
+                cosmix_shell::runtime::KeyboardInteractivity::OnDemand);
+            observe_focus(&mut app, None);
+            pump(&mut app, &peer, &comp);
+            let after = left(&app);
+            assert_eq!((after.mode, after.active_page_id.as_deref()), (mode, Some("alpha")));
+            assert!(!after.keyboard_requested);
         }
     }
 
     #[test]
     fn activation_targets_focused_window_output_else_pointer() {
-        let mut comp = FakeComp::new(true);
-        comp.focus = json!({"keyboard":7,"pointer":9,"window":{"id":7,"generation":1}});
-        comp.outputs = BTreeMap::from([(7, "DP-1"), (9, "HDMI-A-1")]);
+        let comp = FakeComp::new(true);
+        *comp.focus.borrow_mut() = json!({"keyboard":7,"pointer":9,"window":{"id":7,"generation":1}});
+        *comp.outputs.borrow_mut() = BTreeMap::from([(7, "DP-1"), (9, "HDMI-A-1")]);
         let (mut app, peer) = activation_app(&comp);
         let target = |app: &mut App| {
             let (rc, body) = sub_send(app, &peer, "shell.sub.activate", json!({"name":"alpha"}));
@@ -4186,7 +4374,7 @@ mod tests {
         assert_eq!(target(&mut app), "DP-1", "the focused window's output");
         // Nothing focused: the pointer's output. The focus change starts a
         // fresh round of reads, literal `comp.props.get`s to the instance.
-        comp.focus = json!({"keyboard":null,"pointer":9});
+        *comp.focus.borrow_mut() = json!({"keyboard":null,"pointer":9});
         peer.deliver_message(focus_changed(None, Some(7)));
         let reads: Vec<_> = pump(&mut app, &peer, &comp).into_iter()
             .filter(|call| call.command == "comp.props.get")
@@ -4195,17 +4383,17 @@ mod tests {
         assert_eq!(reads, [json!("focus"), json!("surfaces.s9.output")]);
         assert_eq!(target(&mut app), "HDMI-A-1");
         // A focused surface comp puts on no output falls back to the pointer.
-        comp.focus = json!({"keyboard":11,"pointer":9});
+        *comp.focus.borrow_mut() = json!({"keyboard":11,"pointer":9});
         peer.deliver_message(focus_changed(Some(11), None));
         pump(&mut app, &peer, &comp);
         assert_eq!(target(&mut app), "HDMI-A-1");
         // Neither known: no target, and the activation still stands.
-        comp.focus = json!({"keyboard":null,"pointer":null});
+        *comp.focus.borrow_mut() = json!({"keyboard":null,"pointer":null});
         peer.deliver_message(focus_changed(None, Some(11)));
         pump(&mut app, &peer, &comp);
         assert_eq!(target(&mut app), Value::Null);
         // A lost connection forgets where the user was.
-        comp.focus = json!({"keyboard":7,"pointer":null});
+        *comp.focus.borrow_mut() = json!({"keyboard":7,"pointer":null});
         peer.deliver_message(focus_changed(Some(7), None));
         pump(&mut app, &peer, &comp);
         assert_eq!(target(&mut app), "DP-1");

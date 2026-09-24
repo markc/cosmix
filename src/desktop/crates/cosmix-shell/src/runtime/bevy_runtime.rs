@@ -414,11 +414,14 @@ fn update_model(
                 name,
                 owner,
                 accepted_at,
+                focus,
             } => {
                 // Addressed like a removal: only that exact registration,
                 // and only on the model that carries its seat — an
                 // activation whose name was removed, replaced or migrated
-                // away since dispatch has nothing to show here.
+                // away since dispatch has nothing to show here. The verb was
+                // acked at dispatch, so that one-frame race answers accepted
+                // and applies nothing (logged below).
                 let exact = registry.0.seat(name).is_some_and(|seat| {
                     seat.owner == *owner
                         && seat.accepted_at == *accepted_at
@@ -440,11 +443,12 @@ fn update_model(
                 // §5) — including onto a page already sliding in.
                 runtime.page_changes[edge.index()] = PageChange::Named;
                 // Hidden: a transient reveal, never a mode change (panel doc
-                // §6); the host holds it with a compositor focus hold.
-                // Pinned or docked: a page switch, no mode change. Either way
-                // the panel then asks for the keyboard, as a focus-cycle stop
-                // does (the layer turns exclusive until focus lands and leaves,
-                // Escape, or the grant times out).
+                // §6); a focusing one is held by a compositor focus hold
+                // until the keyboard lands. Pinned or docked: a page switch,
+                // no mode change. With `focus` the panel then asks for the
+                // keyboard exactly as a focus-cycle stop does (exclusive until
+                // granted, then on-demand; ends when focus leaves, on Escape
+                // or when the grant times out).
                 let at = command.at.clamp(runtime.model.last_update(), now);
                 if runtime.model.panel(*edge).mode == PanelMode::Hidden
                     && let Ok(update) = runtime.model.panel_input(*edge, at, PanelInput::Reveal)
@@ -455,7 +459,9 @@ fn update_model(
                         effect,
                     });
                 }
-                runtime.model.request_keyboard_focus(*edge, at);
+                if *focus {
+                    runtime.model.request_keyboard_focus(*edge, at);
+                }
                 continue;
             }
             ShellCommandKind::HolderPlane(available) => {

@@ -173,9 +173,10 @@ impl ActivationTargets {
     }
 }
 
-/// `shell.sub.activate name=<name>` (panel doc §6). Refusals, in order: an
-/// unattested caller or a stale Quoin connection (the fences every sub-panel
-/// verb keeps), a missing name, an unregistered name (the same refusal as
+/// `shell.sub.activate name=<name> [focus=true|false]` (panel doc §6).
+/// Refusals, in order: an unattested caller or a stale Quoin connection (the
+/// fences every sub-panel verb keeps), a missing name, a malformed `focus`,
+/// an unregistered name (the same refusal as
 /// `sub.remove` — activation never creates), and then the capability gate.
 /// The name is the address: its seat supplies the edge, owner and receipt,
 /// and the Model stage applies the activation only while that exact
@@ -204,6 +205,9 @@ pub(crate) fn dispatch_activate(
     let Some(name) = argument(request, "name").filter(|name| !name.trim().is_empty()) else {
         return (10, json!({"error":"sub.activate requires a name argument"}).to_string(), None);
     };
+    let Some(focus) = focus_argument(request) else {
+        return (10, json!({"error":"focus must be true or false"}).to_string(), None);
+    };
     let Some(seat) = registry.seat(&name) else {
         let error = SubPanelRegistryError::Unknown(name);
         return (10, json!({"error":error.to_string()}).to_string(), None);
@@ -218,7 +222,7 @@ pub(crate) fn dispatch_activate(
     }
     let body = json!({
         "accepted":true, "name":name, "edge":edge_name(seat.edge),
-        "output":seat.output.as_str(), "target":target.map(OutputKey::as_str),
+        "output":seat.output.as_str(), "target":target.map(OutputKey::as_str), "focus":focus,
     });
     let command = semantic_shell_command(
         frame.geometry.output.clone(),
@@ -228,7 +232,26 @@ pub(crate) fn dispatch_activate(
             name,
             owner: seat.owner.clone(),
             accepted_at: seat.accepted_at,
+            focus,
         },
     );
     (0, body.to_string(), Some(command))
+}
+
+/// The optional `focus` flag, default `true` (panel doc §6: reveal and
+/// focus). A JSON boolean or the string `true`/`false`, as Mix header
+/// routing delivers it; `None` for any other value.
+fn focus_argument(request: &InboundRequest) -> Option<bool> {
+    let body = serde_json::from_str::<Value>(&request.body).ok();
+    match body.as_ref().and_then(|body| body.get("focus")) {
+        Some(Value::Bool(focus)) => return Some(*focus),
+        Some(Value::String(_)) | None => {}
+        Some(_) => return None,
+    }
+    match argument(request, "focus").as_deref() {
+        None => Some(true),
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(_) => None,
+    }
 }

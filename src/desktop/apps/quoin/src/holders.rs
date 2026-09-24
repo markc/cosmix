@@ -32,7 +32,7 @@ use crate::bus_service::edge_name;
 use crate::hotspot::{COMP_PROPS_GET, is_comp_gap};
 
 const HOLDERS_PATH: &str = "input.corners.holders";
-const TOPIC_SUFFIXES: [&str; 4] = ["props.changed", "panel.command", "surface.mapped", "focus.changed"];
+const TOPIC_SUFFIXES: [&str; 3] = ["props.changed", "panel.command", "surface.mapped"];
 const RETRY_FIRST: Duration = Duration::from_millis(250);
 const RETRY_CAP: Duration = Duration::from_secs(8);
 
@@ -113,13 +113,15 @@ pub(crate) struct HolderClient {
     backoff: Duration,
     popup: BTreeMap<(String, String), bool>,
     popup_surfaces: BTreeMap<(String, String), String>,
-    /// Named activation's focus holds by `(output, edge)`, each flagged once
-    /// comp has acknowledged its acquisition. One is wanted from the
-    /// activation that revealed a hidden edge until that reveal ends, the
-    /// edge goes persistent, or keyboard focus moves after the
-    /// acknowledgement: it stands in for focus until focus first moves, and
-    /// comp's own focus holder keeps the edge if that move was into it.
-    focus: BTreeMap<(String, Edge), bool>,
+    /// Named activation's focus holds by `(output, edge)`: the bridge from a
+    /// focusing activation of a hidden edge to the keyboard landing there.
+    /// Wanted while that reveal lasts and its keyboard request is pending;
+    /// released once the keyboard lands (comp's own focus holder then holds
+    /// the edge, and releases it when focus leaves) or when the request ends
+    /// without landing (grant timeout, Escape, another cycle stop), after
+    /// which comp's ordinary holders decide. Derived from Quoin's own frame,
+    /// never from comp's focus events, so no event ordering can end it early.
+    focus: BTreeSet<(String, Edge)>,
 }
 
 pub(crate) fn install(app: &mut App, bus: &mut BusBridgeConfig, service: String) {
@@ -166,7 +168,7 @@ impl HolderClient {
             maybe_held: BTreeMap::new(), pending: None, pending_superseded: false,
             retry_wanted: false, retry_read: false,
             retry_at: None, backoff: RETRY_FIRST, popup: BTreeMap::new(),
-            popup_surfaces: BTreeMap::new(), focus: BTreeMap::new(),
+            popup_surfaces: BTreeMap::new(), focus: BTreeSet::new(),
         }
     }
 
@@ -185,9 +187,6 @@ impl HolderClient {
         self.retry_read = false;
         self.retry_at = None;
         self.backoff = RETRY_FIRST;
-        // Whatever was lost may include the focus change that ends them;
-        // unwanted, each is released once the gate reopens.
-        self.focus.clear();
     }
 
     /// The capability to hand the model when it differs from what the model
@@ -301,10 +300,6 @@ impl HolderClient {
                 }
                 if release {
                     self.maybe_held.remove(&key);
-                } else if body["holder"] == "focus" {
-                    for ((output, edge), acquired) in &mut self.focus {
-                        *acquired |= body["output"] == output.as_str() && body["edge"] == edge_name(*edge);
-                    }
                 }
                 self.acknowledged.insert(key, body);
             }
@@ -339,16 +334,6 @@ impl HolderClient {
         match suffix {
             "surface.mapped" => {
                 self.failed.retain(|_, (_, wait)| *wait != Wait::Mapping);
-                return None;
-            }
-            // Keyboard focus moved (not just the exclusive latch): an
-            // acknowledged activation hold has done its job. A move into the
-            // panel is held on by comp's own focus holder; one elsewhere ends
-            // the reveal (panel doc §6).
-            "focus.changed" => {
-                if body["keyboard"] != body["previous"] {
-                    self.focus.retain(|_, acquired| !*acquired);
-                }
                 return None;
             }
             "props.changed" => {
@@ -501,27 +486,29 @@ pub(crate) fn report_holders(
             ShellCommandKind::Panel { edge, input: cosmix_shell::core::PanelInput::MenuHold(open) } => {
                 client.popup.insert((command.output.as_str().into(), edge_name(*edge).into()), *open);
             }
-            ShellCommandKind::SubPanelActivate { edge, name, .. } => {
+            ShellCommandKind::SubPanelActivate { edge, name, focus: true, .. } => {
                 activated.push((command.output.clone(), *edge, name.clone()));
             }
             _ => {}
         }
     }
-    // A named activation holds only the reveal it made (the Model stage
+    // A focusing activation holds only the reveal it made (the Model stage
     // applied it: the edge is hidden, revealed and on that page), and only
-    // while that reveal lasts on this output.
-    let shows = |edge: Edge| {
+    // while that reveal lasts on this output and its keyboard request is
+    // still waiting for the keyboard.
+    let pending = |edge: Edge| {
         let panel = frame.0.panel(edge);
         panel.mode == PanelMode::Hidden && panel.transient_revealed
+            && panel.keyboard_requested && !panel.keyboard_focused
     };
     for (activated_output, edge, name) in activated {
-        if client.capable && activated_output == *output && shows(edge)
+        if client.capable && activated_output == *output && pending(edge)
             && frame.0.panel(edge).active_page_id.as_deref() == Some(name.as_str())
         {
-            client.focus.entry((output.as_str().into(), edge)).or_insert(false);
+            client.focus.insert((output.as_str().into(), edge));
         }
     }
-    client.focus.retain(|(focus_output, edge), _| focus_output == output.as_str() && shows(*edge));
+    client.focus.retain(|(focus_output, edge)| focus_output == output.as_str() && pending(*edge));
     if let Some(identity) = &popup_identity {
         client.popup_surfaces.insert((identity.output.as_str().into(), edge_name(identity.edge).into()),
             identity.surface.clone());
@@ -537,7 +524,7 @@ pub(crate) fn report_holders(
             // The activation's focus hold names the panel's own layer, which
             // maps with the reveal: an acquisition that overtakes the mapping
             // is refused and resent on the next `surface.mapped`.
-            if client.focus.contains_key(&(output.as_str().to_owned(), edge)) {
+            if client.focus.contains(&(output.as_str().to_owned(), edge)) {
                 client.desired.insert((surface.into(), "panel.hold".into()), json!({
                     "output":output.as_str(),"edge":edge_name(edge),"surface":surface,
                     "holder":"focus","acquire":true,

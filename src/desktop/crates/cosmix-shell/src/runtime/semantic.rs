@@ -75,6 +75,9 @@ pub enum ShellSemanticVerb {
         name: String,
         owner: String,
         accepted_at: u64,
+        /// Ask for the keyboard too (the §6 default); `false` reveals or
+        /// switches without it.
+        focus: bool,
     },
 }
 
@@ -154,11 +157,13 @@ pub fn semantic_shell_command(
             name,
             owner,
             accepted_at,
+            focus,
         } => ShellCommandKind::SubPanelActivate {
             edge,
             name,
             owner,
             accepted_at,
+            focus,
         },
     };
     ShellCommand { output, at, kind }

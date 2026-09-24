@@ -1832,7 +1832,10 @@ keyboard focus dismisses any active XDG popup keyboard grab before the arbiter
 sets its chosen focus. While an Exclusive latch is held, an unrelated popup
 grab request is denied with `popup_done`, because xdg-shell requires the
 topmost grabbing popup to own keyboard focus; a popup belonging to the latched
-layer may grab normally. When a focused layer stops being eligible, focus
+layer may grab normally. A latched layer that holds the keyboard and commits
+`OnDemand` keeps the keyboard: the latch ends, the focus stays, and from then
+on a click elsewhere moves it like any `OnDemand` layer (Quoin's panels ask
+for the grab only until it lands). When a focused layer stops being eligible, focus
 moves to the next Exclusive layer, otherwise to the highest visible normal
 toplevel, or to no surface when neither exists. Keyboard focus inside an
 Exclusive layer's own active popup grab satisfies the layer's latch: ordinary

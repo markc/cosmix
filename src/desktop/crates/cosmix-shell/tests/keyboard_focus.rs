@@ -186,10 +186,45 @@ fn an_ungranted_cycle_request_expires() {
     assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::OnDemand);
     assert_eq!(model.next_deadline(), None);
 
-    // A granted request keeps its grab past the deadline.
+    // A granted request outlives the deadline, but its grab does not: once
+    // the panel holds the keyboard it is on-demand again (changed with named
+    // activation, chunk 16), so a click elsewhere can take focus away.
     model.cycle_keyboard_focus(ms(1_000));
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::Exclusive);
     model.keyboard_focus_observed(Some(Edge::Left));
     model.tick(ms(5_000)).unwrap();
     assert_eq!(model.focus_directive(), FocusDirective::Panel(Edge::Left));
-    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::Exclusive);
+    assert_eq!(keyboard(&model, Edge::Left), KeyboardInteractivity::OnDemand);
+}
+
+/// Click-away after the grant, for both callers of the one focus request:
+/// the focus cycle and named activation. Focus landing drops the grab to
+/// on-demand; the host then reporting focus gone (a click elsewhere) ends
+/// the request, and nothing re-grabs.
+#[test]
+fn a_granted_focus_request_can_be_clicked_away() {
+    for activation in [false, true] {
+        let mut model = model();
+        model.set_mode(Edge::Left, ms(0), PanelMode::Pinned).unwrap();
+        model.tick(ms(300)).unwrap();
+        if activation {
+            model.request_keyboard_focus(Edge::Left, ms(300));
+        } else {
+            assert_eq!(model.cycle_keyboard_focus(ms(300)), FocusStop::Panel(Edge::Left));
+        }
+        let frame = ShellFrame::from_model(&model);
+        assert_eq!(frame.panel(Edge::Left).keyboard_interactivity, KeyboardInteractivity::Exclusive);
+        assert!(frame.panel(Edge::Left).keyboard_requested && !frame.panel(Edge::Left).keyboard_focused);
+        model.keyboard_focus_observed(Some(Edge::Left));
+        let frame = ShellFrame::from_model(&model);
+        assert_eq!(frame.panel(Edge::Left).keyboard_interactivity, KeyboardInteractivity::OnDemand,
+            "activation={activation}: granted, so no longer exclusive");
+        assert!(frame.panel(Edge::Left).keyboard_focused);
+        model.keyboard_focus_observed(None);
+        assert_eq!(model.focus_directive(), FocusDirective::Follow, "activation={activation}");
+        let frame = ShellFrame::from_model(&model);
+        assert_eq!(frame.panel(Edge::Left).keyboard_interactivity, KeyboardInteractivity::OnDemand);
+        assert!(!frame.panel(Edge::Left).keyboard_requested);
+        assert_eq!(model.panel(Edge::Left).mode, PanelMode::Pinned);
+    }
 }
