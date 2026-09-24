@@ -855,8 +855,17 @@ unsnapped origin it last placed a window at. A later inset change or scale
 change derives the new whole-pixel origin from that anchor, never from an
 already snapped value. So a GTK window whose shadow inset changes on every
 focus change stays put, and a scale change from 2.5 to 1.25 and back returns
-the window to the same pixel. The anchor is dropped once anything else moves
-the window.
+the window to the same pixel.
+
+Which requests set the anchor:
+- A move, `comp.window.place`, an interactive resize and the output-shrink
+  clamp each REPLACE the anchor, per axis, with the origin they asked for.
+- An axis such a request leaves where the window already stands keeps its
+  recorded anchor. Examples are a size-only place, a right or bottom edge
+  drag, and the unmoved axis of a left drag. So interleaving resizes with
+  inset changes cannot walk the window either.
+- Anything else that moves the window, such as a return from maximised or a
+  decoration-mode switch, makes its new origin the anchor.
 
 **Constraints choose between the two nearest grid points.**
 - `comp.window.place` validates the snapped origin, not the requested one.
@@ -864,8 +873,14 @@ the window.
   it takes the grid point on the other side.
 - The output-shrink clamp takes the nearest grid point that is still inside
   the clamp. The window does not slide under a panel or lose the room it was
-  clamped to fit. If the clamp interval is narrower than a pixel, the clamped
-  origin stays unsnapped.
+  clamped to fit. When the window is wider than the work area, the clamp
+  interval is narrower than a pixel. Then the origin takes the nearest grid
+  point at or past the work area's near edge, and the size clamp that follows
+  shrinks the window. That grid point becomes the anchor, so the next commit
+  keeps it.
+- A left or top edge drag whose stationary edge sits exactly on the output's
+  left or top edge may have no grid point that keeps it on its pixel. It then
+  moves one pixel toward the visible side, never behind the output edge.
 - A left or top edge drag keeps the STATIONARY edge on the physical pixel it
   started on. The moving origin takes whichever grid point preserves it, so
   the far edge does not wobble as the drag crosses odd sizes.
