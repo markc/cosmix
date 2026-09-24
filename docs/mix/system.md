@@ -373,7 +373,12 @@ stdout unchanged only when the aggregate `.ok` is true and no captured stream
 was truncated. Otherwise it raises `PIPELINE_EXIT_NONZERO`, `PIPELINE_TIMEOUT`,
 `PIPELINE_SIGNAL`, `PIPELINE_INTERRUPTED`, `PIPELINE_OUTPUT_LIMIT`, or the
 setup/lifecycle code above. The complete pipeline_result is always available as
-`$err.details.result`.
+`$err.details.result`. A stage failure is raised from that result's own
+`status` and `failed_stage`, so the raise and the result always agree. A
+`signal` or `broken_pipe` status gives `PIPELINE_SIGNAL`, anything else gives
+`PIPELINE_EXIT_NONZERO`, and the message names `failed_stage`. For
+`yes | sh -c 'exit 3'` that is `PIPELINE_EXIT_NONZERO` for stage 1, not
+stage 0's broken pipe.
 
 ### run — stdout string, fail-fast
 

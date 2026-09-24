@@ -784,7 +784,12 @@ stdout unchanged only when the aggregate <code>.ok</code> is true and no capture
 was truncated. Otherwise it raises <code>PIPELINE_EXIT_NONZERO</code>, <code>PIPELINE_TIMEOUT</code>,
 <code>PIPELINE_SIGNAL</code>, <code>PIPELINE_INTERRUPTED</code>, <code>PIPELINE_OUTPUT_LIMIT</code>, or the
 setup/lifecycle code above. The complete pipeline_result is always available as
-<code>$err.details.result</code>.</p>
+<code>$err.details.result</code>. A stage failure is raised from that result's own
+<code>status</code> and <code>failed_stage</code>, so the raise and the result always agree. A
+<code>signal</code> or <code>broken_pipe</code> status gives <code>PIPELINE_SIGNAL</code>, anything else gives
+<code>PIPELINE_EXIT_NONZERO</code>, and the message names <code>failed_stage</code>. For
+<code>yes | sh -c 'exit 3'</code> that is <code>PIPELINE_EXIT_NONZERO</code> for stage 1, not
+stage 0's broken pipe.</p>
 <h3 id="run--stdout-string-fail-fast">run — stdout string, fail-fast</h3>
 <p><code>run(cmd)</code> runs <code>cmd</code> through <code>/bin/sh -c</code>, returns its stdout as a string with
 <strong>trailing</strong> whitespace stripped (leading whitespace is preserved), and on a

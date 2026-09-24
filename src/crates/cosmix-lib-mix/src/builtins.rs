@@ -6998,52 +6998,51 @@ fn builtin_run_pipeline_must(args: Vec<Value>) -> MixResult<Option<Value>> {
             "run_pipeline_must: captured output exceeded max_output".to_string(),
         )
     } else if !get_bool("ok") {
-        let failed_signal = match map.get("stages") {
-            Some(Value::List(stages)) => stages.iter().enumerate().find_map(|(index, stage)| {
-                let stage = match stage {
-                    Value::Map(stage) => stage,
-                    _ => return None,
-                };
-                if matches!(stage.get("accepted_signal"), Some(Value::Bool(true))) {
-                    return None;
-                }
-                match stage.get("signal") {
-                    Some(Value::Number(signal)) => Some((index, *signal as i64)),
-                    _ => None,
-                }
-            }),
+        // The code and the named stage come from the SAME fields the value
+        // carries — `status` and `failed_stage` (pipefail's rightmost rule) —
+        // so the raise can never contradict $err.details.result. In
+        // `yes | sh -c 'exit 3'` stage 0's broken pipe is the symptom and
+        // stage 1's exit 3 the cause: this raises PIPELINE_EXIT_NONZERO for
+        // stage[1], exactly as the result's status/failed_stage say.
+        let failed_stage = match map.get("failed_stage") {
+            Some(Value::Number(index)) => Some(*index as usize),
             _ => None,
         };
-        if let Some((index, signal)) = failed_signal {
-            (
-                "PIPELINE_SIGNAL".to_string(),
-                format!("run_pipeline_must: stage[{index}] killed by signal {signal}"),
-            )
-        } else {
-            let failed_exit = match map.get("stages") {
-                Some(Value::List(stages)) => {
-                    stages.iter().enumerate().find_map(|(index, stage)| {
-                        let stage = match stage {
-                            Value::Map(stage) => stage,
-                            _ => return None,
-                        };
-                        match (stage.get("ok"), stage.get("exit_code")) {
-                            (Some(Value::Bool(false)), Some(Value::Number(code))) => {
-                                Some((index, *code as i64))
-                            }
-                            _ => None,
-                        }
-                    })
-                }
+        let stage = failed_stage.and_then(|index| match map.get("stages") {
+            Some(Value::List(stages)) => match stages.get(index) {
+                Some(Value::Map(stage)) => Some(stage.clone()),
                 _ => None,
-            };
-            let message = failed_exit.map_or_else(
-                || "run_pipeline_must: pipeline failed".to_string(),
-                |(index, code)| {
-                    format!("run_pipeline_must: stage[{index}] failed (exit_code={code})")
-                },
-            );
-            ("PIPELINE_EXIT_NONZERO".to_string(), message)
+            },
+            _ => None,
+        });
+        let status = match map.get("status") {
+            Some(Value::String(status)) => status.as_str(),
+            _ => "exit_nonzero",
+        };
+        let number = |key: &str| match stage.as_ref().and_then(|stage| stage.get(key)) {
+            Some(Value::Number(n)) => Some(*n as i64),
+            _ => None,
+        };
+        match (status, failed_stage) {
+            ("signal" | "broken_pipe", Some(index)) => (
+                "PIPELINE_SIGNAL".to_string(),
+                format!(
+                    "run_pipeline_must: stage[{index}] killed by signal {}{}",
+                    number("signal").unwrap_or_default(),
+                    if status == "broken_pipe" { " (broken pipe: its reader closed)" } else { "" }
+                ),
+            ),
+            (_, Some(index)) => (
+                "PIPELINE_EXIT_NONZERO".to_string(),
+                format!(
+                    "run_pipeline_must: stage[{index}] failed (exit_code={})",
+                    number("exit_code").unwrap_or_default()
+                ),
+            ),
+            (_, None) => (
+                "PIPELINE_EXIT_NONZERO".to_string(),
+                "run_pipeline_must: pipeline failed".to_string(),
+            ),
         }
     } else {
         return Ok(Some(

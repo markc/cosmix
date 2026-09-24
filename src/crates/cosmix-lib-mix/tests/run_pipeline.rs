@@ -456,3 +456,29 @@ async fn pipeline_setup_error_carries_status_and_failed_stage() {
         "setup_error 1 setup_error false\ntrue\nPIPELINE_STDIO setup_error nil\n"
     );
 }
+
+/// run_pipeline_must raises from the result's own status/failed_stage, so the
+/// raise and $err.details.result can never disagree. Stage 0's broken pipe is
+/// the symptom of stage 1's exit 3: the code is PIPELINE_EXIT_NONZERO and the
+/// message names stage[1], not the leftmost signalled stage.
+#[tokio::test]
+async fn pipeline_must_code_and_stage_agree_with_the_result() {
+    let output = run_ok(
+        "try\n\
+           run_pipeline_must([[\"yes\"], [\"sh\", \"-c\", \"exit 3\"]])\n\
+         catch $message, $error\n\
+           print($error.code .. \" \" .. contains($message, \"stage[1]\") .. \" \" .. contains($message, \"exit_code=3\"))\n\
+           print($error.details.result.status .. \" \" .. $error.details.result.failed_stage)\n\
+         end\n\
+         try\n\
+           run_pipeline_must([[\"sh\", \"-c\", \"kill -TERM $$\"], [\"cat\"]])\n\
+         catch $message, $error\n\
+           print($error.code .. \" \" .. contains($message, \"stage[0]\") .. \" \" .. contains($message, \"signal 15\"))\n\
+         end\n",
+    )
+    .await;
+    assert_eq!(
+        output,
+        "PIPELINE_EXIT_NONZERO true true\nexit_nonzero 1\nPIPELINE_SIGNAL true true\n"
+    );
+}
