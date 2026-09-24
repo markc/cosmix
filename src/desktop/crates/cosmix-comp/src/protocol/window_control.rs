@@ -915,6 +915,11 @@ impl WaylandState {
     /// A frame of this mapping was shown: renderer-shown content (what
     /// `comp.window.stats` counts) or, additionally, `wp_presentation`
     /// feedback. Either must be at or after the map time.
+    ///
+    /// Known limit, shared by both signals: the test is the frame's
+    /// presentation time against the map time, not when the frame was
+    /// extracted. A frame extracted before an unmap but presented after a
+    /// remap in the same frame period can count for the new mapping.
     fn presented_since_map(&self, record: &SurfaceRecord) -> bool {
         let counters = self.presentation.ledger.counters(record.id);
         let (base, mapped_at_us) = self
