@@ -139,6 +139,9 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # display cells (UAX #11). std covers codepoints (`.chars()`), no crate needed.
 unicode-segmentation = "1"
 unicode-width = "0.2"
+# `normalize()` (0.92.0) — UAX #15 NFC/NFD/NFKC/NFKD. Same shape as the two
+# above: no_std-capable, one small dependency (tinyvec), already in the lock.
+unicode-normalization = "0.1"
 ureq = { version = "2", optional = true }
 # http `ca_file`/`ca_pem` (0.29.0): private-CA trust ADDED to the default
 # webpki roots. Version lines match ureq 2's own transitive deps so cargo

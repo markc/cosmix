@@ -53,6 +53,7 @@ Since 0.29.0 every builtin carries a structured contract — per-argument names/
   word            Extract Nth word from string (1-based)
   ord             Unicode codepoint of the FIRST character: ord("A") -> 65, ord("é") -> 233. Empty string raises. Inverse: chr()
   chr             The 1-character string for a Unicode codepoint: chr(65) -> "A", chr(10084) -> "❤". Surrogates (D800-DFFF) and >0x10FFFF raise, same rule as \u{...}. Inverse: ord()
+  normalize       Unicode normalisation (UAX #15): normalize(s[, form]) with form "NFC" (default), "NFD", "NFKC" or "NFKD" (case-insensitive; anything else raises VALUE_ERROR). Makes canonically-equivalent text compare equal: a decomposed e + combining acute (macOS filenames, NFD) equals the precomposed é after normalize(); NFKC also folds compatibility forms (fullwidth letters, ligatures: normalize("ﬁ", "NFKC") -> "fi"). Emoji and ZWJ sequences pass through unchanged (v0.92.0)
   before          Text before the FIRST delim: before(s, delim) -> string | nil (nil when delim absent; "" is a real result — delim at the start). Empty delim raises
   after           Text after the FIRST delim: after(s, delim) -> string | nil (nil when delim absent; "" when delim at the end). Empty delim raises. Want a default? `after($s, "=") or ""`
   before_last     Text before the LAST delim -> string | nil (nil when absent). Empty delim raises

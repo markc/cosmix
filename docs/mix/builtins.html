@@ -492,6 +492,7 @@ words           Count whitespace-delimited words in string
 word            Extract Nth word from string (1-based)
 ord             Unicode codepoint of the FIRST character: ord("A") -&gt; 65, ord("é") -&gt; 233. Empty string raises. Inverse: chr()
 chr             The 1-character string for a Unicode codepoint: chr(65) -&gt; "A", chr(10084) -&gt; "❤". Surrogates (D800-DFFF) and &gt;0x10FFFF raise, same rule as \u{...}. Inverse: ord()
+normalize       Unicode normalisation (UAX #15): normalize(s[, form]) with form "NFC" (default), "NFD", "NFKC" or "NFKD" (case-insensitive; anything else raises VALUE_ERROR). Makes canonically-equivalent text compare equal: a decomposed e + combining acute (macOS filenames, NFD) equals the precomposed é after normalize(); NFKC also folds compatibility forms (fullwidth letters, ligatures: normalize("ﬁ", "NFKC") -&gt; "fi"). Emoji and ZWJ sequences pass through unchanged (v0.92.0)
 before          Text before the FIRST delim: before(s, delim) -&gt; string | nil (nil when delim absent; "" is a real result — delim at the start). Empty delim raises
 after           Text after the FIRST delim: after(s, delim) -&gt; string | nil (nil when delim absent; "" when delim at the end). Empty delim raises. Want a default? <code>after($s, "=") or ""</code>
 before_last     Text before the LAST delim -&gt; string | nil (nil when absent). Empty delim raises

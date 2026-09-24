@@ -108,6 +108,7 @@ builtin_table! {
     // UTF-8 bytes, not codepoints.
     ("ord", CapabilityClass::Pure,             "string",  "Unicode codepoint of the FIRST character: ord(\"A\") -> 65, ord(\"é\") -> 233. Empty string raises. Inverse: chr()", contract!((s: string) -> number; failure[raises])),
     ("chr", CapabilityClass::Pure,             "string",  "The 1-character string for a Unicode codepoint: chr(65) -> \"A\", chr(10084) -> \"❤\". Surrogates (D800-DFFF) and >0x10FFFF raise, same rule as \\u{...}. Inverse: ord()", contract!((n: number) -> string; failure[raises])),
+    ("normalize", CapabilityClass::Pure,       "string",  "Unicode normalisation (UAX #15): normalize(s[, form]) with form \"NFC\" (default), \"NFD\", \"NFKC\" or \"NFKD\" (case-insensitive; anything else raises VALUE_ERROR). Makes canonically-equivalent text compare equal: a decomposed e + combining acute (macOS filenames, NFD) equals the precomposed é after normalize(); NFKC also folds compatibility forms (fullwidth letters, ligatures: normalize(\"ﬁ\", \"NFKC\") -> \"fi\"). Emoji and ZWJ sequences pass through unchanged (v0.92.0)", contract!((s: string, form?: string) -> string; failure[raises])),
     // --- Subject-first string helpers (0.63.0). Tier 1 (delimiter family):
     // absent delimiter/marker -> nil, "" is a REAL result (delimiter at the
     // edge), empty delimiter raises — nil and "" never blur. Tier 2
@@ -443,6 +444,7 @@ pub fn call_builtin(name: &str, args: Vec<Value>) -> MixResult<Option<Value>> {
         "word" => builtin_word(args),
         "ord" => builtin_ord(args),
         "chr" => builtin_chr(args),
+        "normalize" => builtin_normalize(args),
         // Char-aware string ops (P0) — see the registry block above.
         "byte_length" => builtin_byte_length(args),
         "byte_pos" => builtin_byte_pos(args),
@@ -2261,6 +2263,41 @@ fn builtin_ord(args: Vec<Value>) -> MixResult<Option<Value>> {
         "ord(): empty string has no codepoint — guard with `if $s != \"\"` (0 is NUL, a real codepoint, so it cannot be the absent answer)",
     ))?;
     Ok(Some(Value::Number(c as u32 as f64)))
+}
+
+/// `normalize(s[, form])` — UAX #15 normalisation. The subject is taken with
+/// `to_mix_string` like `ord`/`upper`; the form is a category string and is
+/// NOT coerced — a typo must raise, not silently pick a default.
+fn builtin_normalize(args: Vec<Value>) -> MixResult<Option<Value>> {
+    use unicode_normalization::UnicodeNormalization;
+    expect_args_between("normalize", &args, 1, 2)?;
+    let s = args[0].to_mix_string();
+    let form = match args.get(1) {
+        None | Some(Value::Nil) => "NFC".to_string(),
+        Some(Value::String(f)) => f.to_ascii_uppercase(),
+        Some(other) => {
+            return Err(MixError::structured(
+                "TYPE_MISMATCH",
+                format!("normalize(): form must be a string, got {}", other.type_name()),
+            ));
+        }
+    };
+    let out: String = match form.as_str() {
+        "NFC" => s.nfc().collect(),
+        "NFD" => s.nfd().collect(),
+        "NFKC" => s.nfkc().collect(),
+        "NFKD" => s.nfkd().collect(),
+        _ => {
+            return Err(MixError::structured(
+                "VALUE_ERROR",
+                format!(
+                    "normalize(): unknown form '{}' — use \"NFC\" (default), \"NFD\", \"NFKC\" or \"NFKD\"",
+                    sanitize_for_diag(&form)
+                ),
+            ));
+        }
+    };
+    Ok(Some(Value::String(out)))
 }
 
 fn builtin_chr(args: Vec<Value>) -> MixResult<Option<Value>> {
@@ -26756,6 +26793,8 @@ mod char_aware_tests {
             // Codepoint <-> character (0.90.0) — pure string arithmetic.
             "ord",
             "chr",
+            // Unicode normalisation (0.92.0) — pure table lookup.
+            "normalize",
             "parse_form",
             "parse_query",
             "password_hash",
