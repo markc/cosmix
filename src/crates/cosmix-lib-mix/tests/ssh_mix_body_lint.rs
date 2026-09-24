@@ -201,6 +201,16 @@ fn a_shared_heredoc_reports_each_finding_once() {
 }
 
 #[test]
+fn a_shared_heredoc_with_different_bindings_still_reports_each_finding_once() {
+    // Three calls, three different bindings sets: each is analysed (they
+    // could disagree about undefined names), but the finding they share is
+    // one finding.
+    let src = "$probe = <<END\n$m = {a: []}\npush($m[\"a\"], 1)\nprint($m)\nEND\n$r1 = ssh_mix(\"a\", $probe, {bindings: {x: 1}})\n$r2 = ssh_mix(\"b\", $probe, {bindings: {y: 2}})\n$r3 = ssh_mix(\"c\", $probe)\n";
+    let n = codes(src).iter().filter(|c| *c == "MIX-E1501").count();
+    assert_eq!(n, 1, "{:?}", codes(src));
+}
+
+#[test]
 fn a_variable_bound_more_than_once_is_not_resolved() {
     // "Sole definition" is the guarantee: with two binders the value at
     // the call is not knowable, so the body stays unanalysable.

@@ -2068,9 +2068,13 @@ fn check_ssh_mix_bodies(
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
 ) {
-    // One heredoc bound once and shipped by several calls with the same
-    // injected names would otherwise report every finding once per call.
+    // One heredoc bound once and shipped by several calls would otherwise
+    // report every finding once per call. Identical calls are skipped
+    // outright; calls with DIFFERENT bindings are each analysed (they can
+    // disagree about which names are undefined), and `reported` then keeps
+    // one copy of every (code, line, message) they share.
     let mut analysed: HashSet<(usize, Option<Vec<String>>)> = HashSet::new();
+    let mut reported: HashSet<(&'static str, Option<usize>, String)> = HashSet::new();
     let openers = cfg.source.as_deref().map(literal_openers).unwrap_or_default();
     for site in collect_remote_sites(stmts) {
         match site.body {
@@ -2098,7 +2102,8 @@ fn check_ssh_mix_bodies(
                     v
                 });
                 if analysed.insert((origin, key)) {
-                    analyse_remote_body(&src, first_line, site.injected.as_ref(), ctx, a, cfg);
+                    let injected = site.injected.as_ref();
+                    analyse_remote_body(&src, first_line, injected, ctx, a, cfg, &mut reported);
                 }
             }
             RemoteBody::Interpolated { locals, .. } => a.diagnostics.push(diag(
@@ -2541,6 +2546,7 @@ fn analyse_remote_body(
     ctx: &FileContext,
     a: &mut Analysis,
     cfg: &AnalyzerConfig,
+    reported: &mut HashSet<(&'static str, Option<usize>, String)>,
 ) {
     let mut lexer = crate::lexer::Lexer::new(src);
     let tokens = match lexer.tokenize() {
@@ -2548,11 +2554,11 @@ fn analyse_remote_body(
         // A body that does not LEX is reported, not swallowed: the remote
         // would fail the same way, and silence here is the failure mode
         // this whole pass exists to remove.
-        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string()),
+        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string(), reported),
     };
     let inner = match crate::parser::Parser::new(tokens, src).parse_program() {
         Ok(s) => s,
-        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string()),
+        Err(e) => return push_unparsable(a, ctx, first_line, &e.to_string(), reported),
     };
     let mut allow_globals = cfg.allow_globals.clone();
     allow_globals.extend(injected.into_iter().flatten().cloned());
@@ -2570,12 +2576,20 @@ fn analyse_remote_body(
         d.file.clone_from(&ctx.file);
         d.line = Some(first_line + d.line.unwrap_or(1).saturating_sub(1));
         d.message = format!("[inside ssh_mix body] {}", d.message);
-        a.diagnostics.push(d);
+        if reported.insert((d.code, d.line, d.message.clone())) {
+            a.diagnostics.push(d);
+        }
     }
 }
 
-fn push_unparsable(a: &mut Analysis, ctx: &FileContext, line: usize, why: &str) {
-    a.diagnostics.push(diag(
+fn push_unparsable(
+    a: &mut Analysis,
+    ctx: &FileContext,
+    line: usize,
+    why: &str,
+    reported: &mut HashSet<(&'static str, Option<usize>, String)>,
+) {
+    let d = diag(
         ctx,
         "MIX-D3012",
         Severity::Note,
@@ -2586,7 +2600,10 @@ fn push_unparsable(a: &mut Analysis, ctx: &FileContext, line: usize, why: &str) 
              `mix -` on the remote and it will fail there too"
                 .to_string(),
         ),
-    ));
+    );
+    if reported.insert((d.code, d.line, d.message.clone())) {
+        a.diagnostics.push(d);
+    }
 }
 
 /// Builtins whose "not found" sentinel is `-1` and whose "found at the
