@@ -94,7 +94,7 @@ The ACME provider, challenge, and contact fields form one mode. Manual certifica
 
 `vhost remove` reads the current row version before deleting it. Missing rows are treated as an idempotent success; concurrent changes require a retry.
 
-`vhost add` and `vhost remove` refuse a change the next restart would reject. On a node with explicit `[[webd.listener]]` rows, add the FQDN to exactly one enabled listener's `vhosts` in `node.conf.mix` before `vhost add`. Drop it from the listener before `vhost remove`, unless a `[[webd.vhost]]` block still defines it. A refused add writes nothing. See [Bus verbs](bus-verbs.md#vhost-verbs) for the exact rules and for how runtime-added certificates are loaded after a restart.
+`vhost add` and `vhost remove` refuse a change the next restart would reject. On a node with explicit `[[webd.listener]]` rows, add the FQDN to exactly one enabled listener's `vhosts` in `node.conf.mix`, then run `vhost add` straight away. Do not restart between the two steps: a listener naming a host with no row aborts the boot. To remove, drop the host from the listener, then run `vhost remove`, unless a `[[webd.vhost]]` block still defines it. A refused add writes nothing. On such a node the new host is served after the next restart, and the reply says `"served_after": "restart"`. See [Bus verbs](bus-verbs.md#vhost-verbs) for the exact rules and for how runtime-added certificates are loaded after a restart.
 
 ## ACME, routes, statistics, TLS, and autoconfiguration
 
