@@ -261,6 +261,32 @@ struct UntrainRequest {
     target: MessageSelector,
 }
 
+/// `#[serde(flatten)]` rules out `deny_unknown_fields`, so the training
+/// verbs check keys by hand: a misspelt or unsupported option (`dry_run`,
+/// say) must be refused, not silently ignored while the verb trains for real.
+fn reject_unknown_keys(args: &serde_json::Value, allowed: &[&str]) -> Result<(), String> {
+    let Some(map) = args.as_object() else {
+        return Err("request must be a JSON object".to_string());
+    };
+    let mut unknown: Vec<&str> = map
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !allowed.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    Err(format!(
+        "unknown field(s): {}; expected {}",
+        unknown.join(", "),
+        allowed.join(", ")
+    ))
+}
+
+const TRAIN_KEYS: &[&str] = &["account_id", "email", "email_id", "message_id", "class"];
+const UNTRAIN_KEYS: &[&str] = &["account_id", "email", "email_id", "message_id"];
+
 /// Which message to (un)train: exactly one of `email_id` (the JMAP Email
 /// id, i.e. the MDS item UUID — also the classifier stamp) or `message_id`
 /// (the RFC 5322 `Message-ID`, with or without angle brackets).
@@ -343,6 +369,9 @@ async fn handle_train(
     mailstore: &Arc<SqliteMailStore>,
     args: &serde_json::Value,
 ) -> (u8, String) {
+    if let Err(e) = reject_unknown_keys(args, TRAIN_KEYS) {
+        return (RC_ERROR, err_body(&format!("malformed train request: {e}")));
+    }
     let req: TrainRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
         Err(e) => return (RC_ERROR, err_body(&format!("malformed train request: {e}"))),
@@ -404,6 +433,9 @@ async fn handle_untrain(
     mailstore: &Arc<SqliteMailStore>,
     args: &serde_json::Value,
 ) -> (u8, String) {
+    if let Err(e) = reject_unknown_keys(args, UNTRAIN_KEYS) {
+        return (RC_ERROR, err_body(&format!("malformed untrain request: {e}")));
+    }
     let req: UntrainRequest = match serde_json::from_value(args.clone()) {
         Ok(r) => r,
         Err(e) => {
@@ -1950,6 +1982,35 @@ mod tests {
         assert_eq!(worker.drain_once().await.unwrap(), 1);
         let stats = cls.peek_stats(&account).await.unwrap();
         assert_eq!((stats.labelled_spam, stats.labelled_ham), (1, 0));
+    }
+
+    /// Review MINOR-7: an unsupported key such as `dry_run` must refuse the
+    /// call, not be ignored while the message is trained for real.
+    #[tokio::test]
+    async fn train_and_untrain_refuse_unknown_keys() {
+        let dir = TempDir::new().unwrap();
+        let cls = disk_classifier(dir.path());
+        let (_mdir, mds, store) = temp_mailstore();
+        let set = store.ensure_account_set(3).unwrap();
+        let inbox = create_mailbox(&mds, &set, "Inbox", Some("\\Inbox"));
+        let item = add_message(&mds, &set, inbox, b"Subject: x\r\n\r\nbody\r\n");
+        let database = database_with_accounts(&[3]);
+        let id = item.0.to_string();
+
+        let args = serde_json::json!({
+            "account_id": 3, "email_id": id, "class": "spam", "dry_run": true,
+        });
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("unknown field(s): dry_run"), "{body}");
+
+        let args = serde_json::json!({"account_id": 3, "email_id": id, "class": "spam"});
+        let (rc, body) = handle_untrain(&cls, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("unknown field(s): class"), "{body}");
+
+        let stats = cls.peek_stats(&AccountId::new("3")).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 0));
     }
 
     #[tokio::test]
