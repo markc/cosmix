@@ -1,4 +1,3 @@
--- version: 0.1.0
 # version_flag_gate_selftest.mix — prove version_flag_gate.mix still fails.
 #
 # A gate nobody has watched fail is not yet a gate. This builds a fake pair of
@@ -27,14 +26,56 @@
 #   cosmix-foreman SKIP decommissioned, not a member
 #
 # Usage (from $COSMIX/src): mix tools/version_flag_gate_selftest.mix [--gate PATH]
+#   --skip-accounting-only runs the log controls without cargo or stub binaries.
 # Exit 0 = the gate behaved exactly as expected; 1 = it did not.
 
+fn skip_errors($out)
+    $bad = []
+    $named_skips = 0
+    for $line in split($out, "\n")
+        if starts_with($line, "SKIP ") then
+            $named_skips = $named_skips + 1
+            if !re_match($line, "^SKIP [^ ]+ \\([^)]+\\): .+$") then
+                push($bad, "skip lacks binary, crate or reason: " + $line)
+            end
+        end
+    end
+    $skip_summary = re_find($out, "version_flag_gate: [0-9]+ pass, [0-9]+ fail, ([0-9]+) skipped")
+    if len($skip_summary) != 1 then
+        push($bad, "missing or duplicate skip summary")
+    elif to_string($named_skips) != $skip_summary[0].groups[0] then
+        push($bad, "named SKIP lines disagree with summary: " + to_string($named_skips))
+    end
+    return $bad
+end
+
+# Exercise the SAME checker used on the real gate output below. The negative
+# control retains a counted skip but deletes its named line: without the
+# count==named check it would be accepted, so these assertions would fail.
+fn skip_accounting_controls()
+    $named = "SKIP optional (optional): not built (required-features outside default)\n"
+    $summary = "version_flag_gate: 0 pass, 0 fail, 1 skipped\n"
+    if len(skip_errors($named + $summary)) != 0 then
+        raise("SELFTEST", "named skip positive control failed")
+    end
+    $errors = skip_errors($summary)
+    if len($errors) != 1 or $errors[0] != "named SKIP lines disagree with summary: 0" then
+        raise("SELFTEST", "unnamed counted skip was not rejected by count==named")
+    end
+    print("selftest: unnamed counted skip rejected: " + $errors[0])
+end
+
 $argv = args()
+skip_accounting_controls()
+if len($argv) == 1 and $argv[0] == "--skip-accounting-only" then
+    print("version_flag_gate_selftest: skip accounting controls OK")
+    exit(0)
+end
 $gate = "tools/version_flag_gate.mix"
 if len($argv) == 2 and $argv[0] == "--gate" then
     $gate = $argv[1]
 elif len($argv) != 0 then
-    print("usage: mix tools/version_flag_gate_selftest.mix [--gate PATH]")
+    print("usage: mix tools/version_flag_gate_selftest.mix [--gate PATH|--skip-accounting-only]")
     exit(2)
 end
 if !exists($gate) and env("COSMIX") != nil then
@@ -146,23 +187,8 @@ $expect = {
     "cosmix-foreman (cosmix-foreman)": "SKIP|decommissioned"
 }
 
-$bad = []
+$bad = skip_errors($out)
 $lines = split($out, "\n")
-$named_skips = 0
-for $line in $lines
-    if starts_with($line, "SKIP ") then
-        $named_skips = $named_skips + 1
-        if !re_match($line, "^SKIP [^ ]+ \\([^)]+\\): .+$") then
-            push($bad, "skip lacks binary, crate or reason: " + $line)
-        end
-    end
-end
-$skip_summary = re_find($out, "version_flag_gate: [0-9]+ pass, [0-9]+ fail, ([0-9]+) skipped")
-if len($skip_summary) != 1 then
-    push($bad, "missing or duplicate skip summary")
-elif to_string($named_skips) != $skip_summary[0].groups[0] then
-    push($bad, "named SKIP lines disagree with summary: " + to_string($named_skips))
-end
 for $label in keys($expect)
     $spec = split($expect[$label], "|")
     $verdict = $spec[0]

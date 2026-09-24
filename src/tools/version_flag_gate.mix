@@ -1,4 +1,3 @@
--- version: 0.1.0
 # version_flag_gate.mix — every cosmix Rust binary answers `--version`.
 #
 # Contract (AGENTS.md "Conventions"): `<bin> --version` and `<bin> -V` exit 0
