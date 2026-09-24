@@ -631,13 +631,18 @@ struct FocusAnchorInvariantWarned(bool);
 ///   dispatch whenever the focused widget's window is not the one holding
 ///   the keyboard.
 ///
-/// Call after `DefaultPlugins`. Idempotent for the plugin and the systems'
-/// resources; the anchor is spawned after `Startup` (see
+/// Call after `DefaultPlugins`. Idempotent: a second call is a no-op. The
+/// anchor is spawned after `Startup` (see
 /// [`spawn_focus_anchor`]) and only when no `PrimaryWindow` exists, because
 /// two would silence the dispatcher again. Nothing enforces that afterwards:
 /// `First` checks the invariant every frame and warns once if it breaks,
 /// which is a diagnostic, not a repair.
 pub(crate) fn install_focus_dispatch(app: &mut App) {
+    if app.world().contains_resource::<KeyboardWindow>() {
+        // Already installed: a second call would register the systems twice
+        // and, before the first frame, queue a second anchor spawn.
+        return;
+    }
     app.init_resource::<InputFocus>()
         .init_resource::<KeyboardWindow>()
         .init_resource::<FocusAnchorInvariantWarned>()
@@ -715,6 +720,13 @@ fn confine_input_focus_to_keyboard_window(
     let (Some(keyboard_window), Some(focused)) = (keyboard.0, focus.get()) else {
         return;
     };
+    // A focus set this frame — a click into a field in another panel — is
+    // given until the next frame for that panel's keyboard enter to land;
+    // comp moves the keyboard on the click, but the enter and the press are
+    // two Wayland events and need not be dispatched in one turn.
+    if focus.is_changed() {
+        return;
+    }
     let mut root = focused;
     while let Ok(child_of) = parents.get(root) {
         root = child_of.parent();
@@ -1712,6 +1724,10 @@ mod tests {
             app.world_mut().resource_mut::<KeyboardWindow>().0 = Some(other);
             app.finish();
             app.cleanup();
+            // A focus set this frame survives it (the click-then-enter grace);
+            // settle one frame so the next key meets an established focus.
+            app.update();
+            assert_eq!(app.world().resource::<InputFocus>().get(), Some(field));
 
             emit_keyboard(
                 &mut app,
