@@ -13125,6 +13125,11 @@ enum AtomicFault {
     /// fresh directory at its old path (the review MINOR-12 race): the
     /// rename must still land in the directory that was pinned.
     SwapDirectoryBeforeRename,
+    /// Read the target's ACL by path, as when /proc is not mounted.
+    ForceAclPathFallback,
+    /// In the by-path fallback, replace the target by another file between
+    /// the ACL read and the identity re-check (review R2).
+    SwapTargetBetweenLookups,
 }
 
 const WRITE_ATOMIC_OPT_KEYS: &[&str] = &["durability", "mode", "max_bytes"];
@@ -13278,17 +13283,23 @@ fn builtin_write_atomic(args: Vec<Value>) -> MixResult<Option<Value>> {
 const ACL_ACCESS_XATTR: &std::ffi::CStr = c"system.posix_acl_access";
 
 /// The file's POSIX access ACL as its raw xattr, `None` when it has none or
-/// the filesystem does not support ACLs. The final component is not
-/// followed (lgetxattr): write_atomic passes /proc/self/fd/DIR/NAME, and an
-/// entry swapped for a symlink must not have its referent's ACL read.
-fn read_access_acl(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+/// the filesystem does not support ACLs. `follow` picks getxattr (for
+/// write_atomic's /proc/self/fd/N magic link to the target's own O_PATH fd,
+/// which must be followed to reach the inode) or lgetxattr (the by-path
+/// fallback, where a name swapped for a symlink must not have its referent's
+/// ACL read).
+fn read_access_acl(path: &std::path::Path, follow: bool) -> std::io::Result<Option<Vec<u8>>> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     loop {
         // SAFETY: size query — a null buffer of length 0.
         let size = unsafe {
-            libc::lgetxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+            if follow {
+                libc::getxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+            } else {
+                libc::lgetxattr(c_path.as_ptr(), ACL_ACCESS_XATTR.as_ptr(), std::ptr::null_mut(), 0)
+            }
         };
         if size < 0 {
             let e = std::io::Error::last_os_error();
@@ -13300,12 +13311,21 @@ fn read_access_acl(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
         let mut buf = vec![0u8; size as usize];
         // SAFETY: `buf` is exactly `size` writable bytes.
         let got = unsafe {
-            libc::lgetxattr(
-                c_path.as_ptr(),
-                ACL_ACCESS_XATTR.as_ptr(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
+            if follow {
+                libc::getxattr(
+                    c_path.as_ptr(),
+                    ACL_ACCESS_XATTR.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            } else {
+                libc::lgetxattr(
+                    c_path.as_ptr(),
+                    ACL_ACCESS_XATTR.as_ptr(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            }
         };
         if got >= 0 {
             buf.truncate(got as usize);
@@ -13439,30 +13459,58 @@ fn write_atomic_impl(
         .map_err(|e| write_atomic_error(path, "opening the target's directory", &e))?;
     let dirfd = dir_fd.as_raw_fd();
 
-    // Inspect the final name WITHOUT following it. A regular target resolved
-    // above that is now a symlink was swapped concurrently: refuse rather
-    // than replace a link the caller never named.
+    // Inspect the final name WITHOUT following it, through ONE handle (review
+    // R2): open it O_PATH|O_NOFOLLOW and take type, owner and mode from
+    // fstat of that fd, and the ACL through the same fd — so the ACL can
+    // never come from a different inode than the owner and mode. A regular
+    // target resolved above that is now a symlink was swapped concurrently:
+    // refuse rather than replace a link the caller never named.
     struct Existing {
         uid: u32,
         gid: u32,
         mode: u32,
+        dev: u64,
+        ino: u64,
     }
-    let existing: Option<Existing> = {
-        // SAFETY: fstatat writes only into the zeroed local `st`.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        let rc = unsafe { libc::fstatat(dirfd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-        if rc == -1 {
+    let target_fd: Option<std::fs::File> = {
+        // SAFETY: openat with a valid dirfd and NUL-terminated name.
+        let fd = unsafe {
+            libc::openat(
+                dirfd,
+                name_c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd == -1 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(write_atomic_error(path, "stat target", &e));
+                return Err(write_atomic_error(path, "opening target", &e));
             }
             None
         } else {
+            // SAFETY: openat returned a fresh descriptor we now own.
+            Some(unsafe { std::fs::File::from_raw_fd(fd) })
+        }
+    };
+    let existing: Option<Existing> = match &target_fd {
+        None => None,
+        Some(tfd) => {
+            // SAFETY: fstat writes only into the zeroed local `st`.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(tfd.as_raw_fd(), &mut st) } == -1 {
+                return Err(write_atomic_error(
+                    path,
+                    "stat target",
+                    &std::io::Error::last_os_error(),
+                ));
+            }
             match st.st_mode & libc::S_IFMT {
                 libc::S_IFREG => Some(Existing {
                     uid: st.st_uid,
                     gid: st.st_gid,
                     mode: st.st_mode & 0o7777,
+                    dev: st.st_dev,
+                    ino: st.st_ino,
                 }),
                 libc::S_IFLNK => {
                     return Err(MixError::RuntimeError {
@@ -13485,16 +13533,53 @@ fn write_atomic_impl(
         }
     };
 
-    // The existing target's POSIX access ACL, read through the pinned
-    // directory (/proc/self/fd/N/name, final component not followed).
-    let existing_acl = match &existing {
-        Some(_) => {
-            let via_dir = PathBuf::from(format!("/proc/self/fd/{dirfd}")).join(name);
-            read_access_acl(&via_dir)
-                .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?
+    // The existing target's POSIX access ACL. With /proc it is read through
+    // the target's own O_PATH fd (/proc/self/fd/N, followed to that inode).
+    // Without /proc (review R2: every overwrite used to raise ENOENT there)
+    // it is read by path, and the name is then re-checked: a dev/ino other
+    // than the one fstat saw means the name was swapped between the two
+    // lookups, and the call refuses rather than pair one inode's ACL with
+    // another's owner and mode.
+    let existing_acl = match (&existing, &target_fd) {
+        (Some(ex), Some(tfd)) => {
+            let proc_fd = PathBuf::from(format!("/proc/self/fd/{}", tfd.as_raw_fd()));
+            let use_proc = !matches!(
+                fault,
+                AtomicFault::ForceAclPathFallback | AtomicFault::SwapTargetBetweenLookups
+            )
+                && std::path::Path::new("/proc/self/fd").is_dir();
+            if use_proc {
+                read_access_acl(&proc_fd, true)
+                    .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?
+            } else {
+                let acl = read_access_acl(&dir.join(name), false)
+                    .map_err(|e| write_atomic_error(path, "reading the target's access ACL", &e))?;
+                if fault == AtomicFault::SwapTargetBetweenLookups {
+                    let impostor = dir.join(".write-atomic-test-impostor");
+                    let _ = std::fs::write(&impostor, "IMPOSTOR");
+                    let _ = std::fs::rename(&impostor, dir.join(name));
+                }
+                // SAFETY: fstatat writes only into the zeroed local `st`.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(dirfd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                };
+                if rc == -1 || st.st_dev != ex.dev || st.st_ino != ex.ino {
+                    return Err(MixError::structured(
+                        "WRITE_NOT_ATOMIC",
+                        format!(
+                            "write_atomic '{path}': the target was replaced while its metadata \
+                             was being read (no /proc to read it through one handle); nothing \
+                             was written"
+                        ),
+                    ));
+                }
+                acl
+            }
         }
-        None => None,
+        _ => None,
     };
+    drop(target_fd);
 
     // Final permissions: an explicit mode wins; otherwise an existing target
     // keeps its own (including setuid/setgid/sticky); a brand-new file gets
@@ -24370,6 +24455,58 @@ mod write_atomic_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Review R2: with no /proc the ACL is read by path and the target's
+    /// identity re-checked; an ordinary overwrite must still succeed there
+    /// (it used to raise ENOENT on every existing file).
+    #[test]
+    fn the_no_proc_fallback_still_overwrites() {
+        let d = tmpdir("noproc");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::None),
+            AtomicFault::ForceAclPathFallback,
+        )
+        .expect("the by-path fallback overwrites");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Review R2: in the by-path fallback, a target swapped between the
+    /// metadata read and the ACL read is detected by dev/ino and refused
+    /// with WRITE_NOT_ATOMIC — one inode's ACL is never paired with
+    /// another's owner and mode. Nothing is written, no temp is left.
+    #[test]
+    fn a_target_swapped_between_lookups_is_refused() {
+        let d = tmpdir("swap");
+        let target = d.join("config");
+        std::fs::write(&target, "OLD").unwrap();
+        let e = write_atomic_impl(
+            &s(&target),
+            b"NEW",
+            &opts(WriteDurability::None),
+            AtomicFault::SwapTargetBetweenLookups,
+        )
+        .expect_err("a swap between the lookups must be refused");
+        match e {
+            MixError::Structured(info) => assert_eq!(info.code, "WRITE_NOT_ATOMIC"),
+            other => panic!("expected WRITE_NOT_ATOMIC, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "IMPOSTOR",
+            "the call wrote nothing over the swapped-in file"
+        );
+        assert_eq!(leftovers(&d), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn a_failed_first_write_leaves_no_file_at_all() {
         let d = tmpdir("fresh");
@@ -24488,12 +24625,12 @@ mod write_atomic_tests {
             let _ = std::fs::remove_dir_all(&d);
             return;
         }
-        let before = super::read_access_acl(&target).unwrap().expect("ACL was set");
+        let before = super::read_access_acl(&target, false).unwrap().expect("ACL was set");
         let mode_before = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         builtin_write_atomic(vec![Value::String(s(&target)), Value::String("NEW".into())])
             .expect("write_atomic over an ACL'd file");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "NEW");
-        let after = super::read_access_acl(&target).unwrap();
+        let after = super::read_access_acl(&target, false).unwrap();
         assert_eq!(after.as_deref(), Some(before.as_slice()), "the access ACL must carry over");
         let mode_after = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode_after, mode_before);

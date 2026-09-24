@@ -221,6 +221,10 @@ Other rules:
   group that access. If the ACL cannot be set, the call raises and leaves the
   target untouched. If the old file had no ACL, one inherited from the
   directory's default ACL is removed, so the replacement matches the original.
+  Owner, mode and ACL are all read from one handle on the old file, so they
+  always describe the same file. Without `/proc` mounted the ACL is read by
+  path instead. If the name has been swapped in between, the call raises
+  `WRITE_NOT_ATOMIC` and writes nothing.
 - **Owner.** An existing target keeps its owner and group. The new file is a
   new inode, so root rewriting a user's file would otherwise hand it to root.
   If the owner cannot be kept, typically because you are not root, the call
