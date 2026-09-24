@@ -180,7 +180,7 @@ async fn serve(
                     Some(BoundedIncomingEvent::Overflow { .. }) => { eprintln!("{service} Bus incoming overflow"); continue; },
                     None => break,
                 };
-                let result = dispatch(
+                let guarded = guard(terminal, std::panic::AssertUnwindSafe(|| dispatch(
                     crate::control::mesh_open(),
                     service,
                     terminal,
@@ -188,13 +188,50 @@ async fn serve(
                     &mut replies,
                     &command.command,
                     &command.body,
-                );
+                )));
+                let Ok(result) = guarded else {
+                    // The panic unwound through a held TabSet lock: the set may
+                    // be half-mutated, and the frontend's next lock would panic
+                    // on the poison anyway, somewhere less legible. Stop here,
+                    // saying why, rather than serve verbs over torn state.
+                    eprintln!("{service} Bus verb {:?} panicked while holding the tab set; aborting", command.command);
+                    std::process::abort();
+                };
                 let (rc, body) = match result { Ok(body) => (0, body), Err(error) => (10, error) };
                 peer.reply(&command, rc, &body).await;
             }
         }
     }
     turns
+}
+
+const HANDLER_PANICKED: &str = "internal error: verb handler panicked";
+
+/// A panic that unwound through the tab-set lock, poisoning it.
+#[derive(Debug, PartialEq, Eq)]
+struct Torn;
+
+/// Panic boundary for one Bus verb. Before this, a handler panic killed the
+/// Bus thread silently (the frontend discards its join result) while every
+/// other verb went unanswered.
+///
+/// The TabSet lock is what decides the outcome, because it is the only state
+/// a handler shares with the frontend. `handle()` takes every Terminal lock
+/// under it, so a panic that leaves the set unpoisoned happened outside any
+/// shared critical section — nothing is torn, the caller gets an ordinary
+/// error, and the lane keeps serving. A poisoned set may be half-mutated;
+/// that is [`Torn`], and the caller must not carry on. The reply cache is
+/// only written after `handle()` returns, so a panic leaves it untouched and
+/// a retry re-executes.
+fn guard<T>(
+    set: &Mutex<T>,
+    run: impl FnOnce() -> Result<String, String> + std::panic::UnwindSafe,
+) -> Result<Result<String, String>, Torn> {
+    match std::panic::catch_unwind(run) {
+        Ok(result) => Ok(result),
+        Err(_) if set.is_poisoned() => Err(Torn),
+        Err(_) => Ok(Err(HANDLER_PANICKED.into())),
+    }
 }
 
 async fn drain_notifications<F, Fut>(
@@ -833,6 +870,29 @@ mod tests {
         assert_eq!(turns, 0);
         drop(cleanup);
         worker.join().unwrap();
+    }
+
+    /// A handler panic outside the shared lock is an ordinary error reply and
+    /// the lock stays usable; one that unwinds through the lock is Torn.
+    #[test]
+    fn panic_boundary_answers_clean_panics_and_flags_torn_state() {
+        let set = Mutex::new(0u32);
+        assert_eq!(guard(&set, || Ok("fine".into())), Ok(Ok("fine".into())));
+        assert_eq!(guard(&set, || Err("refused".into())), Ok(Err("refused".into())));
+        assert_eq!(
+            guard(&set, || panic!("outside the lock")),
+            Ok(Err(HANDLER_PANICKED.into()))
+        );
+        assert!(!set.is_poisoned());
+        *set.lock().unwrap() += 1;
+        assert_eq!(
+            guard(&set, || {
+                let _held = set.lock().unwrap();
+                panic!("under the lock")
+            }),
+            Err(Torn)
+        );
+        assert!(set.is_poisoned());
     }
 
     #[test]
