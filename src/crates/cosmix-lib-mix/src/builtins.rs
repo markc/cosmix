@@ -4482,8 +4482,10 @@ pub mod owned_spawns {
             .collect();
         for pid in &live {
             // SAFETY: the leader is unreaped, so -pid names its own group.
+            // SIGCONT so a stopped member can act on the SIGTERM (review R6).
             unsafe {
                 libc::kill(-pid, libc::SIGTERM);
+                libc::kill(-pid, libc::SIGCONT);
             }
         }
         // Wait for every GROUP to empty (not just its leader), bounded by the
@@ -9961,9 +9963,12 @@ pub(crate) fn group_has_live_members(pgid: i32) -> bool {
 pub(crate) fn terminate_process_group(pgid: i32, grace: std::time::Duration) {
     use std::time::{Duration, Instant};
     if !grace.is_zero() {
-        // SAFETY: kill(2) on a group whose id the caller holds.
+        // SAFETY: kill(2) on a group whose id the caller holds. SIGCONT right
+        // after SIGTERM, as shells do (review R6): a STOPPED member never
+        // handles its SIGTERM, so without it the grace would be wasted on it.
         unsafe {
             libc::kill(-pgid, libc::SIGTERM);
+            libc::kill(-pgid, libc::SIGCONT);
         }
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline && group_has_live_members(pgid) {

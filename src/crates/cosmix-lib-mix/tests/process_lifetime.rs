@@ -228,3 +228,31 @@ async fn run_parallel_timeout_override_applies_before_grace_validation() {
     .await;
     assert_eq!(output, "true\nOPTION_INVALID\n");
 }
+
+/// Review R6: a STOPPED member never handles SIGTERM until it is continued.
+/// The escalation sends SIGCONT right after SIGTERM, so a stopped member
+/// that traps SIGTERM still runs its cleanup inside the grace.
+#[tokio::test]
+async fn a_stopped_member_is_continued_so_it_can_honour_sigterm() {
+    let marker = marker_path("stopped");
+    let helper = marker_path("stopper-sh");
+    std::fs::write(
+        &helper,
+        format!(
+            "trap 'echo done > {}; exit 0' TERM\nkill -STOP $$\nwhile true; do sleep 0.1; done\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let h = helper.display();
+    let output = run_ok(&format!(
+        "$r = run_argv([\"sh\", \"-c\", \"sh {h} & wait\"], {{timeout: 0.5, grace: 3}})\n\
+         print($r.timed_out .. \" \" .. ($r.duration_ms < 3000))\n",
+    ))
+    .await;
+    let finished = marker.exists();
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&helper);
+    assert_eq!(output, "true true\n", "full output: {output:?}");
+    assert!(finished, "the stopped member never ran its SIGTERM trap");
+}
