@@ -1588,6 +1588,51 @@ impl SqliteMailStore {
         Ok(out)
     }
 
+    /// Every item in `account` whose envelope `Message-ID` equals
+    /// `message_id`, with or without angle brackets (delivery stores the
+    /// bare addr-spec; older rows may carry the brackets). More than one
+    /// hit is normal for duplicate deliveries. Empty for an unprovisioned
+    /// account.
+    pub fn find_items_by_message_id(
+        &self,
+        account: AccountId,
+        message_id: &str,
+    ) -> Result<Vec<ItemId>> {
+        let bare = message_id
+            .trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string();
+        let bracketed = format!("<{bare}>");
+        let set = account_id_to_setid(account);
+        let found = self.mds.with_set_tx(&set, |tx| {
+            let mut stmt = tx
+                .tx()
+                .prepare(
+                    "SELECT item_id FROM mail_envelopes \
+                     WHERE message_id IN (?1, ?2) ORDER BY item_id",
+                )
+                .map_err(|e| cosmix_mds::Error::Other(format!("prepare message_id lookup: {e}")))?;
+            let rows = stmt
+                .query_map(params![bare, bracketed], |r| r.get::<_, String>(0))
+                .map_err(|e| cosmix_mds::Error::Other(format!("message_id lookup: {e}")))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| cosmix_mds::Error::Other(format!("message_id rows: {e}")))
+        });
+        let ids = match found {
+            Ok(ids) => ids,
+            Err(cosmix_mds::Error::SetNotFound(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow!(e)),
+        };
+        ids.iter()
+            .map(|s| {
+                uuid::Uuid::parse_str(s)
+                    .map(ItemId)
+                    .map_err(|e| anyhow!("mail_envelopes.item_id {s:?} is not a UUID: {e}"))
+            })
+            .collect()
+    }
+
     /// Account-wide rollup for `maild.stats.account` (the doveadm
     /// `quota get` analog). Unlike summing [`Self::mailbox_stats`]
     /// per-folder counts, this **dedupes by `ItemId`** so a multi-homed

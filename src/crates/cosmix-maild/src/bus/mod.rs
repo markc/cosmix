@@ -385,6 +385,18 @@ fn verb_manifest() -> Vec<cosmix_bus::VerbDescriptor> {
             true,
         ),
         VerbDescriptor::new(
+            "maild.bayesian.train",
+            &["account_id", "email", "email_id", "message_id", "class"],
+            "Train one stored message as spam or ham",
+            false,
+        ),
+        VerbDescriptor::new(
+            "maild.bayesian.untrain",
+            &["account_id", "email", "email_id", "message_id"],
+            "Remove one stored message's training label",
+            false,
+        ),
+        VerbDescriptor::new(
             "maild.bayesian.rebuild",
             &["account_id", "snapshot", "wait", "allow_empty"],
             "Rebuild Bayesian training data",

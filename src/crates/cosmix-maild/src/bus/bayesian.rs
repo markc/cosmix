@@ -1,6 +1,6 @@
 //! `maild.bayesian.*` Bus action handlers.
 //!
-//! Four actions:
+//! Six actions:
 //! - `maild.bayesian.stats` — per-account corpus stats, read-only
 //!   (`DefaultClassifier::peek_stats`). Refuses an id with no
 //!   `maild.accounts` row, and never creates, seeds or promotes a corpus:
@@ -11,6 +11,10 @@
 //!   message. Synthesises a `ClassifyContext` with `rules_score = 0.0`,
 //!   no matched rules, and `trusted = false`. Read-only: never calls
 //!   `record_label`.
+//! - `maild.bayesian.train` — label one stored message (`email_id` or
+//!   `message_id`) as `spam` or `ham` through `retrain_logged`, the path an
+//!   IMAP/JMAP move across Junk takes, keyed on the same item-id stamp.
+//! - `maild.bayesian.untrain` — remove that label and reverse its counts.
 //! - `maild.bayesian.rebuild` — build a shadow corpus from current folder
 //!   state, replay corrections made during the walk, then atomically replace
 //!   the live corpus. `\\Junk` is Spam; `\\Trash`, `\\Drafts`, `\\Sent`, and
@@ -63,7 +67,10 @@ use cosmix_mds::{BlobHash, ContainerId, ItemId, Mds};
 
 use crate::{
     db,
-    mailstore::{ListOpts, MailStore, SqliteMailStore, account_id_to_setid},
+    mailstore::{
+        ListOpts, MailStore, SqliteMailStore, account_id_to_setid,
+        retrain::{TrainVia, retrain_logged},
+    },
 };
 
 const RC_ERROR: u8 = 10;
@@ -145,6 +152,8 @@ pub async fn dispatch(
     match action {
         "stats" => handle_stats(classifier, db, &args).await,
         "classify" => handle_classify(classifier, &args).await,
+        "train" => handle_train(classifier, db, mailstore, &args).await,
+        "untrain" => handle_untrain(classifier, db, mailstore, &args).await,
         "rebuild" => {
             if !rebuild_authorised(cmd, state) {
                 (RC_ERROR, err_body("not an authorised rebuild operator"))
@@ -229,6 +238,207 @@ async fn handle_stats(
             (0, body.to_string())
         }
         Err(e) => (RC_ERROR, err_body(&format!("stats failed: {e}"))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TrainRequest {
+    #[serde(flatten)]
+    account: AccountSelector,
+    #[serde(flatten)]
+    target: MessageSelector,
+    /// `spam` or `ham`.
+    class: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UntrainRequest {
+    #[serde(flatten)]
+    account: AccountSelector,
+    #[serde(flatten)]
+    target: MessageSelector,
+}
+
+/// Which message to (un)train: exactly one of `email_id` (the JMAP Email
+/// id, i.e. the MDS item UUID — also the classifier stamp) or `message_id`
+/// (the RFC 5322 `Message-ID`, with or without angle brackets).
+#[derive(serde::Deserialize)]
+struct MessageSelector {
+    #[serde(default)]
+    email_id: Option<String>,
+    #[serde(default)]
+    message_id: Option<String>,
+}
+
+/// Resolve a [`MessageSelector`] inside one account to its item id and
+/// raw bytes. A `message_id` naming several items is refused with their
+/// ids so the caller can pick one by `email_id`.
+async fn resolve_message(
+    mailstore: &Arc<SqliteMailStore>,
+    account_id: i32,
+    target: &MessageSelector,
+) -> Result<(ItemId, Vec<u8>), String> {
+    let item = match (&target.email_id, &target.message_id) {
+        (Some(_), Some(_)) => return Err("pass email_id or message_id, not both".to_string()),
+        (None, None) => return Err("missing email_id or message_id".to_string()),
+        (Some(raw), None) => ItemId(
+            uuid::Uuid::parse_str(raw)
+                .map_err(|e| format!("email_id {raw:?} is not an Email id: {e}"))?,
+        ),
+        (None, Some(mid)) => {
+            let ms = Arc::clone(mailstore);
+            let mid_owned = mid.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                ms.find_items_by_message_id(account_id, &mid_owned)
+            })
+            .await
+            .map_err(|e| format!("message lookup task: {e}"))?
+            .map_err(|e| format!("message lookup failed: {e}"))?;
+            match found.as_slice() {
+                [] => return Err(format!("no message with Message-ID {mid:?} in this account")),
+                [one] => *one,
+                many => {
+                    let ids: Vec<String> = many.iter().map(|i| i.0.to_string()).collect();
+                    return Err(format!(
+                        "Message-ID {mid:?} names {} messages ({}); pass email_id",
+                        many.len(),
+                        ids.join(", ")
+                    ));
+                }
+            }
+        }
+    };
+    let ms = Arc::clone(mailstore);
+    let set = account_id_to_setid(account_id);
+    let bytes = tokio::task::spawn_blocking(move || {
+        let meta = ms.mds().fetch_item_meta(&set, &item)?;
+        ms.mds().get_blob(&meta.blob_hash)
+    })
+    .await
+    .map_err(|e| format!("message fetch task: {e}"))?;
+    match bytes {
+        Ok(b) => Ok((item, b)),
+        Err(cosmix_mds::Error::SetNotFound(_)) | Err(cosmix_mds::Error::ItemNotFound(_)) => {
+            Err(format!("no message {} in this account", item.0))
+        }
+        Err(e) => Err(format!("message fetch failed: {e}")),
+    }
+}
+
+/// `maild.bayesian.train` — label one stored message as spam or ham through
+/// the exact path a user's move across Junk takes
+/// (`mailstore::retrain::retrain_logged`, stamp = item id), so a later user
+/// move of the same message flips this label rather than double-counting.
+async fn handle_train(
+    classifier: &DefaultClassifier,
+    database: &db::Db,
+    mailstore: &Arc<SqliteMailStore>,
+    args: &serde_json::Value,
+) -> (u8, String) {
+    let req: TrainRequest = match serde_json::from_value(args.clone()) {
+        Ok(r) => r,
+        Err(e) => return (RC_ERROR, err_body(&format!("malformed train request: {e}"))),
+    };
+    let label = match req.class.as_str() {
+        "spam" => Label::Spam,
+        "ham" => Label::Ham,
+        other => {
+            return (
+                RC_ERROR,
+                err_body(&format!("class must be \"spam\" or \"ham\", got {other:?}")),
+            );
+        }
+    };
+    let row = match resolve_account(database, &req.account).await {
+        Ok(row) => row,
+        Err(e) => return (RC_ERROR, err_body(&e)),
+    };
+    let (item, message) = match resolve_message(mailstore, row.id, &req.target).await {
+        Ok(found) => found,
+        Err(e) => return (RC_ERROR, err_body(&e)),
+    };
+    let account = AccountId::new(row.id.to_string());
+    let stamp = item.0.to_string();
+    let retrain = RetrainRequest {
+        stamp_id: &stamp,
+        account: &account,
+        message: &message,
+        label,
+    };
+    match retrain_logged(classifier, &retrain, TrainVia::Bus).await {
+        Ok(outcome) => {
+            let result = match outcome {
+                RetrainOutcome::Applied => "applied",
+                RetrainOutcome::AlreadyLabeled => "already_labeled",
+                RetrainOutcome::NoStamp => "no_stamp",
+            };
+            let body = serde_json::json!({
+                "account_id": row.id,
+                "email": row.email,
+                "email_id": stamp,
+                "class": req.class,
+                "result": result,
+            });
+            (0, body.to_string())
+        }
+        Err(e) => (RC_ERROR, err_body(&format!("train failed: {e}"))),
+    }
+}
+
+/// `maild.bayesian.untrain` — remove one message's training label and
+/// reverse its token counts (`DefaultClassifier::forget_from`, the call a
+/// rebuild's replay uses). `removed` is the label that was reversed, or
+/// null when the message carried none.
+async fn handle_untrain(
+    classifier: &DefaultClassifier,
+    database: &db::Db,
+    mailstore: &Arc<SqliteMailStore>,
+    args: &serde_json::Value,
+) -> (u8, String) {
+    let req: UntrainRequest = match serde_json::from_value(args.clone()) {
+        Ok(r) => r,
+        Err(e) => return (RC_ERROR, err_body(&format!("malformed untrain request: {e}"))),
+    };
+    let row = match resolve_account(database, &req.account).await {
+        Ok(row) => row,
+        Err(e) => return (RC_ERROR, err_body(&e)),
+    };
+    let (item, message) = match resolve_message(mailstore, row.id, &req.target).await {
+        Ok(found) => found,
+        Err(e) => return (RC_ERROR, err_body(&e)),
+    };
+    let account = AccountId::new(row.id.to_string());
+    let stamp = item.0.to_string();
+    let conn = match classifier.open_account_connection(&account).await {
+        Ok(c) => c,
+        Err(e) => return (RC_ERROR, err_body(&format!("open corpus failed: {e}"))),
+    };
+    match classifier.forget_from(conn.as_ref(), &stamp, &message).await {
+        Ok(removed) => {
+            let removed = removed.map(|l| match l {
+                Label::Spam => "spam",
+                Label::Ham => "ham",
+            });
+            tracing::info!(
+                target: "maild::bayesian::train",
+                account = row.id,
+                direction = "untrain",
+                stamp = %stamp,
+                removed = removed.unwrap_or("none"),
+                via = "bus",
+                "untrained {stamp} (account {}, removed {})",
+                row.id,
+                removed.unwrap_or("none"),
+            );
+            let body = serde_json::json!({
+                "account_id": row.id,
+                "email": row.email,
+                "email_id": stamp,
+                "removed": removed,
+            });
+            (0, body.to_string())
+        }
+        Err(e) => (RC_ERROR, err_body(&format!("untrain failed: {e}"))),
     }
 }
 
@@ -1600,6 +1810,112 @@ mod tests {
         )
         .unwrap()
         .item_id
+    }
+
+    fn set_message_id(mds: &SqliteCasMds, set: &cosmix_mds::SetId, item: ItemId, mid: &str) {
+        mds.with_set_tx(set, |tx| {
+            tx.tx()
+                .execute(
+                    "INSERT INTO mail_envelopes (item_id, from_addr, message_id) \
+                     VALUES (?1, 'x@example.com', ?2)",
+                    rusqlite::params![item.0.to_string(), mid],
+                )
+                .map_err(|e| cosmix_mds::Error::Other(e.to_string()))?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn train_by_message_id_then_untrain_round_trips_the_corpus() {
+        let dir = TempDir::new().unwrap();
+        let cls = disk_classifier(dir.path());
+        let (_mdir, mds, store) = temp_mailstore();
+        let set = store.ensure_account_set(3).unwrap();
+        let inbox = create_mailbox(&mds, &set, "Inbox", Some("\\Inbox"));
+        let item = add_message(
+            &mds,
+            &set,
+            inbox,
+            b"Message-ID: <scam-1@example.com>\r\nSubject: Pending Account Matter-7G4K2Q\r\n\r\nsettle now\r\n",
+        );
+        set_message_id(&mds, &set, item, "scam-1@example.com");
+        let database = database_with_accounts(&[3]);
+
+        let args = serde_json::json!({
+            "email": "account-3@example.com",
+            "message_id": "<scam-1@example.com>",
+            "class": "spam",
+        });
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["account_id"], 3);
+        assert_eq!(v["email_id"], item.0.to_string());
+        assert_eq!(v["result"], "applied");
+
+        let stats = cls.peek_stats(&AccountId::new("3")).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.labelled_spam), (1, 1));
+
+        // Same stamp as a user move: training it again is a no-op.
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        assert!(body.contains("already_labeled"), "{body}");
+
+        let args = serde_json::json!({"account_id": 3, "email_id": item.0.to_string()});
+        let (rc, body) = handle_untrain(&cls, &database, &store, &args).await;
+        assert_eq!(rc, 0, "body was: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["removed"], "spam");
+        let stats = cls.peek_stats(&AccountId::new("3")).await.unwrap();
+        assert_eq!((stats.spam_messages, stats.labelled_spam), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn train_refuses_bad_class_foreign_items_and_ambiguous_message_ids() {
+        let dir = TempDir::new().unwrap();
+        let cls = disk_classifier(dir.path());
+        let (_mdir, mds, store) = temp_mailstore();
+        let set3 = store.ensure_account_set(3).unwrap();
+        let set4 = store.ensure_account_set(4).unwrap();
+        let inbox3 = create_mailbox(&mds, &set3, "Inbox", Some("\\Inbox"));
+        let inbox4 = create_mailbox(&mds, &set4, "Inbox", Some("\\Inbox"));
+        let a = add_message(&mds, &set3, inbox3, b"Subject: one\r\n\r\nbody one\r\n");
+        let b = add_message(&mds, &set3, inbox3, b"Subject: two\r\n\r\nbody two\r\n");
+        set_message_id(&mds, &set3, a, "dup@example.com");
+        set_message_id(&mds, &set3, b, "dup@example.com");
+        let foreign = add_message(&mds, &set4, inbox4, b"Subject: other\r\n\r\nbody\r\n");
+        let database = database_with_accounts(&[3, 4]);
+
+        let args = serde_json::json!({"account_id": 3, "email_id": a.0.to_string(), "class": "junk"});
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("class must be"), "{body}");
+
+        // Account 4's message is not reachable through account 3.
+        let args = serde_json::json!({
+            "account_id": 3, "email_id": foreign.0.to_string(), "class": "spam",
+        });
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("no message"), "{body}");
+
+        let args =
+            serde_json::json!({"account_id": 3, "message_id": "dup@example.com", "class": "ham"});
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("names 2 messages"), "{body}");
+        assert!(body.contains(&a.0.to_string()), "{body}");
+
+        let args = serde_json::json!({"account_id": 9, "email_id": a.0.to_string(), "class": "spam"});
+        let (rc, body) = handle_train(&cls, &database, &store, &args).await;
+        assert_eq!(rc, RC_ERROR);
+        assert!(body.contains("account not found"), "{body}");
+        assert!(!dir.path().join("9").exists());
+
+        // Nothing above trained anything.
+        let stats = cls.peek_stats(&AccountId::new("3")).await.unwrap();
+        assert_eq!((stats.labelled_spam, stats.labelled_ham), (0, 0));
     }
 
     fn cmd_with_args(parsed: serde_json::Value) -> IncomingCommand {

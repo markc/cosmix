@@ -40,6 +40,8 @@ An unknown account and a wrong password both produce `valid: false` from `verify
 | `maild.rules.explain` | Envelope and base64 message | Explain rule evaluation without delivering |
 | `maild.bayesian.stats` | `account_id` or `email` | Return per-account corpus statistics, read-only, echoing the resolved `account_id` and `email`; an account with no row is refused |
 | `maild.bayesian.classify` | `account_id`, `message_b64` | Classify without recording a training label |
+| `maild.bayesian.train` | `account_id` or `email`; `email_id` or `message_id`; `class` (`spam` / `ham`) | Train one stored message through the Junk-move path; returns `result` (`applied` / `already_labeled`) |
+| `maild.bayesian.untrain` | `account_id` or `email`; `email_id` or `message_id` | Remove the message's training label and reverse its counts; returns `removed` (`spam`, `ham`, or null) |
 
 `maild.rules.explain` accepts:
 

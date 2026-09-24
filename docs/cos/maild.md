@@ -62,7 +62,7 @@ so reverse DNS, SPF/iprev, rate limiting and logging use the same peer address.
 - accounts: `maild.accounts.seed_mailboxes`, `maild.accounts.seed_content`, `maild.accounts.revoke_tokens`
 - stats: `maild.stats.server`, `maild.stats.account`, `maild.stats.mailboxes`, `maild.stats.online`, `maild.stats.top`
 - rules: `maild.rules.reload`, `maild.rules.explain`, `maild.rules.stats`
-- bayesian: `maild.bayesian.classify`, `maild.bayesian.stats`, `maild.bayesian.rebuild`, `maild.bayesian.rebuild_status`
+- bayesian: `maild.bayesian.classify`, `maild.bayesian.stats`, `maild.bayesian.train`, `maild.bayesian.untrain`, `maild.bayesian.rebuild`, `maild.bayesian.rebuild_status`
 - dkim: `maild.dkim.generate`, `maild.dkim.rotate`, `maild.dkim.retire`
 - vtoken: `maild.vtoken.mint_opaque`, `maild.vtoken.lookup_opaque`, `maild.vtoken.list_opaque`, `maild.vtoken.disable_opaque`
 - retention: `maild.retention.run`, `maild.retention.status`
