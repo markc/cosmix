@@ -248,16 +248,22 @@ async fn vhost_add(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, String)
         )
         .await;
     match outcome {
-        Ok(_) => (
-            0,
-            json!({
+        Ok(_) => {
+            let mut reply = json!({
                 "ok": true,
                 "fqdn": fqdn,
                 "source": SOURCE_BUS_RUNTIME,
-            })
-            .to_string(),
-        ),
-        Err(e) => caller_error(&format!("vhost.add failed: {e}")),
+            });
+            // On an explicit-listener node the live allowlists were fixed
+            // at startup: the row is stored and the next boot will serve
+            // it, but nothing serves it now. Say so rather than let "ok"
+            // imply it is live.
+            if node.explicit_listeners {
+                reply["served_after"] = json!("restart");
+            }
+            (0, reply.to_string())
+        }
+        Err(e) => write_error("vhost.add", &e),
     }
 }
 
@@ -321,7 +327,7 @@ async fn vhost_remove(node: &Arc<NodeState>, cmd: &IncomingCommand) -> (u8, Stri
             })
             .to_string(),
         ),
-        Err(e) => caller_error(&format!("vhost.remove failed: {e}")),
+        Err(e) => write_error("vhost.remove", &e),
     }
 }
 
@@ -660,6 +666,30 @@ pub(crate) fn caller_error(msg: &str) -> (u8, String) {
     )
 }
 
+/// rc for a node-side fault the operator must fix on the node itself —
+/// today only an unreadable `node.conf.mix` reported by the
+/// `webd.vhosts` hooks (`HookError::Hook`), matching the rc 20 the raw
+/// `webd.props.*` surface returns for the same hook error.
+const RC_NODE_FAULT: u8 = 20;
+
+/// Project a namespace write error: a hook-reported node fault is rc 20
+/// (`kind: "server"`); everything else — validation refusals, OCC
+/// conflicts — stays the caller-side rc 10 this module has always used.
+fn write_error(verb: &str, e: &cosmix_props::RuntimeError) -> (u8, String) {
+    let msg = format!("{verb} failed: {e}");
+    match e {
+        cosmix_props::RuntimeError::Hook(cosmix_props::HookError::Hook { .. }) => (
+            RC_NODE_FAULT,
+            json!({
+                "error": msg,
+                "kind": "server",
+            })
+            .to_string(),
+        ),
+        _ => caller_error(&msg),
+    }
+}
+
 fn server_error(msg: &str) -> (u8, String) {
     // Same rc=10 sentinel — `NodedClient::call` doesn't distinguish a
     // server-side failure from a caller error at the wire level (both
@@ -761,8 +791,12 @@ fn project_row(row: &VhostRow, acme_status: &str, with_secrets: bool) -> JsonVal
 mod tests {
     use super::*;
     use crate::acme_provisioner::FqdnLockMap;
+    use crate::vhosts_namespace::{
+        ListenerConfigSource, listener_add_error, listener_remove_error,
+        register_vhosts_namespace_with_listener_config,
+    };
+    use cosmix_config::node::{NodeConfig, WebdListenerConfig};
     use crate::tls_status::{AcmeStatusSnapshot, AcmeVhostStateSnapshot, TlsStatusSnapshot};
-    use crate::vhosts_namespace::register_vhosts_namespace;
     use arc_swap::ArcSwap;
     use cosmix_props::sqlite::SqliteStore;
     use cosmix_props::{AuthPolicy, PropsRouter};
@@ -815,6 +849,26 @@ mod tests {
     /// `listeners_namespace::auth_policy`), so a test that must reach a
     /// listener MUTATION arm needs both this AND a matching `cmd.from`.
     async fn build_node_with_caps_ops(caps: &[&str], operators: &[&str]) -> Arc<NodeState> {
+        build_node_full(caps, operators, ListenerConfigSource::Fixed(None)).await
+    }
+
+    /// As [`build_node_with_caps`], but the verbs' restart-time
+    /// listener check reads `cfg` instead of "no node config".
+    async fn build_node_with_listener_config(caps: &[&str], cfg: NodeConfig) -> Arc<NodeState> {
+        build_node_full(caps, &[], ListenerConfigSource::Fixed(Some(Arc::new(cfg)))).await
+    }
+
+    async fn build_node_full(
+        caps: &[&str],
+        operators: &[&str],
+        listener_config: ListenerConfigSource,
+    ) -> Arc<NodeState> {
+        // Mirror production: explicit iff the node config carries a
+        // [[webd.listener]] array.
+        let explicit_listeners = matches!(
+            &listener_config,
+            ListenerConfigSource::Fixed(Some(cfg)) if !cfg.webd.listener.is_empty()
+        );
         let conn = Connection::open_in_memory().expect("sqlite");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
@@ -823,7 +877,8 @@ mod tests {
         let store = Arc::new(SqliteStore::new("webd", conn).expect("store"));
         let mut router = PropsRouter::new("webd");
         let (runtime, _events_rx) =
-            register_vhosts_namespace(&mut router, &store).expect("register");
+            register_vhosts_namespace_with_listener_config(&mut router, &store, listener_config)
+                .expect("register");
         // Override the spec's AuthPolicy after registration so the test
         // cap set is what verb dispatch sees. We can't replace the
         // `NamespaceSpec` already wired into the runtime, but the
@@ -881,6 +936,7 @@ mod tests {
             ))),
             handler_ast_cache: crate::mix_handler::new_ast_cache(),
             tls_reload: None,
+            explicit_listeners,
         })
     }
 
@@ -960,6 +1016,8 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["fqdn"], "p3test.example.com");
         assert_eq!(v["source"], "bus_runtime");
+        // No explicit listener array: no restart caveat in the reply.
+        assert!(v.get("served_after").is_none(), "{body}");
 
         // Read it back via store().get and assert source.
         let runtime = node.vhosts_runtime.as_ref().unwrap();
@@ -1594,6 +1652,7 @@ mod tests {
                 ))),
                 handler_ast_cache: crate::mix_handler::new_ast_cache(),
                 tls_reload: None,
+                explicit_listeners: false,
             })
         };
         let _tx = tx; // keep sender alive for the rx to remain live
@@ -1634,6 +1693,472 @@ mod tests {
             rc, 0,
             "props.write holder admitted for ACME vhost.add; body={body}"
         );
+        clear_auth_policy_for_test();
+    }
+
+    // ── restart-time listener surface: vhost.add / vhost.remove must
+    //    not leave a change the next boot rejects ─────────────────────
+
+    fn listener(id: &str, bind: &str, enabled: bool, hosts: &[&str]) -> WebdListenerConfig {
+        WebdListenerConfig {
+            id: id.to_string(),
+            bind: bind.to_string(),
+            external: true,
+            enabled,
+            vhosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+        }
+    }
+
+    fn cfg_with(listeners: Vec<WebdListenerConfig>, vhost_hosts: &[&str]) -> NodeConfig {
+        let mut cfg = NodeConfig::default();
+        cfg.webd.listener = listeners;
+        cfg.webd.vhost = vhost_hosts
+            .iter()
+            .map(|h| cosmix_config::node::WebdVhostConfig {
+                host: (*h).to_string(),
+                www_dir: "/srv/x".to_string(),
+                ..Default::default()
+            })
+            .collect();
+        cfg
+    }
+
+    fn add_cmd(fqdn: &str) -> IncomingCommand {
+        add_cmd_in(fqdn, "/srv/new")
+    }
+
+    fn add_cmd_in(fqdn: &str, www_dir: &str) -> IncomingCommand {
+        cmd_with_headers(
+            "webd.vhost.add",
+            &[
+                ("fqdn", fqdn),
+                ("www_dir", www_dir),
+                ("acme.provider", "letsencrypt_staging"),
+                ("acme.challenge", "http01"),
+                ("acme.contact_email", "ops@example.com"),
+            ],
+        )
+    }
+
+    async fn namespace_hosts(node: &NodeState) -> Vec<String> {
+        let runtime = node.vhosts_runtime.as_ref().unwrap();
+        crate::vhosts_namespace::snapshot_rows(runtime)
+            .await
+            .expect("snapshot")
+            .into_iter()
+            .map(|r| r.fqdn)
+            .collect()
+    }
+
+    #[test]
+    fn listener_add_error_mirrors_synthesize_listeners_per_host_rules() {
+        let h = "new.example.org";
+        // No node config / no listener array: implicit single listener
+        // serves every host.
+        assert!(listener_add_error(None, h).is_none());
+        assert!(listener_add_error(Some(&cfg_with(vec![], &[])), h).is_none());
+        // Named by exactly one enabled listener: admissible.
+        let ok = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[h])], &[]);
+        assert!(listener_add_error(Some(&ok), h).is_none());
+        // Named by none: the crash-loop case.
+        let none = cfg_with(
+            vec![listener("pub", "192.0.2.1:443", true, &["other.example.org"])],
+            &[],
+        );
+        let msg = listener_add_error(Some(&none), h).expect("unnamed host refused");
+        assert!(msg.contains("not in any [[webd.listener]]"), "{msg}");
+        // Named only by a disabled listener.
+        let off = cfg_with(vec![listener("pub", "192.0.2.1:443", false, &[h])], &[]);
+        let msg = listener_add_error(Some(&off), h).expect("disabled owner refused");
+        assert!(msg.contains("disabled listener"), "{msg}");
+        // Named by two listeners.
+        let two = cfg_with(
+            vec![
+                listener("pub", "192.0.2.1:443", true, &[h]),
+                listener("wg", "198.51.100.1:443", true, &[h]),
+            ],
+            &[],
+        );
+        let msg = listener_add_error(Some(&two), h).expect("double owner refused");
+        assert!(msg.contains("two listeners"), "{msg}");
+        // Listed twice by ONE listener: startup counts slots, not
+        // listeners, so this aborts the boot — the check must agree.
+        let dup = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[h, h])], &[]);
+        assert!(
+            dup.synthesize_listeners(&[h.to_string()], &HashSet::new())
+                .is_err(),
+            "startup rejects a duplicate slot"
+        );
+        let msg = listener_add_error(Some(&dup), h).expect("duplicate slot refused");
+        assert!(msg.contains("listed twice"), "{msg}");
+        // And the admissible shape is admissible to the real synthesis.
+        assert!(
+            ok.synthesize_listeners(&[h.to_string()], &HashSet::new())
+                .is_ok()
+        );
+        // Exact match, as at startup: a case-variant is not the same key.
+        let upper = cfg_with(
+            vec![listener("pub", "192.0.2.1:443", true, &["NEW.example.org"])],
+            &[],
+        );
+        assert!(listener_add_error(Some(&upper), h).is_some());
+    }
+
+    #[test]
+    fn listener_remove_error_only_when_a_listener_would_name_an_unknown_host() {
+        let h = "gone.example.org";
+        assert!(listener_remove_error(None, h).is_none());
+        // No listener names it: removal is safe.
+        let unnamed = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[])], &[]);
+        assert!(listener_remove_error(Some(&unnamed), h).is_none());
+        // Named, and a [[webd.vhost]] block still defines it (bootstrap
+        // re-materialises the row): safe.
+        let defined = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[h])], &[h]);
+        assert!(listener_remove_error(Some(&defined), h).is_none());
+        // Named and defined nowhere else: the next boot would abort.
+        let orphan = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[h])], &[]);
+        let msg = listener_remove_error(Some(&orphan), h).expect("orphaning remove refused");
+        assert!(msg.contains("\"pub\""), "{msg}");
+    }
+
+    /// The failure half: a `vhost.add` the next restart would reject is
+    /// refused BEFORE any write, so nothing partial persists — no
+    /// namespace row, no tombstone, no provisioner event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn vhost_add_refused_when_no_listener_serves_it_writes_nothing() {
+        let cfg = cfg_with(
+            vec![listener(
+                "pub",
+                "192.0.2.1:443",
+                true,
+                &["existing.example.org"],
+            )],
+            &[],
+        );
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg).await;
+        let (rc, body) = vhost_add(&node, &add_cmd("new.example.org")).await;
+        assert_eq!(rc, RC_CALLER_ERROR, "refused as caller error; body={body}");
+        assert!(body.contains("vhost.add failed"), "{body}");
+        assert!(body.contains("not in any [[webd.listener]]"), "{body}");
+
+        let runtime = node.vhosts_runtime.as_ref().unwrap();
+        let key = RecordKey::collection(namespace_name(), "new.example.org".to_string());
+        assert!(
+            matches!(runtime.store().get(&key).await, Err(StoreError::NotFound)),
+            "a refused add must leave no row behind",
+        );
+        assert!(
+            matches!(runtime.store().version_anchor(&key).await, Ok(None)),
+            "a refused add must not even leave a tombstone",
+        );
+        assert!(namespace_hosts(&node).await.is_empty());
+        clear_auth_policy_for_test();
+    }
+
+    /// The success half: after an admitted `vhost.add`, every surface
+    /// the NEXT boot consults agrees on the new host — the namespace row
+    /// (routing directory source), the `[[webd.listener]]` allowlist
+    /// (`synthesize_listeners` over the namespace hosts succeeds and
+    /// assigns it), and the per-listener TLS partition (its identity
+    /// lands on that listener's resolver, not skipped). The cert
+    /// adoption itself is pinned in `acme_provisioner`'s
+    /// `startup_adopt_*` tests.
+    #[tokio::test(flavor = "current_thread")]
+    async fn vhost_add_admitted_host_is_consistent_across_restart_surfaces() {
+        let host = "new.example.org";
+        let cfg = cfg_with(
+            vec![
+                listener("pub", "192.0.2.1:443", true, &[host]),
+                listener("wg", "198.51.100.1:443", true, &[]),
+            ],
+            &[],
+        );
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg.clone()).await;
+        let www = tempfile::tempdir().unwrap();
+        let www_dir = www.path().to_string_lossy().into_owned();
+        let (rc, body) = vhost_add(&node, &add_cmd_in(host, &www_dir)).await;
+        assert_eq!(rc, 0, "admitted add rc=0; body={body}");
+        // Explicit-listener node: the reply must not imply it is live.
+        let v: JsonValue = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["served_after"], "restart", "{body}");
+
+        // Surface: routing directory — rebuilt exactly as the next boot
+        // does (namespace snapshot → from_namespace_rows), so the host
+        // is actually routed, not merely stored.
+        let rows = crate::vhosts_namespace::snapshot_rows(node.vhosts_runtime.as_ref().unwrap())
+            .await
+            .expect("snapshot");
+        let dir = crate::vhost_directory::from_namespace_rows(&rows, &HashMap::new(), &HashSet::new())
+            .expect("directory");
+        assert!(dir.by_host.contains_key(host), "host routed after restart");
+        let all_hosts: Vec<String> = dir.by_host.keys().cloned().collect();
+        let dropped = crate::vhost_directory::routing_dropped_hosts(&rows, &dir);
+        assert!(dropped.is_empty());
+
+        // Surface: listener allowlist — the startup check over the
+        // routed hosts must pass and put the host on `pub`.
+        let resolved = cfg
+            .synthesize_listeners(&all_hosts, &dropped)
+            .expect("the next boot's listener resolution accepts the added host");
+        let owner = resolved
+            .iter()
+            .find(|l| l.hosts.iter().any(|h| h == host))
+            .expect("host assigned to a listener");
+        assert_eq!(owner.id, "pub");
+        assert!(owner.enabled);
+
+        // Surface: TLS partition — an identity for the host is routed
+        // to its listener's resolver bucket.
+        let ident = cosmix_config::node::TlsIdentityConfig {
+            server_name: host.to_string(),
+            cert: "/nonexistent/fullchain.pem".to_string(),
+            key: "/nonexistent/privkey.pem".to_string(),
+            default: false,
+            no_sni_fallback: false,
+        };
+        let buckets = crate::partition_identities_by_listener(&[ident], &resolved);
+        assert_eq!(buckets.get("pub").map(Vec::len), Some(1));
+        assert!(!buckets.contains_key("wg"));
+        clear_auth_policy_for_test();
+    }
+
+    /// Remove mirror: refusing to orphan a listener entry, and allowing
+    /// the removal once config no longer names the host.
+    #[tokio::test(flavor = "current_thread")]
+    async fn vhost_remove_refused_while_a_listener_still_names_the_host() {
+        let host = "gone.example.org";
+        let naming = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[host])], &[]);
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], naming).await;
+        let (rc, body) = vhost_add(&node, &add_cmd(host)).await;
+        assert_eq!(rc, 0, "seed add; body={body}");
+
+        let rm = cmd_with_headers("webd.vhost.remove", &[("fqdn", host)]);
+        let (rc, body) = vhost_remove(&node, &rm).await;
+        assert_eq!(rc, RC_CALLER_ERROR, "refused; body={body}");
+        assert!(body.contains("still names vhost"), "{body}");
+        assert_eq!(
+            namespace_hosts(&node).await,
+            vec![host.to_string()],
+            "a refused remove must leave the row in place",
+        );
+        clear_auth_policy_for_test();
+    }
+
+    /// A disabled row is not routed, so it needs no listener: the add is
+    /// admitted even though no listener names it, and startup's
+    /// fail-soft keeps the node booting. Flipping it to enabled later is
+    /// the transition the hook checks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn disabled_add_needs_no_listener_but_enabling_it_does() {
+        let host = "staged.example.org";
+        let cfg = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[])], &[]);
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg.clone()).await;
+        let mut add = add_cmd(host);
+        add.headers.insert("enabled".to_string(), "false".to_string());
+        let (rc, body) = vhost_add(&node, &add).await;
+        assert_eq!(rc, 0, "disabled add admitted; body={body}");
+
+        let rows = crate::vhosts_namespace::snapshot_rows(node.vhosts_runtime.as_ref().unwrap())
+            .await
+            .expect("snapshot");
+        let dir = crate::vhost_directory::from_namespace_rows(&rows, &HashMap::new(), &HashSet::new())
+            .expect("directory");
+        let all_hosts: Vec<String> = dir.by_host.keys().cloned().collect();
+        let dropped = crate::vhost_directory::routing_dropped_hosts(&rows, &dir);
+        cfg.synthesize_listeners(&all_hosts, &dropped)
+            .expect("next boot survives the disabled row");
+
+        // Enabling it (vhost.add Patch with enabled=true) is refused.
+        let (rc, body) = vhost_add(&node, &add_cmd(host)).await;
+        assert_eq!(rc, RC_CALLER_ERROR, "enable refused; body={body}");
+        assert!(body.contains("not in any [[webd.listener]]"), "{body}");
+        clear_auth_policy_for_test();
+    }
+
+    /// An unreadable node.conf.mix is a node fault: rc 20 on both the
+    /// ergonomic verb and the raw props surface, not a caller error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreadable_node_config_is_rc_20_on_both_surfaces() {
+        let node = build_node_full(
+            &["props.write:webd.vhosts"],
+            &[],
+            ListenerConfigSource::Broken("parse error at line 3".to_string()),
+        )
+        .await;
+        let (rc, body) = vhost_add(&node, &add_cmd("any.example.org")).await;
+        assert_eq!(rc, 20, "verb: node fault; body={body}");
+        assert!(body.contains("could not be loaded"), "{body}");
+        assert!(body.contains("\"kind\":\"server\""), "{body}");
+
+        let set = props_cmd(
+            "webd.props.set",
+            &[("namespace", "vhosts"), ("key", "any.example.org"), ("if_version", "0")],
+            r#"{"fqdn":"any.example.org","www_dir":"/srv/x","enabled":true,
+                "acme_provider":"letsencrypt_staging","acme_challenge":"http01",
+                "acme_contact_email":"ops@example.com"}"#,
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "set", &set).await;
+        assert_eq!(rc, 20, "props.set: node fault; body={body}");
+        assert!(namespace_hosts(&node).await.is_empty());
+        clear_auth_policy_for_test();
+    }
+
+    fn props_cmd(verb: &str, headers: &[(&str, &str)], body: &str) -> IncomingCommand {
+        let mut cmd = cmd_with_headers(verb, headers);
+        cmd.body = body.to_string();
+        cmd
+    }
+
+    /// The check lives in the namespace hooks, so the raw SPEC-12 surface
+    /// (`webd.props.set` / `webd.props.delete`) is guarded exactly like
+    /// the ergonomic verbs — no writer can bypass it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn raw_props_set_and_delete_hit_the_same_listener_check() {
+        let named = "named.example.org";
+        let unnamed = "unnamed.example.org";
+        let cfg = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[named])], &[]);
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg).await;
+        let row = |fqdn: &str| {
+            format!(
+                r#"{{"fqdn":"{fqdn}","www_dir":"/srv/x","enabled":true,
+                    "acme_provider":"letsencrypt_staging","acme_challenge":"http01",
+                    "acme_contact_email":"ops@example.com"}}"#
+            )
+        };
+
+        // Unnamed host through props.set: refused, nothing written.
+        let set = props_cmd(
+            "webd.props.set",
+            &[("namespace", "vhosts"), ("key", unnamed), ("if_version", "0")],
+            &row(unnamed),
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "set", &set).await;
+        assert_eq!(rc, 10, "validation refusal; body={body}");
+        assert!(body.contains("not in any [[webd.listener]]"), "{body}");
+        assert!(namespace_hosts(&node).await.is_empty(), "nothing persisted");
+
+        // Named host through props.set: admitted.
+        let set = props_cmd(
+            "webd.props.set",
+            &[("namespace", "vhosts"), ("key", named), ("if_version", "0")],
+            &row(named),
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "set", &set).await;
+        assert_eq!(rc, 0, "admitted; body={body}");
+
+        // props.delete of the named host would orphan the listener entry.
+        let del = cmd_with_headers(
+            "webd.props.delete",
+            &[("namespace", "vhosts"), ("key", named), ("if_version", "1")],
+        );
+        let (rc, body) =
+            crate::vhosts_namespace::dispatch_props(&node.props_router, "delete", &del).await;
+        assert_eq!(rc, 10, "delete refused; body={body}");
+        assert!(body.contains("still names vhost"), "{body}");
+        assert_eq!(namespace_hosts(&node).await, vec![named.to_string()]);
+        clear_auth_policy_for_test();
+    }
+
+    /// Writes to an already-enabled row are not re-checked: config that
+    /// drifted after the row was admitted must never block a
+    /// provisioner cert writeback or an ordinary field update.
+    #[tokio::test(flavor = "current_thread")]
+    async fn writes_to_an_already_enabled_row_are_not_rechecked() {
+        let host = "drift.example.org";
+        // Seed under a permissive (no node config) namespace, then open
+        // the SAME database again under a config that no longer names the
+        // host — a restart after the operator edited node.conf.mix.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("web.db");
+        let open = || {
+            let conn = Connection::open(&db).expect("sqlite");
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                .expect("pragmas");
+            Arc::new(SqliteStore::new("webd", conn).expect("store"))
+        };
+        let store1 = open();
+        let mut r1 = PropsRouter::new("webd");
+        let (rt1, _rx1) = register_vhosts_namespace_with_listener_config(
+            &mut r1,
+            &store1,
+            ListenerConfigSource::Fixed(None),
+        )
+        .expect("register");
+        let key = RecordKey::collection(namespace_name(), host.to_string());
+        let mut body = BTreeMap::new();
+        body.insert("fqdn".to_string(), PropValue::String(host.into()));
+        body.insert("www_dir".to_string(), PropValue::String("/srv/x".into()));
+        body.insert("enabled".to_string(), PropValue::Bool(true));
+        body.insert("source".to_string(), PropValue::String("bus_runtime".into()));
+        for (k, v) in [
+            ("acme_provider", "letsencrypt_staging"),
+            ("acme_challenge", "http01"),
+            ("acme_contact_email", "ops@example.com"),
+        ] {
+            body.insert(k.to_string(), PropValue::String(v.into()));
+        }
+        rt1.set_with_origin(
+            key.clone(),
+            PropValue::Object(body),
+            SetOpts {
+                expected_version: Some(Version::zero()),
+                merge: MergeMode::Patch,
+                actor: Actor::service("webd").expect("actor"),
+                cause: None,
+                ts_ms: 0,
+            },
+            WriteOrigin::backend(),
+        )
+        .await
+        .expect("seed");
+
+        let drifted = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[])], &[]);
+        let store2 = open();
+        let mut r2 = PropsRouter::new("webd");
+        let (rt2, _rx2) = register_vhosts_namespace_with_listener_config(
+            &mut r2,
+            &store2,
+            ListenerConfigSource::Fixed(Some(Arc::new(drifted))),
+        )
+        .expect("re-register");
+        let mut patch = BTreeMap::new();
+        patch.insert(
+            "not_after".to_string(),
+            PropValue::String("2100-01-01T00:00:00Z".into()),
+        );
+        rt2.set_with_origin(
+            key,
+            PropValue::Object(patch),
+            SetOpts {
+                expected_version: Some(Version(1)),
+                merge: MergeMode::Patch,
+                actor: Actor::service("webd").expect("actor"),
+                cause: None,
+                ts_ms: 0,
+            },
+            WriteOrigin::backend(),
+        )
+        .await
+        .expect("writeback to an admitted row must not be refused");
+    }
+
+    /// Remove is allowed while a listener names the host when a
+    /// `[[webd.vhost]]` block still defines it (bootstrap re-creates the
+    /// row at the next boot, so the listener entry is not orphaned).
+    #[tokio::test(flavor = "current_thread")]
+    async fn vhost_remove_allowed_when_config_still_defines_the_host() {
+        let host = "kept.example.org";
+        let cfg = cfg_with(vec![listener("pub", "192.0.2.1:443", true, &[host])], &[host]);
+        let node = build_node_with_listener_config(&["props.write:webd.vhosts"], cfg).await;
+        let (rc, body) = vhost_add(&node, &add_cmd(host)).await;
+        assert_eq!(rc, 0, "seed add; body={body}");
+        let rm = cmd_with_headers("webd.vhost.remove", &[("fqdn", host)]);
+        let (rc, body) = vhost_remove(&node, &rm).await;
+        assert_eq!(rc, 0, "remove allowed; body={body}");
+        assert!(namespace_hosts(&node).await.is_empty());
         clear_auth_policy_for_test();
     }
 }

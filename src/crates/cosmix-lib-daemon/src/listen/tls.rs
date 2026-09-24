@@ -116,6 +116,33 @@ impl ListenerTls {
         let cfg = self.cache.get_or_build(&resolver);
         Some((resolver, cfg))
     }
+
+    /// Whether this handle holds a resolver with NO identities — TLS
+    /// pending issuance. Distinct from `None` (TLS absent): a pending
+    /// handle is a TLS slot a later [`swap`](Self::swap) fills in place.
+    pub fn is_pending(&self) -> bool {
+        self.slot
+            .load()
+            .as_ref()
+            .as_ref()
+            .is_some_and(|r| r.is_empty())
+    }
+
+    /// For a pending handle only: a `ServerConfig` over the empty
+    /// resolver. A handshake against it resolves no certificate, so
+    /// rustls refuses it with a TLS alert — how a listener opted into
+    /// [`ListenerSpec::tls_pending_ok`] answers until its first cert
+    /// lands. `None` when the handle is not pending.
+    ///
+    /// [`ListenerSpec::tls_pending_ok`]: crate::listen::ListenerSpec::tls_pending_ok
+    pub fn pending_config(&self) -> Option<Arc<ServerConfig>> {
+        let guard = self.slot.load();
+        let resolver = guard.as_ref().as_ref().cloned()?;
+        if !resolver.is_empty() {
+            return None;
+        }
+        Some(self.cache.get_or_build(&resolver))
+    }
 }
 
 #[cfg(test)]

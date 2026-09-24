@@ -80,6 +80,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use cosmix_config::node::{NodeConfig, WebdListenerConfig};
 use cosmix_props::sqlite::{JsonValuesMapping, SqliteStore};
 use cosmix_props::{
     AuthPolicy, Capability, CapabilitySet, Cardinality, FieldSchema, FieldType, HookCtx, HookError,
@@ -682,6 +683,9 @@ pub(crate) fn namespace_name() -> NamespaceName {
 /// producer-only build safe in the meantime.
 pub struct VhostsNamespaceHooks {
     events_tx: mpsc::Sender<NamespaceEvent>,
+    /// The `node.conf.mix` the NEXT restart will read; see
+    /// [`ListenerConfigSource`] and [`Self::restart_listener_check`].
+    listener_config: ListenerConfigSource,
 }
 
 impl VhostsNamespaceHooks {
@@ -689,8 +693,173 @@ impl VhostsNamespaceHooks {
     /// supplied bounded sender. The receiver lives in `main.rs` for
     /// C1d (parked binding); commits §"4a"/§"4b" of the rev-6 plan
     /// move it into the provisioner's `run_forever` `select!`.
-    pub fn new(events_tx: mpsc::Sender<NamespaceEvent>) -> Self {
-        Self { events_tx }
+    pub fn new(
+        events_tx: mpsc::Sender<NamespaceEvent>,
+        listener_config: ListenerConfigSource,
+    ) -> Self {
+        Self {
+            events_tx,
+            listener_config,
+        }
+    }
+
+    /// Refuse a write the next restart's `synthesize_listeners` would
+    /// reject. A config that does not load is a node fault
+    /// (`HookError::hook`, rc 20), not a caller error: the next restart
+    /// fails whatever this write does, so the hook cannot vouch for it.
+    fn restart_listener_check(&self, fqdn: &str, removing: bool) -> Result<(), HookError> {
+        let cfg = self.listener_config.load().map_err(|e| {
+            HookError::hook(format!(
+                "node.conf.mix could not be loaded ({e}); cannot tell whether the \
+                 next webd restart would accept this webd.vhosts change. Fix the \
+                 config first",
+            ))
+        })?;
+        let refusal = if removing {
+            listener_remove_error(cfg.as_deref(), fqdn)
+        } else {
+            listener_add_error(cfg.as_deref(), fqdn)
+        };
+        match refusal {
+            Some(msg) => Err(HookError::validation(msg)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Where the `webd.vhosts` hooks read the `node.conf.mix` that the NEXT
+/// webd restart will enforce.
+///
+/// The restart — not the live daemon — is what a runtime row can break:
+/// `synthesize_listeners` runs over every routed namespace host at
+/// startup, and on a node with an explicit `[[webd.listener]]` array an
+/// enabled host that no enabled listener names (or a listener naming a
+/// host that no longer exists) aborts the boot, taking every vhost on
+/// the node down. The hooks re-read the on-disk config on each guarded
+/// write and refuse a change that restart would reject, so every writer
+/// — `webd.vhost.add` / `.remove`, raw `webd.props.set` / `.delete` —
+/// hits the same check.
+#[derive(Clone)]
+pub enum ListenerConfigSource {
+    /// Re-read `node.conf.mix` through the same resolution startup uses
+    /// ([`cosmix_config::node::load_node_config`]). Production.
+    Disk,
+    /// A fixed config: test fixtures. `None` = no node config, i.e. the
+    /// implicit single `wg` listener that serves every host.
+    #[cfg(test)]
+    Fixed(Option<Arc<NodeConfig>>),
+    /// Test fixture: a config that fails to load with this error.
+    #[cfg(test)]
+    Broken(String),
+}
+
+impl ListenerConfigSource {
+    fn load(&self) -> Result<Option<Arc<NodeConfig>>, String> {
+        match self {
+            Self::Disk => cosmix_config::node::load_node_config()
+                .map(|c| c.map(Arc::new))
+                .map_err(|e| format!("{e:#}")),
+            #[cfg(test)]
+            Self::Fixed(cfg) => Ok(cfg.clone()),
+            #[cfg(test)]
+            Self::Broken(e) => Err(e.clone()),
+        }
+    }
+}
+
+/// One entry per `vhosts` allowlist slot in `cfg` that names `fqdn`
+/// (exact match — the startup check compares the namespace key
+/// byte-for-byte).
+///
+/// Per SLOT, not per listener: `synthesize_listeners` records an owner
+/// per allowlist entry, so one listener listing the host twice is
+/// already a "served by two listeners" boot failure and must count as
+/// two here.
+fn listeners_naming<'a>(cfg: &'a NodeConfig, fqdn: &str) -> Vec<&'a WebdListenerConfig> {
+    cfg.webd
+        .listener
+        .iter()
+        .flat_map(|l| l.vhosts.iter().filter(move |h| *h == fqdn).map(move |_| l))
+        .collect()
+}
+
+/// Would the next restart serve a newly enabled `fqdn`? Mirrors the
+/// per-host half of `NodeConfig::synthesize_listeners`: with an explicit
+/// listener array the host must be named by exactly one listener, and
+/// that listener must be enabled. `None` = admissible (including the
+/// implicit single-listener node, which serves every host).
+pub fn listener_add_error(cfg: Option<&NodeConfig>, fqdn: &str) -> Option<String> {
+    let cfg = cfg?;
+    if cfg.webd.listener.is_empty() {
+        return None;
+    }
+    match listeners_naming(cfg, fqdn).as_slice() {
+        [] => Some(format!(
+            "vhost {fqdn:?} is not in any [[webd.listener]] `vhosts` allowlist in \
+             node.conf.mix; the next webd restart would refuse to start and take \
+             every vhost on this node down. Add it to exactly one enabled \
+             listener's `vhosts` first, then retry",
+        )),
+        [l] if !l.enabled => Some(format!(
+            "vhost {fqdn:?} is named only by the disabled listener {:?} in \
+             node.conf.mix; the next webd restart would refuse to start. Move it \
+             to an enabled listener first, then retry",
+            l.id,
+        )),
+        [_] => None,
+        [a, b, ..] if a.id == b.id => Some(format!(
+            "vhost {fqdn:?} is listed twice in listener {:?}'s `vhosts` in \
+             node.conf.mix; the next webd restart would refuse to start. List \
+             it once",
+            a.id,
+        )),
+        [a, b, ..] => Some(format!(
+            "vhost {fqdn:?} is named by two listeners ({:?} and {:?}) in \
+             node.conf.mix; the next webd restart would refuse to start. A host \
+             belongs to exactly one listener",
+            a.id, b.id,
+        )),
+    }
+}
+
+/// Would the next restart survive removing `fqdn`? A listener that still
+/// names a host no longer defined anywhere is a hard "unknown vhost"
+/// startup error. The host stays defined when a `[[webd.vhost]]` block
+/// still declares it (host or alias): bootstrap re-materialises that row
+/// (bootstrap lowercases the configured host, hence the case-insensitive
+/// compare on the config side).
+pub fn listener_remove_error(cfg: Option<&NodeConfig>, fqdn: &str) -> Option<String> {
+    let cfg = cfg?;
+    let naming = listeners_naming(cfg, fqdn);
+    let first = naming.first()?;
+    let still_defined = cfg.webd.vhost.iter().any(|v| {
+        v.host.eq_ignore_ascii_case(fqdn) || v.aliases.iter().any(|a| a.eq_ignore_ascii_case(fqdn))
+    });
+    if still_defined {
+        return None;
+    }
+    Some(format!(
+        "listener {:?} in node.conf.mix still names vhost {fqdn:?}; removing the \
+         row would make the next webd restart refuse to start (unknown vhost). \
+         Drop it from that listener's `vhosts` first, then retry",
+        first.id,
+    ))
+}
+
+/// `source` of a row value, if it is an Object carrying one.
+fn row_source(value: Option<&PropValue>) -> Option<&str> {
+    match value {
+        Some(PropValue::Object(m)) => field_as_str(m, "source"),
+        _ => None,
+    }
+}
+
+/// `enabled` of a prior row: absent row ⇒ `false`; absent field ⇒ the
+/// schema default `true`.
+fn row_enabled(value: Option<&PropValue>) -> bool {
+    match value {
+        Some(PropValue::Object(m)) => !matches!(m.get("enabled"), Some(PropValue::Bool(false))),
+        _ => false,
     }
 }
 
@@ -895,6 +1064,7 @@ impl HookHandler for VhostsNamespaceHooks {
             // closes — an operator typo like `acme_provdier` would
             // commit cleanly today and re-surface as a soft-error log
             // in `after_set`.
+            let effective_source = field_as_str(&effective, "source").map(str::to_owned);
             let effective_value = PropValue::Object(effective);
             if let Err(e) = vhost_row_from_value(&effective_value) {
                 return Err(HookError::validation(format!(
@@ -905,6 +1075,23 @@ impl HookHandler for VhostsNamespaceHooks {
                      See vhosts_namespace.rs::VhostRow for the required \
                      field set and `deny_unknown_fields` rule",
                 )));
+            }
+
+            // Rule 7 — the next restart must accept a row this write
+            // makes routable. Only a transition INTO enabled is checked
+            // (create, re-create over a tombstone, false→true): a write
+            // to an already-enabled row (provisioner cert writeback, a
+            // www_dir tweak) must never be refused because config drifted
+            // after the row was admitted. `config_bootstrap` rows are
+            // config-owned: startup's own listener resolution validates
+            // them with the config they came from. Disabled rows are
+            // skipped at startup (routing-dropped hosts are fail-soft),
+            // so they need no listener.
+            if enabled
+                && !row_enabled(ctx.old.as_ref())
+                && effective_source.as_deref() != Some("config_bootstrap")
+            {
+                self.restart_listener_check(&ctx.key.key, false)?;
             }
 
             Ok(())
@@ -993,14 +1180,18 @@ impl HookHandler for VhostsNamespaceHooks {
         })
     }
 
-    fn before_delete<'a>(&'a self, _ctx: &'a HookCtx) -> HookFuture<'a, ()> {
-        Box::pin(async {
-            // Reversible preflight only. Phase 3 has no held refs to
-            // validate (a vhost row deletion has no FK children
-            // today), so this arm returns Ok unconditionally. The
-            // arm exists for future phases where a CMS-namespace row
-            // might reference a vhost FQDN and require a "delete the
-            // CMS row first" preflight.
+    fn before_delete<'a>(&'a self, ctx: &'a HookCtx) -> HookFuture<'a, ()> {
+        Box::pin(async move {
+            // Reversible preflight only. The one check: deleting a row a
+            // listener still names (and no [[webd.vhost]] block defines)
+            // would make the next restart abort on an unknown vhost —
+            // refuse it for every writer (`webd.vhost.remove` and raw
+            // `webd.props.delete` alike). `config_bootstrap` rows are
+            // skipped: bootstrap owns them (its orphan pass deletes rows
+            // config dropped) and re-creates any a caller deletes.
+            if row_source(ctx.old.as_ref()) != Some("config_bootstrap") {
+                self.restart_listener_check(&ctx.key.key, true)?;
+            }
             //
             // CRUCIAL: destructive cleanup (cert archive, SNI
             // resolver flip) is in `after_delete`, not here — see
@@ -1074,13 +1265,30 @@ impl HookHandler for VhostsNamespaceHooks {
 /// that lands, `webd.props.list namespace=vhosts` returns an empty
 /// list; the ergonomic `webd.routes.list` continues to project the
 /// runtime vhost map.
+#[cfg(test)]
 pub fn register_vhosts_namespace(
     router: &mut PropsRouter,
     store: &Arc<SqliteStore>,
 ) -> Result<(Arc<Runtime>, mpsc::Receiver<NamespaceEvent>)> {
+    register_vhosts_namespace_with_listener_config(
+        router,
+        store,
+        ListenerConfigSource::Fixed(None),
+    )
+}
+
+/// As [`register_vhosts_namespace`], with the restart-time listener
+/// check reading `listener_config` (production passes
+/// [`ListenerConfigSource::Disk`]; the plain form is "no node config",
+/// under which the check always passes).
+pub fn register_vhosts_namespace_with_listener_config(
+    router: &mut PropsRouter,
+    store: &Arc<SqliteStore>,
+    listener_config: ListenerConfigSource,
+) -> Result<(Arc<Runtime>, mpsc::Receiver<NamespaceEvent>)> {
     let service = router.service().to_string();
     let (events_tx, events_rx) = mpsc::channel(PROVISIONER_EVENT_CHANNEL_CAPACITY);
-    let hooks = Hooks::new(VhostsNamespaceHooks::new(events_tx));
+    let hooks = Hooks::new(VhostsNamespaceHooks::new(events_tx, listener_config));
     let spec = spec(&service, hooks);
     store
         .register_namespace(&spec, Arc::new(JsonValuesMapping::new(namespace_name())))
@@ -1247,7 +1455,7 @@ mod tests {
     /// after_delete sites in this module bind the receiver explicitly.
     fn hooks_with_channel() -> (VhostsNamespaceHooks, mpsc::Receiver<NamespaceEvent>) {
         let (tx, rx) = mpsc::channel(PROVISIONER_EVENT_CHANNEL_CAPACITY);
-        (VhostsNamespaceHooks::new(tx), rx)
+        (VhostsNamespaceHooks::new(tx, ListenerConfigSource::Fixed(None)), rx)
     }
 
     #[test]
@@ -2175,7 +2383,7 @@ mod tests {
         // mpsc scheduler; the rule under test is "Full → drop, not
         // block", independent of capacity value.
         let (tx, mut rx) = mpsc::channel(1);
-        let h = VhostsNamespaceHooks::new(tx);
+        let h = VhostsNamespaceHooks::new(tx, ListenerConfigSource::Fixed(None));
         let body = minimal_acme_body("a.example.com");
         let ctx_a = hook_ctx_caller_replace("a.example.com", body.clone());
         let ctx_b = hook_ctx_caller_replace("b.example.com", body);

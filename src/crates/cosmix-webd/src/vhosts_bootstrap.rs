@@ -1133,6 +1133,79 @@ mod tests {
         assert_eq!(row.source.as_deref(), Some(SOURCE_CONFIG_BOOTSTRAP));
     }
 
+    /// Deleting a `config_bootstrap` row can never break the next boot,
+    /// even while a listener names the host: the listener-check hook
+    /// skips config-owned rows, and bootstrap re-materialises the row
+    /// before listener resolution runs.
+    #[tokio::test]
+    async fn deleted_config_row_named_by_listener_is_rebuilt_before_listener_resolution() {
+        use crate::vhosts_namespace::{
+            ListenerConfigSource, register_vhosts_namespace_with_listener_config,
+        };
+        use cosmix_config::node::{NodeConfig, WebdListenerConfig};
+
+        let host = "markc.example";
+        let webd = cfg_with(vec![manual_tls_row(host, "/srv/www/markc")]);
+        let node_cfg = NodeConfig {
+            webd: {
+                let mut w = webd.clone();
+                w.listener = vec![WebdListenerConfig {
+                    id: "pub".to_string(),
+                    bind: "192.0.2.1:443".to_string(),
+                    external: true,
+                    enabled: true,
+                    vhosts: vec![host.to_string()],
+                }];
+                w
+            },
+            ..Default::default()
+        };
+        let conn = Connection::open_in_memory().expect("sqlite");
+        let store = Arc::new(SqliteStore::new("webd", conn).expect("store"));
+        let mut router = PropsRouter::new("webd");
+        let (runtime, _rx) = register_vhosts_namespace_with_listener_config(
+            &mut router,
+            &store,
+            ListenerConfigSource::Fixed(Some(Arc::new(node_cfg.clone()))),
+        )
+        .expect("register");
+        bootstrap_upsert_from_config(&runtime, &webd, 1_000)
+            .await
+            .expect("bootstrap");
+
+        // Caller-origin delete (the raw props.delete path): allowed.
+        let key = cosmix_props::RecordKey::collection(runtime.spec().name.clone(), host.to_string());
+        let v = runtime.store().version_anchor(&key).await.unwrap().unwrap();
+        runtime
+            .delete_with_origin(
+                key,
+                DeleteOpts {
+                    expected_version: Some(v),
+                    actor: Actor::service("webd").expect("actor"),
+                    cause: Some("test".into()),
+                    ts_ms: 2_000,
+                },
+                WriteOrigin::caller(),
+            )
+            .await
+            .expect("config-owned row deletion is not listener-checked");
+        assert!(list_rows(&runtime).await.is_empty());
+
+        // Next boot: bootstrap first, then listener resolution.
+        bootstrap_upsert_from_config(&runtime, &webd, 3_000)
+            .await
+            .expect("re-bootstrap");
+        let hosts: Vec<String> = list_rows(&runtime)
+            .await
+            .into_iter()
+            .map(|r| r.key.key.to_string())
+            .collect();
+        assert_eq!(hosts, vec![host.to_string()]);
+        node_cfg
+            .synthesize_listeners(&hosts, &std::collections::HashSet::new())
+            .expect("listener resolution passes after the rebuild");
+    }
+
     /// V-B.13 — `acme = ...` together with `tls_cert` / `tls_key`
     /// must fail bootstrap fast. The two modes are mutually exclusive
     /// per the [[webd.vhost]] schema; the resolver should reject this

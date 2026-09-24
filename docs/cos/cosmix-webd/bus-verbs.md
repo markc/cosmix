@@ -35,7 +35,25 @@ Dotted names take precedence. `enabled` accepts `true`, `false`, `1`, or `0` and
 
 The add verb stamps `source = "bus_runtime"` and uses a tombstone-aware version anchor. It supports re-adding a previously removed FQDN.
 
-The remove verb deletes the property row. Namespace hooks notify the runtime and certificate provisioner so routing and managed state can be reconciled.
+Runtime rows survive restarts, so every write to `webd.vhosts` is checked against the `node.conf.mix` the next restart will read. The check lives in the namespace hooks, so it covers `webd.vhost.add` and `webd.vhost.remove` and also raw `webd.props.set` and `webd.props.delete`. The hooks re-read the config from disk on every guarded write.
+
+On a node with an explicit `[[webd.listener]]` array, a write that makes a row enabled is refused unless exactly one enabled listener lists the FQDN in its `vhosts`, once. "Makes enabled" means a new row, a re-add over a removed one, or a flip from `enabled = false`. The refused cases are: no listener names the host, only a disabled listener names it, or it appears in two allowlist slots. Each would make the next restart abort and take every vhost on the node down. A refused write stores nothing: no row, no tombstone, no provisioner event. Writes to a row that is already enabled are not re-checked, so a later config edit never blocks a certificate writeback. Rows sourced from `[[webd.vhost]]` blocks are validated by startup itself and are not checked here. A node without explicit listeners serves every host, so the check always passes there.
+
+A disabled row needs no listener. At startup, rows the routing directory does not serve are skipped in listener resolution, just like vhosts whose configuration failed to load. That covers disabled rows and runtime rows whose `www_dir` does not exist. A listener naming one of them no longer aborts the boot.
+
+Removing a row is refused while a listener still names the FQDN and no `[[webd.vhost]]` block defines it as a host or alias. Otherwise the listener would point at an unknown vhost and abort the next boot. Drop the host from the listener first.
+
+The config edit and the write must happen back to back, with no restart between them. Adding a host to a listener's `vhosts` before its row exists, then restarting, still aborts the boot on an unknown vhost.
+
+Refusals are validation errors with rc 10. If the config file does not load, the write is refused with rc 20, a node fault, because the next restart would fail anyway.
+
+On a node with explicit listeners, a runtime-added host is not served until the next restart, because each listener's allowlist is read at startup. The add reply then carries `"served_after": "restart"`.
+
+After a restart, webd loads the on-disk certificate of every runtime-added ACME vhost before the listeners bind. The first handshake gets the vhost's own certificate, not another vhost's. A listener whose only TLS hosts are runtime-added always binds as a TLS port. If their certificates are still pending issuance, it binds with `tls=pending`: every handshake is refused with a TLS alert and nothing is ever served in plaintext. When a certificate is issued, the same listener starts serving it without a restart. The startup log prints `tls=pending` for such a listener. Each listener keeps its `strict_sni` policy across these reloads and across renewals. Rows with no servable certificate on disk are logged at startup and issued once the listeners are bound. After that, every 6-hour renewal tick retries them once their cooldown has passed.
+
+All of this needs the certificate provisioner. The provisioner only exists on a node whose `node.conf.mix` declares at least one ACME vhost, and which has at least one TLS listener at startup. On a node where every ACME vhost is runtime-added, those certificates are neither issued nor loaded.
+
+The verbs cannot see a front proxy. On a node behind an nginx SNI router, the router's `stream` map entry and its `:80` `server_name` entry still have to be added by the operator.
 
 The list verb adds a derived `acme_status` to each row. Secret fields are returned only when the caller has the secret-read capability.
 

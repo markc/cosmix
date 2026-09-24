@@ -420,6 +420,21 @@ pub fn from_namespace_rows(
     VhostDirectory::build(entries)
 }
 
+/// Namespace hosts that [`from_namespace_rows`] left out of `directory`:
+/// `enabled = false` rows and `bus_runtime` rows whose `www_dir` is not a
+/// directory. They serve nothing this run, exactly like a B1 fail-soft
+/// config host, so startup must skip them in listener resolution too:
+/// a listener naming one is not an "unknown vhost" (the row exists and
+/// resurrects on repair + restart), and an unnamed one needs no listener.
+/// Without this a runtime row disabled — or whose `www_dir` vanished —
+/// after it was admitted aborted the whole node at the next boot.
+pub fn routing_dropped_hosts(rows: &[VhostRow], directory: &VhostDirectory) -> HashSet<String> {
+    rows.iter()
+        .filter(|r| !directory.by_host.contains_key(&r.fqdn))
+        .map(|r| r.fqdn.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -449,6 +464,79 @@ mod tests {
             session_epoch_cache: crate::SessionEpochCache::default(),
             public_response_cache: crate::public_response_cache::Cache::default(),
         })
+    }
+
+    fn runtime_row(fqdn: &str, www_dir: &str, enabled: bool) -> VhostRow {
+        VhostRow {
+            fqdn: fqdn.to_string(),
+            enabled,
+            www_dir: www_dir.to_string(),
+            aliases: Vec::new(),
+            source: Some("bus_runtime".to_string()),
+            acme_provider: Some("letsencrypt_staging".to_string()),
+            acme_challenge: Some("http01".to_string()),
+            acme_contact_email: Some("ops@example.com".to_string()),
+            tls_cert_path: None,
+            tls_key_path: None,
+            cert_blob_id: None,
+            key_blob_id: None,
+            not_after: None,
+            last_attempt: None,
+            last_error_count: None,
+            last_error: None,
+        }
+    }
+
+    /// Startup fail-soft for rows the directory drops. A listener that
+    /// names a disabled row, or a runtime row whose www_dir is missing,
+    /// used to abort the whole node ("unknown vhost"); with the dropped
+    /// set passed to `synthesize_listeners` boot proceeds and still
+    /// serves the routed host.
+    #[test]
+    fn routing_dropped_hosts_keep_listener_resolution_booting() {
+        use cosmix_config::node::{NodeConfig, WebdListenerConfig};
+
+        let www = tempfile::tempdir().unwrap();
+        let live_dir = www.path().to_string_lossy().into_owned();
+        let rows = vec![
+            runtime_row("live.example.org", &live_dir, true),
+            runtime_row("off.example.org", &live_dir, false),
+            runtime_row("nodir.example.org", "/nonexistent/webd-test-www", true),
+        ];
+        let dir = from_namespace_rows(&rows, &HashMap::new(), &HashSet::new()).expect("directory");
+        let all_hosts: Vec<String> = dir.by_host.keys().cloned().collect();
+        assert_eq!(all_hosts, vec!["live.example.org".to_string()]);
+
+        let dropped = routing_dropped_hosts(&rows, &dir);
+        let want: HashSet<String> = ["off.example.org", "nodir.example.org"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(dropped, want);
+
+        let mut cfg = NodeConfig::default();
+        cfg.webd.listener = vec![WebdListenerConfig {
+            id: "pub".to_string(),
+            bind: "192.0.2.1:443".to_string(),
+            external: true,
+            enabled: true,
+            vhosts: vec![
+                "live.example.org".to_string(),
+                "off.example.org".to_string(),
+                "nodir.example.org".to_string(),
+            ],
+        }];
+        // Pre-fix behaviour: the dropped hosts are "unknown" → abort.
+        let err = cfg
+            .synthesize_listeners(&all_hosts, &HashSet::new())
+            .expect_err("without the dropped set boot aborts");
+        assert!(format!("{err:#}").contains("unknown vhost"), "{err:#}");
+        // With it: boot proceeds and the routed host keeps its listener.
+        let resolved = cfg
+            .synthesize_listeners(&all_hosts, &dropped)
+            .expect("fail-soft boot");
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].hosts.contains(&"live.example.org".to_string()));
     }
 
     #[test]

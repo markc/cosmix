@@ -751,6 +751,66 @@ pub(crate) fn partition_identities_by_listener(
     by_listener
 }
 
+/// Listeners that own a routed `bus_runtime` ACME row but got no TLS
+/// handle from the config-derived identity partition. Their certs are
+/// loaded later by the provisioner's pre-bind adoption pass, which can
+/// only publish into a handle that already exists — so these listeners
+/// get an empty handle first (see [`empty_listener_tls`]). Sorted for
+/// deterministic startup.
+pub(crate) fn listeners_needing_runtime_tls(
+    rows: &[vhosts_namespace::VhostRow],
+    routed: &HashMap<String, Arc<VhostState>>,
+    listeners: &[ResolvedWebdListener],
+    have_tls: &HashMap<String, ListenerTls>,
+) -> Vec<String> {
+    let runtime_acme: HashSet<&str> = rows
+        .iter()
+        .filter(|r| {
+            r.enabled
+                && r.source.as_deref() == Some("bus_runtime")
+                && r.acme_provider.is_some()
+                && routed.contains_key(&r.fqdn)
+        })
+        .map(|r| r.fqdn.as_str())
+        .collect();
+    let mut out: Vec<String> = listeners
+        .iter()
+        .filter(|l| !have_tls.contains_key(&l.id))
+        .filter(|l| l.hosts.iter().any(|h| runtime_acme.contains(h.as_str())))
+        .map(|l| l.id.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// A TLS handle holding an EMPTY resolver with the listener's
+/// `strict_sni` — a slot the ACME provisioner can republish adopted or
+/// freshly issued runtime certs into.
+pub(crate) fn empty_listener_tls(strict_sni: bool) -> Result<ListenerTls> {
+    let resolver = SniCertResolver::from_config(&[], strict_sni)
+        .context("building an empty TLS resolver for a runtime-cert listener")?;
+    Ok(ListenerTls::new(Some(Arc::new(resolver))))
+}
+
+/// Bind-time TLS decision, taken AFTER runtime-cert adoption. Returns
+/// `(handle, mode, pending)`:
+/// * usable resolver → `Terminate`, serving certs;
+/// * a handle that is still EMPTY (runtime certs pending issuance) →
+///   `Terminate` with `pending = true`: the listener binds as a TLS port,
+///   refuses every handshake with a TLS alert, and upgrades in place when
+///   the provisioner publishes the cert into this same handle. Never
+///   plaintext on a TLS port;
+/// * no handle → `Plain` (a listener with no TLS vhosts at all).
+pub(crate) fn listener_bind_tls(
+    tls: Option<&ListenerTls>,
+) -> (Option<ListenerTls>, TlsMode, bool) {
+    match tls {
+        Some(t) if t.is_enabled() => (Some(t.clone()), TlsMode::Terminate, false),
+        Some(t) if t.is_pending() => (Some(t.clone()), TlsMode::Terminate, true),
+        _ => (None, TlsMode::Plain, false),
+    }
+}
+
 /// Node-wide state shared across every vhost. Created once at
 /// startup and cloned into each request via axum `State`. Carries
 /// only the genuinely node-scoped concerns: the autoconfig
@@ -958,6 +1018,11 @@ struct NodeState {
     /// nodes (no TLS). The verb returns a helpful `rc=10` when `None`.
     /// See [`bus::tls`].
     tls_reload: Option<bus::tls::TlsReloadState>,
+    /// Whether this RUNNING daemon partitions hosts by an explicit
+    /// `[[webd.listener]]` array. Each listener's allowlist is fixed at
+    /// startup, so a host `webd.vhost.add` creates is not served until
+    /// the next restart; the add reply says so (`served_after`).
+    explicit_listeners: bool,
 }
 
 /// Which Basic seam a cached service token belongs to (keeps the dev and
@@ -6373,6 +6438,7 @@ async fn run_static_dev_server(static_dir: PathBuf, cli_listen: Option<String>) 
         )),
         handler_ast_cache: mix_handler::new_ast_cache(),
         tls_reload: None,
+        explicit_listeners: false,
     });
 
     let listen = addr.to_string();
@@ -7250,6 +7316,7 @@ async fn main() -> Result<()> {
                         handler_ast_cache: mix_handler::new_ast_cache(),
                         // Pre-ACME bootstrap node serves no TLS — no reload.
                         tls_reload: None,
+                        explicit_listeners: false,
                     });
                     let redirect = build_http_redirect_router(bootstrap_node);
                     let listener = tokio::net::TcpListener::bind(&http_listen)
@@ -7399,9 +7466,17 @@ async fn main() -> Result<()> {
             // can graduate from no-ACME to ACME without a
             // `node.conf.mix` edit — is a later-phase substrate fix,
             // not C4a's scope.
+            // `Disk`: the namespace hooks re-read node.conf.mix on each
+            // guarded write so no writer (vhost verbs, raw props.set /
+            // props.delete) can leave a row the next boot's listener
+            // resolution rejects.
             let (vhosts_runtime, vhosts_provisioner_events_rx) =
-                vhosts_namespace::register_vhosts_namespace(&mut props_router_inner, &props_store)
-                    .context("registering webd.vhosts substrate namespace")?;
+                vhosts_namespace::register_vhosts_namespace_with_listener_config(
+                    &mut props_router_inner,
+                    &props_store,
+                    vhosts_namespace::ListenerConfigSource::Disk,
+                )
+                .context("registering webd.vhosts substrate namespace")?;
 
             // Slice #3 — register the `webd.handlers` namespace on the
             // same router + store (must happen before the router is
@@ -7621,11 +7696,28 @@ async fn main() -> Result<()> {
                 .keys()
                 .cloned()
                 .collect();
+            // Fail-soft for namespace rows the directory did not route
+            // (disabled, or a runtime row whose www_dir is missing): a
+            // listener naming one is skipped, not an "unknown vhost"
+            // abort — the same B1 treatment config hosts get.
+            let routing_dropped = vhost_directory::routing_dropped_hosts(
+                &vhosts_namespace_rows,
+                &vhost_directory_handle.load(),
+            );
+            if !routing_dropped.is_empty() {
+                tracing::warn!(
+                    hosts = ?routing_dropped,
+                    "webd.vhosts rows not routed this run (disabled or www_dir \
+                     missing) — skipped in listener resolution"
+                );
+            }
+            let listener_skip_hosts: HashSet<String> =
+                disabled_hosts.union(&routing_dropped).cloned().collect();
             let resolved_listeners: Vec<ResolvedWebdListener> = if has_explicit_listeners {
                 node_cfg
                     .as_ref()
                     .expect("has_explicit_listeners implies node_cfg is Some")
-                    .synthesize_listeners(&all_hosts, &disabled_hosts)
+                    .synthesize_listeners(&all_hosts, &listener_skip_hosts)
                     .context("resolving [[webd.listener]] array")?
             } else {
                 vec![ResolvedWebdListener {
@@ -7695,13 +7787,50 @@ async fn main() -> Result<()> {
                 // seeded from config + tunable at runtime; a strict
                 // resolver rejects no-SNI / unknown-SNI handshakes at
                 // the TLS layer (the handshake half of public-listener
-                // hardening). Renewals rebuild the resolver via the
-                // provisioner; a later strict_sni flip applies on the
-                // next renewal (documented).
+                // hardening). A later strict_sni flip applies on the next
+                // resolver rebuild of either kind — an ACME republish
+                // (renewal, issuance, runtime-cert adoption) or a manual-PEM
+                // `webd.tls.reload` — because both read the live row through
+                // `listeners_namespace::live_strict_sni`. It does not rebuild
+                // the resolver by itself.
                 let strict_sni = listener_rows.get(&l.id).is_some_and(|r| r.strict_sni);
                 let resolver = SniCertResolver::from_config(&bucket, strict_sni)
                     .with_context(|| format!("building TLS resolver for listener {:?}", l.id))?;
                 tls_listeners.insert(l.id.clone(), ListenerTls::new(Some(Arc::new(resolver))));
+            }
+            // Each listener's boot-time strict_sni: seeds the empty
+            // runtime-cert handles below, and is the ACME provisioner's
+            // fallback if its live webd.listeners read fails (the live
+            // row is the source of truth for every republish).
+            let listener_strict_sni: HashMap<String, bool> = resolved_listeners
+                .iter()
+                .map(|l| {
+                    (
+                        l.id.clone(),
+                        listener_rows.get(&l.id).is_some_and(|r| r.strict_sni),
+                    )
+                })
+                .collect();
+            // A listener whose TLS hosts are all runtime-added (`vhost.add`)
+            // got no handle above — its identities are not in the
+            // config-derived set. Give it an empty handle (with its own
+            // strict_sni) so the provisioner's pre-bind adoption can
+            // publish the on-disk certs into it; the bind decision below
+            // is taken after adoption.
+            // Only with a provisioner: without one nothing could ever fill
+            // the handle, and a TLS port pending forever would be a dead
+            // port (such a node keeps the old plain bind; see the manual).
+            if acme_provisioner_opt.is_some() {
+                let routed = vhost_directory_handle.load();
+                for lid in listeners_needing_runtime_tls(
+                    &vhosts_namespace_rows,
+                    &routed.by_host,
+                    &resolved_listeners,
+                    &tls_listeners,
+                ) {
+                    let strict = listener_strict_sni.get(&lid).copied().unwrap_or(false);
+                    tls_listeners.insert(lid, empty_listener_tls(strict)?);
+                }
             }
 
             // C5 — capture the ACME provisioner's notify-into-sweep
@@ -7805,6 +7934,7 @@ async fn main() -> Result<()> {
                 handlers,
                 handler_ast_cache,
                 tls_reload,
+                explicit_listeners: has_explicit_listeners,
             });
 
             // Slice #3 — webd.handlers reload task. The namespace hooks
@@ -7875,6 +8005,9 @@ async fn main() -> Result<()> {
             // NodeState) so the C5 ergonomic verbs can share the same
             // lock map. The match arm here just clones it into the
             // provisioner via `attach_key_locks`.
+            // Set when the startup adoption left runtime rows needing
+            // issuance; the provisioner is woken once the listeners bind.
+            let mut acme_pending_after_bind = false;
             let acme_renewal_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> =
                 match acme_provisioner_opt {
                     // An ACME plan always issues at least one cert at
@@ -7885,6 +8018,8 @@ async fn main() -> Result<()> {
                     Some(mut provisioner) if !tls_listeners.is_empty() => {
                         provisioner
                             .attach_tls_listeners(tls_listeners.clone(), fqdn_to_listener.clone());
+                        provisioner.attach_listener_strict_sni(listener_strict_sni);
+                        provisioner.attach_listeners_runtime(listeners_runtime.clone());
                         let events_rx = vhosts_provisioner_events_rx_opt
                             .take()
                             .expect("vhosts_provisioner_events_rx_opt is Some on first match arm");
@@ -7899,6 +8034,33 @@ async fn main() -> Result<()> {
                             disabled_hosts.clone(),
                         );
                         provisioner.attach_key_locks(webd_key_locks.clone());
+                        // Adopt the on-disk certs of runtime-added
+                        // (`vhost.add`) ACME rows BEFORE the listener set
+                        // binds below. `startup_pass` only walked the
+                        // `node.conf.mix` plans, so without this a
+                        // restarted node served another vhost's cert for
+                        // every runtime-added vhost.
+                        let adoption = provisioner
+                            .adopt_namespace_rows_at_startup(
+                                time::OffsetDateTime::now_utc(),
+                                std::time::Duration::from_secs(6 * 60 * 60),
+                            )
+                            .await;
+                        if adoption.adopted > 0 {
+                            provisioner.publish_tls_status();
+                            tracing::info!(
+                                adopted = adoption.adopted,
+                                "ACME: adopted on-disk certs for runtime-added vhosts"
+                            );
+                        }
+                        if !adoption.pending.is_empty() {
+                            tracing::warn!(
+                                hosts = ?adoption.pending,
+                                "ACME: runtime-added vhosts have no cert on disk — issuing \
+                                 once the listeners are bound"
+                            );
+                        }
+                        acme_pending_after_bind = !adoption.pending.is_empty();
                         Some(tokio::spawn(async move { provisioner.run_forever().await }))
                     }
                     _ => None,
@@ -7974,12 +8136,25 @@ async fn main() -> Result<()> {
                 let handler = Arc::new(WebdConnHandler {
                     app: app_for_listener,
                 });
-                let tls = tls_listeners.get(&l.id).cloned();
-                let tls_mode = if tls.is_some() {
-                    TlsMode::Terminate
-                } else {
-                    TlsMode::Plain
-                };
+                // Decided after runtime-cert adoption: a runtime-only
+                // listener whose certs were adopted terminates TLS; one
+                // whose handle is still empty binds as pending TLS
+                // (handshakes refused until issuance fills the handle).
+                let (tls, tls_mode, tls_pending) = listener_bind_tls(tls_listeners.get(&l.id));
+                if tls_pending {
+                    let hosts: Vec<&String> = l
+                        .hosts
+                        .iter()
+                        .filter(|h| all_hosts.contains(*h))
+                        .collect();
+                    tracing::warn!(
+                        listener = %l.id,
+                        tls = "pending",
+                        ?hosts,
+                        "tls pending for runtime-added vhosts: bound as TLS, handshakes \
+                         refused until their certificates are issued"
+                    );
+                }
                 // L1-authoritative: `enabled` + the guard policy come
                 // from the `webd.listeners` row (config-seeded, then
                 // operator-owned), NOT raw config — so a listener an
@@ -7996,6 +8171,7 @@ async fn main() -> Result<()> {
                     .with_external(l.external)
                     .with_enabled(enabled)
                     .with_tls_mode(tls_mode)
+                    .with_tls_pending_ok(tls_pending)
                     .with_guard(guard);
                 listener_builder.add(spec, handler, tls);
             }
@@ -8004,6 +8180,25 @@ async fn main() -> Result<()> {
                 .start_all()
                 .await
                 .context("starting webd listener set")?;
+            // Listeners (incl. the :80 HTTP-01 path) are up: wake the ACME
+            // provisioner once so runtime rows the startup adoption left
+            // without a cert are issued now rather than at the first 6 h
+            // tick. The Notify stores the permit if the loop is not yet
+            // waiting.
+            if acme_pending_after_bind && let Some(n) = node.acme_notify.as_ref() {
+                n.notify_one();
+            }
+            // One line per listener with its TLS state, so a pending TLS
+            // port reads `tls=pending`, never as plain.
+            for s in listener_set.control().status() {
+                tracing::info!(
+                    listener = %s.id,
+                    running = s.running,
+                    tls = s.tls,
+                    binds = ?s.binds,
+                    "listener state"
+                );
+            }
 
             // `start_all` is best-effort (it only errors when *every*
             // enabled listener fails to bind), so a partial bind — e.g.
@@ -8792,6 +8987,7 @@ vhost: [
             )),
             handler_ast_cache: mix_handler::new_ast_cache(),
             tls_reload: None,
+            explicit_listeners: false,
         })
     }
 
@@ -10044,6 +10240,7 @@ mod session_login_tests {
             handlers: Arc::new(ArcSwap::from(Arc::new(handlers))),
             handler_ast_cache: mix_handler::new_ast_cache(),
             tls_reload: None,
+            explicit_listeners: false,
         })
     }
 

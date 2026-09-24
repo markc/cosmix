@@ -505,6 +505,7 @@ cosmix-webd vhost remove &lt;FQDN&gt;
 </tbody></table>
 <p>The ACME provider, challenge, and contact fields form one mode. Manual certificate and key fields form the other mode. The modes are mutually exclusive, and certificate/key half-pairs are rejected.</p>
 <p><code>vhost remove</code> reads the current row version before deleting it. Missing rows are treated as an idempotent success; concurrent changes require a retry.</p>
+<p><code>vhost add</code> and <code>vhost remove</code> refuse a change the next restart would reject. On a node with explicit <code>[[webd.listener]]</code> rows, add the FQDN to exactly one enabled listener's <code>vhosts</code> in <code>node.conf.mix</code>, then run <code>vhost add</code> straight away. Do not restart between the two steps: a listener naming a host with no row aborts the boot. To remove, drop the host from the listener, then run <code>vhost remove</code>, unless a <code>[[webd.vhost]]</code> block still defines it. A refused add writes nothing. On such a node the new host is served after the next restart, and the reply says <code>"served_after": "restart"</code>. See <a href="/cos/cosmix-webd/bus-verbs#vhost-verbs">Bus verbs</a> for the exact rules and for how runtime-added certificates are loaded after a restart.</p>
 <h2 id="acme-routes-statistics-tls-and-autoconfiguration">ACME, routes, statistics, TLS, and autoconfiguration</h2>
 <pre><code class="language-text">cosmix-webd acme renew &lt;FQDN&gt;
 cosmix-webd acme status &lt;FQDN&gt;
